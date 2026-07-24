@@ -72,15 +72,17 @@
 (def ^:private command-exit-marker "__JOLT_COMMAND_EXIT__")
 
 (defn- shell-result
-  "Run one POSIX-shell command and return its exit status plus stdout.
+  "Run one POSIX-shell command and return its exit status plus combined output.
 
   jolt.host/sh-out intentionally exposes only stdout. Append an exit marker
   after the command so validation never mistakes a failed Git query for clean,
-  empty output. The final marker wins even when an adversarial filename happens
-  to contain the same text."
+  empty output. Git's stderr is retained in the pre-marker output so a structured
+  validation failure remains actionable on platforms where exit 128 alone is
+  ambiguous. The final marker wins even when an adversarial filename happens to
+  contain the same text."
   [cmd]
   (let [raw (jolt.host/sh-out
-              (str cmd " 2>/dev/null; rc=$?; printf '\\n"
+              (str "{ " cmd "; } 2>&1; rc=$?; printf '\\n"
                    command-exit-marker "%s\\n' \"$rc\""))
         marker (str "\n" command-exit-marker)
         i (str/last-index-of raw marker)]
@@ -184,7 +186,7 @@
     (cond
       (not (result-ok? status))
       {:valid? false :reason :git-error :operation :status :path dir
-       :exit (:exit status)}
+       :exit (:exit status) :output (:out status)}
 
       (not (str/blank? (:out status)))
       {:valid? false :reason :dirty :path dir :status (:out status)}
@@ -194,7 +196,7 @@
         (cond
           (not (result-ok? index))
           {:valid? false :reason :git-error :operation :ls-files :path dir
-           :exit (:exit index)}
+           :exit (:exit index) :output (:out index)}
 
           (some unsafe-index-line? (result-lines index))
           {:valid? false :reason :unsafe-index :path dir}
@@ -259,7 +261,7 @@
                         (not (result-ok? sub-status))
                         {:valid? false :reason :git-error
                          :operation :submodule-status :path dir
-                         :exit (:exit sub-status)}
+                         :exit (:exit sub-status) :output (:out sub-status)}
 
                         (some (fn [line]
                                 (and (seq line)
@@ -277,7 +279,8 @@
                           (if-not (result-ok? sub-paths)
                             {:valid? false :reason :git-error
                              :operation :submodule-foreach :path dir
-                             :exit (:exit sub-paths)}
+                             :exit (:exit sub-paths)
+                             :output (:out sub-paths)}
                             (or
                               (some
                                 (fn [subpath]
