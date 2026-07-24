@@ -1505,8 +1505,10 @@
       ;; libraries that wrap protocol methods sync this cache (schema's fn
       ;; instrumentation) and a consistent nil makes that a safe no-op.
       ((string=? method-name "__methodImplCache") jolt-nil)
-      (else (error #f (string-append "No method " method-name " for value: "
-                                     (jolt-pr-str obj)))))))
+      ;; A dependency-owned class provider may add this member.  Return the same
+      ;; miss sentinel as the ordered arms; record-method-dispatch below owns the
+      ;; single retry and the final diagnostic.
+      (else 'pass))))
 
 ;; ---- method-dispatch arm registry ------------------------------------------
 ;; A .method call (record-method-dispatch) is resolved by an ordered list of arms
@@ -1536,12 +1538,34 @@
 (define arm-priority-nio-path 42)     ; java.nio.file.Path methods (above jfile)
 (define arm-priority-htable 43)       ; tagged htable method registry
 (define arm-priority-host-type 44)    ; jhost/number/string per-type dispatch
-(define (record-method-dispatch obj method-name rest-args)
+(define record-method-miss-retry! (lambda (obj method-name) #f))
+(define record-method-extension-dispatch
+  (lambda (obj method-name rest-args) 'pass))
+(define (record-method-dispatch-once obj method-name rest-args)
   (let loop ((as method-dispatch-arms))
     (if (null? as)
-        (record-method-dispatch-base obj method-name rest-args)
+        (let ((base (record-method-dispatch-base obj method-name rest-args)))
+          ;; Extensions are a missing-member fallback, never an override for a
+          ;; built-in arm or the base Object/String/etc. surface.
+          (if (eq? base 'pass)
+              (record-method-extension-dispatch obj method-name rest-args)
+              base))
         (let ((r ((cdar as) obj method-name rest-args)))
           (if (eq? r 'pass) (loop (cdr as)) r)))))
+(define (record-method-dispatch obj method-name rest-args)
+  (let ((result (record-method-dispatch-once obj method-name rest-args)))
+    (if (eq? result 'pass)
+        ;; The second dispatch is deliberately non-recursive: a provider that
+        ;; does not register the member fails instead of forming a retry loop.
+        (if (record-method-miss-retry! obj method-name)
+            (let ((retry (record-method-dispatch-once obj method-name rest-args)))
+              (if (eq? retry 'pass)
+                  (error #f (string-append "No method " method-name " for value: "
+                                           (jolt-pr-str obj)))
+                  retry))
+            (error #f (string-append "No method " method-name " for value: "
+                                     (jolt-pr-str obj))))
+        result)))
 
 ;; (.getClass x): a universal Object method reached by EVERY value before any
 ;; per-type arm — the class token for the value (jolt has no Class objects; the
