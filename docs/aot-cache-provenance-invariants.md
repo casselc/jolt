@@ -1,18 +1,106 @@
 # AOT generation and provenance invariants
 
 This note records bounded Chiasmus/Z3 analyses of the namespace AOT cache. The
-accepted proof target is provenance-sealed generation routing, recursive
-candidate eligibility, an atomic in-memory artifact guard/selection commit,
-complete consumed-input/effect and compiler-environment gating, route-complete
-nested loading, reconstruct-or-taint reload handling, atomic shared load
-bookkeeping, and a phase-safe retry boundary. The older source/provider and
-live-revalidation models are kept as evidence about rejected designs; they are
-not the accepted invariant.
+production recommendation is now a fresh-process, closed-world whole-project
+image selected atomically under one immutable build token. Independently
+reusable namespace artifacts are not a production boundary: they admit a mixed
+build snapshot unless the runtime also implements provenance-sealed generation
+routing, recursive candidate eligibility, an atomic in-memory artifact
+guard/selection commit, complete consumed-input/effect and compiler-environment
+gating, route-complete nested loading, reconstruct-or-taint reload handling,
+atomic shared load bookkeeping, and a phase-safe retry boundary.
+
+Those selective-runtime generation models remain useful research contracts and
+counterexample records, but the stronger and simpler whole-image contract is the
+recommended implementation. The older source/provider and live-revalidation
+models remain evidence about rejected designs.
 
 Every `UNSAT` result below means only that no counterexample exists within its
-stated finite model. Runtime tests remain the semantic oracle.
+stated finite model. Runtime tests remain the semantic oracle. In particular,
+the whole-image proof assumes that project-graph resolution and compiler-input
+observation are complete; it does not establish their completeness.
 
-## Accepted invariant: provenance-sealed generations
+## Production invariant: fresh-process closed-world whole image
+
+The production unit of reuse is one immutable whole-project image, not a set of
+independently reusable namespace artifacts. A build:
+
+- starts from a fresh compiler process and project namespace state;
+- resolves one declared, complete project source graph and one complete
+  compiler-input witness;
+- binds that graph, input witness, emitted image bytes, and every namespace
+  revision to one collision-resistant build token;
+- publishes the image immutably in a private cache; and
+- selects that image atomically by token, with no per-namespace selection or
+  fallback to an artifact from another build.
+
+Before user forms execute, the loaded image token, aggregate graph witness,
+aggregate compiler-input witness, bytes, and namespace revisions must all match
+the selected token. A dynamic compile input outside the declared graph fails
+closed. Thus one execution cannot combine namespaces from different build
+tokens, substitute different image bytes, run an undeclared dynamic compile
+input, or inherit state from a non-fresh compiler process.
+
+This is a deliberately closed-world contract. Complete graph and input
+classification, collision-free tokens, and immutable token-to-image publication
+are explicit implementation assumptions. The formal model proves the
+post-classification selection gate, not a filesystem snapshot algorithm, a
+dependency resolver, or exhaustive instrumentation.
+
+## Whole-image production models and results
+
+The checked-in inputs omit `(check-sat)` and model-extraction commands because
+`chiasmus_verify` supplies them.
+
+| Model | Expected and observed result | Meaning |
+| --- | --- | --- |
+| [`aot-whole-image-independent-artifacts-buggy.smt2`](../test/chez/formal/aot-whole-image-independent-artifacts-buggy.smt2) | `SAT` (72 returned model entries) | Independently selecting namespace A from `build0` and namespace B from `build1` executes a mixed snapshot even though each build's whole-image metadata is internally coherent. |
+| [`aot-whole-image-closed-world-corrected.smt2`](../test/chez/formal/aot-whole-image-closed-world-corrected.smt2) | `UNSAT` (18-label core) | Fresh-process compilation, exact image-witness validation, atomic whole-image selection, and rejection of undeclared dynamic input admit no modeled mixed, substituted, undeclared-input, or non-fresh execution. |
+| [`aot-whole-image-closed-world-nonvacuity.smt2`](../test/chez/formal/aot-whole-image-closed-world-nonvacuity.smt2) | `SAT` (72 returned model entries) | A coherent `build1` image executes with `violation=false`; irrelevant independently chosen namespace tokens are ignored. |
+
+The rejected independent-artifact witness is:
+
+```text
+selected whole-image build token   = build0
+independently selected namespace A = build0 / rev0
+independently selected namespace B = build1 / rev1
+loaded whole-image witness         = build0 / graph0 / inputs0 / bytes0
+dynamic compile input              = declared
+fresh compiler process             = true
+user forms execute                 = true
+mixed snapshot violation           = true
+```
+
+The corrected violation query has this exact 18-label `UNSAT` core:
+
+```text
+image_witness_integrity_definition
+corrected_fresh_process_required
+corrected_atomic_whole_image_selection
+corrected_image_witness_guard
+corrected_closed_world_dynamic_input_gate
+effective_a_token_definition
+effective_b_token_definition
+effective_a_revision_definition
+effective_b_revision_definition
+closed_world_input_definition
+execution_preflight_definition
+user_form_execution_definition
+mixed_snapshot_violation_definition
+image_provenance_violation_definition
+undeclared_dynamic_input_violation_definition
+nonfresh_process_violation_definition
+violation_definition
+violation_query
+```
+
+The non-vacuity control selects and loads
+`build1 / graph1 / inputs1 / bytes1`, obtains `effective_a_token=build1`,
+`effective_b_token=build1`, `user_forms_exec=true`, and `violation=false`.
+Both `SAT` model sizes count every binding returned by Chiasmus, including
+named-assertion symbols, rather than only the projected witness fields.
+
+## Selective-runtime research invariant: provenance-sealed generations
 
 An executable namespace generation is an immutable record containing:
 
@@ -20,7 +108,7 @@ An executable namespace generation is an immutable record containing:
 - the recorded compile-input witness from which those bytes were emitted;
 - exact dependency-generation tokens, recursively through the provider graph.
 
-The accepted execution contract is:
+The selective-runtime research contract is:
 
 > User forms may execute only from the artifact bytes selected by one immutable
 > generation token. Those bytes must map to that generation's sealed
@@ -57,7 +145,7 @@ selected immutable route; they affect a later top-level load/reload transaction
 or another process. The transaction does not attempt to make arbitrary live
 process state equal the old compile state immediately before each form.
 
-Two nested-loading boundaries are fail-closed in the accepted runtime policy:
+Two nested-loading boundaries are fail-closed in the selective-runtime policy:
 
 - Arbitrary nested `:reload` or `:reload-all` cannot both honor moving-source
   semantics and preserve the selected generation's in-flight sealed route. A
@@ -88,7 +176,7 @@ The retry boundary is separate:
 > retry. Once any user top-level form has begun, failure propagates and the same
 > load transaction must not recompile or enter user forms a second time.
 
-## Accepted generation models and results
+## Selective-runtime generation models and results
 
 The checked-in inputs omit `(check-sat)` and model-extraction commands because
 `chiasmus_verify` supplies them.
@@ -453,7 +541,7 @@ violation_query
 
 A global permanent bit is therefore sufficient by itself only if complete,
 synchronous instrumentation is assumed to catch every unsafe change before the
-decision. The accepted bounded contract does not silently assume that stronger
+decision. The selective-runtime bounded contract does not silently assume that stronger
 property: it also requires the final publication recheck. A global bit set for
 *every* Var-root mutation would be sound but wrong for the late-bound negative
 control and unnecessarily disable the process; it must track only the refined
@@ -574,7 +662,7 @@ The non-vacuity control starts with both entries absent and reaches
 
 The selected-reload family starts with one selected cached generation and one
 provider sealed at `provider_rev0`. Under the buggy policy a nested reload is
-accepted inside that transaction:
+permitted inside that selective transaction:
 
 ```text
 reload intent                            = nested_reload_requested
@@ -585,7 +673,7 @@ retry started                            = false
 violation                                = true
 ```
 
-The accepted policy rejects the request before the first provider or namespace
+The selective-runtime policy rejects the request before the first provider or namespace
 mutation, stops the selected transaction, and keeps post-user retry disabled.
 It does not reread source or attempt to choose a newer generation inside the
 in-flight route. The violation query is `UNSAT` with this named core:
@@ -712,8 +800,9 @@ global type registries, direct/nested loading, loaded-libs bookkeeping, and
 caller context before `ns`. A fresh namespace alone closes only some of them; a
 source hash or namespace generation alone closes fewer.
 
-The cache should therefore remain research-only and explicitly opt-in until
-runtime tests demonstrate all of these gates on production paths:
+The counterexamples make independently reusable namespace artifacts the wrong
+production default. Closing every hole while preserving selective in-process
+reuse requires all of these gates:
 
 - complete consumption-side observation, including negative lookups and global
   registries;
@@ -724,19 +813,32 @@ runtime tests demonstrate all of these gates on production paths:
 - reconstructed or tainted same-namespace reloads;
 - first meaningful form is matching `ns`, or exact caller context is sealed.
 
-If complete instrumentation or controlled-operation classification cannot be
-made trustworthy, the guarantee and selective in-process warm caching are
-irreconcilable. The conservative pivot is process-isolated compilation from a
-fresh compiler/namespace image, a much narrower immutable provider contract, or
-ordinary non-AOT loading. The bounded `UNSAT` results describe the target
-contract; they are not evidence that the current in-process cache is ready for
-default use.
+The production recommendation is instead to build one closed-world
+whole-project image in a fresh process and select it atomically under one build
+token. There is no namespace-by-namespace cache lookup on that path. A load
+either receives the complete immutable image described by the selected graph
+and compiler-input witness, or misses/fails before user forms. A newly reached
+compile-time input outside the declared graph also fails closed rather than
+silently extending the snapshot.
+
+That pivot removes mutable per-namespace generation routing from the production
+trusted computing base, but it does not remove the hard discovery problem.
+Production enablement still requires runtime tests showing that graph and
+compiler-input collection are complete, image publication is immutable,
+selection is atomic, and the compiler process is actually fresh. Until those
+conditions are demonstrated, whole-image reuse should remain opt-in and the safe
+fallback is ordinary non-AOT loading.
+
+The selective generation machinery should remain a separate research path, not
+an incremental prerequisite for the whole-image implementation. Its bounded
+`UNSAT` results specify what selective reuse would need; they are not evidence
+that the current in-process cache is ready for default use.
 
 ## Historical analyses of rejected designs
 
 The following models remain checked in because their counterexamples motivated
 the redesign. Filenames containing `corrected` mean corrected relative to that
-historical design, not the accepted generation contract.
+historical design, not the selective-runtime generation contract.
 
 ### Source/provider live-validation family
 
@@ -756,8 +858,9 @@ still obtained the mismatch.
 The historical `v4-corrected` `UNSAT` result never proved a
 validation-to-execution guarantee. Its six-stage abstraction collapses manifest
 validation and warm execution into one final stage. Treating it as proof against
-post-selection filesystem/provider changes was misleading. Under the accepted
-contract, those later live changes are outside the sealed transaction anyway.
+post-selection filesystem/provider changes was misleading. Under the
+selective-runtime contract, those later live changes are outside the sealed
+transaction anyway.
 
 ### Live-state temporal revalidation family
 
@@ -781,9 +884,26 @@ loader line ranges while that work is active.
 
 ## Bounds and assumptions
 
+### Whole-image production family
+
+The whole-image model has two build tokens, two aggregate project-graph
+witnesses, two aggregate compiler-input witnesses, two immutable image-byte
+identities, two namespaces with two revisions each, and one bounded dynamic
+compile input classified as absent, declared, or undeclared. It models one
+fresh-process fact, one atomic image-selection decision, one preflight, and one
+user-form execution decision.
+
+Namespaces A and B stand for the complete project image. The graph and input
+witnesses are opaque aggregates: the model assumes that each token maps to one
+complete, exact graph/input/image tuple and that publication preserves that
+mapping. It does not enumerate a real dependency graph, discover compiler
+inputs, prove that dynamic code loading is classified exhaustively, construct
+the fresh process, or prove filesystem atomicity. Atomic whole-image selection
+is a modeled contract, not a derived implementation fact.
+
 ### Generation-routing family
 
-The accepted routing model has:
+The selective routing model has:
 
 - two consumer generations, two provider generations, and two helper
   generations;
@@ -903,8 +1023,11 @@ individual form or side effect.
 
 ### Contract assumptions and omissions
 
-All accepted families assume:
+All production and research families assume, where applicable:
 
+- **complete project-graph resolution**: the whole-image gate receives one
+  declared graph containing every project namespace and compile-time edge; the
+  finite model does not prove that the real resolver discovers them all;
 - **complete compiler-input observation**: the corrected finite model requires
   exact seals for its enumerated events, including negative registry and caller
   context lookups, but real observer-hook coverage remains an implementation
@@ -913,7 +1036,18 @@ All accepted families assume:
   are sealed with the bytes they produced; they are not claimed to be an atomic
   filesystem snapshot;
 - **immutable private cache**: generation records and token-addressed bytes
-  cannot change after publication, and tokens do not collide;
+  or whole-project images cannot change after publication, and tokens do not
+  collide;
+- **fresh-process isolation is real**: the whole-image `fresh_compiler_process`
+  fact means no project namespace cells or compiler state survive from an
+  earlier build; the model accepts this fact rather than constructing the
+  process boundary;
+- **whole-image selection is atomic**: one selected token commits the complete
+  graph/input/image tuple before user forms; partial image visibility and
+  namespace-level fallback are excluded by contract;
+- **dynamic compile-input classification is exhaustive**: an input absent from
+  the declared closed world is classified as undeclared and rejected; the model
+  does not prove that production hooks observe every such input;
 - **trusted cache participants**: hostile writers, forged records, malicious
   token substitution, and compromised filesystem ownership are excluded;
 - **ordinary late-bound Var mutation is outside provenance**: only a nonmacro
@@ -950,10 +1084,24 @@ witness.
 
 ## Exact Chiasmus workflow
 
+For the whole-image production boundary:
+
+1. `chiasmus_skills` searched for a bounded closed-world build, atomic
+   whole-image selection, mixed namespace snapshots, undeclared dynamic compile
+   inputs, fail-closed evaluation, and non-vacuity.
+2. `chiasmus_formalize` selected `fail-closed-evaluator`; the skeleton was
+   adapted to one aggregate build token/graph/input/image witness, independent
+   namespace selection as the rejected control, fresh-process and dynamic-input
+   gates, and user execution.
+3. All three exact inputs passed `chiasmus_lint` with zero fixes and zero
+   errors. `chiasmus_verify` returned buggy `SAT` with 72 model entries,
+   corrected `UNSAT` with an 18-label core, and non-vacuity `SAT` with 72 model
+   entries.
+
 For generation routing:
 
 1. `chiasmus_skills` searched for a bounded AOT post-selection/full-manifest
-   fail-closed query, then the accepted direction was reformulated around sealed
+   fail-closed query, then the selective direction was reformulated around sealed
    generation and dependency-token routing.
 2. `chiasmus_formalize` selected `fail-closed-evaluator`; the skeleton was
    adapted into explicit direct/transitive routing, token/byte, loaded-conflict,
@@ -1045,6 +1193,9 @@ For transaction phases:
 The nine historical inputs were also re-linted and re-verified after being
 relabeled as rejected-design evidence. All had zero lint fixes/errors and
 retained their recorded results: six `SAT` and three `UNSAT`.
+
+The checked-in suite now contains 44 exact SMT inputs: 30 observed `SAT` and 14
+observed `UNSAT`.
 
 All semantic result flags are equality-defined. The `SAT` files expose concrete
 witness values, the `UNSAT` files record named cores, and the non-vacuity files
