@@ -20,6 +20,7 @@ upstream Jolt origin, or requests an upstream pull request.
 
 | Workstream | Canonical records | Scope and current disposition |
 | --- | --- | --- |
+| Jolt native-library and Java-interop integration | [`RFD 0001`](rfd/0001/README.md) | Jolt core/stdlib/ecosystem ownership, native-versus-interop exposure, provider and adapter mechanisms, rejected architectures, repository landing order, conformance/proof obligations, and future graduation questions. The RFD is in prediscussion; cross-runtime extraction is motivating context rather than a determination here. |
 | Core AOT correctness | [`aot-cache-provenance-invariants.md`](aot-cache-provenance-invariants.md) and the AOT-prefixed [checked models](../test/chez/formal) | Compiler inputs, caller context, cache selection/publication races, bug controls, and the fresh-process closed-world conclusion. The selective-runtime prototype remains research-only. |
 | Core runtime/platform behavior | [`executor-shutdown-invariants.md`](executor-shutdown-invariants.md), [`windows-path-invariants.md`](windows-path-invariants.md), [`windows-toolchains-and-validation.md`](windows-toolchains-and-validation.md), and draft [PR #4](https://github.com/casselc/jolt/pull/4) | Executor admission/drain, rejected execution, cache-off source tests, absolute caller paths, Windows host-shim behavior, inherited MinGW packaging history, the future MSVC backend boundary, and source/runtime/package evidence lanes. |
 | Core FFI/ABI surface | Draft [PR #2](https://github.com/casselc/jolt/pull/2), [PR #3](https://github.com/casselc/jolt/pull/3), and [PR #5](https://github.com/casselc/jolt/pull/5), with requirements traced from TCP, HTTP, and Hegel below | Monotonic time, width-correct integers, immediate native errors, overlap-safe copy, borrowed ranges, aggregates/struct-by-value, variadic calls, and target descriptors. The record is split by reviewable landing boundary rather than duplicated into a synthetic narrative. |
@@ -30,6 +31,18 @@ upstream Jolt origin, or requests an upstream pull request.
 | Non-network sibling ecosystem | [`upstream-ecosystem-audit-2026-07-23.md`](upstream-ecosystem-audit-2026-07-23.md) | Read-only review of time, Transit, XML, YAML, Crypto, logging, and router, split into core-owned substrate and library-owned behavior. This is what the shorter phrase “ecosystem audit” means in older prose. |
 | Git dependency acquisition | Draft [PR #6](https://github.com/casselc/jolt/pull/6), `jolt.deps`, and `test/deps_test.clj` | Failed/partial clones, collisions, literal and relative origins, linked tools.gitlibs worktrees, replacement refs, sparse/index/submodule states, locking, and non-destructive publication. The packaged Windows gate is currently red at the `cmd.exe` to POSIX-shell launch boundary and is not waived. |
 | Consumer composition/dogfood | Local branches listed below | Tests whether the new layers replace private socket stacks in nREPL, http-client, and Ring. This is implementation evidence, not a claim that those upstream-owned projects accepted the changes. |
+
+The Git publication claim has one explicit filesystem boundary. Compliant Jolt
+writers are no-clobber because every transactional version contends on the same
+adjacent `.jolt-lock`; the checkout is staged beside the final leaf and renamed
+only while that lock is held. The current no-replace `Files/move` implementation
+still checks destination absence before calling the platform rename primitive.
+On POSIX, an independent non-Jolt creator that appears between those operations
+can be replaced by `rename(2)`. The existing regression proves preservation when
+the destination is already present, not against that check/rename race. A native
+no-clobber directory move (`renameat2(RENAME_NOREPLACE)`, `renamex_np`, and the
+Windows equivalent) is a separate host-filesystem slice; it is not silently
+assumed by the cache proof.
 
 ## Consumer-validation snapshot
 
