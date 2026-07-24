@@ -15,6 +15,10 @@
 (def url-cache-key      (var jolt.deps/git-url-cache-key))
 (def cache-entry-dir    (var jolt.deps/git-cache-entry-dir))
 (def origin-marker      (var jolt.deps/git-cache-origin-marker))
+(def origin-claim       (var jolt.deps/git-cache-origin-claim))
+(def cache-lock-dir     (var jolt.deps/git-cache-lock-dir))
+(def cache-stage-dir    (var jolt.deps/git-cache-stage-dir))
+(def remove-cache-path! (var jolt.deps/remove-own-cache-path!))
 (def checkout-inspection (var jolt.deps/git-checkout-inspection))
 (def checkout-valid?    (var jolt.deps/git-checkout-valid?))
 (def publish-checkout!  (var jolt.deps/publish-git-checkout!))
@@ -77,6 +81,37 @@
 (defn- head [repo]
   (sh-out (str "git -C " (shell-quote repo) " rev-parse HEAD")))
 
+(defn- parent-path [path]
+  (subs path 0 (.lastIndexOf path "/")))
+
+(defn- test-private-cache-paths-stay-shallow! [root]
+  (let [target (str root "/private-layout/final")
+        lock (cache-lock-dir target)
+        stage (cache-stage-dir target)
+        sentinel (str target ".unrelated")]
+    (check= (str target ".jolt-lock") lock
+            ".jolt-lock remains the stable cross-version ownership path")
+    (check= (str target ".s") stage
+            "private checkout uses the bounded sibling stage")
+    (check= (+ 2 (count target)) (count stage)
+            "staging adds exactly two characters to the Git worktree path")
+    (check= (parent-path target) (parent-path stage)
+            "stage and final checkout share one publication filesystem")
+    (check (not (str/starts-with? stage (str lock "/")))
+           "stage is a sibling rather than nested under the lock")
+
+    (mkdir! stage)
+    (spit sentinel "preserve")
+    (check (throws? #(remove-cache-path! target sentinel))
+           "cache cleanup refuses a nearby path outside its exact allowlist")
+    (check (jolt.host/file-exists? sentinel)
+           "refused cleanup preserves the unrelated sentinel")
+    (remove-cache-path! target stage)
+    (check (not (jolt.host/file-exists? stage))
+           "cache cleanup accepts the exact private stage")
+    (check (jolt.host/file-exists? sentinel)
+           "private-stage cleanup remains bounded to that stage")))
+
 (defn- test-windows-backslash-mkdirs! [root]
   ;; Native Windows environment variables conventionally contain backslashes.
   ;; File.mkdirs must create every parent in those paths; the Git cache and
@@ -95,15 +130,18 @@
   (let [hidden (str root "/failed-origin-hidden")
         url (str root "/failed-origin")
         sha (init-repo! hidden :failed-clone)
-        target (cache-target url sha)]
+        target (cache-target url sha)
+        stage (cache-stage-dir target)]
     ;; The requested URL does not exist yet. A failed clone must leave neither
     ;; the final cache leaf nor its ownership/staging directory.
     (check (throws? #(ensure-git 'fixture/failed url sha))
            "missing local remote reports clone failure")
     (check (not (jolt.host/file-exists? target))
            "failed clone does not publish its target")
-    (check (not (jolt.host/file-exists? (str target ".jolt-lock")))
+    (check (not (jolt.host/file-exists? (cache-lock-dir target)))
            "failed clone removes private lock/staging residue")
+    (check (not (jolt.host/file-exists? stage))
+           "failed clone removes the sibling checkout stage")
     (check= url (slurp (origin-marker target))
             "failed clone preserves only its durable literal-origin claim")
 
@@ -115,6 +153,47 @@
             "retry after clone failure publishes the requested cache leaf")
     (check (checkout-valid? target sha url)
            "retry result is a verified exact checkout")))
+
+(defn- test-stage-cleanup-failure-retains-lock! [root]
+  (let [url (str root "/cleanup-failure-origin")
+        sha (init-repo! url :cleanup-failure)
+        target (cache-target url sha)
+        lock (cache-lock-dir target)
+        stage (cache-stage-dir target)
+        real-inspection @checkout-inspection
+        real-remove @remove-cache-path!
+        stage-removals (atom 0)
+        data
+        (with-redefs-fn
+          {checkout-inspection
+           (fn [path expected-sha expected-url]
+             (if (= path stage)
+               {:valid? false :reason :fixture-rejection :path path}
+               (real-inspection path expected-sha expected-url)))
+           remove-cache-path!
+           (fn [dir path]
+             (if (and (= path stage)
+                      (= 2 (swap! stage-removals inc)))
+               (throw (ex-info "fixture stage cleanup failure"
+                               {:path path :fixture true}))
+               (real-remove dir path)))}
+          (fn []
+            (thrown-data
+              #(ensure-git 'fixture/cleanup-failure url sha))))]
+    (check= :jolt.deps/git-cache-cleanup-failed (:type data)
+            "cleanup failure preserves a structured combined error")
+    (check (some? (:primary-error data))
+           "cleanup failure retains the primary checkout error")
+    (check (some? (:cleanup-error data))
+           "cleanup failure retains the cleanup error")
+    (check (jolt.host/file-exists? stage)
+           "failed stage cleanup leaves its private residue visible")
+    (check (jolt.host/file-exists? lock)
+           "failed stage cleanup retains the coordinating lock")
+    ;; Restore the original implementation before removing the deliberate
+    ;; failure fixture.
+    (real-remove target stage)
+    (real-remove target lock)))
 
 (defn- test-incomplete-and-dirty-entries-are-repaired! [root]
   (let [url (str root "/repair-origin")
@@ -189,6 +268,7 @@
   (let [url (str root "/concurrent-origin")
         sha (init-repo! url :concurrent)
         target (cache-target url sha)
+        stage (cache-stage-dir target)
         start (promise)
         jobs (mapv (fn [_]
                      (future
@@ -202,13 +282,16 @@
                   (pr-str results))))
     (check (checkout-valid? target sha url)
            "concurrent winner publishes one valid checkout")
-    (check (not (jolt.host/file-exists? (str target ".jolt-lock")))
-           "concurrent completion leaves no ownership/staging directory")))
+    (check (not (jolt.host/file-exists? (cache-lock-dir target)))
+           "concurrent completion leaves no ownership lock")
+    (check (not (jolt.host/file-exists? stage))
+           "concurrent completion leaves no sibling checkout stage")))
 
 (defn- test-separate-processes-share-one-publication! [root]
   (let [url (str root "/interprocess-origin")
         sha (init-repo! url :interprocess)
         target (cache-target url sha)
+        stage (cache-stage-dir target)
         start (str root "/interprocess-start")
         child-a (str root "/interprocess-a.out")
         child-b (str root "/interprocess-b.out")
@@ -235,15 +318,17 @@
             "second process returns shared published path")
     (check (checkout-valid? target sha url)
            "interprocess winner leaves one exact checkout")
-    (check (not (jolt.host/file-exists? (str target ".jolt-lock")))
-           "interprocess publication leaves no lock residue")))
+    (check (not (jolt.host/file-exists? (cache-lock-dir target)))
+           "interprocess publication leaves no lock residue")
+    (check (not (jolt.host/file-exists? stage))
+           "interprocess publication leaves no sibling stage residue")))
 
 (defn- test-waiter-observes-in-flight-winner! [root]
   (let [url (str root "/waiter-origin")
         sha (init-repo! url :waiter)
         target (cache-target url sha)
         parent (subs target 0 (.lastIndexOf target "/"))
-        lock (str target ".jolt-lock")]
+        lock (cache-lock-dir target)]
     ;; Deterministically put this caller on the loser path instead of relying on
     ;; thread scheduling to overlap two fast local clones.
     (mkdir! parent)
@@ -262,6 +347,61 @@
       (check (jolt.host/file-exists? lock)
              "loser never removes another writer's lock")
       (sh! (str "rm -rf " (shell-quote lock))))))
+
+(defn- test-orphan-sibling-stage-is-recovered! [root]
+  (let [url (str root "/orphan-stage-origin")
+        sha (init-repo! url :orphan-stage)
+        target (cache-target url sha)
+        lock (cache-lock-dir target)
+        stage (cache-stage-dir target)
+        unrelated (str target ".preserve")]
+    (mkdir! stage)
+    (spit (str stage "/poison") "killed writer residue")
+    (spit unrelated "not part of the transaction")
+    (check= target (ensure-git 'fixture/orphan-stage url sha)
+            "new lock owner removes an orphan sibling stage before cloning")
+    (check (checkout-valid? target sha url)
+           "orphan-stage recovery publishes an exact checkout")
+    (check (not (jolt.host/file-exists? stage))
+           "successful recovery leaves no sibling stage")
+    (check (not (jolt.host/file-exists? lock))
+           "successful recovery releases the stable lock")
+    (check (jolt.host/file-exists? unrelated)
+           "orphan-stage recovery preserves adjacent unrelated state")))
+
+(defn- test-post-lock-origin-reread-precedes-stage-cleanup! [root]
+  (let [url (str root "/post-lock-origin")
+        sha (init-repo! url :post-lock-origin)
+        target (cache-target url sha)
+        lock (cache-lock-dir target)
+        stage (cache-stage-dir target)
+        sentinel (str stage "/foreign-stage-sentinel")
+        real-claim @origin-claim
+        claim-reads (atom 0)]
+    (mkdir! stage)
+    (spit sentinel "preserve until durable identity is re-read")
+    (let [data
+          (with-redefs-fn
+            {origin-claim
+             (fn [dir expected-url]
+               (if (= 3 (swap! claim-reads inc))
+                 {:claimed? true :matches? false
+                  :marker (origin-marker dir)
+                  :expected-url expected-url
+                  :actual-url "fixture://foreign-owner"}
+                 (real-claim dir expected-url)))}
+            (fn []
+              (thrown-data
+                #(ensure-git 'fixture/post-lock-origin url sha))))]
+      (check= :jolt.deps/git-cache-origin-mismatch (:type data)
+              "post-lock durable-origin mismatch fails closed"))
+    (check (>= @claim-reads 3)
+           "origin identity is re-read after lock acquisition")
+    (check (jolt.host/file-exists? sentinel)
+           "post-lock origin mismatch precedes destructive stage cleanup")
+    (check (not (jolt.host/file-exists? lock))
+           "caller releases only its newly acquired lock on mismatch")
+    (remove-cache-path! target stage)))
 
 (defn- test-tools-gitlibs-reuse-is-read-only! [root]
   (let [url (str root "/shared-origin")
@@ -327,23 +467,58 @@
            "tools.gitlibs metadata remains untouched")))
 
 (defn- test-submodule-dirt-invalidates-checkout! [root]
-  (let [sub-url (str root "/submodule-origin")
+  (let [nested-url (str root "/nested-submodule-origin")
+        _ (init-repo! nested-url :nested-submodule)
+        sub-url (str root "/submodule-origin")
         _ (init-repo! sub-url :submodule)
         _ (commit! sub-url ".gitignore" "ignored.clj\n" "ignore fixture")
+        _ (sh! (str "git -c protocol.file.allow=always -C "
+                    (shell-quote sub-url) " submodule add --quiet "
+                    (shell-quote nested-url)
+                    " " (shell-quote "nested modules/deep child")))
+        _ (commit-all! sub-url "add nested submodule with spaces")
         parent-url (str root "/submodule-parent-origin")
         _ (init-repo! parent-url :submodule-parent)
         _ (sh! (str "git -c protocol.file.allow=always -C "
                     (shell-quote parent-url) " submodule add --quiet "
-                    (shell-quote sub-url) " modules/sub"))
+                    (shell-quote sub-url)
+                    " " (shell-quote "modules/outer sub")))
         sha (commit-all! parent-url "add submodule")
         target (cache-target parent-url sha)
-        sub-checkout (str target "/modules/sub")
+        sub-checkout (str target "/modules/outer sub")
+        nested-checkout (str sub-checkout "/nested modules/deep child")
+        nested-deps (str nested-checkout "/deps.edn")
         injected (str sub-checkout "/injected.clj")
         ignored (str sub-checkout "/ignored.clj")]
     (check= target (ensure-git 'fixture/submodule parent-url sha)
             "clean recursive submodule checkout is published")
     (check (checkout-valid? target sha parent-url)
            "clean recursive submodule checkout validates")
+
+    ;; Hide a tracked mutation from the root and intermediate porcelain status.
+    ;; Inspection can find it only by traversing recursive `submodule foreach`
+    ;; and joining Git's top-level-relative $displaypath. The nested path and
+    ;; both ancestor paths contain spaces, so this is also a quoting regression.
+    (sh! (str "git -C " (shell-quote nested-checkout)
+              " update-index --skip-worktree deps.edn"))
+    (spit nested-deps "{:fixture :hidden-nested-submodule-tamper}\n")
+    (check (str/blank?
+             (sh-out (str "git -C " (shell-quote target)
+                          " status --porcelain=v1")))
+           "nested skip-worktree mutation is hidden from root porcelain")
+    (let [inspection (checkout-inspection target sha parent-url)]
+      (check= :unsafe-index (:reason inspection)
+              "recursive inspection reaches hidden nested index state")
+      (check= nested-checkout (:path inspection)
+              "recursive inspection reports Git's full nested displaypath")
+      (check (:submodule? inspection)
+             "nested unsafe index is classified as submodule state")
+      (check= target (:checkout-path inspection)
+              "nested inspection retains its owning checkout path"))
+    (check= target (ensure-git 'fixture/submodule parent-url sha)
+            "hidden nested spaced submodule state is repaired")
+    (check (checkout-valid? target sha parent-url)
+           "nested submodule repair restores recursive immutable checkout")
 
     (spit injected "(ns injected)\n")
     (check (not (checkout-valid? target sha parent-url))
@@ -639,7 +814,7 @@
         sha (init-repo! url :slow-owner)
         target (cache-target url sha)
         parent (subs target 0 (.lastIndexOf target "/"))
-        lock (str target ".jolt-lock")]
+        lock (cache-lock-dir target)]
     (mkdir! parent)
     (mkdir! lock)
     (spit (origin-marker target) url)
@@ -653,11 +828,11 @@
                   (sh! (str "git clone --quiet " (shell-quote url) " "
                             (shell-quote target)))
                   target)
-          started (System/currentTimeMillis)
+          started (jolt.host/monotonic-nanos)
           _ (deliver begin-owner true)]
       (check= target (ensure-git 'fixture/slow-owner url sha)
               "waiter observes a healthy owner after more than ten seconds")
-      (check (>= (- (System/currentTimeMillis) started) 10000)
+      (check (>= (- (jolt.host/monotonic-nanos) started) 10000000000)
              "healthy-owner regression actually crosses old ten-second bound")
       (check= target (deref owner 5000 ::timeout)
               "slow owner completed its publication")
@@ -670,7 +845,7 @@
         sha (init-repo! url :stale-owner)
         target (cache-target url sha)
         parent (subs target 0 (.lastIndexOf target "/"))
-        lock (str target ".jolt-lock")
+        lock (cache-lock-dir target)
         owner "{:fixture :stale-owner}"]
     (mkdir! parent)
     (mkdir! lock)
@@ -695,7 +870,8 @@
         tag-sha (sh-out (str "git -C " (shell-quote url)
                              " rev-parse refs/tags/jolt-test-tag"))
         commit-sha (head url)
-        target (cache-target url tag-sha)]
+        target (cache-target url tag-sha)
+        stage (cache-stage-dir target)]
     (check= "tag" (sh-out (str "git -C " (shell-quote url)
                                 " cat-file -t " (shell-quote tag-sha)))
             "fixture SHA names an annotated-tag object")
@@ -703,8 +879,10 @@
            "annotated-tag object ID is rejected instead of peeled")
     (check (not (jolt.host/file-exists? target))
            "annotated-tag object never publishes a cache entry")
-    (check (not (jolt.host/file-exists? (str target ".jolt-lock")))
+    (check (not (jolt.host/file-exists? (cache-lock-dir target)))
            "annotated-tag rejection cleans private staging state")
+    (check (not (jolt.host/file-exists? stage))
+           "annotated-tag rejection removes the sibling checkout stage")
 
     ;; Git replacement refs alter cat-file/rev-parse unless every identity query
     ;; explicitly disables them. Seed an otherwise plausible cache leaf whose
@@ -763,13 +941,17 @@
     (when-not (and root (jolt.host/getenv "JOLT_GITLIBS")
                    (jolt.host/getenv "GITLIBS"))
       (throw (ex-info "deps-test requires fixture root, JOLT_GITLIBS, and GITLIBS" {})))
+    (test-private-cache-paths-stay-shallow! root)
     (test-windows-backslash-mkdirs! root)
     (test-failed-clone-is-recoverable! root)
+    (test-stage-cleanup-failure-retains-lock! root)
     (test-incomplete-and-dirty-entries-are-repaired! root)
     (test-wrong-head-is-repaired! root)
     (test-concurrent-losers-reuse-winner! root)
     (test-separate-processes-share-one-publication! root)
     (test-waiter-observes-in-flight-winner! root)
+    (test-orphan-sibling-stage-is-recovered! root)
+    (test-post-lock-origin-reread-precedes-stage-cleanup! root)
     (test-healthy-owner-may-take-longer-than-ten-seconds! root)
     (test-stale-lock-diagnostic-preserves-owner! root)
     (test-tools-gitlibs-reuse-is-read-only! root)
