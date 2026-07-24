@@ -74,3 +74,70 @@ jobs:
         # -Oline keeps per-recipe output contiguous for failure reading.
         run: make -j"$(nproc)" -Oline test
 
+  # The normal behavior gate is intentionally Linux-only, but dependency
+  # subprocesses cross a different host boundary on native Windows: Chez starts
+  # cmd.exe while jolt.host promises POSIX sh semantics. Build the packaged
+  # compiler and exercise the transactional cache on every push/PR so that path
+  # cannot regress unnoticed until a release tag.
+  git-deps-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: inherit
+          install: >-
+            git make vim
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-lz4
+            mingw-w64-x86_64-zlib
+
+      - name: Cache Chez Scheme
+        id: cache-chez-win
+        uses: actions/cache@v4
+        with:
+          path: chez-install
+          key: chez-${{ runner.os }}-v10.4.1-mingw64
+
+      - name: Build Chez Scheme from source
+        if: steps.cache-chez-win.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
+          cd /tmp/chez-src
+          ./configure --threads
+          make -j"$(nproc)"
+          inst="$GITHUB_WORKSPACE/chez-install"
+          mkdir -p "$inst/bin" "$inst/csv"
+          cp ta6nt/bin/ta6nt/*.exe "$inst/bin/"
+          cp ta6nt/bin/ta6nt/*.dll "$inst/bin/" 2>/dev/null || true
+          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/bin/"
+          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/csv/"
+          cp ta6nt/boot/ta6nt/scheme.h "$inst/csv/"
+          cp ta6nt/boot/ta6nt/equates.h "$inst/csv/" 2>/dev/null || true
+          cp ta6nt/boot/ta6nt/libkernel.a "$inst/csv/"
+
+      - name: Put Chez and cc on PATH
+        run: |
+          bindir="$GITHUB_WORKSPACE/chez-install/bin"
+          { echo '#!/bin/sh'; echo "exec \"$bindir/scheme.exe\" \"\$@\""; } > "$bindir/chez"
+          { echo '#!/bin/sh'; echo 'exec gcc "$@"'; } > "$bindir/cc"
+          chmod +x "$bindir/chez" "$bindir/cc"
+          echo "$bindir" >> "$GITHUB_PATH"
+          echo "JOLT_CHEZ_CSV=$GITHUB_WORKSPACE/chez-install/csv" >> "$GITHUB_ENV"
+
+      - name: Build packaged joltc
+        run: |
+          chez --version
+          make joltc-release
+
+      - name: Transactional Git dependency cache
+        run: make depstest DEPSTEST_JOLTC=./target/release/joltc
