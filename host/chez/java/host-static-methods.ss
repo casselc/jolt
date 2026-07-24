@@ -229,11 +229,43 @@
   (let ((t (current-time 'time-utc)))
     (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
 
+;; --- monotonic clock -------------------------------------------------------
+;; nanoTime must NOT be wall-clock. The JVM contract is an arbitrary-origin source
+;; useful only for deltas, and deadline math (poll/connect timeouts, reactor wakeups)
+;; is unsound on a clock that can jump backwards when NTP steps the wall clock.
+;; It previously read (* 1000000 (now-millis)) over 'time-utc, which is both
+;; wall-clock AND truncated to milliseconds -- two adjacent calls reported a delta
+;; of 0 across intervals a real clock resolves at ~13us.
+;;
+;; Chez's 'time-monotonic is a per-platform monotonic counter ('time-utc is not).
+;; Probe it once at load: a platform without it degrades to the old projection
+;; rather than erroring at first call, and monotonic-source reports which is live
+;; so a caller (or test) can tell the difference instead of guessing.
+(define monotonic-supported?
+  (guard (e (#t #f))
+    (eq? 'time-monotonic (time-type (current-time 'time-monotonic)))))
+
+(define (now-monotonic-nanos)
+  (if monotonic-supported?
+      (let ((t (current-time 'time-monotonic)))
+        (+ (* 1000000000 (time-second t)) (time-nanosecond t)))
+      (* 1000000 (now-millis))))
+
+;; jolt.host/monotonic-nanos — the portable monotonic source. Prefer this over
+;; System/nanoTime in new code that needs a deadline; the origin is arbitrary, so
+;; only differences are meaningful.
+(def-var! "jolt.host" "monotonic-nanos" (lambda () (->num (now-monotonic-nanos))))
+;; :monotonic when a true monotonic counter backs the clock, :wall-clock-fallback
+;; when this platform's Chez lacks one (deadlines are then only as good as the
+;; wall clock, and that must not be claimed otherwise).
+(def-var! "jolt.host" "monotonic-source"
+  (lambda () (keyword #f (if monotonic-supported? "monotonic" "wall-clock-fallback"))))
+
 ;; clojure.core/current-time-ms — epoch milliseconds; backs the `time` macro.
 (def-var! "clojure.core" "current-time-ms" (lambda () (->num (now-millis))))
 (register-class-statics! "System"
   (list (cons "currentTimeMillis" (lambda () (->num (now-millis))))
-        (cons "nanoTime" (lambda () (->num (* 1000000 (now-millis)))))
+        (cons "nanoTime" (lambda () (->num (now-monotonic-nanos))))
         (cons "exit" (lambda args (exit (if (null? args) 0 (jnum->exact (car args))))))
         ;; System/gc -> a full Chez collection (so weak references clear and their
         ;; guardians fire); Runtime.gc() routes here too.
