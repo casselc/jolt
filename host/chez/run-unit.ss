@@ -7,7 +7,7 @@
 ;; reader, walk, …) that isn't in the JVM-portable corpus. Global state is reset
 ;; between cases for per-case isolation.
 ;;
-;;   chez --script host/chez/run-unit.ss
+;;   JOLT_AOT_CACHE=0 chez --script host/chez/run-unit.ss
 (import (chezscheme))
 
 (load "host/chez/run-gate-harness.ss")
@@ -80,6 +80,11 @@
 (define suite-pass (make-hashtable string-hash string=?))
 (define suite-total (make-hashtable string-hash string=?))
 (define (bump! ht k) (hashtable-set! ht k (+ 1 (hashtable-ref ht k 0))))
+(define (condition->string e)
+  (let ((sink (open-output-string)))
+    (parameterize ((current-output-port sink))
+      (display-condition e))
+    (get-output-string sink)))
 
 (let loop ((i 0))
   (when (< i (pvec-count cases))
@@ -92,7 +97,10 @@
       (bump! suite-total suite)
       (guard (e (#t (if throws?
                         (begin (set! pass (+ pass 1)) (bump! suite-pass suite))
-                        (set! fails (cons (list suite expr "raised") fails)))))
+                        (set! fails
+                          (cons (list suite expr
+                                      (string-append "raised: " (condition->string e)))
+                                fails)))))
         (let ((got (jolt-final-str
                      (parameterize ((current-output-port sink))
                        (jolt-compile-eval (string-append "(do " expr ")") "user")))))
