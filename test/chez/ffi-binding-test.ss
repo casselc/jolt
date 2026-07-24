@@ -52,8 +52,9 @@
                      (= 0 (aget back 0)) (= 65 (aget back 1))
                      (= 200 (aget back 2)) (= 255 (aget back 3)) (= 10 (aget back 4)))))")))
 
-;; Range-aware byte transfers avoid an intermediate allocation/copy in socket
-;; and crypto callers. High/signed input bytes remain binary-faithful.
+;; Range-aware byte transfers expose caller-controlled source/destination
+;; windows for socket and crypto callers. High/signed input bytes remain
+;; binary-faithful.
 (ok "write-array source range"
     (jolt-truthy?
       (ev "(let [src (byte-array [9 -1 -128 7])
