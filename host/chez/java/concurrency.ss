@@ -780,9 +780,24 @@
 (define (executor-enqueue! self job)
   (let ((st (jhost-state self)))
     (with-mutex (vector-ref st 2)
-      (let ((q (unbox (vector-ref st 1))))
-        (set-cdr! q (cons job (cdr q))))
-      (condition-broadcast (vector-ref st 3)))))
+      ;; Admission and shutdown share this mutex.  Once shutdown returns, no
+      ;; later execute/submit may enqueue a task that has no workers left to
+      ;; run it; the JVM contract is synchronous rejection at that boundary.
+      (if (vector-ref st 0)
+          (jolt-throw
+           (jolt-host-throwable
+            "java.util.concurrent.RejectedExecutionException"
+            "Executor has been shut down"))
+          (begin
+            (let ((q (unbox (vector-ref st 1))))
+              (set-cdr! q (cons job (cdr q))))
+            (condition-broadcast (vector-ref st 3)))))))
+(define (executor-shutdown! self)
+  (let ((st (jhost-state self)))
+    (with-mutex (vector-ref st 2)
+      (vector-set! st 0 #t)
+      (condition-broadcast (vector-ref st 3))))
+  jolt-nil)
 (let ((single (lambda _ (make-executor 1)))
       (fixed  (lambda (n . _) (make-executor (max 1 (jnum->exact n)))))
       ;; per-task / cached / virtual: enough workers to not serialize; a generous
@@ -808,12 +823,9 @@
                               (jolt-report-throwable e (current-error-port)))))
                 (jolt-invoke thunk)))))
           jolt-nil))
-        (cons "shutdown" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (with-mutex (vector-ref st 2) (condition-broadcast (vector-ref st 3)))) jolt-nil))
-        (cons "shutdownNow" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (with-mutex (vector-ref st 2) (condition-broadcast (vector-ref st 3)))) (jolt-vector)))
-        (cons "close" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (with-mutex (vector-ref st 2) (condition-broadcast (vector-ref st 3)))) jolt-nil))
+        (cons "shutdown" (lambda (self) (executor-shutdown! self)))
+        (cons "shutdownNow" (lambda (self) (executor-shutdown! self) (jolt-vector)))
+        (cons "close" (lambda (self) (executor-shutdown! self)))
         (cons "isShutdown" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isTerminated" (lambda (self) (let* ((st (jhost-state self)) (q (unbox (vector-ref st 1))))
           (and (vector-ref st 0) (null? (car q)) (null? (cdr q)) (fx=? 0 (vector-ref st 4))))))
