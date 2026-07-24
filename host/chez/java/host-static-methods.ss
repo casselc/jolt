@@ -248,7 +248,7 @@
         ;; redirected) — the safe default here; libraries (pretty) use it to
         ;; decide whether to emit ANSI, and a nil means "not a tty".
         (cons "console" (lambda _ jolt-nil))
-        (cons "lineSeparator" (lambda _ "\n"))
+        (cons "lineSeparator" (lambda _ sys-line-separator))
         (cons "identityHashCode" (lambda (x) (->num (equal-hash x))))))
 
 ;; java.lang.Long.bitCount: the population count of the value's 64-bit two's-
@@ -420,10 +420,10 @@
                   ((forname-known? nm) (make-class-obj nm))
                   (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm))))))))
 
-;; ---- System helpers (defined before use above via top-level order) ----------
-;; os.name reflects the actual platform (Chez's machine-type names it): a *osx
-;; machine is macOS, otherwise Linux. Code that branches on the OS (socket struct
-;; layout, path handling) needs the truth, not a fixed value.
+;; ---- System + target helpers (called by the registrations above) ------------
+;; Native libraries need more than os.name. Keep one descriptor for the compiler
+;; target, ABI/libc selection, separators, and capacity; System and Runtime below
+;; project their compatibility values from the same facts.
 ;; Optimized: character-by-character scan, no substring allocation per position.
 (define (substring-index needle hay)
   (let ((nl (string-length needle)) (hl (string-length hay)))
@@ -434,11 +434,180 @@
             (cond ((= j nl) i)
                   ((char=? (string-ref hay (+ i j)) (string-ref needle j)) (inner (+ j 1)))
                   (else (outer (+ i 1)))))))))
+
+(define (target-os-for-machine-name machine-name)
+  (cond ((or (substring-index "osx" machine-name)
+             (substring-index "macos" machine-name))
+         (keyword #f "darwin"))
+        ((or (substring-index "nt" machine-name)
+             (substring-index "windows" machine-name))
+         (keyword #f "windows"))
+        ;; Chez's native Linux targets end in "le" (a6le, ta6le, arm64le,
+        ;; ...). The portable-bytecode target is just "pb" and deliberately
+        ;; remains unknown: its host OS is not encoded in the compiler target.
+        ((and (>= (string-length machine-name) 2)
+              (string=? "le"
+                        (substring machine-name
+                                   (- (string-length machine-name) 2)
+                                   (string-length machine-name))))
+         (keyword #f "linux"))
+        (else (keyword #f "unknown"))))
+(define (target-arch-for-machine-name machine-name)
+  (cond ((or (substring-index "arm64" machine-name)
+             (substring-index "aarch64" machine-name))
+         (keyword #f "aarch64"))
+        ((substring-index "arm32" machine-name) (keyword #f "arm"))
+        ;; Check the longer/specialized architecture tokens before Chez's
+        ;; x86-64 "a6" token: "la64" contains "a6".
+        ((substring-index "rv64" machine-name) (keyword #f "riscv64"))
+        ((substring-index "la64" machine-name) (keyword #f "loongarch64"))
+        ((substring-index "a6" machine-name) (keyword #f "x86-64"))
+        ((substring-index "i3" machine-name) (keyword #f "x86"))
+        ((substring-index "ppc64" machine-name) (keyword #f "ppc64"))
+        ((substring-index "ppc32" machine-name) (keyword #f "ppc"))
+        (else (keyword #f "unknown"))))
+(define target-machine-name (symbol->string (machine-type)))
+(define target-os (target-os-for-machine-name target-machine-name))
+(define target-arch (target-arch-for-machine-name target-machine-name))
+(define target-pointer-bits (* 8 (foreign-sizeof 'void*)))
+(define target-endian
+  (case (native-endianness)
+    ((little) (keyword #f "little"))
+    ((big) (keyword #f "big"))
+    (else (keyword #f "unknown"))))
+(define target-file-separator (string (directory-separator)))
+(define target-windows-paths? (string=? target-file-separator "\\"))
+(define target-path-separator (if target-windows-paths? ";" ":"))
+(define sys-line-separator (if target-windows-paths? "\r\n" "\n"))
+
+;; This is keyed from Chez's concrete compiler target, rather than inferred from
+;; the public os/arch pair. New targets therefore fail closed as :unknown until
+;; their calling convention is verified.
+(define (target-abi-for os arch)
+  (cond
+    ((and (eq? os (keyword #f "windows"))
+          (eq? arch (keyword #f "x86-64"))) (keyword #f "win64"))
+    ((and (eq? os (keyword #f "windows"))
+          (eq? arch (keyword #f "x86"))) (keyword #f "cdecl-x86"))
+    ((and (or (eq? os (keyword #f "linux"))
+              (eq? os (keyword #f "darwin")))
+          (eq? arch (keyword #f "x86-64"))) (keyword #f "sysv-amd64"))
+    ((and (eq? os (keyword #f "linux"))
+          (eq? arch (keyword #f "x86"))) (keyword #f "sysv-i386"))
+    ((and (eq? os (keyword #f "linux"))
+          (eq? arch (keyword #f "aarch64"))) (keyword #f "aapcs64"))
+    ((and (eq? os (keyword #f "darwin"))
+          (eq? arch (keyword #f "aarch64"))) (keyword #f "darwin-arm64"))
+    (else (keyword #f "unknown"))))
+(define target-abi (target-abi-for target-os target-arch))
+
+;; Symbol presence distinguishes glibc from other Linux libcs without guessing
+;; from the OS label. macOS's verified native target uses libSystem; Windows CRT
+;; selection is toolchain-specific and remains explicit :unknown for now.
+(define target-gnu-libc-version
+  (jolt-foreign-proc-safe "gnu_get_libc_version" '() 'string))
+(define target-libc
+  (cond (target-gnu-libc-version (keyword #f "glibc"))
+        ((eq? target-os (keyword #f "darwin")) (keyword #f "libsystem"))
+        (else (keyword #f "unknown"))))
+
+;; Linux affinity is the most useful process/container capacity fact. Grow the
+;; cpu_set buffer if a kernel supports more than 1024 CPUs; fall back to
+;; _SC_NPROCESSORS_ONLN (Linux=84, Darwin=58), then NUMBER_OF_PROCESSORS on
+;; Windows, and finally 1. This policy respects cpuset/affinity restrictions but
+;; intentionally does not reinterpret cgroup CPU quotas as fractional CPUs.
+(define target-sched-getaffinity
+  (jolt-foreign-proc-safe "sched_getaffinity" '(int size_t void*) 'int))
+(define target-sysconf
+  (jolt-foreign-proc-safe "sysconf" '(int) 'long))
+(define (target-byte-popcount n)
+  (let loop ((n n) (count 0))
+    (if (= n 0) count
+        (loop (bitwise-arithmetic-shift-right n 1)
+              (+ count (bitwise-and n 1))))))
+(define (target-affinity-processors)
+  (and target-sched-getaffinity
+       (guard (e (#t #f))
+         (let grow ((n 128))
+           (let ((p (foreign-alloc n)))
+             (let ((result
+                    (dynamic-wind
+                      (lambda () #f)
+                      (lambda ()
+                        (do ((i 0 (+ i 1))) ((= i n))
+                          (foreign-set! 'unsigned-8 p i 0))
+                        (if (= 0 (target-sched-getaffinity 0 n p))
+                            (let count ((i 0) (total 0))
+                              (if (= i n)
+                                  (and (> total 0) total)
+                                  (count (+ i 1)
+                                         (+ total
+                                            (target-byte-popcount
+                                              (foreign-ref 'unsigned-8 p i))))))
+                            'retry))
+                      (lambda () (foreign-free p)))))
+               (if (eq? result 'retry)
+                   (if (< n 8192) (grow (* n 2)) #f)
+                   result)))))))
+(define (target-online-processors)
+  (and target-sysconf
+       (let ((selector
+              (cond ((eq? target-os (keyword #f "linux")) 84)
+                    ((eq? target-os (keyword #f "darwin")) 58)
+                    (else #f))))
+         (and selector
+              (let ((n (guard (e (#t -1)) (target-sysconf selector))))
+                (and (> n 0) (< n 1048576) n))))))
+(define target-processors
+  (or (target-affinity-processors)
+      (target-online-processors)
+      (let ((s (getenv "NUMBER_OF_PROCESSORS")))
+        (and s (let ((n (string->number s)))
+                 (and (integer? n) (> n 0) n))))
+      1))
+
 (define sys-os-name
-  (let ((m (symbol->string (machine-type))))
-    (cond ((or (substring-index "osx" m) (substring-index "macos" m)) "Mac OS X")
-          ((or (substring-index "nt" m) (substring-index "windows" m)) "Windows")
-          (else "Linux"))))
+  (cond ((eq? target-os (keyword #f "linux")) "Linux")
+        ((eq? target-os (keyword #f "darwin")) "Mac OS X")
+        ((eq? target-os (keyword #f "windows")) "Windows")
+        (else "Unknown")))
+(define sys-os-arch
+  (cond ((eq? target-arch (keyword #f "x86-64")) "amd64")
+        ((eq? target-arch (keyword #f "aarch64")) "aarch64")
+        ((eq? target-arch (keyword #f "x86")) "x86")
+        ((eq? target-arch (keyword #f "arm")) "arm")
+        ((eq? target-arch (keyword #f "riscv64")) "riscv64")
+        ((eq? target-arch (keyword #f "loongarch64")) "loongarch64")
+        ((eq? target-arch (keyword #f "ppc64")) "ppc64")
+        ((eq? target-arch (keyword #f "ppc")) "ppc")
+        (else "unknown")))
+
+(define (jolt-host-target)
+  (jolt-hash-map
+    (keyword #f "os") target-os
+    (keyword #f "arch") target-arch
+    (keyword #f "abi") target-abi
+    (keyword #f "libc") target-libc
+    (keyword #f "endian") target-endian
+    (keyword #f "pointer-bits") (->num target-pointer-bits)
+    (keyword #f "file-separator") target-file-separator
+    (keyword #f "path-separator") target-path-separator
+    (keyword #f "processors") (->num target-processors)))
+(def-var! "jolt.host" "target" jolt-host-target)
+
+;; Scheme-readable subset used by the AOT manifest. Keep records/keywords out of
+;; it because the cache metadata is written and read as plain Scheme data.
+(define (jolt-target-aot-key)
+  (list target-machine-name
+        (keyword-t-name target-os)
+        (keyword-t-name target-arch)
+        (keyword-t-name target-abi)
+        (keyword-t-name target-libc)
+        (keyword-t-name target-endian)
+        target-pointer-bits
+        target-file-separator
+        target-path-separator))
+
 ;; runtime-settable system properties (System/setProperty). A set value wins over
 ;; the built-in defaults below; clearProperty removes it.
 (define sys-prop-table (make-hashtable string-hash string=?))
@@ -453,10 +622,11 @@
   (let ((set-val (hashtable-ref sys-prop-table k #f)))
     (cond (set-val set-val)
           ((string=? k "os.name") sys-os-name)
+          ((string=? k "os.arch") sys-os-arch)
           ((string=? k "jolt.version") (jolt-version-string))
-          ((string=? k "line.separator") "\n")
-          ((string=? k "file.separator") "/")
-          ((string=? k "path.separator") ":")
+          ((string=? k "line.separator") sys-line-separator)
+          ((string=? k "file.separator") target-file-separator)
+          ((string=? k "path.separator") target-path-separator)
           ;; user.dir is the user's cwd (JVM: the process cwd). jolt's launcher
           ;; cd's to the repo root and resets PWD, but preserves the user's cwd in
           ;; JOLT_PWD — prefer it so user.dir and spawned-child cwds agree.
@@ -466,7 +636,11 @@
           ((pair? dflt) (car dflt))
           (else jolt-nil))))
 (define (sys-properties-map)
-  (let ((base (jolt-hash-map "os.name" sys-os-name "line.separator" "\n" "file.separator" "/"
+  (let ((base (jolt-hash-map "os.name" sys-os-name "os.arch" sys-os-arch
+                             "jolt.version" (jolt-version-string)
+                             "line.separator" sys-line-separator
+                             "file.separator" target-file-separator
+                             "path.separator" target-path-separator
                              "user.dir" (or (getenv "JOLT_PWD") (getenv "PWD") ".") "user.home" (or (getenv "HOME") "")
                              "java.io.tmpdir" (or (getenv "TMPDIR") "/tmp"))))
     (for-each
@@ -536,4 +710,3 @@
 ;; (Object.) — a fresh value with distinct identity (libraries use it as a lock
 ;; or a unique sentinel). Each call returns a new jhost so identical?/= separate.
 (register-class-ctor! "Object" (lambda _ (make-jhost "object" (vector))))
-

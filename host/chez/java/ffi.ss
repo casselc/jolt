@@ -84,17 +84,64 @@
 ;; Move raw bytes between a jolt byte-array (jolt-array kind 'byte) and foreign
 ;; memory, byte-exact (no UTF-8 / latin1 decode) — for socket recv/send and the
 ;; zlib / OpenSSL buffers an HTTP client passes through. read-array returns a
-;; fresh byte-array of n bytes; write-array copies a byte-array's bytes into ptr
-;; and returns the count.
+;; fresh byte-array; read-array! fills an existing destination range and returns
+;; the copied count. write-array keeps its two-argument whole-array API and adds
+;; a four-argument source range, also returning the copied count.
+(define (ffi-byte-array-vec who arr)
+  (if (and (jolt-array? arr) (eq? (jolt-array-kind arr) 'byte))
+      (jolt-array-vec arr)
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append "jolt.ffi/" who ": expected byte-array"))))
+(define (ffi-check-array-range who v off len)
+  (let ((n (vector-length v)))
+    (when (or (< off 0) (< len 0) (> off n) (> len (- n off)))
+      (throw-jvm (quote IndexOutOfBoundsException)
+                 (string-append "jolt.ffi/" who ": byte-array range out of bounds")))))
+(define (ffi-check-transfer-pointer who ptr len)
+  ;; A null pointer is harmless for an empty range because no native memory is
+  ;; touched. Reject it before the first foreign-ref/set! for every non-empty
+  ;; transfer so a caller mistake is a catchable Jolt error, not a process crash.
+  (when (and (> len 0) (= ptr 0))
+    (throw-jvm (quote NullPointerException)
+               (string-append "jolt.ffi/" who ": null pointer"))))
+(define (ffi-read-array! ptr n arr off)
+  (let* ((cnt (jnum->exact n))
+         (start (jnum->exact off))
+         (p (jnum->exact ptr))
+         (v (ffi-byte-array-vec "read-array!" arr)))
+    (ffi-check-array-range "read-array!" v start cnt)
+    (ffi-check-transfer-pointer "read-array!" p cnt)
+    (do ((i 0 (+ i 1)))
+        ((= i cnt) cnt)
+      (vector-set! v (+ start i) (foreign-ref 'unsigned-8 p i)))))
 (define (ffi-read-array ptr n)
-  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (foreign-ref 'unsigned-8 p i)))
-    (make-jolt-array v 'byte)))
-(define (ffi-write-array ptr arr)
-  (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
-    (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
-    n))
+  (let* ((cnt (jnum->exact n)))
+    ;; Validate before allocation so a negative length is a stable public bounds
+    ;; error rather than a Chez make-vector condition leaking through the API.
+    (when (< cnt 0)
+      (throw-jvm (quote IndexOutOfBoundsException)
+                 "jolt.ffi/read-array: negative length"))
+    (let ((arr (make-jolt-array (make-vector cnt 0) 'byte)))
+    (ffi-read-array! ptr cnt arr 0)
+      arr)))
+(define ffi-write-array
+  (case-lambda
+    ((ptr arr)
+     (let ((v (ffi-byte-array-vec "write-array" arr)))
+       (ffi-write-array ptr arr 0 (vector-length v))))
+    ((ptr arr off len)
+     (let* ((start (jnum->exact off))
+            (cnt (jnum->exact len))
+            (p (jnum->exact ptr))
+            (v (ffi-byte-array-vec "write-array" arr)))
+       (ffi-check-array-range "write-array" v start cnt)
+       (ffi-check-transfer-pointer "write-array" p cnt)
+       (do ((i 0 (+ i 1)))
+           ((= i cnt) cnt)
+         (foreign-set! 'unsigned-8 p i
+                       (bitwise-and (exact (vector-ref v (+ start i))) #xff)))))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
+(def-var! "jolt.ffi" "read-array!" ffi-read-array!)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
 
 ;; --- string / bytevector marshaling ------------------------------------------
