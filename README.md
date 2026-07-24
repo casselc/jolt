@@ -18,8 +18,10 @@ executable) and need only the base system libraries:
 - **macOS arm64**: macOS 14+.
 - Anything else (Intel Mac, musl/Alpine, older glibc): build from source.
 
-Building from source needs only [Chez Scheme](https://cisco.github.io/ChezScheme/)
-(the gate invokes it as `chez`) and a C compiler. The conformance gate
+Building from source needs
+[Chez Scheme 10.0 or newer](https://cisco.github.io/ChezScheme/)
+(the gate invokes it as `chez`) and a C compiler. Chez 9.x lacks the flvector
+primitives used by the current runtime. The conformance gate
 additionally uses Clojure on the JVM as an oracle, but running jolt does not.
 
 ### Dependency resolution
@@ -308,6 +310,14 @@ Clojure. The genuine divergences:
   class. See [Host Interop](https://jolt-lang.github.io/docs/host-interop.html). To call C libraries
   directly, use the `jolt.ffi` foreign-function interface (how the db and
   http-client libraries bind SQLite/libpq and sockets/OpenSSL/zlib).
+- **Native target facts.** `(jolt.host/target)` returns a stable map with `:os`,
+  `:arch`, `:abi`, `:libc`, `:endian`, `:pointer-bits`, `:file-separator`,
+  `:path-separator`, and `:processors`. Unverified combinations report
+  `:unknown`; they are never relabeled as a nearby ABI. Processor count uses the
+  process CPU affinity where supported, then the OS online-CPU count, and falls
+  back to `1`. It respects cpuset/affinity restrictions but does not reinterpret
+  a fractional cgroup CPU quota. `System` properties and
+  `Runtime.availableProcessors` are projections of the same descriptor.
 - **Codepoint strings.** Strings are Chez strings — codepoint-indexed, no
   UTF-16 surrogate pairs. `(count "😀")` is 1 (JVM: 2) and `subs` never splits
   a character; only code doing UTF-16 unit arithmetic notices.
@@ -327,7 +337,9 @@ make unit                     # host-specific unit cases
 make selfhost                 # bootstrap fixpoint (rebuild == checked-in seed)
 make smoke                    # bin/jolt CLI smoke
 make sci                      # load borkdude/sci's source through jolt (compat stress)
-make ffi                      # HTTP-server GC-safety + http-client temp paths
+make ffi                      # typed calls, memory/ranges, GC safety, callbacks
+make ffistress                # opt-in bounded concurrent-FFI reduction
+make executorprobe            # opt-in executor-constructor characterization
 make transient                # transient mutation + linear-time builds
 make certify                  # JVM oracle (skips if clojure is absent)
 ```

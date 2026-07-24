@@ -15,10 +15,16 @@
   :iptr :uptr :double :float :pointer :string :void :uint8 :char.
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
-  ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers
-  a compile-time-typed signature to a real Chez foreign-procedure. foreign-callable
-  is the inverse — it wraps a jolt fn as a C-callable function pointer so C can
-  call back into jolt (e.g. GTK signal handlers); free-callable releases it.")
+  ptr->string/string->ptr/null/null?) are provided by the host. Binary buffers
+  can be copied as `(read-array ptr len)`, into an existing byte-array as
+  `(read-array! ptr len dest dest-off)`, or out with
+  `(write-array ptr src [src-off len])`. A null pointer is allowed only for a
+  zero-length transfer.
+
+  foreign-fn lowers a compile-time-typed signature to a real Chez
+  foreign-procedure. foreign-callable is the inverse — it wraps a jolt fn as a
+  C-callable function pointer so C can call back into jolt (e.g. GTK signal
+  handlers); free-callable releases it.")
 
 ;; foreign-fn binds C symbol `csym` to a typed callable. Expands to the __cfn
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):

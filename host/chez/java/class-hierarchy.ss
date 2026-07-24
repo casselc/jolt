@@ -281,6 +281,7 @@
 (jch-register-supers! "javax.net.ssl.SSLException" '("java.io.IOException"))
 (jch-register-supers! "java.lang.Error" '("java.lang.Throwable"))
 (jch-register-supers! "java.lang.AssertionError" '("java.lang.Error"))
+(jch-register-supers! "java.lang.ArrayStoreException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.lang.ArrayIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
 (jch-register-supers! "java.lang.StringIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
 (jch-register-supers! "java.lang.ReflectiveOperationException" '("java.lang.Exception"))
@@ -313,7 +314,8 @@
 (jch-register-supers! "java.io.OutputStream" '())
 (jch-register-supers! "java.io.Reader" '())
 (jch-register-supers! "java.io.Writer" '())
-(jch-register-supers! "java.io.File" '())
+(jch-register-supers! "java.io.File"
+                      '("java.lang.Comparable" "java.io.Serializable"))
 (jch-register-supers! "java.io.StringReader" '("java.io.Reader"))
 (jch-register-supers! "java.io.PushbackReader" '("java.io.Reader"))
 (jch-register-supers! "clojure.lang.LineNumberingPushbackReader" '("java.io.PushbackReader"))
