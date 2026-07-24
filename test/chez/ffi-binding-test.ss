@@ -39,6 +39,66 @@
                      (let [v (jolt.ffi/read p :int)] (jolt.ffi/free p) v))"))))
 (ok "sizeof :pointer is a word" (let ((n (jnum->exact (ev "(jolt.ffi/sizeof :pointer)")))) (or (= n 8) (= n 4))))
 
+;; --- 16-bit types -----------------------------------------------------------
+;; Before these existed a caller could not express a C `short` at all: struct
+;; pollfd's two shorts had to be packed into one :int and masked, which is
+;; silently wrong on a big-endian host. sockaddr_in.sin_family needs them too.
+(ok "sizeof :int16/:uint16/:short/:ushort is 2"
+    (equal? '(2 2 2 2)
+            (map (lambda (t) (jnum->exact (ev (string-append "(jolt.ffi/sizeof " t ")"))))
+                 '(":int16" ":uint16" ":short" ":ushort"))))
+(ok "sizeof :int8 is 1" (= 1 (jnum->exact (ev "(jolt.ffi/sizeof :int8)"))))
+
+(ok "uint16 roundtrip at the top of its range"
+    (= 65535 (jnum->exact
+               (ev "(let [p (jolt.ffi/alloc 2)]
+                      (jolt.ffi/write p :uint16 0 65535)
+                      (let [v (jolt.ffi/read p :uint16 0)] (jolt.ffi/free p) v))"))))
+;; signedness is the whole point of having both: the same bits must read back as
+;; -1 through :int16 and 65535 through :uint16.
+(ev "(def p16 (jolt.ffi/alloc 2))")
+(ev "(jolt.ffi/write p16 :int16 0 -1)")
+(ok "int16 is signed where uint16 is not"
+    (and (= -1 (jnum->exact (ev "(jolt.ffi/read p16 :int16 0)")))
+         (= 65535 (jnum->exact (ev "(jolt.ffi/read p16 :uint16 0)")))))
+(ev "(jolt.ffi/free p16)")
+(ok "int16 roundtrips its most negative value"
+    (= -32768 (jnum->exact
+                (ev "(let [p (jolt.ffi/alloc 2)]
+                       (jolt.ffi/write p :int16 0 -32768)
+                       (let [v (jolt.ffi/read p :int16 0)] (jolt.ffi/free p) v))"))))
+
+;; A 16-bit store must occupy exactly two bytes and be readable back as the same
+;; value. Asserted endian-agnostically (the byte pair as a set), so this test is
+;; meaningful on a big-endian host rather than silently host-specific.
+(ev "(def pb (jolt.ffi/alloc 4))")
+(ev "(jolt.ffi/write pb :uint8 2 171)")   ; sentinel byte after the 16-bit slot
+(ev "(jolt.ffi/write pb :uint16 0 4660)") ; 0x1234
+(ok "uint16 store occupies exactly its two bytes"
+    (let ((b0 (jnum->exact (ev "(jolt.ffi/read pb :uint8 0)")))
+          (b1 (jnum->exact (ev "(jolt.ffi/read pb :uint8 1)")))
+          (b2 (jnum->exact (ev "(jolt.ffi/read pb :uint8 2)")))
+          (v  (jnum->exact (ev "(jolt.ffi/read pb :uint16 0)"))))
+      (and (equal? (list 18 52) (sort < (list b0 b1)))  ; {0x12,0x34}, either order
+           (= 171 b2)                                    ; sentinel untouched
+           (= 4660 v))))                                 ; 0x1234 reads back
+(ev "(jolt.ffi/free pb)")
+
+;; The compile-time half: a defcfn signature must accept 16-bit types too. htons
+;; is genuinely uint16 -> uint16, so a wrong width shows up as a wrong value
+;; rather than a crash. 443 = 0x01BB; byte-swapped = 0xBB01 = 47873.
+(ev "(def c-htons (jolt.ffi/__cfn \"htons\" [:uint16] :uint16))")
+(ev "(def c-ntohs (jolt.ffi/__cfn \"ntohs\" [:uint16] :uint16))")
+(ok "typed 16-bit call: htons/ntohs roundtrip"
+    (= 4660 (jnum->exact (ev "(c-ntohs (c-htons 4660))"))))
+(ok "typed 16-bit call: htons(443) byte-swaps on a little-endian host"
+    (let ((v (jnum->exact (ev "(c-htons 443)"))))
+      (or (= v 47873) (= v 443))))   ; 443 unchanged iff the host is big-endian
+
+;; still fails closed on a genuinely unknown type
+(ok "unknown foreign type is still rejected"
+    (guard (e (#t #t)) (ev "(jolt.ffi/sizeof :int128)") #f))
+
 ;; byte-array buffer I/O: write a byte-array into foreign memory and read it back
 ;; byte-exact (high bytes preserved, no UTF-8 mangling).
 (ok "byte-array roundtrip (binary-faithful)"

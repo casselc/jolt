@@ -34,6 +34,12 @@
     (cond
       ((string=? n "int") 'int)
       ((string=? n "uint") 'unsigned-int)
+      ;; 16-bit. Without these a caller cannot express a C `short` field at all:
+      ;; struct pollfd's two shorts had to be packed into one :int slot and masked,
+      ;; which is silently wrong on a big-endian host. sockaddr_in.sin_family and
+      ;; sockaddr_in6.sin6_* need them too.
+      ((or (string=? n "int16") (string=? n "short")) 'integer-16)
+      ((or (string=? n "uint16") (string=? n "ushort")) 'unsigned-16)
       ((string=? n "long") 'long)
       ((string=? n "ulong") 'unsigned-long)
       ((string=? n "int64") 'integer-64)
@@ -48,6 +54,8 @@
       ((string=? n "string") 'string)
       ((string=? n "void") 'void)
       ((or (string=? n "uint8") (string=? n "u8") (string=? n "byte")) 'unsigned-8)
+      ;; signed 8-bit, so the width matrix has no hole a caller can fall into
+      ((or (string=? n "int8") (string=? n "i8")) 'integer-8)
       ((string=? n "char") 'char)
       (else (error #f (string-append "jolt.ffi: unknown foreign type :" n))))))
 
