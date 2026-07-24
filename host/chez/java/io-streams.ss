@@ -315,9 +315,17 @@
   jolt-nil)
 (def-var! "clojure.java.io" "copy" jio-copy)
 
-;; --- instance? for the java.io stream taxonomy ------------------------------
-(register-class-arm! in-stream? (lambda (x) "java.io.InputStream"))
-(register-class-arm! out-stream? (lambda (x) "java.io.OutputStream"))
+;; --- JVM class taxonomy ------------------------------------------------------
+;; The binary stream representations intentionally erase the concrete constructor
+;; (FileInputStream and ByteArrayInputStream share one Chez-port wrapper), so map
+;; them to their honest common base. The central registry expands that same class
+;; through the graph for instance? and protocol dispatch.
+(register-host-class! in-stream? "java.io.InputStream")
+(register-host-class! out-stream? "java.io.OutputStream")
+;; These legacy character-stream arms predate the central registry. Their jhost
+;; tags currently model concrete InputStreamReader/OutputStreamWriter classes;
+;; keep their existing class answers and instance aliases pending a separate
+;; representation audit.
 (register-class-arm! char-reader? (lambda (x) "java.io.Reader"))
 (register-class-arm! char-writer? (lambda (x) "java.io.Writer"))
 (register-instance-check-arm!
@@ -325,10 +333,6 @@
     (if (not (symbol-t? type-sym)) 'pass
     (let ((short (last-dot (symbol-t-name type-sym))))
       (cond
-        ((and (in-stream? val) (member short '("InputStream" "FileInputStream" "ByteArrayInputStream"
-                                               "BufferedInputStream" "FilterInputStream" "Closeable" "AutoCloseable"))) #t)
-        ((and (out-stream? val) (member short '("OutputStream" "FileOutputStream" "ByteArrayOutputStream"
-                                                "BufferedOutputStream" "FilterOutputStream" "Closeable" "AutoCloseable" "Flushable"))) #t)
         ((and (char-reader? val) (member short '("Reader" "BufferedReader" "FileReader" "InputStreamReader"
                                                  "Closeable" "AutoCloseable" "Readable"))) #t)
         ((and (char-writer? val) (member short '("Writer" "BufferedWriter" "FileWriter" "OutputStreamWriter"

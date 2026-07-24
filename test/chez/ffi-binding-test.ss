@@ -52,6 +52,70 @@
                      (= 0 (aget back 0)) (= 65 (aget back 1))
                      (= 200 (aget back 2)) (= 255 (aget back 3)) (= 10 (aget back 4)))))")))
 
+;; Range-aware byte transfers expose caller-controlled source/destination
+;; windows for socket and crypto callers. High/signed input bytes remain
+;; binary-faithful.
+(ok "write-array source range"
+    (jolt-truthy?
+      (ev "(let [src (byte-array [9 -1 -128 7])
+                  p (jolt.ffi/alloc 2)]
+              (jolt.ffi/write-array p src 1 2)
+              (let [back (jolt.ffi/read-array p 2)]
+                (jolt.ffi/free p)
+                (= [255 128] (vec back))))")))
+(ok "read-array! destination range"
+    (jolt-truthy?
+      (ev "(let [src (byte-array [0 65 200 255 10])
+                  dst (byte-array [7 7 7 7 7])
+                  p (jolt.ffi/alloc 5)]
+              (jolt.ffi/write-array p src)
+              (let [n (jolt.ffi/read-array! (+ p 1) 3 dst 1)]
+                (jolt.ffi/free p)
+                (and (= 3 n) (= [7 65 200 255 7] (vec dst)))))")))
+(ok "range transfers match snapshot copies across small subranges"
+    (jolt-truthy?
+      (ev "(let [src (byte-array [0 65 128 200 255])
+                  p (jolt.ffi/alloc 5)
+                  good? (every? true?
+                          (for [src-off (range 6)
+                                len (range (inc (- 5 src-off)))
+                                dst-off (range (inc (- 6 len)))]
+                            (let [dst (byte-array (repeat 6 -7))
+                                  expected (reduce
+                                             (fn [v [i x]] (assoc v (+ dst-off i) x))
+                                             [249 249 249 249 249 249]
+                                             (map-indexed vector
+                                               (subvec (vec src) src-off (+ src-off len))))]
+                              (and (= len (jolt.ffi/write-array p src src-off len))
+                                   (= len (jolt.ffi/read-array! p len dst dst-off))
+                                   (= expected (vec dst))))))]
+              (jolt.ffi/free p)
+              good?)")))
+(ok "range transfers allow zero length at array end"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2])]
+              (and (= 0 (jolt.ffi/read-array! 0 0 a 2))
+                   (= 0 (jolt.ffi/write-array 0 a 2 0))
+                   (= [1 2] (vec a))))")))
+(ok "range transfers reject out-of-bounds before native access"
+    (jolt-truthy?
+      (ev "(let [a (byte-array 2)]
+              (and (try (jolt.ffi/read-array! 0 2 a 1) false
+                        (catch IndexOutOfBoundsException _ true))
+                   (try (jolt.ffi/write-array 0 a -1 1) false
+                        (catch IndexOutOfBoundsException _ true))))")))
+(ok "non-empty range transfers reject a null pointer"
+    (jolt-truthy?
+      (ev "(let [a (byte-array 1)]
+              (and (try (jolt.ffi/read-array! 0 1 a 0) false
+                        (catch NullPointerException _ true))
+                   (try (jolt.ffi/write-array 0 a 0 1) false
+                        (catch NullPointerException _ true))))")))
+(ok "read-array rejects a negative length before allocation"
+    (jolt-truthy?
+      (ev "(try (jolt.ffi/read-array 0 -1) false
+                (catch IndexOutOfBoundsException _ true))")))
+
 ;; a :blocking foreign call is collect-safe: a thread parked in it must not pin
 ;; the stop-the-world collector. (collect) here would throw "cannot collect when
 ;; multiple threads are active" if usleep weren't emitted __collect_safe.

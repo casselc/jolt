@@ -45,17 +45,9 @@
 (register-pr-readable-arm! jolt-queue? (lambda (x) (jolt-pr-readable (jolt-seq-or-empty x))))
 (register-str-render! jolt-queue? (lambda (x) (jolt-str-render-one (jolt-seq-or-empty x))))
 
-;; class / type / instance? recognize a queue.
-(register-class-arm! jolt-queue? (lambda (x) "clojure.lang.PersistentQueue"))
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (if (jolt-queue? val)
-        (let ((tn (cond ((string? type-sym) type-sym)
-                        ((symbol-t? type-sym) (symbol-t-name type-sym)) (else ""))))
-          (and (member (last-dot tn)
-                       '("PersistentQueue" "IPersistentCollection" "Sequential" "Collection" "Object"))
-               #t))
-        'pass)))
+;; One class mapping drives class/type, instance?, and protocol dispatch; the
+;; graph carries PersistentQueue's exact JVM superclass/interfaces.
+(register-host-class! jolt-queue? "clojure.lang.PersistentQueue")
 
 ;; clojure.lang.PersistentQueue/EMPTY + a queue? predicate.
 (register-class-statics! "PersistentQueue" (list (cons "EMPTY" jolt-queue-empty)))
@@ -64,19 +56,3 @@
 ;; the FQ class token self-evaluates to the interned Class object (for
 ;; (instance? clojure.lang.PersistentQueue …) and (= clojure.lang.PersistentQueue (type q))).
 (def-var! "clojure.core" "clojure.lang.PersistentQueue" (jolt-class-for "clojure.lang.PersistentQueue"))
-
-;; PersistentQueue's JVM taxonomy: an IPersistentStack (peek/pop), an ordinary
-;; persistent collection, and a meta carrier.
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (if (and (jolt-queue? val) (symbol-t? type-sym))
-        (let* ((tn (symbol-t-name type-sym))
-               (short (let loop ((i (- (string-length tn) 1)))
-                        (cond ((< i 0) tn)
-                              ((char=? (string-ref tn i) #\.) (substring tn (+ i 1) (string-length tn)))
-                              (else (loop (- i 1)))))))
-          (if (member short '("IPersistentStack" "IPersistentCollection" "IPersistentList"
-                              "Collection" "Seqable" "Sequential" "Counted" "IObj" "IMeta"
-                              "Iterable"))
-              #t 'pass))
-        'pass)))

@@ -26,11 +26,17 @@
 ;;   load-time relocation there and a missing symbol aborts the boot (exit 3)
 ;;   before any guard runs; eval keeps the form out of the fasl entirely.
 ;;   Windows builds always carry the compiler boot, so eval compiles.
+(define (jolt-windows-machine-type? machine)
+  (and (memq machine '(a6nt ta6nt i3nt ti3nt arm64nt tarm64nt)) #t))
+
 (define-syntax jolt-foreign-proc-safe
   (lambda (x)
     (syntax-case x (quote)
       ((_ name (quote args) (quote res))
-       (if (memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
+       ;; Keep this phase-local: an ordinary helper defined above is not
+       ;; available while compile-file evaluates this transformer.
+       (if (memq (machine-type)
+                 '(a6nt ta6nt i3nt ti3nt arm64nt tarm64nt))
            #'(guard (e (#t #f))
                (load-shared-object #f)
                (and (foreign-entry? name)

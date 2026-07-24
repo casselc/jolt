@@ -9,9 +9,10 @@
 ;; lists only what a class directly extends/implements, matching the JVM source.
 ;;
 ;; It is OPEN: a library registers a class and its supers with
-;; jolt.host/register-class-supers! (plus a class-arm in host-class.ss to map its
-;; values to that class name), and every derived view picks the class up with no
-;; core change. Loaded before records.ss so value-host-tags can derive from it.
+;; jolt.host/register-class-supers!. A dedicated host shim also calls
+;; register-host-class! with its representation predicate and canonical class
+;; name; class, instance?, and protocol dispatch then consume that one mapping.
+;; Loaded before records.ss so value-host-tags can derive from it.
 
 ;; canonical-name -> list of direct super canonical-names. Mutable + extensible.
 (define jvm-class-parents (make-hashtable string-hash string=?))
@@ -19,6 +20,33 @@
 (define jch-cache-mutex (make-mutex))
 (define jch-closure-cache (make-hashtable string-hash string=?))
 (define jch-tags-cache (make-hashtable string-hash string=?))
+
+;; Dedicated host representations (records or otherwise non-jhost values) map to
+;; one canonical JVM class here. Both host-class.ss and records.ss consult this
+;; exact lookup: (class x) returns the FQN, while value-host-tags expands the FQN
+;; through jch-tags for protocol dispatch and instance?. A stable predicate/FQN
+;; belongs here instead of parallel register-class-arm!, value-host-tags wrappers,
+;; and register-instance-check-arm! lists.
+(define registered-host-classes '())
+(define (register-host-class! pred fqn)
+  (unless (procedure? pred)
+    (error 'register-host-class! "expected predicate procedure" pred))
+  (unless (string? fqn)
+    (error 'register-host-class! "expected canonical class-name string" fqn))
+  ;; Re-registering the identical predicate replaces its old row; a newly
+  ;; allocated predicate is a distinct representation arm even if its FQN agrees.
+  (set! registered-host-classes
+    (cons (cons pred fqn)
+          (let prune ((rows registered-host-classes))
+            (cond ((null? rows) '())
+                  ((eq? pred (caar rows)) (prune (cdr rows)))
+                  (else (cons (car rows) (prune (cdr rows))))))))
+  fqn)
+(define (registered-host-class-fqn value)
+  (let loop ((rows registered-host-classes))
+    (cond ((null? rows) #f)
+          (((caar rows) value) (cdar rows))
+          (else (loop (cdr rows))))))
 
 ;; Merge direct supers for a class (union with any already registered). Public so
 ;; libraries can graft their own classes onto the modeled hierarchy.
@@ -186,8 +214,10 @@
             "clojure.lang.IExceptionInfo" "clojure.lang.IReduceInit"
             "java.util.List" "java.util.Set" "java.util.Collection" "java.util.Map"
             "java.util.Iterator" "java.lang.Iterable" "java.lang.CharSequence"
-            "java.lang.Comparable" "java.lang.Runnable"
-            "java.util.concurrent.Callable" "java.io.Serializable"))
+            "java.lang.Comparable" "java.lang.Runnable" "java.lang.Readable"
+            "java.lang.Appendable" "java.lang.AutoCloseable"
+            "java.util.concurrent.Callable" "java.io.Serializable"
+            "java.io.Closeable" "java.io.Flushable"))
 
 ;; ---- seed the built-in graph: direct supers only, faithful to the JVM ---------
 ;; core clojure.lang interfaces
@@ -226,7 +256,11 @@
 (jch-register-supers! "clojure.lang.PersistentList$EmptyList" '("clojure.lang.PersistentList"))
 (jch-register-supers! "clojure.lang.LazySeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "java.util.List" "clojure.lang.IObj"))
 (jch-register-supers! "clojure.lang.Cons" '("clojure.lang.ASeq"))
-(jch-register-supers! "clojure.lang.PersistentQueue" '("clojure.lang.IPersistentList" "clojure.lang.IPersistentCollection" "java.util.Collection"))
+(jch-register-supers! "clojure.lang.Obj" '("clojure.lang.IObj" "java.io.Serializable"))
+(jch-register-supers! "clojure.lang.PersistentQueue"
+                      '("clojure.lang.Obj" "clojure.lang.IPersistentList"
+                        "java.util.Collection" "clojure.lang.Counted"
+                        "clojure.lang.IHashEq"))
 ;; scalars / named / callable
 (jch-register-supers! "clojure.lang.Keyword" '("clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable"))
 (jch-register-supers! "clojure.lang.Symbol" '("clojure.lang.IObj" "clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable"))
@@ -281,6 +315,7 @@
 (jch-register-supers! "javax.net.ssl.SSLException" '("java.io.IOException"))
 (jch-register-supers! "java.lang.Error" '("java.lang.Throwable"))
 (jch-register-supers! "java.lang.AssertionError" '("java.lang.Error"))
+(jch-register-supers! "java.lang.ArrayStoreException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.lang.ArrayIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
 (jch-register-supers! "java.lang.StringIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
 (jch-register-supers! "java.lang.ReflectiveOperationException" '("java.lang.Exception"))
@@ -309,11 +344,13 @@
 (jch-register-supers! "java.lang.Throwable" '())
 (jch-register-supers! "java.lang.Byte" '("java.lang.Number"))
 (jch-register-supers! "java.lang.Short" '("java.lang.Number"))
-(jch-register-supers! "java.io.InputStream" '())
-(jch-register-supers! "java.io.OutputStream" '())
-(jch-register-supers! "java.io.Reader" '())
-(jch-register-supers! "java.io.Writer" '())
-(jch-register-supers! "java.io.File" '())
+(jch-register-supers! "java.io.InputStream" '("java.io.Closeable"))
+(jch-register-supers! "java.io.OutputStream" '("java.io.Closeable" "java.io.Flushable"))
+(jch-register-supers! "java.io.Reader" '("java.lang.Readable" "java.io.Closeable"))
+(jch-register-supers! "java.io.Writer"
+                      '("java.lang.Appendable" "java.io.Closeable" "java.io.Flushable"))
+(jch-register-supers! "java.io.File"
+                      '("java.lang.Comparable" "java.io.Serializable"))
 (jch-register-supers! "java.io.StringReader" '("java.io.Reader"))
 (jch-register-supers! "java.io.PushbackReader" '("java.io.Reader"))
 (jch-register-supers! "clojure.lang.LineNumberingPushbackReader" '("java.io.PushbackReader"))
@@ -344,6 +381,11 @@
 (jch-register-supers! "java.lang.CharSequence" '())
 (jch-register-supers! "java.lang.Comparable" '())
 (jch-register-supers! "java.lang.Runnable" '())
+(jch-register-supers! "java.lang.Readable" '())
+(jch-register-supers! "java.lang.Appendable" '())
+(jch-register-supers! "java.lang.AutoCloseable" '())
+(jch-register-supers! "java.io.Closeable" '("java.lang.AutoCloseable"))
+(jch-register-supers! "java.io.Flushable" '())
 (jch-register-supers! "java.util.concurrent.Callable" '())
 ;; java.time temporal interfaces — base abstractions the concrete time classes implement
 (jch-register-supers! "java.time.temporal.TemporalAccessor" '())
