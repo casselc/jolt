@@ -9,7 +9,7 @@ JOLT_CHEZ := $(CHEZ)
 export JOLT_CHEZ
 DEPSTEST_JOLTC ?= bin/jolt
 
-.PHONY: test ci testbin values targetfacts buildcapture monotonic hostclass corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint aotcacheperf namespaceeffectsmoke submodules httpsfetch mvnhttp depssmoke depsunit depstest
+.PHONY: test ci testbin values targetfacts buildcapture monotonic hostclass classproviders corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint aotcacheperf namespaceeffectsmoke submodules httpsfetch mvnhttp depssmoke depsunit depstest
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -25,7 +25,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values targetfacts buildcapture monotonic hostclass corpus unit mvnhttp depssmoke depsunit depstest smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke namespaceeffectsmoke certify
+ci: submodules values targetfacts buildcapture monotonic hostclass classproviders corpus unit mvnhttp depssmoke depsunit depstest smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke namespaceeffectsmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -53,6 +53,11 @@ monotonic:
 # Central predicate/FQN registration drives class, instance?, and protocols.
 hostclass:
 	@$(CHEZ) --script test/chez/host-class-registry-test.ss
+
+# Dependency-owned Java compatibility classes load one declared namespace and
+# retry once; covers source roots, add-deps, conflicts/cycles, and AOT bundling.
+classproviders:
+	@sh host/chez/class-provider-smoke.sh
 
 # Corpus conformance vs JVM-sourced expecteds (allowlist + floor).
 corpus:
