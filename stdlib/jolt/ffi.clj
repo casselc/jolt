@@ -11,9 +11,15 @@
         (let [db (ffi/read pp :pointer)] ...)
         (ffi/free pp))
 
-  Types (keywords): :int :uint :int32 :uint32 :long :ulong :int64 :uint64 :size_t :ssize_t
-  :iptr :uptr :double :float :pointer :string :void :uint8 :char. A C struct
-  argument passed by value is described inline:
+  Types (keywords): :int :uint :int32 :uint32 :long :ulong :int64 :uint64
+  :size_t :ssize_t :iptr :uptr :double :float :pointer :string :void :uint8
+  :char. An outbound, non-:blocking call may also use :byte-array for a C u8*
+  argument. The array's bytevector storage is borrowed without a native copy
+  only for the duration of that call; C must not retain the pointer. Because a
+  :blocking call deactivates the Scheme thread for collection, :byte-array is
+  rejected there.
+
+  A C struct argument passed by value is described inline:
 
       [:by-value
        [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]

@@ -562,10 +562,11 @@
 ;; compile-time literals from the analyzer, so this emits a real typed binding;
 ;; the resulting Scheme procedure is callable like any jolt fn. The library must
 ;; have loaded the shared object (jolt.ffi/load-library) before this def runs.
-;; MUST stay in lockstep with ffi-type->chez in host/chez/java/ffi.ss: this table is
-;; the compile-time half (foreign-procedure signatures) and that one is the runtime
-;; half (foreign-ref/set!). A type present in only one of them fails asymmetrically
-;; -- defcfn compiles but ffi/read rejects it, or the reverse.
+;; MUST stay in lockstep with ffi-type->chez in host/chez/java/ffi.ss for scalar
+;; types: this table is the compile-time half (foreign-procedure signatures) and
+;; that one is the runtime half (foreign-ref/set!). :byte-array is deliberately
+;; signature-only: it borrows the backing bytevector as u8* for one outbound call
+;; and is not a scalar foreign-ref/set! type.
 (def ^:private ffi-types
   {"int" "int" "uint" "unsigned-int" "long" "long" "ulong" "unsigned-long"
    "int32" "integer-32" "uint32" "unsigned-32"
@@ -574,6 +575,7 @@
    "int64" "integer-64" "uint64" "unsigned-64" "size_t" "size_t" "ssize_t" "ssize_t"
    "iptr" "iptr" "uptr" "uptr" "double" "double" "float" "float"
    "pointer" "void*" "void*" "void*" "string" "string" "void" "void"
+   "byte-array" "u8*"
    "uint8" "unsigned-8" "u8" "unsigned-8" "byte" "unsigned-8" "char" "char"
    "int8" "integer-8" "i8" "integer-8"})
 (defn- ffi-type->chez [t]
@@ -623,14 +625,22 @@
               (:argtypes node))
         emitted-call-args
         (mapv (fn [i param]
-                (if-let [entry (aggregate-by-index i)]
-                  (str "(let ((address (jnum->exact " param "))) "
-                       "(if (= address 0) "
-                       "(throw-jvm 'NullPointerException "
-                       (chez-str-lit "jolt.ffi: null by-value aggregate pointer")
-                       ") "
-                       "(make-ftype-pointer " (:name entry) " address)))")
-                  param))
+                (let [t (nth (:argtypes node) i)]
+                  (cond
+                    (aggregate-by-index i)
+                    (let [entry (aggregate-by-index i)]
+                      (str "(let ((address (jnum->exact " param "))) "
+                           "(if (= address 0) "
+                           "(throw-jvm 'NullPointerException "
+                           (chez-str-lit "jolt.ffi: null by-value aggregate pointer")
+                           ") "
+                           "(make-ftype-pointer " (:name entry) " address)))"))
+
+                    (= "byte-array" t)
+                    (str "(ffi-byte-array-backing "
+                         (chez-str-lit "foreign-fn") " " param ")")
+
+                    :else param)))
               (range n)
               params)
         fp (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
