@@ -13,9 +13,10 @@
 ;; (str (type x)) is the clean host taxonomy and
 ;; is never compared against a class token in the corpus. Records yield their
 ;; ns-qualified class name (= (str (type x))). Total — never crashes.
-;; A host shim (bigdec, queue, host-table) registers its type's class name via
-;; register-class-arm! instead of set!-wrapping jolt-class (cf. register-hash-arm!).
-;; The entry is stable, so the var cell bound below stays current as arms register.
+;; A host shim whose values have one stable JVM class calls register-host-class!;
+;; class, instance?, and protocol dispatch then share its predicate/FQN row.
+;; register-class-arm! remains for value-dependent or legacy class handlers.
+;; The entries are stable, so the var cell bound below stays current as arms register.
 (define jolt-class-arms '())
 (define (register-class-arm! pred handler)
   (set! jolt-class-arms (cons (cons pred handler) jolt-class-arms)))
@@ -89,10 +90,11 @@
                 (string-append (class-munge-name (car p)) "$" (class-munge-name (cdr p))))))
 
 (define (jolt-class-name x)
-  (let loop ((as jolt-class-arms))
-    (cond ((null? as) (jolt-class-base x))
-          (((caar as) x) ((cdar as) x))
-          (else (loop (cdr as))))))
+  (or (registered-host-class-fqn x)
+      (let loop ((as jolt-class-arms))
+        (cond ((null? as) (jolt-class-base x))
+              (((caar as) x) ((cdar as) x))
+              (else (loop (cdr as)))))))
 (define (jolt-class x)
   (let ((n (jolt-class-name x)))
     (if (jolt-nil? n) jolt-nil (make-class-obj n))))
