@@ -32,7 +32,27 @@ fatal:
 
 - **Git deps** (`:git/url` + `:git/sha`) need `git` on `PATH`. `:git/url` may be
   omitted when the lib name encodes a host, as in tools.deps — e.g.
-  `io.github.OWNER/REPO` clones from GitHub.
+  `io.github.OWNER/REPO` clones from GitHub. The SHA must be a hexadecimal commit
+  object ID or tools.deps-style prefix, not a branch/tag/ref or annotated-tag
+  object ID. Jolt reuses a verified, completely clean tools.gitlibs checkout
+  read-only when available; otherwise it stages a clone privately and publishes
+  the cache entry only after the requested commit resolves to exact `HEAD`,
+  recursive submodule setup succeeds, and no tracked, staged, untracked,
+  Git-ignored, sparse, skip-worktree, assume-unchanged, or recursive-submodule
+  residue exists. Its fixed-size URL key is Git's collision-resistant object
+  hash of the complete URL, so ordinary path punctuation cannot alias origins.
+  The literal configured origin and a durable adjacent ownership marker are
+  checked independently; a mismatch fails closed without deleting either
+  checkout, even if Git metadata was later damaged. Ambiguous legacy URL keys
+  and unclaimed non-Git entries are ignored rather than migrated destructively.
+  A failed fetch therefore leaves no source entry that a retry can mistake for
+  a completed checkout. Dependency build outputs
+  and downloaded native artifacts belong in a project/user cache outside this
+  immutable source checkout (or behind a library-specific cache override).
+  Concurrent fetches wait up to five minutes for the recorded owner; a crashed
+  owner's single `.jolt-lock` directory is reported for explicit recovery.
+  Native Windows runs POSIX dependency commands through the `sh` shipped with
+  Git for Windows; set `JOLT_SH` to its full path when it is not on `PATH`.
 - **Maven deps** (`:mvn/version`) are downloaded over HTTPS by jolt itself (no
   `curl`), using the system **OpenSSL** (`libssl`/`libcrypto`) via FFI, and
   extracted with `unzip`. A jar already in `~/.m2/repository` is reused with no

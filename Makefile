@@ -5,8 +5,9 @@
 # source change.
 
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
+DEPSTEST_JOLTC ?= bin/jolt
 
-.PHONY: test ci testbin values targetfacts monotonic hostclass corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
+.PHONY: test ci testbin values targetfacts monotonic hostclass corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit depstest
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -22,7 +23,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values targetfacts monotonic hostclass corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint certify
+ci: submodules values targetfacts monotonic hostclass corpus unit mvnhttp depssmoke depsunit depstest smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -53,7 +54,7 @@ corpus:
 
 # Host-specific unit cases. This is a source-mode dev runner, so keep its
 # dynamically-created fixture namespaces out of the persistent AOT cache just as
-# bin/joltc does; the dedicated aotcachesmoke target covers cache behavior.
+# bin/jolt does; the dedicated aotcachesmoke target covers cache behavior.
 unit:
 	@JOLT_AOT_CACHE=0 $(CHEZ) --script host/chez/run-unit.ss
 
@@ -126,6 +127,18 @@ depssmoke: testbin
 # type — the cases are ported from tools.deps' own test suite. Offline.
 depsunit:
 	@JOLT_NO_USER_DEPS=1 bin/jolt run test/deps_expand_test.clj
+
+# jolt.deps transactional Git-cache tests. Every remote is a local temporary
+# repository; isolated cache roots make the failure/retry and concurrent-writer
+# cases deterministic without touching the user's dependency caches.
+depstest:
+	@root="$$(mktemp -d "$${TMPDIR:-/tmp}/jolt-deps-test.XXXXXX")"; \
+	  trap 'rm -rf "$$root"' EXIT INT TERM; \
+	  JOLT_AOT_CACHE=0 GIT_ALLOW_PROTOCOL=file GIT_CONFIG_NOSYSTEM=1 \
+	    GIT_CONFIG_GLOBAL="$$root/gitconfig" \
+	  JOLT_DEPSTEST_JOLTC="$(DEPSTEST_JOLTC)" \
+	  JOLT_GITLIBS="$$root/jolt-cache" GITLIBS="$$root/tools-gitlibs" \
+	  $(DEPSTEST_JOLTC) run test/deps_test.clj "$$root"
 
 # Build jolt as a self-contained native binary into target/<profile>/jolt. The
 # binary bundles the runtime, compiler, jolt-core + stdlib source, the Chez boots,

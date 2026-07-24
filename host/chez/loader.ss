@@ -956,21 +956,78 @@
 (def-var! "clojure.core" "load" jolt-load)
 
 ;; --- shell primitive (jolt.host/sh, sh-out) ---------------------------------
-;; `sh` runs `sh -c CMD`, inheriting stdout/stderr (so git progress shows), and
-;; returns the exit code. `sh-out` captures stdout to a string (exit ignored) for
-;; commands whose output we parse (git rev-parse). Used by jolt.deps for git.
-(define (jolt-sh cmd) (system cmd))
+;; Chez routes `system` / `open-process-ports` through cmd.exe on Windows. Jolt's
+;; shell contract is POSIX sh (dependency resolution and build tooling use it),
+;; so native Windows must not hand a compound POSIX command to cmd. Spill it to a
+;; uniquely named script and ask sh to execute that one path, matching build.ss'
+;; proven Windows boundary. Git for Windows and the release CI both provide sh;
+;; JOLT_SH can name an alternate executable explicitly.
+(define jolt-runtime-sh-counter 0)
+(define jolt-runtime-sh-mutex (make-mutex))
+(define (jolt-runtime-sh-program) (or (getenv "JOLT_SH") "sh"))
+(define (jolt-cmd-quote s)
+  ;; JOLT_SH / TEMP paths may contain spaces. Neither is user command text; the
+  ;; POSIX command itself lives inside the script, so ordinary cmd path quoting
+  ;; is the only Windows parsing boundary left here.
+  (string-append "\""
+    (apply string-append
+      (map (lambda (c) (if (char=? c #\") "\"\"" (string c)))
+           (string->list s)))
+    "\""))
+(define (jolt-runtime-sh-script cmd)
+  (mutex-acquire jolt-runtime-sh-mutex)
+  (set! jolt-runtime-sh-counter (+ jolt-runtime-sh-counter 1))
+  (let ((n jolt-runtime-sh-counter))
+    (mutex-release jolt-runtime-sh-mutex)
+    (let* ((tmp (or (getenv "TEMP") (getenv "TMP") "."))
+           (sep (if (and (> (string-length tmp) 0)
+                         (or (char=? (string-ref tmp (- (string-length tmp) 1)) #\/)
+                             (char=? (string-ref tmp (- (string-length tmp) 1)) #\\)))
+                    "" "\\"))
+           (f (string-append tmp sep "jolt-runtime-sh-"
+                             (number->string (get-process-id)) "-"
+                             (number->string (real-time)) "-"
+                             (number->string n) ".sh"))
+           (p (open-output-file f 'replace)))
+      (put-string p cmd)
+      (newline p)
+      (close-port p)
+      f)))
+(define (jolt-runtime-shell-command cmd)
+  (if (jolt-windows-machine-type? (machine-type))
+      (let ((f (jolt-runtime-sh-script cmd)))
+        (values (string-append (jolt-cmd-quote (jolt-runtime-sh-program))
+                               " " (jolt-cmd-quote f))
+                f))
+      (values cmd #f)))
+(define (jolt-runtime-delete-script f)
+  (when f (guard (_ (#t #f)) (delete-file f))))
+(define (jolt-sh cmd)
+  (call-with-values
+    (lambda () (jolt-runtime-shell-command cmd))
+    (lambda (wrapped script)
+      (let ((rc (guard (e (#t (jolt-runtime-delete-script script) (raise e)))
+                  (system wrapped))))
+        (jolt-runtime-delete-script script)
+        rc))))
 (def-var! "jolt.host" "sh" jolt-sh)
 
 (define (jolt-sh-out cmd)
   (call-with-values
-    (lambda () (open-process-ports (string-append "exec sh -c " (sh-quote cmd))
-                                   (buffer-mode block) (native-transcoder)))
-    (lambda (stdin stdout stderr pid)
-      (close-port stdin)
-      (let ((out (get-string-all stdout)))
-        (close-port stdout) (close-port stderr)
-        (if (eof-object? out) "" out)))))
+    (lambda () (jolt-runtime-shell-command cmd))
+    (lambda (wrapped script)
+      (guard (e (#t (jolt-runtime-delete-script script) (raise e)))
+        (call-with-values
+          (lambda () (open-process-ports
+                       (if script wrapped
+                           (string-append "exec sh -c " (sh-quote wrapped)))
+                       (buffer-mode block) (native-transcoder)))
+          (lambda (stdin stdout stderr pid)
+            (close-port stdin)
+            (let ((out (get-string-all stdout)))
+              (close-port stdout) (close-port stderr)
+              (jolt-runtime-delete-script script)
+              (if (eof-object? out) "" out))))))))
 (define (sh-quote s)   ; single-quote for the outer sh -c
   (string-append "'"
     (apply string-append
