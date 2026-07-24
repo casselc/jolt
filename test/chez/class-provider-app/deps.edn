@@ -1,0 +1,3 @@
+{:paths ["src"]
+ :deps {fixture/class-providers {:local/root "../class-provider-lib"}}
+ :aliases {:test {:main-opts ["-m" "cpapp.main"]}}}
