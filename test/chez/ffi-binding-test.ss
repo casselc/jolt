@@ -14,6 +14,16 @@
 ;; eval one form (string) in `user`, like the loader does form-by-form, so a def
 ;; is visible to a later form.
 (define (ev s) (jolt-compile-eval s "user"))
+(define (has? s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i nsub) ns) #f)
+            ((string=? (substring s i (+ i nsub)) sub) #t)
+            (else (loop (+ i 1)))))))
+(define (emitf ns str)
+  (let-values (((f j) (rdr-read-form str 0 (string-length str))))
+    (let ((ctx (make-analyze-ctx ns)))
+      (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
 
 ;; load libc (process symbols) and bind typed foreign functions
 (ev "(jolt.ffi/load-library)")
@@ -23,6 +33,69 @@
 (ok "foreign-procedure built for strlen" (procedure? (var-deref "user" "c-strlen")))
 (ok "typed call: strlen(\"hello\") = 5" (= 5 (jnum->exact (ev "(c-strlen \"hello\")"))))
 (ok "typed call: abs(-7) = 7"          (= 7 (jnum->exact (ev "(c-abs -7)"))))
+
+;; --- variadic ABI boundary --------------------------------------------------
+;; A typed FFI still has to distinguish fixed from variadic C parameters. Apple
+;; arm64 passes the latter on the stack even while fixed parameters still fit in
+;; registers. fcntl's third argument is after `...`; treating this as a fixed
+;; three-argument function can return success without applying F_SETFL.
+(ok "lowering preserves collect-safe and variadic conventions together"
+    (has? (emitf "user"
+             "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                                    {:blocking true :varargs-after 2})")
+          "(foreign-procedure __collect_safe (__varargs_after 2) \"fcntl\""))
+(ev "(def c-fcntl
+       (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                         {:varargs-after 2}))")
+(ev "(def c-fcntl-collect-safe
+       (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                         {:blocking true :varargs-after 2}))")
+(ev "(def c-open-va
+       (jolt.ffi/__cfn \"open\" [:string :int] :int
+                         {:varargs-after 2}))")
+(ev "(def c-close-va (jolt.ffi/__cfn \"close\" [:int] :int))")
+(ok "variadic fcntl applies and reports O_NONBLOCK"
+    (jolt-truthy?
+      (ev "(let [fd (c-open-va \"/dev/null\" 0)
+                  nonblock (case (:os (jolt.host/target))
+                             :darwin 4
+                             :linux 2048
+                             2048)
+                  before (c-fcntl fd 3 0)
+                  rc (c-fcntl fd 4 (bit-or before nonblock))
+                  after (c-fcntl fd 3 0)]
+              (c-close-va fd)
+              (and (not (neg? before))
+                   (zero? rc)
+                   (not (zero? (bit-and after nonblock)))))")))
+(ok "variadic boundary composes with collect-safe calls"
+    (integer?
+      (jnum->exact
+        (ev "(c-fcntl-collect-safe 0 3 0)"))))
+(ok "varargs boundary must be positive and within the declared arguments"
+    (and
+      (guard (e (#t #t))
+        (ev "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                              {:varargs-after 0})")
+        #f)
+      (guard (e (#t #t))
+        (ev "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                              {:varargs-after 4})")
+        #f)))
+(ok "foreign-fn option maps reject unknown and nonliteral policy"
+    (and
+      (guard (e (#t #t))
+        (ev "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                              {:varargs-after 2 :typo true})")
+        #f)
+      (guard (e (#t #t))
+        (ev "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                              {:blocking :yes :varargs-after 2})")
+        #f)
+      (guard (e (#t #t))
+        (ev "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                              {:varargs-after 1.5})")
+        #f)))
 
 ;; memory: alloc / write / read roundtrip through the host primitives
 (ok "mem int roundtrip"
