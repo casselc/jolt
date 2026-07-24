@@ -134,7 +134,6 @@
         "(compile-file " (ei-str-lit jb-flat-ss) " " (ei-str-lit jb-flat-so-tmp) ")\n"))
     (close-port p))
   (bld-system (string-append bld-chez " --script '" cs "'")))
-(when (file-exists? jb-flat-so) (delete-file jb-flat-so))
-(rename-file jb-flat-so-tmp jb-flat-so)
+(jolt-replace-file! jb-flat-so-tmp jb-flat-so)
 
 (display (string-append "make-devboot: wrote " jb-flat-so "\n"))

@@ -46,6 +46,95 @@
                (and (foreign-entry? name)
                     (foreign-procedure name args res))))))))
 
+;; WinAPI uses __stdcall on 32-bit Windows but the platform's single x64/ARM64
+;; calling convention on 64-bit Windows. Chez rejects __stdcall on the latter,
+;; so select it at expansion time instead of treating all Windows machines as
+;; cdecl. Keep the eval boundary for the same compiled-image reason as
+;; jolt-foreign-proc-safe above.
+(define-syntax jolt-winapi-proc-safe
+  (lambda (x)
+    (syntax-case x (quote)
+      ((_ name (quote args) (quote res))
+       (case (machine-type)
+         ((i3nt ti3nt)
+          #'(guard (e (#t #f))
+              (load-shared-object #f)
+              (and (foreign-entry? name)
+                   (eval `(foreign-procedure __stdcall ,name ,'args ,'res)))))
+         ((a6nt ta6nt arm64nt tarm64nt)
+          #'(guard (e (#t #f))
+              (load-shared-object #f)
+              (and (foreign-entry? name)
+                   (eval `(foreign-procedure ,name ,'args ,'res)))))
+         (else #'#f))))))
+
+;; Like jolt-winapi-proc-safe, but atomically captures the thread's Win32 last
+;; error as a second return value before any intervening Scheme/FFI call can
+;; overwrite it.
+(define-syntax jolt-winapi-proc-safe/last-error
+  (lambda (x)
+    (syntax-case x (quote)
+      ((_ name (quote args) (quote res))
+       (case (machine-type)
+         ((i3nt ti3nt)
+          #'(guard (e (#t #f))
+              (load-shared-object #f)
+              (and (foreign-entry? name)
+                   (eval `(foreign-procedure __get_last_error __stdcall
+                                             ,name ,'args ,'res)))))
+         ((a6nt ta6nt arm64nt tarm64nt)
+          #'(guard (e (#t #f))
+              (load-shared-object #f)
+              (and (foreign-entry? name)
+                   (eval `(foreign-procedure __get_last_error
+                                             ,name ,'args ,'res)))))
+         (else #'#f))))))
+
+;; Java's temp-directory contract is host-specific. POSIX conventionally uses
+;; TMPDIR; native Windows normally exposes TEMP/TMP and need not have a /tmp.
+(define (jolt-temp-directory)
+  (or (getenv "TMPDIR")
+      (and (jolt-windows-machine-type? (machine-type))
+           (or (getenv "TEMP") (getenv "TMP")))
+      "/tmp"))
+
+;; HOME is conventional under POSIX/MSYS, while an ordinary native Windows
+;; process normally exposes USERPROFILE instead.
+(define (jolt-home-directory)
+  (or (getenv "HOME")
+      (and (jolt-windows-machine-type? (machine-type))
+           (getenv "USERPROFILE"))
+      ""))
+
+;; Same-filesystem replacement used by single-operation publishers. POSIX rename(2)
+;; replaces an existing destination atomically. Chez implements rename-file
+;; with _wrename on Windows, where an existing destination makes the call fail.
+;; MoveFileExW with REPLACE_EXISTING restores same-volume replacement and keeps Unicode
+;; paths intact; WRITE_THROUGH asks Windows not to return before the move reaches
+;; the filesystem. This is not a power-loss durability/fsync guarantee. Keep
+;; this in rt.ss because loader AOT publication, java.io
+;; spit, java.nio Files/move, and the dev-boot publisher all need one definition.
+(define jolt-win-move-file-ex
+  (jolt-winapi-proc-safe/last-error "MoveFileExW"
+                                    '(wstring wstring unsigned-int)
+                                    'int))
+(define jolt-movefile-replace-existing #x1)
+(define jolt-movefile-write-through #x8)
+(define (jolt-replace-file! source destination)
+  (if jolt-win-move-file-ex
+      (call-with-values
+        (lambda ()
+          (jolt-win-move-file-ex
+            source destination
+            (bitwise-ior jolt-movefile-replace-existing
+                         jolt-movefile-write-through)))
+        (lambda (ok last-error)
+          (when (= 0 ok)
+            (error 'jolt-replace-file!
+                   "MoveFileExW failed"
+                   source destination last-error))))
+      (rename-file source destination)))
+
 (load "host/chez/collections.ss")
 (load "host/chez/seq.ss")
 
