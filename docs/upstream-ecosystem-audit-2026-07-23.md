@@ -44,6 +44,7 @@ hard-coded ABI layout is correct.
 | P0 | XML compatibility parsing can return before closing its native reader/buffer. | XML wrapper; Jolt scoped-resource support removes repeated lifetime boilerplate. |
 | P1 | YAML lazy events need early-abandon cleanup and length-aware scalar decoding. | Jolt closeable producers/bytes API, then YAML adoption. |
 | P1 | XML/YAML/Crypto native discovery is Darwin/Linux-only; time's system zone is UTC and libc fallback is POSIX-specific. | Jolt target/native/timezone capability. |
+| P1 | Source-mode Windows launch duplicated drive-rooted `JOLT_PWD` paths while reading `deps.edn`; absolute-path semantics also diverged between `File`, `Path`, and dependency roots. | Jolt host filesystem contract; fixed and characterized in this proposal fork. |
 | P2 | Transit emulates large integers/chars/tagged values with private records; router/logging expose host-class and stream compatibility seams. | Jolt core/host contract after characterization. |
 
 ## Design direction
