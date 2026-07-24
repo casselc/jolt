@@ -13,7 +13,7 @@
 (define files-accum '())   ; collects Files member alists for one-shot registration
 
 ;; ---- path string algebra ----------------------------------------------------
-(define (npath-absolute? s) (and (> (string-length s) 0) (char=? (string-ref s 0) #\/)))
+(define (npath-absolute? s) (jolt-path-absolute? s))
 
 ;; The non-empty "/"-separated segments of a path.
 (define (npath-segs s)
