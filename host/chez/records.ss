@@ -834,7 +834,12 @@
 (define (value-host-tags obj)
   ;; numbers dispatch by actual type (a Double is NOT a Long): flonum -> Double,
   ;; exact ratio -> Ratio, exact integer -> Long.
-  (cond ((flonum? obj) '("Double" "Float" "Number" "Object"))
+  (cond
+        ;; Dedicated host representations register one predicate/FQN pair in the
+        ;; class graph. This same lookup is the first choice of jolt-class-name,
+        ;; and these expanded tags drive both protocol dispatch and instance?.
+        ((registered-host-class-fqn obj) => (lambda (fqn) (jch-tags fqn)))
+        ((flonum? obj) '("Double" "Float" "Number" "Object"))
         ((and (number? obj) (exact? obj) (not (integer? obj))) '("Ratio" "Number" "Object"))
         ((number? obj) '("Long" "Integer" "BigInteger" "BigInt" "Number" "Object"))
         ((string? obj) '("String" "CharSequence" "Object"))
