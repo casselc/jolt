@@ -20,6 +20,31 @@ stated finite model. Runtime tests remain the semantic oracle. In particular,
 the whole-image proof assumes that project-graph resolution and compiler-input
 observation are complete; it does not establish their completeness.
 
+## Downstream witness: cached tests disappear
+
+A 2026-07-24 validation of the `jolt-lang/http-client` test runner supplied a
+concrete ecosystem witness for the already modeled top-level-effect problem.
+With released `joltc v0.4.15`, a cold `joltc -M:test` discovered and ran 60
+tests. The immediately following warm invocation loaded the cached test
+namespaces but reported:
+
+```text
+Ran 0 tests. 0 assertions passed, 0 failures, 0 errors.
+```
+
+Running with `JOLT_AOT_CACHE=0` discovered all 60 tests again. `deftest` both
+defines a Var and performs a top-level registration effect; restoring namespace
+definitions without reconstructing that effect leaves `clojure.test`'s runtime
+registry empty. The TLS assertions in that downstream suite have independent
+failures and do not affect the discovery witness.
+
+This observation does not require a new invariant: it is a live instance of the
+existing incomplete-effect/replay counterexamples. It strengthens the decision
+to keep namespace-level runtime reuse disabled rather than adding
+`clojure.test`-specific replay logic. A closed-world image must contain one
+coherent post-initialization state or execute its initialization exactly once;
+it may not restore only the namespace definitions.
+
 ## Production invariant: fresh-process closed-world whole image
 
 The production unit of reuse is one immutable whole-project image, not a set of
