@@ -219,6 +219,14 @@ jobs:
           out="$($JOLT_RUN_PREFIX ./target/release/joltc -e '(reduce + (range 10))')"
           test "$out" = "45" || { echo "joltc -e gave '$out', want 45"; exit 1; }
 
+      # Exercise dependency subprocesses from the packaged native runtime itself.
+      # This is load-bearing on Windows: Chez launches commands through cmd.exe,
+      # while jolt.host's public contract is POSIX sh.
+      - name: Transactional Git dependency cache (packaged joltc)
+        run: |
+          make depstest \
+            DEPSTEST_JOLTC="$JOLT_RUN_PREFIX ./target/release/joltc"
+
       # The binary is a self-contained COMPILER: it must `build` an app with no
       # jolt source on disk. Run from an isolated dir (nothing but the tiny app)
       # so a build that reaches for host/chez/*.ss on the filesystem fails here,

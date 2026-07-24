@@ -55,6 +55,236 @@
 (defn- sanitize [s]
   (str/join (map (fn [c] (if (or (alnum? c) (= c \.) (= c \-)) c \_)) (seq s))))
 
+(defn- shell-quote
+  "Quote one string as one POSIX-shell argument. `pr-str` is not sufficient:
+  its double quotes still allow command substitution in a path or URL."
+  [s]
+  (str "'" (str/replace (str s) "'" "'\"'\"'") "'"))
+
+(def ^:private command-exit-marker "__JOLT_COMMAND_EXIT__")
+
+(defn- shell-result
+  "Run one POSIX-shell command and return its exit status plus stdout.
+
+  jolt.host/sh-out intentionally exposes only stdout. Append an exit marker
+  after the command so validation never mistakes a failed Git query for clean,
+  empty output. The final marker wins even when an adversarial filename happens
+  to contain the same text."
+  [cmd]
+  (let [raw (jolt.host/sh-out
+              (str cmd " 2>/dev/null; rc=$?; printf '\\n"
+                   command-exit-marker "%s\\n' \"$rc\""))
+        marker (str "\n" command-exit-marker)
+        i (str/last-index-of raw marker)]
+    (if (nil? i)
+      {:exit 255 :out raw}
+      (let [status (str/trim (subs raw (+ i (count marker))))]
+        {:exit (or (parse-long status) 255)
+         :out (subs raw 0 i)}))))
+
+(defn- git-result
+  "Run Git with replacement objects disabled. `args` are quoted independently,
+  so dependency URLs and cache paths never become shell syntax."
+  [dir args]
+  (shell-result
+    (str "git --no-optional-locks --no-replace-objects"
+         (when dir (str " -C " (shell-quote dir)))
+         (when (seq args)
+           (str " " (str/join " " (map shell-quote args)))))))
+
+(defn- result-ok? [result] (zero? (:exit result)))
+
+(defn- result-lines [result]
+  (if (str/blank? (:out result)) [] (vec (str/split-lines (:out result)))))
+
+(defn- git-sha?
+  "Accept a hexadecimal commit-object prefix, never a ref or path. Seven
+  characters preserves the tools.deps ecosystem convention (including Jolt's
+  vendored test-runner aliases); validation resolves it and compares full object
+  ids. The upper bound covers Git's 64-character SHA-256 object format."
+  [sha]
+  (and (string? sha)
+       (<= 7 (count sha) 64)
+       (every? (fn [c]
+                 (let [n (int c)]
+                   (or (and (>= n 48) (<= n 57))
+                       (and (>= n 65) (<= n 70))
+                       (and (>= n 97) (<= n 102)))))
+               (seq sha))))
+
+(defn- git-url-cache-key
+  "A fixed-size, path-safe key for a Git URL.
+
+  `sanitize` is deliberately not used: it maps distinct URLs such as `a/b` and
+  `a_b` to one directory, allowing repair of one origin to delete the other's
+  checkout at a shared SHA. Git is already required for Git deps, and
+  `hash-object --stdin` gives its stable collision-resistant blob object ID
+  without writing an object or repository. The validated 40/64 hex result keeps
+  one filesystem component short on both current SHA-1 and SHA-256 Git builds.
+  Legacy sanitize-keyed URL leaves are deliberately ignored: because they are
+  ambiguous, automatically migrating or deleting one could corrupt another
+  origin's cache."
+  [url]
+  (let [result (shell-result
+                 (str "printf '%s' " (shell-quote url)
+                      " | git hash-object --stdin"))
+        digest (str/trim (:out result))]
+    (if (and (result-ok? result) (git-sha? digest))
+      (str "url-" (str/lower-case digest))
+      (throw (ex-info (str "could not derive git cache key for " url)
+                      {:url url :digest digest :exit (:exit result)})))))
+
+(defn- git-cache-entry-dir
+  "Versioned layout keeps collision-resistant URL keys disjoint from every
+  ambiguous sanitize-keyed cache leaf written by older Jolt versions. Literal
+  origin validation supplies the independent fail-closed collision check."
+  [url sha]
+  (str (gitlibs-dir) "/git-v2/" (git-url-cache-key url) "/" sha))
+
+(defn- git-cache-origin-marker [dir]
+  (str dir ".jolt-origin"))
+
+(defn- git-cache-origin-claim
+  "Read the ownership claim adjacent to one url@sha leaf. It remains available
+  even if the checkout's .git metadata is later damaged, so a forced URL-key
+  collision can never turn corruption into permission to delete another
+  origin's cache entry."
+  [dir url]
+  (let [marker (git-cache-origin-marker dir)]
+    (if-not (file-exists? marker)
+      {:claimed? false :matches? false :marker marker}
+      (let [actual (try (slurp marker) (catch :default _ nil))]
+        {:claimed? true :matches? (= url actual) :marker marker
+         :expected-url url :actual-url actual}))))
+
+(defn- unsafe-index-line?
+  "git ls-files -v prefixes skip-worktree with S and assume-unchanged with
+  lower-case status letters. Either can hide missing or modified source from
+  porcelain status."
+  [line]
+  (when (seq line)
+    (let [c (first line)
+          n (int c)]
+      (or (= c \S) (and (>= n 97) (<= n 122))))))
+
+(defn- inspect-worktree-state
+  "Inspect mutable worktree/index state at one repository boundary."
+  [dir]
+  (let [status (git-result dir ["status" "--porcelain=v1"
+                                "--untracked-files=all" "--ignored=matching"
+                                "--ignore-submodules=none"])]
+    (cond
+      (not (result-ok? status))
+      {:valid? false :reason :git-error :operation :status :path dir
+       :exit (:exit status)}
+
+      (not (str/blank? (:out status)))
+      {:valid? false :reason :dirty :path dir :status (:out status)}
+
+      :else
+      (let [index (git-result dir ["ls-files" "-v"])]
+        (cond
+          (not (result-ok? index))
+          {:valid? false :reason :git-error :operation :ls-files :path dir
+           :exit (:exit index)}
+
+          (some unsafe-index-line? (result-lines index))
+          {:valid? false :reason :unsafe-index :path dir}
+
+          :else {:valid? true})))))
+
+(defn- git-checkout-inspection
+  "Return a structured, fail-closed inspection of `dir` at exactly `sha`.
+
+  `expected-url`, when non-nil, is compared with the literal remote.origin.url;
+  unlike `git remote get-url`, this does not expand a user's url.*.insteadOf
+  mirror or transport rules. Origin mismatch is distinct because it may mean a
+  URL-key collision and must never enter destructive repair."
+  [dir sha expected-url]
+  (if-not (file-exists? dir)
+    {:valid? false :reason :missing :path dir}
+    (let [inside (git-result dir ["rev-parse" "--is-inside-work-tree"])]
+      (cond
+        (or (not (result-ok? inside))
+            (not= "true" (str/trim (:out inside))))
+        {:valid? false :reason :not-worktree :path dir}
+
+        :else
+        ;; Check literal ownership before inspecting content. Even a malformed
+        ;; or dirty wrong-origin checkout may be evidence of a URL-key collision;
+        ;; never classify it as ordinary repairable residue first.
+        (let [origins (when expected-url
+                        (git-result dir ["config" "--local" "--get-all"
+                                         "remote.origin.url"]))]
+          (if (and expected-url
+                   (or (not (result-ok? origins))
+                       (not= [expected-url] (result-lines origins))))
+            {:valid? false :reason :origin-mismatch :path dir
+             :expected-url expected-url
+             :actual-urls (if origins (result-lines origins) [])}
+            (let [kind (git-result dir ["cat-file" "-t" sha])
+                  head (git-result dir ["rev-parse" "--verify"
+                                        "HEAD^{commit}"])
+                  wanted (git-result dir ["rev-parse" "--verify"
+                                          (str sha "^{commit}")])]
+              (cond
+                (or (not (result-ok? kind))
+                    (not= "commit" (str/trim (:out kind))))
+                {:valid? false :reason :wrong-object :path dir :sha sha
+                 :object-type (str/trim (:out kind))}
+
+                (or (not (result-ok? head)) (not (result-ok? wanted)))
+                {:valid? false :reason :unresolved-head :path dir :sha sha}
+
+                (not= (str/trim (:out head)) (str/trim (:out wanted)))
+                {:valid? false :reason :wrong-head :path dir :sha sha
+                 :head (str/trim (:out head))
+                 :wanted (str/trim (:out wanted))}
+
+                :else
+                (let [state (inspect-worktree-state dir)]
+                  (if-not (:valid? state)
+                    state
+                    (let [sub-status
+                          (git-result dir ["submodule" "status" "--recursive"])]
+                      (cond
+                        (not (result-ok? sub-status))
+                        {:valid? false :reason :git-error
+                         :operation :submodule-status :path dir
+                         :exit (:exit sub-status)}
+
+                        (some (fn [line]
+                                (and (seq line)
+                                     (not= \space (first line))))
+                              (result-lines sub-status))
+                        {:valid? false :reason :incomplete-submodule :path dir
+                         :status (:out sub-status)}
+
+                        :else
+                        (let [sub-dirs
+                              (git-result
+                                dir ["submodule" "foreach" "--quiet"
+                                     "--recursive" "pwd"])]
+                          (if-not (result-ok? sub-dirs)
+                            {:valid? false :reason :git-error
+                             :operation :submodule-foreach :path dir
+                             :exit (:exit sub-dirs)}
+                            (or
+                              (some
+                                (fn [subdir]
+                                  (let [inspection
+                                        (inspect-worktree-state subdir)]
+                                    (when-not (:valid? inspection)
+                                      (assoc inspection
+                                             :submodule? true
+                                             :checkout-path dir))))
+                                (result-lines sub-dirs))
+                              {:valid? true :reason :valid :path dir
+                               :head (str/trim (:out head))})))))))))))))))
+
+(defn- git-checkout-valid? [dir sha expected-url]
+  (:valid? (git-checkout-inspection dir sha expected-url)))
+
 (defn- gitlibs-shared-checkout
   "An existing tools.gitlibs checkout for lib@sha ($GITLIBS or ~/.gitlibs,
   layout libs/<group>/<name>/<sha>) — reused read-only when the JVM toolchain
@@ -65,28 +295,276 @@
   (when (and lib (namespace lib))
     (let [base (or (getenv "GITLIBS") (str (or (getenv "HOME") ".") "/.gitlibs"))
           dir (str base "/libs/" (namespace lib) "/" (name lib) "/" sha)]
-      (when (file-exists? dir) dir))))
+      (when (git-checkout-valid? dir sha nil) dir))))
+
+(def ^:private git-lock-wait-attempts 6000)
+(def ^:private git-lock-wait-ms 50)
+
+(defn- remove-own-cache-path!
+  "Remove only the final url@sha leaf or that leaf's private lock/stage paths.
+  Refuse every broader or unrelated target even if a caller regresses."
+  [dir path]
+  (when-not (or (= path dir)
+                (= path (str dir ".jolt-lock"))
+                (= path (str dir ".jolt-lock/checkout")))
+    (throw (ex-info (str "refusing unsafe git cache removal " path)
+                    {:cache-entry dir :path path})))
+  (when (file-exists? path)
+    (when-not (zero? (sh (str "rm -rf " (shell-quote path))))
+      (throw (ex-info (str "could not remove incomplete git cache entry " path)
+                      {:path path}))))
+  nil)
+
+(defn- cache-origin-mismatch!
+  [inspection url sha dir]
+  (throw
+    (ex-info
+      (str "git cache entry has a different literal origin; refusing to "
+           "replace it because this may be a URL-key collision: " dir)
+      {:type ::git-cache-origin-mismatch
+       :url url :sha sha :path dir :inspection inspection})))
+
+(defn- unowned-cache-entry!
+  [inspection url sha dir]
+  (throw
+    (ex-info
+      (str "git cache entry has no durable origin claim and is not an "
+           "inspectable checkout; refusing to replace it: " dir)
+      {:type ::git-cache-unowned-entry
+       :url url :sha sha :path dir :inspection inspection})))
+
+(defn- claim-cache-origin!
+  "Record literal ownership while holding this leaf's publication lock. The
+  marker precedes publication and survives checkout corruption or failed
+  retries. Publish the marker by same-filesystem rename so a killed writer
+  cannot leave a truncated claim. A caller must re-read it before relying on
+  the claim."
+  [dir lock url sha]
+  (let [marker (git-cache-origin-marker dir)
+        stage (str lock "/origin-claim")]
+    (when-not (file-exists? marker)
+      (spit stage url)
+      (try
+        (java.nio.file.Files/move
+          (.toPath (java.io.File. stage))
+          (.toPath (java.io.File. marker))
+          (into-array java.nio.file.CopyOption []))
+        (catch :default _
+          ;; Another actor may have published between the existence check and
+          ;; rename. The mandatory re-read below decides whether that is benign.
+          nil)))
+    (let [claim (git-cache-origin-claim dir url)]
+      (when-not (and (:claimed? claim) (:matches? claim))
+        (cache-origin-mismatch! claim url sha dir)))
+    marker))
+
+(defn- publish-git-checkout!
+  "Publish `stage` without replacement/nesting, then validate the final path
+  while ownership is still held."
+  [stage dir url sha]
+  (when (file-exists? dir)
+    (throw (ex-info (str "git cache destination appeared during publication " dir)
+                    {:type ::git-cache-publish-conflict
+                     :url url :sha sha :path dir})))
+  (try
+    (java.nio.file.Files/move
+      (.toPath (java.io.File. stage))
+      (.toPath (java.io.File. dir))
+      (into-array java.nio.file.CopyOption []))
+    (catch :default cause
+      (throw (ex-info (str "could not publish git checkout " dir)
+                      {:type ::git-cache-publish-failed
+                       :url url :sha sha :path dir :error cause}))))
+  (let [inspection (git-checkout-inspection dir sha url)]
+    (cond
+      (:valid? inspection) dir
+      (= :origin-mismatch (:reason inspection))
+      (cache-origin-mismatch! inspection url sha dir)
+      :else
+      (do
+        (remove-own-cache-path! dir dir)
+        (throw (ex-info (str "published git checkout failed final validation "
+                             dir)
+                        {:type ::git-cache-final-validation-failed
+                         :url url :sha sha :path dir
+                         :inspection inspection}))))))
+
+(defn- fetch-git-while-locked!
+  "The caller owns `lock`. Clone beneath it, then publish with a same-filesystem
+  rename only after checkout and recursive submodule initialisation succeed."
+  [url sha dir lock]
+  (let [stage (str lock "/checkout")]
+    (try
+      ;; A killed older owner can leave its private staging payload behind if a
+      ;; user elects to remove/recover the lock. Never clone over that residue.
+      (remove-own-cache-path! dir stage)
+      ;; The final target may be an empty/partial checkout from the pre-lock
+      ;; implementation. It is safe to repair only this exact url@sha leaf.
+      (remove-own-cache-path! dir dir)
+      (info "fetching " url " @ " (subs sha 0 (min 12 (count sha))))
+      (when-not (zero? (sh (str "git clone --quiet --origin origin "
+                                (shell-quote url)
+                                " " (shell-quote stage))))
+        (throw (ex-info (str "git clone failed: " url) {:url url :sha sha})))
+      ;; Git canonicalizes a relative/local clone source before storing it in
+      ;; remote.origin.url. Cache identity is the dependency's literal URL, so
+      ;; restore that exact spelling before strict origin validation.
+      (when-not
+        (zero?
+          (sh (str "git -C " (shell-quote stage)
+                   " config --local --replace-all remote.origin.url "
+                   (shell-quote url))))
+        (throw
+          (ex-info (str "could not record literal git origin: " url)
+                   {:url url :sha sha :path stage})))
+      (when-not (zero? (sh (str "git -C " (shell-quote stage)
+                                " checkout --quiet " (shell-quote sha))))
+        (throw (ex-info (str "git checkout failed: " sha " in " url)
+                        {:url url :sha sha})))
+      ;; Submodules are part of the pinned checkout and therefore part of the
+      ;; transaction: a failure must not publish the parent repository.
+      (when-not (zero? (sh (str "git -C " (shell-quote stage)
+                                " submodule update --init --recursive --quiet")))
+        (throw (ex-info (str "git submodule update failed for " url)
+                        {:url url :sha sha})))
+      (when-not (git-checkout-valid? stage sha url)
+        (let [inspection (git-checkout-inspection stage sha url)]
+          (throw (ex-info (str "git checkout validation failed: " url " @ " sha)
+                          {:url url :sha sha :path stage
+                           :inspection inspection}))))
+      (publish-git-checkout! stage dir url sha)
+      (finally
+        ;; On success this removes an empty lock dir. On any failure it removes
+        ;; only this target's private staging tree, leaving no publishable
+        ;; residue for a retry.
+        (remove-own-cache-path! dir lock)))))
+
+(defn- ensure-own-git
+  "Return jolt's verified checkout for url@sha. An atomic mkdir is the bounded
+  ownership protocol: one writer stages under the lock while losers wait for a
+  verified publication. A crashed owner leaves a visible lock and produces a
+  bounded, actionable error instead of allowing a second writer to consume or
+  overwrite its partial state."
+  [url sha dir]
+  (let [parent (subs dir 0 (.lastIndexOf dir "/"))
+        lock (str dir ".jolt-lock")]
+    (when-not (.mkdirs (java.io.File. parent))
+      (when-not (.isDirectory (java.io.File. parent))
+        (throw (ex-info (str "could not create git cache directory " parent)
+                        {:path parent}))))
+    (loop [attempt 0]
+      (let [claim (git-cache-origin-claim dir url)
+            inspection (git-checkout-inspection dir sha url)]
+        (cond
+          (and (:claimed? claim) (not (:matches? claim)))
+          (cache-origin-mismatch! claim url sha dir)
+
+          (= :origin-mismatch (:reason inspection))
+          (cache-origin-mismatch! inspection url sha dir)
+
+          (and (:valid? inspection) (:matches? claim)) dir
+
+          (and (not (:claimed? claim))
+               (file-exists? dir)
+               (= :not-worktree (:reason inspection)))
+          (unowned-cache-entry! inspection url sha dir)
+
+          ;; mkdir is atomic: success grants exclusive ownership of this one
+          ;; url@sha publication without serialising unrelated dependencies.
+          (.mkdir (java.io.File. lock))
+          (try
+            (spit (str lock "/owner.edn")
+                  (pr-str {:started-ms (System/currentTimeMillis)
+                           :sha sha
+                           :jolt-version (jolt.host/jolt-version)}))
+            (let [owned-claim (git-cache-origin-claim dir url)
+                  owned-inspection (git-checkout-inspection dir sha url)]
+              (cond
+                (and (:claimed? owned-claim) (not (:matches? owned-claim)))
+                (do
+                  (remove-own-cache-path! dir lock)
+                  (cache-origin-mismatch! owned-claim url sha dir))
+
+                (= :origin-mismatch (:reason owned-inspection))
+                (do
+                  (remove-own-cache-path! dir lock)
+                  (cache-origin-mismatch! owned-inspection url sha dir))
+
+                (and (not (:claimed? owned-claim))
+                     (file-exists? dir)
+                     (= :not-worktree (:reason owned-inspection)))
+                (do
+                  (remove-own-cache-path! dir lock)
+                  (unowned-cache-entry! owned-inspection url sha dir))
+
+                (and (:valid? owned-inspection) (:matches? owned-claim))
+                (do (remove-own-cache-path! dir lock) dir)
+
+                (:valid? owned-inspection)
+                (do
+                  (claim-cache-origin! dir lock url sha)
+                  (remove-own-cache-path! dir lock)
+                  dir)
+
+                :else
+                (do
+                  (when-not (:claimed? owned-claim)
+                    (claim-cache-origin! dir lock url sha))
+                  (fetch-git-while-locked! url sha dir lock))))
+            (catch :default cause
+              ;; fetch-git-while-locked! owns its own finally. This branch also
+              ;; covers metadata failure before that transaction starts.
+              (when (file-exists? lock)
+                (remove-own-cache-path! dir lock))
+              (throw cause)))
+
+          (< attempt git-lock-wait-attempts)
+          (do (Thread/sleep git-lock-wait-ms)
+              (recur (inc attempt)))
+
+          :else
+          (let [owner-file (str lock "/owner.edn")
+                owner (when (file-exists? owner-file)
+                        (try (slurp owner-file)
+                             (catch :default _ nil)))]
+            (throw
+              (ex-info
+                (str "timed out waiting for git cache owner at " lock
+                     "; if no jolt process is fetching this dependency, remove "
+                     "that single stale lock directory and retry")
+                {:url url :sha sha :path dir :lock lock
+                 :owner owner
+                 :wait-ms (* git-lock-wait-attempts
+                             git-lock-wait-ms)}))))))))
 
 (defn- ensure-git
   "Return a checkout dir for url@sha: an existing tools.gitlibs checkout for
-  `lib` when present, else clone into jolt's cache (once)."
+  `lib` when present, else transactionally clone into jolt's cache (once)."
   [lib url sha]
-  (let [dir (str (gitlibs-dir) "/" (sanitize url) "/" sha)]
-    (if-let [shared (and (not (file-exists? dir)) (gitlibs-shared-checkout lib sha))]
-      shared
-      (if (file-exists? dir)
-        dir
-        (do
-          (info "fetching " url " @ " (subs sha 0 (min 12 (count sha))))
-          (sh (str "mkdir -p " (pr-str dir)))
-          (when-not (zero? (sh (str "git clone --quiet " (pr-str url) " " (pr-str dir))))
-            (throw (ex-info (str "git clone failed: " url) {:url url})))
-          (when-not (zero? (sh (str "git -C " (pr-str dir) " checkout --quiet " (pr-str sha))))
-            (throw (ex-info (str "git checkout failed: " sha " in " url) {:url url :sha sha})))
-          ;; submodules are pinned in the checkout; pull them if the dep uses any.
-          (when-not (zero? (sh (str "git -C " (pr-str dir) " submodule update --init --recursive --quiet")))
-            (throw (ex-info (str "git submodule update failed for " url) {:url url})))
-          dir)))))
+  (when-not (git-sha? sha)
+    (throw (ex-info
+             (str "git dep " lib " needs a hexadecimal :git/sha commit prefix "
+                  "of 7 to 64 characters, got " (pr-str sha))
+             {:lib lib :url url :sha sha})))
+  (let [sha (str/lower-case sha)
+        dir (git-cache-entry-dir url sha)
+        claim (git-cache-origin-claim dir url)
+        inspection (git-checkout-inspection dir sha url)]
+    (cond
+      (and (:claimed? claim) (not (:matches? claim)))
+      (cache-origin-mismatch! claim url sha dir)
+
+      (= :origin-mismatch (:reason inspection))
+      (cache-origin-mismatch! inspection url sha dir)
+
+      (and (:valid? inspection) (:matches? claim)) dir
+
+      :else
+      ;; Reuse is read-only. Validation shells out to git but never touches the
+      ;; tools.gitlibs bookkeeping/worktree.
+      (if-let [shared (gitlibs-shared-checkout lib sha)]
+        shared
+        (ensure-own-git url sha dir)))))
 
 ;; --- maven cache ------------------------------------------------------------
 ;; jolt has no JVM, but a Clojure library's Maven JAR carries its .clj/.cljc/.cljs
@@ -267,8 +745,9 @@
                  {:coord coord :spec spec}))
         :else
         (throw (ex-info
-                 (str "git dep " coord " needs :git/sha (the full commit SHA to check "
-                      "out)" (when (:git/tag spec) " — a :git/tag alone doesn't pin a commit") ".")
+                 (str "git dep " coord " needs :git/sha (a hexadecimal commit "
+                      "object ID or prefix)" (when (:git/tag spec)
+                                               " — a :git/tag alone doesn't pin a commit") ".")
                  {:coord coord :spec spec}))))
     (:jolt/module spec)
     (do (info "skipping janet dependency " coord " (:jolt/module is obsolete on Chez)") nil)
@@ -290,8 +769,8 @@
     (do (warn "skipping unsupported coordinate " coord " " (pr-str spec)
               "\n  a dependency needs one of:"
               "\n    {:mvn/version \"1.2.3\"}                              a Maven artifact"
-              "\n    {:git/url \"https://…\" :git/sha \"<full-sha>\"}       an explicit git repo"
-              "\n    {:git/sha \"<full-sha>\"} on io.github.OWNER/REPO     a git repo by host-prefixed name"
+              "\n    {:git/url \"https://…\" :git/sha \"<sha>\"}            an explicit git repo"
+              "\n    {:git/sha \"<sha>\"} on io.github.OWNER/REPO          a git repo by host-prefixed name"
               "\n    {:local/root \"../path\"}                             a directory on disk")
         nil)))
 
