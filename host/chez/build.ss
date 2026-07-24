@@ -810,9 +810,24 @@
                        (not (or (assoc (car p) graph-rest)
                                 (assoc (car p) walked))))
                      reader-pairs))
-           ;; merge: reader pairs + graph-rest + walked novelties (preserving
-           ;; walked order for dynamic requires the scan missed)
-           (merged (append reader-pairs graph-rest))
+           ;; Class-provider catalogs are evaluated while entry-ns loads.  Bundle
+           ;; every namespace they map even when the first class use is deferred
+           ;; until -main; otherwise a standalone binary would have the registry
+           ;; entry but no source/AOT body for its provider.
+           (provider-ns-names (class-provider-namespaces))
+           (provider-pairs (bld-require-closure provider-ns-names))
+           ;; graph-rest precedes provider-pairs so a catalog required by the app
+           ;; is initialized before the provider it names.  The provider closure
+           ;; remains dependency-ordered internally.
+           (provider-pairs
+             (filter (lambda (p)
+                       (not (or (assoc (car p) reader-pairs)
+                                (assoc (car p) graph-rest)
+                                (assoc (car p) walked))))
+                     provider-pairs))
+           ;; merge: readers + app graph + provider closure + dynamic-load
+           ;; novelties (preserving walked order for requires the scan missed)
+           (merged (append reader-pairs graph-rest provider-pairs))
            (merged
              (let loop ((w walked) (m merged))
                (if (null? w)

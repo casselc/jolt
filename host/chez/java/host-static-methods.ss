@@ -455,6 +455,11 @@
                 (cond
                   ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[)) nm)
                   ((forname-known? nm) (make-class-obj nm))
+                  ;; An optional dependency may model the class lazily.  As with
+                  ;; constructor/static dispatch, load its declared provider and
+                  ;; retry this exact existence check once.
+                  ((and (class-provider-try-load! nm) (forname-known? nm))
+                   (make-class-obj nm))
                   (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm))))))))
 
 ;; ---- System + target helpers (called by the registrations above) ------------
