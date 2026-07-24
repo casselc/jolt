@@ -35,7 +35,9 @@
   can be copied as `(read-array ptr len)`, into an existing byte-array as
   `(read-array! ptr len dest dest-off)`, or out with
   `(write-array ptr src [src-off len])`. A null pointer is allowed only for a
-  zero-length transfer.
+  zero-length transfer. `(with-byte-array-pointer arr off len f)` validates and
+  pins an array slice, then calls `f` with its interior pointer and validated
+  length. The pointer is valid only until `f` returns and must not be retained.
 
   foreign-fn lowers a compile-time-typed signature to a real Chez
   foreign-procedure. foreign-callable is the inverse — it wraps a jolt fn as a
