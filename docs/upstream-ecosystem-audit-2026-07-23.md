@@ -50,20 +50,38 @@ hard-coded ABI layout is correct.
 ## Design direction
 
 The portable boundary should be versioned capability maps, not a renamed Jolt
-socket stack:
+socket stack and not an API shaped around one future data structure:
 
 ```text
-clojure.platform.ffi -> clojure.platform.tcp -> clojure.platform.http
-                                      -> clojure.raft / clojure.lsm
+runtime adapters: native/ffi   clock   bytes   files/storage   sockets
+                              \  |      |       |             /
+                         versioned capability maps
+                                      |
+                  +-------------------+--------------------+
+                  |                   |                    |
+          codecs and framing    TCP byte streams    storage operations
+                  |                   |                    |
+          memory structures     TLS and HTTP        disk structures
+                  +--------- composable libraries --------+
+                                      |
+             clients, servers, communication protocols,
+                   storage engines, and applications
 ```
 
-`ffi` owns ABI, library, lifetime, byte/text, and native-error facts. TCP is a
-Teensyp-derived byte-stream contract. HTTP is a Capra-derived message/body
-contract. Raft and LSM stay deterministic above effects and receive explicit
-clock, transport, byte, store, and cancellation capabilities. Adapters for
-Jolt, JVM, fake, and jank must advertise the same versioned semantics and pass
-the same behavioural gate; an unavailable capability is reported, never
-silently emulated as a false equivalent.
+Jolt's `ffi` adapter owns ABI, library, lifetime, byte/text, and native-error
+facts. Other runtimes may implement the same operation, completion, ownership,
+clock, and storage semantics through their natural host APIs rather than a C
+FFI. TCP is a Teensyp-derived byte-stream contract. HTTP is a Capra-derived
+message/body contract. Pure codecs, in-memory and disk-backed structures,
+client/server protocols, storage engines, replication, and consensus then stay
+deterministic above the effects they actually need. Raft and LSM are examples
+of possible consumers, not privileged layers that define the API or gate its
+bootstrap sequence.
+
+Adapters for Jolt, JVM, fake, jank, Node, CLR, or another Clojure-like must
+advertise only the same versioned semantics they actually implement and pass
+the corresponding behavioural gate; an unavailable capability is reported,
+never silently emulated as a false equivalent.
 
 The canonical design record is maintained outside this evidence checkout at
 `jolt-net/docs/CLOJURE-PLATFORM.md`. This note remains an audit snapshot, not
@@ -79,5 +97,7 @@ an implementation specification for upstream Jolt.
    ownership after failure.
 4. Time covers system zone, DST, missing tzdata, locale, and monotonic deadline
    behaviour.
-5. The portable TCP/HTTP suite runs against Jolt, JVM, a deterministic fake,
-   and jank as independent capability claimants.
+5. Each portable capability suite runs against Jolt, JVM, a deterministic fake,
+   and every other claimed runtime as independent implementations. Generality is
+   exercised with representative codecs, memory and disk structures, and
+   client/server protocols rather than inferred from TCP/HTTP alone.
