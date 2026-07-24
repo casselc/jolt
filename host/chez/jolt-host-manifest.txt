@@ -103,6 +103,7 @@ record-shapes
 record-type?
 ref-get
 ref-put!
+register-class-providers!
 register-class-supers!
 register-source!
 resolvable-names
