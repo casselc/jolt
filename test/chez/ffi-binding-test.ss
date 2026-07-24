@@ -141,6 +141,50 @@
       (ev "(let [a (byte-array [1 2 3 4])]
               (c-memset a 171 3)
               (= [171 171 171 4] (vec a)))")))
+(ev "(def c-memcmp-pointer
+       (jolt.ffi/__cfn \"memcmp\" [:pointer :byte-array :size_t] :int))")
+(ev "(def c-memset-pointer
+       (jolt.ffi/__cfn \"memset\" [:pointer :int :size_t] :pointer))")
+(ok "scoped byte-array pointer borrows an interior slice without copying"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [9 1 2 8])
+                  expected (byte-array [1 2])]
+              (jolt.ffi/with-byte-array-pointer
+                a 1 2
+                (fn [p n] (zero? (c-memcmp-pointer p expected n))))))")))
+(ok "scoped byte-array pointer mutates the original interior slice"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3 4])]
+              (jolt.ffi/with-byte-array-pointer
+                a 1 2
+                (fn [p n] (c-memset-pointer p 171 n)))
+              (= [1 171 171 4] (vec a)))")))
+(ok "scoped byte-array pointer remains stable across collection"
+    (let ((a (ev "(byte-array [1 2 3 4])")))
+      (and (ffi-with-byte-array-pointer
+             a 1 2
+             (lambda (p n)
+               (collect)
+               (foreign-set! 'unsigned-8 p 0 205)
+               (= n 2)))
+           (= 205 (bytevector-u8-ref (jolt-array-vec a) 1)))))
+(ok "scoped byte-array pointer allows an empty slice at array end"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2])]
+              (jolt.ffi/with-byte-array-pointer
+                a 2 0
+                (fn [p n] (and (pos? p) (zero? n)))))")))
+(ok "scoped byte-array pointer rejects invalid ranges before callback"
+    (jolt-truthy?
+      (ev "(let [a (byte-array 2)]
+              (and (try
+                     (jolt.ffi/with-byte-array-pointer a -1 1 (fn [_ _] false))
+                     false
+                     (catch IndexOutOfBoundsException _ true))
+                   (try
+                     (jolt.ffi/with-byte-array-pointer a 1 2 (fn [_ _] false))
+                     false
+                     (catch IndexOutOfBoundsException _ true))))")))
 (ok "typed byte-array arguments reject other array kinds"
     (jolt-truthy?
       (ev "(try (c-memset (int-array [1 2]) 0 2) false
