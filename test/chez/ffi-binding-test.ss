@@ -99,6 +99,37 @@
 (ok "unknown foreign type is still rejected"
     (guard (e (#t #t)) (ev "(jolt.ffi/sizeof :int128)") #f))
 
+;; --- native error capture (jolt.ffi/errno) ----------------------------------
+(ok "errno-source names a known strategy"
+    (let ((k (ev "(jolt.ffi/errno-source)")))
+      (and (keyword-t? k)
+           (member (keyword-t-name k)
+                   '("errno-location" "error" "wsa-get-last-error"))
+           #t)))
+
+;; a failing call sets a specific, recognizable code
+(ev "(def c-open (jolt.ffi/__cfn \"open\" [:string :int] :int))")
+(ev "(def rc-missing (c-open \"/nonexistent-zzz/nope\" 0))")
+(ok "failed open returns -1" (= -1 (jnum->exact (var-deref "user" "rc-missing"))))
+(ok "errno reports ENOENT (2) for the failed open"
+    (= 2 (jnum->exact (ev "(jolt.ffi/errno)"))))
+
+;; THE ordering property, made executable. This is the defect shape that
+;; motivated the accessor: a rollback close() runs between the failure and the
+;; read, and the caller reports the cleanup's error instead of the real one.
+;; close(-1) fails with EBADF (9), overwriting the ENOENT (2) above -- exactly
+;; what a constructor's `(c-close fd)` before `(errno)` does. Capture must
+;; therefore happen before any cleanup call, which is what the docstring on
+;; ffi-errno requires of callers.
+(ev "(def c-close (jolt.ffi/__cfn \"close\" [:int] :int))")
+(ev "(def captured-before (jolt.ffi/errno))")   ; capture FIRST, as callers must
+(ev "(def cleanup-rc (c-close -1))")            ; then the rollback call
+(ok "a failing cleanup call does overwrite errno"
+    (and (= -1 (jnum->exact (var-deref "user" "cleanup-rc")))
+         (= 9 (jnum->exact (ev "(jolt.ffi/errno)")))))
+(ok "the value captured before cleanup survives it"
+    (= 2 (jnum->exact (var-deref "user" "captured-before"))))
+
 ;; byte-array buffer I/O: write a byte-array into foreign memory and read it back
 ;; byte-exact (high bytes preserved, no UTF-8 mangling).
 (ok "byte-array roundtrip (binary-faithful)"
