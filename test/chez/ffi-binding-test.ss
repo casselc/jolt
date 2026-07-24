@@ -127,6 +127,28 @@
 ;; byte-exact (high bytes preserved, no UTF-8 mangling).
 (ok "byte-array uses an unboxed Chez bytevector backing"
     (bytevector? (jolt-array-vec (ev "(byte-array [0 128 255])"))))
+(ev "(def c-memcmp
+       (jolt.ffi/__cfn \"memcmp\" [:byte-array :byte-array :size_t] :int))")
+(ev "(def c-memset
+       (jolt.ffi/__cfn \"memset\" [:byte-array :int :size_t] :pointer))")
+(ok "typed byte-array arguments borrow binary storage directly"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [0 128 255 7])
+                  b (byte-array [0 128 255 7])]
+              (zero? (c-memcmp a b 4)))")))
+(ok "typed byte-array output mutates the original array"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3 4])]
+              (c-memset a 171 3)
+              (= [171 171 171 4] (vec a)))")))
+(ok "typed byte-array arguments reject other array kinds"
+    (jolt-truthy?
+      (ev "(try (c-memset (int-array [1 2]) 0 2) false
+                (catch IllegalArgumentException _ true))")))
+(ok "typed byte-array arguments fail closed on collect-safe calls"
+    (guard (e (#t #t))
+      (ev "(jolt.ffi/__cfn \"read\" [:int :byte-array :size_t] :ssize_t :blocking)")
+      #f))
 (ok "byte-array roundtrip (binary-faithful)"
     (jolt-truthy?
       (ev "(let [src (byte-array [0 65 200 255 10])

@@ -650,14 +650,22 @@
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
     (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking])")))
-  {:op :ffi-fn
-   :csym (nth items 1)
-   :argtypes (mapv #(analyze-ffi-type % true)
-                   (form-vec-items (nth items 2)))
-   ;; Aggregate returns require a different wrapper ownership contract. Reject
-   ;; them until that contract is explicit rather than silently choosing one.
-   :rettype (ffi-primitive-type (nth items 3) "foreign-fn return")
-   :blocking (and (= 5 (count items)) (= "blocking" (name (nth items 4))))})
+  (let [argtypes (mapv #(analyze-ffi-type % true)
+                       (form-vec-items (nth items 2)))
+        blocking (and (= 5 (count items))
+                      (= "blocking" (name (nth items 4))))]
+    ;; Chez may pass a bytevector as u8* only while the Scheme thread remains
+    ;; active. A collect-safe call deactivates that thread so the collector may
+    ;; move Scheme objects, making an implicitly borrowed bytevector unsafe.
+    (when (and blocking (some #(= "byte-array" %) argtypes))
+      (throw "jolt.ffi :byte-array arguments are not allowed on :blocking calls"))
+    {:op :ffi-fn
+     :csym (nth items 1)
+     :argtypes argtypes
+     ;; Aggregate returns require a different wrapper ownership contract. Reject
+     ;; them until that contract is explicit rather than silently choosing one.
+     :rettype (ffi-primitive-type (nth items 3) "foreign-fn return")
+     :blocking blocking}))
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
 ;; macro) — the inverse of __cfn. It wraps a jolt fn as a C-callable function
@@ -675,14 +683,18 @@
 (defn- analyze-ffi-callable [ctx items env]
   (when-not (<= 4 (count items) 5)
     (throw (str "jolt.ffi/foreign-callable expects (foreign-callable f [argtypes] rettype [:collect-safe])")))
-  {:op :ffi-callable
-   :fn (analyze ctx (nth items 1) env)
-   ;; Callback aggregate ownership/lifetime is distinct from outbound calls;
-   ;; keep the first aggregate slice deliberately one-way.
-   :argtypes (mapv #(ffi-primitive-type % "foreign-callable")
-                   (form-vec-items (nth items 2)))
-   :rettype (ffi-primitive-type (nth items 3) "foreign-callable return")
-   :collect-safe (and (= 5 (count items)) (= "collect-safe" (name (nth items 4))))})
+  (let [argtypes (mapv #(ffi-primitive-type % "foreign-callable")
+                       (form-vec-items (nth items 2)))]
+    (when (some #(= "byte-array" %) argtypes)
+      (throw "jolt.ffi :byte-array is an outbound foreign-fn argument only"))
+    {:op :ffi-callable
+     :fn (analyze ctx (nth items 1) env)
+     ;; Callback aggregate ownership/lifetime is distinct from outbound calls;
+     ;; keep the first aggregate slice deliberately one-way.
+     :argtypes argtypes
+     :rettype (ffi-primitive-type (nth items 3) "foreign-callable return")
+     :collect-safe (and (= 5 (count items))
+                        (= "collect-safe" (name (nth items 4))))}))
 
 ;; The `.` special form: `(. target member arg*)` — member access / method call.
 ;; A symbol member whose name starts with "-" is a field read; otherwise it is a
