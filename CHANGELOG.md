@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A real monotonic clock.** `jolt.host/monotonic-nanos` returns a monotonic
+  counter (Chez's `time-monotonic`), and `System/nanoTime` now projects it
+  instead of `currentTimeMillis * 1e6`. The old value was wall-clock *and*
+  truncated to milliseconds, so it could step backwards when NTP adjusted the
+  clock and reported a delta of exactly `0` across intervals a real clock
+  resolves at microseconds — unusable for deadlines, and quietly lossy for the
+  benchmark timings that already used it. Support is probed once at load;
+  `jolt.host/monotonic-source` reports `:monotonic` or `:wall-clock-fallback`
+  so callers can tell rather than assume. `System/currentTimeMillis` is
+  unchanged and remains wall-clock.
+- **16-bit and signed 8-bit foreign types.** `:int16`/`:short`,
+  `:uint16`/`:ushort`, and `:int8`/`:i8` join the FFI type table. Without a
+  16-bit type a caller could not express a C `short` at all: `struct pollfd`'s
+  two shorts had to be packed into one `:int` and masked, which is correct only
+  on a little-endian host. `sockaddr_in.sin_family` needs them too.
+- **`jolt.ffi/errno`.** The calling thread's last OS error — POSIX `errno` via
+  the libc-specific thread-local accessor, Winsock via `WSAGetLastError`. It
+  makes exactly one native call and no other, so it cannot clobber the value it
+  reports; callers must still read it *before* any cleanup call, since
+  `close`/`free` will overwrite it. Unknown targets fail closed rather than
+  guessing a symbol. `jolt.ffi/errno-source` reports which strategy is live.
+
+### Notes
+
+- Bulk `ffi/read-array!`/`write-array` transfers are still a byte-at-a-time loop
+  rather than a `memcpy`. That is the throughput ceiling for anything streaming
+  bytes over FFI (sockets, hashing) and is worth revisiting with a benchmark;
+  nothing above is blocked on it.
+
 ## [0.5.4] - 2026-07-26
 
 Ten host-interop fixes, found by running a real library's test suite end to
@@ -253,7 +284,6 @@ work.
   element. The `arrays` benchmark went from ~18.6× the JVM to ~6×.
 - **Generic `inc`/`dec` open-code their numeric fast path** (#458) rather than
   calling through a procedure, matching how `+`/`-`/`*` already worked.
-
 ## [0.4.15] - 2026-07-22
 
 Two numeric fast paths for hot array and math code, both hint- and
