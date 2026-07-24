@@ -11,8 +11,18 @@
         (let [db (ffi/read pp :pointer)] ...)
         (ffi/free pp))
 
-  Types (keywords): :int :uint :long :ulong :int64 :uint64 :size_t :ssize_t
-  :iptr :uptr :double :float :pointer :string :void :uint8 :char.
+  Types (keywords): :int :uint :int32 :uint32 :long :ulong :int64 :uint64 :size_t :ssize_t
+  :iptr :uptr :double :float :pointer :string :void :uint8 :char. A C struct
+  argument passed by value is described inline:
+
+      [:by-value
+       [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]
+
+  The Jolt argument remains a native pointer to caller-owned storage holding
+  that layout; the generated wrapper passes the pointed-to value by C value.
+  Nested [:struct ...] field types are supported. Aggregate results and
+  aggregate callbacks are deliberately rejected until their ownership contract
+  is defined.
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. Binary buffers
@@ -30,7 +40,8 @@
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; An optional trailing :blocking marks a call that may block (accept/recv/...),
-;; so it's emitted collect-safe and won't pin the garbage collector.
+;; so it's emitted collect-safe and won't pin the garbage collector. Aggregate
+;; arguments use the inline descriptor documented above.
 (defmacro foreign-fn [csym argtypes rettype & [opt]]
   (if (= opt :blocking)
     (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)

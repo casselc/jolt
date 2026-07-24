@@ -1,6 +1,6 @@
 ;; byte-buffer.ss — java.nio.ByteBuffer over a jolt byte-array. A buffer is a
 ;; jhost tagged "byte-buffer" with mutable #(backing-array position limit); the
-;; backing is a jolt byte-array (vector of 0..255). Covers the slice of the API
+;; backing is a jolt byte-array (bytevector of 0..255). Covers the slice of the API
 ;; portable code reaches for — wrap / get(byte[]) / array / remaining / position /
 ;; limit / duplicate / flip / rewind — e.g. cognitect aws-api wrapping blob bytes.
 
@@ -11,24 +11,24 @@
 (define (bb-limit b) (vector-ref (jhost-state b) 2))
 (define (bb-pos! b n) (vector-set! (jhost-state b) 1 n))
 (define (bb-limit! b n) (vector-set! (jhost-state b) 2 n))
-(define (bb-capacity b) (vector-length (jolt-array-vec (bb-backing b))))
+(define (bb-capacity b) (ja-len (jolt-array-vec (bb-backing b))))
 
 ;; (ByteBuffer/wrap ba) | (ByteBuffer/wrap ba off len) | (ByteBuffer/allocate n)
 (register-class-statics! "ByteBuffer"
   (list
     (cons "wrap" (lambda (ba . rest)
-                   (let ((cap (vector-length (jolt-array-vec ba))))
+                   (let ((cap (ja-len (jolt-array-vec ba))))
                      (if (pair? rest)
                          (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
                            (make-byte-buffer ba off (+ off len)))
                          (make-byte-buffer ba 0 cap)))))
     (cons "allocate" (lambda (n)
                        (let ((cap (jnum->exact n)))
-                         (make-byte-buffer (make-jolt-array (make-vector cap 0) 'byte) 0 cap))))
+                         (make-byte-buffer (na-byte-array cap) 0 cap))))
     ;; jolt has one heap; a direct buffer is just a buffer here.
     (cons "allocateDirect" (lambda (n)
                              (let ((cap (jnum->exact n)))
-                               (make-byte-buffer (make-jolt-array (make-vector cap 0) 'byte) 0 cap))))))
+                               (make-byte-buffer (na-byte-array cap) 0 cap))))))
 
 (register-host-methods! "byte-buffer"
   (list
@@ -48,10 +48,11 @@
     ;; JVM shares the backing; here it is a copy, so writes don't propagate back
     ;; (read paths — hexdumps, decoders — are unaffected).
     (cons "slice" (lambda (self)
-                    (let* ((src (jolt-array-vec (bb-backing self))) (p (bb-pos self))
-                           (n (- (bb-limit self) p)) (nv (make-vector n 0)))
-                      (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! nv i (vector-ref src (+ p i))))
-                      (make-byte-buffer (make-jolt-array nv 'byte) 0 n))))
+                    (let* ((p (bb-pos self))
+                           (n (- (bb-limit self) p))
+                           (dst (na-byte-array n)))
+                      (na-system-arraycopy (bb-backing self) p dst 0 n)
+                      (make-byte-buffer dst 0 n))))
     (cons "rewind" (lambda (self) (bb-pos! self 0) self))
     (cons "flip" (lambda (self) (bb-limit! self (bb-pos self)) (bb-pos! self 0) self))
     (cons "clear" (lambda (self) (bb-pos! self 0) (bb-limit! self (bb-capacity self)) self))
@@ -63,17 +64,15 @@
                   (let ((dv (jolt-array-vec (bb-backing self))) (dp (bb-pos self)))
                     (cond
                       ((bb? src)
-                       (let* ((sv (jolt-array-vec (bb-backing src))) (sp (bb-pos src))
+                       (let* ((sp (bb-pos src))
                               (n (- (bb-limit src) sp)))
-                         (do ((i 0 (fx+ i 1))) ((fx=? i n))
-                           (vector-set! dv (+ dp i) (vector-ref sv (+ sp i))))
+                         (na-system-arraycopy (bb-backing src) sp (bb-backing self) dp n)
                          (bb-pos! src (bb-limit src)) (bb-pos! self (+ dp n))))
                       ((jolt-array? src)
-                       (let* ((sv (jolt-array-vec src)) (n (vector-length sv)))
-                         (do ((i 0 (fx+ i 1))) ((fx=? i n))
-                           (vector-set! dv (+ dp i) (vector-ref sv i)))
+                       (let ((n (ja-len (jolt-array-vec src))))
+                         (na-system-arraycopy src 0 (bb-backing self) dp n)
                          (bb-pos! self (+ dp n))))
-                      (else (vector-set! dv dp (jnum->exact src)) (bb-pos! self (+ dp 1))))
+                      (else (ja-set! dv dp (jnum->exact src)) (bb-pos! self (+ dp 1))))
                     self)))
     ;; get(): relative single byte at position, advancing it.
     ;; get(int i): absolute single byte at index i (position unchanged).
@@ -82,16 +81,15 @@
                   (let ((src (jolt-array-vec (bb-backing self))))
                     (cond
                       ((null? args)
-                       (let ((p (bb-pos self))) (bb-pos! self (+ p 1)) (->num (vector-ref src p))))
+                       (let ((p (bb-pos self))) (bb-pos! self (+ p 1)) (->num (ja-ref src p))))
                       ((number? (car args))
-                       (->num (vector-ref src (jnum->exact (car args)))))
+                       (->num (ja-ref src (jnum->exact (car args)))))
                       (else
                        (let* ((dst (car args)) (rest (cdr args)) (dv (jolt-array-vec dst))
                               (off (if (pair? rest) (jnum->exact (car rest)) 0))
-                              (len (if (and (pair? rest) (pair? (cdr rest))) (jnum->exact (cadr rest)) (vector-length dv)))
+                              (len (if (and (pair? rest) (pair? (cdr rest))) (jnum->exact (cadr rest)) (ja-len dv)))
                               (p (bb-pos self)))
-                         (do ((i 0 (+ i 1))) ((= i len))
-                           (vector-set! dv (+ off i) (vector-ref src (+ p i))))
+                         (na-system-arraycopy (bb-backing self) p dst off len)
                          (bb-pos! self (+ p len))
                          self))))))))
 

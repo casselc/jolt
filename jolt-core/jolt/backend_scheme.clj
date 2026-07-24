@@ -568,6 +568,7 @@
 ;; -- defcfn compiles but ffi/read rejects it, or the reverse.
 (def ^:private ffi-types
   {"int" "int" "uint" "unsigned-int" "long" "long" "ulong" "unsigned-long"
+   "int32" "integer-32" "uint32" "unsigned-32"
    "int16" "integer-16" "short" "integer-16"
    "uint16" "unsigned-16" "ushort" "unsigned-16"
    "int64" "integer-64" "uint64" "unsigned-64" "size_t" "size_t" "ssize_t" "ssize_t"
@@ -577,12 +578,64 @@
    "int8" "integer-8" "i8" "integer-8"})
 (defn- ffi-type->chez [t]
   (or (ffi-types t) (throw (ex-info (str "jolt.ffi: unknown foreign type :" t) {}))))
+
+(defn- ffi-aggregate? [t]
+  (and (map? t) (= :by-value (:ffi-kind t))))
+
+(defn- emit-ffi-ftype [t]
+  (if (string? t)
+    (ffi-type->chez t)
+    (if (and (map? t) (= :struct (:ffi-kind t)))
+      (str "(struct "
+           (str/join
+            " "
+            (map-indexed
+             (fn [i field]
+               ;; Field names are part of the public descriptor, but generated
+               ;; identifiers keep arbitrary C names from becoming Scheme syntax.
+               (str "[f" i " " (emit-ffi-ftype (:type field)) "]"))
+             (:fields t)))
+           ")")
+      (throw (ex-info (str "jolt.ffi: unsupported aggregate descriptor "
+                           (pr-str t)) {})))))
+
 (defn- emit-ffi-fn [node]
   (let [n (count (:argtypes node))
         params (mapv (fn [i] (str "a" i)) (range n))
+        aggregate-types
+        (mapv (fn [i t]
+                (when (ffi-aggregate? t)
+                  {:index i
+                   :name (fresh-label "jolt_ffi_struct")
+                   :type (:type t)}))
+              (range n)
+              (:argtypes node))
+        aggregate-types (vec (remove nil? aggregate-types))
+        aggregate-by-index (into {} (map (fn [entry]
+                                           [(:index entry) entry])
+                                         aggregate-types))
+        emitted-argtypes
+        (mapv (fn [i t]
+                (if-let [entry (aggregate-by-index i)]
+                  (str "(& " (:name entry) ")")
+                  (ffi-type->chez t)))
+              (range n)
+              (:argtypes node))
+        emitted-call-args
+        (mapv (fn [i param]
+                (if-let [entry (aggregate-by-index i)]
+                  (str "(let ((address (jnum->exact " param "))) "
+                       "(if (= address 0) "
+                       "(throw-jvm 'NullPointerException "
+                       (chez-str-lit "jolt.ffi: null by-value aggregate pointer")
+                       ") "
+                       "(make-ftype-pointer " (:name entry) " address)))")
+                  param))
+              (range n)
+              params)
         fp (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
                 (chez-str-lit (:csym node))
-                " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
+                " (" (str/join " " emitted-argtypes) ") "
                 (ffi-type->chez (:rettype node)) ")")]
     ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
     ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
@@ -590,8 +643,16 @@
     ;; evaluate to a callable closure before the shared library is loaded —
     ;; critical for :optional :jolt/native libs whose load-object runs in the
     ;; scheme-start launcher, after the heap is already built.
-    (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
-         "((or p (begin (set! p " fp ") p)) " (str/join " " params) ")))")))
+    (str "(let () "
+         (str/join
+          " "
+          (map (fn [entry]
+                 (str "(define-ftype " (:name entry) " "
+                      (emit-ffi-ftype (:type entry)) ")"))
+               aggregate-types))
+         " (let ((p #f)) (lambda (" (str/join " " params) ") "
+         "((or p (begin (set! p " fp ") p)) "
+         (str/join " " emitted-call-args) "))))")))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the
