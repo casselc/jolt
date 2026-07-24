@@ -584,11 +584,16 @@
 ;; uses (via the jolt.ffi/foreign-fn macro) to bind native code. Shape:
 ;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)            ; non-blocking
 ;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)  ; may block
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype
+;;                    {:blocking true :varargs-after 2})
 ;; The C symbol is a string literal and the types are literal keywords, read here
 ;; at compile time; the Chez back end lowers it to a real `foreign-procedure`
 ;; (typed marshaling, no runtime eval). A :blocking call is emitted __collect_safe
 ;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
-;; must not pin the stop-the-world collector. A leaf IR node.
+;; must not pin the stop-the-world collector. :varargs-after is the positive
+;; count of fixed C parameters before `...`; Chez needs the exact boundary on
+;; targets such as Apple arm64, whose variadic ABI differs from fixed calls.
+;; A leaf IR node.
 (defn- ffi-primitive-type [form context]
   (when-not (form-keyword? form)
     (throw (str "jolt.ffi/" context " expects a foreign type keyword, got "
@@ -647,13 +652,57 @@
       (throw (str "jolt.ffi foreign type must be a keyword or aggregate descriptor, got "
                   (pr-str form))))))
 
+(defn- ffi-fn-options [form arg-count]
+  (cond
+    (nil? form) {:blocking false :varargs-after nil}
+
+    (form-keyword? form)
+    (if (= "blocking" (name form))
+      {:blocking true :varargs-after nil}
+      (throw (str "jolt.ffi foreign-fn unknown option " (pr-str form))))
+
+    (form-map? form)
+    (let [pairs (vec (form-map-pairs form))
+          allowed #{"blocking" "varargs-after"}
+          entries
+          (reduce
+            (fn [m pair]
+              (let [k (first pair)
+                    v (second pair)]
+                (when-not (form-keyword? k)
+                  (throw (str "jolt.ffi foreign-fn option keys must be keywords, got "
+                              (pr-str k))))
+                (let [kn (name k)]
+                  (when-not (contains? allowed kn)
+                    (throw (str "jolt.ffi foreign-fn unknown option " (pr-str k))))
+                  (assoc m kn v))))
+            {}
+            pairs)
+          blocking (get entries "blocking" false)
+          varargs-after (get entries "varargs-after")]
+      (when-not (or (= true blocking) (= false blocking))
+        (throw "jolt.ffi foreign-fn :blocking must be a literal boolean"))
+      (when (some? varargs-after)
+        (when-not (and (integer? varargs-after)
+                       (pos? varargs-after)
+                       (<= varargs-after arg-count))
+          (throw (str "jolt.ffi foreign-fn :varargs-after must be a positive "
+                      "integer no greater than the argument count (" arg-count ")"))))
+      {:blocking blocking :varargs-after varargs-after})
+
+    :else
+    (throw (str "jolt.ffi foreign-fn option must be :blocking or an options map, got "
+                (pr-str form)))))
+
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
-    (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking])")))
+    (throw (str "jolt.ffi/foreign-fn expects "
+                "(foreign-fn \"sym\" [argtypes] rettype [:blocking-or-options])")))
   (let [argtypes (mapv #(analyze-ffi-type % true)
                        (form-vec-items (nth items 2)))
-        blocking (and (= 5 (count items))
-                      (= "blocking" (name (nth items 4))))]
+        {:keys [blocking varargs-after]}
+        (ffi-fn-options (when (= 5 (count items)) (nth items 4))
+                        (count argtypes))]
     ;; Chez may pass a bytevector as u8* only while the Scheme thread remains
     ;; active. A collect-safe call deactivates that thread so the collector may
     ;; move Scheme objects, making an implicitly borrowed bytevector unsafe.
@@ -665,7 +714,8 @@
      ;; Aggregate returns require a different wrapper ownership contract. Reject
      ;; them until that contract is explicit rather than silently choosing one.
      :rettype (ffi-primitive-type (nth items 3) "foreign-fn return")
-     :blocking blocking}))
+     :blocking blocking
+     :varargs-after varargs-after}))
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
 ;; macro) — the inverse of __cfn. It wraps a jolt fn as a C-callable function

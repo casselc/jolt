@@ -40,26 +40,41 @@
   length. The pointer is valid only until `f` returns and must not be retained.
 
   foreign-fn lowers a compile-time-typed signature to a real Chez
-  foreign-procedure. foreign-callable is the inverse — it wraps a jolt fn as a
-  C-callable function pointer so C can call back into jolt (e.g. GTK signal
-  handlers); free-callable releases it.")
+  foreign-procedure. Its optional final argument is either the legacy
+  :blocking keyword or an options map:
+
+      {:blocking true :varargs-after 2}
+
+  :varargs-after is the positive number of fixed C arguments before `...`.
+  Declaring that boundary is required even when every argument has a known
+  Jolt type: Apple arm64 uses a different ABI location for variadic arguments.
+  The boundary may not exceed the declared argument count. Types after the
+  boundary must name the C ABI types after default argument promotion (for
+  example, use :double for a promoted C float); Jolt does not infer promotions.
+
+  foreign-callable is the inverse — it wraps a jolt fn as a C-callable function
+  pointer so C can call back into jolt (e.g. GTK signal handlers);
+  free-callable releases it.")
 
 ;; foreign-fn binds C symbol `csym` to a typed callable. Expands to the __cfn
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; An optional trailing :blocking marks a call that may block (accept/recv/...),
-;; so it's emitted collect-safe and won't pin the garbage collector. Aggregate
-;; arguments use the inline descriptor documented above.
+;; so it's emitted collect-safe and won't pin the garbage collector. An options
+;; map can instead carry :blocking and/or :varargs-after. Aggregate arguments
+;; use the inline descriptor documented above.
 (defmacro foreign-fn [csym argtypes rettype & [opt]]
-  (if (= opt :blocking)
-    (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
-    (list 'jolt.ffi/__cfn csym argtypes rettype)))
+  (if (nil? opt)
+    (list 'jolt.ffi/__cfn csym argtypes rettype)
+    (list 'jolt.ffi/__cfn csym argtypes rettype opt)))
 
-;; (defcfn name "c_symbol" [argtypes] rettype [:blocking]) — def a foreign function.
+;; (defcfn name "c_symbol" [argtypes] rettype [:blocking-or-options])
+;; defines a foreign function. See foreign-fn above for the options contract.
 (defmacro defcfn [name csym argtypes rettype & [opt]]
-  (list 'def name (if (= opt :blocking)
-                    (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
-                    (list 'jolt.ffi/__cfn csym argtypes rettype))))
+  (list 'def name
+        (if (nil? opt)
+          (list 'jolt.ffi/__cfn csym argtypes rettype)
+          (list 'jolt.ffi/__cfn csym argtypes rettype opt))))
 
 ;; foreign-callable wraps a jolt fn `f` as a C-callable function pointer — the
 ;; inverse of foreign-fn, so C can call back INTO jolt (GTK signal handlers, a

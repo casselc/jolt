@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports; callers must still read it *before* any cleanup call, since
   `close`/`free` will overwrite it. Unknown targets fail closed rather than
   guessing a symbol. `jolt.ffi/errno-source` reports which strategy is live.
+- **Explicit variadic FFI boundaries.** `jolt.ffi/foreign-fn` and `defcfn`
+  accept `{:varargs-after n}` (optionally with `:blocking true`) and lower it to
+  Chez's exact fixed/variadic calling convention. Fully typing every argument
+  is not sufficient on Apple arm64, where arguments after C's `...` are placed
+  on the stack even while a fixed argument would use a register. Invalid,
+  unknown, zero, and out-of-range options fail at analysis instead of silently
+  selecting a fixed call ABI. Types after the boundary are explicit ABI types
+  after C default argument promotion; Jolt does not guess those promotions.
 
 ### Notes
 

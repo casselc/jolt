@@ -647,7 +647,10 @@
                     :else param)))
               (range n)
               params)
-        fp (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
+        fp (str "(foreign-procedure "
+                (when (:blocking node) "__collect_safe ")
+                (when-let [n (:varargs-after node)]
+                  (str "(__varargs_after " n ") "))
                 (chez-str-lit (:csym node))
                 " (" (str/join " " emitted-argtypes) ") "
                 (ffi-type->chez (:rettype node)) ")")]
