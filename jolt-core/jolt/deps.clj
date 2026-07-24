@@ -79,6 +79,14 @@
   [s]
   (str "'" (str/replace (str s) "'" "'\"'\"'") "'"))
 
+(def ^:private git-command-prefix
+  ;; Git for Windows otherwise retains the legacy MAX_PATH boundary for worktree
+  ;; and submodule internals. Keep this per invocation: dependency resolution
+  ;; must not require or mutate a user's global Git configuration. Git propagates
+  ;; command-scope config to the child processes spawned by `submodule update`;
+  ;; the setting is benign on POSIX Git.
+  "git -c core.longpaths=true --no-optional-locks --no-replace-objects")
+
 (def ^:private command-exit-marker "__JOLT_COMMAND_EXIT__")
 
 (defn- shell-result
@@ -105,7 +113,7 @@
   so dependency URLs and cache paths never become shell syntax."
   [dir args]
   (shell-result
-    (str "git --no-optional-locks --no-replace-objects"
+    (str git-command-prefix
          (when dir (str " -C " (shell-quote dir)))
          (when (seq args)
            (str " " (str/join " " (map shell-quote args)))))))
@@ -145,7 +153,7 @@
   [url]
   (let [result (shell-result
                  (str "printf '%s' " (shell-quote url)
-                      " | git hash-object --stdin"))
+                      " | " git-command-prefix " hash-object --stdin"))
         digest (str/trim (:out result))]
     (if (and (result-ok? result) (git-sha? digest))
       (str "url-" (str/lower-case digest))
@@ -279,24 +287,25 @@
                          :status (:out sub-status)}
 
                         :else
-                        (let [sub-dirs
+                        (let [sub-paths
                               (git-result
                                 dir ["submodule" "foreach" "--quiet"
-                                     "--recursive" "pwd"])]
-                          (if-not (result-ok? sub-dirs)
+                                     "--recursive"
+                                     "printf '%s\\n' \"$displaypath\""])]
+                          (if-not (result-ok? sub-paths)
                             {:valid? false :reason :git-error
                              :operation :submodule-foreach :path dir
-                             :exit (:exit sub-dirs)}
+                             :exit (:exit sub-paths)}
                             (or
                               (some
-                                (fn [subdir]
-                                  (let [inspection
-                                        (inspect-worktree-state subdir)]
+                                (fn [subpath]
+                                  (let [subdir (str dir "/" subpath)
+                                        inspection (inspect-worktree-state subdir)]
                                     (when-not (:valid? inspection)
                                       (assoc inspection
                                              :submodule? true
                                              :checkout-path dir))))
-                                (result-lines sub-dirs))
+                                (result-lines sub-paths))
                               {:valid? true :reason :valid :path dir
                                :head (str/trim (:out head))})))))))))))))))
 
@@ -318,20 +327,62 @@
 (def ^:private git-lock-wait-attempts 6000)
 (def ^:private git-lock-wait-ms 50)
 
+(defn- git-cache-lock-dir
+  "The stable per-entry ownership path. This name is part of the cache's
+  cross-version synchronization protocol: transactional Jolt versions must
+  contend on the same lock even if their private staging layout differs."
+  [dir]
+  (str dir ".jolt-lock"))
+
+(defn- git-cache-stage-dir
+  "The private checkout staged beside its final url@sha leaf.
+
+  A sibling preserves same-filesystem publication while adding only two
+  characters to Git's worktree path. The former `.jolt-lock/checkout` nesting
+  consumed 19 characters and pushed recursive Windows submodules past Git's
+  legacy path boundary."
+  [dir]
+  (str dir ".s"))
+
 (defn- remove-own-cache-path!
   "Remove only the final url@sha leaf or that leaf's private lock/stage paths.
   Refuse every broader or unrelated target even if a caller regresses."
   [dir path]
   (when-not (or (= path dir)
-                (= path (str dir ".jolt-lock"))
-                (= path (str dir ".jolt-lock/checkout")))
+                (= path (git-cache-lock-dir dir))
+                (= path (git-cache-stage-dir dir)))
     (throw (ex-info (str "refusing unsafe git cache removal " path)
                     {:cache-entry dir :path path})))
   (when (file-exists? path)
-    (when-not (zero? (sh (str "rm -rf " (shell-quote path))))
+    (when-not (zero? (sh (str "rm -rf -- " (shell-quote path))))
       (throw (ex-info (str "could not remove incomplete git cache entry " path)
                       {:path path}))))
   nil)
+
+(defn- release-git-cache-ownership!
+  "Remove private stage residue before releasing the stable ownership lock.
+  Never release the lock while the stage still exists: a later caller must not
+  observe transaction-private state without its coordinating owner."
+  [dir lock]
+  (let [stage (git-cache-stage-dir dir)]
+    (remove-own-cache-path! dir stage)
+    (when (file-exists? stage)
+      (throw
+        (ex-info (str "git cache stage remains after cleanup " stage)
+                 {:type ::git-cache-stage-cleanup-failed
+                  :path dir :lock lock :stage stage})))
+    (remove-own-cache-path! dir lock)))
+
+(defn- git-cache-cleanup-failed!
+  "Preserve the operation failure when transaction cleanup also fails."
+  [dir lock primary cleanup]
+  (throw
+    (ex-info (str "git cache cleanup failed while handling an earlier failure "
+                  dir)
+             {:type ::git-cache-cleanup-failed
+              :path dir :lock lock :stage (git-cache-stage-dir dir)
+              :primary-error primary :cleanup-error cleanup}
+             primary)))
 
 (defn- cache-origin-mismatch!
   [inspection url sha dir]
@@ -408,54 +459,70 @@
                          :inspection inspection}))))))
 
 (defn- fetch-git-while-locked!
-  "The caller owns `lock`. Clone beneath it, then publish with a same-filesystem
-  rename only after checkout and recursive submodule initialisation succeed."
+  "The caller owns `lock`. Clone into the short sibling stage, then publish with
+  a same-filesystem rename only after checkout and recursive submodule
+  initialisation succeed."
   [url sha dir lock]
-  (let [stage (str lock "/checkout")]
-    (try
-      ;; A killed older owner can leave its private staging payload behind if a
-      ;; user elects to remove/recover the lock. Never clone over that residue.
-      (remove-own-cache-path! dir stage)
-      ;; The final target may be an empty/partial checkout from the pre-lock
-      ;; implementation. It is safe to repair only this exact url@sha leaf.
-      (remove-own-cache-path! dir dir)
-      (info "fetching " url " @ " (subs sha 0 (min 12 (count sha))))
-      (when-not (zero? (sh (str "git clone --quiet --origin origin "
-                                (shell-quote url)
-                                " " (shell-quote stage))))
-        (throw (ex-info (str "git clone failed: " url) {:url url :sha sha})))
-      ;; Git canonicalizes a relative/local clone source before storing it in
-      ;; remote.origin.url. Cache identity is the dependency's literal URL, so
-      ;; restore that exact spelling before strict origin validation.
-      (when-not
-        (zero?
-          (sh (str "git -C " (shell-quote stage)
-                   " config --local --replace-all remote.origin.url "
-                   (shell-quote url))))
-        (throw
-          (ex-info (str "could not record literal git origin: " url)
-                   {:url url :sha sha :path stage})))
-      (when-not (zero? (sh (str "git -C " (shell-quote stage)
-                                " checkout --quiet " (shell-quote sha))))
-        (throw (ex-info (str "git checkout failed: " sha " in " url)
-                        {:url url :sha sha})))
-      ;; Submodules are part of the pinned checkout and therefore part of the
-      ;; transaction: a failure must not publish the parent repository.
-      (when-not (zero? (sh (str "git -C " (shell-quote stage)
-                                " submodule update --init --recursive --quiet")))
-        (throw (ex-info (str "git submodule update failed for " url)
-                        {:url url :sha sha})))
-      (when-not (git-checkout-valid? stage sha url)
-        (let [inspection (git-checkout-inspection stage sha url)]
-          (throw (ex-info (str "git checkout validation failed: " url " @ " sha)
-                          {:url url :sha sha :path stage
-                           :inspection inspection}))))
-      (publish-git-checkout! stage dir url sha)
-      (finally
-        ;; On success this removes an empty lock dir. On any failure it removes
-        ;; only this target's private staging tree, leaving no publishable
-        ;; residue for a retry.
-        (remove-own-cache-path! dir lock)))))
+  (let [stage (git-cache-stage-dir dir)
+        outcome
+        (try
+          ;; A killed older owner can leave its private staging payload behind
+          ;; if a user elects to remove/recover the lock. Never clone over that
+          ;; residue.
+          (remove-own-cache-path! dir stage)
+          ;; The final target may be an empty/partial checkout from the pre-lock
+          ;; implementation. It is safe to repair only this exact url@sha leaf.
+          (remove-own-cache-path! dir dir)
+          (info "fetching " url " @ " (subs sha 0 (min 12 (count sha))))
+          (when-not (zero? (sh (str git-command-prefix
+                                    " clone --quiet --origin origin -- "
+                                    (shell-quote url)
+                                    " " (shell-quote stage))))
+            (throw (ex-info (str "git clone failed: " url)
+                            {:url url :sha sha})))
+          ;; Git canonicalizes a relative/local clone source before storing it in
+          ;; remote.origin.url. Cache identity is the dependency's literal URL,
+          ;; so restore that exact spelling before strict origin validation.
+          (when-not
+            (zero?
+              (sh (str git-command-prefix " -C " (shell-quote stage)
+                       " config --local --replace-all remote.origin.url "
+                       (shell-quote url))))
+            (throw
+              (ex-info (str "could not record literal git origin: " url)
+                       {:url url :sha sha :path stage})))
+          (when-not
+            (zero? (sh (str git-command-prefix " -C " (shell-quote stage)
+                            " checkout --quiet " (shell-quote sha))))
+            (throw (ex-info (str "git checkout failed: " sha " in " url)
+                            {:url url :sha sha})))
+          ;; Submodules are part of the pinned checkout and therefore part of
+          ;; the transaction: a failure must not publish the parent repository.
+          (when-not
+            (zero? (sh (str git-command-prefix " -C " (shell-quote stage)
+                            " submodule update --init --recursive --quiet")))
+            (throw (ex-info (str "git submodule update failed for " url)
+                            {:url url :sha sha})))
+          (when-not (git-checkout-valid? stage sha url)
+            (let [inspection (git-checkout-inspection stage sha url)]
+              (throw
+                (ex-info (str "git checkout validation failed: " url " @ " sha)
+                         {:url url :sha sha :path stage
+                          :inspection inspection}))))
+          {:ok? true
+           :value (publish-git-checkout! stage dir url sha)}
+          (catch :default cause
+            {:ok? false :error cause}))]
+    (if (:ok? outcome)
+      (do
+        (release-git-cache-ownership! dir lock)
+        (:value outcome))
+      (let [cause (:error outcome)]
+        (try
+          (release-git-cache-ownership! dir lock)
+          (catch :default cleanup
+            (git-cache-cleanup-failed! dir lock cause cleanup)))
+        (throw cause)))))
 
 (defn- ensure-own-git
   "Return jolt's verified checkout for url@sha. An atomic mkdir is the bounded
@@ -465,7 +532,8 @@
   overwrite its partial state."
   [url sha dir]
   (let [parent (subs dir 0 (.lastIndexOf dir "/"))
-        lock (str dir ".jolt-lock")]
+        lock (git-cache-lock-dir dir)
+        stage (git-cache-stage-dir dir)]
     (when-not (.mkdirs (java.io.File. parent))
       (when-not (.isDirectory (java.io.File. parent))
         (throw (ex-info (str "could not create git cache directory " parent)
@@ -495,6 +563,10 @@
                   (pr-str {:started-ms (System/currentTimeMillis)
                            :sha sha
                            :jolt-version (jolt.host/jolt-version)}))
+            ;; Re-read durable identity and final state after acquiring the lock
+            ;; and before touching an orphan stage. Manual stale-lock recovery
+            ;; or a forced key collision must never turn a pre-lock observation
+            ;; into permission to delete another origin's transaction state.
             (let [owned-claim (git-cache-origin-claim dir url)
                   owned-inspection (git-checkout-inspection dir sha url)]
               (cond
@@ -516,12 +588,14 @@
                   (unowned-cache-entry! owned-inspection url sha dir))
 
                 (and (:valid? owned-inspection) (:matches? owned-claim))
-                (do (remove-own-cache-path! dir lock) dir)
+                (do
+                  (release-git-cache-ownership! dir lock)
+                  dir)
 
                 (:valid? owned-inspection)
                 (do
                   (claim-cache-origin! dir lock url sha)
-                  (remove-own-cache-path! dir lock)
+                  (release-git-cache-ownership! dir lock)
                   dir)
 
                 :else
@@ -530,10 +604,15 @@
                     (claim-cache-origin! dir lock url sha))
                   (fetch-git-while-locked! url sha dir lock))))
             (catch :default cause
-              ;; fetch-git-while-locked! owns its own finally. This branch also
-              ;; covers metadata failure before that transaction starts.
-              (when (file-exists? lock)
-                (remove-own-cache-path! dir lock))
+              ;; A fetch cleans stage before lock. Errors before that transaction
+              ;; may safely release only when no private stage remains. Preserve
+              ;; both failures if this final cleanup attempt also fails.
+              (when (and (file-exists? lock)
+                         (not (file-exists? stage)))
+                (try
+                  (remove-own-cache-path! dir lock)
+                  (catch :default cleanup
+                    (git-cache-cleanup-failed! dir lock cause cleanup))))
               (throw cause)))
 
           (< attempt git-lock-wait-attempts)

@@ -164,7 +164,7 @@ The most useful local x86_64 setup has both of these lanes:
    CI and release packaging.
 
 Install Git for Windows so `C:/Program Files/Git/bin/sh.exe` is present. For the
-MinGW lane install MSYS2 packages `git`, `make`,
+MinGW lane install MSYS2 packages `git`, `make`, `vim` (for `xxd`),
 `mingw-w64-x86_64-gcc`, `mingw-w64-x86_64-lz4`, and
 `mingw-w64-x86_64-zlib`. Keep sibling checkouts of `jolt`, `jolt-net`,
 `jolt-tcp`, `jolt-http`, and `jolt-hegel` under one ordinary Windows directory.
