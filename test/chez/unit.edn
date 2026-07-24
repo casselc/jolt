@@ -278,8 +278,8 @@
   {:suite "javastatic" :expr "(Character/isUpperCase \\a)" :expected "false"}
   {:suite "javastatic" :expr "(Thread/interrupted)" :expected "false"}
   {:suite "javastatic" :expr "(string? (System/getProperty \"os.name\"))" :expected "true"}
-  {:suite "javastatic" :expr "(string? (get (System/getenv) \"HOME\"))" :expected "true"}
-  {:suite "javastatic" :expr "(string? (System/getenv \"HOME\"))" :expected "true"}
+  {:suite "javastatic" :expr "(map? (System/getenv))" :expected "true"}
+  {:suite "javastatic" :expr "(let [home (System/getenv \"HOME\")] (or (nil? home) (string? home)))" :expected "true"}
   {:suite "javastatic" :expr "(fn? System/exit)" :expected "true"}
   {:suite "javastatic" :expr "(string? (get (System/getProperties) \"os.name\"))" :expected "true"}
   {:suite "javastatic" :expr "(pos? (count (seq (System/getenv))))" :expected "true"}
@@ -853,6 +853,7 @@
   {:suite "getenv" :expr "(= (get (System/getenv) \"HOME\") (System/getenv \"HOME\"))" :expected "true"}
   ;; Stage C — setProperty visible in getProperties
   {:suite "sysprops" :expr "(do (System/setProperty \"zz.k\" \"v\") (get (System/getProperties) \"zz.k\"))" :expected "v"}
+  {:suite "sysprops" :label "user.home follows the native host convention" :expr "(pos? (count (System/getProperty \"user.home\")))" :expected "true"}
   {:suite "sorted / subseq laziness" :expr "(first (subseq (into (sorted-map) (map (fn [i] [i i]) (range 100000))) > 50000))" :expected "[50001 50001]"}
   ;; Stage B — nio Files consolidation: members from 6 original blocks (files-statics,
   ;; files-nofollow-time, files-throwing-setters, files-create+move, files-final, files-nofollow)
@@ -872,13 +873,54 @@
                _  (Files/copy fp gp (into-array java.nio.file.CopyOption []))  ;; files-final (copy)
                cpsz (Files/size gp)                               ;; copy preserved size
                gp2 (.resolve d (Paths/get \"h\" (into-array String [])))
-               _  (Files/move gp gp2 (into-array java.nio.file.CopyOption []))  ;; files-create+move (move)
+               _  (Files/write gp2 (.getBytes \"old\") (into-array java.nio.file.OpenOption []))
+               _  (Files/move gp gp2 (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))  ;; files-create+move (replace)
                mvsz (Files/size gp2)                              ;; move preserved size
                _  (Files/delete fp)
                _  (Files/delete gp2)
                _  (Files/deleteIfExists d)]
            [sz ex mt cpsz mvsz (pos? sz)])))"
    :expected "[5 true 1000 5 5 true]"}
+  {:suite "nio-files" :label "move replace-existing preserves empty-directory behavior"
+   :expr "(let [s (java.io.File/createTempFile \"jns\" \".d\")
+                d (java.io.File/createTempFile \"jnd\" \".d\")
+                _ (.delete s)
+                _ (.delete d)
+                _ (.mkdir s)
+                _ (.mkdir d)
+                sp (Paths/get (.getPath s) (into-array String []))
+                dp (Paths/get (.getPath d) (into-array String []))
+                _ (Files/move sp dp (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+                result [(.exists d) (.isDirectory d) (.exists s)]]
+            (.delete d)
+            result)"
+   :expected "[true true false]"}
+  {:suite "nio-files" :label "Windows atomic directory replacement fails before mutation"
+   :expr "(if (= :windows (:os (jolt.host/target)))
+            (let [s (java.io.File/createTempFile \"jna\" \".d\")
+                  d (java.io.File/createTempFile \"jnb\" \".d\")
+                  _ (.delete s)
+                  _ (.delete d)
+                  _ (.mkdir s)
+                  _ (.mkdir d)
+                  sp (Paths/get (.getPath s) (into-array String []))
+                  dp (Paths/get (.getPath d) (into-array String []))
+                  error (try
+                          (Files/move sp dp
+                            (into-array java.nio.file.CopyOption
+                              [java.nio.file.StandardCopyOption/REPLACE_EXISTING
+                               java.nio.file.StandardCopyOption/ATOMIC_MOVE]))
+                          nil
+                          (catch Throwable e e))
+                  result (and (= \"class java.nio.file.AtomicMoveNotSupportedException\"
+                                 (str (class error)))
+                              (.isDirectory s)
+                              (.isDirectory d))]
+              (.delete s)
+              (.delete d)
+              result)
+            true)"
+   :expected "true"}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44* 0) (set! *set-u44* 9))" :expected :throws}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44b* 0) [(binding [*set-u44b* 99] (set! *set-u44b* 42) *set-u44b*) *set-u44b*])" :expected "[42 0]"}
   {:suite "vars / binding dynamic" :expr "(do (def not-dyn-u44 0) (binding [not-dyn-u44 1] not-dyn-u44))" :expected :throws}
@@ -894,7 +936,7 @@
   {:suite "target" :label "drive-relative paths remain relative" :expected "false" :expr "(jolt.host/absolute-path? \"C:tmp/x\")"}
   {:suite "target" :label "File and Path share host absolute-path semantics" :expected "true" :expr "(let [p \"C:/tmp/x\" expected (jolt.host/absolute-path? p)] (= expected (.isAbsolute (java.io.File. p)) (.isAbsolute (java.nio.file.Paths/get p (make-array String 0)))))"}
   {:suite "ffi" :label "defcfn preserves composable collect-safe and variadic options" :expected "true" :expr "(do (require 'jolt.ffi) (= '(def test-fcntl (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int {:blocking true :varargs-after 2})) (macroexpand-1 '(jolt.ffi/defcfn test-fcntl \"fcntl\" [:int :int :int] :int {:blocking true :varargs-after 2}))))"}
-  {:suite "add-deps" :label "inline :local/root dep becomes requirable" :expected ":pong" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/adddep\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/adddep/core.clj\") \"(ns adddep.core) (defn ping [] :pong)\") (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) (require 'adddep.core) ((resolve 'adddep.core/ping))))"}
+  {:suite "add-deps" :label "inline :local/root dep becomes requirable" :expected ":pong" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\") src (java.nio.file.Paths/get (str d \"/src/adddep\") (into-array String []))] (java.nio.file.Files/createDirectories src (into-array java.nio.file.attribute.FileAttribute [])) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/adddep/core.clj\") \"(ns adddep.core) (defn ping [] :pong)\") (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) (require 'adddep.core) ((resolve 'adddep.core/ping))))"}
   {:suite "add-deps" :label "added roots append after existing roots" :expected "true" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\") before (vec (jolt.host/source-roots)) _ (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) after (vec (jolt.host/source-roots))] (= before (vec (take (count before) after)))))"}
   {:suite "m2-repo" :label "JOLT_LOCAL_REPO wins, then :mvn/local-repo, then HOME/.m2" :expected "true" :expr "(do (require 'jolt.deps) (let [m2 @#'jolt.deps/m2-repo-dir] (and (= \"/o\" (m2 \"/o\" \"/cfg\" \"/h\")) (= \"/cfg\" (m2 nil \"/cfg\" \"/h\")) (= \"/h/.m2/repository\" (m2 nil nil \"/h\")))))"}
   {:suite "git-url-inference" :label "io.github.OWNER/REPO -> github https .git" :expected "https://github.com/paintparty/lasertag.git" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'io.github.paintparty/lasertag))"}

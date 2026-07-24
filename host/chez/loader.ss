@@ -384,7 +384,9 @@
 ;; (embedded in the binary) and bypassed on :reload / :reload-all (live editing).
 (define (aot-cache-dir)
   (or (getenv "JOLT_CACHE_DIR")
-      (string-append (or (getenv "HOME") ".") "/.jolt/aot-cache")))
+      (string-append (let ((home (jolt-home-directory)))
+                       (if (string=? home "") "." home))
+                     "/.jolt/aot-cache")))
 ;; Default ON — a built jolt benefits every run (ys-style startup pulling many
 ;; library namespaces). JOLT_AOT_CACHE=0/false/no/off opts out. The dev bin/jolt
 ;; script exports JOLT_AOT_CACHE=0, so source-mode dev (a volatile compiler whose
@@ -692,8 +694,8 @@
             ;; corrupt the running program's stdout.
             (parameterize ((current-output-port (open-output-string)))
               (compile-file tmp-scm tmp-so))
-            (rename-file tmp-scm scm)
-            (rename-file tmp-so so))
+            (jolt-replace-file! tmp-scm scm)
+            (jolt-replace-file! tmp-so so))
           (unless (file-exists? so)
             (aot-info (string-append "no .so produced for " name))))))))
 ;; A truncated/corrupt .so (a killed process left a partial write, or a concurrent
@@ -979,8 +981,15 @@
 (define (jolt-runtime-shell-command cmd)
   (if (jolt-windows-machine-type? (machine-type))
       (let ((f (jolt-runtime-sh-script cmd)))
-        (values (string-append (jolt-cmd-quote (jolt-runtime-sh-program))
-                               " " (jolt-cmd-quote f))
+        ;; cmd.exe /c strips the first and last quote when a command begins with
+        ;; a quoted executable. Wrap the complete, already token-quoted command
+        ;; in one more pair:  ""C:\...\sh.exe" "C:\...\script.sh""
+        ;; This is cmd's canonical executable-path-with-spaces form and keeps the
+        ;; POSIX command text entirely out of cmd's parser.
+        (values (string-append "\""
+                               (jolt-cmd-quote (jolt-runtime-sh-program))
+                               " " (jolt-cmd-quote f)
+                               "\"")
                 f))
       (values cmd #f)))
 (define (jolt-runtime-delete-script f)

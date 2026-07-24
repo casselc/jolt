@@ -442,7 +442,7 @@
           (with-port (open-output-file tmp 'replace)
             (lambda (port) (put-string port text)))
           (guard (e (#t (guard (_ (#t #f)) (delete-file tmp)) (raise e)))
-            (rename-file tmp p))))
+            (jolt-replace-file! tmp p))))
     jolt-nil))
 
 (define (jolt-flush) (flush-output-port (current-output-port)) jolt-nil)
@@ -649,8 +649,7 @@
 (define temp-file-counter 0)
 (define (file-create-temp prefix suffix . dir)
   (let* ((d (cond ((pair? dir) (file-path-of (car dir)))
-                  ((getenv "TMPDIR") => (lambda (t) t))
-                  (else "/tmp")))
+                  (else (jolt-temp-directory))))
          (sfx (if (or (null? (list suffix)) (jolt-nil? suffix)) ".tmp" (jolt-str-render-one suffix))))
     (let ((n (with-mutex io-counter-mutex
               (set! temp-file-counter (+ temp-file-counter 1))
