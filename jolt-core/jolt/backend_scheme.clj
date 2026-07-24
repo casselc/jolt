@@ -562,12 +562,19 @@
 ;; compile-time literals from the analyzer, so this emits a real typed binding;
 ;; the resulting Scheme procedure is callable like any jolt fn. The library must
 ;; have loaded the shared object (jolt.ffi/load-library) before this def runs.
+;; MUST stay in lockstep with ffi-type->chez in host/chez/java/ffi.ss: this table is
+;; the compile-time half (foreign-procedure signatures) and that one is the runtime
+;; half (foreign-ref/set!). A type present in only one of them fails asymmetrically
+;; -- defcfn compiles but ffi/read rejects it, or the reverse.
 (def ^:private ffi-types
   {"int" "int" "uint" "unsigned-int" "long" "long" "ulong" "unsigned-long"
+   "int16" "integer-16" "short" "integer-16"
+   "uint16" "unsigned-16" "ushort" "unsigned-16"
    "int64" "integer-64" "uint64" "unsigned-64" "size_t" "size_t" "ssize_t" "ssize_t"
    "iptr" "iptr" "uptr" "uptr" "double" "double" "float" "float"
    "pointer" "void*" "void*" "void*" "string" "string" "void" "void"
-   "uint8" "unsigned-8" "u8" "unsigned-8" "byte" "unsigned-8" "char" "char"})
+   "uint8" "unsigned-8" "u8" "unsigned-8" "byte" "unsigned-8" "char" "char"
+   "int8" "integer-8" "i8" "integer-8"})
 (defn- ffi-type->chez [t]
   (or (ffi-types t) (throw (ex-info (str "jolt.ffi: unknown foreign type :" t) {}))))
 (defn- emit-ffi-fn [node]
