@@ -57,7 +57,7 @@
 ;; Paths.get(first, more...) — join with the separator, no normalization. The
 ;; varargs `more` arrives as a jolt String[] (from into-array); spread it.
 (define (npath-spread-args args)
-  (apply append (map (lambda (x) (if (jolt-array? x) (vector->list (jolt-array-vec x)) (list x))) args)))
+  (apply append (map (lambda (x) (if (jolt-array? x) (ja->list (jolt-array-vec x)) (list x))) args)))
 (define (npath-get first . more)
   (let ((s (fold-left (lambda (acc x)
                         (let ((p (npath-string-of x)))
@@ -343,7 +343,7 @@
         (cons "size"          (lambda (p . _) (nio-size (nfp p))))
         (cons "delete"        (lambda (p) (nio-delete1 (nfp p) #f) jolt-nil))
         (cons "deleteIfExists"(lambda (p) (nio-delete1 (nfp p) #t)))
-        (cons "readAllBytes"  (lambda (p) (make-jolt-array (list->vector (bytevector->u8-list (nio-read-bv (nfp p)))) 'byte)))
+        (cons "readAllBytes"  (lambda (p) (na-byte-array (nio-read-bv (nfp p)))))
         (cons "readAllLines"  (lambda (p . _) (nio-read-lines (nfp p))))
         (cons "newInputStream"(lambda (p . _) (make-in-stream (open-file-input-port (nfp p)))))
         (cons "createTempFile"      (lambda args (nio-files-create-temp args #f)))

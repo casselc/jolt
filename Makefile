@@ -138,6 +138,7 @@ cts: testbin
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+	@CHEZ="$(CHEZ)" sh test/chez/ffi-aggregate-test.sh
 
 # OPT-IN evidence probes. ffistress is a POSIX-only bounded concurrent
 # collect-safe/native call reduction; executorprobe characterizes the live

@@ -132,6 +132,8 @@
 
 ;; byte-array buffer I/O: write a byte-array into foreign memory and read it back
 ;; byte-exact (high bytes preserved, no UTF-8 mangling).
+(ok "byte-array uses an unboxed Chez bytevector backing"
+    (bytevector? (jolt-array-vec (ev "(byte-array [0 128 255])"))))
 (ok "byte-array roundtrip (binary-faithful)"
     (jolt-truthy?
       (ev "(let [src (byte-array [0 65 200 255 10])
@@ -206,6 +208,16 @@
     (jolt-truthy?
       (ev "(try (jolt.ffi/read-array 0 -1) false
                 (catch IndexOutOfBoundsException _ true))")))
+(ok "bulk transfer preserves a large binary payload"
+    (jolt-truthy?
+      (ev "(let [n 65536
+                  src (byte-array (map #(bit-and % 255) (range n)))
+                  dst (byte-array n)
+                  p (jolt.ffi/alloc n)]
+              (jolt.ffi/write-array p src)
+              (jolt.ffi/read-array! p n dst 0)
+              (jolt.ffi/free p)
+              (= (vec src) (vec dst)))")))
 
 ;; a :blocking foreign call is collect-safe: a thread parked in it must not pin
 ;; the stop-the-world collector. (collect) here would throw "cannot collect when

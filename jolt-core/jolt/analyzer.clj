@@ -589,13 +589,74 @@
 ;; (typed marshaling, no runtime eval). A :blocking call is emitted __collect_safe
 ;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
 ;; must not pin the stop-the-world collector. A leaf IR node.
+(defn- ffi-primitive-type [form context]
+  (when-not (form-keyword? form)
+    (throw (str "jolt.ffi/" context " expects a foreign type keyword, got "
+                (pr-str form))))
+  (name form))
+
+(declare analyze-ffi-type)
+
+(defn- analyze-ffi-struct [form]
+  (when-not (form-vec? form)
+    (throw (str "jolt.ffi struct descriptor must be [:struct [[field type] ...]], got "
+                (pr-str form))))
+  (let [items (vec (form-vec-items form))]
+    (when-not (and (= 2 (count items))
+                   (form-keyword? (nth items 0))
+                   (= "struct" (name (nth items 0)))
+                   (form-vec? (nth items 1)))
+      (throw (str "jolt.ffi struct descriptor must be [:struct [[field type] ...]], got "
+                  (pr-str form))))
+    (let [field-forms (vec (form-vec-items (nth items 1)))]
+      (when (empty? field-forms)
+        (throw "jolt.ffi struct descriptor must contain at least one field"))
+      {:ffi-kind :struct
+       :fields
+       (mapv
+        (fn [field]
+          (when-not (form-vec? field)
+            (throw (str "jolt.ffi struct field must be [name type], got "
+                        (pr-str field))))
+          (let [parts (vec (form-vec-items field))]
+            (when-not (= 2 (count parts))
+              (throw (str "jolt.ffi struct field must be [name type], got "
+                          (pr-str field))))
+            (let [field-name (nth parts 0)]
+              (when-not (or (form-keyword? field-name) (form-sym? field-name))
+                (throw (str "jolt.ffi struct field name must be a keyword or symbol, got "
+                            (pr-str field-name))))
+              {:name (if (form-keyword? field-name)
+                       (name field-name)
+                       (form-sym-name field-name))
+               :type (analyze-ffi-type (nth parts 1) false)})))
+        field-forms)})))
+
+(defn- analyze-ffi-type [form allow-by-value?]
+  (if (form-keyword? form)
+    (ffi-primitive-type form "foreign-fn")
+    (if (form-vec? form)
+      (let [items (vec (form-vec-items form))]
+        (if (and allow-by-value?
+                 (= 2 (count items))
+                 (form-keyword? (nth items 0))
+                 (= "by-value" (name (nth items 0))))
+          {:ffi-kind :by-value
+           :type (analyze-ffi-struct (nth items 1))}
+          (analyze-ffi-struct form)))
+      (throw (str "jolt.ffi foreign type must be a keyword or aggregate descriptor, got "
+                  (pr-str form))))))
+
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
     (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking])")))
   {:op :ffi-fn
    :csym (nth items 1)
-   :argtypes (mapv name (form-vec-items (nth items 2)))
-   :rettype (name (nth items 3))
+   :argtypes (mapv #(analyze-ffi-type % true)
+                   (form-vec-items (nth items 2)))
+   ;; Aggregate returns require a different wrapper ownership contract. Reject
+   ;; them until that contract is explicit rather than silently choosing one.
+   :rettype (ffi-primitive-type (nth items 3) "foreign-fn return")
    :blocking (and (= 5 (count items)) (= "blocking" (name (nth items 4))))})
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
@@ -616,8 +677,11 @@
     (throw (str "jolt.ffi/foreign-callable expects (foreign-callable f [argtypes] rettype [:collect-safe])")))
   {:op :ffi-callable
    :fn (analyze ctx (nth items 1) env)
-   :argtypes (mapv name (form-vec-items (nth items 2)))
-   :rettype (name (nth items 3))
+   ;; Callback aggregate ownership/lifetime is distinct from outbound calls;
+   ;; keep the first aggregate slice deliberately one-way.
+   :argtypes (mapv #(ffi-primitive-type % "foreign-callable")
+                   (form-vec-items (nth items 2)))
+   :rettype (ffi-primitive-type (nth items 3) "foreign-callable return")
    :collect-safe (and (= 5 (count items)) (= "collect-safe" (name (nth items 4))))})
 
 ;; The `.` special form: `(. target member arg*)` — member access / method call.
