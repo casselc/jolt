@@ -51,9 +51,11 @@ hostclass:
 corpus:
 	@$(CHEZ) --script host/chez/run-corpus.ss
 
-# Host-specific unit cases.
+# Host-specific unit cases. This is a source-mode dev runner, so keep its
+# dynamically-created fixture namespaces out of the persistent AOT cache just as
+# bin/joltc does; the dedicated aotcachesmoke target covers cache behavior.
 unit:
-	@$(CHEZ) --script host/chez/run-unit.ss
+	@JOLT_AOT_CACHE=0 $(CHEZ) --script host/chez/run-unit.ss
 
 # Real-CLI smoke over bin/joltc.
 # smoke and cts spawn a joltc process per case; a prebuilt binary boots ~10x
