@@ -646,12 +646,15 @@
     (spit (str lock "/owner.edn")
           (pr-str {:started-ms (System/currentTimeMillis)
                    :fixture :healthy-slow-owner}))
-    (let [owner (future
+    (let [begin-owner (promise)
+          owner (future
+                  @begin-owner
                   (Thread/sleep 10500)
                   (sh! (str "git clone --quiet " (shell-quote url) " "
                             (shell-quote target)))
                   target)
-          started (System/currentTimeMillis)]
+          started (System/currentTimeMillis)
+          _ (deliver begin-owner true)]
       (check= target (ensure-git 'fixture/slow-owner url sha)
               "waiter observes a healthy owner after more than ten seconds")
       (check (>= (- (System/currentTimeMillis) started) 10000)
