@@ -663,8 +663,8 @@
           ;; cd's to the repo root and resets PWD, but preserves the user's cwd in
           ;; JOLT_PWD — prefer it so user.dir and spawned-child cwds agree.
           ((string=? k "user.dir") (or (getenv "JOLT_PWD") (getenv "PWD") "."))
-          ((string=? k "user.home") (or (getenv "HOME") ""))
-          ((string=? k "java.io.tmpdir") (or (getenv "TMPDIR") "/tmp"))
+          ((string=? k "user.home") (jolt-home-directory))
+          ((string=? k "java.io.tmpdir") (jolt-temp-directory))
           ((pair? dflt) (car dflt))
           (else jolt-nil))))
 (define (sys-properties-map)
@@ -673,17 +673,65 @@
                              "line.separator" sys-line-separator
                              "file.separator" target-file-separator
                              "path.separator" target-path-separator
-                             "user.dir" (or (getenv "JOLT_PWD") (getenv "PWD") ".") "user.home" (or (getenv "HOME") "")
-                             "java.io.tmpdir" (or (getenv "TMPDIR") "/tmp"))))
+                             "user.dir" (or (getenv "JOLT_PWD") (getenv "PWD") ".") "user.home" (jolt-home-directory)
+                             "java.io.tmpdir" (jolt-temp-directory))))
     (for-each
       (lambda (kv)
         (set! base (jolt-assoc base (car kv) (cdr kv))))
       (vector->list (hashtable-cells sys-prop-table)))
     base))
 
-;; full environment as an alist of (name . value), via env -0 (NUL-separated,
-;; fixes multi-line values that the old line-based parse broke).
-(define (all-env-pairs)
+;; Full environment as an alist of (name . value). POSIX uses env -0
+;; (NUL-separated, so multi-line values survive). Native Windows cannot assume
+;; an env.exe is on PATH: use the UTF-16 process environment block instead.
+(define win-get-environment-strings
+  (jolt-winapi-proc-safe "GetEnvironmentStringsW" '() 'void*))
+(define win-free-environment-strings
+  (jolt-winapi-proc-safe "FreeEnvironmentStringsW" '(void*) 'int))
+
+(define (env-entry->pair s)
+  (let ((n (string-length s)))
+    (let loop ((i 0))
+      (cond ((= i n) #f)
+            ((char=? (string-ref s i) #\=)
+             ;; Windows includes internal drive-current-directory entries such
+             ;; as =C:=C:\path. They are not user environment variables.
+             (and (> i 0)
+                  (cons (substring s 0 i) (substring s (+ i 1) n))))
+            (else (loop (+ i 1)))))))
+
+(define (windows-env-entry block start end)
+  (let ((bv (make-bytevector (* 2 (- end start)))))
+    (let loop ((i start))
+      (when (< i end)
+        (bytevector-u16-set! bv (* 2 (- i start))
+                             (foreign-ref 'unsigned-short block (* 2 i))
+                             (endianness little))
+        (loop (+ i 1))))
+    (utf16->string bv (endianness little))))
+
+(define (windows-env-pairs)
+  (unless (and win-get-environment-strings win-free-environment-strings)
+    (error 'System/getenv "native Windows environment API unavailable"))
+  (let ((block (win-get-environment-strings)))
+    (when (or (not block) (eq? block 0))
+      (error 'System/getenv "GetEnvironmentStringsW failed"))
+    (dynamic-wind
+      (lambda () (void))
+      (lambda ()
+        (let loop ((i 0) (start 0) (acc '()))
+          (let ((u16 (foreign-ref 'unsigned-short block (* 2 i))))
+            (if (= u16 0)
+                (if (= i start)
+                    (reverse acc)
+                    (let ((pair (env-entry->pair
+                                  (windows-env-entry block start i))))
+                      (loop (+ i 1) (+ i 1)
+                            (if pair (cons pair acc) acc))))
+                (loop (+ i 1) start acc)))))
+      (lambda () (win-free-environment-strings block)))))
+
+(define (posix-env-pairs)
   (call-with-values
     (lambda () (open-process-ports "env -0" (buffer-mode block) (native-transcoder)))
     (lambda (stdin stdout stderr pid)
@@ -693,28 +741,23 @@
         (let loop ((i 0) (start 0) (acc '()))
           (cond ((= i (string-length s))
                  (reverse (if (> i start)
-                              (let ((eq (let scan ((j start))
-                                          (cond ((= j i) #f)
-                                                ((char=? (string-ref s j) #\=) j)
-                                                (else (scan (+ j 1)))))))
-                                (if eq (cons (cons (substring s start eq)
-                                                   (substring s (+ eq 1) i))
-                                             acc)
-                                    acc))
+                              (let ((pair (env-entry->pair
+                                            (substring s start i))))
+                                (if pair (cons pair acc) acc))
                               acc)))
                 ((char=? (string-ref s i) (integer->char 0))
                  (let ((entry (if (> i start)
-                                  (let ((eq (let scan ((j start))
-                                              (cond ((= j i) #f)
-                                                    ((char=? (string-ref s j) #\=) j)
-                                                    (else (scan (+ j 1)))))))
-                                    (if eq (cons (cons (substring s start eq)
-                                                       (substring s (+ eq 1) i))
-                                                 acc)
-                                        acc))
+                                  (let ((pair (env-entry->pair
+                                                (substring s start i))))
+                                    (if pair (cons pair acc) acc))
                                   acc)))
                    (loop (+ i 1) (+ i 1) entry)))
                 (else (loop (+ i 1) start acc))))))))
+
+(define (all-env-pairs)
+  (if (jolt-windows-machine-type? (machine-type))
+      (windows-env-pairs)
+      (posix-env-pairs)))
 ;; JOLT_BAKE_ENV_ALLOWLIST: when set, only the listed comma-separated
 ;; names are served; unset (the normal case) reads are live and unfiltered.
 (define (env-allowlist)

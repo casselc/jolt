@@ -15,20 +15,19 @@
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 export JOLT_PWD="${JOLT_PWD:-$PWD}"
 
-# Identify the Chez Scheme executable
-while read -r CHEZ
+# Identify the Chez executable. Official/source installs commonly expose
+# `scheme`, while some distributions and CI shims use `chez` or `chezscheme`.
+CHEZ=
+for candidate in chez chezscheme scheme petite
 do
-    if [ `which ${CHEZ}` ]
+    if command -v "$candidate" >/dev/null 2>&1
     then
-	break;
+        CHEZ="$(command -v "$candidate")"
+        break
     fi
-done <<EOF
-chez
-chezscheme
-EOF
+done
 
-# If we failed to find one, whinge and exit.
-if [ ! `which ${CHEZ}` ]
+if [ -z "$CHEZ" ]
 then
     echo "No valid Chez Scheme executable found: please install Chez Scheme."
     exit 1
@@ -65,11 +64,11 @@ fi
 # The devcache entry is a checked-in script sharing cli.ss's tail (cli-tail.ss)
 # — an inline heredoc here once drifted from cli.ss and broke project commands.
 if [ "$use_cache" = 1 ]; then
-  exec ${CHEZ} --script host/chez/cli-devcache.ss "$@"
+  exec "$CHEZ" --script host/chez/cli-devcache.ss "$@"
 fi
 
 # Fallback: source mode. Hint for devs (only when interactive).
 if [ -t 1 ] && [ -z "${JOLT_QUIET:-}" ]; then
   echo "joltc: source mode; run 'make devboot' to precompile" >&2
 fi
-exec ${CHEZ} --script host/chez/cli.ss "$@"
+exec "$CHEZ" --script host/chez/cli.ss "$@"

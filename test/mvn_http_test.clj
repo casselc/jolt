@@ -14,6 +14,7 @@
 (def parse-response   (var jolt.mvn-http/parse-response))
 (def dechunk          (var jolt.mvn-http/dechunk))
 (def ctl-free?        (var jolt.mvn-http/ctl-free?))
+(def write-bytes      (var jolt.mvn-http/write-bytes-to-file))
 
 (def ^:private fails (atom []))
 (defn- ok= [expected actual label]
@@ -75,7 +76,16 @@
   (let [r (parse-response (bytes-of "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"))]
     (ok= "hello" (String. ^bytes (:body r) "ISO-8859-1") "parse-response chunked body")
     (ok= nil (:content-length r) "parse-response chunked ignores content-length"))
-  (throws #(parse-response (bytes-of "no header terminator here")) "parse-response no terminator throws"))
+  (throws #(parse-response (bytes-of "no header terminator here")) "parse-response no terminator throws")
+
+  ;; Publication replaces an existing destination in one filesystem operation;
+  ;; this catches the Windows rename-over-existing boundary without networking.
+  (let [f (java.io.File/createTempFile "jolt-mvn-http" ".jar")
+        path (.getPath f)]
+    (spit f "old")
+    (write-bytes path (bytes-of "new"))
+    (ok= "new" (slurp f) "download publication replaces destination")
+    (.delete f)))
 
 (defn -main [& _]
   (run)

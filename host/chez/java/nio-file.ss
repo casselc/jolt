@@ -317,7 +317,7 @@
 
 (define nio-temp-counter 0)
 (define nio-temp-mutex (make-mutex))
-(define (nio-tmp-dir) (or (getenv "TMPDIR") "/tmp"))
+(define (nio-tmp-dir) (jolt-temp-directory))
 ;; A temp path in `dir` (default the system temp dir), unique across processes
 ;; via now-millis + a retry counter, like java.nio.file's createTemp*.
 (define (nio-temp-path dir prefix suffix)
@@ -689,13 +689,12 @@
             ((string=? (substring m i (+ i 3)) "osx") #t)
             (else (loop (+ i 1)))))))
 ;; struct stat field offsets are platform ABIs, not portable: verified for
-;; Darwin (st_mode@4/st_uid@16, all arches) and x86_64 Linux glibc
-;; (st_mode@24/st_uid@28 -- ground-truthed via offsetof probes). aarch64 Linux
-;; DIFFERS (st_mode@16/st_uid@24), and other hosts are unknown -- reading the
-;; hardcoded offsets there returns garbage, so the mode/uid readers throw a
-;; clear error instead. st_mtim@88 is identical on both Linux ABIs, so the
-;; mtime readers stay unguarded. Add a verified branch (not a guess) when a
-;; new host is brought up.
+;; Darwin (st_mode@4/st_uid@16, all arches), x86_64 Linux glibc
+;; (st_mode@24/st_uid@28), and aarch64 Linux glibc
+;; (st_mode@16/st_uid@24), all ground-truthed via offsetof probes. Other hosts
+;; are unknown: reading guessed offsets returns garbage, so the mode/uid readers
+;; throw a clear error instead. st_mtim@88 is identical on both Linux ABIs, so
+;; the mtime readers stay unguarded. Add a verified branch for every new ABI.
 (define nio-x86-64-linux?
   (let* ((m (symbol->string (machine-type))) (n (string-length m)))
     (and (>= n 2) (string=? (substring m (- n 2) n) "le")
@@ -703,7 +702,15 @@
            (cond ((> (+ i 2) n) #f)
                  ((string=? (substring m i (+ i 2)) "a6") #t)
                  (else (loop (+ i 1))))))))
-(define nio-stat-layout-known? (or nio-macos? nio-x86-64-linux?))
+(define nio-aarch64-linux?
+  (let* ((m (symbol->string (machine-type))) (n (string-length m)))
+    (and (>= n 2) (string=? (substring m (- n 2) n) "le")
+         (let loop ((i 0))
+           (cond ((> (+ i 5) n) #f)
+                 ((string=? (substring m i (+ i 5)) "arm64") #t)
+                 (else (loop (+ i 1))))))))
+(define nio-stat-layout-known?
+  (or nio-macos? nio-x86-64-linux? nio-aarch64-linux?))
 (define (nio-stat-layout-guard! who)
   (unless nio-stat-layout-known?
     (jolt-throw (jolt-host-throwable "java.lang.UnsupportedOperationException"
@@ -717,9 +724,13 @@
          (nio-stat-layout-guard! "getPosixFilePermissions")
          (let ((buf (make-bytevector 256 0)))
            (and (= 0 (c-stat fp buf))
-                (if nio-macos?
-                    (bytevector-u16-ref buf 4 (native-endianness))
-                    (bytevector-u32-ref buf 24 (native-endianness))))))))
+                (cond
+                  (nio-macos?
+                   (bytevector-u16-ref buf 4 (native-endianness)))
+                  (nio-aarch64-linux?
+                   (bytevector-u32-ref buf 16 (native-endianness)))
+                  (else
+                   (bytevector-u32-ref buf 24 (native-endianness)))))))))
 (define (nio-cstr buf)                          ; buf up to the first NUL, as a string
   (let loop ((i 0))
     (cond ((>= i (bytevector-length buf)) (utf8->string buf))
@@ -807,6 +818,25 @@
           (else (loop (nio-parent-of p) (cons p acc))))))
 ;; is the dest present as a link (even broken) or a real file?
 (define (nio-dest-present? d) (or (file-exists? d) (nio-is-symlink? d)))
+(define (nio-replace-move! s d atomic?)
+  ;; POSIX rename handles file and empty-directory replacement in one operation.
+  ;; MoveFileExW cannot replace a directory, so native Windows retains the
+  ;; delete+rename compatibility path only when ATOMIC_MOVE was not requested.
+  ;; Never silently turn an explicit atomic request into a visibility gap.
+  (let ((windows-directory-fallback?
+         (and (jolt-windows-machine-type? (machine-type))
+              (or (file-directory? s)
+                  (and (nio-dest-present? d) (file-directory? d))))))
+    (if (not windows-directory-fallback?)
+        (jolt-replace-file! s d)
+        (begin
+          (when atomic?
+            (jolt-throw
+              (jolt-host-throwable
+                "java.nio.file.AtomicMoveNotSupportedException"
+                "ATOMIC_MOVE cannot replace a directory on native Windows")))
+          (when (nio-dest-present? d) (nio-delete1 d #t))
+          (rename-file s d)))))
 (let ((files-create+move
        (list
         (cons "createDirectory" (lambda (p . attrs) (mkdir (nfp p)) (nio-apply-attrs-umask! (nfp p) attrs) (->path p)))
@@ -823,9 +853,14 @@
                          (cond
                            ((string=? s d) (->path dst))
                            ((and (nio-dest-present? d) (not (nio-opts-have? opts copt-sym 'replace-existing)))
-                            (jolt-throw (jolt-ex-info (string-append d " already exists") empty-pmap)))
-                           (else (when (nio-dest-present? d) (nio-delete1 d #t))
-                                 (rename-file s d) (->path dst)))))))))
+                           (jolt-throw (jolt-ex-info (string-append d " already exists") empty-pmap)))
+                           ((nio-opts-have? opts copt-sym 'replace-existing)
+                            (nio-replace-move!
+                              s d
+                              (nio-opts-have? opts copt-sym 'atomic-move))
+                            (->path dst))
+                           (else
+                            (rename-file s d) (->path dst)))))))))
   (set! files-accum (append files-accum files-create+move)))
 
 ;; ---- nofollow timestamps (the link's own mtime, via lstat/lutimes) ----------
@@ -936,7 +971,13 @@
   (and c-stat (begin
                 (nio-stat-layout-guard! "getOwner")
                 (let ((buf (make-bytevector 256 0)))
-                  (and (= 0 (c-stat fp buf)) (bytevector-u32-ref buf (if nio-macos? 16 28) (native-endianness)))))))
+                  (and (= 0 (c-stat fp buf))
+                       (bytevector-u32-ref
+                         buf
+                         (cond (nio-macos? 16)
+                               (nio-aarch64-linux? 24)
+                               (else 28))
+                         (native-endianness)))))))
 (define (nio-uid->name uid)
   (and c-getpwuid (let ((pw (c-getpwuid uid))) (and (not (= 0 pw)) (nio-cstr-at (foreign-ref 'iptr pw 0))))))
 ;; user-principal values compare and hash by name; getOwner honors NOFOLLOW.
@@ -948,7 +989,13 @@
   (and c-lstat (begin
                  (nio-stat-layout-guard! "getOwner")
                  (let ((buf (make-bytevector 256 0)))
-                   (and (= 0 (c-lstat fp buf)) (bytevector-u32-ref buf (if nio-macos? 16 28) (native-endianness)))))))
+                   (and (= 0 (c-lstat fp buf))
+                        (bytevector-u32-ref
+                          buf
+                          (cond (nio-macos? 16)
+                                (nio-aarch64-linux? 24)
+                                (else 28))
+                          (native-endianness)))))))
 (let ((files-owner2
        (list (cons "getOwner" (lambda (p . opts)
                                 (let* ((fp (nfp p))
