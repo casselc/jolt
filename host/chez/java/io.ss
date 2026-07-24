@@ -97,12 +97,32 @@
          0)
         (else (system (string-append "chmod 755 '" path "'")))))))
 
+;; True when p is absolute on the running host.  POSIX uses a leading slash.
+;; Windows additionally accepts drive-rooted paths (C:/x or C:\x) and
+;; root/UNC paths beginning with a backslash.  A drive-relative path such as
+;; C:foo remains relative, matching java.io.File.
+(define (jolt-ascii-alpha? c)
+  (or (and (char>=? c #\a) (char<=? c #\z))
+      (and (char>=? c #\A) (char<=? c #\Z))))
+(define (jolt-path-absolute? p)
+  (let ((n (string-length p))
+        (windows? (jolt-windows-machine-type? (machine-type))))
+    (and (> n 0)
+         (or (char=? (string-ref p 0) #\/)
+             (and windows?
+                  (or (char=? (string-ref p 0) #\\)
+                      (and (>= n 3)
+                           (jolt-ascii-alpha? (string-ref p 0))
+                           (char=? (string-ref p 1) #\:)
+                           (or (char=? (string-ref p 2) #\/)
+                               (char=? (string-ref p 2) #\\)))))))))
+
 ;; A user-facing relative path resolves against JOLT_PWD — the user's cwd before
 ;; the launcher cd'd to the jolt repo root — matching the JVM, where io/file is
 ;; cwd-relative. (io/resource builds jfiles from the source roots directly, so it
 ;; isn't routed through here.)
 (define (project-relative p)
-  (if (or (= (string-length p) 0) (char=? (string-ref p 0) #\/))
+  (if (or (= (string-length p) 0) (jolt-path-absolute? p))
       p
       (let ((pwd (getenv "JOLT_PWD")))
         (if (and pwd (> (string-length pwd) 0)) (string-append pwd "/" p) p))))
@@ -234,7 +254,7 @@
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
-      ((string=? name "isAbsolute")     (list (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/)) #t #f)))
+      ((string=? name "isAbsolute")     (list (jolt-path-absolute? p)))
       ((string=? name "listFiles")      (list (list->cseq (map make-jfile (jolt-list-dir fp)))))
       ;; .list -> the child NAMES (a String[]), nil if not a directory.
       ((string=? name "list")

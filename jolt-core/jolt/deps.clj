@@ -53,7 +53,7 @@
            (throw (ex-info (str path ": " (ex-message e)) {:path path :error e}))))))
 
 (defn- abspath [dir p]
-  (if (str/starts-with? p "/") p (str dir "/" p)))
+  (if (jolt.host/absolute-path? p) p (str dir "/" p)))
 
 ;; --- git cache --------------------------------------------------------------
 ;; jolt's own clone cache. $GITLIBS (the tools.gitlibs location knob) is

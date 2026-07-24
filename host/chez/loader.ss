@@ -947,6 +947,7 @@
 (def-var! "jolt.host" "source-roots" (lambda () (list->cseq source-roots)))
 (def-var! "jolt.host" "load-namespace" (lambda (n) (load-namespace n) jolt-nil))
 (def-var! "jolt.host" "file-exists?" (lambda (p) (if (file-exists? p) #t #f)))
+(def-var! "jolt.host" "absolute-path?" jolt-path-absolute?)
 (def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n))) (if v v jolt-nil))))
 
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked
