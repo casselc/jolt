@@ -1,0 +1,55 @@
+# Jolt proposal-fork audit index — 2026-07-24
+
+This is the durable map of the audits, design reviews, bounded proofs, and
+consumer validations that informed the `casselc/jolt` proposal fork. It keeps
+different kinds of evidence separate:
+
+- an **audit** records source findings and ownership;
+- a **design spike** records alternatives and decisions;
+- a **proof record** states bounded invariants, assumptions, controls, and
+  checked models;
+- a **consumer validation** demonstrates composition against a concrete local
+  branch and test suite; and
+- a draft pull request is a review and landing boundary, not an audit by
+  itself.
+
+Nothing here claims acceptance by `jolt-lang`, authorizes a push to the
+upstream Jolt origin, or requests an upstream pull request.
+
+## Audit map
+
+| Workstream | Canonical records | Scope and current disposition |
+| --- | --- | --- |
+| Core AOT correctness | [`aot-cache-provenance-invariants.md`](aot-cache-provenance-invariants.md) and the AOT-prefixed [checked models](../test/chez/formal) | Compiler inputs, caller context, cache selection/publication races, bug controls, and the fresh-process closed-world conclusion. The selective-runtime prototype remains research-only. |
+| Core runtime/platform behavior | [`executor-shutdown-invariants.md`](executor-shutdown-invariants.md), [`windows-path-invariants.md`](windows-path-invariants.md), and draft [PR #4](https://github.com/casselc/jolt/pull/4) | Executor admission/drain, rejected execution, cache-off source tests, absolute caller paths, and Windows host-shim behavior. |
+| Core FFI/ABI surface | Draft [PR #2](https://github.com/casselc/jolt/pull/2), [PR #3](https://github.com/casselc/jolt/pull/3), and [PR #5](https://github.com/casselc/jolt/pull/5), with requirements traced from TCP, HTTP, and Hegel below | Monotonic time, width-correct integers, immediate native errors, overlap-safe copy, borrowed ranges, aggregates/struct-by-value, variadic calls, and target descriptors. The record is split by reviewable landing boundary rather than duplicated into a synthetic narrative. |
+| Network architecture/design | [`JOLT-NET-DESIGN-SPIKE.md`](https://github.com/casselc/jolt-tcp/blob/0c3e085f43b90b346be9843e43448c890f8b701d/docs/JOLT-NET-DESIGN-SPIKE.md), [`UPSTREAM-NOTES.md`](https://github.com/casselc/jolt-net/blob/4e7dc435319c5c65d4248fda31e5bc217945c2ab/docs/UPSTREAM-NOTES.md), [`PLATFORM-COVERAGE.md`](https://github.com/casselc/jolt-net/blob/4e7dc435319c5c65d4248fda31e5bc217945c2ab/docs/PLATFORM-COVERAGE.md), and [`CLOJURE-PLATFORM.md`](https://github.com/casselc/jolt-net/blob/4e7dc435319c5c65d4248fda31e5bc217945c2ab/docs/CLOJURE-PLATFORM.md) | Original TCP/FFI extraction audit, independent Claude worktree reconciliation, accepted decisions, runtime support versus ABI-probe evidence, readiness versus completion, and the generalized capability/SPI follow-on. |
+| Socket and TCP lifecycle | [`socket-invariants.md`](https://github.com/casselc/jolt-net/blob/4e7dc435319c5c65d4248fda31e5bc217945c2ab/docs/proofs/socket-invariants.md), [`reactor-lifecycle-invariants.md`](https://github.com/casselc/jolt-tcp/blob/0c3e085f43b90b346be9843e43448c890f8b701d/docs/proofs/reactor-lifecycle-invariants.md), and [`client-connection-invariants.md`](https://github.com/casselc/jolt-tcp/blob/0c3e085f43b90b346be9843e43448c890f8b701d/docs/proofs/client-connection-invariants.md) | Descriptor generations, close/lease ownership, wakeups, connect completion, handler admission, shutdown/drain, EOF visibility, outbound deadlines, and cleanup. |
+| HTTP protocol and capacity | [`UPSTREAM-IMPROVEMENTS.md`](https://github.com/casselc/jolt-http/blob/3046a249e95876c53abb522b567e751d4f4a1634/docs/UPSTREAM-IMPROVEMENTS.md), [`http-fail-closed.md`](https://github.com/casselc/jolt-http/blob/3046a249e95876c53abb522b567e751d4f4a1634/docs/proofs/http-fail-closed.md), and [`inline-resume-capacity.md`](https://github.com/casselc/jolt-http/blob/3046a249e95876c53abb522b567e751d4f4a1634/docs/proofs/inline-resume-capacity.md) | Parser/framing boundaries, terminal EOF, response canonicalization, exactly-once sink finalization, causal write failure, and queue capacity. The deterministic Hegel harness follow-up is still awaiting its final commit. |
+| Hegel/core/FFI integration | [`UPSTREAM-IMPROVEMENTS.md`](https://github.com/chucklehead-dev/jolt-hegel/blob/e03127174bcaea4ffa1c0cef11bde0efa009e9dc/docs/UPSTREAM-IMPROVEMENTS.md), [`CORE-JOLT-INTEGRATION-SPIKE.md`](https://github.com/chucklehead-dev/jolt-hegel/blob/e03127174bcaea4ffa1c0cef11bde0efa009e9dc/docs/CORE-JOLT-INTEGRATION-SPIKE.md), and [`ARCHITECTURE.md`](https://github.com/chucklehead-dev/jolt-hegel/blob/e03127174bcaea4ffa1c0cef11bde0efa009e9dc/docs/ARCHITECTURE.md) | Struct-by-value FFI, AOT identity, `clojure.test` reporting, static-link rejection, external upstream libhegel acquisition, and versioned native-cache ownership. Hegel remains a separate external library. |
+| Non-network sibling ecosystem | [`upstream-ecosystem-audit-2026-07-23.md`](upstream-ecosystem-audit-2026-07-23.md) | Read-only review of time, Transit, XML, YAML, Crypto, logging, and router, split into core-owned substrate and library-owned behavior. This is what the shorter phrase “ecosystem audit” means in older prose. |
+| Git dependency acquisition | Draft [PR #6](https://github.com/casselc/jolt/pull/6), `jolt.deps`, and `test/deps_test.clj` | Failed/partial clones, collisions, literal and relative origins, linked tools.gitlibs worktrees, replacement refs, sparse/index/submodule states, locking, and non-destructive publication. The packaged Windows gate is currently red at the `cmd.exe` to POSIX-shell launch boundary and is not waived. |
+| Consumer composition/dogfood | Local branches listed below | Tests whether the new layers replace private socket stacks in nREPL, http-client, and Ring. This is implementation evidence, not a claim that those upstream-owned projects accepted the changes. |
+
+## Consumer-validation snapshot
+
+These branches are intentionally local and have not been pushed or proposed
+upstream:
+
+| Consumer | Local branch/evidence | Result on 2026-07-24 |
+| --- | --- | --- |
+| nREPL | `codex/platform-tcp-validation` at `145458b` over `dbd8e4a` | Portable client transport through `jolt-tcp`; 30 tests / 75 assertions passed. |
+| http-client | dirty `codex/platform-tcp-validation` worktree | Plain TCP and TLS-over-memory-BIO migration is under final review. Host-compatible unbounded and request-wide timeout semantics are still an active gate, so this audit is not complete. |
+| ring-chez-adapter | `codex/jolt-http-validation` at `eebfefa` | Delegates to `jolt-http`; seven checks passed against the then-current HTTP proposal SHA. It must be repinned after the final HTTP harness commit. |
+
+## Scope corrections
+
+The network audit was never part of the non-network sibling survey. Its primary
+design record is the Jolt TCP design spike; implementation and lifecycle
+evidence then moved to `jolt-net`, `jolt-tcp`, and `jolt-http` so each invariant
+stays beside the layer that owns it.
+
+Likewise, the add-deps and consumer work should not be described as formal
+architecture audits. The former is an adversarial implementation/test review;
+the latter is dogfood evidence. This index records both without inflating their
+evidentiary status.

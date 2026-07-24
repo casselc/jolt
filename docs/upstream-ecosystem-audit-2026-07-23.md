@@ -1,9 +1,13 @@
-# Upstream ecosystem audit — 2026-07-23
+# Non-network upstream ecosystem audit — 2026-07-23
 
-This is a versioned, read-only audit record for the Jolt ecosystem. It records
-evidence from sibling `jolt-lang` repositories and local proposal-fork work. It
-does **not** request edits to those repositories, claim upstream acceptance, or
-recommend opening a pull request.
+This is the versioned, read-only audit record for the **non-network** portion of
+the Jolt ecosystem review. The complete map—including the separate network,
+HTTP, Hegel, AOT, FFI, dependency, and consumer records—is
+[`audit-index-2026-07-24.md`](audit-index-2026-07-24.md).
+
+This file records evidence from non-network sibling `jolt-lang` repositories
+and local proposal-fork work. It does **not** request edits to those
+repositories, claim upstream acceptance, or recommend opening a pull request.
 
 ## Baseline and scope
 
@@ -11,9 +15,9 @@ recommend opening a pull request.
 - Proposal-fork package evidence: packages 2--5 checkpointed at
   `3105198aad6acb8da348d1ef90170673b9cc1ca3`; package-3 host-class follow-up
   at `287f9022`; packages 6--8 are recorded as local prerequisites by jolt-net.
-- Ecosystem evidence: time, transit-jolt, xml, yaml, jolt-crypto, logging, and
-  router. Socket-centric nrepl and ring-chez-adapter are intentionally left to
-  the networking audit.
+- Non-network ecosystem evidence: time, transit-jolt, xml, yaml, jolt-crypto,
+  logging, and router. Socket-centric nrepl, http-client, and ring-chez-adapter
+  belong to the separate networking/consumer audit indexed above.
 
 The audit distinguishes source facts from a portability claim. A green table
 test or a successful Linux run is neither a Windows call nor proof that a
