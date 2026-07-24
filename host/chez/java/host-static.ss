@@ -43,6 +43,10 @@
           ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s)))
           (else (loop (- i 1))))))
 
+;; Generic dependency-owned providers.  This must remain a literal top-level
+;; load so application/joltc build flattening embeds the implementation.
+(load "host/chez/java/class-providers.ss")
+
 ;; A member re-registered with a DIFFERENT value across files is drift (two
 ;; sources fighting over one static, last-wins silently deciding). This is a
 ;; diagnostic for the Pattern/compile+quote class of bug, but it ALSO fires when
@@ -134,7 +138,7 @@
          (let ((f (and mh (hashtable-ref mh method-name #f))))
            (if f
                (apply f obj (if (jolt-nil? rest-args) '() (seq->list rest-args)))
-               (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method-name " for " (jhost-tag obj)))))))
+               'pass))))
       ((number? obj) (apply number-method method-name obj (if (jolt-nil? rest-args) '() (seq->list rest-args))))
       (else 'pass))))
 
@@ -170,7 +174,7 @@
     ;; precision, so an arithmetic shift by the (positive) amount.
     ((string=? method "shiftLeft") (->num (bitwise-arithmetic-shift-left (jnum->exact n) (jnum->exact (car args)))))
     ((string=? method "shiftRight") (->num (bitwise-arithmetic-shift-right (jnum->exact n) (jnum->exact (car args)))))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method " for Number")))))
+    (else 'pass)))
 
 ;; Mutable static fields: "Class" -> (member -> 1-vector cell). A library that
 ;; writes a static field — clojure.spec.alpha's (set! (. clojure.lang.RT
@@ -254,28 +258,46 @@
 
 ;; ---- emit entry points ------------------------------------------------------
 (define (host-static-ref class member)
+  (host-static-ref* class member #t))
+(define (host-static-ref* class member allow-provider?)
   (let ((cell (mutable-static-cell class member #f)))
     (if cell
         (vector-ref cell 0)
         (let ((h (lookup-class class-statics-tbl class)))
           (if h
               (let ((v (hashtable-ref h member #f)))
-                (if v v (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member))))
+                (if v
+                    v
+                    ;; A dependency may extend a partially built-in class.  Load
+                    ;; its one declared provider, then retry this exact lookup once.
+                    (if (and allow-provider? (class-provider-try-load! class))
+                        (host-static-ref* class member #f)
+                        (throw-jvm (quote IllegalArgumentException)
+                          (string-append "No matching field or method: " class "/" member)))))
               ;; class miss — autoload the java.time base and retry once, else throw
               (if (jt-try-autoload! class)
-                  (host-static-ref class member)
-                  (throw-jvm (quote IllegalArgumentException) (unknown-class-message class))))))))
+                  (host-static-ref* class member allow-provider?)
+                  (if (and allow-provider? (class-provider-try-load! class))
+                      (host-static-ref* class member #f)
+                      (throw-jvm (quote IllegalArgumentException)
+                        (unknown-class-message class)))))))))
 
 (define (host-static-call class member . args)
   (apply (host-static-ref class member) args))
 
 (define (host-new class . args)
+  (apply host-new* class #t args))
+(define (host-new* class allow-provider? . args)
   (let ((ctor (lookup-class class-ctors-tbl class)))
     (cond
       (ctor (apply ctor args))
       ;; a java.time. constructor may live in the not-yet-loaded base — autoload
       ;; and retry once before falling through to the var / no-ctor paths.
-      ((jt-try-autoload! class) (apply host-new class args))
+      ((jt-try-autoload! class) (apply host-new* class allow-provider? args))
+      ;; A class may already have statics while its dependency supplies the ctor.
+      ;; As for statics, there is one provider load and one non-recursive retry.
+      ((and allow-provider? (class-provider-try-load! class))
+       (apply host-new* class #f args))
       ;; deftype/defrecord: the type name is bound as a VAR (the
       ;; make-deftype-ctor closure) in its defining ns, not a registered host class.
       ;; Resolve it in the current ns / clojure.core and invoke it — so (P. args)
@@ -322,4 +344,3 @@
                     (string-append "For input string: \""
                                    (if (string? s) s (jolt-str-render-one s)) "\"")))))
 (define (->double x) (if (number? x) (exact->inexact x) (parse-double-or-throw x)))
-

@@ -891,6 +891,12 @@
   (lambda (name proc) (register-class-ctor! name proc) jolt-nil))
 (def-var! "clojure.core" "__register-class-statics!"
   (lambda (name members) (register-class-statics! name (jmap->static-alist members)) jolt-nil))
+(def-var! "jolt.host" "register-class-providers!"
+  (lambda (providers)
+    (for-each
+      (lambda (p) (class-provider-register-one! (car p) (cdr p)))
+      (jmap->static-alist providers))
+    jolt-nil))
 
 ;; ---- tagged-table method dispatch + pluggable instance? --------------------
 ;; A jolt library can build stateful host objects with (jolt.host/tagged-table
@@ -924,6 +930,27 @@
 
 (def-var! "clojure.core" "__register-class-methods!"
   (lambda (tag members) (register-tagged-methods! tag (jmap->static-alist members)) jolt-nil))
+
+;; String/symbol tags passed to __register-class-methods! are class extensions.
+;; They are resolved through value-host-tags, so extension dispatch uses the same
+;; canonical/simple class facts as instance? and protocol dispatch.  Built-in
+;; type arms run first; this arm only fills a member they declined.
+(define (class-extension-method obj method-name)
+  (let loop ((tags (value-host-tags obj)))
+    (and (pair? tags)
+         (let* ((mh (hashtable-ref tagged-methods-tbl (car tags) #f))
+                (f (and mh (hashtable-ref mh method-name #f))))
+           (or f (loop (cdr tags)))))))
+(set! record-method-extension-dispatch
+  (lambda (obj method-name rest-args)
+    (let ((f (class-extension-method obj method-name)))
+      (if f
+          (apply f obj (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+          'pass))))
+
+;; records.ss owns the one-retry shape; install the dependency-aware miss hook
+;; only after the class-provider registry is available.
+(set! record-method-miss-retry! class-provider-try-load-for-value!)
 
 ;; java.lang.ThreadLocal via a Chez thread-parameter: real per-thread storage with
 ;; a lazy initialValue (the proxy macro lowers (proxy [ThreadLocal] …) to this).
