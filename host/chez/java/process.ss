@@ -454,7 +454,7 @@
         (cons "removeShutdownHook"
           (lambda (self hook)
             (set-box! proc-shutdown-hooks (remq hook (unbox proc-shutdown-hooks))) #t))
-        (cons "availableProcessors" (lambda (self) (->num 1)))
+        (cons "availableProcessors" (lambda (self) (->num target-processors)))
         (cons "exec" (lambda (self . args) (proc-runtime-exec args)))))
 (register-class-statics! "java.lang.Runtime" (list (cons "getRuntime" (lambda () the-jolt-runtime))))
 

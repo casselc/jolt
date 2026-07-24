@@ -440,17 +440,6 @@
 (define io-kw-file (keyword "jolt" "file"))
 (register-type-arm! jfile? (lambda (x) io-kw-file))
 
-;; (instance? java.io.File f): the instance? macro passes the class-name symbol;
-;; match "File" / "java.io.File" (and any *.File) against a jfile.
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (let ((tname (symbol-t-name type-sym)))
-      (if (and (jfile? val)
-               (or (string=? tname "File") (string=? tname "java.io.File")
-                   (string=? (path-last-segment tname) "File")))
-          #t
-          'pass))))
-
 ;; --- def-var! the native names the overlay file-seq + str/slurp use ----
 (def-var! "clojure.core" "__make-file" jolt-make-file)
 (def-var! "clojure.core" "__file?" jolt-file?)
@@ -818,4 +807,15 @@
 ;; class of the host value types defined by now (uri/uuid/file).
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "uri"))) (lambda (x) "java.net.URI"))
 (register-class-arm! juuid? (lambda (x) "java.util.UUID"))
-(register-class-arm! jfile? (lambda (x) "java.io.File"))
+(define io-jfile-fqn "java.io.File")
+(register-class-arm! jfile? (lambda (x) io-jfile-fqn))
+;; jfile is a dedicated record rather than a jhost, so it cannot use the
+;; jhost-tag->fqn registry. Feed the same canonical class name into the shared
+;; value-host-tags path instead: protocol dispatch and instance? both consume
+;; these tags, while class/type consume the class arm immediately above. Keeping
+;; all three views on one FQN prevents a shim from answering `instance?` true yet
+;; silently falling through to an Object protocol extension.
+(let ((prev value-host-tags))
+  (set! value-host-tags
+    (lambda (obj)
+      (if (jfile? obj) (jch-tags io-jfile-fqn) (prev obj)))))
