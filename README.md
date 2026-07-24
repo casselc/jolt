@@ -323,10 +323,12 @@ Clojure. The genuine divergences:
   http-client libraries bind SQLite/libpq and sockets/OpenSSL/zlib).
 - **Native target facts.** `(jolt.host/target)` returns a stable map with `:os`,
   `:arch`, `:abi`, `:libc`, `:endian`, `:pointer-bits`, `:file-separator`,
-  `:path-separator`, and `:processors`. Unverified combinations report
-  `:unknown`; they are never relabeled as a nearby ABI. Processor count uses the
-  process CPU affinity where supported, then the OS online-CPU count, and falls
-  back to `1`. It respects cpuset/affinity restrictions but does not reinterpret
+  `:path-separator`, and `:processors`. Target OS, architecture, and ABI come
+  from an exact allowlist of Chez machine types; an unrecognized machine type
+  reports all three as `:unknown` rather than being relabeled from a similar
+  name. Processor count uses process CPU affinity where supported, then the OS
+  online-CPU count, a valid `NUMBER_OF_PROCESSORS` environment value, and
+  finally `1`. It respects cpuset/affinity restrictions but does not reinterpret
   a fractional cgroup CPU quota. `System` properties and
   `Runtime.availableProcessors` are projections of the same descriptor.
 - **Codepoint strings.** Strings are Chez strings — codepoint-indexed, no
@@ -356,7 +358,7 @@ make selfhost                 # bootstrap fixpoint (rebuild == checked-in seed)
 make smoke                    # bin/jolt CLI smoke
 make sci                      # load borkdude/sci's source through jolt (compat stress)
 make ffi                      # typed calls, memory/ranges, GC safety, callbacks
-make ffistress                # opt-in bounded concurrent-FFI reduction
+make ffistress                # opt-in POSIX-only concurrent-FFI reduction
 make executorprobe            # opt-in executor-constructor characterization
 make transient                # transient mutation + linear-time builds
 make certify                  # JVM oracle (skips if clojure is absent)
