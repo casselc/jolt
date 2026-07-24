@@ -452,17 +452,34 @@
       (str/starts-with? loc "/")        (str "https://" host-port loc)
       :else                             (str "https://" host-port "/" loc))))
 
-;; Write via a temp file + atomic rename so a crash/partial write never leaves a
-;; corrupt jar at the final path (which deps.clj would then trust and never
-;; re-fetch).
+;; Write via an adjacent temp file plus one same-filesystem replacement so a
+;; partial write is never published at the final path (which deps.clj would then
+;; trust and never re-fetch). This is a visibility contract, not an fsync or
+;; power-loss durability guarantee.
 (defn- write-bytes-to-file [path ba]
-  (let [tmp (str path ".part")]
-    (doto (java.io.FileOutputStream. tmp) (.write ba) (.close))
-    (let [t (java.io.File. tmp) f (java.io.File. path)]
-      (.delete f)
-      (when-not (.renameTo t f)
-        (.delete t)
-        (throw (ex-info "rename of downloaded file failed" {:path path}))))))
+  ;; Keep the temporary file beside the destination so the final move remains
+  ;; a single same-filesystem replacement. A per-attempt name prevents concurrent dependency
+  ;; resolvers from truncating or publishing one another's partial download.
+  (let [tmp (str path ".part-" (random-uuid))
+        t (java.io.File. tmp)
+        f (java.io.File. path)]
+    (try
+      (with-open [out (java.io.FileOutputStream. t)]
+        (.write out ba))
+      (java.nio.file.Files/move
+        (.toPath t)
+        (.toPath f)
+        (into-array
+          java.nio.file.CopyOption
+          [java.nio.file.StandardCopyOption/REPLACE_EXISTING
+           java.nio.file.StandardCopyOption/ATOMIC_MOVE]))
+      (catch :default e
+        ;; The stream is closed before cleanup even when write throws. Deletion
+        ;; is best effort so it cannot hide the publication failure.
+        (try (.delete t) (catch :default _ nil))
+        (throw (ex-info "single-operation publication of downloaded file failed"
+                        {:path path}
+                        e))))))
 
 (def ^:private max-redirects 5)
 (def ^:private redirect-codes #{301 302 303 307 308})

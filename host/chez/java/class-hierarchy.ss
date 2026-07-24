@@ -303,6 +303,9 @@
 (jch-register-supers! "java.text.ParseException" '("java.lang.Exception"))
 (jch-register-supers! "java.lang.InterruptedException" '("java.lang.Exception"))
 (jch-register-supers! "java.io.IOException" '("java.lang.Exception"))
+(jch-register-supers! "java.nio.file.FileSystemException" '("java.io.IOException"))
+(jch-register-supers! "java.nio.file.AtomicMoveNotSupportedException"
+                      '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.io.InterruptedIOException" '("java.io.IOException"))
 (jch-register-supers! "java.io.FileNotFoundException" '("java.io.IOException"))
 (jch-register-supers! "java.io.UnsupportedEncodingException" '("java.io.IOException"))
