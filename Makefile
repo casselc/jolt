@@ -117,9 +117,10 @@ cts: testbin
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 
-# OPT-IN evidence probes. ffistress is a bounded concurrent collect-safe/native
-# call reduction; executorprobe characterizes the live semantics behind the
-# JVM-named executor constructors. Neither pins today's behavior in the CI gate.
+# OPT-IN evidence probes. ffistress is a POSIX-only bounded concurrent
+# collect-safe/native call reduction; executorprobe characterizes the live
+# semantics behind the JVM-named executor constructors. Neither pins today's
+# behavior in the CI gate.
 ffistress:
 	@"$${JOLT_BIN:-bin/joltc}" run test/chez/concurrent_ffi_stress.clj
 

@@ -424,51 +424,72 @@
 ;; Native libraries need more than os.name. Keep one descriptor for the compiler
 ;; target, ABI/libc selection, separators, and capacity; System and Runtime below
 ;; project their compatibility values from the same facts.
-;; Optimized: character-by-character scan, no substring allocation per position.
-(define (substring-index needle hay)
-  (let ((nl (string-length needle)) (hl (string-length hay)))
-    (let outer ((i 0))
-      (if (> (+ i nl) hl)
-          #f
-          (let inner ((j 0))
-            (cond ((= j nl) i)
-                  ((char=? (string-ref hay (+ i j)) (string-ref needle j)) (inner (+ j 1)))
-                  (else (outer (+ i 1)))))))))
+;; This allowlist follows Chez 10.5's canonical machine-type names
+;; (s/cmacros.ss), with nonthreaded and threaded variants written out
+;; separately. Keep the whole (OS, architecture, ABI) tuple behind this exact
+;; lookup: fuzzy token/suffix matching can silently turn a future Chez target
+;; into a nearby but false platform or calling convention.
+(define target-machine-fact-names
+  '(;; Linux
+    ("i3le"       linux x86         sysv-i386)
+    ("ti3le"      linux x86         sysv-i386)
+    ("a6le"       linux x86-64      sysv-amd64)
+    ("ta6le"      linux x86-64      sysv-amd64)
+    ("ppc32le"    linux ppc         unknown)
+    ("tppc32le"   linux ppc         unknown)
+    ("arm32le"    linux arm         unknown)
+    ("tarm32le"   linux arm         unknown)
+    ("arm64le"    linux aarch64     aapcs64)
+    ("tarm64le"   linux aarch64     aapcs64)
+    ("rv64le"     linux riscv64     unknown)
+    ("trv64le"    linux riscv64     unknown)
+    ("la64le"     linux loongarch64 unknown)
+    ("tla64le"    linux loongarch64 unknown)
+    ;; macOS
+    ("i3osx"      darwin x86         unknown)
+    ("ti3osx"     darwin x86         unknown)
+    ("a6osx"      darwin x86-64      sysv-amd64)
+    ("ta6osx"     darwin x86-64      sysv-amd64)
+    ("ppc32osx"   darwin ppc         unknown)
+    ("tppc32osx"  darwin ppc         unknown)
+    ("arm64osx"   darwin aarch64     darwin-arm64)
+    ("tarm64osx"  darwin aarch64     darwin-arm64)
+    ;; Windows
+    ("i3nt"       windows x86     cdecl-x86)
+    ("ti3nt"      windows x86     cdecl-x86)
+    ("a6nt"       windows x86-64  win64)
+    ("ta6nt"      windows x86-64  win64)
+    ("arm64nt"    windows aarch64 unknown)
+    ("tarm64nt"   windows aarch64 unknown)))
+
+(define target-unknown-facts
+  (list (keyword #f "unknown")
+        (keyword #f "unknown")
+        (keyword #f "unknown")))
+
+(define (target-facts-for-machine-name machine-name)
+  (let loop ((rows target-machine-fact-names))
+    (cond
+      ((null? rows) target-unknown-facts)
+      ((string=? machine-name (caar rows))
+       (let ((row (car rows)))
+         (list (keyword #f (symbol->string (cadr row)))
+               (keyword #f (symbol->string (caddr row)))
+               (keyword #f (symbol->string (cadddr row))))))
+      (else (loop (cdr rows))))))
 
 (define (target-os-for-machine-name machine-name)
-  (cond ((or (substring-index "osx" machine-name)
-             (substring-index "macos" machine-name))
-         (keyword #f "darwin"))
-        ((or (substring-index "nt" machine-name)
-             (substring-index "windows" machine-name))
-         (keyword #f "windows"))
-        ;; Chez's native Linux targets end in "le" (a6le, ta6le, arm64le,
-        ;; ...). The portable-bytecode target is just "pb" and deliberately
-        ;; remains unknown: its host OS is not encoded in the compiler target.
-        ((and (>= (string-length machine-name) 2)
-              (string=? "le"
-                        (substring machine-name
-                                   (- (string-length machine-name) 2)
-                                   (string-length machine-name))))
-         (keyword #f "linux"))
-        (else (keyword #f "unknown"))))
+  (car (target-facts-for-machine-name machine-name)))
 (define (target-arch-for-machine-name machine-name)
-  (cond ((or (substring-index "arm64" machine-name)
-             (substring-index "aarch64" machine-name))
-         (keyword #f "aarch64"))
-        ((substring-index "arm32" machine-name) (keyword #f "arm"))
-        ;; Check the longer/specialized architecture tokens before Chez's
-        ;; x86-64 "a6" token: "la64" contains "a6".
-        ((substring-index "rv64" machine-name) (keyword #f "riscv64"))
-        ((substring-index "la64" machine-name) (keyword #f "loongarch64"))
-        ((substring-index "a6" machine-name) (keyword #f "x86-64"))
-        ((substring-index "i3" machine-name) (keyword #f "x86"))
-        ((substring-index "ppc64" machine-name) (keyword #f "ppc64"))
-        ((substring-index "ppc32" machine-name) (keyword #f "ppc"))
-        (else (keyword #f "unknown"))))
+  (cadr (target-facts-for-machine-name machine-name)))
+(define (target-abi-for-machine-name machine-name)
+  (caddr (target-facts-for-machine-name machine-name)))
+
 (define target-machine-name (symbol->string (machine-type)))
-(define target-os (target-os-for-machine-name target-machine-name))
-(define target-arch (target-arch-for-machine-name target-machine-name))
+(define target-facts (target-facts-for-machine-name target-machine-name))
+(define target-os (car target-facts))
+(define target-arch (cadr target-facts))
+(define target-abi (caddr target-facts))
 (define target-pointer-bits (* 8 (foreign-sizeof 'void*)))
 (define target-endian
   (case (native-endianness)
@@ -479,27 +500,6 @@
 (define target-windows-paths? (string=? target-file-separator "\\"))
 (define target-path-separator (if target-windows-paths? ";" ":"))
 (define sys-line-separator (if target-windows-paths? "\r\n" "\n"))
-
-;; This is keyed from Chez's concrete compiler target, rather than inferred from
-;; the public os/arch pair. New targets therefore fail closed as :unknown until
-;; their calling convention is verified.
-(define (target-abi-for os arch)
-  (cond
-    ((and (eq? os (keyword #f "windows"))
-          (eq? arch (keyword #f "x86-64"))) (keyword #f "win64"))
-    ((and (eq? os (keyword #f "windows"))
-          (eq? arch (keyword #f "x86"))) (keyword #f "cdecl-x86"))
-    ((and (or (eq? os (keyword #f "linux"))
-              (eq? os (keyword #f "darwin")))
-          (eq? arch (keyword #f "x86-64"))) (keyword #f "sysv-amd64"))
-    ((and (eq? os (keyword #f "linux"))
-          (eq? arch (keyword #f "x86"))) (keyword #f "sysv-i386"))
-    ((and (eq? os (keyword #f "linux"))
-          (eq? arch (keyword #f "aarch64"))) (keyword #f "aapcs64"))
-    ((and (eq? os (keyword #f "darwin"))
-          (eq? arch (keyword #f "aarch64"))) (keyword #f "darwin-arm64"))
-    (else (keyword #f "unknown"))))
-(define target-abi (target-abi-for target-os target-arch))
 
 ;; Symbol presence distinguishes glibc from other Linux libcs without guessing
 ;; from the OS label. macOS's verified native target uses libSystem; Windows CRT
