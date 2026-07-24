@@ -34,6 +34,12 @@
     (cond
       ((string=? n "int") 'int)
       ((string=? n "uint") 'unsigned-int)
+      ;; 16-bit. Without these a caller cannot express a C `short` field at all:
+      ;; struct pollfd's two shorts had to be packed into one :int slot and masked,
+      ;; which is silently wrong on a big-endian host. sockaddr_in.sin_family and
+      ;; sockaddr_in6.sin6_* need them too.
+      ((or (string=? n "int16") (string=? n "short")) 'integer-16)
+      ((or (string=? n "uint16") (string=? n "ushort")) 'unsigned-16)
       ((string=? n "long") 'long)
       ((string=? n "ulong") 'unsigned-long)
       ((string=? n "int64") 'integer-64)
@@ -48,6 +54,8 @@
       ((string=? n "string") 'string)
       ((string=? n "void") 'void)
       ((or (string=? n "uint8") (string=? n "u8") (string=? n "byte")) 'unsigned-8)
+      ;; signed 8-bit, so the width matrix has no hole a caller can fall into
+      ((or (string=? n "int8") (string=? n "i8")) 'integer-8)
       ((string=? n "char") 'char)
       (else (error #f (string-append "jolt.ffi: unknown foreign type :" n))))))
 
@@ -225,6 +233,59 @@
           ((guard (e (#t #f)) (load-shared-object (car cs)) #t) #t)
           (else (loop (cdr cs)))))))
 
+;; --- native error capture ----------------------------------------------------
+;; The calling thread's last OS error. Every native binding that can fail needs
+;; this, and each one used to re-derive it: teensyp.ffi-net binds
+;; __errno_location/__error itself, jolt.mvn-http mostly throws without a code,
+;; and jolt.nrepl omits it entirely.
+;;
+;; CONTRACT: one native call and no other, so it cannot clobber the value it
+;; reports. Callers must read it IMMEDIATELY after the failing call and before
+;; any cleanup -- close/free/closesocket are themselves native calls and will
+;; overwrite errno, which is exactly how a failed bind ends up reporting the
+;; error from its own rollback close.
+;;
+;; POSIX keeps errno in thread-local storage behind an accessor returning int*,
+;; under a libc-specific symbol. The address is per-thread, so it is re-fetched
+;; on each call and never cached. Windows sockets do not use errno at all --
+;; WSAGetLastError() is itself the capture, with no indirection.
+;;
+;; Fails closed on an unrecognized OS rather than guessing a symbol: a wrong
+;; guess here reads an arbitrary address, which is worse than no errno.
+(define errno-thunk #f)
+(define (ffi-errno-thunk)
+  (or errno-thunk
+      (let* ((os (keyword-t-name target-os))
+             (t (cond
+                  ;; returns the code directly; there is no errno to dereference
+                  ((string=? os "windows")
+                   (let ((f (foreign-procedure "WSAGetLastError" () int)))
+                     (lambda () (f))))
+                  ;; BSD-derived libc
+                  ((string=? os "darwin")
+                   (let ((loc (foreign-procedure "__error" () void*)))
+                     (lambda () (foreign-ref 'int (loc) 0))))
+                  ;; glibc and musl both export __errno_location
+                  ((string=? os "linux")
+                   (let ((loc (foreign-procedure "__errno_location" () void*)))
+                     (lambda () (foreign-ref 'int (loc) 0))))
+                  (else
+                   (error #f (string-append
+                              "jolt.ffi/errno: unsupported target os :" os
+                              " (no known errno accessor; refusing to guess)"))))))
+        (set! errno-thunk t)
+        t)))
+(define (ffi-errno) ((ffi-errno-thunk)))
+
+;; Which strategy backs errno on this target, for diagnostics and tests:
+;; :errno-location, :error, or :wsa-get-last-error.
+(define (ffi-errno-source)
+  (let ((os (keyword-t-name target-os)))
+    (cond ((string=? os "windows") (keyword #f "wsa-get-last-error"))
+          ((string=? os "darwin") (keyword #f "error"))
+          ((string=? os "linux") (keyword #f "errno-location"))
+          (else (keyword #f "unsupported")))))
+
 ;; --- expose under jolt.ffi ---------------------------------------------------
 (def-var! "jolt.ffi" "free-callable" ffi-free-callable)
 (def-var! "jolt.ffi" "register-export" jolt-ffi-register-export!)
@@ -239,3 +300,5 @@
 (def-var! "jolt.ffi" "null" ffi-null)
 (def-var! "jolt.ffi" "ptr->string" ffi-ptr->string)
 (def-var! "jolt.ffi" "string->ptr" ffi-string->ptr)
+(def-var! "jolt.ffi" "errno" ffi-errno)
+(def-var! "jolt.ffi" "errno-source" ffi-errno-source)

@@ -369,7 +369,7 @@
 ;; side-effect check); each is emitted once here.
 (defn- emit-ordered [ctor nodes]
   (ordered-call nodes (mapv emit nodes)
-    (fn [strs] (str "(" ctor (if (empty? strs) "" (str " " (str/join " " strs))) ")"))))
+                (fn [strs] (str "(" ctor (if (empty? strs) "" (str " " (str/join " " strs))) ")"))))
 
 ;; An operand whose evaluation has no observable effect: constants, locals,
 ;; var/the-var reads, quoted literals.
@@ -506,12 +506,19 @@
 ;; compile-time literals from the analyzer, so this emits a real typed binding;
 ;; the resulting Scheme procedure is callable like any jolt fn. The library must
 ;; have loaded the shared object (jolt.ffi/load-library) before this def runs.
+;; MUST stay in lockstep with ffi-type->chez in host/chez/java/ffi.ss: this table is
+;; the compile-time half (foreign-procedure signatures) and that one is the runtime
+;; half (foreign-ref/set!). A type present in only one of them fails asymmetrically
+;; -- defcfn compiles but ffi/read rejects it, or the reverse.
 (def ^:private ffi-types
   {"int" "int" "uint" "unsigned-int" "long" "long" "ulong" "unsigned-long"
+   "int16" "integer-16" "short" "integer-16"
+   "uint16" "unsigned-16" "ushort" "unsigned-16"
    "int64" "integer-64" "uint64" "unsigned-64" "size_t" "size_t" "ssize_t" "ssize_t"
    "iptr" "iptr" "uptr" "uptr" "double" "double" "float" "float"
    "pointer" "void*" "void*" "void*" "string" "string" "void" "void"
-   "uint8" "unsigned-8" "u8" "unsigned-8" "byte" "unsigned-8" "char" "char"})
+   "uint8" "unsigned-8" "u8" "unsigned-8" "byte" "unsigned-8" "char" "char"
+   "int8" "integer-8" "i8" "integer-8"})
 (defn- ffi-type->chez [t]
   (or (ffi-types t) (throw (ex-info (str "jolt.ffi: unknown foreign type :" t) {}))))
 (defn- emit-ffi-fn [node]
@@ -690,8 +697,8 @@
         ;; binary op is 2-ary, so expand rather than pass 3+ args to it. order-args
         ;; binds each operand to a temp once, so reusing a temp across pairs is safe.
         (order-args (fn [as]
-          (str "(and " (str/join " " (map (fn [pair] (str "(" op " " (first pair) " " (second pair) ")"))
-                                          (partition 2 1 as))) ")")))
+                      (str "(and " (str/join " " (map (fn [pair] (str "(" op " " (first pair) " " (second pair) ")"))
+                                                      (partition 2 1 as))) ")")))
         (order-args (fn [as] (str "(" op " " (str/join " " as) ")")))))))
 
 ;; slot of a declared field key in a record's field-order shape, or nil.
@@ -732,27 +739,27 @@
 
 (defn- emit-invoke [node]
   (let [tail? *tail?*]           ; capture: children below emit non-tail
-   (binding [*tail?* false]
-    (let [fnode (:fn node)
-        arg-nodes (:args node)
-        args (mapv emit arg-nodes)
-        nop (native-op fnode (count args))
-        kind (ifn-kind fnode)
+    (binding [*tail?* false]
+      (let [fnode (:fn node)
+            arg-nodes (:args node)
+            args (mapv emit arg-nodes)
+            nop (native-op fnode (count args))
+            kind (ifn-kind fnode)
         ;; order args left-to-right (build receives the spliced operand strings)
-        order-args (fn [build] (ordered-call arg-nodes args build))
-        defstr (fn [as] (if (> (count as) 1) (str " " (nth as 1)) ""))
+            order-args (fn [build] (ordered-call arg-nodes args build))
+            defstr (fn [as] (if (> (count as) 1) (str " " (nth as 1)) ""))
         ;; jolt-invoke dispatch: Clojure evaluates the fn expr before the args, so
         ;; order [callee & args] together when ordering is observable. Pick a
         ;; fixed-arity entry point (jolt-invoke0..4) by arg count so the common
         ;; raw-procedure fast path allocates no rest-list; keep variadic jolt-invoke
         ;; for larger arities / apply tails.
-        invoke (fn []
-                 (let [callee (if (<= (count args) 4)
-                                (str "jolt-invoke" (count args))
-                                "jolt-invoke")]
-                   (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
-                                 (fn [operands] (emit-call tail? callee operands)))))]
-    (cond
+            invoke (fn []
+                     (let [callee (if (<= (count args) 4)
+                                    (str "jolt-invoke" (count args))
+                                    "jolt-invoke")]
+                       (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
+                                     (fn [operands] (emit-call tail? callee operands)))))]
+        (cond
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
       ;; through the protocol var -> jolt-invoke -> protocol-resolve (which recomputes
@@ -762,35 +769,35 @@
       ;; record satisfying the protocol via an Object/host-tag default). Fires only on
       ;; a monomorphic site (a megamorphic receiver joins to :any, no :devirt-type).
       ;; The receiver is bound once — it feeds both the resolve and the application.
-      (:devirt-type node)
-      (order-args (fn [as]
-                     (let [r (fresh-label "_r$")
+          (:devirt-type node)
+          (order-args (fn [as]
+                        (let [r (fresh-label "_r$")
                           ;; a site whose impl has a contagion clone resolves the clone
                           ;; (fl* + exact->inexact on the :num operand) instead of the
                           ;; shared impl; otherwise the ordinary devirt-resolve. The
                           ;; non-specialized path is byte-identical (clone-sites empty
                           ;; outside a whole-program build).
-                          resolver-name (if (clone-site? (:devirt-type node) (:devirt-proto node) (:devirt-method node))
-                                           "devirt-resolve-fl" "devirt-resolve")
-                          dv (str "(" resolver-name " " (chez-str-lit (:devirt-type node)) " "
-                                  (chez-str-lit (:devirt-proto node)) " " (chez-str-lit (:devirt-method node))
-                                  " " r ")")
-                          cells @(:cache-cells (cur))
+                              resolver-name (if (clone-site? (:devirt-type node) (:devirt-proto node) (:devirt-method node))
+                                              "devirt-resolve-fl" "devirt-resolve")
+                              dv (str "(" resolver-name " " (chez-str-lit (:devirt-type node)) " "
+                                      (chez-str-lit (:devirt-proto node)) " " (chez-str-lit (:devirt-method node))
+                                      " " r ")")
+                              cells @(:cache-cells (cur))
                           ;; cache the resolved impl in a per-site cell when inside a
                           ;; def; else resolve per call. The cell carries (epoch . fn):
                           ;; each call compares its epoch against jolt-proto-epoch and
                           ;; re-resolves on mismatch, so an extend-type after warmup
                           ;; (a register-protocol-method epoch bump) invalidates this
                           ;; site like every other dispatch path, mirroring the PIC.
-                          resolver (if cells
-                                      (let [c (fresh-label "_dvc$")]
-                                        (swap! cells conj c)
-                                        (str "(if (and (pair? " c ") (fx= (car " c ") jolt-proto-epoch))"
-                                             " (cdr " c ")"
-                                             " (let ((_f " dv ")) (set! " c " (cons jolt-proto-epoch _f)) _f))"))
-                                      dv)]
-                      (str "(let* ((" r " " (first as) ")) ("
-                           resolver " " (str/join " " (cons r (rest as))) "))"))))
+                              resolver (if cells
+                                         (let [c (fresh-label "_dvc$")]
+                                           (swap! cells conj c)
+                                           (str "(if (and (pair? " c ") (fx= (car " c ") jolt-proto-epoch))"
+                                                " (cdr " c ")"
+                                                " (let ((_f " dv ")) (set! " c " (cons jolt-proto-epoch _f)) _f))"))
+                                         dv)]
+                          (str "(let* ((" r " " (first as) ")) ("
+                               resolver " " (str/join " " (cons r (rest as))) "))"))))
       ;; polymorphic inline cache: a protocol call the inference recognized (:proto)
       ;; but could NOT prove monomorphic (no :devirt-type — a megamorphic / unknown
       ;; receiver). Emit a per-site cache keyed on the receiver's descriptor identity:
@@ -801,47 +808,47 @@
       ;; so an extend-type at runtime can't strand a stale impl. Falls back to a
       ;; direct protocol-resolve (still the per-descriptor fast path) when not inside
       ;; a def. The receiver is bound once and feeds both the resolve and the apply.
-      (:proto node)
-      (order-args (fn [as]
-                    (let [r (fresh-label "_r$")
-                          d (fresh-label "_d$")
-                          v (fresh-label "_v$")
-                          cells @(:cache-cells (cur))
-                          proto (chez-str-lit (:proto node))
-                          method (chez-str-lit (:method node))
-                          apply-args (str/join " " (cons r (rest as)))]
-                      (if cells
-                        (let [c (fresh-label "_picv$")
-                              scan (pic-scan-clauses v d)]
-                          (swap! cells conj c)
+          (:proto node)
+          (order-args (fn [as]
+                        (let [r (fresh-label "_r$")
+                              d (fresh-label "_d$")
+                              v (fresh-label "_v$")
+                              cells @(:cache-cells (cur))
+                              proto (chez-str-lit (:proto node))
+                              method (chez-str-lit (:method node))
+                              apply-args (str/join " " (cons r (rest as)))]
+                          (if cells
+                            (let [c (fresh-label "_picv$")
+                                  scan (pic-scan-clauses v d)]
+                              (swap! cells conj c)
                           ;; hot path inlined: bind the receiver, the cache vector
                           ;; (lazily allocated on first call), and its desc; then, if
                           ;; the epoch still matches, eq?-scan the cached descs and
                           ;; apply the hit impl directly — no helper call after warmup.
                           ;; A miss (no cached desc / stale epoch) resolves + (re)fills
                           ;; via the jolt-pic-install/-rebuild helpers.
-                          (str "(let* ((" r " " (first as) ")"
-                               " (" v " (or " c " (let ((_nv (jolt-pic-make))) (set! " c " _nv) _nv)))"
-                               " (" d " (jrec-pic-desc " r ")))"
-                               " ((if (and " d " (#3%fx= (#3%vector-ref " v " " pic-epoch-idx ") jolt-proto-epoch))"
-                                " (or " scan " (jolt-pic-install " v " " d " " proto " " method " " r "))"
-                                " (jolt-pic-rebuild " v " " d " " proto " " method " " r "))"
-                                " " apply-args "))"))
-                        (str "(let* ((" r " " (first as) "))"
-                             " ((protocol-resolve " proto " " method " " r ") " apply-args "))")))))
+                              (str "(let* ((" r " " (first as) ")"
+                                   " (" v " (or " c " (let ((_nv (jolt-pic-make))) (set! " c " _nv) _nv)))"
+                                   " (" d " (jrec-pic-desc " r ")))"
+                                   " ((if (and " d " (#3%fx= (#3%vector-ref " v " " pic-epoch-idx ") jolt-proto-epoch))"
+                                   " (or " scan " (jolt-pic-install " v " " d " " proto " " method " " r "))"
+                                   " (jolt-pic-rebuild " v " " d " " proto " " method " " r "))"
+                                   " " apply-args "))"))
+                            (str "(let* ((" r " " (first as) "))"
+                                 " ((protocol-resolve " proto " " method " " r ") " apply-args "))")))))
       ;; a java.lang.Math call jolt.passes.numeric proved is over flonum operands:
       ;; emit the native Chez flonum op (flsqrt/flatan/…) instead of the generic
       ;; string-keyed host-static-call, and (via its :double result kind) keep the
       ;; surrounding arithmetic unboxed.
       ;; (aget ^doubles a i): jolt.passes.numeric proved the array is a flvector, so
       ;; read it unboxed and typed :double (jolt-flaget = flvector-ref on the backing).
-      (:fl-aget node) (order-args (fn [as] (str "(jolt-flaget " (str/join " " as) ")")))
-      (:fl-aset node) (order-args (fn [as] (str "(jolt-flaset " (str/join " " as) ")")))
-      (:fl-op node) (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")")))
+          (:fl-aget node) (order-args (fn [as] (str "(jolt-flaget " (str/join " " as) ")")))
+          (:fl-aset node) (order-args (fn [as] (str "(jolt-flaset " (str/join " " as) ")")))
+          (:fl-op node) (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")")))
       ;; hint-directed fast arithmetic: jolt.passes.numeric proved every operand a
       ;; flonum (^double) or fixnum (^long), so emit the Chez fl*/fx* op.
-      (:num-kind node) (emit-numeric (:num-kind node) (:name fnode) args order-args)
-      (and nop (= 1 (count args)) (cmp1-ops nop)) (str "(begin " (first args) " #t)")
+          (:num-kind node) (emit-numeric (:num-kind node) (:name fnode) args order-args)
+          (and nop (= 1 (count args)) (cmp1-ops nop)) (str "(begin " (first args) " #t)")
       ;; (get coll k [default]) with a struct-typed coll — the inference marked the
       ;; receiver with :hint :struct and a :shape matching the declared field layout.
       ;; Read the field by its static slot instead of the generic jolt-get dispatch.
@@ -850,20 +857,20 @@
       ;; back to jolt-get on nil. Only the 2-arg (no-default) form takes this path
       ;; since a declared field is always present. The key must be a compile-time
       ;; keyword literal so (struct-field-index) can resolve it.
-      (and (= nop "jolt-get") (<= 2 (count arg-nodes) 3))
-      (let [recv (first arg-nodes) key-node (second arg-nodes)
-            idx (when (and (= 2 (count arg-nodes))
-                           (= :struct (:hint recv))
-                           (= :const (:op key-node))
-                           (keyword? (:val key-node)))
-                  (struct-field-index (:shape recv) (:val key-node)))
-            dir (when (and idx (not (:nilable recv)))
-                  (direct-field-accessor (:shape recv) idx))]
-        (cond
-          dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
-          idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit key-node) ")")))
-          :else (order-args (fn [as] (str "(jolt-get " (str/join " " as) ")")))))
-      nop (order-args (fn [as] (str "(" nop " " (str/join " " as) ")")))
+          (and (= nop "jolt-get") (<= 2 (count arg-nodes) 3))
+          (let [recv (first arg-nodes) key-node (second arg-nodes)
+                idx (when (and (= 2 (count arg-nodes))
+                               (= :struct (:hint recv))
+                               (= :const (:op key-node))
+                               (keyword? (:val key-node)))
+                      (struct-field-index (:shape recv) (:val key-node)))
+                dir (when (and idx (not (:nilable recv)))
+                      (direct-field-accessor (:shape recv) idx))]
+            (cond
+              dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
+              idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit key-node) ")")))
+              :else (order-args (fn [as] (str "(jolt-get " (str/join " " as) ")")))))
+          nop (order-args (fn [as] (str "(" nop " " (str/join " " as) ")")))
       ;; (:k coll [default]) -> (jolt-get coll :k [default]) — the key (fnode) is a
       ;; const, so only the coll/default args carry order. When the inference typed
       ;; the receiver as a record whose declared fields include :k (it carries the
@@ -872,88 +879,88 @@
       ;; per-arity accessor (jrecN-fI); a nilable one keeps jrec-field-at. Only the
       ;; no-default form (a declared field is always present, so a default is never
       ;; taken).
-      (= kind :keyword)
-      (let [recv (first arg-nodes)
-            idx (when (and (= :struct (:hint recv)) (= 1 (count arg-nodes)))
-                  (struct-field-index (:shape recv) (:val fnode)))
-            dir (when (and idx (not (:nilable recv)))
-                  (direct-field-accessor (:shape recv) idx))]
-        (cond
-          dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
-          idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit fnode) ")")))
-          :else (order-args (fn [as] (str "(jolt-get " (first as) " " (emit fnode) (defstr as) ")")))))
+          (= kind :keyword)
+          (let [recv (first arg-nodes)
+                idx (when (and (= :struct (:hint recv)) (= 1 (count arg-nodes)))
+                      (struct-field-index (:shape recv) (:val fnode)))
+                dir (when (and idx (not (:nilable recv)))
+                      (direct-field-accessor (:shape recv) idx))]
+            (cond
+              dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
+              idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit fnode) ")")))
+              :else (order-args (fn [as] (str "(jolt-get " (first as) " " (emit fnode) (defstr as) ")")))))
       ;; (coll k [default]) -> lookup — coll (fnode) is the callee, evaluated
       ;; before the key/default args. A VECTOR literal invokes as nth (a bad
       ;; index throws, IPersistentVector.invoke); maps/sets invoke as get.
-      (= kind :coll)
-      (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
-                    (fn [[c & as]]
-                      (str (if (and (= :vector (:op fnode)) (= 1 (count as)))
-                             "(jolt-nth "
-                             "(jolt-get ")
-                           c " " (str/join " " as) ")")))
-      (and (stdlib-var? fnode) (not (prelude-mode?)))
-      (throw (ex-info (str "emit: unsupported stdlib fn `" (:ns fnode) "/" (:name fnode)
-                           "` (no core on Chez yet)") {}))
+          (= kind :coll)
+          (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
+                        (fn [[c & as]]
+                          (str (if (and (= :vector (:op fnode)) (= 1 (count as)))
+                                 "(jolt-nth "
+                                 "(jolt-get ")
+                               c " " (str/join " " as) ")")))
+          (and (stdlib-var? fnode) (not (prelude-mode?)))
+          (throw (ex-info (str "emit: unsupported stdlib fn `" (:ns fnode) "/" (:name fnode)
+                               "` (no core on Chez yet)") {}))
       ;; static method call (Class/method arg*) -> (host-static-call ...).
-      (= :host-static (:op fnode))
-      (order-args (fn [as]
-                    (str "(host-static-call " (chez-str-lit (:class fnode)) " " (chez-str-lit (:member fnode))
-                         (if (empty? as) "" (str " " (str/join " " as))) ")")))
-      (= :host (:op fnode))
-      (throw (ex-info (str "emit: unsupported host call `" (:name fnode) "`") {}))
+          (= :host-static (:op fnode))
+          (order-args (fn [as]
+                        (str "(host-static-call " (chez-str-lit (:class fnode)) " " (chez-str-lit (:member fnode))
+                             (if (empty? as) "" (str " " (str/join " " as))) ")")))
+          (= :host (:op fnode))
+          (throw (ex-info (str "emit: unsupported host call `" (:name fnode) "`") {}))
       ;; a :local callee: a known procedure (the letrec-bound self-name of a named
       ;; fn — i.e. self-recursion) is a real Scheme proc, so call it directly with
       ;; no jolt-invoke / arg consing; case-lambda handles arity. Any other local
       ;; holds an arbitrary IFn -> dynamic dispatch.
-      (= :local (:op fnode))
-      (if (*known-procs* (munge-name (:name fnode)))
-        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as)))
-        (invoke))
+          (= :local (:op fnode))
+          (if (*known-procs* (munge-name (:name fnode)))
+            (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as)))
+            (invoke))
       ;; closed-world direct call: the callee var is an app fn def already emitted
       ;; with a Scheme binding — apply it directly, no var lookup, no jolt-invoke.
       ;; Only fn-valued defs qualify; a non-fn invokable value (a map/set/keyword
       ;; held in a var) isn't a Scheme procedure, so it falls through to jolt-invoke
       ;; below (which still uses the direct binding as the invoke target).
-      (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
-           (direct-link-fn? (:ns fnode) (:name fnode)))
-      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as)))
+          (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
+               (direct-link-fn? (:ns fnode) (:name fnode)))
+          (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as)))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
        ;; lookup AND the field vector. After per-site desc-cell warmup the hot
        ;; path is: cell read -> make-jrecN — one allocation, no lookups, no
        ;; dispatch. The shape comes from the unit's record-shapes (set-record-shapes!).
-       (let [key (str (:ns fnode) "/" (:name fnode))
-             shape (get (ctor-shapes) key)]
-         (and (= :var (:op fnode)) shape
-              (= (count (get shape :fields)) (count args))
-              (<= (count args) 6)
+          (let [key (str (:ns fnode) "/" (:name fnode))
+                shape (get (ctor-shapes) key)]
+            (and (= :var (:op fnode)) shape
+                 (= (count (get shape :fields)) (count args))
+                 (<= (count args) 6)
               ;; skip if any ^double field — the inlined path doesn't coerce
-              (not-any? #{"double"} (get shape :tags))))
-       (let [s (get (ctor-shapes) (str (:ns fnode) "/" (:name fnode)))
-             tag (:type s)
-             cells @(:cache-cells (cur))
-             desc-lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
-             cached-desc (if cells
-                           (let [c (fresh-label "_cdesc$")]
-                             (swap! cells conj c)
-                             (str "(or " c " (let ((_d " desc-lookup ")) (set! " c " _d) _d))"))
-                           desc-lookup)]
-         (order-args (fn [as]
-                       (let [n (count as)]
-                         (if (<= n 8)
-                           (str "(make-jrec" n " " cached-desc " jolt-nil"
-                                (when (pos? n) (str " " (str/join " " as))) ")")
-                           (str "(let ((v (vector " (str/join " " as) "))) (make-jrec " cached-desc " v jolt-nil))"))))))
+                 (not-any? #{"double"} (get shape :tags))))
+          (let [s (get (ctor-shapes) (str (:ns fnode) "/" (:name fnode)))
+                tag (:type s)
+                cells @(:cache-cells (cur))
+                desc-lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
+                cached-desc (if cells
+                              (let [c (fresh-label "_cdesc$")]
+                                (swap! cells conj c)
+                                (str "(or " c " (let ((_d " desc-lookup ")) (set! " c " _d) _d))"))
+                              desc-lookup)]
+            (order-args (fn [as]
+                          (let [n (count as)]
+                            (if (<= n 8)
+                              (str "(make-jrec" n " " cached-desc " jolt-nil"
+                                   (when (pos? n) (str " " (str/join " " as))) ")")
+                              (str "(let ((v (vector " (str/join " " as) "))) (make-jrec " cached-desc " v jolt-nil))"))))))
       ;; a late-bound :var call head can hold a procedure OR a non-applicable
       ;; value the RT dispatches (multimethod, keyword/coll IFn) — route via
       ;; jolt-invoke (transparent for a procedure).
-      (= :var (:op fnode))
-      (invoke)
+          (= :var (:op fnode))
+          (invoke)
       ;; a computed callee can yield ANY IFn — route through jolt-invoke.
-      :else
-      (invoke))))))
+          :else
+          (invoke))))))
 
 ;; try/catch/finally. throw raises a Chez condition wrapping the jolt value
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
@@ -1029,17 +1036,17 @@
 ;; so the clone and impl land under the same tag the devirt site's :devirt-type names.
 (defn- emit-impl-clone [node]
   (when-some [u @jolt.op-registry/current-unit-box]
-   (when-some [[type-name proto method fc] (register-impl-invoke node)]
-    (let [ars (:arities fc)]
-      (when (= 1 (count ars))
-        (let [res (types/contagion-specialize-arity u (first ars) type-name)]
-          (when (nth res 1)
-            (let [spar (nth res 0)
-                  sym (fresh-label "_jcf$")
-                  clone (emit (numeric/annotate {:op :fn :arities [spar]}))]
-              (str "(define " sym " " clone ") (register-clone* "
-                   (chez-str-lit type-name) " " (chez-str-lit proto) " "
-                   (chez-str-lit method) " " sym ")")))))))))
+    (when-some [[type-name proto method fc] (register-impl-invoke node)]
+      (let [ars (:arities fc)]
+        (when (= 1 (count ars))
+          (let [res (types/contagion-specialize-arity u (first ars) type-name)]
+            (when (nth res 1)
+              (let [spar (nth res 0)
+                    sym (fresh-label "_jcf$")
+                    clone (emit (numeric/annotate {:op :fn :arities [spar]}))]
+                (str "(define " sym " " clone ") (register-clone* "
+                     (chez-str-lit type-name) " " (chez-str-lit proto) " "
+                     (chez-str-lit method) " " sym ")")))))))))
 
 ;; Wrap emit-invoke so an eligible impl registration also emits its contagion clone as
 ;; a sibling. The non-eligible path is byte-identical to before (no clone emitted).
@@ -1110,9 +1117,9 @@
      ;; collection literals -> rt constructors (collections.ss). Elements are
      ;; already-analyzed IR nodes; evaluate LEFT-TO-RIGHT (emit-ordered, which
      ;; wraps only when two or more operands could have observable effects).
-     :vector (emit-ordered "jolt-vector" (:items node))
-     :set (emit-ordered "jolt-hash-set" (:items node))
-     :map (emit-ordered "jolt-hash-map"
+    :vector (emit-ordered "jolt-vector" (:items node))
+    :set (emit-ordered "jolt-hash-set" (:items node))
+    :map (emit-ordered "jolt-hash-map"
                        (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node)))
     :quote (emit-quoted (:form node))
     :throw (str "(jolt-throw " (emit (:expr node)) ")")
@@ -1121,11 +1128,11 @@
      ;; NOT the bare exact->inexact a proven typed-param coercion uses. The 2-arg
      ;; :coerce (inlined ^double/^long param or return) has no :cast-fn and keeps
      ;; the bare fast-path coercion.
-     :coerce (let [e (emit (:expr node))]
-               (cond (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
-                     (= :double (:kind node)) (str "(exact->inexact " e ")")
-                     (= :long (:kind node)) (str "(jolt->fx " e ")")
-                     :else e))
+    :coerce (let [e (emit (:expr node))]
+              (cond (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
+                    (= :double (:kind node)) (str "(exact->inexact " e ")")
+                    (= :long (:kind node)) (str "(jolt->fx " e ")")
+                    :else e))
     :try (emit-try node)
     ;; regex literal #"…" -> a jolt-regex value (regex.ss, vendored irregex).
     :regex (str "(jolt-regex " (chez-str-lit (:source node)) ")")
@@ -1208,7 +1215,7 @@
                    (or (get pos :line) 0) ")"))
         ;; register before emitting the init so a self-referential body direct-links.
         _ (when dl? (swap! (:direct-link-defined (cur)) conj (dl-fqn ns nm))
-                    (when fn? (swap! (:direct-link-fns (cur)) conj (dl-fqn ns nm))))
+                (when fn? (swap! (:direct-link-fns (cur)) conj (dl-fqn ns nm))))
         init (emit-with-cells #(emit (:init node)))]
     (cond
       dl?
