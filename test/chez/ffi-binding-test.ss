@@ -132,6 +132,74 @@
 
 ;; byte-array buffer I/O: write a byte-array into foreign memory and read it back
 ;; byte-exact (high bytes preserved, no UTF-8 mangling).
+(ok "byte-array uses an unboxed Chez bytevector backing"
+    (bytevector? (jolt-array-vec (ev "(byte-array [0 128 255])"))))
+(ev "(def c-memcmp
+       (jolt.ffi/__cfn \"memcmp\" [:byte-array :byte-array :size_t] :int))")
+(ev "(def c-memset
+       (jolt.ffi/__cfn \"memset\" [:byte-array :int :size_t] :pointer))")
+(ok "typed byte-array arguments borrow binary storage directly"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [0 128 255 7])
+                  b (byte-array [0 128 255 7])]
+              (zero? (c-memcmp a b 4)))")))
+(ok "typed byte-array output mutates the original array"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3 4])]
+              (c-memset a 171 3)
+              (= [171 171 171 4] (vec a)))")))
+(ev "(def c-memcmp-pointer
+       (jolt.ffi/__cfn \"memcmp\" [:pointer :byte-array :size_t] :int))")
+(ev "(def c-memset-pointer
+       (jolt.ffi/__cfn \"memset\" [:pointer :int :size_t] :pointer))")
+(ok "scoped byte-array pointer borrows an interior slice without copying"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [9 1 2 8])
+                  expected (byte-array [1 2])]
+              (jolt.ffi/with-byte-array-pointer
+                a 1 2
+                (fn [p n] (zero? (c-memcmp-pointer p expected n))))))")))
+(ok "scoped byte-array pointer mutates the original interior slice"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3 4])]
+              (jolt.ffi/with-byte-array-pointer
+                a 1 2
+                (fn [p n] (c-memset-pointer p 171 n)))
+              (= [1 171 171 4] (vec a)))")))
+(ok "scoped byte-array pointer remains stable across collection"
+    (let ((a (ev "(byte-array [1 2 3 4])")))
+      (and (ffi-with-byte-array-pointer
+             a 1 2
+             (lambda (p n)
+               (collect)
+               (foreign-set! 'unsigned-8 p 0 205)
+               (= n 2)))
+           (= 205 (bytevector-u8-ref (jolt-array-vec a) 1)))))
+(ok "scoped byte-array pointer allows an empty slice at array end"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2])]
+              (jolt.ffi/with-byte-array-pointer
+                a 2 0
+                (fn [p n] (and (pos? p) (zero? n)))))")))
+(ok "scoped byte-array pointer rejects invalid ranges before callback"
+    (jolt-truthy?
+      (ev "(let [a (byte-array 2)]
+              (and (try
+                     (jolt.ffi/with-byte-array-pointer a -1 1 (fn [_ _] false))
+                     false
+                     (catch IndexOutOfBoundsException _ true))
+                   (try
+                     (jolt.ffi/with-byte-array-pointer a 1 2 (fn [_ _] false))
+                     false
+                     (catch IndexOutOfBoundsException _ true))))")))
+(ok "typed byte-array arguments reject other array kinds"
+    (jolt-truthy?
+      (ev "(try (c-memset (int-array [1 2]) 0 2) false
+                (catch IllegalArgumentException _ true))")))
+(ok "typed byte-array arguments fail closed on collect-safe calls"
+    (guard (e (#t #t))
+      (ev "(jolt.ffi/__cfn \"read\" [:int :byte-array :size_t] :ssize_t :blocking)")
+      #f))
 (ok "byte-array roundtrip (binary-faithful)"
     (jolt-truthy?
       (ev "(let [src (byte-array [0 65 200 255 10])
@@ -206,6 +274,16 @@
     (jolt-truthy?
       (ev "(try (jolt.ffi/read-array 0 -1) false
                 (catch IndexOutOfBoundsException _ true))")))
+(ok "bulk transfer preserves a large binary payload"
+    (jolt-truthy?
+      (ev "(let [n 65536
+                  src (byte-array (map #(bit-and % 255) (range n)))
+                  dst (byte-array n)
+                  p (jolt.ffi/alloc n)]
+              (jolt.ffi/write-array p src)
+              (jolt.ffi/read-array! p n dst 0)
+              (jolt.ffi/free p)
+              (= (vec src) (vec dst)))")))
 
 ;; a :blocking foreign call is collect-safe: a thread parked in it must not pin
 ;; the stop-the-world collector. (collect) here would throw "cannot collect when

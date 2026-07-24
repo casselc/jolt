@@ -113,6 +113,7 @@
   {:suite "arraycopy" :expr "(let [src (byte-array [1 -1 -128 4]) dst (byte-array 6)] (System/arraycopy src 1 dst 2 2) (vec dst))" :expected "[0 0 255 128 0 0]"}
   {:suite "arraycopy" :expr "(let [a (int-array [1 2 3 4 5])] (System/arraycopy a 0 a 1 4) (vec a))" :expected "[1 1 2 3 4]"}
   {:suite "arraycopy" :expr "(let [a (int-array [1 2 3 4 5])] (System/arraycopy a 1 a 0 4) (vec a))" :expected "[2 3 4 5 5]"}
+  {:suite "arraycopy" :label "byte-array overlap keeps memmove snapshot semantics" :expr "(let [a (byte-array [0 1 2 3 4 5])] (System/arraycopy a 0 a 2 4) (vec a))" :expected "[0 1 0 1 2 3]"}
   {:suite "arraycopy" :expr "(let [a (double-array [1.0 2.0 3.0 4.0 5.0])] (System/arraycopy a 0 a 1 4) (vec a))" :expected "[1.0 1.0 2.0 3.0 4.0]"}
   {:suite "arraycopy" :expr "(let [src (object-array [:a {:k 1}]) dst (object-array 3)] (System/arraycopy src 0 dst 1 2) (vec dst))" :expected "[nil :a {:k 1}]"}
   {:suite "arraycopy" :label "all valid small overlaps match a snapshot reference copy" :expr "(every? true? (for [s (range 7) d (range 7) n (range (inc (min (- 6 s) (- 6 d))))] (let [initial [0 1 2 3 4 5] snapshot (subvec initial s (+ s n)) expected (reduce (fn [v [i x]] (assoc v (+ d i) x)) initial (map-indexed vector snapshot)) a (int-array initial)] (System/arraycopy a s a d n) (= expected (vec a)))))" :expected "true"}
@@ -618,6 +619,7 @@
   {:suite "bytes" :expr "(String. (byte-array [104 105]) \"UTF-8\")" :expected "hi"}
   {:suite "bytes" :expr "(int (first (String. (byte-array [200]) \"ISO-8859-1\")))" :expected "200"}
   {:suite "bytes" :expr "(String. (.getBytes \"round\" \"UTF-8\") \"UTF-8\")" :expected "round"}
+  {:suite "bytes" :label "aclone snapshots the byte backing and aset-byte keeps unsigned values" :expr "(let [a (byte-array [1 -1 -128]) b (aclone a)] (aset-byte a 0 258) [(vec a) (vec b)])" :expected "[[2 255 128] [1 255 128]]"}
   {:suite "deftype-map" :expr "(do (deftype Mp [m] clojure.lang.IPersistentMap (without [_ k] m)) [(map? (->Mp 1)) (record? (->Mp 1))])" :expected "[true false]"}
   ;; contains? routes to a set-like deftype's own `contains` (not field presence);
   ;; the plain field-presence arm is guarded to skip a type declaring contains.

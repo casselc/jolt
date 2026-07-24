@@ -11,15 +11,33 @@
         (let [db (ffi/read pp :pointer)] ...)
         (ffi/free pp))
 
-  Types (keywords): :int :uint :long :ulong :int64 :uint64 :size_t :ssize_t
-  :iptr :uptr :double :float :pointer :string :void :uint8 :char.
+  Types (keywords): :int :uint :int32 :uint32 :long :ulong :int64 :uint64
+  :size_t :ssize_t :iptr :uptr :double :float :pointer :string :void :uint8
+  :char. An outbound, non-:blocking call may also use :byte-array for a C u8*
+  argument. The array's bytevector storage is borrowed without a native copy
+  only for the duration of that call; C must not retain the pointer. Because a
+  :blocking call deactivates the Scheme thread for collection, :byte-array is
+  rejected there.
+
+  A C struct argument passed by value is described inline:
+
+      [:by-value
+       [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]
+
+  The Jolt argument remains a native pointer to caller-owned storage holding
+  that layout; the generated wrapper passes the pointed-to value by C value.
+  Nested [:struct ...] field types are supported. Aggregate results and
+  aggregate callbacks are deliberately rejected until their ownership contract
+  is defined.
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. Binary buffers
   can be copied as `(read-array ptr len)`, into an existing byte-array as
   `(read-array! ptr len dest dest-off)`, or out with
   `(write-array ptr src [src-off len])`. A null pointer is allowed only for a
-  zero-length transfer.
+  zero-length transfer. `(with-byte-array-pointer arr off len f)` validates and
+  pins an array slice, then calls `f` with its interior pointer and validated
+  length. The pointer is valid only until `f` returns and must not be retained.
 
   foreign-fn lowers a compile-time-typed signature to a real Chez
   foreign-procedure. foreign-callable is the inverse — it wraps a jolt fn as a
@@ -30,7 +48,8 @@
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; An optional trailing :blocking marks a call that may block (accept/recv/...),
-;; so it's emitted collect-safe and won't pin the garbage collector.
+;; so it's emitted collect-safe and won't pin the garbage collector. Aggregate
+;; arguments use the inline descriptor documented above.
 (defmacro foreign-fn [csym argtypes rettype & [opt]]
   (if (= opt :blocking)
     (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)

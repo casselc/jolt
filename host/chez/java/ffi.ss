@@ -34,6 +34,10 @@
     (cond
       ((string=? n "int") 'int)
       ((string=? n "uint") 'unsigned-int)
+      ;; Fixed-width aliases are useful in public ABI descriptors even on the
+      ;; platforms where C int happens to be 32 bits.
+      ((string=? n "int32") 'integer-32)
+      ((string=? n "uint32") 'unsigned-32)
       ;; 16-bit. Without these a caller cannot express a C `short` field at all:
       ;; struct pollfd's two shorts had to be packed into one :int slot and masked,
       ;; which is silently wrong on a big-endian host. sockaddr_in.sin_family and
@@ -95,13 +99,13 @@
 ;; fresh byte-array; read-array! fills an existing destination range and returns
 ;; the copied count. write-array keeps its two-argument whole-array API and adds
 ;; a four-argument source range, also returning the copied count.
-(define (ffi-byte-array-vec who arr)
+(define (ffi-byte-array-backing who arr)
   (if (and (jolt-array? arr) (eq? (jolt-array-kind arr) 'byte))
       (jolt-array-vec arr)
       (throw-jvm (quote IllegalArgumentException)
                  (string-append "jolt.ffi/" who ": expected byte-array"))))
-(define (ffi-check-array-range who v off len)
-  (let ((n (vector-length v)))
+(define (ffi-check-array-range who bv off len)
+  (let ((n (bytevector-length bv)))
     (when (or (< off 0) (< len 0) (> off n) (> len (- n off)))
       (throw-jvm (quote IndexOutOfBoundsException)
                  (string-append "jolt.ffi/" who ": byte-array range out of bounds")))))
@@ -112,16 +116,53 @@
   (when (and (> len 0) (= ptr 0))
     (throw-jvm (quote NullPointerException)
                (string-append "jolt.ffi/" who ": null pointer"))))
+(define (ffi-with-byte-array-pointer arr off len f)
+  ;; Scope an interior pointer to a movable Jolt byte-array. Chez documents the
+  ;; reference address of a bytevector as the address of its first content byte;
+  ;; lock-object keeps that address stable across allocations and collections
+  ;; performed by f. lock-object is reference-counted, so overlapping scopes on
+  ;; the same array remain safe. C must not retain the pointer after f returns.
+  (let* ((start (jnum->exact off))
+         (cnt (jnum->exact len))
+         (bv (ffi-byte-array-backing "with-byte-array-pointer" arr)))
+    (ffi-check-array-range "with-byte-array-pointer" bv start cnt)
+    (lock-object bv)
+    (dynamic-wind
+      void
+      (lambda ()
+        (jolt-invoke2 f (+ (object->reference-address bv) start) cnt))
+      (lambda () (unlock-object bv)))))
+;; Chez accepts bytevectors directly for u8* arguments. Keep the native call to
+;; one memcpy for whole-array transfers; ranged transfers use one temporary
+;; bytevector because a u8* argument denotes the bytevector base, then one
+;; overlap-safe Chez bytevector copy. This removes one FFI crossing per byte.
+(define ffi-memcpy-from-pointer!
+  (foreign-procedure "memcpy" (u8* uptr uptr) void*))
+(define ffi-memcpy-to-pointer!
+  (foreign-procedure "memcpy" (uptr u8* uptr) void*))
+(define (ffi-copy-from-pointer! p bv start cnt)
+  (when (> cnt 0)
+    (if (and (= start 0) (= cnt (bytevector-length bv)))
+        (ffi-memcpy-from-pointer! bv p cnt)
+        (let ((tmp (make-bytevector cnt)))
+          (ffi-memcpy-from-pointer! tmp p cnt)
+          (bytevector-copy! tmp 0 bv start cnt)))))
+(define (ffi-copy-to-pointer! p bv start cnt)
+  (when (> cnt 0)
+    (if (and (= start 0) (= cnt (bytevector-length bv)))
+        (ffi-memcpy-to-pointer! p bv cnt)
+        (let ((tmp (make-bytevector cnt)))
+          (bytevector-copy! bv start tmp 0 cnt)
+          (ffi-memcpy-to-pointer! p tmp cnt)))))
 (define (ffi-read-array! ptr n arr off)
   (let* ((cnt (jnum->exact n))
          (start (jnum->exact off))
          (p (jnum->exact ptr))
-         (v (ffi-byte-array-vec "read-array!" arr)))
-    (ffi-check-array-range "read-array!" v start cnt)
+         (bv (ffi-byte-array-backing "read-array!" arr)))
+    (ffi-check-array-range "read-array!" bv start cnt)
     (ffi-check-transfer-pointer "read-array!" p cnt)
-    (do ((i 0 (+ i 1)))
-        ((= i cnt) cnt)
-      (vector-set! v (+ start i) (foreign-ref 'unsigned-8 p i)))))
+    (ffi-copy-from-pointer! p bv start cnt)
+    cnt))
 (define (ffi-read-array ptr n)
   (let* ((cnt (jnum->exact n)))
     ;; Validate before allocation so a negative length is a stable public bounds
@@ -129,28 +170,27 @@
     (when (< cnt 0)
       (throw-jvm (quote IndexOutOfBoundsException)
                  "jolt.ffi/read-array: negative length"))
-    (let ((arr (make-jolt-array (make-vector cnt 0) 'byte)))
-    (ffi-read-array! ptr cnt arr 0)
+    (let ((arr (make-jolt-array (make-bytevector cnt 0) 'byte)))
+      (ffi-read-array! ptr cnt arr 0)
       arr)))
 (define ffi-write-array
   (case-lambda
     ((ptr arr)
-     (let ((v (ffi-byte-array-vec "write-array" arr)))
-       (ffi-write-array ptr arr 0 (vector-length v))))
+     (let ((bv (ffi-byte-array-backing "write-array" arr)))
+       (ffi-write-array ptr arr 0 (bytevector-length bv))))
     ((ptr arr off len)
      (let* ((start (jnum->exact off))
             (cnt (jnum->exact len))
             (p (jnum->exact ptr))
-            (v (ffi-byte-array-vec "write-array" arr)))
-       (ffi-check-array-range "write-array" v start cnt)
+            (bv (ffi-byte-array-backing "write-array" arr)))
+       (ffi-check-array-range "write-array" bv start cnt)
        (ffi-check-transfer-pointer "write-array" p cnt)
-       (do ((i 0 (+ i 1)))
-           ((= i cnt) cnt)
-         (foreign-set! 'unsigned-8 p i
-                       (bitwise-and (exact (vector-ref v (+ start i))) #xff)))))))
+       (ffi-copy-to-pointer! p bv start cnt)
+       cnt))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-array!" ffi-read-array!)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
+(def-var! "jolt.ffi" "with-byte-array-pointer" ffi-with-byte-array-pointer)
 
 ;; --- string / bytevector marshaling ------------------------------------------
 ;; A C string result already comes back as a jolt string (the `string` foreign
