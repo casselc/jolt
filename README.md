@@ -49,8 +49,14 @@ fatal:
   a completed checkout. Dependency build outputs
   and downloaded native artifacts belong in a project/user cache outside this
   immutable source checkout (or behind a library-specific cache override).
-  Concurrent fetches wait up to five minutes for the recorded owner; a crashed
-  owner's single `.jolt-lock` directory is reported for explicit recovery.
+  Writers coordinate through the stable adjacent `.jolt-lock` path and stage
+  the checkout in a short same-filesystem `.s` sibling. Both private paths are
+  removed before a normal writer releases ownership. Concurrent fetches wait up
+  to five minutes for the recorded owner; a crashed owner's exact lock is
+  reported for explicit recovery, and the next owner removes only that entry's
+  orphan `.s` stage before retrying. Every Git invocation sets
+  `core.longpaths=true` locally to the command, so native Windows recursive
+  submodules do not depend on or mutate the user's global Git configuration.
   Native Windows runs POSIX dependency commands through the `sh` shipped with
   Git for Windows; set `JOLT_SH` to its full path when it is not on `PATH`.
 - **Maven deps** (`:mvn/version`) are downloaded over HTTPS by jolt itself (no

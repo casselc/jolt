@@ -100,7 +100,11 @@ mvnhttp:
 # repository; isolated cache roots make the failure/retry and concurrent-writer
 # cases deterministic without touching the user's dependency caches.
 depstest:
-	@root="$$(mktemp -d "$${TMPDIR:-/tmp}/jolt-deps-test.XXXXXX")"; \
+	@base="$${TMPDIR:-/tmp}"; \
+	  case "$$(uname -s)" in \
+	    MINGW*|MSYS*) [ -z "$${TEMP:-}" ] || base="$$(cygpath -u "$$TEMP")" ;; \
+	  esac; \
+	  root="$$(mktemp -d "$$base/jolt-deps-test.XXXXXX")"; \
 	  trap 'rm -rf "$$root"' EXIT INT TERM; \
 	  JOLT_AOT_CACHE=0 GIT_ALLOW_PROTOCOL=file GIT_CONFIG_NOSYSTEM=1 \
 	    GIT_CONFIG_GLOBAL="$$root/gitconfig" \
