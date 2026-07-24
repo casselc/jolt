@@ -8,7 +8,17 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: full gate (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
         with:
@@ -29,7 +39,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/chez
-          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off
+          key: chez-${{ matrix.runner }}-${{ runner.arch }}-v10.4.1-x11off
 
       - name: Build Chez Scheme from source
         if: steps.cache-chez.outputs.cache-hit != 'true'
@@ -80,7 +90,9 @@ jobs:
   # compiler and exercise the transactional cache on every push/PR so that path
   # cannot regress unnoticed until a release tag.
   git-deps-windows:
+    name: packaged Git deps (Windows x86_64)
     runs-on: windows-latest
+    timeout-minutes: 90
     defaults:
       run:
         shell: msys2 {0}
@@ -134,10 +146,84 @@ jobs:
           echo "$bindir" >> "$GITHUB_PATH"
           echo "JOLT_CHEZ_CSV=$GITHUB_WORKSPACE/chez-install/csv" >> "$GITHUB_ENV"
 
+      # This is deliberately source-mode. It covers the native Windows runtime
+      # even though the current self-contained compiler still uses the separate
+      # MinGW/libkernel.a packaging contract below.
+      - name: Native Windows source-mode core gate
+        env:
+          JOLT_AOT_CACHE: "0"
+          JOLT_SH: C:/Program Files/Git/bin/sh.exe
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          chez --script test/chez/target-descriptor-test.ss
+          chez --script host/chez/run-unit.ss
+          chez --script host/chez/cli.ss run test/mvn_http_test.clj
+
       - name: Build packaged jolt
         run: |
           chez --version
           make jolt-release
 
+      - name: Packaged Windows POSIX-shell boundary
+        run: |
+          shell_tmp="$RUNNER_TEMP/jolt shell temp"
+          mkdir -p "$shell_tmp"
+          shell_tmp_win="$(cygpath -w "$shell_tmp")"
+          JOLT_SH='C:/Program Files/Git/bin/sh.exe' \
+            TEMP="$shell_tmp_win" TMP="$shell_tmp_win" \
+            ./target/release/jolt run test/windows_shell_test.clj
+
       - name: Transactional Git dependency cache
         run: make depstest DEPSTEST_JOLTC=./target/release/jolt
+
+  # Windows ARM64 currently has no GNU/libkernel.a package lane. That must not
+  # hide native source-runtime regressions. Build the exact Chez release with
+  # its supported MSVC ARM64 target and run the core source gates directly.
+  # The runner image is still in public preview, so this job initially records
+  # evidence without making an image outage block the established gates.
+  windows-arm64-source:
+    name: source runtime (Windows aarch64 preview)
+    runs-on: windows-11-vs2026-arm
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Checkout Chez Scheme v10.4.1
+        uses: actions/checkout@v5
+        with:
+          repository: cisco/ChezScheme
+          ref: v10.4.1
+          submodules: recursive
+          path: chez-src
+
+      - name: Build native ARM64 Chez Scheme
+        shell: cmd
+        working-directory: chez-src
+        run: build.bat tarm64nt /only
+
+      - name: Native Windows ARM64 source-mode core gate
+        shell: pwsh
+        env:
+          HOME: ${{ runner.temp }}
+          JOLT_AOT_CACHE: "0"
+          JOLT_SH: C:/Program Files/Git/bin/sh.exe
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          $chez = Join-Path $env:GITHUB_WORKSPACE 'chez-src\tarm64nt\bin\tarm64nt\scheme.exe'
+          if (-not (Test-Path $chez)) {
+            throw "Chez ARM64 executable not found: $chez"
+          }
+          & $chez --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $chez --script test\chez\target-descriptor-test.ss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $chez --script host\chez\run-unit.ss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:JOLT_PWD = $env:GITHUB_WORKSPACE
+          & $chez --script host\chez\cli.ss run test\mvn_http_test.clj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $chez --script host\chez\cli.ss run test\windows_shell_test.clj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
