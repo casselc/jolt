@@ -796,6 +796,9 @@
   {:suite "javastatic" :expr "(Math/getExponent 0.0)" :expected "-1023"}
   ;; Stage D — executor awaitTermination blocks until workers drain
   {:suite "concurrency" :expr "(do (require '[clojure.core.async :refer [<!!]]) (let [e (java.util.concurrent.Executors/newSingleThreadExecutor) c (java.util.concurrent.CountDownLatch. 1)] (.execute e (fn [] (.countDown c))) (.shutdown e) (.await c) (.awaitTermination e 5000) (.isTerminated e)))" :expected "true"}
+  ;; Stage D — execute/submit reject synchronously after shutdown.  Accepting
+  ;; either task would strand it behind workers that have already terminated.
+  {:suite "concurrency" :expr "(let [e (java.util.concurrent.Executors/newSingleThreadExecutor)] (.shutdown e) [(try (.execute e (fn [] :never)) :accepted (catch java.util.concurrent.RejectedExecutionException _ :rejected)) (try (.submit e (fn [] :never)) :accepted (catch java.util.concurrent.RejectedExecutionException _ :rejected))])" :expected "[:rejected :rejected]"}
   ;; Stage D — ReentrantLock reentrant lock/unlock + hold count
   {:suite "concurrency" :expr "(let [l (java.util.concurrent.locks.ReentrantLock.)] (.lock l) (.lock l) (let [locked (.isLocked l) held (.isHeldByCurrentThread l)] (.unlock l) (.unlock l) [locked held (.isLocked l)]))" :expected "[true true false]"}
   ;; Stage D — ReentrantLock tryLock
