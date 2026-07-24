@@ -116,6 +116,22 @@
   (when (and (> len 0) (= ptr 0))
     (throw-jvm (quote NullPointerException)
                (string-append "jolt.ffi/" who ": null pointer"))))
+(define (ffi-with-byte-array-pointer arr off len f)
+  ;; Scope an interior pointer to a movable Jolt byte-array. Chez documents the
+  ;; reference address of a bytevector as the address of its first content byte;
+  ;; lock-object keeps that address stable across allocations and collections
+  ;; performed by f. lock-object is reference-counted, so overlapping scopes on
+  ;; the same array remain safe. C must not retain the pointer after f returns.
+  (let* ((start (jnum->exact off))
+         (cnt (jnum->exact len))
+         (bv (ffi-byte-array-backing "with-byte-array-pointer" arr)))
+    (ffi-check-array-range "with-byte-array-pointer" bv start cnt)
+    (lock-object bv)
+    (dynamic-wind
+      void
+      (lambda ()
+        (jolt-invoke2 f (+ (object->reference-address bv) start) cnt))
+      (lambda () (unlock-object bv)))))
 ;; Chez accepts bytevectors directly for u8* arguments. Keep the native call to
 ;; one memcpy for whole-array transfers; ranged transfers use one temporary
 ;; bytevector because a u8* argument denotes the bytevector base, then one
@@ -174,6 +190,7 @@
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-array!" ffi-read-array!)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
+(def-var! "jolt.ffi" "with-byte-array-pointer" ffi-with-byte-array-pointer)
 
 ;; --- string / bytevector marshaling ------------------------------------------
 ;; A C string result already comes back as a jolt string (the `string` foreign
