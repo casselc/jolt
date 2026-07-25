@@ -347,6 +347,16 @@
               (nr (hc-cell-num-ret cell)))
           (if nr (jolt-assoc base hc-kw-num-ret nr) base))
         (cond
+          ;; A namespace alias is categorical: `a/name` denotes a var in the
+          ;; aliased namespace, never a class named `a`. Preserve that target
+          ;; even when the var is not defined yet so the analyzer can apply the
+          ;; same scoped late-binding rule as an unqualified forward reference.
+          ;; This must precede name-based class recognition: aliased vars may
+          ;; themselves have class-like names such as `a/String`.
+          ;; Top-level references remain compile errors.
+          (alias-target
+           (jolt-hash-map hc-kw-kind hc-kw-alias-var
+                          hc-kw-ns alias-target hc-kw-name nm))
           ;; An explicit namespace-local import is a class mapping even before
           ;; the import macro's runtime value binding executes.
           ((chez-resolve-class-import (chez-actx-cns ctx) nm)
@@ -371,14 +381,6 @@
           ((and (fx>? (string-length nm) 0) (char-upper-case? (string-ref nm 0))
                 (chez-deftype-simple->tag nm))
            => (lambda (dtag) (jolt-hash-map hc-kw-kind hc-kw-class hc-kw-name dtag)))
-          ;; A namespace alias is categorical: `a/name` denotes a var in the
-          ;; aliased namespace, never a class named `a`. Preserve that target
-          ;; even when the var is not defined yet so the analyzer can apply the
-          ;; same scoped late-binding rule as an unqualified forward reference.
-          ;; Top-level references remain compile errors.
-          (alias-target
-           (jolt-hash-map hc-kw-kind hc-kw-alias-var
-                          hc-kw-ns alias-target hc-kw-name nm))
           (else (jolt-hash-map hc-kw-kind hc-kw-unresolved hc-kw-name nm))))))
 
 ;; Every unqualified var name resolvable from the compile ns — the current ns's
