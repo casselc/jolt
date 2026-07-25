@@ -74,6 +74,14 @@
                       "java.lang.ClassCastException"
                       (string-append "class " (guard (e (#t "?")) (jolt-class-name x))
                                      " cannot be cast to class clojure.lang.IPending"))))
+        ;; A deftype/reify implementing clojure.lang.IPending participates in
+        ;; realized? through isRealized, just as custom IDeref participates in
+        ;; deref. This arm follows the native built-ins so their synchronization
+        ;; and memory-ordering implementations remain canonical.
+        ((iface-method x "clojure.lang.IPending" "isRealized" 1)
+         => (lambda (m) (if (jolt-truthy? (jolt-invoke m x)) #t #f)))
+        ((iface-declared? x "clojure.lang.IPending")
+         (iface-abstract-method-error x "isRealized"))
         (else (jolt-invoke overlay-realized? x))))))
 ;; clojure.edn/read over a reader: drain the jhost reader, then read through the
 ;; overlay read-string so the opts map (:readers/:default/:eof) is honored.
@@ -263,3 +271,21 @@
     ("set?" . "clojure.lang.IPersistentSet")
     ("associative?" . "clojure.lang.Associative")
     ("sequential?" . "clojure.lang.Sequential")))
+;; The overlay recognizes built-in representations, while custom deftype/reify
+;; values answer these predicates through the interface they actually declare.
+;; Keep this separate from persistent-collection predicates: Seqable, Counted,
+;; and Indexed do not imply coll? or Sequential on the JVM.
+(for-each
+  (lambda (p)
+    (let ((nm (car p)) (iface (cdr p)))
+      (let ((prev (var-deref "clojure.core" nm)))
+        (def-var! "clojure.core" nm
+          (lambda (x)
+            (if (and (or (jreify? x)
+                         (and (jrec? x) (not (jrec-record? x))))
+                     (eq? #t (instance-check (jolt-symbol #f iface) x)))
+                #t
+                (jolt-invoke1 prev x)))))))
+  '(("seqable?" . "clojure.lang.Seqable")
+    ("counted?" . "clojure.lang.Counted")
+    ("indexed?" . "clojure.lang.Indexed")))

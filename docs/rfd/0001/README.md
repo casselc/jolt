@@ -432,6 +432,20 @@ generic protocol-dispatch gaps:
 - `realized?` must honor custom `IPending`.
 
 Those are general Clojure compatibility fixes, not byte-window special cases.
+Their dispatch invariant is canonical namespace-qualified interface identity
+**and** exact method arity. Selecting by method shape alone, or first collapsing
+interface ids to simple names, lets an unrelated local protocol impersonate a
+core interface. A declared interface whose selected method is absent is a
+distinct `AbstractMethodError`, not an absent-interface cast failure. The
+checked buggy/corrected/non-vacuity models and JVM/runtime collision controls
+are recorded in the supplementary byte/I/O invariant note.
+
+This is a runtime-wide protocol rule, not only a core-adapter rule. A `reify`
+may use a compact method-name table internally, but an instance-local method is
+eligible only when the reify declared the exact requested canonical protocol.
+Otherwise dispatch proceeds to that protocol's host/default extension or fails
+missing. A second checked model trio and JVM/runtime control pin the
+same-method-name cross-protocol collision.
 
 ### Completions are future-shaped, not native-I/O Futures
 
@@ -815,6 +829,10 @@ examples, but neither should define the base API.
 - Identical declarations compose; conflicts fail closed.
 - Cycles and re-entrant loads terminate with structured diagnostics.
 - Host class, `instance?`, protocol extension, and invocation agree.
+- A same-shaped or same-short-name user protocol cannot drive a core operation:
+  canonical identity and exact method arity must both match.
+- A reify-local method is selected only for an exact canonical protocol that
+  the reify declared; an equal method name from another protocol is irrelevant.
 - Source and built behavior match.
 
 ### Buffers and concurrency
@@ -863,10 +881,10 @@ examples, but neither should define the base API.
 
 Every solver proof records source anchors, assumptions, a corrected model, a
 buggy control with a witness, a non-vacuity control, and reproduction commands.
-The byte-window containment and completion-lease models are recorded with the
-RFD's supplementary invariant note. Models complement real native and
-concurrency tests; they do not substitute for them or prove behavior through a
-retained raw-array alias.
+The byte-window containment, exact interface-dispatch, exact reify-dispatch,
+and completion-lease models are recorded with the RFD's supplementary
+invariant note. Models complement real native and concurrency tests; they do
+not substitute for them or prove behavior through a retained raw-array alias.
 
 ## Performance considerations
 
