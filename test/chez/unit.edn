@@ -238,8 +238,8 @@
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (pos? (count (filter (fn [f] (.isFile f)) (file-seq (io/file \"stdlib\"))))))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.string :as s])) (boolean (some (fn [p] (s/ends-with? p \"README.md\")) (file-seq \".\"))))" :expected "true"}
   {:suite "io" :expr "(string? (slurp \"README.md\"))" :expected "true"}
-  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"hello\") (slurp \"/tmp/jolt-io-test.txt\"))" :expected "hello"}
-  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"a\") (spit \"/tmp/jolt-io-test.txt\" \"b\" :append true) (slurp \"/tmp/jolt-io-test.txt\"))" :expected "ab"}
+  {:suite "io" :label "spit and slurp use the native temporary directory" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") (System/getProperty \"file.separator\") \"jolt-io-test.txt\")] (spit p \"hello\") (slurp p))" :expected "hello"}
+  {:suite "io" :label "append uses the native temporary directory" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") (System/getProperty \"file.separator\") \"jolt-io-test.txt\")] (spit p \"a\") (spit p \"b\" :append true) (slurp p))" :expected "ab"}
   {:suite "io" :expr "(flush)" :expected ""}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (string? (slurp (io/file \"README.md\"))))" :expected "true"}
   {:suite "ioreader" :expr "(apply str (char-array \"abc\"))" :expected "abc"}
