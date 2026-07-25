@@ -35,7 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that binding. Chez captures `errno` on POSIX or the Windows last-error slot in
   the foreign-call return path, before collect-safe thread reactivation or
   cleanup can overwrite it. The option composes with `:blocking` and
-  `:varargs-after`; existing bindings keep their scalar result.
+  `:varargs-after`; existing bindings keep their scalar result. Consumers keep
+  scalar and captured dispatch surfaces separate. Direct-return failures such
+  as `WSAStartup` stay scalar, while delegated errors such as POSIX
+  `getaddrinfo`'s `EAI_SYSTEM` require the captured pair.
 - **Explicit variadic FFI boundaries.** `jolt.ffi/foreign-fn` and `defcfn`
   accept `{:varargs-after n}` (optionally with `:blocking true`) and lower it to
   Chez's exact fixed/variadic calling convention. Fully typing every argument

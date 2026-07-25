@@ -108,8 +108,20 @@ dependency for non-blocking calls as well.
 independently of a particular call. Its caller is responsible for ensuring that
 no native or runtime work has intervened.
 
-Functions such as `WSAStartup` and `getaddrinfo` return their error code directly;
-they should keep their ordinary scalar binding instead of enabling this option.
+A function should keep an ordinary scalar binding only when its return value
+fully identifies the outcome. `WSAStartup` is the representative case: its
+nonzero return is itself the Winsock error and no last-error read is required.
+
+`getaddrinfo` is subtler. Its normal failures are returned directly as
+`EAI_*`, but POSIX `EAI_SYSTEM` delegates the underlying cause to `errno`.
+Therefore a blocking `getaddrinfo` caller that preserves `EAI_SYSTEM` detail
+must use the captured pair and consult its second element only for that return
+code. Windows has no `EAI_SYSTEM`, so the captured slot is ignored there.
+
+Downstream dispatch should keep scalar and captured calls structurally
+distinct. One wrapper must not return a scalar for some operation names and a
+pair for others; use, for example, separate `invoke` and `invoke-captured`
+surfaces whose result shapes are invariant.
 
 ## Chez requirement
 
