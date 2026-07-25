@@ -99,9 +99,11 @@ classes always resolve before it.
 4. **Registrations publish after successful evaluation.** Provider-owned
    constructor, static, method, hierarchy, class, instance, and value-semantics
    mutations are staged while the namespace evaluates. A source exception
-   discards the stage, so another thread cannot observe half of those
-   registrations. Arbitrary application side effects are not transactional;
-   provider namespaces should keep top-level work limited to registration.
+   discards the stage. Commit snapshots the registries reachable through those
+   hooks and restores the snapshot if an operation throws, while class-provider
+   lookup callers remain behind the stable-registry boundary. Arbitrary
+   application side effects are not transactional; provider namespaces should
+   keep top-level work limited to registration.
 5. **Concurrent failure is shared.** A caller blocked behind an evaluation that
    attempted its provider receives that attempt's error. It does not
    immediately start a second attempt and replay provider top-level effects.
@@ -175,6 +177,8 @@ not define a reproducible closed graph.
 - a successful concurrent provider joined exactly once;
 - a concurrent failed provider whose error is shared and whose staged static
   registration does not leak;
+- a commit-time failure after a staged static, proving rollback of the published
+  prefix and a clean later namespace retry;
 - identical/conflicting declarations, atomic global and provider-local
   registration batches, a successful omission, no mapping, and a provider
   cycle;
