@@ -1,18 +1,20 @@
 ;; records + protocols — the deftype/defrecord + defprotocol/extend-type
 ;; subsystem.
 ;;
-;; A record is a `jrec`: a shared per-type descriptor + a flat vector of field
-;; values in declared order, plus an extension map for any non-field keys assoc'd
-;; on (jolt-nil when there are none — the common case). This lays fields out like a
-;; native struct: construction allocates one vector, not a chain of cons cells, and
-;; a field read is an index lookup, not a list scan. It is map?/coll?, equal to
-;; another jrec of the same type with equal fields (never equal to a plain map),
-;; and prints as #ns.Name{...}.
+;; A deftype or defrecord instance is a `jrec`: a shared per-type descriptor,
+;; flat inline field slots in declared order, and an extension map for non-field
+;; keys assoc'd onto a defrecord (jolt-nil when there are none). This lays fields
+;; out like a native struct: construction avoids a chain of cons cells and a
+;; field read is an index lookup, not a list scan. A defrecord is map?/coll?,
+;; compares structurally with the same record type (never a plain map), and
+;; prints as #ns.Name{...}; a bare deftype receives only declared collection
+;; behavior.
 ;; The collection dispatchers (jolt-get/count/keys/vals/seq/assoc/contains?/=/
 ;; hash/conj + the printers) are set!-extended with a jrec arm that delegates to
 ;; the original — the transients.ss pattern — so all record logic lives here and
-;; the hot collection paths are untouched. (get r :jolt/deftype) returns the tag,
-;; so the overlay record? predicate works unchanged.
+;; the hot collection paths are untouched. A host predicate installed by
+;; post-prelude identifies actual defrecords; it does not infer record identity
+;; from a bare deftype's physical representation or ILookup behavior.
 ;;
 ;; Loaded after collections/seq/values/converters/printing/transients/multimethods
 ;; (the dispatchers it wraps + chez-current-ns).
@@ -160,7 +162,7 @@
       (vector-set! v i (jrec-field-ref r i)))))
 (define (jrec-tag r) (jrdesc-tag (jrec-desc r)))
 ;; descriptor or #f — the dispatch key the inline cache eq?-scans. #f for a
-;; non-record so a PIC site (and protocol-resolve's record branch) cheaply falls
+;; non-jrec so a PIC site (and protocol-resolve's jrec branch) cheaply falls
 ;; through to the value-host-tags path without a separate type test.
 (define (jrec-pic-desc x) (and (jrec? x) (jrec-desc x)))
 
@@ -293,7 +295,8 @@
 ;; the shape record-type-from-entry consumes.
 (define (chez-record-shapes-map)
   (let ((by-name (make-hashtable string-hash string=?))
-        (kw-fields (keyword #f "fields")) (kw-tags (keyword #f "tags")) (kw-type (keyword #f "type"))
+        (kw-fields (keyword #f "fields")) (kw-tags (keyword #f "tags"))
+        (kw-type (keyword #f "type")) (kw-record? (keyword #f "record?"))
         (out (jolt-hash-map)))
     ;; index the full type tag "ns.Name" AND the simple record name -> ctor-key
     ;; for nested-field-tag resolution (qualified entries are unambiguous; the
@@ -313,7 +316,17 @@
             (set! out (jolt-assoc out k
                                   (jolt-hash-map kw-fields (apply jolt-vector fields)
                                                  kw-tags   (apply jolt-vector rtags)
-                                                 kw-type   type-tag)))))
+                                                 kw-type   type-tag
+                                                 ;; The physical jrec layout is shared by
+                                                 ;; deftype and defrecord, but public field
+                                                 ;; lookup is record-only. Carry that fact
+                                                 ;; into inference/codegen so --opt cannot
+                                                 ;; turn an opaque deftype lookup into a
+                                                 ;; raw slot read.
+                                                 kw-record?
+                                                 (if (hashtable-ref chez-record-type-tbl
+                                                                    type-tag #f)
+                                                     #t #f))))))
         ks vs))
     out))
 
@@ -372,25 +385,22 @@
            (let ((ext (jrec-ext r)))
              (and (not (jolt-nil? ext))
                   (not (eq? jrec-absent (jolt-get ext k jrec-absent))))))))
-;; The get path: like jrec-lookup, but a deftype's ILookup valAt runs when a key
-;; is genuinely missing from both the fields and the extension map.
+;; Public get path. A defrecord exposes its declared and extension fields as a
+;; map. A bare deftype is opaque: only an explicitly declared ILookup/IPersistentSet
+;; method can answer. In particular, a physical field whose name matches an
+;; ILookup key must not bypass valAt.
 (define (jrec-ref coll k d)
-  (if (eq? k jolt-deftype-kw)
-      (jrec-tag coll)
-      (let ((i (jrec-field-index coll k)))
-        (if i (jrec-field-ref coll i)
-            (let* ((ext (jrec-ext coll))
-                   (v (if (jolt-nil? ext) jrec-absent (jolt-get ext k jrec-absent))))
-              (if (eq? v jrec-absent)
-                  (cond ((find-method-any-protocol (jrec-tag coll) "valAt")
-                          => (lambda (m) (jolt-invoke m coll k d)))
-                        ;; a deftype implementing clojure.lang.IPersistentSet.get
-                        ;; (get returns the element when present, else nil) — a
-                        ;; membership lookup, so (get an-ordered-set k) works.
-                        ((find-method-any-protocol (jrec-tag coll) "get")
-                          => (lambda (m) (let ((r (jolt-invoke m coll k))) (if (jolt-nil? r) d r))))
-                         (else d))
-                   v))))))
+  (cond
+    ((jrec-record? coll) (jrec-lookup coll k d))
+    ((find-method-any-protocol (jrec-tag coll) "valAt")
+     => (lambda (m) (jolt-invoke m coll k d)))
+    ;; a deftype implementing clojure.lang.IPersistentSet.get
+    ;; (get returns the element when present, else nil) — a membership lookup.
+    ((find-method-any-protocol (jrec-tag coll) "get")
+     => (lambda (m)
+          (let ((r (jolt-invoke m coll k)))
+            (if (jolt-nil? r) d r))))
+    (else d)))
 
 ;; mutate a deftype's mutable field in place: fields are mutable slots, so
 ;; jrec-field-set! updates the field. (set! field v) inside a method lowers to
@@ -497,25 +507,22 @@
                 ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
                 ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
                 (else (jrec-hash x)))))
-;; get on a jrec: a real field reads raw (so a deftype method's own field bindings,
-;; compiled to (get inst :field), never recurse); a NON-field key on a deftype that
-;; implements clojure.lang.ILookup routes to its valAt (core.match's pattern types
-;; compute ::tag in valAt), else the default.
+;; get on a jrec: defrecord fields are public map entries; a bare deftype is
+;; opaque unless it explicitly implements ILookup or a set-like get method.
 ;; jrec is the hottest get target (every record field read); jolt-get-dispatch
 ;; (collections.ss) checks jrec? directly and calls jrec-ref, skipping the get-arm
 ;; walk. This registration is the equivalent fallback for any other caller.
 (register-get-arm! jrec? jrec-ref)
-;; A jrec is a defrecord (map of fields) by default, BUT a deftype that
-;; implements a clojure.lang collection interface carries the op as an inline
-;; method — prefer that method, else fall back to the field/map behavior. (jrec-cl
-;; finds the method; find-method-any-protocol / jolt-invoke resolve at call time.)
+;; A defrecord has record collection fallbacks. A deftype may instead implement
+;; a clojure.lang collection interface via inline methods; those methods are the
+;; only collection behavior it receives. (jrec-cl finds the method;
+;; find-method-any-protocol / jolt-invoke resolve at call time.)
 ;; Same lookup as collections.ss rec-coll-method — one definition, aliased here.
 (define jrec-cl rec-coll-method)
 
 ;; A deftype that DECLARES a clojure.lang collection interface but leaves one of
 ;; its methods unimplemented throws AbstractMethodError when a core fn reaches
-;; for it, like the JVM — it must not fall back to the bare-deftype
-;; fields-as-map behavior (fireworks renders such types by catching this).
+;; for it, like the JVM (fireworks renders such types by catching this).
 ;; Records are exempt: defrecord generates the full map implementation.
 (define jrec-coll-iface-names
   '("clojure.lang.IPersistentCollection" "clojure.lang.IPersistentMap"
@@ -563,12 +570,19 @@
     ;; IBlockingDeref (or IReduce and IReduceInit) share a method name but not an
     ;; arity, and unrelated protocols may reuse either name and arity.
     (and m (or (not nargs) (proc-accepts? m nargs)) m)))
-(register-count-arm! (lambda (coll) (or (jrec? coll) (jolt-transient? coll)))
+(register-count-arm!
+  (lambda (coll)
+    (or (jrec-record? coll)
+        (and (jrec? coll)
+             (or (jrec-cl coll "count")
+                 (jrec-declares-coll-iface? coll)))
+        (jolt-transient? coll)))
   (lambda (coll)
     (cond ((jrec-cl coll "count") => (lambda (m) (jolt-invoke m coll)))
           ((jrec-declares-coll-iface? coll) (jrec-abstract-method-error coll "count"))
-          ((jrec? coll) (+ (jrec-nfields coll)
-                           (let ((ext (jrec-ext coll))) (if (jolt-nil? ext) 0 (jolt-count ext)))))
+          ((jrec-record? coll) (+ (jrec-nfields coll)
+                                  (let ((ext (jrec-ext coll)))
+                                    (if (jolt-nil? ext) 0 (jolt-count ext)))))
           ((jolt-transient? coll) (t-count coll))
           (else (error 'count "uncountable record"))))
   ;; note: the else arm is unreachable since the predicate matches both
@@ -587,7 +601,7 @@
 ;; checked after this one in the newest-first walk) win for a deftype that declares
 ;; either — else contains?/find on a map-like (OrderedMap: containsKey) or set-like
 ;; (OrderedSet: contains) deftype reads field presence, not the type's membership.
-(register-contains-arm! (lambda (coll) (and (jrec? coll)
+(register-contains-arm! (lambda (coll) (and (jrec-record? coll)
                                             (not (jrec-cl coll "containsKey"))
                                             (not (jrec-cl coll "contains"))))
   (lambda (coll k) (jrec-has? coll k)))
@@ -620,7 +634,7 @@
 (define %r-jolt-assoc1 jolt-assoc1)
 (set! jolt-assoc1 (lambda (coll k v)
   (cond ((jrec-cl coll "assoc") => (lambda (m) (jolt-invoke m coll k v)))
-        ((jrec? coll)
+        ((jrec-record? coll)
          (let ((i (and (keyword? k) (jrec-field-index coll k))))
             (if i
                 (let ((v2 (let ((flags (hashtable-ref chez-record-dbl-tbl (jrec-tag coll) #f)))
@@ -659,12 +673,12 @@
 (set! jolt-dissoc (lambda (coll . ks)
   (cond ((jrec-cl coll "without")
          => (lambda (m) (fold-left (lambda (c k) (jolt-invoke m c k)) coll ks)))
-        ((jrec? coll) (fold-left jrec-dissoc1 coll ks))
+        ((jrec-record? coll) (fold-left jrec-dissoc1 coll ks))
         (else (apply %r-jolt-dissoc coll ks)))))
 (set! jolt-dissoc2
   (lambda (coll k)
     (cond ((jrec-cl coll "without") => (lambda (m) (jolt-invoke m coll k)))
-          ((jrec? coll) (jrec-dissoc1 coll k))
+          ((jrec-record? coll) (jrec-dissoc1 coll k))
           (else (%r-jolt-dissoc2 coll k)))))
 ;; keys/vals over a jrec read its entry seq (jolt-seq is method-first, so a
 ;; map-like deftype delegates to its Seqable; a defrecord's seq is its fields, so
@@ -699,7 +713,8 @@
 ;; or map. Guarded to skip a deftype that declares its own cons — that method wins
 ;; (registered above but checked after this newer arm), so the guard preserves the
 ;; deftype's collection semantics (flatland.ordered's OrderedSet conjs a scalar).
-(register-conj-arm! (lambda (coll) (and (jrec? coll) (not (jrec-cl coll "cons"))))
+(register-conj-arm! (lambda (coll) (and (jrec-record? coll)
+                                        (not (jrec-cl coll "cons"))))
   (lambda (coll x) (jolt-assoc1 coll (jolt-nth x 0) (jolt-nth x 1))))
 ;; peek/pop on a deftype implementing IPersistentStack (data.priority-map, which
 ;; core.cache's LRU/LU caches lean on) dispatch to its methods.
@@ -716,10 +731,6 @@
         (else (%r-jolt-pop coll)))))
 (register-pr-arm! jrec? jrec-pr)
 
-;; records are map? and coll? (Clojure: a record IS an associative map). The
-;; predicates.ss vars hold a snapshot, so re-def-var! after extending. record? is
-;; the overlay's (some? (get x :jolt/deftype)) — works for free since the get
-;; override returns the tag for that key.
 ;; only a defrecord is a map (Clojure: a record IS an associative map); a bare
 ;; deftype is not. coll? additionally covers a deftype implementing a collection
 ;; interface. predicates.ss vars hold a snapshot, so re-def-var! after extending.
@@ -959,6 +970,9 @@
                                                   (number? a) (not (flonum? a)))
                                              (exact->inexact a) a))
                             (loop (cdr as) (+ i 1)))))))))
+    ;; A redefinition from defrecord to bare deftype must become opaque again.
+    ;; defrecord calls register-record-type! immediately after this ctor setup.
+    (hashtable-delete! chez-record-type-tbl tag)
     ;; Register the ctor under its fully-qualified tag ("ns.Name") — a bare
     ;; (Name. …) in the DEFINING ns is qualified to this by the analyzer, so a
     ;; deftype whose simple name collides with a built-in host class (tools.reader's

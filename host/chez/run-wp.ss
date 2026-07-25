@@ -26,7 +26,8 @@
   (jolt-hash-map "user/->Node"
                  (jolt-hash-map (keyword #f "fields") (jolt-vector (keyword #f "left") (keyword #f "right"))
                                 (keyword #f "tags")   (jolt-vector jolt-nil jolt-nil)
-                                (keyword #f "type")   "user.Node")))
+                                (keyword #f "type")   "user.Node"
+                                (keyword #f "record?") #t)))
 (set-protocol-methods! U (jolt-hash-map))
 
 ;; a 3-def unit: make-tree returns ->Node, run calls check-tree with a make-tree

@@ -13,7 +13,7 @@
             [jolt.passes.types.lattice :refer
              [velem selem sfields vec-type? set-type? struct-type? mk-vec mk-set
               mk-struct union-cap scalar-t? union-type? umembers union-of merge-fields
-              join-t join type-depth cap struct-safe? field-type type-shape
+              join-t join type-depth cap struct-safe? field-type
               mark-struct truthy-type? num-ret-fns vector-ret-fns nilable? strip-nilable]]))
 
 ;; --- engine state ------------------------------------------------------------
@@ -187,7 +187,10 @@
                          (assoc m fw (field-type-from-tag (when tags (nth tags i))
                                                            (dec depth) shapes ctor-key fw))))
                      {} (range (count fields)))]
-    (assoc (mk-struct fmap) :shape (vec fields) :type (get rs :type))))
+    (assoc (mk-struct fmap)
+           :shape (vec fields)
+           :type (get rs :type)
+           :record? (boolean (get rs :record?)))))
 
 ;; fns that RETURN an element of their (first) collection arg, so a lookup on the
 ;; result of (rand-nth coll-of-structs) etc. types as the element.
@@ -242,7 +245,8 @@
 ;; provably non-nil.
 (def ^:private fold-preds
   #{"number?" "string?" "keyword?" "record?" "nil?" "some?"})
-(defn- record-t? [t] (and (struct-type? t) (some? (get t :type))))
+(defn- record-t? [t]
+  (and (struct-type? t) (some? (get t :type)) (true? (get t :record?))))
 (defn- pred-on [pname t]
   (cond
     (or (= t :any) (= t :truthy)) nil
@@ -404,7 +408,12 @@
   (let [mr (infer (nth args 0) tenv env)
         mt (ty mr)
         msub (if (struct-safe? mt) (mark-struct (nd mr) mt) (nd mr))
-        ft (field-type mt (get fnode :val))
+        ;; Only a defrecord exposes physical fields through keyword lookup.
+        ;; A deftype may implement ILookup with unrelated semantics, so its
+        ;; return type stays unknown even when its concrete layout is known.
+        ft (if (true? (get mt :record?))
+             (field-type mt (get fnode :val))
+             :any)
         dr (when (= n 2) (infer (nth args 1) tenv env))
         rt (if dr (join ft (ty dr)) ft)
         node' (assoc node :args (if dr [msub (nd dr)] [msub]))]
@@ -421,7 +430,9 @@
         mt (ty mr)
         msub (if (struct-safe? mt) (mark-struct (nd mr) mt) (nd mr))
         kr (infer (nth args 1) tenv env)
-        ft (field-type mt (get (nth args 1) :val))
+        ft (if (true? (get mt :record?))
+             (field-type mt (get (nth args 1) :val))
+             :any)
         dr (when (= n 3) (infer (nth args 2) tenv env))
         rt (if dr (join ft (ty dr)) ft)
         node' (assoc node :args (if dr [msub (nd kr) (nd dr)] [msub (nd kr)]))]
@@ -652,8 +663,7 @@
       (let [t (get tenv (get node :name))]
         [(if t t :any)
          (cond
-           (struct-safe? t) (let [n (assoc node :hint :struct)]
-                              (if (type-shape t) (assoc n :shape (type-shape t)) n))
+           (struct-safe? t) (mark-struct node t)
            :else node)])
       (= op :map)
       (let [pairs (get node :pairs)
@@ -701,6 +711,23 @@
       (= op :var) (do (swap! (get env :escapes) conj (var-key node))
                       [(let [vt (get (get env :vtypes) (var-key node))] (if vt vt :any)) node])
       (= op :invoke) (infer-invoke node tenv env)
+      ;; Explicit (.-field target) access is distinct from public lookup. Carry
+      ;; the receiver's exact shape to codegen for a direct slot read and retain
+      ;; its declared/inferred field type (including ^double).
+      (= op :host-call)
+      (let [tr (infer (get node :target) tenv env)
+            tt (ty tr)
+            m (get node :method)
+            field? (and (string? m) (.startsWith ^String m "-"))
+            k (when field? (keyword (.substring ^String m 1)))
+            target (if (and field? (struct-safe? tt))
+                     (mark-struct (nd tr) tt)
+                     (nd tr))
+            ars (mapv (fn [a] (infer a tenv env)) (get node :args))
+            rt (if (and field? k) (field-type tt k) :any)
+            node' (assoc node :target target
+                              :args (mapv (fn [r] (nd r)) ars))]
+        [rt (if (= rt :double) (assoc node' :num-read :double) node')])
       (= op :let)
       (let [res (reduce (fn [acc b]
                           (let [te (nth acc 0) binds (nth acc 1)
@@ -969,11 +996,13 @@
     (reset! (:pm-rets unit) (reduce (fn [acc n] (walk-pm-rets unit n acc)) {} nodes))))
 
 ;; --- inline method body receiver typing ------------------------------------
-;; A defrecord/deftype inline method body reads its fields via (get this :field).
-;; With the receiver param seeded as the record type, those reads resolve to
-;; jrec-field-at (bare index) instead of jolt-get. The receiver-typed node is
-;; spliced into the register-inline-method's fn arg so the backend emits the
-;; fast-path body. See also collect-pm-rets! (return-type inference only).
+;; A defrecord/deftype inline method body reads its fields through explicit
+;; (.-field this) forms emitted by the deftype macro. With the receiver param
+;; seeded as the concrete type, those reads resolve to jrec-field-at/direct
+;; accessors without granting public get/keyword access to a bare deftype. The
+;; receiver-typed node is spliced into the register-inline-method's fn arg so the
+;; backend emits the fast-path body. See also collect-pm-rets! (return-type
+;; inference only).
 
 (defn- inline-impl-receiver-type
   "Given the type-name string from args[0] of register-inline-method (e.g.
@@ -1192,7 +1221,9 @@
     ;; mixed) join reads :any, so flonum arithmetic over it stays generic — dbl
     ;; contagion is reserved for :double fields (the all-flonum->:double spec).
     (= t :double) t
-    (struct-type? t) (let [base {:type (get t :type) :struct {} :shape (get t :shape)}]
+    (struct-type? t) (let [base {:type (get t :type) :struct {}
+                                 :shape (get t :shape)
+                                 :record? (get t :record?)}]
                        (if (nilable? t) (assoc base :nilable true) base))
     :else :any))
 ;; the rich variant keeps :num, so a specialized clone's :num field reads type :num
@@ -1201,7 +1232,9 @@
 (defn- shallow-field-type-rich [t]
   (cond
     (or (= t :double) (= t :num)) t
-    (struct-type? t) (let [base {:type (get t :type) :struct {} :shape (get t :shape)}]
+    (struct-type? t) (let [base {:type (get t :type) :struct {}
+                                 :shape (get t :shape)
+                                 :record? (get t :record?)}]
                        (if (nilable? t) (assoc base :nilable true) base))
     :else :any))
 (defn- derive-field-types [unit joins demoted escaped shallow]
