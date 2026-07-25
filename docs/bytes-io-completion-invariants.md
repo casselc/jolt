@@ -4,9 +4,12 @@ This note supplements [RFD 0001](rfd/0001/README.md). The RFD owns the selected
 layering and public semantics; this note records the bounded models, witnesses,
 assumptions, and implementation gates behind those decisions.
 
-These are design proofs. Until `jolt.bytes/Window` and the jolt-tcp completion
-type exist and pass their runtime conformance suites, the models establish
-consistency of the proposed contracts rather than correctness of code.
+The models have different implementation status. Core protocol dispatch and
+the deftype/defrecord representation boundary have runtime controls in this
+fork. `Window` and strict `Cursor` implementations are incubating in the
+separate `jolt-bytes` package. The jolt-tcp completion lifecycle remains a
+design contract. In every case, a solver result establishes only the property
+encoded by its bounded or abstract model; it is not a proof of the runtime.
 
 ## Byte-window containment
 
@@ -105,8 +108,9 @@ Before that claim becomes a gate, a deliberately failing construction must
 shrink to a reproducible minimal case that still satisfies every hypothesis and
 reports `:flaky? false`.
 
-Once `jolt.bytes/Window` lands, the first property has this shape; the Window
-calls are the selected RFD surface, while the Hegel forms are current:
+The incubating `jolt.bytes` package exercises the first property in this shape;
+the Window calls are the selected RFD surface, while the Hegel forms are
+current:
 
 ```clojure
 (deftest valid-window-slices-follow-proved-geometry
@@ -248,6 +252,53 @@ local method belonging to a different protocol is never a candidate. The
 both declare `m`; the JVM returns the first implementation only through the
 first protocol and reports the second call missing.
 
+## Deftype and defrecord representation boundary
+
+Jolt uses one physical `jrec` representation for `deftype` and `defrecord`.
+That implementation choice must not manufacture public map behavior. The
+semantic selector is the declared kind and operation:
+
+```text
+public raw slot read
+  iff value is a defrecord
+  and operation is get/keyword lookup
+  and key names a declared field
+
+explicit raw slot read
+  iff operation is .-field
+  and the field exists
+```
+
+A bare deftype therefore answers public lookup only through its declared
+`ILookup` or set-like `get` method. A same-named physical field cannot bypass
+that method. Record-style fallbacks for `count`, `contains?`, `find`, `assoc`,
+`dissoc`, and `conj` are defrecord-only; a deftype receives them only by
+declaring and implementing the corresponding interfaces. Explicit `.-field`
+access remains available to generated deftype method bodies and direct callers.
+
+The compiler must preserve the same distinction. Record-shape metadata carries
+`:record?` through joins, caps, local annotations, whole-program field types,
+and code generation. Public keyword/get inference and scalar replacement use a
+physical field only when that flag is true. Explicit field IR may still use the
+direct accessor for either kind. Otherwise an optimized build could reintroduce
+a private-slot leak that the runtime dispatcher correctly rejects.
+
+The corrected model is a complete Boolean selector model for these choices. Its
+counterexample query is UNSAT. This means no assignment satisfying the encoded
+selectors simultaneously leaks a bare deftype slot, bypasses its declared
+lookup handler, or grants it record collection fallbacks. It does not model
+field-index calculation, protocol resolution internals, generated Scheme, or
+Chez execution. The buggy control is SAT with all three violations true. The
+non-vacuity control is SAT with a record public read, a deftype `ILookup` read,
+and an explicit deftype field read all available.
+
+Runtime controls pin the JVM-facing consequences: eleven unit assertions cover
+opaque public lookup, rejected record collection operations, same-name
+`ILookup`, explicit fields, kind predicates, and retained defrecord map
+behavior. The optimizer control requires public lookup to retain `jolt-get` and
+return the handler's `:lookup`, while explicit access emits the direct field
+accessor and returns the physical value.
+
 ## Completion and lease lifecycle
 
 The selected completion is future-shaped without claiming Jolt `Future`
@@ -321,6 +372,9 @@ primitive.
 | [`protocol-reify-dispatch-buggy.smt2`](../test/chez/formal/protocol-reify-dispatch-buggy.smt2) | SAT, undeclared protocol selects a same-named local method | A method-name-only reify table admits cross-protocol dispatch. |
 | [`protocol-reify-dispatch-corrected.smt2`](../test/chez/formal/protocol-reify-dispatch-corrected.smt2) | UNSAT | Local selection requires membership of the requested canonical protocol in the reify declaration set. |
 | [`protocol-reify-dispatch-nonvacuity.smt2`](../test/chez/formal/protocol-reify-dispatch-nonvacuity.smt2) | SAT, declared protocol selects its method | The membership guard preserves useful local dispatch. |
+| [`deftype-record-boundary-buggy.smt2`](../test/chez/formal/deftype-record-boundary-buggy.smt2) | SAT, bare deftype slot exposed and handler bypassed | Treating every physical `jrec` as a record fabricates three modeled capabilities. |
+| [`deftype-record-boundary-corrected.smt2`](../test/chez/formal/deftype-record-boundary-corrected.smt2) | UNSAT | Kind-aware runtime and compiler selectors exclude the modeled public-slot, handler-bypass, and collection-fallback counterexample. |
+| [`deftype-record-boundary-nonvacuity.smt2`](../test/chez/formal/deftype-record-boundary-nonvacuity.smt2) | SAT, all intended access paths available | Defrecord lookup, declared deftype lookup, explicit deftype field access, and record collection behavior remain useful. |
 
 Run each SMT file through Chiasmus `chiasmus_lint` and `chiasmus_verify` with
 `solver=z3`; Chiasmus supplies the final solver commands omitted from the
@@ -344,16 +398,25 @@ The generic core dispatch implementation and its runtime controls live in:
 - `jolt-core/clojure/core/20-coll.clj` for collection predicates and reduce;
 - `jolt-core/clojure/core/30-macros.clj` for canonical protocol ids carried
   through `defprotocol`, `deftype`, `defrecord`, `reify`, extension, and
-  `instance?`;
+  `instance?`, and for explicit field reads in generated deftype methods;
 - `host/chez/records.ss` (`iface-method`) for interface-identity and exact-arity
   method selection, and `protocol-resolve` for requested-protocol membership
-  before a reify-local method is selected;
+  before a reify-local method is selected; the same file owns the runtime
+  defrecord-kind and public-lookup/collection selectors;
+- `jolt-core/jolt/passes/types.clj`,
+  `jolt-core/jolt/passes/types/lattice.clj`,
+  `jolt-core/jolt/passes/inline.clj`, and
+  `jolt-core/jolt/backend_scheme.clj` for preserving the kind distinction
+  through inference, scalar replacement, and code generation;
+- `host/chez/java/dot-forms.ss` for the explicit field-access path;
 - `host/chez/seq.ss` (`jolt-reduce`) for `IReduce` and `IReduceInit`;
 - `host/chez/java/concurrency.ss` (`jolt-deref` and its instance-check arm) for
   `IDeref`/`IBlockingDeref` behavior;
 - `host/chez/post-prelude.ss` for `IPending`; and
-- the `reify`, `protocol-predicates`, `protocol-reduce`, and `protocol-deref`
-  suites in `test/chez/unit.edn`.
+- the `reify`, `protocol-predicates`, `protocol-reduce`, `protocol-deref`, and
+  `deftype-opacity` suites in `test/chez/unit.edn`; and
+- `host/chez/run-inline-body.ss` for the optimized public-versus-explicit field
+  control.
 
 The accepted implementation is commit `3ac5be82`. Its final gates passed
 1106/1106 unit assertions, self-host fixpoint, host-class 22/22, PIC 22/22,
@@ -361,3 +424,14 @@ protocol-return 4/4, devirtualization 12/12, inline-body 3/3, contagion 20/20,
 and corpus 3803/3822 with zero new divergence (9 known mismatches and 10
 expected crashes). The model claims remain bounded to the selector and do not
 replace those runtime/JVM parity controls.
+
+The additional deftype/defrecord implementation is commit `ecc22d78`. Its
+focused post-remint gates passed 1122/1122 unit assertions, inference 36/36,
+whole-program inference 7/7, field reads 11/11, inline-body 7/7, and a
+byte-identical Chez 10.4.1 self-host fixpoint with zero skipped forms. The
+remaining core/compiler, FFI, tree-shake, dev-boot, namespace-effect, and JVM
+certification gates passed. The full CTS command is not green on the branch
+base: clean commit `edd4a257` and this implementation both produce the same
+pre-existing `bigint` 5-failure and `num` 3-failure results against baselines
+of 1 and 2; this slice does not relabel or fix that unrelated numeric/class
+regression.

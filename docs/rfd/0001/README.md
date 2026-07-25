@@ -455,8 +455,8 @@ Java `ByteBuffer` remains an interop type with Java cursor semantics; making it
 the same underlying byte representation and copy implementation without
 becoming the canonical native view.
 
-Before `Window` can claim idiomatic collection behavior, core must correct four
-generic protocol-dispatch gaps:
+Core now supplies the four generic protocol-dispatch prerequisites for
+idiomatic `Window` collection behavior:
 
 - `seqable?`, `counted?`, and `indexed?` must recognize custom protocol
   implementations just as `seq`, `count`, and `nth` already do;
@@ -479,6 +479,26 @@ eligible only when the reify declared the exact requested canonical protocol.
 Otherwise dispatch proceeds to that protocol's host/default extension or fails
 missing. A second checked model trio and JVM/runtime control pin the
 same-method-name cross-protocol collision.
+
+The `Window`/`Cursor` implementation also exposed a representation boundary
+that those protocol fixes did not cover. Jolt physically stores both `deftype`
+and `defrecord` instances as `jrec` values, but a shared representation is not
+a shared public capability:
+
+- only a defrecord exposes declared fields through `get` or keyword invocation
+  and receives record fallbacks for `count`, `contains?`, `find`, `assoc`,
+  `dissoc`, and `conj`;
+- a bare deftype uses only explicitly declared lookup and collection methods;
+- generated method bodies and explicit callers retain `.-field` access; and
+- inference, scalar replacement, and code generation carry a record/deftype
+  kind bit so AOT optimization cannot turn public deftype lookup into a raw slot
+  read.
+
+Commit `ecc22d78` implements that boundary with JVM-parity runtime and optimizer
+controls. The supplementary note records the SAT buggy witness, UNSAT corrected
+counterexample query, SAT non-vacuity control, exact implementation anchors,
+and the inherited unrelated CTS baseline failure. This is a generic Jolt object
+semantics correction, not a special case in `jolt.bytes`.
 
 ### Completions are future-shaped, not native-I/O Futures
 
