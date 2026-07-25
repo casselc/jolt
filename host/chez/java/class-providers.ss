@@ -209,20 +209,127 @@
            (vector-set! stage 0 (cons proc (vector-ref stage 0)))
            #t))))
 
+;; Ordinary (non-provider) registration must not race a provider transaction:
+;; otherwise a rollback could restore its older snapshot over an unrelated
+;; successful mutation. The operation itself runs under the coordinator lock,
+;; so a provider claim cannot begin between the stable-world check and publish.
+(define (class-provider-run-operation! proc)
+  (with-mutex class-provider-mu
+    (class-provider-wait-evaluator-locked! (get-thread-id))
+    (proc)))
+
+(define (class-provider-copy-string-table table copy-value)
+  (let ((result (make-hashtable string-hash string=?)))
+    (let-values (((keys vals) (hashtable-entries table)))
+      (vector-for-each
+        (lambda (key value)
+          (hashtable-set! result key (copy-value value)))
+        keys vals))
+    result))
+
+;; Copy a string table whose values are themselves string tables. Preserve
+;; shared inner tables: core's historic short/FQN aliases intentionally point at
+;; one member table, and rollback must not split that identity.
+(define (class-provider-copy-nested-string-table table copy-leaf)
+  (let ((result (make-hashtable string-hash string=?))
+        (seen (make-eq-hashtable)))
+    (let-values (((keys vals) (hashtable-entries table)))
+      (vector-for-each
+        (lambda (key inner)
+          (let ((copy
+                  (or (hashtable-ref seen inner #f)
+                      (let ((new
+                              (class-provider-copy-string-table
+                                inner copy-leaf)))
+                        (hashtable-set! seen inner new)
+                        new))))
+            (hashtable-set! result key copy)))
+        keys vals))
+    result))
+
+(define (class-provider-copy-vector value)
+  (list->vector (vector->list value)))
+
+;; Snapshot exactly the mutable registries reachable through the provider
+;; registration hooks. Arbitrary provider top-level side effects remain outside
+;; the transaction, as documented.
+(define (class-provider-world-snapshot)
+  (let ((provider-table
+          (with-mutex class-provider-mu
+            (class-provider-copy-string-table
+              class-providers-tbl (lambda (x) x))))
+        (provider-generation
+          (with-mutex class-provider-mu
+            class-provider-registry-generation)))
+    (vector
+      provider-table
+      provider-generation
+      (class-provider-copy-nested-string-table
+        class-statics-tbl (lambda (x) x))
+      (class-provider-copy-string-table class-ctors-tbl (lambda (x) x))
+      (class-provider-copy-nested-string-table
+        mutable-statics-tbl class-provider-copy-vector)
+      (class-provider-copy-nested-string-table
+        tagged-methods-tbl (lambda (x) x))
+      (class-provider-copy-string-table jvm-class-parents (lambda (x) x))
+      user-instance-checks
+      jolt-eq-arms
+      jolt-hash-arms
+      str-render-registry
+      jolt-pr-str-arms
+      jolt-pr-readable-arms
+      jolt-compare-arms
+      jolt-class-arms
+      jt-user-value-tags-arms)))
+
+(define (class-provider-world-restore! snapshot)
+  (with-mutex class-provider-mu
+    (set! class-providers-tbl (vector-ref snapshot 0))
+    (set! class-provider-registry-generation (vector-ref snapshot 1)))
+  (set! class-statics-tbl (vector-ref snapshot 2))
+  (set! class-ctors-tbl (vector-ref snapshot 3))
+  (set! mutable-statics-tbl (vector-ref snapshot 4))
+  (set! tagged-methods-tbl (vector-ref snapshot 5))
+  (set! jvm-class-parents (vector-ref snapshot 6))
+  (set! user-instance-checks (vector-ref snapshot 7))
+  (set! jolt-eq-arms (vector-ref snapshot 8))
+  (set! jolt-hash-arms (vector-ref snapshot 9))
+  (set! str-render-registry (vector-ref snapshot 10))
+  (set! jolt-pr-str-arms (vector-ref snapshot 11))
+  (set! jolt-pr-readable-arms (vector-ref snapshot 12))
+  (set! jolt-compare-arms (vector-ref snapshot 13))
+  (set! jolt-class-arms (vector-ref snapshot 14))
+  (set! jt-user-value-tags-arms (vector-ref snapshot 15))
+  ;; The restored hierarchy is authoritative; discard every derived cache.
+  (with-mutex jch-cache-mutex
+    (set! jch-closure-cache (make-hashtable string-hash string=?))
+    (set! jch-tags-cache (make-hashtable string-hash string=?)))
+  (set! jch-known-cache #f)
+  (set! jch-simple->fqn-cache #f))
+
 (define (class-provider-commit-stage! stage)
-  ;; Mapping conflicts were preflighted when staged, but an external add-deps
-  ;; caller may have registered while source evaluated.  The global evaluator
-  ;; owner blocks such callers; register-many! still rechecks defensively.
-  (let ((pending (vector-ref stage 1)))
-    (let-values (((keys vals) (hashtable-entries pending)))
-      (class-provider-register-many!
-        (let loop ((i 0) (acc '()))
-          (if (= i (vector-length keys))
-              (reverse acc)
-              (loop (+ i 1)
-                    (cons (cons (vector-ref keys i) (vector-ref vals i)) acc)))))))
-  ;; Source order matters for representation hooks, hence the reverse.
-  (for-each (lambda (proc) (proc)) (reverse (vector-ref stage 0))))
+  (let ((snapshot (class-provider-world-snapshot)))
+    (guard (e (else
+                (class-provider-world-restore! snapshot)
+                (raise e)))
+      ;; Mapping conflicts were preflighted when staged, but an external
+      ;; add-deps caller may have registered while source evaluated. The global
+      ;; evaluator owner blocks such callers; register-many! still rechecks
+      ;; defensively.
+      (let ((pending (vector-ref stage 1)))
+        (let-values (((keys vals) (hashtable-entries pending)))
+          (class-provider-register-many!
+            (let loop ((i 0) (acc '()))
+              (if (= i (vector-length keys))
+                  (reverse acc)
+                  (loop (+ i 1)
+                        (cons
+                          (cons (vector-ref keys i) (vector-ref vals i))
+                          acc)))))))
+      ;; Source order matters for representation hooks, hence the reverse.
+      (for-each
+        (lambda (proc) (proc))
+        (reverse (vector-ref stage 0))))))
 
 ;; Exact provider lookup.  There is intentionally no last-segment fallback:
 ;; namespace imports are canonicalized by the analyzer.
@@ -361,6 +468,13 @@
               (root? (caddr claim))
               (stage (vector '() (make-hashtable string-hash string=?))))
          (guard (e (else
+                     ;; load-namespace returned successfully before a commit-time
+                     ;; registration failure, so its ordinary loader guard no
+                     ;; longer owns the loaded mark. Remove it here; otherwise a
+                     ;; later claim no-ops the namespace load and falsely marks
+                     ;; this failed provider loaded.
+                     (guard (ignored (else #f))
+                       (ldr-unmark-loaded! provider))
                      (class-provider-abort! provider attempt root? e)
                      (raise e)))
            (parameterize

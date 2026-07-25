@@ -518,10 +518,9 @@
       ;; registries, but this public hook is only invoked after runtime startup.
       ;; Provider hierarchy changes publish atomically with its other class
       ;; registrations; ordinary calls remain immediate.
-      (unless
-        (class-provider-stage-operation!
-          (lambda () (jch-register-supers! name supers)))
-        (jch-register-supers! name supers))
+      (let ((op (lambda () (jch-register-supers! name supers))))
+        (unless (class-provider-stage-operation! op)
+          (class-provider-run-operation! op)))
       jolt-nil)))
 
 ;; transitive ancestry rooted at Object for a concrete class; an interface's chain
