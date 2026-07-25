@@ -167,8 +167,9 @@ The proposal branch already contains or has validated:
 
 - a fail-closed target descriptor;
 - a real monotonic clock;
-- direct POSIX `errno` and Winsock `WSAGetLastError` retrieval, with the public
-  atomic return-value/error FFI option still to land;
+- direct POSIX `errno` and Winsock `WSAGetLastError` retrieval, plus the public
+  `{:capture-native-error true}` FFI option that returns the native result and
+  its matching error from one foreign-call transition;
 - signed and unsigned 8- and 16-bit foreign scalars;
 - overlap-safe array copy and scoped borrowed byte-array slices;
 - by-value aggregate/struct support;
@@ -181,6 +182,15 @@ The remaining Windows process layer is still POSIX-shaped. Genuine argv-safe
 `ProcessBuilder` behavior requires a Win32 `CreateProcessW` backend with
 retained process handles; it is separate from `jolt.host/sh`, whose contract is
 explicitly a shell program.
+
+Atomic error capture selects Chez's `__get_last_error` or `__errno` convention
+from the compiler's `$target-machine`, not the build host's `(machine-type)`.
+Deterministic `ta6nt` and `ta6le` expansion controls cover both cross-target
+selection directions, Linux exercises the captured-pair ordering, and a native
+Windows probe observes the expected Winsock `10061`. A full xpatch Windows
+cross-build remains a distinct validation lane. The contract, bounded ordering
+argument, and cross-target evidence are recorded in
+[`ffi-native-error-capture.md`](../../ffi-native-error-capture.md).
 
 ### jolt-net
 
@@ -202,10 +212,10 @@ Each capability remains unadvertised until the corresponding real calls pass.
 The first blocking-Winsock implementation is under review rather than accepted:
 its native suite exposed that a collect-safe foreign call followed by a
 separate `WSAGetLastError` can observe zero instead of the matching `10061`.
-W1 therefore depends on the core atomic return/error FFI option, a
-failure-terminal initialization path, forced-contention tests, bounded
-watchdogs, and strengthened proof controls before the nonblocking W2 slice
-starts.
+The core atomic return/error FFI prerequisite is now implemented. W1 must
+consume it and still add a failure-terminal initialization path,
+forced-contention tests, bounded watchdogs, and strengthened proof controls
+before the nonblocking W2 slice starts.
 
 ### jolt-tcp and jolt-http
 
