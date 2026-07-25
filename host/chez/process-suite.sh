@@ -24,7 +24,11 @@ if [ ! -f "$vend/test-resources/print-dirs.sh" ]; then
   exit 0
 fi
 
-chez="$(command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)"
+if [ -n "${JOLT_CHEZ:-}" ]; then
+  chez="$(command -v "$JOLT_CHEZ" 2>/dev/null || true)"
+else
+  chez="$(command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)"
+fi
 if [ -z "$chez" ]; then echo "process-suite: no chez on PATH"; exit 1; fi
 
 # Canonicalize the temp dir: on macOS mktemp returns /var/… (a symlink to

@@ -11,7 +11,11 @@ cd "$root"
 # csv dir we validate so the build uses exactly it.
 csv="$JOLT_CHEZ_CSV"
 if [ -z "$csv" ]; then
-  chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)"
+  if [ -n "${JOLT_CHEZ:-}" ]; then
+    chez_bin="$(command -v "$JOLT_CHEZ" 2>/dev/null || true)"
+  else
+    chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)"
+  fi
   if [ -n "$chez_bin" ]; then
     base="$(cd "$(dirname "$chez_bin")/.." 2>/dev/null && pwd)"
     for d in "$base"/lib/csv*/*/; do
