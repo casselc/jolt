@@ -893,7 +893,8 @@
 ;; batch only after the namespace returns successfully.  Ordinary application
 ;; registrations still take effect immediately.
 (define (class-provider-register-operation! proc)
-  (unless (class-provider-stage-operation! proc) (proc))
+  (unless (class-provider-stage-operation! proc)
+    (class-provider-run-operation! proc))
   jolt-nil)
 
 (def-var! "clojure.core" "__register-class-ctor!"

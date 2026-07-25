@@ -222,7 +222,8 @@
     (let ((op
             (lambda ()
               (vector-set! (mutable-static-cell class member #t) 0 val))))
-      (unless (class-provider-stage-operation! op) (op)))
+      (unless (class-provider-stage-operation! op)
+        (class-provider-run-operation! op)))
     val))
 ;; clojure.lang.RT.checkSpecAsserts — a JVM-internal flag clojure.spec.alpha reads
 ;; and writes; default false. Pre-seed the cell so a read before any write works.
