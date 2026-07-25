@@ -151,7 +151,6 @@ jobs:
       # MinGW/libkernel.a packaging contract below.
       - name: Native Windows source-mode core gate
         env:
-          JOLT_AOT_CACHE: "0"
           JOLT_SH: C:/Program Files/Git/bin/sh.exe
           TMPDIR: ${{ runner.temp }}
         run: |
@@ -208,7 +207,6 @@ jobs:
         shell: pwsh
         env:
           HOME: ${{ runner.temp }}
-          JOLT_AOT_CACHE: "0"
           JOLT_SH: C:/Program Files/Git/bin/sh.exe
           TMPDIR: ${{ runner.temp }}
         run: |
