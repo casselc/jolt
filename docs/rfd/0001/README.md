@@ -337,9 +337,14 @@ The registry must:
 - accept repeated identical declarations;
 - reject conflicting declarations;
 - detect cycles and re-entrant loading;
-- preserve honest class tags and protocol dispatch;
+- publish provider-owned registry mutations only after a successful namespace
+  evaluation and roll back a failed commit so a later attempt can reevaluate;
+- preserve canonical class tags through namespace imports and protocol
+  extension, including two provider classes with the same simple name;
+- invalidate all derived hierarchy caches when a provider adds class supers;
 - report class, member, provider, and load state in structured failures; and
-- behave the same in source mode and built applications.
+- keep declared lookup behavior identical while making the mutability boundary
+  explicit: source/REPL/`add-deps` are open, standalone builds are frozen.
 
 It is not an arbitrary namespace search.
 
@@ -555,12 +560,15 @@ distribution. The selected mechanism is:
 4. Registration success is cached. A missing member, cycle, provider conflict,
    or second miss fails with structured data.
 5. A closed-world build includes every declared provider reachable from its
-   resolved graph and seals the mapping into the build manifest. It does not
-   discover providers from the filesystem at runtime.
+   resolved graph, freezes that exact map before loading the entry namespace,
+   and emits the map plus freeze before application/provider forms. Identical
+   declarations remain idempotent, while a new key fails with
+   `:class-provider-registry-frozen`. It does not discover providers from the
+   filesystem at runtime.
 
-The runtime registry can land before `deps.edn` plumbing. Tests may register
-providers explicitly; project metadata follows after the registry contract is
-stable and reconciled with dependency/AOT resolution.
+For this proposal, `:jolt/class-providers` in resolved `deps.edn` metadata is the
+closed-build authority. Tests and open source/REPL sessions may register
+providers explicitly; a separate manifest is not another source of truth.
 
 ### Exact-source experiments belong beside the native ports
 
@@ -893,12 +901,17 @@ in [`bytes-io-completion-invariants.md`](../../bytes-io-completion-invariants.md
 - One provider load causes no more than one retry.
 - Identical declarations compose; conflicts fail closed.
 - Cycles and re-entrant loads terminate with structured diagnostics.
-- Host class, `instance?`, protocol extension, and invocation agree.
+- Failed provider commits publish no registry prefix and remain retryable.
+- Host class, `instance?`, protocol extension, and invocation agree on the exact
+  FQN, including same-simple-name controls.
 - A same-shaped or same-short-name user protocol cannot drive a core operation:
   canonical identity and exact method arity must both match.
 - A reify-local method is selected only for an exact canonical protocol that
   the reify declared; an equal method name from another protocol is irrelevant.
-- Source and built behavior match.
+- A hierarchy row added after cached misses invalidates closure, tag,
+  known-class, and simple-name indices.
+- Declared providers behave the same in source and built execution; source is
+  open to reconciled additions, while a built program rejects undeclared keys.
 
 ### Buffers and concurrency
 
@@ -996,8 +1009,6 @@ oracles; they do not close those trust boundaries.
 
 ## Open questions
 
-- Should class-provider declarations ultimately live in `deps.edn`, a separate
-  manifest, or both?
 - Which provider and compatibility namespaces belong in core versus a
   `jolt.compat.*` library?
 - Should exact-source compatibility track corrected upstream Teensyp/Capra
