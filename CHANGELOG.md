@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports; callers must still read it *before* any cleanup call, since
   `close`/`free` will overwrite it. Unknown targets fail closed rather than
   guessing a symbol. `jolt.ffi/errno-source` reports which strategy is live.
+- **Atomic native-error FFI results.** `jolt.ffi/foreign-fn` and `defcfn` accept
+  `{:capture-native-error true}` and return `[native-result error-code]` for
+  that binding. Chez captures `errno` on POSIX or the Windows last-error slot in
+  the foreign-call return path, before collect-safe thread reactivation or
+  cleanup can overwrite it. The option composes with `:blocking` and
+  `:varargs-after`; existing bindings keep their scalar result.
 - **Explicit variadic FFI boundaries.** `jolt.ffi/foreign-fn` and `defcfn`
   accept `{:varargs-after n}` (optionally with `:blocking true`) and lower it to
   Chez's exact fixed/variadic calling convention. Fully typing every argument
