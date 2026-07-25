@@ -1163,6 +1163,12 @@
 ;; instance?/satisfies? on the protocol hold.
 (define (register-inline-protocol! type-name proto-name)
   (let* ((proto-name (canonical-protocol-name proto-name))
+         ;; Protocol dispatch is keyed by the Clojure source name above, while
+         ;; the class graph models the JVM interface that defprotocol emits.
+         ;; JVM class names munge dashes in namespace/name segments, so keep the
+         ;; two identities explicit instead of leaking a source-spelled FQN
+         ;; through parents/ancestors.
+         (interface-name (jch-munge-segments proto-name))
          (tag (string-append (chez-current-ns) "." type-name))
          (ti (or (hashtable-ref type-registry tag #f)
                  (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry tag h) h))))
@@ -1171,8 +1177,8 @@
     ;; The exact canonical interface joins the type ancestry. Core JVM
     ;; interfaces retain their inherited graph; local protocols are unique
     ;; marker interfaces even when their short name matches a core interface.
-    (jch-mark-interface! proto-name)
-    (jch-register-supers! tag (list proto-name)))
+    (jch-mark-interface! interface-name)
+    (jch-register-supers! tag (list interface-name)))
   jolt-nil)
 
 ;; protocol-resolve: the impl procedure for obj — by record type tag, a reify's
