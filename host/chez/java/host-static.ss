@@ -62,8 +62,11 @@
              kind class member)))
 
 (define (register-class-statics! name members)  ; members: list of (str . val/proc)
-  (let* ((short (short-class-name name))
+  (let* ((canonical (resolve-class-hint name))
+         (short (short-class-name name))
          (h (or (hashtable-ref class-statics-tbl name #f)
+                (and canonical
+                     (hashtable-ref class-statics-tbl canonical #f))
                 (hashtable-ref class-statics-tbl short #f)
                 (let ((h (make-hashtable string-hash string=?)))
                   h))))
@@ -71,6 +74,8 @@
     ;; under either name lands in the merged table, so re-registrations under one
     ;; name are visible through the other.
     (hashtable-set! class-statics-tbl name h)
+    (when canonical
+      (hashtable-set! class-statics-tbl canonical h))
     (unless (string=? name short)
       (hashtable-set! class-statics-tbl short h))
     (for-each (lambda (p)
@@ -79,7 +84,32 @@
                 (hashtable-set! h (car p) (cdr p)))
               members)))
 
-(define (register-class-ctor! name proc) (hashtable-set! class-ctors-tbl name proc))
+;; Dependency-owned providers use canonical FQNs as their identity.  They must
+;; not merge their member table with an unrelated built-in or provider that has
+;; the same final segment (com.acme.ByteBuffer vs java.nio.ByteBuffer).
+(define (register-class-statics-exact! name members)
+  (let ((h (or (hashtable-ref class-statics-tbl name #f)
+               (let ((h (make-hashtable string-hash string=?)))
+                 (hashtable-set! class-statics-tbl name h)
+                 h))))
+    (for-each
+      (lambda (p)
+        (let ((old (hashtable-ref h (car p) #f)))
+          (when old
+            (registry-collision! "static" name (car p) old (cdr p))))
+        (hashtable-set! h (car p) (cdr p)))
+      members)))
+
+(define (register-class-ctor! name proc)
+  (let ((canonical (resolve-class-hint name))
+        (short (short-class-name name)))
+    (hashtable-set! class-ctors-tbl name proc)
+    (when canonical (hashtable-set! class-ctors-tbl canonical proc))
+    (unless (string=? name short)
+      (hashtable-set! class-ctors-tbl short proc))))
+
+(define (register-class-ctor-exact! name proc)
+  (hashtable-set! class-ctors-tbl name proc))
 
 (define (register-host-methods! tag members)
   (let ((h (or (hashtable-ref host-methods-tbl tag #f)
@@ -189,7 +219,10 @@
                (and create? (let ((c (vector jolt-nil))) (hashtable-set! h member c) c))))))
 (def-var! "jolt.host" "set-static-field!"
   (lambda (class member val)
-    (vector-set! (mutable-static-cell class member #t) 0 val)
+    (let ((op
+            (lambda ()
+              (vector-set! (mutable-static-cell class member #t) 0 val))))
+      (unless (class-provider-stage-operation! op) (op)))
     val))
 ;; clojure.lang.RT.checkSpecAsserts — a JVM-internal flag clojure.spec.alpha reads
 ;; and writes; default false. Pre-seed the cell so a read before any write works.
@@ -274,28 +307,43 @@
 ;; ---- emit entry points ------------------------------------------------------
 (define (host-static-ref class member)
   (host-static-ref* class member #t))
+(define class-registry-missing (list 'class-registry-missing))
+
+;; Return [member-found? class-found? value] from a stable provider world.  A
+;; mapped class is exact; legacy built-ins retain their short/FQN mirror.
+(define (host-static-probe class member)
+  (class-provider-call-stable
+    class
+    (lambda (mapped?)
+      (let ((cell (mutable-static-cell class member #f)))
+        (if cell
+            (vector #t #t (vector-ref cell 0))
+            (let ((h (if mapped?
+                         (hashtable-ref class-statics-tbl class #f)
+                         (lookup-class class-statics-tbl class))))
+              (if h
+                  (let ((v (hashtable-ref h member class-registry-missing)))
+                    (if (eq? v class-registry-missing)
+                        (vector #f #t class-registry-missing)
+                        (vector #t #t v)))
+                  (vector #f #f class-registry-missing))))))))
+
 (define (host-static-ref* class member allow-provider?)
-  (let ((cell (mutable-static-cell class member #f)))
-    (if cell
-        (vector-ref cell 0)
-        (let ((h (lookup-class class-statics-tbl class)))
-          (if h
-              (let ((v (hashtable-ref h member #f)))
-                (if v
-                    v
-                    ;; A dependency may extend a partially built-in class.  Load
-                    ;; its one declared provider, then retry this exact lookup once.
-                    (if (and allow-provider? (class-provider-try-load! class))
-                        (host-static-ref* class member #f)
-                        (throw-jvm (quote IllegalArgumentException)
-                          (string-append "No matching field or method: " class "/" member)))))
-              ;; class miss — autoload the java.time base and retry once, else throw
-              (if (jt-try-autoload! class)
-                  (host-static-ref* class member allow-provider?)
-                  (if (and allow-provider? (class-provider-try-load! class))
-                      (host-static-ref* class member #f)
-                      (throw-jvm (quote IllegalArgumentException)
-                        (unknown-class-message class)))))))))
+  (let ((probe (host-static-probe class member)))
+    (cond
+      ((vector-ref probe 0) (vector-ref probe 2))
+      ;; Preserve java.time's core-base autoload before consulting a dependency
+      ;; provider.  Both paths get one bounded retry.
+      ((jt-try-autoload! class)
+       (host-static-ref* class member allow-provider?))
+      ((and allow-provider? (class-provider-try-load! class))
+       (host-static-ref* class member #f))
+      ((vector-ref probe 1)
+       (throw-jvm (quote IllegalArgumentException)
+         (string-append "No matching field or method: " class "/" member)))
+      (else
+       (throw-jvm (quote IllegalArgumentException)
+         (unknown-class-message class))))))
 
 (define (host-static-call class member . args)
   (apply (host-static-ref class member) args))
@@ -303,7 +351,13 @@
 (define (host-new class . args)
   (apply host-new* class #t args))
 (define (host-new* class allow-provider? . args)
-  (let ((ctor (lookup-class class-ctors-tbl class)))
+  (let ((ctor
+          (class-provider-call-stable
+            class
+            (lambda (mapped?)
+              (if mapped?
+                  (hashtable-ref class-ctors-tbl class #f)
+                  (lookup-class class-ctors-tbl class))))))
     (cond
       (ctor (apply ctor args))
       ;; a java.time. constructor may live in the not-yet-loaded base — autoload

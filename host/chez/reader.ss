@@ -1064,8 +1064,21 @@
                (let ((g (gensym-fn (substring nm 0 (fx- (string-length nm) 1)))))
                  (hashtable-set! gsmap nm g) g)))
           ((member nm jsq-specials) sym)
-          ((hc-interop-head? nm) sym)         ; interop (.method / Class. / .-field)
+          ;; An imported constructor token is special syntax, but its class
+          ;; identity is still namespace-local.  Preserve the trailing dot while
+          ;; qualifying the class exactly, matching a syntax-quote read after an
+          ;; ns :import has established the mapping.
+          ((and (fx>? (string-length nm) 1)
+                (char=? (string-ref nm (fx- (string-length nm) 1)) #\.))
+           (let* ((base (substring nm 0 (fx- (string-length nm) 1)))
+                  (class (chez-resolve-class-name cns base)))
+             (if class
+                 (jolt-symbol #f (string-append class "."))
+                 sym)))
+          ((hc-interop-head? nm) sym)         ; interop (.method / .-field)
           ((hc-fq-class-name? nm) sym)        ; a fully-qualified class token
+          ((chez-resolve-class-import cns nm)
+           => (lambda (fqn) (jolt-symbol #f fqn)))
           ((var-cell-lookup cns nm) (jolt-symbol cns nm))          ; the ns's own var
           ((chez-resolve-refer cns nm)                             ; a :refer'd name
            => (lambda (target) (jolt-symbol target nm)))
@@ -1076,8 +1089,12 @@
           (else (jolt-symbol cns nm)))                             ; else the ns itself
         ;; qualified: resolve an :as alias in cns to the target ns, else leave as
         ;; written (a real ns or an interop class token).
-        (let ((target (chez-resolve-alias cns sns)))
-          (if target (jolt-symbol target nm) sym)))))
+        (let ((class (chez-resolve-class-name cns sns))
+              (target (chez-resolve-alias cns sns)))
+          (cond
+            (class (jolt-symbol class nm))
+            (target (jolt-symbol target nm))
+            (else sym))))))
 
 (define (rdr-sq-head-is? x nm)
   (and (cseq? x)

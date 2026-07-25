@@ -34,7 +34,7 @@
                                form-macro? form-expand-1 resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                record-type? record-ctor-key deftype-ctor-class form-position late-bind?
-                               resolve-class-hint host-class-name?]]))
+                               resolve-class-name]]))
 
 (declare analyze)
 
@@ -423,7 +423,7 @@
                            (string? tag) tag
                            :else nil)
             base-meta (if tag-name
-                        (let [c (resolve-class-hint tag-name)]
+                        (let [c (resolve-class-name ctx tag-name)]
                           (if c (assoc base0 :tag c) base0))
                         base0)
             node-meta (if has-doc (assoc base-meta :doc (nth items 2)) base-meta)]
@@ -452,11 +452,13 @@
       ;; (set! (. Class member) val) — a host static-field set. clojure.spec.alpha
       ;; toggles clojure.lang.RT/checkSpecAsserts this way. Lowered to a runtime
       ;; jolt.host/set-static-field! call (the read side is a :host-static ref).
-      (and (= thead ".") (>= (count ti) 3) (form-sym? (nth ti 1)) (form-sym? (nth ti 2))
-           (= :class (:kind (resolve-global ctx (nth ti 1)))))
-      (invoke (var-ref "jolt.host" "set-static-field!")
-              [(const (:name (resolve-global ctx (nth ti 1))))
-               (const (form-sym-name (nth ti 2))) val-node])
+      (and (= thead ".") (>= (count ti) 3) (form-sym? (nth ti 1))
+           (form-sym? (nth ti 2))
+           (resolve-class-name ctx (form-sym-name (nth ti 1))))
+      (invoke
+        (var-ref "jolt.host" "set-static-field!")
+        [(const (resolve-class-name ctx (form-sym-name (nth ti 1))))
+         (const (form-sym-name (nth ti 2))) val-node])
       (form-sym? target)
       (do (when (local? env (form-sym-name target)) (uncompilable "set! of a local"))
           (let [r (resolve-global ctx target)]
@@ -577,7 +579,9 @@
   ;; so a deftype named like a built-in host class (tools.reader's PushbackReader)
   ;; resolves to the deftype here while an unrelated ns's bare (PushbackReader. …)
   ;; still reaches java.io.PushbackReader.
-  (host-new (or (deftype-ctor-class ctx class) class)
+  (host-new (or (deftype-ctor-class ctx class)
+                (resolve-class-name ctx class)
+                class)
             (mapv #(analyze ctx % env) args)))
 
 ;; jolt.ffi/__cfn: the low-level foreign-function form a jolt library
@@ -783,18 +787,11 @@
         target (nth items 1)
         member (nth items 2)
         ;; (. Class method args*) with a class target is a static call —
-        ;; equivalent to (Class/method args*). resolve-global tags a class
-        ;; symbol :kind :class; a local of the same name shadows it. The value
-        ;; classes (Long/Integer/String) self-evaluate through a clojure.core var,
-        ;; so they resolve :var, not :class — host-class-name? catches those, so
-        ;; (. Long parseLong x) dispatches statically like (Long/parseLong x).
+        ;; equivalent to (Class/method args*). A local of the same name shadows
+        ;; the namespace import. The shared resolver makes the IR class exact.
         class-target (when (and (form-sym? target)
                                 (not (local? env (form-sym-name target))))
-                       (let [nm (form-sym-name target)
-                             r (resolve-global ctx target)]
-                         (cond
-                           (= :class (:kind r)) (:name r)
-                           (host-class-name? nm) nm)))]
+                       (resolve-class-name ctx (form-sym-name target)))]
     (cond
       (and class-target (form-sym? member))
         (invoke (host-static class-target (form-sym-name member))
@@ -928,8 +925,10 @@
                      (cond-> (var-ref (:ns r) (:name r)) (:num-ret r) (assoc :num-ret (:num-ret r)))))
              ;; A non-var qualified ref `Class/member` is a host class static
              ;; (Math/sqrt, Long/MAX_VALUE, System/getenv). The Chez back end
-             ;; lowers it to a runtime static dispatch.
-             (host-static ns nm)))
+             ;; lowers it to an exact-FQN runtime static dispatch.
+             (if-let [class (resolve-class-name ctx ns)]
+               (host-static class nm)
+               (resolve-error ctx (str ns "/" nm) env))))
       :else (let [r (resolve-global ctx form)]
               (case (:kind r)
                 ;; :num-ret (a ^double/^long declared return) rides on the var node so
