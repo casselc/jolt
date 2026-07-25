@@ -62,6 +62,9 @@
 (ev "(def c-fcntl-collect-safe
        (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
                          {:blocking true :varargs-after 2}))")
+(ev "(def c-fcntl-all-options
+       (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+         {:blocking true :varargs-after 2 :capture-native-error true}))")
 (ev "(def c-open-va
        (jolt.ffi/__cfn \"open\" [:string :int] :int
                          {:varargs-after 2}))")
@@ -84,6 +87,15 @@
     (integer?
       (jnum->exact
         (ev "(c-fcntl-collect-safe 0 3 0)"))))
+(ok "native-error capture executes with collect-safe and variadic conventions"
+    (jolt-truthy?
+      (ev "(let [fd (c-open-va \"/dev/null\" 0)
+                  result (c-fcntl-all-options fd 3 0)
+                  _ (c-close-va fd)]
+              (and (= 2 (count result))
+                   (integer? (nth result 0))
+                   (not (neg? (nth result 0)))
+                   (integer? (nth result 1)))))")))
 (ok "varargs boundary must be positive and within the declared arguments"
     (and
       (guard (e (#t #t))
