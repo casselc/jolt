@@ -437,27 +437,15 @@
 ;; [from-ns Type ...] binds each Type's ctor closure under the current ns, so its
 ;; (Type. ...) constructor (host-new resolves it as a var) works after :import.
 (define (chez-runtime-import . specs)
+  ;; Register the whole import form before binding any value-position class
+  ;; tokens. A conflict therefore leaves neither aliases nor vars behind.
   (for-each
-    (lambda (spec)
-      (let ((items (cond ((pvec? spec) (seq->list spec))
-                         ((or (cseq? spec) (empty-list-t? spec)) (seq->list spec))
-                         (else '()))))
-        (when (and (pair? items) (symbol-t? (car items)))
-          (let ((from (symbol-t-name (car items))))
-            (for-each
-              (lambda (tn)
-                (when (symbol-t? tn)
-                  ;; bind the short name to the interned CLASS value (java.lang.Class
-                  ;; token) for its fully-qualified name — the same self-evaluating
-                  ;; pattern the core Long/Integer/String tokens use. For a deftype/
-                  ;; defrecord this is its "ns.Name" class, equal to (type inst) /
-                  ;; (class inst), so (= SomeType (type inst)) and (instance? SomeType
-                  ;; x) work; (SomeType. …) construction resolves through the ctor
-                  ;; registry (host-new), not this binding.
-                  (def-var! (chez-current-ns) (symbol-t-name tn)
-                            (jolt-class-for (string-append from "." (symbol-t-name tn))))))
-              (cdr items))))))
-    specs)
+    (lambda (p)
+      ;; Bind the short name to the interned CLASS value for value-position
+      ;; compatibility. Constructor/static analysis uses the namespace-local
+      ;; mapping registered by the same shared parser and emits the FQN.
+      (def-var! (chez-current-ns) (car p) (jolt-class-for (cdr p))))
+    (chez-register-import-specs! (chez-current-ns) specs))
   jolt-nil)
 ;; clojure.core/import is a macro (00-syntax.clj) expanding to this runtime fn.
 (def-var! "clojure.core" "__import" chez-runtime-import)

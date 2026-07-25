@@ -1,0 +1,3 @@
+{:paths ["src"]
+ :jolt/class-providers
+ {"fixture.DependencyConflict" fixture.provider-b}}

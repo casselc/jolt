@@ -22,6 +22,7 @@ class-ancestors
 class-bases
 class-isa?
 class-object?
+class-provider-state
 class-supers
 class-value?
 compile-ns
@@ -108,6 +109,7 @@ register-class-supers!
 register-source!
 resolvable-names
 resolve-class-hint
+resolve-class-name
 resolve-global
 run-expr-string
 run-interruptible

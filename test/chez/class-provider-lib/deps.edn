@@ -1,1 +1,10 @@
-{:paths ["src"]}
+{:paths ["src"]
+ :deps {fixture/class-provider-nested
+        {:local/root "../class-provider-nested"}}
+ :jolt/class-providers
+ {"fixture.LazyStatics" cpfixture.static-provider
+  "fixture.LazyCtor" cpfixture.ctor-provider
+  "fixture.Concurrent" cpfixture.concurrent-provider
+  "java.nio.ByteBuffer" cpfixture.buffer-provider
+  "java.nio.charset.StandardCharsets" cpfixture.standard-charsets-provider
+  "com.acme.ByteBuffer" cpfixture.acme-buffer-provider}}
