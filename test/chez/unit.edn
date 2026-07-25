@@ -843,7 +843,7 @@
  {:suite "records-ctor-arity" :expr "(do (defrecord ArC9b [x y]) (try (->ArC9b 1 2 3) (catch Exception e :arity-throw)))" :expected ":arity-throw"}
  {:suite "records-ctor-arity" :expr "(do (defrecord ArC9c [x y]) (->ArC9c 1 2))" :expected "#user.ArC9c{:x 1, :y 2}"}
  ;; Stage C — assoc applies ^double coercion on record fields
- {:suite "records-assoc-double" :expr "(do (deftype DblC10 [^double x]) (.getName (class (.-x (assoc (->DblC10 1) :x 2)))))" :expected "java.lang.Double"}
+ {:suite "records-assoc-double" :expr "(do (defrecord DblC10 [^double x]) (.getName (class (.-x (assoc (->DblC10 1) :x 2)))))" :expected "java.lang.Double"}
  ;; Stage D — range step 0 repeats start infinitely
  {:suite "seq-range-step-zero" :expr "(take 3 (range 5 10 0))" :expected "(5 5 5)"}
  ;; Stage D — binding does not auto-deref var-cell
@@ -1359,4 +1359,18 @@
   ;; JVM errors too — but with a non-empty message naming the offending value.
   ;; Not JVM-certifiable (the JVM's own message differs), so a unit row.
   {:suite "satisfies" :expr "(do (deftype S [x] CharSequence (toString [_] \"x\")) (try (satisfies? CharSequence (S. 1)) (catch Throwable e (let [m (ex-message e)] [(boolean (and (string? m) (seq m))) (boolean (and m (.contains m \"CharSequence\")))]))))" :expected "[true true]"}
+  ;; A bare deftype is an opaque object, not an implicit map of its physical
+  ;; fields. These mirror JVM Clojure and are the core contract required by
+  ;; jolt.bytes Window/Cursor.
+  {:suite "deftype-opacity" :label "get and keyword invocation cannot expose slots" :expr "(do (deftype OpaqueLookup [secret]) (let [x (->OpaqueLookup 7)] [(get x :secret :missing) (:secret x :missing)]))" :expected "[:missing :missing]"}
+  {:suite "deftype-opacity" :label "count rejects an opaque deftype" :expr "(do (deftype OpaqueCount [secret]) (count (->OpaqueCount 7)))" :expected :throws}
+  {:suite "deftype-opacity" :label "contains rejects an opaque deftype" :expr "(do (deftype OpaqueContains [secret]) (contains? (->OpaqueContains 7) :secret))" :expected :throws}
+  {:suite "deftype-opacity" :label "find rejects an opaque deftype" :expr "(do (deftype OpaqueFind [secret]) (find (->OpaqueFind 7) :secret))" :expected :throws}
+  {:suite "deftype-opacity" :label "assoc rejects an opaque deftype" :expr "(do (deftype OpaqueAssoc [secret]) (assoc (->OpaqueAssoc 7) :secret 8))" :expected :throws}
+  {:suite "deftype-opacity" :label "conj rejects an opaque deftype" :expr "(do (deftype OpaqueConj [secret]) (conj (->OpaqueConj 7) [:extra 8]))" :expected :throws}
+  {:suite "deftype-opacity" :label "dissoc rejects an opaque deftype" :expr "(do (deftype OpaqueDissoc [secret]) (dissoc (->OpaqueDissoc 7) :secret))" :expected :throws}
+  {:suite "deftype-opacity" :label "declared ILookup wins over a same-named slot" :expr "(do (deftype LookupWins [secret] clojure.lang.ILookup (valAt [_ k] (if (= k :secret) :lookup nil)) (valAt [_ k d] (if (= k :secret) :lookup d))) (let [x (->LookupWins 7)] [(get x :secret) (:secret x) (get x :other :missing)]))" :expected "[:lookup :lookup :missing]"}
+  {:suite "deftype-opacity" :label "explicit field reads remain available to compiled methods" :expr "(do (defprotocol SlotRead (slot-read [x])) (deftype SlotBox [secret] SlotRead (slot-read [_] secret)) (let [x (->SlotBox 7)] [(slot-read x) (.-secret x)]))" :expected "[7 7]"}
+  {:suite "deftype-opacity" :label "record and deftype predicates remain distinct" :expr "(do (defrecord VisibleKind [secret]) (deftype OpaqueKind [secret]) [(record? (->VisibleKind 7)) (record? (->OpaqueKind 7)) (map? (->VisibleKind 7)) (map? (->OpaqueKind 7))])" :expected "[true false true false]"}
+  {:suite "deftype-opacity" :label "defrecord retains map semantics" :expr "(do (defrecord VisibleMap [secret]) (let [r (assoc (->VisibleMap 7) :extra 8)] [(get r :secret) (:secret r) (count r) (contains? r :secret) (find r :secret) (:secret (assoc r :secret 9))]))" :expected "[7 7 2 true [:secret 7] 9]"}
 ]

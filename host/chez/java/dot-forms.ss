@@ -207,8 +207,12 @@
         ;; data.priority-map's subseq/rsubseq reach for these.
         ((and (not field?) (htable-sorted? obj) (sorted-iface-method? mname))
          (sorted-iface-dispatch obj mname rest))
-        ;; (.-field obj) / (. obj -field): field read on a record or map.
-        (field? (jolt-get obj (keyword #f mname) jolt-nil))
+        ;; (.-field obj) / (. obj -field): explicit field access is an internal
+        ;; slot read for deftype/defrecord values, independent of public ILookup.
+        ;; Maps retain the historical keyword-field convenience.
+        (field? (if (jrec? obj)
+                    (jrec-lookup obj (keyword #f mname) jolt-nil)
+                    (jolt-get obj (keyword #f mname) jolt-nil)))
         ;; non-record map: a universal object-method (getMessage/...) wins first,
         ;; then a stored procedure is a method (call with self), else the field.
         ((and (jolt-map? obj) (not (jrec? obj)))

@@ -119,6 +119,11 @@
                      (assoc merged :shape (get a :shape)) merged)
             merged (if (and (get a :type) (= (get a :type) (get b :type)))
                      (assoc merged :type (get a :type)) merged)
+            ;; defrecord/deftype kind controls whether public lookup may read a
+            ;; physical slot. Preserve it only when both exact types agree.
+            merged (if (and (some? (get a :record?))
+                            (= (get a :record?) (get b :record?)))
+                     (assoc merged :record? (get a :record?)) merged)
             ;; nilability is contagious: a nilable side makes the join nilable.
             merged (if (or (get a :nilable) (get b :nilable))
                      (assoc merged :nilable true) merged)]
@@ -149,7 +154,9 @@
             ;; container keeps its identity, so devirtualization, record? folding,
             ;; and the record fast path still fire on it.
             capped (if (get t :shape) (assoc capped :shape (get t :shape)) capped)
-            capped (if (get t :type) (assoc capped :type (get t :type)) capped)]
+            capped (if (get t :type) (assoc capped :type (get t :type)) capped)
+            capped (if (some? (get t :record?))
+                     (assoc capped :record? (get t :record?)) capped)]
         capped)
     (vec-type? t) (mk-vec (cap (velem t) (dec d)))
     (set-type? t) (mk-set (cap (selem t) (dec d)))
@@ -185,7 +192,9 @@
 ;; keeps the nil-safe read path instead of a direct (nil-unsafe) slot accessor.
 (defn mark-struct [node t]
   (let [n (assoc node :hint :struct)
-        n (if (get t :shape) (assoc n :shape (get t :shape)) n)]
+        n (if (get t :shape) (assoc n :shape (get t :shape)) n)
+        n (if (some? (get t :record?))
+            (assoc n :record? (get t :record?)) n)]
     (if (nilable? t) (assoc n :nilable true) n)))
 ;; a value provably neither nil nor false — the back end only builds a struct
 ;; (vs a phm) when every value is non-nil/non-false, so a map literal is a struct
