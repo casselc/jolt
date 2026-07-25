@@ -40,7 +40,8 @@
           'pass))))
 
 (define (instance-check-base type-sym val)
-  (let ((tname (symbol-t-name type-sym)))
+  (let* ((tname (symbol-t-name type-sym))
+         (canonical-interface (canonical-protocol-name tname)))
     (cond
       ((jrec? val)
        (let ((tag (jrec-tag val)))
@@ -55,15 +56,16 @@
              ;; a protocol/interface the type implements (defprotocol generates an
              ;; interface; (instance? SomeProtocol record) is true when the record
              ;; implements it — core.match dispatches on instance? IPatternCompile).
-             (type-satisfies? tag tname)
-             (type-satisfies? tag (last-dot tname))
+             (type-satisfies? tag canonical-interface)
              ;; the class graph: a declared interface's own ancestry answers too
              ;; (IPersistentMap is an Associative is an IPersistentCollection).
-             (jch-isa? tag tname))))
-      ((jreify? val) (let ((short (last-dot tname)))
+             (jch-isa? tag canonical-interface))))
+      ((jreify? val) (let ((short (last-dot canonical-interface)))
                        ;; every Clojure reify implements IObj/IMeta (carries metadata).
                        (or (member short '("IObj" "IMeta"))
-                           (and (memp (lambda (p) (string=? (last-dot p) short)) (jreify-protos val)) #t))))
+                           (and (memp (lambda (p) (string=? p canonical-interface))
+                                      (jreify-protos val))
+                                #t))))
       ((ex-info-map? val) (exception-isa? (last-dot (ex-info-class val)) (last-dot tname)))
       (else (case-string tname val)))))
 

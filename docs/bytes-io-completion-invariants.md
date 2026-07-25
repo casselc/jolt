@@ -48,6 +48,54 @@ Runtime conformance must additionally check:
 - `drop`/`take` produce ordinary sequence projections while `slice` preserves
   backing identity in O(1).
 
+## Protocol and core-interface dispatch
+
+The idiomatic `Window` and completion surfaces rely on ordinary Clojure core
+operations. Dispatch is sound only when all three facts hold:
+
+1. the value declares the required interface;
+2. the implementation has the required method name; and
+3. the implementation accepts the exact interface arity, including `this`.
+
+Method name and arity alone are insufficient, and a registry that stores only a
+simple interface name has not preserved identity. The buggy model pins a local
+protocol with the same short name and method shape as a core interface: its
+logical identity differs while its lossy stored id compares equal, producing a
+false dispatch. The corrected model requires canonical stored-id equality to
+agree with logical interface identity, so the false-dispatch query is UNSAT
+over the complete Boolean domain. Its non-vacuity control still selects a
+genuine implementation.
+
+The runtime controls use both unrelated protocol names and local protocols
+literally named `IReduce`, `IDeref`, `IBlockingDeref`, `IPending`, `Seqable`,
+`Counted`, and `Indexed`. Their canonical namespace-qualified ids must remain
+distinct from `clojure.lang.*`, and their same-shaped methods must never drive
+the core operations. JVM controls establish the intended fallback or
+`ClassCastException`. The same suite verifies that:
+
+- custom `IReduce` and `IReduceInit` return values are not unwrapped by core;
+- future and promise, but not delay, report `IBlockingDeref`;
+- timed deref rejects native and custom IDeref-only values;
+- invalid public deref arities throw `clojure.lang.ArityException`; and
+- declaring a core interface while omitting its selected method throws
+  `AbstractMethodError`, rather than being confused with an absent interface.
+
+The same identity rule applies below the core adapters. A `reify` stores its
+local implementations in a compact method-name table, but that representation
+does not authorize selection by name alone:
+
+```text
+select-local(reify, requested-protocol, method)
+  implies requested-protocol is in reify.declared-protocols
+```
+
+If the requested protocol was not declared, dispatch must continue to that
+protocol's host/default extensions and otherwise report a missing method. A
+local method belonging to a different protocol is never a candidate. The
+`reify` unit control captures the concrete collision using two protocols that
+both declare `m`; the JVM returns the first implementation only through the
+first protocol and reports the second call missing.
+
 ## Completion and lease lifecycle
 
 The model separates four facts that must not be collapsed:
@@ -107,6 +155,12 @@ primitive.
 | [`io-completion-lease-lifecycle-buggy.pl`](../test/chez/formal/io-completion-lease-lifecycle-buggy.pl) | `premature_reuse/2` and `double_publication/2` each have a witness | Both rejected transition classes are observable. |
 | [`io-completion-lease-lifecycle-corrected.pl`](../test/chez/formal/io-completion-lease-lifecycle-corrected.pl) | `bad/2` has no solution; `valid_cancel_path/1` has one | Safety holds without eliminating valid cancellation. |
 | [`io-completion-lease-lifecycle-nonvacuity.pl`](../test/chez/formal/io-completion-lease-lifecycle-nonvacuity.pl) | `valid_cancel_path/1` has the four-transition solution | The lifecycle constraints are non-vacuous. |
+| [`protocol-interface-dispatch-buggy.smt2`](../test/chez/formal/protocol-interface-dispatch-buggy.smt2) | SAT, local same-short-name protocol selected | Lossy simple-name identity plus a same-shaped method admits false core-interface dispatch. |
+| [`protocol-interface-dispatch-corrected.smt2`](../test/chez/formal/protocol-interface-dispatch-corrected.smt2) | UNSAT | Canonical stored ids preserve logical interface identity and exclude the modeled false dispatch. |
+| [`protocol-interface-dispatch-nonvacuity.smt2`](../test/chez/formal/protocol-interface-dispatch-nonvacuity.smt2) | SAT, genuine implementation selected | The exact selector still admits useful dispatch. |
+| [`protocol-reify-dispatch-buggy.smt2`](../test/chez/formal/protocol-reify-dispatch-buggy.smt2) | SAT, undeclared protocol selects a same-named local method | A method-name-only reify table admits cross-protocol dispatch. |
+| [`protocol-reify-dispatch-corrected.smt2`](../test/chez/formal/protocol-reify-dispatch-corrected.smt2) | UNSAT | Local selection requires membership of the requested canonical protocol in the reify declaration set. |
+| [`protocol-reify-dispatch-nonvacuity.smt2`](../test/chez/formal/protocol-reify-dispatch-nonvacuity.smt2) | SAT, declared protocol selects its method | The membership guard preserves useful local dispatch. |
 
 Run each SMT file through Chiasmus `chiasmus_lint` and `chiasmus_verify` with
 `solver=z3`; Chiasmus supplies the final solver commands omitted from the
@@ -119,20 +173,28 @@ bad(State, Path).
 valid_cancel_path(Path).
 ```
 
-The expected SMT sequence is SAT, UNSAT, SAT. The buggy Prolog queries must
-produce paths, the corrected `bad/2` query must not, and both valid-cancel
-queries must produce the path shown above.
+Each SMT model trio has the expected SAT, UNSAT, SAT sequence. The buggy Prolog
+queries must produce paths, the corrected `bad/2` query must not, and both
+valid-cancel queries must produce the path shown above.
 
 ## Source and implementation anchors
 
-The generic core dispatch gaps that must be corrected before the idiomatic
-surface is claimed currently live in:
+The generic core dispatch implementation and its runtime controls live in:
 
 - `jolt-core/clojure/core/20-coll.clj` for collection predicates and reduce;
-- `host/chez/seq.ss` for sequence/reduction dispatch;
-- `host/chez/java/concurrency.ss` for Future behavior; and
-- `host/chez/post-prelude.ss` for deref and pending dispatch.
+- `jolt-core/clojure/core/30-macros.clj` for canonical protocol ids carried
+  through `defprotocol`, `deftype`, `defrecord`, `reify`, extension, and
+  `instance?`;
+- `host/chez/records.ss` (`iface-method`) for interface-identity and exact-arity
+  method selection, and `protocol-resolve` for requested-protocol membership
+  before a reify-local method is selected;
+- `host/chez/seq.ss` (`jolt-reduce`) for `IReduce` and `IReduceInit`;
+- `host/chez/java/concurrency.ss` (`jolt-deref` and its instance-check arm) for
+  `IDeref`/`IBlockingDeref` behavior;
+- `host/chez/post-prelude.ss` for `IPending`; and
+- the `reify`, `protocol-predicates`, `protocol-reduce`, and `protocol-deref`
+  suites in `test/chez/unit.edn`.
 
-Implementation commits must replace these broad anchors with exact functions
-and line references, add JVM controls where parity is intended, and link the
-runtime tests back to this note.
+The implementation commit and final gate counts are recorded when this slice
+is accepted; the model claims remain bounded to the selector and do not replace
+runtime/JVM parity controls.
