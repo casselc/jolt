@@ -954,7 +954,7 @@
   {:suite "target" :label "drive-rooted paths are absolute exactly on Windows" :expected "true" :expr "(= (= :windows (:os (jolt.host/target))) (jolt.host/absolute-path? \"C:/tmp/x\"))"}
   {:suite "target" :label "drive-relative paths remain relative" :expected "false" :expr "(jolt.host/absolute-path? \"C:tmp/x\")"}
   {:suite "target" :label "File and Path share host absolute-path semantics" :expected "true" :expr "(let [p \"C:/tmp/x\" expected (jolt.host/absolute-path? p)] (= expected (.isAbsolute (java.io.File. p)) (.isAbsolute (java.nio.file.Paths/get p (make-array String 0)))))"}
-  {:suite "ffi" :label "defcfn preserves composable collect-safe and variadic options" :expected "true" :expr "(do (require 'jolt.ffi) (= '(def test-fcntl (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int {:blocking true :varargs-after 2})) (macroexpand-1 '(jolt.ffi/defcfn test-fcntl \"fcntl\" [:int :int :int] :int {:blocking true :varargs-after 2}))))"}
+  {:suite "ffi" :label "defcfn preserves composable collect-safe variadic and native-error options" :expected "true" :expr "(do (require 'jolt.ffi) (= '(def test-fcntl (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int {:blocking true :varargs-after 2 :capture-native-error true})) (macroexpand-1 '(jolt.ffi/defcfn test-fcntl \"fcntl\" [:int :int :int] :int {:blocking true :varargs-after 2 :capture-native-error true}))))"}
   {:suite "add-deps" :label "inline :local/root dep becomes requirable" :expected ":pong" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\") src (java.nio.file.Paths/get (str d \"/src/adddep\") (into-array String []))] (java.nio.file.Files/createDirectories src (into-array java.nio.file.attribute.FileAttribute [])) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/adddep/core.clj\") \"(ns adddep.core) (defn ping [] :pong)\") (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) (require 'adddep.core) ((resolve 'adddep.core/ping))))"}
   {:suite "add-deps" :label "added roots append after existing roots" :expected "true" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\") before (vec (jolt.host/source-roots)) _ (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) after (vec (jolt.host/source-roots))] (= before (vec (take (count before) after)))))"}
   {:suite "m2-repo" :label "JOLT_LOCAL_REPO wins, then :mvn/local-repo, then HOME/.m2" :expected "true" :expr "(do (require 'jolt.deps) (let [m2 @#'jolt.deps/m2-repo-dir] (and (= \"/o\" (m2 \"/o\" \"/cfg\" \"/h\")) (= \"/cfg\" (m2 nil \"/cfg\" \"/h\")) (= \"/h/.m2/repository\" (m2 nil nil \"/h\")))))"}
@@ -1036,8 +1036,9 @@
   ;; unit-testable via compile-eval (they emit only on the whole-program path):
   ;; var-cell-deref (cell-cached var-cache? deref), def-var! / def-var-with-meta!
   ;; / declare-var! / intern-ns! / define (top-level + forward-decl + ns-splice),
-  ;; foreign-procedure (ffi lowering). A local shadowing these only clashes when
-  ;; the def/ffi/var-cache form is emitted inside that local's scope.
+  ;; foreign-procedure / jolt-ffi-native-error-procedure / call-with-values (ffi
+  ;; lowering). A local shadowing these only clashes when the def/ffi/var-cache
+  ;; form is emitted inside that local's scope.
   ;; munge-injective (compiler-review R2 stage 2). munge-name maps ' -> $P, # -> $H,
   ;; and $ -> $$ (escape-first) so distinct Clojure locals get distinct Scheme ids.
   ;; Pre-remint a' and a_PRIME_ both emit a_PRIME_ (old ' -> _PRIME_ substitution),

@@ -46,6 +46,30 @@
                (and (foreign-entry? name)
                     (foreign-procedure name args res))))))))
 
+;; Build a foreign procedure whose invocation returns the native result and the
+;; calling thread's native error slot as two Scheme values. Chez captures the
+;; slot in the foreign-call return path, before collect-safe thread reactivation
+;; or any other Scheme/native work can overwrite it.
+;;
+;; POSIX calls use errno; Windows calls use GetLastError, which is also the slot
+;; Winsock exposes through WSAGetLastError. The back end wraps the two values as
+;; a Jolt [result error-code] vector. Keep target selection in syntax so an
+;; unsupported __get_last_error convention never reaches a non-Windows Chez
+;; expander.
+(define-syntax jolt-ffi-native-error-procedure
+  (lambda (x)
+    (syntax-case x ()
+      ((_ (conv ...) name args res)
+       (with-syntax
+         ((error-conv
+            (datum->syntax
+              #'foreign-procedure
+              (if (memq (machine-type)
+                        '(i3nt ti3nt a6nt ta6nt arm64nt tarm64nt))
+                  '__get_last_error
+                  '__errno))))
+         #'(foreign-procedure error-conv conv ... name args res))))))
+
 ;; WinAPI uses __stdcall on 32-bit Windows but the platform's single x64/ARM64
 ;; calling convention on 64-bit Windows. Chez rejects __stdcall on the latter,
 ;; so select it at expansion time instead of treating all Windows machines as

@@ -51,6 +51,11 @@
              "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
                                     {:blocking true :varargs-after 2})")
           "(foreign-procedure __collect_safe (__varargs_after 2) \"fcntl\""))
+(ok "native-error capture composes with collect-safe and variadic conventions"
+    (has? (emitf "user"
+             "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                {:blocking true :varargs-after 2 :capture-native-error true})")
+          "(jolt-ffi-native-error-procedure (__collect_safe (__varargs_after 2)) \"fcntl\""))
 (ev "(def c-fcntl
        (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
                          {:varargs-after 2}))")
@@ -101,8 +106,17 @@
         #f)
       (guard (e (#t #t))
         (ev "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                              {:capture-native-error :yes})")
+        #f)
+      (guard (e (#t #t))
+        (ev "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
                               {:varargs-after 1.5})")
         #f)))
+(ok "native-error capture requires a result sentinel"
+    (guard (e (#t #t))
+      (ev "(jolt.ffi/__cfn \"free\" [:pointer] :void
+                            {:capture-native-error true})")
+      #f))
 
 ;; memory: alloc / write / read roundtrip through the host primitives
 (ok "mem int roundtrip"
@@ -202,6 +216,29 @@
          (= 9 (jnum->exact (ev "(jolt.ffi/errno)")))))
 (ok "the value captured before cleanup survives it"
     (= 2 (jnum->exact (var-deref "user" "captured-before"))))
+
+;; Stronger opt-in: Chez captures errno in the foreign-call return path itself.
+;; The generated Jolt callable materializes both Scheme values as [result code],
+;; so even a collect-safe return transition cannot interpose before capture.
+(ev "(def c-open-with-error
+       (jolt.ffi/__cfn \"open\" [:string :int] :int
+         {:capture-native-error true}))")
+(ev "(def open-with-error
+       (c-open-with-error \"/nonexistent-zzz/nope\" 0))")
+(ok "atomic native-error binding returns [result error-code]"
+    (jolt-truthy? (ev "(= [-1 2] open-with-error)")))
+(ev "(c-close -1)")
+(ok "atomic native-error pair survives later native cleanup"
+    (jolt-truthy? (ev "(= [-1 2] open-with-error)")))
+
+;; Composition with __collect_safe is the Windows/Winsock defect shape: the
+;; runtime may perform work while reactivating the Scheme thread, after the C
+;; call returned but before ordinary Jolt code could call ffi/errno.
+(ev "(def c-close-with-error-blocking
+       (jolt.ffi/__cfn \"close\" [:int] :int
+         {:blocking true :capture-native-error true}))")
+(ok "atomic native-error capture composes with collect-safe calls"
+    (jolt-truthy? (ev "(= [-1 9] (c-close-with-error-blocking -1))")))
 
 ;; byte-array buffer I/O: write a byte-array into foreign memory and read it back
 ;; byte-exact (high bytes preserved, no UTF-8 mangling).
