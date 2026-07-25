@@ -48,6 +48,158 @@ Runtime conformance must additionally check:
 - `drop`/`take` produce ordinary sequence projections while `slice` preserves
   backing identity in O(1).
 
+## Ansatz oracle and Hegel runtime properties
+
+The solver model answers a bounded counterexample query, but it need not be the
+only source of runtime properties. The selected follow-on uses Ansatz as a
+proof oracle and jolt-hegel as the shrinking runtime explorer:
+
+```text
+Ansatz theorem
+   | hypotheses                         | conclusions
+   v                                    v
+constructive dependent generators   runtime assertions
+   |                                    |
+   +---------- hand-written Hegel property ---------+
+                              |
+                       actual Jolt Window
+
+pinned theorem/environment --> exhaustive bounded EDN oracle
+```
+
+The proposed initial pure theorem is over unbounded naturals:
+
+```text
+offset + length <= capacity
+and start <= end
+and end <= length
+implies
+  child-offset = offset + start
+  child-length = end - start
+  child-offset + child-length <= capacity
+```
+
+The theorem does not prove Jolt's integer coercions, allocation bounds, byte
+sign, mutation behavior, or backing identity. Those remain runtime
+obligations. The first oracle lane will enumerate capacities `0..16`: 969 valid
+parent descriptors and all 20,349 valid relative slices. It retains the known
+buggy empty-tail witness for parent `[0,1)` and slice `[1,1)`.
+
+The Hegel positive-domain property draws inputs dependently:
+
+| Theorem hypothesis | Constructive draw | Runtime observation |
+| --- | --- | --- |
+| `capacity : Nat` | capacity `0..256`, then an exact-size backing | backing has the requested capacity |
+| `0 <= offset <= capacity` | offset `0..capacity` | parent construction succeeds |
+| `offset + length <= capacity` | length `0..capacity-offset` | traversal stays inside backing |
+| `0 <= start <= end <= length` | start `0..length`, then end `start..length` | slice construction succeeds |
+| `child-length = end-start` | no independent draw | child count is `end-start` |
+| `child-offset = offset+start` | no independent draw | child contents equal the corresponding backing subsequence |
+| shared backing | outside the theorem | a nonempty child observes a backing mutation |
+
+Independent integers followed by `h/assume!` or `g/filter` are rejected for
+this positive-domain property. They waste cases and may shrink out of the
+theorem's domain. `g/let` inside `hegel.clojure-test/with`, or nested `g/bind`
+for a reusable generator, makes each later bound depend on earlier draws.
+Before that claim becomes a gate, a deliberately failing construction must
+shrink to a reproducible minimal case that still satisfies every hypothesis and
+reports `:flaky? false`.
+
+Once `jolt.bytes/Window` lands, the first property has this shape; the Window
+calls are the selected RFD surface, while the Hegel forms are current:
+
+```clojure
+(deftest valid-window-slices-follow-proved-geometry
+  (with {:test-cases 500
+         :seed 20260724
+         :name "jolt.bytes/window-slice-containment/v1"
+         :database ""
+         :verbosity :quiet}
+    [capacity (g/integer 0 256)
+     octets   (g/vector {:size capacity} (g/octet))
+     offset   (g/integer 0 capacity)
+     length   (g/integer 0 (- capacity offset))
+     start    (g/integer 0 length)
+     end      (g/integer start length)]
+    (let [backing  (byte-array (mapv unchecked-byte octets))
+          parent   (bytes/window backing offset (+ offset length))
+          child    (bytes/slice parent start end)
+          expected (mapv #(if (> % 127) (- % 256) %)
+                         (subvec octets
+                                 (+ offset start)
+                                 (+ offset end)))]
+      (when-not (= (- end start) (count child))
+        (throw (ex-info "slice length disagrees with proved geometry"
+                        {:hegel/origin
+                         "jolt.bytes/window-slice:length"})))
+      (when-not (= expected (vec child))
+        (throw (ex-info "slice contents disagree with proved geometry"
+                        {:hegel/origin
+                         "jolt.bytes/window-slice:contents"})))
+      ;; A nonempty mutation/alias check is a separate runtime obligation.
+      )))
+```
+
+Invalid windows and slices use separate generators by violation class:
+negative bounds, reversed ranges, parent escape, and child escape. Machine
+overflow is also a separate property because the natural-number theorem does
+not decide signed fixed-width arithmetic or feasible allocation size.
+
+The same division generalizes without making networking the organizing
+example:
+
+- for codecs, Ansatz proves round-trip, canonicalization, encoded-length, and
+  cursor-consumption laws; Hegel generates semantic values first and derives
+  encoded bytes, then uses `g/chunkings` for incremental-versus-whole decoding;
+- for pure state machines, an Ansatz invariant and transition theorem supply
+  the model precondition, step, and post-state invariant; Hegel stateful rules
+  execute real operations and shrink traces; and
+- mutation, callbacks, native completion, cleanup, scheduling, fairness, and
+  durability remain runtime or environmental evidence rather than consequences
+  of the pure theorem.
+
+### Provenance manifest and trust boundary
+
+The spike audited Ansatz tag `0.2.75`, commit
+`d58b619b18f66c5cc05f684043e3d8978c568d81`. Adoption requires a verified
+environment replay and a dependency-closure audit that rejects unreviewed
+hooks, `partial`, `foreign`, opaque or assumed constants, and Quot declarations
+from the initial proof slice. The current elaborator and Clojure generator are
+not assumed semantics-preserving. A hook-free generated JVM evaluation may be
+used as another differential lane, but the portable artifact remains data:
+versioned EDN rows with a digest.
+
+A reviewed manifest may record:
+
+```clojure
+{:id :jolt.bytes/window-slice/v1
+ :theorem {:engine :ansatz
+           :commit "d58b619b18f66c5cc05f684043e3d8978c568d81"
+           :environment-sha256 "<required>"
+           :names [:slice-end-preserved :slice-contained]}
+ :oracle {:resource "byte-window-slices-v1.edn"
+          :sha256 "<required>"
+          :case-count 20349}
+ :mapping {:hypotheses
+           {:capacity :generated-backing-size
+            :parent-contained :dependent-offset-length
+            :slice-valid :dependent-start-end}
+           :conclusions
+           {:child-length :runtime-count
+            :child-offset :runtime-contents}}
+ :runtime {:property
+           jolt.bytes-property-test/valid-window-slices-follow-proved-geometry}
+ :runtime-only [:signed-traversal :backing-alias :invalid-rejection]
+ :omissions [:negative-nat :machine-overflow :concurrency :leases]}
+```
+
+Automation may validate the manifest schema, pins, named tests, case count, and
+digests. It must not yet synthesize executable generators or assertions:
+theorem types do not determine Nat-to-Long representation, allocation policy,
+effects, invalid-input behavior, or sound shrinking. The theorem, oracle, and
+manifest are proposed follow-on artifacts; the checked-in evidence today is the
+solver trio and its runtime controls.
+
 ## Protocol and core-interface dispatch
 
 The idiomatic `Window` and completion surfaces rely on ordinary Clojure core
