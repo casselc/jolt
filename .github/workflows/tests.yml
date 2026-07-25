@@ -155,6 +155,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           chez --script test/chez/target-descriptor-test.ss
+          chez --script test/chez/build-output-test.ss
           chez --script host/chez/run-unit.ss
           chez --script host/chez/cli.ss run test/mvn_http_test.clj
 
