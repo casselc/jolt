@@ -473,9 +473,14 @@
                           ;; provides, and treat those params as shadowing so a
                           ;; mutable field's live-read rewrite doesn't override them.
                           pnames (set (map name argv))
-                          ;; let-bind only immutable fields; mutable ones are read live
-                          ;; via rewrite-body so a set! within the method is observed.
-                          binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
+                          ;; Let-bind only immutable fields; mutable ones are read
+                          ;; live via rewrite-body so a set! within the method is
+                          ;; observed. Field binding is explicit interop, not public
+                          ;; ILookup: a bare deftype's physical slots are opaque to
+                          ;; get/keyword invocation.
+                          binds (vec (mapcat (fn [f]
+                                              [f (list (symbol (str ".-" (name f)))
+                                                       inst)])
                                              (filter (fn [f] (and (not (mutable? f))
                                                                   (not (contains? pnames (name f)))))
                                                      fields)))

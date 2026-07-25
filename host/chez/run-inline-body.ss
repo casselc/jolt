@@ -41,17 +41,47 @@
   (gate-check "inline method body field read uses direct accessor"
          (gate-sub? emitted "jrec1-f0") #t))
 
-;; Also check that a deftype (non-record protocol impl) does NOT break anything.
-;; deftype bodies use register-method, not register-inline-method.
-(evals "(defrecord Square [s] Shape (area [_] (* s s)))")
+;; Also check a real deftype (non-record protocol impl). Its method field binding
+;; is explicit (.-s), never public (get this :s), and still specializes to the
+;; direct slot accessor.
+(evals "(deftype Square [s] Shape (area [_] (* s s)))")
 (define shapes2 (chez-record-shapes-map))
 (let* ((ir2 (analyze (make-analyze-ctx "user")
-                     (jolt-ce-read "(defrecord Square [s] Shape (area [_] (* s s)))")))
+                     (jolt-ce-read "(deftype Square [s] Shape (area [_] (* s s)))")))
        (_ (set-record-shapes! U shapes2))
        (passed2 (run-passes ir2 (make-analyze-ctx "user") U))
        (emitted2 (emit passed2)))
   (gate-check "deftype field read uses direct accessor"
          (gate-sub? emitted2 "jrec1-f0") #t))
+
+;; Public lookup and explicit field access must remain distinct under --opt.
+;; LookupWins deliberately gives :secret semantics unrelated to its same-named
+;; physical slot; scalar replacement or backend slot selection would return 7
+;; instead of :lookup.
+(evals "(deftype LookupWins [secret] clojure.lang.ILookup
+          (valAt [_ k] (if (= k :secret) :lookup nil))
+          (valAt [_ k d] (if (= k :secret) :lookup d)))")
+(define shapes3 (chez-record-shapes-map))
+(define (pass-emit src)
+  (let* ((ir (analyze (make-analyze-ctx "user") (jolt-ce-read src)))
+         (_ (set-record-shapes! U shapes3))
+         (passed (run-passes ir (make-analyze-ctx "user") U)))
+    (emit passed)))
+(define (run-emitted scm)
+  (eval (read (open-input-string scm)) (interaction-environment)))
+
+(set-direct-link-flag! #t)
+(let ((e (pass-emit "((fn [^LookupWins x] (:secret x)) (->LookupWins 7))")))
+  (gate-check "optimized deftype lookup keeps public dispatch"
+              (gate-sub? e "jolt-get") #t)
+  (gate-check "optimized same-name ILookup beats physical slot"
+              (run-emitted e) (keyword #f "lookup")))
+(let ((e (pass-emit "((fn [^LookupWins x] (.-secret x)) (->LookupWins 7))")))
+  (gate-check "optimized explicit deftype field uses direct accessor"
+              (gate-sub? e "jrec1-f0") #t)
+  (gate-check "optimized explicit deftype field reads slot"
+              (run-emitted e) 7))
+(set-direct-link-flag! #f)
 
 ;; jolt-ox7c.46: scalar-replace must not DISCARD a throwing sibling. A numeric op
 ;; throws on a non-numeric arg, so a map value like (+ x "throwme") whose key is

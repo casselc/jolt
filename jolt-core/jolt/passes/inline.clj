@@ -458,7 +458,8 @@
     (let [f (get node :fn)]
       (if (= :var (get f :op))
         (let [rs (get (rec-shapes) (str (get f :ns) "/" (get f :name)))]
-          (if (and rs (= (count (get rs :fields)) (count (get node :args))))
+          (if (and rs (true? (get rs :record?))
+                   (= (count (get rs :fields)) (count (get node :args))))
             rs
             nil))
         nil))
