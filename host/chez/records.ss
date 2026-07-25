@@ -1055,6 +1055,11 @@
     ;; the ns-qualified tag, not the bare segment — so a name that resolves to a
     ;; deftype never canonicalizes through the graph arm.
     (cond
+      ;; Provider ownership is exact and takes precedence over the historic
+      ;; built-in simple tags. A provider-backed java.nio.ByteBuffer and an
+      ;; unrelated com.acme.ByteBuffer may both be extended without sharing the
+      ;; "ByteBuffer" protocol slot.
+      ((class-provider-for type-name) type-name)
       ;; a "ns$name" fn-class / inner-class name (from a Class value, e.g.
       ;; (class some-fn) -> "clojure.core$double") is always a host tag — the
       ;; value reports the same string in value-host-tags — so use it verbatim
@@ -1089,7 +1094,14 @@
     (when ti (let ((pi (hashtable-ref ti proto-name #f)))
                (when pi (hashtable-set! pi extend-mark #t))))))
 (define (register-method type-name proto-name method-name fn)
-  (let* ((host (canonical-host-tag type-name))
+  (let* (;; extend-type receives the source token's name. Resolve a simple Java
+         ;; import in the namespace that owns the extension before choosing its
+         ;; dispatch tag; otherwise two namespaces importing same-simple-name
+         ;; provider classes overwrite one shared slot.
+         (resolved-type-name
+           (or (chez-resolve-class-import (chez-current-ns) type-name)
+               type-name))
+         (host (canonical-host-tag resolved-type-name))
          (local (string-append (chez-current-ns) "." type-name))
          ;; a host class -> its canonical tag; a deftype defined in THIS ns -> the
          ;; local tag; an :import-ed deftype from another ns -> its real tag via the

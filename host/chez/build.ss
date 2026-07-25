@@ -743,17 +743,17 @@
   (bld-require-closure names))
 
 (define (bld-emit-class-providers out mappings)
-  (when (pair? mappings)
-    (put-string out "\n;; === frozen class-provider metadata ===\n")
-    (put-string out "(class-provider-register-many! (list")
-    (for-each
-      (lambda (p)
-        (put-string
-          out
-          (string-append "\n  (cons " (ei-str-lit (car p)) " "
-                         (ei-str-lit (cdr p)) ")")))
-      mappings)
-    (put-string out "))\n")))
+  (put-string out "\n;; === frozen class-provider metadata ===\n")
+  (put-string out "(class-provider-register-many! (list")
+  (for-each
+    (lambda (p)
+      (put-string
+        out
+        (string-append "\n  (cons " (ei-str-lit (car p)) " "
+                       (ei-str-lit (cdr p)) ")")))
+    mappings)
+  (put-string out "))\n")
+  (put-string out "(class-provider-freeze!)\n"))
 
 ;; Bake the *data-readers* table into the binary so a runtime (read-string
 ;; "#my/tag …") resolves its reader fn like it does under joltc run. Tag and
@@ -789,6 +789,10 @@
                             (not (bld-suffix? out-path ".exe")))
                        (string-append out-path ".exe")
                        out-path)))
+  ;; The build-time application load and the emitted standalone program share
+  ;; the same closed-world boundary. Any new key after dependency reconciliation
+  ;; is a structured error; identical declarations remain harmless.
+  (class-provider-freeze!)
   ;; The self-contained path (jolt-embedded-bytes "stub/launcher") needs no csv
   ;; kernel files, no Chez, no cc — only the legacy cc path does. A --library build
   ;; ALWAYS takes the cc path (build-shared), and a cross build (--target) always
