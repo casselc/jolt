@@ -220,15 +220,20 @@ native implementation is sequenced as:
 5. native runtime CI promotion.
 
 Each capability remains unadvertised until the corresponding real calls pass.
-Windows W1 is accepted locally at jolt-net revision `11142a3`: the native
-x86-64 suite passed 149/149 with no skips, the Linux dependency-free suite
-passed 146 checks with only its not-applicable Winsock skip, and the complete
-Hegel-required Linux suite passed 222/222 with no skips. Its forced-contention
-test performs exactly one `WSAStartup`, failure paths terminalize one shared
-outcome, and bounded watchdogs surround the process. Scalar dispatch owns only
-error-independent close; every sentinel-returning operation whose error is
-consumed uses the captured-pair surface. W2 may now implement Windows
-nonblocking transitions and byte I/O without reopening W1.
+Windows W1 and W2 are accepted locally: native x86-64 exercises Winsock
+initialization, blocking sockets, `ioctlsocket(FIONBIO)`, nonblocking byte I/O,
+connect initiation, and `SO_ERROR` completion under direct PowerShell/Chez
+watchdogs. Scalar dispatch owns only error-independent close; every
+sentinel-returning operation whose error is consumed uses the captured-pair
+surface.
+
+The nonblocking evidence is deliberately asymmetric. POSIX reads
+`O_NONBLOCK` back on the exact handle before marking it. Winsock exposes no
+portable getter, so Windows marks after successful `ioctlsocket` under probed
+ABI facts and the documented FIONBIO contract; later would-block behavior is
+cross-boundary conformance evidence, not a per-handle admission guard. Separate
+bounded model trios preserve that trusted boundary. `WSAPoll` and the
+owner-independent Windows wake/close lifecycle remain the next two slices.
 
 ### jolt-tcp and jolt-http
 
@@ -521,6 +526,17 @@ or OS buffer boundary was crossed; it does not imply remote observation,
 filesystem visibility, or durable storage unless a separate capability says
 so. Operation deadline, observer timeout, cancellation request, terminal
 cancellation, EOF, reset, and close are distinct outcomes.
+
+The same rule applies inside one TCP stream. A successful send orders those
+bytes before a later local half-close, but neither event synchronizes the
+peer's readiness or makes an immediate peer read succeed. Portable transfer
+code must compose arbitrary positive partial progress, wait only after
+would-block, and reuse one caller-owned absolute monotonic deadline across
+retries. Tests must establish receiver readiness—or retry under that
+deadline—before asserting payload or EOF visibility; otherwise a locally
+ordered send/shutdown sequence becomes a platform-timing assumption. This
+invariant belongs above the native socket call and below protocol framing, so
+jolt-tcp and any compatibility channel adapter share it.
 
 ### jolt-net should graduate to stdlib; TCP and HTTP should not move with it
 
