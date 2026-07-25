@@ -17,6 +17,7 @@
 ;; emit-image.ss supplies the cross-compiler (ei-* helpers); it's loaded here so a
 ;; normal run never pays for it.
 
+(load "host/chez/build-output.ss")
 (load "host/chez/emit-image.ss")
 (load "host/chez/dce.ss")
 
@@ -31,9 +32,7 @@
                    ;; rejoin with newlines (get-line stripped them). Callers use
                    ;; single-line output; this just avoids silently concatenating
                    ;; two lines into one corrupt token if a command emits more.
-                   (let ((ls (reverse acc)))
-                     (if (null? ls) ""
-                         (fold-left (lambda (s x) (string-append s "\n" x)) (car ls) (cdr ls)))))
+                   (bld-captured-lines->string (reverse acc)))
             (loop (cons l acc)))))))
 
 (define (bld-system cmd)
