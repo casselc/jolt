@@ -31,6 +31,7 @@
 (define hc-kw-ns    (keyword #f "ns"))
 (define hc-kw-name  (keyword #f "name"))
 (define hc-kw-var   (keyword #f "var"))
+(define hc-kw-alias-var (keyword #f "alias-var"))
 (define hc-kw-unresolved (keyword #f "unresolved"))
 (define hc-kw-class (keyword #f "class"))
 (define hc-kw-num-ret (keyword #f "num-ret"))
@@ -278,8 +279,13 @@
 
 ;; Classify a global (non-local) symbol reference against the var registry:
 ;;   {:kind :var :ns NS :name NAME}   — a defined var (compile ns / clojure.core)
+;;   {:kind :alias-var :ns NS :name NAME}
+;;                                    — an unresolved name under a known namespace
+;;                                      alias; the analyzer may late-bind it only
+;;                                      inside an executable scope
 ;;   {:kind :unresolved :name NAME}   — not found (late-bind -> var-ref @ compile ns;
-;;                                      a qualified one -> host-static in the analyzer)
+;;                                      an exact qualified class may become
+;;                                      host-static in the analyzer)
 ;; No :host branch: there is no separate native-op env — the hot
 ;; clojure.core primitives (+,-,map,...) are declared in clojure.core below so
 ;; they classify as :var and the emitter's native-op path lowers them.
@@ -328,6 +334,11 @@
 
 (define (hc-resolve-global ctx sym)
   (let* ((nm (symbol-t-name sym))
+         (sns (symbol-t-ns sym))
+         (qualified (and sns (not (jolt-nil? sns)) (not (null? sns)) sns))
+         (alias-target
+           (and qualified
+                (chez-resolve-alias (chez-actx-cns ctx) qualified)))
          (cell (hc-resolve-cell ctx sym)))
     (if (and cell (var-cell-defined? cell))
         (let ((base (jolt-hash-map hc-kw-kind hc-kw-var
@@ -360,6 +371,14 @@
           ((and (fx>? (string-length nm) 0) (char-upper-case? (string-ref nm 0))
                 (chez-deftype-simple->tag nm))
            => (lambda (dtag) (jolt-hash-map hc-kw-kind hc-kw-class hc-kw-name dtag)))
+          ;; A namespace alias is categorical: `a/name` denotes a var in the
+          ;; aliased namespace, never a class named `a`. Preserve that target
+          ;; even when the var is not defined yet so the analyzer can apply the
+          ;; same scoped late-binding rule as an unqualified forward reference.
+          ;; Top-level references remain compile errors.
+          (alias-target
+           (jolt-hash-map hc-kw-kind hc-kw-alias-var
+                          hc-kw-ns alias-target hc-kw-name nm))
           (else (jolt-hash-map hc-kw-kind hc-kw-unresolved hc-kw-name nm))))))
 
 ;; Every unqualified var name resolvable from the compile ns — the current ns's
