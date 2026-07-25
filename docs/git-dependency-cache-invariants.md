@@ -78,6 +78,25 @@ This claim is exercised by
 `test-forced-coordinate-key-collision-is-nondestructive!`, not inferred from
 the cryptographic hash alone.
 
+## Native Windows and MSYS local paths
+
+The durable `.jolt-origin` ownership marker remains an exact literal
+coordinate. No path normalization can grant deletion authority or merge cache
+keys.
+
+One narrower compatibility seam applies only while validating the checkout's
+single `remote.origin.url`: on a native Windows host, one drive-rooted path and
+one single-slash MSYS-rooted path may compare equal when the active shell's
+`cygpath -am` independently maps both strings to the same absolute
+drive-rooted path. Remote and `file:` URLs, relative and UNC paths, two
+same-style local paths, distinct translations, failed translation, and
+multiple configured origins remain literal mismatches.
+
+`test-windows-msys-local-origin-equivalence!` records the accepted pair and
+each fail-closed counterexample without requiring a Windows host. The native
+Windows dependency runner remains the integration witness for Git's actual
+path spelling.
+
 ## Solver records
 
 | Model | Expected and verified result | Meaning |
