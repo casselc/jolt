@@ -18,20 +18,31 @@ export JOLT_PWD="${JOLT_PWD:-$PWD}"
 # Identify the Chez executable. Official/source installs commonly expose
 # `scheme`, while some distributions and CI shims use `chez` or `chezscheme`.
 CHEZ=
-for candidate in chez chezscheme scheme petite
-do
-    if command -v "$candidate" >/dev/null 2>&1
+if [ -n "${JOLT_CHEZ:-}" ]
+then
+    CHEZ="$(command -v "$JOLT_CHEZ" 2>/dev/null || true)"
+    if [ -z "$CHEZ" ]
     then
-        CHEZ="$(command -v "$candidate")"
-        break
+        echo "JOLT_CHEZ does not name an executable: $JOLT_CHEZ"
+        exit 1
     fi
-done
+else
+    for candidate in chez chezscheme scheme petite
+    do
+        if command -v "$candidate" >/dev/null 2>&1
+        then
+            CHEZ="$(command -v "$candidate")"
+            break
+        fi
+    done
+fi
 
 if [ -z "$CHEZ" ]
 then
     echo "No valid Chez Scheme executable found: please install Chez Scheme."
     exit 1
 fi
+export JOLT_CHEZ="$CHEZ"
 
 # Version for --version / banners: git describe of this checkout, else "dev".
 export JOLT_VERSION="${JOLT_VERSION:-$(git -C "$root" describe --tags --always --dirty 2>/dev/null || echo dev)}"
