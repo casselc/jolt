@@ -4,7 +4,8 @@
 
   The Makefile supplies isolated JOLT_GITLIBS and GITLIBS directories plus the
   fixture root as argv[0]."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [jolt.deps]))
 
 ;; Private implementation seams are intentional here: these tests pin the
@@ -12,7 +13,7 @@
 (def ensure-git         (var jolt.deps/ensure-git))
 (def sanitize           (var jolt.deps/sanitize))
 (def shell-quote        (var jolt.deps/shell-quote))
-(def url-cache-key      (var jolt.deps/git-url-cache-key))
+(def coordinate-cache-key (var jolt.deps/git-coordinate-cache-key))
 (def cache-entry-dir    (var jolt.deps/git-cache-entry-dir))
 (def origin-marker      (var jolt.deps/git-cache-origin-marker))
 (def origin-claim       (var jolt.deps/git-cache-origin-claim))
@@ -78,6 +79,9 @@
 (defn- cache-target [url sha]
   (cache-entry-dir url sha))
 
+(defn- write-claim! [dir url sha]
+  (spit (origin-marker dir) (pr-str {:url url :sha sha})))
+
 (defn- head [repo]
   (sh-out (str "git -C " (shell-quote repo) " rev-parse HEAD")))
 
@@ -112,6 +116,32 @@
     (check (jolt.host/file-exists? sentinel)
            "private-stage cleanup remains bounded to that stage")))
 
+(defn- test-windows-git-dir-path-budget! [root]
+  ;; Git's explicit-GIT_DIR guard rejects strlen >= PATH_MAX-40. Git for
+  ;; Windows uses PATH_MAX=260 here, so 219 is the largest accepted path. The
+  ;; recursive fixture's nested module metadata suffix is 65 characters.
+  ;;
+  ;; Keep the production layout within a useful, explicit budget rather than
+  ;; shortening only this test's TEMP directory. A cache root of up to 80
+  ;; characters plus the exact 54-character v3 stage leaf and a recursive
+  ;; suffix of up to 85 characters reaches the inclusive safe boundary 219.
+  (let [cache-root (jolt.host/getenv "JOLT_GITLIBS")
+        sha (apply str (repeat 40 "a"))
+        target (cache-target (str root "/path-budget-origin") sha)
+        stage (cache-stage-dir target)
+        recursive-suffix
+        "/.git/modules/modules/outer sub/modules/nested modules/deep child"
+        stage-overhead (- (count stage) (count cache-root))
+        git-dir-limit 220]
+    (check= 54 stage-overhead
+            "v3 coordinate key plus private stage has fixed 54-char overhead")
+    (check= 219 (+ 80 stage-overhead 85)
+            "declared cache-root and recursive-suffix bounds reach 219 exactly")
+    (check (<= (count cache-root) 80)
+           "dependency-test cache root is inside the declared Windows budget")
+    (check (< (count (str stage recursive-suffix)) git-dir-limit)
+           "recursive fixture GIT_DIR remains below Git for Windows guard")))
+
 (defn- test-windows-backslash-mkdirs! [root]
   ;; Native Windows environment variables conventionally contain backslashes.
   ;; File.mkdirs must create every parent in those paths; the Git cache and
@@ -142,8 +172,9 @@
            "failed clone removes private lock/staging residue")
     (check (not (jolt.host/file-exists? stage))
            "failed clone removes the sibling checkout stage")
-    (check= url (slurp (origin-marker target))
-            "failed clone preserves only its durable literal-origin claim")
+    (check= {:url url :sha sha}
+            (edn/read-string (slurp (origin-marker target)))
+            "failed clone preserves only its durable literal-coordinate claim")
 
     ;; Make the exact same url@sha available and retry. This is the concrete
     ;; poisoned-cache reproducer: the retry must clone instead of trusting the
@@ -201,8 +232,8 @@
         target (cache-target url sha)
         sentinel (str target "/.git/jolt-test-reuse-sentinel")
         injected (str target "/src/injected.clj")]
-    ;; This is the exact shape the old implementation left when clone failed
-    ;; after creating an owned v2 target but before publication completed.
+    ;; This is the exact shape an older implementation could leave when clone
+    ;; failed after creating an owned target but before publication completed.
     (mkdir! target)
     (spit (str target "/poison") "not a repository")
     (let [data (thrown-data #(ensure-git 'fixture/repair url sha))]
@@ -210,7 +241,7 @@
               "unclaimed non-Git cache entry fails closed"))
     (check (jolt.host/file-exists? (str target "/poison"))
            "unclaimed non-Git cache entry is never deleted")
-    (spit (origin-marker target) url)
+    (write-claim! target url sha)
     (check= target (ensure-git 'fixture/repair url sha)
             "empty/incomplete target is replaced")
     (check (checkout-valid? target sha url)
@@ -333,7 +364,7 @@
     ;; thread scheduling to overlap two fast local clones.
     (mkdir! parent)
     (sh! (str "mkdir " (shell-quote lock)))
-    (spit (origin-marker target) url)
+    (write-claim! target url sha)
     (let [waiter (future (ensure-git 'fixture/waiter url sha))]
       (check= ::waiting (deref waiter 150 ::waiting)
               "loser waits while another writer owns the target")
@@ -383,13 +414,15 @@
     (let [data
           (with-redefs-fn
             {origin-claim
-             (fn [dir expected-url]
+             (fn [dir expected-url expected-sha]
                (if (= 3 (swap! claim-reads inc))
                  {:claimed? true :matches? false
                   :marker (origin-marker dir)
                   :expected-url expected-url
-                  :actual-url "fixture://foreign-owner"}
-                 (real-claim dir expected-url)))}
+                  :actual-url "fixture://foreign-owner"
+                  :expected-sha expected-sha
+                  :actual-sha expected-sha}
+                 (real-claim dir expected-url expected-sha)))}
             (fn []
               (thrown-data
                 #(ensure-git 'fixture/post-lock-origin url sha))))]
@@ -567,7 +600,7 @@
     (check (checkout-valid? target sha parent-url)
            "submodule index repair restores immutable checkout")))
 
-(defn- test-url-cache-key-separates-sanitize-collision! [root]
+(defn- test-coordinate-cache-key-separates-sanitize-collision! [root]
   (let [source (str root "/collision-source")
         sha (init-repo! source :collision)
         url-a (str root "/collision/a/b")
@@ -591,10 +624,11 @@
     (spit legacy-sentinel "do not touch")
     (check= (sanitize url-a) (sanitize url-b)
             "fixture URLs collide under legacy sanitize")
-    (check (not= (url-cache-key url-a) (url-cache-key url-b))
-           "Git object-ID URL keys separate adversarial spellings")
-    (check (<= (count (url-cache-key url-a)) 68)
-           "URL cache key remains one practical bounded path component")
+    (check (not= (coordinate-cache-key url-a sha)
+                 (coordinate-cache-key url-b sha))
+           "Git object-ID coordinate keys separate adversarial spellings")
+    (check= 44 (count (coordinate-cache-key url-a sha))
+            "coordinate cache key has one fixed bounded path component")
     (check= target-a (ensure-git 'fixture/collision-a url-a sha)
             "first colliding legacy URL gets its own checkout")
     (spit sentinel "preserve")
@@ -680,12 +714,13 @@
       (finally
         (sh! (str "rm -rf " (shell-quote absolute)))))))
 
-(defn- test-forced-url-key-collision-is-nondestructive! [root]
+(defn- test-forced-coordinate-key-collision-is-nondestructive! [root]
   (with-redefs-fn
-    {url-cache-key (fn [_] "url-forced-collision")}
+    {coordinate-cache-key (fn [_ _] "dep-forced-collision")}
     (fn []
       (let [source (str root "/forced-collision-source")
             sha (init-repo! source :forced-collision)
+            next-sha (commit! source "next.txt" "next\n" "second revision")
             url-a (str root "/forced-collision-a")
             url-b (str root "/forced-collision-b")
             _ (sh! (str "git clone --quiet " (shell-quote source) " "
@@ -701,6 +736,10 @@
                      #(ensure-git 'fixture/collision-b url-b sha))]
           (check= :jolt.deps/git-cache-origin-mismatch (:type data)
                   "second forced hash collision fails as origin mismatch"))
+        (let [data (thrown-data
+                     #(ensure-git 'fixture/collision-revision url-a next-sha))]
+          (check= :jolt.deps/git-cache-origin-mismatch (:type data)
+                  "same URL at a colliding revision fails by durable coordinate"))
         (check (checkout-valid? target sha url-a)
                "forced collision preserves first checkout")
         (check (jolt.host/file-exists? sentinel)
@@ -817,7 +856,7 @@
         lock (cache-lock-dir target)]
     (mkdir! parent)
     (mkdir! lock)
-    (spit (origin-marker target) url)
+    (write-claim! target url sha)
     (spit (str lock "/owner.edn")
           (pr-str {:started-ms (System/currentTimeMillis)
                    :fixture :healthy-slow-owner}))
@@ -942,6 +981,7 @@
                    (jolt.host/getenv "GITLIBS"))
       (throw (ex-info "deps-test requires fixture root, JOLT_GITLIBS, and GITLIBS" {})))
     (test-private-cache-paths-stay-shallow! root)
+    (test-windows-git-dir-path-budget! root)
     (test-windows-backslash-mkdirs! root)
     (test-failed-clone-is-recoverable! root)
     (test-stage-cleanup-failure-retains-lock! root)
@@ -956,11 +996,11 @@
     (test-stale-lock-diagnostic-preserves-owner! root)
     (test-tools-gitlibs-reuse-is-read-only! root)
     (test-submodule-dirt-invalidates-checkout! root)
-    (test-url-cache-key-separates-sanitize-collision! root)
+    (test-coordinate-cache-key-separates-sanitize-collision! root)
     (test-literal-origin-survives-insteadof! root)
     (test-clone-default-remote-name-cannot-break-origin! root)
     (test-relative-local-origin-retains-literal-identity! root)
-    (test-forced-url-key-collision-is-nondestructive! root)
+    (test-forced-coordinate-key-collision-is-nondestructive! root)
     (test-index-flags-and-sparse-checkout-are-repaired! root)
     (test-publish-never-nests-and-revalidates! root)
     (test-annotated-tag-object-is-not-a-commit-sha! root)
