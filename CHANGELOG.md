@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiler whose version differs from the running Chez. This prevents a host
   with multiple Chez installations from compiling a FASL with one version and
   embedding boot/kernel files from another.
+- **Recursive Git dependencies retain a usable Windows path budget.** The
+  private cache now folds the complete literal URL and requested revision into
+  one fixed 40-hex coordinate key. Its staged leaf consumes 54 characters
+  instead of 95, avoiding Git for Windows' independent path-length rejection
+  (`GIT_DIR` length at least `PATH_MAX - 40`) in the recursive-submodule
+  fixture. A durable EDN coordinate claim still makes forced URL or revision
+  key collisions fail closed before repair.
 
 ### Notes
 
