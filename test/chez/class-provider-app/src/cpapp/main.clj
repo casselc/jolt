@@ -95,6 +95,7 @@
     {"fixture.MissingAfterLoad" 'cpfixture.missing-provider
      "fixture.ConcurrentFailure" 'cpfixture.failing-provider
      "fixture.StagedAtomicTrigger" 'cpfixture.atomic-provider
+     "fixture.TransactionalRetry" 'cpfixture.transactional-provider
      "fixture.CycleA" 'cpfixture.cycle-a
      "fixture.CycleB" 'cpfixture.cycle-b})
 
@@ -207,6 +208,26 @@
            (= 1 (state/load-count :failing)))
     (check :failed-concurrent-no-partial-registration
            (some? leaked)))
+
+  ;; A registration can fail after namespace evaluation has returned, while the
+  ;; staged operations are committing. No prefix may survive, and clearing the
+  ;; namespace loader's success mark must let an independent lookup evaluate the
+  ;; corrected second attempt.
+  (let [first-error (thrown (fn [] fixture.TransactionalRetry/VALUE))
+        leaked (thrown (fn [] fixture.TransactionalLeak/VALUE))
+        failed-state
+        (jolt.host/class-provider-state "fixture.TransactionalRetry")
+        recovered fixture.TransactionalRetry/VALUE
+        loaded-state
+        (jolt.host/class-provider-state "fixture.TransactionalRetry")]
+    (check :commit-failure-thrown (some? first-error))
+    (check :commit-failure-no-prefix (some? leaked))
+    (check :commit-failure-state (= :failed (:state failed-state)))
+    (check :commit-failure-has-attempt (pos? (:attempt failed-state)))
+    (check :commit-failure-retry-value (= :recovered recovered))
+    (check :commit-failure-retried-exactly-once
+           (= 2 (state/load-count :transactional)))
+    (check :commit-failure-retry-loaded (= :loaded (:state loaded-state))))
 
   (let [cycle (thrown (fn [] fixture.CycleA/VALUE))
         data (:jolt/error (ex-data cycle))]
