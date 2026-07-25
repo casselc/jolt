@@ -187,9 +187,12 @@ Atomic error capture selects Chez's `__get_last_error` or `__errno` convention
 from the compiler's `$target-machine`, not the build host's `(machine-type)`.
 Deterministic `ta6nt` and `ta6le` expansion controls cover both cross-target
 selection directions, Linux exercises the captured-pair ordering, and a native
-Windows probe observes the expected Winsock `10061`. A full xpatch Windows
-cross-build remains a distinct validation lane. The contract, bounded ordering
-argument, and cross-target evidence are recorded in
+Windows jolt-net gate observes exact Winsock `10061` and first-attempt `10048`
+in one process. The latter was an ordinary `bind`, establishing that every
+failure sentinel whose error is consumed needs the pair, not only collect-safe
+calls. A full xpatch Windows cross-build remains a distinct validation lane.
+The contract, bounded ordering argument, and cross-target evidence are recorded
+in
 [`ffi-native-error-capture.md`](../../ffi-native-error-capture.md).
 
 Consumers must preserve that distinction in their own call surface. Ordinary
@@ -217,15 +220,15 @@ native implementation is sequenced as:
 5. native runtime CI promotion.
 
 Each capability remains unadvertised until the corresponding real calls pass.
-The first blocking-Winsock implementation is under review rather than accepted:
-its native suite exposed that a collect-safe foreign call followed by a
-separate `WSAGetLastError` can observe zero instead of the matching `10061`.
-The core atomic return/error FFI prerequisite is now implemented. W1 must
-consume it through separate scalar and captured dispatch surfaces for blocking
-`accept`, `connect`, `poll`, and `getaddrinfo`'s `EAI_SYSTEM` path. It must also
-add a failure-terminal initialization path, forced-contention tests, bounded
-watchdogs, and strengthened proof controls before the nonblocking W2 slice
-starts.
+Windows W1 is accepted locally at jolt-net revision `11142a3`: the native
+x86-64 suite passed 149/149 with no skips, the Linux dependency-free suite
+passed 146 checks with only its not-applicable Winsock skip, and the complete
+Hegel-required Linux suite passed 222/222 with no skips. Its forced-contention
+test performs exactly one `WSAStartup`, failure paths terminalize one shared
+outcome, and bounded watchdogs surround the process. Scalar dispatch owns only
+error-independent close; every sentinel-returning operation whose error is
+consumed uses the captured-pair surface. W2 may now implement Windows
+nonblocking transitions and byte I/O without reopening W1.
 
 ### jolt-tcp and jolt-http
 
@@ -658,6 +661,17 @@ This removes one setup step but couples a property-testing library and native
 artifact release cadence to the language runtime. The reviewed FFI already
 supports the required calls. Rejected.
 
+### Generate executable Hegel properties directly from Ansatz
+
+A checked theorem does not determine the runtime representation of naturals,
+allocation bounds, exception and invalid-input policy, effect handling, or a
+shrink strategy. Ansatz's current elaboration and Clojure generation are
+additional trusted boundaries, and foreign declarations are assumptions about
+their implementations. The safe near-term bridge is a reviewed provenance
+manifest, a deterministic bounded oracle, and hand-written Hegel properties
+whose generators and assertions explicitly map theorem hypotheses and
+conclusions onto Jolt values. Direct generation is rejected for this proposal.
+
 ### Extract the cross-runtime platform API first
 
 The larger portability idea is compelling, but freezing it from Jolt alone
@@ -842,6 +856,37 @@ examples, but neither should define the base API.
 
 ## Conformance and proof obligations
 
+### Proof-derived runtime properties
+
+Proof-derived testing uses four distinct evidence lanes:
+
+1. a bounded solver model with a deliberately buggy witness and a non-vacuity
+   control;
+2. an unbounded pure theorem where the proof tool and representation permit it;
+3. a deterministic bounded EDN oracle checked exhaustively; and
+4. hand-written jolt-hegel properties against the actual runtime.
+
+Theorem hypotheses guide constructive dependent generators; theorem conclusions
+identify runtime assertions. Positive-domain cases are generated valid by
+construction rather than filtered with assumptions, so shrinking must preserve
+the hypotheses. The proposed first byte-window slice pins an Ansatz environment,
+enumerates all 969 valid parents and 20,349 valid slices at capacities `0..16`,
+then uses Hegel to explore larger descriptors, signed contents, nesting,
+invalid inputs, and backing aliasing.
+
+A versioned manifest records theorem and environment hashes, named
+obligations, oracle digest and count, hypothesis-to-generator mappings,
+conclusion-to-assertion mappings, the runtime property var, runtime-only
+obligations, and known omissions. It provides provenance, not executable
+certification. Automation may validate that schema, its pins, fixture digests,
+and named tests; it must not yet synthesize Hegel generators or assertions.
+
+Neither generated examples nor a proved pure model certify representation
+mapping, mutation, resource ownership, concurrency, native effects, exception
+behavior, fairness, or durability. jolt-hegel remains an external test
+dependency. The detailed byte-window mapping and first property skeleton live
+in [`bytes-io-completion-invariants.md`](../../bytes-io-completion-invariants.md).
+
 ### Provider and host interop
 
 - Unknown class/member fails before arbitrary namespace loading.
@@ -875,8 +920,8 @@ examples, but neither should define the base API.
 - A native return value and its matching error are captured atomically before
   allocation, cleanup, callback, or another foreign call can overwrite it.
 - Scalar and captured foreign-call dispatch have invariant, distinct result
-  shapes; a failure-sensitive blocking call never falls back to a later error
-  accessor.
+  shapes; every sentinel-returning call whose error is consumed uses the pair
+  and never falls back to a later error accessor.
 - Every owned native handle closes once.
 - Old descriptor generations and registration revisions cannot produce current
   events.
@@ -908,6 +953,8 @@ The byte-window containment, exact interface-dispatch, exact reify-dispatch,
 and completion-lease models are recorded with the RFD's supplementary
 invariant note. Models complement real native and concurrency tests; they do
 not substitute for them or prove behavior through a retained raw-array alias.
+Proof-derived property manifests add traceability and reproducible runtime
+oracles; they do not close those trust boundaries.
 
 ## Performance considerations
 
