@@ -15,6 +15,21 @@ counterexample records, but the stronger and simpler whole-image contract is the
 recommended implementation. The older source/provider and live-revalidation
 models remain evidence about rejected designs.
 
+## Production disposition
+
+The per-namespace runtime cache has been removed from the production loader.
+`JOLT_AOT_CACHE` and `JOLT_CACHE_DIR` are accepted only as inert legacy process
+environment; neither changes namespace loading nor creates artifacts.
+[`namespace-load-effects-smoke.sh`](../test/chez/namespace-load-effects-smoke.sh)
+sets both adversarially and checks with two fresh processes that `deftest`
+registration runs both times and no cache files are created.
+
+The checked models below therefore have two durable jobs: record why selective
+namespace reuse was rejected, and bound any future whole-image implementation.
+They do not justify another incremental namespace-cache prototype on the
+production branch. The `research/aot-v5-prototype` branch remains the explicit
+home for that investigation.
+
 Every `UNSAT` result below means only that no counterexample exists within its
 stated finite model. Runtime tests remain the semantic oracle. In particular,
 the whole-image proof assumes that project-graph resolution and compiler-input
@@ -40,7 +55,7 @@ failures and do not affect the discovery witness.
 
 This observation does not require a new invariant: it is a live instance of the
 existing incomplete-effect/replay counterexamples. It strengthens the decision
-to keep namespace-level runtime reuse disabled rather than adding
+to remove namespace-level runtime reuse rather than adding
 `clojure.test`-specific replay logic. A closed-world image must contain one
 coherent post-initialization state or execute its initialization exactly once;
 it may not restore only the namespace definitions.

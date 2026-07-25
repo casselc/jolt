@@ -6,8 +6,6 @@
 ;; the case raises. These cover host-specific behavior (dot-forms, java statics, io,
 ;; reader, walk, …) that isn't in the JVM-portable corpus. Global state is reset
 ;; between cases for per-case isolation.
-;;
-;;   JOLT_AOT_CACHE=0 chez --script host/chez/run-unit.ss
 (import (chezscheme))
 
 (load "host/chez/run-gate-harness.ss")

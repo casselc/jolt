@@ -324,9 +324,9 @@
 (define (load-jolt-file path)
   (load-jolt-file* path (ldr-read-source path)))
 
-;; load-jolt-file* — the read/compile/eval loop over a PRE-READ source string.
-;; Split out so the AOT cache (below) reads source once for both keying and the
-;; capture load, instead of re-reading inside the loop.
+;; load-jolt-file* — the read/compile/eval loop over a pre-read source string.
+;; Keeping source acquisition separate also lets closed-world builds use the
+;; same parser/compiler path after resolving their complete input graph.
 (define (load-jolt-file* path src)
   (let* ((end (string-length src))
          ;; Restore the current-source position on NORMAL return only. Loading a
@@ -776,7 +776,7 @@
                          (set-chez-ns! saved)          ; restore ns, then roll the mark back
                          (unless was-loaded? (ldr-unmark-loaded! name))
                          (raise e)))
-                (aot-load-or-compile name file force?))
+               (load-jolt-file file))
               (set-chez-ns! saved)             ; restore the current ns (thread-local)
               (ns-loaded-hook name file)))
           ;; No source file but the namespace exists in memory (AOT'd into a built
