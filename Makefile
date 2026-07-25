@@ -5,6 +5,8 @@
 # source change.
 
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
+JOLT_CHEZ := $(CHEZ)
+export JOLT_CHEZ
 DEPSTEST_JOLTC ?= bin/jolt
 
 .PHONY: test ci testbin values targetfacts monotonic hostclass corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot devbootsmoke aotcachesmoke aotcacheperf namespaceeffectsmoke submodules httpsfetch mvnhttp depssmoke depsunit depstest
@@ -62,7 +64,7 @@ unit:
 # always rebuilt so it can't go stale against edited sources). JOLT_BIN=bin/jolt
 # forces script mode.
 testbin:
-	@$(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt
+	@"$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt
 
 smoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/smoke.sh
@@ -130,9 +132,9 @@ depstest:
 # JOLT_CROSS_TARGET (optional) cross-compiles jolt for another Chez machine — it is
 # passed as build-jolt.ss's 3rd arg and needs $JOLT_TARGET_PACK (empty = native).
 jolt-release:
-	@$(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
+	@"$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
 jolt-debug:
-	@$(CHEZ) --script host/chez/build-jolt.ss debug target/debug/jolt
+	@"$(CHEZ)" --script host/chez/build-jolt.ss debug target/debug/jolt
 # Re-mint the seed first so the embedded compiler image is current, then both builds.
 jolt: selfhost jolt-release jolt-debug
 	@echo "OK: target/release/jolt and target/debug/jolt built"
@@ -331,7 +333,7 @@ remint:
 # Precompile the runtime to target/dev/flat.so so dev bin/jolt boots ~10x faster
 # (loads the .so instead of compiling ~50 .ss files from source every invocation).
 devboot: submodules
-	@$(CHEZ) --script host/chez/make-devboot.ss
+	@"$(CHEZ)" --script host/chez/make-devboot.ss
 
 # Smoke test: the dev boot cache is used when fresh and invalidated correctly.
 devbootsmoke: devboot
