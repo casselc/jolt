@@ -1,0 +1,95 @@
+# Atomic native-error capture
+
+## Problem
+
+Native error slots are per-thread, mutable state. POSIX functions conventionally
+write `errno`; Windows functions, including Winsock, write the thread's last-error
+slot. Any later native call can replace that value.
+
+Calling `jolt.ffi/errno` immediately after an ordinary foreign call is sufficient
+only when nothing runs between the native return and the accessor. It is not a
+sound boundary for a `:blocking` foreign call: Chez must reactivate a
+collect-safe Scheme thread before Jolt code can invoke the accessor, and that
+return path can disturb the Windows last-error slot.
+
+## Public contract
+
+`jolt.ffi/foreign-fn` and `jolt.ffi/defcfn` accept the literal option
+`:capture-native-error`:
+
+```clojure
+(ffi/defcfn connect-with-error
+  "connect" [:uptr :pointer :int] :int
+  {:blocking true :capture-native-error true})
+
+(let [[result error-code] (connect-with-error socket address address-len)]
+  (if (neg? result)
+    (throw (ex-info "connect failed" {:code error-code}))
+    result))
+```
+
+The option has these exact semantics:
+
+- Its value must be the literal Boolean `true` or `false`.
+- `false`, omission, and the legacy `:blocking` option preserve the existing
+  scalar return value.
+- `true` returns a two-element Jolt vector `[native-result error-code]`.
+- The error code is meaningful only when the native API's result indicates
+  failure. Callers must ignore it on success; native APIs need not clear their
+  error slot after a successful call.
+- On POSIX, the second element is the `errno` captured by Chez's `__errno`
+  foreign-procedure convention.
+- On Windows, the second element is the value captured by Chez's
+  `__get_last_error` convention. This is the value observed as a Winsock
+  `WSAGetLastError` code by the native Windows socket probe.
+- Capture occurs in Chez's foreign-call return path, before control returns to
+  Scheme. Constructing the result vector therefore cannot race with or clobber
+  the captured value.
+- The option composes with `:blocking true` and `:varargs-after`.
+- A `:void` binding is rejected. Exposing Chez's unspecified void result as the
+  first vector element would not be a stable Jolt contract.
+
+This option changes only the opted-in binding. It does not alter the C ABI or the
+behavior of other bindings for the same symbol.
+
+## Ordering invariant
+
+Assume the native function returns result `r` after setting its documented
+thread-local error slot to `e`. An opted-in binding returns `[r e]` even if later
+runtime or cleanup work changes the slot.
+
+The argument is bounded to the call boundary:
+
+1. Chez's `__errno`/`__get_last_error` convention reads the slot before the
+   foreign call returns to Scheme.
+2. Both values are passed to the generated two-argument continuation.
+3. The continuation constructs the persistent Jolt vector.
+4. Later native calls can mutate the thread-local slot, but not either value
+   already stored in that vector.
+
+The Linux regression control first obtains `[-1 2]` from a failing `open`, then
+executes `close(-1)`, which changes current `errno` to `9`; the saved vector
+remains `[-1 2]`. The collect-safe control obtains `[-1 9]` directly from an
+opted-in `:blocking` call. This proves ordering under Chez's documented capture
+semantics; it cannot prove that a particular C API sets its documented error
+channel correctly.
+
+## Choosing between the two APIs
+
+Use `{:capture-native-error true}` whenever a caller interprets a native failure
+sentinel and needs its associated error code. This is mandatory for
+failure-sensitive `:blocking` calls and avoids a fragile call/capture ordering
+dependency for non-blocking calls as well.
+
+`jolt.ffi/errno` remains available for code that must inspect the current slot
+independently of a particular call. Its caller is responsible for ensuring that
+no native or runtime work has intervened.
+
+Functions such as `WSAStartup` and `getaddrinfo` return their error code directly;
+they should keep their ordinary scalar binding instead of enabling this option.
+
+## Chez requirement
+
+The implementation relies on the `__errno` and `__get_last_error`
+foreign-procedure conventions added in Chez Scheme 10.4.0. The supported Jolt
+toolchain uses Chez 10.4.1.

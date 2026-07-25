@@ -313,8 +313,11 @@
                   ;; (emit-def-cached, :forward-decl, :the-ns).
                   "define" "def-var!" "def-var-with-meta!"
                   "declare-var!" "intern-ns!"
-                  ;; ffi lowering (emit-ffi-fn: a Chez foreign-procedure).
-                  "foreign-procedure"}]
+                  ;; ffi lowering (emit-ffi-fn): an ordinary Chez
+                  ;; foreign-procedure, or the target-native error-capturing
+                  ;; variant whose two values are collected into a Jolt vector.
+                  "foreign-procedure" "jolt-ffi-native-error-procedure"
+                  "call-with-values"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is
@@ -643,13 +646,33 @@
                     :else param)))
               (range n)
               params)
-        fp (str "(foreign-procedure "
-                (when (:blocking node) "__collect_safe ")
-                (when-let [n (:varargs-after node)]
-                  (str "(__varargs_after " n ") "))
-                (chez-str-lit (:csym node))
-                " (" (str/join " " emitted-argtypes) ") "
-                (ffi-type->chez (:rettype node)) ")")]
+        conventions
+        (vec
+         (remove nil?
+                 [(when (:blocking node) "__collect_safe")
+                  (when-let [n (:varargs-after node)]
+                    (str "(__varargs_after " n ")"))]))
+        signature
+        (str (chez-str-lit (:csym node))
+             " (" (str/join " " emitted-argtypes) ") "
+             (ffi-type->chez (:rettype node)))
+        fp
+        (if (:capture-native-error node)
+          (str "(jolt-ffi-native-error-procedure ("
+               (str/join " " conventions) ") " signature ")")
+          (str "(foreign-procedure "
+               (when (seq conventions)
+                 (str (str/join " " conventions) " "))
+               signature ")"))
+        foreign-call
+        (str "((or p (begin (set! p " fp ") p)) "
+             (str/join " " emitted-call-args) ")")
+        result
+        (if (:capture-native-error node)
+          (str "(call-with-values (lambda () " foreign-call ") "
+               "(lambda (result native-error) "
+               "(jolt-vector result native-error)))")
+          foreign-call)]
     ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
     ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
     ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
@@ -664,8 +687,7 @@
                       (emit-ffi-ftype (:type entry)) ")"))
                aggregate-types))
          " (let ((p #f)) (lambda (" (str/join " " params) ") "
-         "((or p (begin (set! p " fp ") p)) "
-         (str/join " " emitted-call-args) "))))")))
+         result ")))")))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the

@@ -43,7 +43,9 @@
   foreign-procedure. Its optional final argument is either the legacy
   :blocking keyword or an options map:
 
-      {:blocking true :varargs-after 2}
+      {:blocking true
+       :varargs-after 2
+       :capture-native-error true}
 
   :varargs-after is the positive number of fixed C arguments before `...`.
   Declaring that boundary is required even when every argument has a known
@@ -51,6 +53,16 @@
   The boundary may not exceed the declared argument count. Types after the
   boundary must name the C ABI types after default argument promotion (for
   example, use :double for a promoted C float); Jolt does not infer promotions.
+
+  :capture-native-error asks Chez to capture the calling thread's native error
+  slot in the foreign-call return path, before collect-safe thread reactivation
+  or any later native work can overwrite it. On POSIX this is errno; on Windows
+  it is GetLastError (the slot reported by WSAGetLastError for Winsock calls).
+  An opted-in binding returns `[native-result error-code]`; a binding without
+  the option keeps returning its original scalar result. The error code is
+  meaningful only when the API's native result indicates failure and must be
+  ignored on success. This option composes with :blocking and :varargs-after and
+  requires a non-:void return type.
 
   foreign-callable is the inverse — it wraps a jolt fn as a C-callable function
   pointer so C can call back into jolt (e.g. GTK signal handlers);
@@ -61,8 +73,9 @@
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; An optional trailing :blocking marks a call that may block (accept/recv/...),
 ;; so it's emitted collect-safe and won't pin the garbage collector. An options
-;; map can instead carry :blocking and/or :varargs-after. Aggregate arguments
-;; use the inline descriptor documented above.
+;; map can instead carry :blocking, :varargs-after, and/or
+;; :capture-native-error. Aggregate arguments use the inline descriptor
+;; documented above.
 (defmacro foreign-fn [csym argtypes rettype & [opt]]
   (if (nil? opt)
     (list 'jolt.ffi/__cfn csym argtypes rettype)

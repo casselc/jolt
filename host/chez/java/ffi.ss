@@ -279,11 +279,15 @@
 ;; __errno_location/__error itself, jolt.mvn-http mostly throws without a code,
 ;; and jolt.nrepl omits it entirely.
 ;;
-;; CONTRACT: one native call and no other, so it cannot clobber the value it
-;; reports. Callers must read it IMMEDIATELY after the failing call and before
-;; any cleanup -- close/free/closesocket are themselves native calls and will
-;; overwrite errno, which is exactly how a failed bind ends up reporting the
-;; error from its own rollback close.
+;; CONTRACT: one native call and no other, so the accessor itself cannot clobber
+;; the value it reports. Callers must read it IMMEDIATELY after the failing call
+;; and before any cleanup -- close/free/closesocket are themselves native calls
+;; and will overwrite errno, which is exactly how a failed bind ends up
+;; reporting the error from its own rollback close. For failure-sensitive
+;; foreign calls, and especially :blocking/collect-safe calls whose runtime
+;; return path can itself disturb the slot, prefer
+;; {:capture-native-error true}; Chez then captures the slot before control
+;; returns to Scheme at all.
 ;;
 ;; POSIX keeps errno in thread-local storage behind an accessor returning int*,
 ;; under a libc-specific symbol. The address is per-thread, so it is re-fetched
