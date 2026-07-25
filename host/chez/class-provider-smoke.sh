@@ -17,6 +17,8 @@ source_out="$(
 printf '%s\n' "$source_out"
 printf '%s\n' "$source_out" |
   grep -Fq 'class-provider positive before= [0 0 0 0 0] after= [1 1 1 1 1]'
+printf '%s\n' "$source_out" |
+  grep -Fq 'class-provider registry mode= :source-mutable'
 printf '%s\n' "$source_out" | grep -Fq 'class-provider errors checked'
 printf '%s\n' "$source_out" | grep -Fq 'class-provider PASS'
 
@@ -71,6 +73,18 @@ echo "class-provider smoke: standalone AOT"
 cp -R test/chez/class-provider-app "$tmp/class-provider-app"
 cp -R test/chez/class-provider-lib "$tmp/class-provider-lib"
 cp -R test/chez/class-provider-nested "$tmp/class-provider-nested"
+
+echo "class-provider smoke: closed build rejects undeclared mappings"
+undeclared_out="$tmp/undeclared-build.out"
+if JOLT_CHEZ_CSV="$csv" JOLT_PWD="$tmp/class-provider-app" \
+     bin/joltc build -m cpapp.undeclared \
+       -o "$tmp/class-provider-undeclared" >"$undeclared_out" 2>&1; then
+  echo "class-provider smoke: undeclared mapping unexpectedly built"
+  exit 1
+fi
+cat "$undeclared_out"
+grep -Fq 'class-provider-registry-frozen' "$undeclared_out"
+
 out="$tmp/class-provider-bin"
 JOLT_CHEZ_CSV="$csv" JOLT_PWD="$tmp/class-provider-app" \
   bin/joltc build -m cpapp.main -o "$out" >/dev/null
@@ -85,10 +99,12 @@ for provider in \
   cpfixture.buffer-provider \
   cpfixture.standard-charsets-provider \
   cpfixture.acme-buffer-provider \
+  cpfixture.frozen-provider \
   nestedfixture.deep-provider
 do
   grep -Fq "$provider" "$out.build/flat.ss"
 done
+grep -Fq '(class-provider-freeze!)' "$out.build/flat.ss"
 
 rm -rf "$tmp/class-provider-app" "$tmp/class-provider-lib" \
        "$tmp/class-provider-nested"
@@ -96,6 +112,8 @@ built_out="$(cd / && "$out")"
 printf '%s\n' "$built_out"
 printf '%s\n' "$built_out" |
   grep -Fq 'class-provider positive before= [1 1 1 1 1] after= [1 1 1 1 1]'
+printf '%s\n' "$built_out" |
+  grep -Fq 'class-provider registry mode= :class-provider-registry-frozen'
 printf '%s\n' "$built_out" | grep -Fq 'class-provider PASS'
 
 echo "class-provider smoke: passed"

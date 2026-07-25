@@ -2,7 +2,7 @@
   (:require [cpfixture.state :as state]
             [cpapp.java-buffer :as java-buffer]
             [cpapp.acme-buffer :as acme-buffer])
-  (:import [fixture LazyStatics LazyCtor]
+  (:import [fixture LazyStatics LazyCtor FrozenProbe]
            [java.nio.charset StandardCharsets]
            [nested Deep]))
 
@@ -47,6 +47,11 @@
                                 (java-buffer/provider-value)))
     (check :acme-byte-buffer (= [:acme :payload]
                                 (acme-buffer/provider-value)))
+    (check :java-byte-buffer-protocol
+           (= [:java-protocol 3] (java-buffer/protocol-value)))
+    (check :acme-byte-buffer-protocol
+           (= [:acme-protocol :protocol-payload]
+              (acme-buffer/protocol-value)))
     (check :canonical-import-forms
            (= ["java.nio.ByteBuffer."
                "java.nio.ByteBuffer/allocate"
@@ -63,6 +68,11 @@
                           "java.nio.charset.StandardCharsets"))))
     (check :standard-charsets (= "US-ASCII" StandardCharsets/US_ASCII))
     (check :transitive-provider (= :transitive-provider Deep/VALUE))
+    (let [registry-mode FrozenProbe/REGISTRY_MODE]
+      (check :provider-registry-mode
+             (or (= :source-mutable registry-mode)
+                 (= :class-provider-registry-frozen registry-mode)))
+      (println "class-provider registry mode=" registry-mode))
     (check :positive-load-counts (= [1 1 1 1 1] (provider-counts)))
     (println "class-provider positive before=" before
              "after=" (provider-counts))))
