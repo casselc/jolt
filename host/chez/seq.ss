@@ -900,17 +900,27 @@
                    (jolt-seq (seq-more s))))))))
 (define jolt-reduce
   (case-lambda
-    ((f coll) (let ((s (jolt-seq coll)))
-                (if (jolt-nil? s) (jolt-invoke f)          ; (reduce f []) -> (f)
-                    (reduce-seq f (seq-first s) (jolt-seq (seq-more s))))))
+    ((f coll)
+     ;; IReduce: the two-argument reduce contract is independent of
+     ;; IReduceInit even though both interfaces name their method `reduce`.
+     (cond
+       ((iface-method coll "clojure.lang.IReduce" "reduce" 2)
+        => (lambda (m) (jolt-invoke m coll f)))
+       ((iface-declared? coll "clojure.lang.IReduce")
+        (iface-abstract-method-error coll "reduce"))
+       (else
+        (let ((s (jolt-seq coll)))
+          (if (jolt-nil? s) (jolt-invoke f)          ; (reduce f []) -> (f)
+              (reduce-seq f (seq-first s) (jolt-seq (seq-more s))))))))
     ((f init coll)
      ;; IReduceInit: a deftype/record OR reify with its own `reduce` method drives
      ;; the reduction, e.g. (reduce f init (reify clojure.lang.IReduceInit
      ;; (reduce [_ f i] ...))) or the same on a deftype.
      (cond
-       ((iface-method coll "reduce" 3)
-        => (lambda (m) (let ((r (jolt-invoke m coll f init)))
-                         (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       ((iface-method coll "clojure.lang.IReduceInit" "reduce" 3)
+        => (lambda (m) (jolt-invoke m coll f init)))
+       ((iface-declared? coll "clojure.lang.IReduceInit")
+        (iface-abstract-method-error coll "reduce"))
        (else (reduce-seq f init (jolt-seq coll)))))))
 
 ;; Fold through a transient so a pvec/pmap/pset target is built in O(n): a

@@ -462,15 +462,20 @@
 (defn associative? [x] (or (map? x) (vector? x)))
 (defn counted? [x]
   ;; a String is not Counted on the JVM (count works via CharSequence, not O(1))
-  (or (vector? x) (map? x) (set? x) (list? x)))
-(defn indexed? [x] (vector? x))
+  (or (vector? x) (map? x) (set? x) (list? x)
+      (instance? clojure.lang.Counted x)))
+(defn indexed? [x]
+  (or (vector? x) (instance? clojure.lang.Indexed x)))
 ;; sorted? is defined by the next tier (25-sorted) — declared here so this
 ;; tier compiles (forward references are analysis errors).
 (declare sorted?)
 
 (defn reversible? [x] (or (vector? x) (sorted? x)))
 (defn seqable? [x]
-  (if (or (nil? x) (coll? x) (string? x) (jolt.host/array-value? x)) true false))
+  (if (or (nil? x) (coll? x) (string? x) (jolt.host/array-value? x)
+          (instance? clojure.lang.Seqable x))
+    true
+    false))
 
 (defn boolean? [x] (or (true? x) (false? x)))
 (defn double? [x] (and (number? x) (not (integer? x))))
@@ -555,4 +560,3 @@
 (defn print-str [& xs] (__with-out-str (fn* [] (apply print xs))))
 (defn println-str [& xs] (__with-out-str (fn* [] (apply println xs))))
 (defn prn-str [& xs] (__with-out-str (fn* [] (apply prn xs))))
-

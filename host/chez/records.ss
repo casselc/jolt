@@ -526,16 +526,20 @@
 ;; fields-as-map behavior (fireworks renders such types by catching this).
 ;; Records are exempt: defrecord generates the full map implementation.
 (define jrec-coll-iface-names
-  '("IPersistentCollection" "IPersistentMap" "IPersistentVector" "IPersistentSet"
-    "IPersistentStack" "IPersistentList" "ISeq" "Seqable" "Indexed" "Counted"
-    "Associative" "ILookup" "Reversible" "Sorted"))
+  '("clojure.lang.IPersistentCollection" "clojure.lang.IPersistentMap"
+    "clojure.lang.IPersistentVector" "clojure.lang.IPersistentSet"
+    "clojure.lang.IPersistentStack" "clojure.lang.IPersistentList"
+    "clojure.lang.ISeq" "clojure.lang.Seqable" "clojure.lang.Indexed"
+    "clojure.lang.Counted" "clojure.lang.Associative"
+    "clojure.lang.ILookup" "clojure.lang.Reversible"
+    "clojure.lang.Sorted"))
 (define (jrec-declares-coll-iface? x)
   (and (jrec? x) (not (jrec-record? x))
        (let ((ti (hashtable-ref type-registry (jrec-tag x) #f)))
          (and ti
               (let loop ((ps (vector->list (hashtable-keys ti))))
                 (cond ((null? ps) #f)
-                      ((member (jch-last-segment (car ps)) jrec-coll-iface-names) #t)
+                      ((member (car ps) jrec-coll-iface-names) #t)
                       (else (loop (cdr ps)))))))))
 ;; Does this deftype DECLARE clojure.lang.Sequential? On the JVM that marker is
 ;; what makes a value participate in sequential value equality — the collection
@@ -548,28 +552,43 @@
          (and ti
               (let loop ((ps (vector->list (hashtable-keys ti))))
                 (cond ((null? ps) #f)
-                      ((string=? (jch-last-segment (car ps)) "Sequential") #t)
+                      ((string=? (car ps) "clojure.lang.Sequential") #t)
                       (else (loop (cdr ps)))))))))
 ;; Both sides must be seq-comparable for the element-wise path; anything else
 ;; (a number, a map, a bare deftype) is simply not equal to a sequential.
 (define (seq-eq-candidate? x)
   (or (jolt-sequential? x) (jolt-lazyseq? x) (jrec-sequential-decl? x)))
 
-(define (jrec-abstract-method-error x method)
+(define (iface-abstract-method-error x method)
   (jolt-throw (jolt-host-throwable "java.lang.AbstractMethodError"
-    (string-append "Method " (jrec-tag x) "/" method "() is abstract"))))
+    (string-append "Method " (jolt-class-name x) "/" method "() is abstract"))))
+(define jrec-abstract-method-error iface-abstract-method-error)
 
-;; iface-method: the single deftype/reify interface-method lookup. Returns the
-;; impl fn for METHOD declared by V (a deftype/record OR a reify), or #f. NARGS
-;; (including `this`) selects the matching arity for a deftype; #f means any
-;; arity. Core fns route interface dispatch through this instead of each
-;; re-deriving jrec-vs-reify lookup and arity handling.
-(define (iface-method v method nargs)
-  (cond ((jrec? v)
-         (if nargs (find-method-any-protocol-arity (jrec-tag v) method nargs)
-             (find-method-any-protocol (jrec-tag v) method)))
-        ((jreify? v) (let ((rm (reified-methods v))) (and rm (hashtable-ref rm method #f))))
-        (else #f)))
+;; iface-method: exact deftype/reify interface-method lookup. Returns the impl fn
+;; registered under IFACE/METHOD by V (a deftype/record OR a reify), or #f.
+;; NARGS includes `this`; #f accepts any arity. Requiring the interface identity
+;; prevents an unrelated user protocol with a same-named method from
+;; impersonating IDeref, IReduce, IPending, etc.
+(define (iface-declared? v iface)
+  (let ((iface (canonical-protocol-name iface)))
+    (cond ((jrec? v) (type-satisfies? (jrec-tag v) iface))
+          ((jreify? v)
+           (and (memp (lambda (p) (string=? p iface)) (jreify-protos v)) #t))
+          (else #f))))
+(define (iface-method v iface method nargs)
+  (let* ((iface (canonical-protocol-name iface))
+         (m
+         (cond ((jrec? v)
+                (find-protocol-method (jrec-tag v) iface method))
+               ((jreify? v)
+                (and (iface-declared? v iface)
+                     (let ((rm (reified-methods v)))
+                       (and rm (hashtable-ref rm method #f)))))
+               (else #f))))
+    ;; Interface dispatch is stricter than Java-style method lookup: IDeref and
+    ;; IBlockingDeref (or IReduce and IReduceInit) share a method name but not an
+    ;; arity, and unrelated protocols may reuse either name and arity.
+    (and m (or (not nargs) (proc-accepts? m nargs)) m)))
 (register-count-arm! (lambda (coll) (or (jrec? coll) (jolt-transient? coll)))
   (lambda (coll)
     (cond ((jrec-cl coll "count") => (lambda (m) (jolt-invoke m coll)))
@@ -741,6 +760,26 @@
 ;; (keyed by an interned proto-method identity) so protocol-resolve's record
 ;; branch resolves by descriptor identity instead of re-walking this string tree.
 (define type-registry (make-hashtable string-hash string=?))
+
+;; Canonical protocol/interface identity. Macro-expanded Jolt protocols arrive
+;; with a dotted namespace-qualified id. A simple imported JVM interface is
+;; resolved through the one class graph; an otherwise simple legacy/forward
+;; protocol is qualified to the current namespace. No registry key intentionally
+;; discards a namespace.
+(define (protocol-name-dotted? s)
+  (let loop ((i 0))
+    (cond ((fx=? i (string-length s)) #f)
+          ((char=? (string-ref s i) #\.) #t)
+          (else (loop (fx+ i 1))))))
+(define (canonical-protocol-name proto-name)
+  (let ((p (if (symbol-t? proto-name) (symbol-t-name proto-name) proto-name)))
+    (if (protocol-name-dotted? p)
+        p
+        (let ((fqn (jch-fqn-of-simple p)))
+          (if (string=? fqn p)
+              (string-append (chez-current-ns) "." p)
+              fqn)))))
+
 ;; Global protocol epoch: bumped on EVERY register-protocol-method. A per-site
 ;; inline cache (the PIC the back end emits) tags itself with the epoch at
 ;; populate time; a later extension (a new bump) invalidates it so a cached
@@ -762,25 +801,25 @@
   (let ((pt (jrdesc-ptable desc)))
     (and pt (hashtable-ref pt (intern-pm-key proto method) #f))))
 (define (register-protocol-method type-tag proto method fn)
-  (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
-  (let* ((ti (or (hashtable-ref type-registry type-tag #f)
-                 (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry type-tag h) h)))
-         (pi (or (hashtable-ref ti proto #f)
-                 (let ((h (make-hashtable string-hash string=?))) (hashtable-set! ti proto h) h))))
-    (hashtable-set! pi method fn))
-  ;; mirror onto the type's descriptor ptable (record types only — a host tag
-  ;; like "String"/"Object" has no desc). A re-def invalidated the old desc's
-  ;; ptable (set it to #f), and this call populates the new desc's ptable.
-  (let ((desc (hashtable-ref chez-tag-desc type-tag #f)))
-    (when desc
-      (let ((pt (or (jrdesc-ptable desc)
-                    (let ((h (make-eq-hashtable))) (jrdesc-ptable-set! desc h) h))))
-        (hashtable-set! pt (intern-pm-key proto method) fn))))
-  ;; a (re)registration of this impl invalidates any contagion clone built for it —
-  ;; the clone captured the prior body. Keyed exactly (type/proto/method) so a
-  ;; sibling type's clone survives; devirt-resolve-fl then falls back to devirt-resolve.
-  (remove-clone! type-tag proto method)
-  (if #f #f))
+  (let ((proto (canonical-protocol-name proto)))
+    (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+    (let* ((ti (or (hashtable-ref type-registry type-tag #f)
+                   (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry type-tag h) h)))
+           (pi (or (hashtable-ref ti proto #f)
+                   (let ((h (make-hashtable string-hash string=?))) (hashtable-set! ti proto h) h))))
+      (hashtable-set! pi method fn))
+    ;; mirror onto the type's descriptor ptable (record types only — a host tag
+    ;; like "String"/"Object" has no desc). A re-def invalidated the old desc's
+    ;; ptable (set it to #f), and this call populates the new desc's ptable.
+    (let ((desc (hashtable-ref chez-tag-desc type-tag #f)))
+      (when desc
+        (let ((pt (or (jrdesc-ptable desc)
+                      (let ((h (make-eq-hashtable))) (jrdesc-ptable-set! desc h) h))))
+          (hashtable-set! pt (intern-pm-key proto method) fn))))
+    ;; a (re)registration of this impl invalidates any contagion clone built for
+    ;; it. The canonical protocol id keeps same-short-name protocols distinct.
+    (remove-clone! type-tag proto method)
+    (if #f #f)))
 (define (find-protocol-method type-tag proto method)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti (let ((pi (hashtable-ref ti proto #f))) (and pi (hashtable-ref pi method #f))))))
@@ -1084,7 +1123,8 @@
 ;; extenders excludes them.
 (define extend-mark "__jolt_extend__")
 (define (mark-extend! tag proto-name)
-  (let ((ti (hashtable-ref type-registry tag #f)))
+  (let ((ti (hashtable-ref type-registry tag #f))
+        (proto-name (canonical-protocol-name proto-name)))
     (when ti (let ((pi (hashtable-ref ti proto-name #f)))
                (when pi (hashtable-set! pi extend-mark #t))))))
 (define (register-method type-name proto-name method-name fn)
@@ -1110,32 +1150,17 @@
 ;; methods (a MARKER protocol, e.g. core.match's IPseudoPattern) — so
 ;; instance?/satisfies? on the protocol hold.
 (define (register-inline-protocol! type-name proto-name)
-  (let* ((tag (string-append (chez-current-ns) "." type-name))
+  (let* ((proto-name (canonical-protocol-name proto-name))
+         (tag (string-append (chez-current-ns) "." type-name))
          (ti (or (hashtable-ref type-registry tag #f)
                  (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry tag h) h))))
     (unless (hashtable-ref ti proto-name #f)
-      (hashtable-set! ti proto-name (make-hashtable string-hash string=?))))
-  ;; the protocol's interface joins the type's class ancestry, spelled like the
-  ;; JVM interface. A dotted name (clojure.lang.IPersistentMap, a java interface)
-  ;; is already canonical; a simple protocol name qualifies against the defining
-  ;; ns (assumed current — the macro passes only the simple name).
-  (let ((iface (if (let dotted ((i 0))
-                     (cond ((fx=? i (string-length proto-name)) #f)
-                           ((char=? (string-ref proto-name i) #\.) #t)
-                           (else (dotted (fx+ i 1)))))
-                   proto-name
-                   ;; a SIMPLE name: an imported JVM interface (IPersistentMap, from
-                   ;; (:import (clojure.lang IPersistentMap))) resolves to its
-                   ;; canonical FQN so the type inherits that interface's own
-                   ;; ancestry (IPersistentMap → Associative → IPersistentCollection);
-                   ;; an unknown simple name is a local protocol, qualified against
-                   ;; the defining ns.
-                   (let ((fqn (jch-fqn-of-simple proto-name)))
-                     (if (string=? fqn proto-name)
-                         (string-append (jch-munge-segments (chez-current-ns)) "." proto-name)
-                         fqn)))))
-    (jch-mark-interface! iface)
-    (jch-register-supers! (string-append (chez-current-ns) "." type-name) (list iface)))
+      (hashtable-set! ti proto-name (make-hashtable string-hash string=?)))
+    ;; The exact canonical interface joins the type ancestry. Core JVM
+    ;; interfaces retain their inherited graph; local protocols are unique
+    ;; marker interfaces even when their short name matches a core interface.
+    (jch-mark-interface! proto-name)
+    (jch-register-supers! tag (list proto-name)))
   jolt-nil)
 
 ;; protocol-resolve: the impl procedure for obj — by record type tag, a reify's
@@ -1154,7 +1179,13 @@
             (or f (find-protocol-method (jrdesc-tag desc) proto-name method-name)))))
     ((reified-methods obj)
      => (lambda (rm)
-          (or (hashtable-ref rm method-name #f)
+          ;; A reify's compact method table is keyed by method name because one
+          ;; generated class method implements every declared interface with
+          ;; that signature. Gate that lookup by the requested canonical
+          ;; protocol: otherwise a P1.m implementation can answer an unrelated
+          ;; P2.m call merely because both protocols use the same method name.
+          (or (and (iface-declared? obj proto-name)
+                   (hashtable-ref rm method-name #f))
               ;; not implemented on the reify — fall back to the protocol's
               ;; extended impls over the reify's host tags (e.g. an Object/default
               ;; extension). malli reifies some protocols and leans on the default.
@@ -1537,7 +1568,7 @@
     (for-each (lambda (p) (hashtable-set! ht (if (keyword? p) (keyword-t-name p) p)
                                           (jolt-get methods-map p jolt-nil)))
               (seq->list (jolt-keys methods-map)))
-    (make-jreify ht (map (lambda (p) (if (symbol-t? p) (symbol-t-name p) p)) protos))))
+    (make-jreify ht (map canonical-protocol-name protos))))
 
 ;; satisfies?: does obj's type implement the protocol? proto must be a defprotocol
 ;; value (a map with a :name); a host Class/interface or any non-protocol throws —
@@ -1554,8 +1585,7 @@
     (cond
       ((jrec? obj) (type-satisfies? (jrec-tag obj) pn-str))
       ((jreify? obj)
-       (let ((short (last-dot pn-str)))
-         (and (memp (lambda (p) (string=? (last-dot p) short)) (jreify-protos obj)) #t)))
+       (and (memp (lambda (p) (string=? p pn-str)) (jreify-protos obj)) #t))
       (else (let loop ((tags (value-host-tags obj)))
               (cond ((null? tags) #f)
                     ((type-satisfies? (car tags) pn-str) #t)
@@ -1586,7 +1616,7 @@
 ;; the optional :jolt/class key, defaulting to clojure.lang.ExceptionInfo.
 (register-str-render! jrec?
   (lambda (v)
-    (let ((f (find-protocol-method (jrec-tag v) "Object" "toString")))
+    (let ((f (find-protocol-method (jrec-tag v) "java.lang.Object" "toString")))
       (if f (jolt-invoke f v)
           (let ((s (jrec-pr v))) (substring s 1 (string-length s)))))))
 

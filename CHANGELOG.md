@@ -53,6 +53,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Custom core interfaces now drive their Clojure operations.** A
+  `deftype`/`reify` implementing `Seqable`, `Counted`, or `Indexed` now answers
+  the matching predicate; two-argument `reduce` invokes `IReduce`; timed
+  `deref` selects `IBlockingDeref` instead of silently calling `IDeref`; and
+  `realized?` invokes `IPending.isRealized`. Interface methods are selected by
+  canonical namespace-qualified interface identity and arity, so unrelated or
+  same-short-name protocols cannot impersonate core interfaces. Declared but
+  unimplemented interface methods throw `AbstractMethodError`. Future and
+  promise now report `IBlockingDeref`; timed deref rejects IDeref-only values;
+  and custom reduce results retain the JVM's exact return value. Generic `reify`
+  dispatch likewise checks the requested canonical protocol before selecting
+  its instance-local method, so equal method names in unrelated protocols
+  remain isolated.
 - **Fresh compile passes retain the selected Chez executable.** Source and make
   launchers export `JOLT_CHEZ`; `build.ss` resolves and quotes that exact
   executable, derives its installation from the same path, and rejects a child
