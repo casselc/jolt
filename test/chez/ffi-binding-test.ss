@@ -118,6 +118,29 @@
                             {:capture-native-error true})")
       #f))
 
+;; xpatch changes Chez's compiler target but not (machine-type), which continues
+;; to name the build host. Exercise both target choices directly so a
+;; Linux-host -> Windows-target build cannot silently select __errno and a
+;; Windows-host -> Linux-target build cannot leak the Windows-only convention
+;; into the POSIX expander.
+(define (native-error-convention-for-target target)
+  (parameterize ((#%$target-machine target))
+    ;; Build the test form at run time. Chez may pre-expand a literal passed to
+    ;; eval while compiling this test procedure, before the parameterization is
+    ;; active; expand on a fresh datum observes the intended compiler boundary.
+    (cadr
+      (syntax->datum
+        (expand
+          (list 'jolt-ffi-native-error-convention-case
+                (list 'quote '__get_last_error)
+                (list 'quote '__errno)))))))
+(ok "simulated Linux->Windows target selects __get_last_error"
+    (eq? '__get_last_error
+         (native-error-convention-for-target 'ta6nt)))
+(ok "simulated Windows->Linux target selects __errno"
+    (eq? '__errno
+         (native-error-convention-for-target 'ta6le)))
+
 ;; memory: alloc / write / read roundtrip through the host primitives
 (ok "mem int roundtrip"
     (= 4242 (jnum->exact

@@ -74,6 +74,29 @@ opted-in `:blocking` call. This proves ordering under Chez's documented capture
 semantics; it cannot prove that a particular C API sets its documented error
 channel correctly.
 
+## Cross-target selection invariant
+
+The capture convention must describe the generated program's target, not the
+machine running the compiler:
+
+- a Windows target must expand the opted-in binding with
+  `__get_last_error`; and
+- a POSIX target must expand it with `__errno`.
+
+This distinction matters when Jolt cross-compiles through Chez's `xpatch`.
+Chez's `(machine-type)` continues to describe the build host, while the
+compiler parameter `$target-machine` is rebound to the requested target around
+source expansion and compilation. The selector therefore reads
+`#%$target-machine` at macro-expansion time.
+
+The deterministic controls parameterize the compiler target to `ta6nt` and
+`ta6le` in the same test process. They assert selection of
+`__get_last_error` and `__errno`, respectively. Because neither control derives
+its expected value from `(machine-type)`, together they cover the two failure
+shapes: Linux-host to Windows-target accidentally retaining `__errno`, and
+Windows-host to Linux-target accidentally emitting the Windows-only
+convention.
+
 ## Choosing between the two APIs
 
 Use `{:capture-native-error true}` whenever a caller interprets a native failure
