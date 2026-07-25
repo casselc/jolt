@@ -101,7 +101,8 @@
   (jolt-hash-map "user/->P"
                  (jolt-hash-map (keyword #f "fields") (jolt-vector (keyword #f "x"))
                                 (keyword #f "tags")   (jolt-vector jolt-nil)
-                                (keyword #f "type")   "user.P")))
+                                (keyword #f "type")   "user.P"
+                                (keyword #f "record?") #t)))
 (gate-check "ctor result struct w/ shapes" (diags "(+ (->P 1) 1)" #f) 1)
 (set-record-shapes! U (jolt-hash-map))
 
@@ -154,7 +155,8 @@
   (jolt-hash-map "user/->P"
                  (jolt-hash-map (keyword #f "fields") (jolt-vector (keyword #f "x"))
                                 (keyword #f "tags")   (jolt-vector jolt-nil)
-                                (keyword #f "type")   "user.P")))
+                                (keyword #f "type")   "user.P"
+                                (keyword #f "record?") #t)))
 (gate-check "record local still num-op diag (unshadowed)"
        (diags "(let [p (->P 1.0 2.0)] (+ p 1))" #f) 1)
 (gate-check "loop var shadows record local (no diag)"

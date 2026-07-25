@@ -1035,6 +1035,7 @@
       (and (= nop "jolt-get") (<= 2 (count arg-nodes) 3))
       (let [recv (first arg-nodes) key-node (second arg-nodes)
             idx (when (and (= 2 (count arg-nodes))
+                           (true? (:record? recv))
                            (= :struct (:hint recv))
                            (= :const (:op key-node))
                            (keyword? (:val key-node)))
@@ -1056,7 +1057,8 @@
       ;; taken).
       (= kind :keyword)
       (let [recv (first arg-nodes)
-            idx (when (and (= :struct (:hint recv)) (= 1 (count arg-nodes)))
+            idx (when (and (true? (:record? recv))
+                           (= :struct (:hint recv)) (= 1 (count arg-nodes)))
                   (struct-field-index (:shape recv) (:val fnode)))
             dir (when (and idx (not (:nilable recv)))
                   (direct-field-accessor (:shape recv) idx))]
@@ -1323,11 +1325,25 @@
     ;; (.method target arg*) -> jolt-host-call for an rt-shimmed method, else
     ;; record-method-dispatch (a reify/record protocol method).
     :host-call (let [m (:method node)
-                     target (emit (:target node))
-                     args (map emit (:args node))]
-                 (if (supported-host-methods m)
+                     tnode (:target node)
+                     target (emit tnode)
+                     args (map emit (:args node))
+                     field-name (when (and (empty? (:args node))
+                                           (str/starts-with? m "-"))
+                                  (subs m 1))
+                     field-key (when field-name (keyword field-name))
+                     idx (when (and field-key (= :struct (:hint tnode)))
+                           (struct-field-index (:shape tnode) field-key))
+                     dir (when (and idx (not (:nilable tnode)))
+                           (direct-field-accessor (:shape tnode) idx))]
+                 (cond
+                   dir (str "(" dir " " target ")")
+                   idx (str "(jrec-field-at " target " " idx " "
+                            (emit {:op :const :val field-key}) ")")
+                   (supported-host-methods m)
                    (str "(jolt-host-call " (chez-str-lit m) " " target
                         (if (empty? args) "" (str " " (str/join " " args))) ")")
+                   :else
                    (str "(record-method-dispatch " target " " (chez-str-lit m)
                         " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
     :let (emit-let node)
