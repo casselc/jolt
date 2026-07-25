@@ -122,50 +122,71 @@
                        (and (>= n 97) (<= n 102)))))
                (seq sha))))
 
-(defn- git-url-cache-key
-  "A fixed-size, path-safe key for a Git URL.
+(defn- git-coordinate-cache-key
+  "A fixed-size, path-safe key for one literal Git URL and revision.
 
   `sanitize` is deliberately not used: it maps distinct URLs such as `a/b` and
   `a_b` to one directory, allowing repair of one origin to delete the other's
   checkout at a shared SHA. Git is already required for Git deps, and
-  `hash-object --stdin` gives its stable collision-resistant blob object ID
-  without writing an object or repository. The validated 40/64 hex result keeps
-  one filesystem component short on both current SHA-1 and SHA-256 Git builds.
-  Legacy sanitize-keyed URL leaves are deliberately ignored: because they are
-  ambiguous, automatically migrating or deleting one could corrupt another
-  origin's cache."
-  [url]
-  (let [result (shell-result
-                 (str "printf '%s' " (shell-quote url)
+  `hash-object --stdin` gives a stable collision-resistant blob object ID
+  without writing an object or repository. The payload length-prefixes the URL
+  before the hexadecimal revision, so no URL spelling can create an ambiguous
+  coordinate. Truncating a SHA-256 object ID to the first 40 hex digits keeps
+  the cache path exactly bounded while retaining 160 collision-resistant bits;
+  the independent durable coordinate claim below turns a forced collision into
+  a fail-closed error rather than authority to replace another checkout.
+
+  The compact v3 leaf is also a correctness boundary on Git for Windows.
+  Recursive submodule commands export GIT_DIR, and Git rejects that value at
+  PATH_MAX-40 even when core.longpaths=true. The previous url-key/sha nesting
+  spent 95 characters before recursive submodule metadata; v3 spends 54
+  including the private `.s` stage suffix.
+
+  Legacy sanitize- and v2-keyed leaves are deliberately ignored: automatically
+  migrating or deleting an ambiguous older leaf could corrupt another origin."
+  [url sha]
+  (let [payload (str (count url) ":" url ":" sha)
+        result (shell-result
+                 (str "printf '%s' " (shell-quote payload)
                       " | " git-command-prefix " hash-object --stdin"))
         digest (str/trim (:out result))]
-    (if (and (result-ok? result) (git-sha? digest))
-      (str "url-" (str/lower-case digest))
-      (throw (ex-info (str "could not derive git cache key for " url)
-                      {:url url :digest digest :exit (:exit result)})))))
+    (if (and (result-ok? result) (git-sha? digest)
+             (>= (count digest) 40))
+      (str "dep-" (subs (str/lower-case digest) 0 40))
+      (throw (ex-info (str "could not derive git cache key for " url
+                           " @ " sha)
+                      {:url url :sha sha
+                       :digest digest :exit (:exit result)})))))
 
 (defn- git-cache-entry-dir
-  "Versioned layout keeps collision-resistant URL keys disjoint from every
-  ambiguous sanitize-keyed cache leaf written by older Jolt versions. Literal
-  origin validation supplies the independent fail-closed collision check."
+  "Versioned layout keeps compact coordinate keys disjoint from every ambiguous
+  sanitize- or v2-keyed cache leaf written by older Jolt versions. The durable
+  literal URL+SHA claim supplies the independent fail-closed collision check."
   [url sha]
-  (str (gitlibs-dir) "/git-v2/" (git-url-cache-key url) "/" sha))
+  (str (gitlibs-dir) "/git-v3/" (git-coordinate-cache-key url sha)))
 
 (defn- git-cache-origin-marker [dir]
   (str dir ".jolt-origin"))
 
 (defn- git-cache-origin-claim
-  "Read the ownership claim adjacent to one url@sha leaf. It remains available
-  even if the checkout's .git metadata is later damaged, so a forced URL-key
-  collision can never turn corruption into permission to delete another
-  origin's cache entry."
-  [dir url]
+  "Read the ownership claim adjacent to one url@sha leaf.
+
+  The v3 marker records both literal URL and normalized revision because both
+  values are folded into the compact path key. It remains available even if the
+  checkout's .git metadata is later damaged, so a forced coordinate-key
+  collision can never turn corruption into permission to delete another cache
+  entry."
+  [dir url sha]
   (let [marker (git-cache-origin-marker dir)]
     (if-not (file-exists? marker)
       {:claimed? false :matches? false :marker marker}
-      (let [actual (try (slurp marker) (catch :default _ nil))]
-        {:claimed? true :matches? (= url actual) :marker marker
-         :expected-url url :actual-url actual}))))
+      (let [expected {:url url :sha sha}
+            actual (try (edn/read-string (slurp marker))
+                        (catch :default _ nil))]
+        {:claimed? true :matches? (= expected actual) :marker marker
+         :expected-coordinate expected :actual-coordinate actual
+         :expected-url url :actual-url (:url actual)
+         :expected-sha sha :actual-sha (:sha actual)}))))
 
 (defn- unsafe-index-line?
   "git ls-files -v prefixes skip-worktree with S and assume-unchanged with
@@ -373,8 +394,8 @@
   [inspection url sha dir]
   (throw
     (ex-info
-      (str "git cache entry has a different literal origin; refusing to "
-           "replace it because this may be a URL-key collision: " dir)
+      (str "git cache entry has a different literal coordinate; refusing to "
+           "replace it because this may be a coordinate-key collision: " dir)
       {:type ::git-cache-origin-mismatch
        :url url :sha sha :path dir :inspection inspection})))
 
@@ -382,14 +403,14 @@
   [inspection url sha dir]
   (throw
     (ex-info
-      (str "git cache entry has no durable origin claim and is not an "
+      (str "git cache entry has no durable coordinate claim and is not an "
            "inspectable checkout; refusing to replace it: " dir)
       {:type ::git-cache-unowned-entry
        :url url :sha sha :path dir :inspection inspection})))
 
 (defn- claim-cache-origin!
-  "Record literal ownership while holding this leaf's publication lock. The
-  marker precedes publication and survives checkout corruption or failed
+  "Record literal URL+SHA ownership while holding this leaf's publication lock.
+  The marker precedes publication and survives checkout corruption or failed
   retries. Publish the marker by same-filesystem rename so a killed writer
   cannot leave a truncated claim. A caller must re-read it before relying on
   the claim."
@@ -397,7 +418,7 @@
   (let [marker (git-cache-origin-marker dir)
         stage (str lock "/origin-claim")]
     (when-not (file-exists? marker)
-      (spit stage url)
+      (spit stage (pr-str {:url url :sha sha}))
       (try
         (java.nio.file.Files/move
           (.toPath (java.io.File. stage))
@@ -407,7 +428,7 @@
           ;; Another actor may have published between the existence check and
           ;; rename. The mandatory re-read below decides whether that is benign.
           nil)))
-    (let [claim (git-cache-origin-claim dir url)]
+    (let [claim (git-cache-origin-claim dir url sha)]
       (when-not (and (:claimed? claim) (:matches? claim))
         (cache-origin-mismatch! claim url sha dir)))
     marker))
@@ -524,7 +545,7 @@
         (throw (ex-info (str "could not create git cache directory " parent)
                         {:path parent}))))
     (loop [attempt 0]
-      (let [claim (git-cache-origin-claim dir url)
+      (let [claim (git-cache-origin-claim dir url sha)
             inspection (git-checkout-inspection dir sha url)]
         (cond
           (and (:claimed? claim) (not (:matches? claim)))
@@ -552,7 +573,7 @@
             ;; and before touching an orphan stage. Manual stale-lock recovery
             ;; or a forced key collision must never turn a pre-lock observation
             ;; into permission to delete another origin's transaction state.
-            (let [owned-claim (git-cache-origin-claim dir url)
+            (let [owned-claim (git-cache-origin-claim dir url sha)
                   owned-inspection (git-checkout-inspection dir sha url)]
               (cond
                 (and (:claimed? owned-claim) (not (:matches? owned-claim)))
@@ -630,7 +651,7 @@
              {:lib lib :url url :sha sha})))
   (let [sha (str/lower-case sha)
         dir (git-cache-entry-dir url sha)
-        claim (git-cache-origin-claim dir url)
+        claim (git-cache-origin-claim dir url sha)
         inspection (git-checkout-inspection dir sha url)]
     (cond
       (and (:claimed? claim) (not (:matches? claim)))
