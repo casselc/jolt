@@ -98,6 +98,13 @@ first protocol and reports the second call missing.
 
 ## Completion and lease lifecycle
 
+The selected completion is future-shaped without claiming Jolt `Future`
+cancellation. It implements `IDeref`, timed `IBlockingDeref`, and `IPending`,
+exposes a nonblocking `outcome`, and accepts an explicit two-phase `cancel!`
+request. Untimed and timed deref return a success value or throw the stored
+failure/cancellation exception. An observation timeout changes no operation or
+lease state.
+
 The model separates four facts that must not be collapsed:
 
 1. cancellation was requested;
@@ -108,8 +115,9 @@ The model separates four facts that must not be collapsed:
 The selected lifecycle keeps caller reuse false throughout submitted,
 cancel-requested, and internal release-before-publication states. Native access
 ends before terminal publication. Exactly one of succeeded, failed, or
-cancelled becomes visible, and only that terminal observation makes the window
-reusable by the caller.
+cancelled becomes visible. Terminal publication makes the storage eligible for
+reuse; the caller may actually reuse it only after observing that terminal
+state.
 
 The corrected graph has no reachable state, in paths through four transitions,
 with:
@@ -195,6 +203,9 @@ The generic core dispatch implementation and its runtime controls live in:
 - the `reify`, `protocol-predicates`, `protocol-reduce`, and `protocol-deref`
   suites in `test/chez/unit.edn`.
 
-The implementation commit and final gate counts are recorded when this slice
-is accepted; the model claims remain bounded to the selector and do not replace
-runtime/JVM parity controls.
+The accepted implementation is commit `3ac5be82`. Its final gates passed
+1106/1106 unit assertions, self-host fixpoint, host-class 22/22, PIC 22/22,
+protocol-return 4/4, devirtualization 12/12, inline-body 3/3, contagion 20/20,
+and corpus 3803/3822 with zero new divergence (9 known mismatches and 10
+expected crashes). The model claims remain bounded to the selector and do not
+replace those runtime/JVM parity controls.
