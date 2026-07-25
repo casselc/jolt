@@ -34,6 +34,124 @@
   (hashtable-set! ns-alias-table (cons cns alias) target))
 (define (chez-resolve-alias cns alias)
   (hashtable-ref ns-alias-table (cons cns alias) #f))
+
+;; --- namespace-local class imports ------------------------------------------
+;; Java/Clojure imports are mappings owned by one namespace, not global aliases.
+;; Keeping (compile-ns, simple-name) -> canonical FQN prevents dependencies with
+;; the same final segment from colliding (for example com.acme.ByteBuffer and
+;; java.nio.ByteBuffer in different namespaces).
+(define class-import-table (make-hashtable equal-hash equal?))
+
+(define (chez-class-last-segment name)
+  (let loop ((i (fx- (string-length name) 1)))
+    (cond ((fx<? i 0) name)
+          ((char=? (string-ref name i) #\.)
+           (substring name (fx+ i 1) (string-length name)))
+          (else (loop (fx- i 1))))))
+
+(define (chez-class-dotted? name)
+  (let ((n (string-length name)))
+    (let loop ((i 0))
+      (and (fx<? i n)
+           (or (char=? (string-ref name i) #\.)
+               (loop (fx+ i 1)))))))
+
+(define (chez-class-import-conflict! cns simple old fqn)
+  (jolt-throw
+    (jolt-ex-info
+      (string-append "Conflicting class imports for " simple " in " cns
+                     ": " old " and " fqn)
+      (jolt-hash-map
+        (keyword "jolt" "error")
+        (jolt-hash-map
+          (keyword #f "type") (keyword #f "class-import-conflict")
+          (keyword #f "ns") cns
+          (keyword #f "simple-name") simple
+          (keyword #f "existing-class") old
+          (keyword #f "new-class") fqn)))))
+
+(define (chez-register-class-import! cns simple fqn)
+  (let* ((key (cons cns simple))
+         (old (hashtable-ref class-import-table key #f)))
+    (cond
+      ((not old) (hashtable-set! class-import-table key fqn))
+      ((string=? old fqn) #f)
+      (else (chez-class-import-conflict! cns simple old fqn))))
+  fqn)
+
+(define (chez-register-class-imports! cns pairs)
+  ;; An import form is one declaration batch.  Preflight every alias before
+  ;; publishing any of them so a rejected `(import ...)` or `ns :import` cannot
+  ;; poison a later retry of the same namespace with a prefix of its mappings.
+  (let ((pending (make-hashtable equal-hash equal?)))
+    (for-each
+      (lambda (p)
+        (let* ((simple (car p))
+               (fqn (cdr p))
+               (key (cons cns simple))
+               (old (or (hashtable-ref pending key #f)
+                        (hashtable-ref class-import-table key #f))))
+          (cond
+            ((not old) (hashtable-set! pending key fqn))
+            ((string=? old fqn) #f)
+            (else (chez-class-import-conflict! cns simple old fqn)))))
+      pairs)
+    (vector-for-each
+      (lambda (key fqn)
+        (hashtable-set! class-import-table key fqn))
+      (hashtable-keys pending)
+      (hashtable-values pending)))
+  pairs)
+
+(define (chez-resolve-class-import cns simple)
+  (hashtable-ref class-import-table (cons cns simple) #f))
+
+;; Parse one JVM import spec into (simple-name . canonical-FQN) pairs.  Accepted
+;; source shapes are `[package Class ...]`, `(package Class ...)`, and a bare
+;; fully-qualified class symbol.
+(define (chez-import-spec-pairs spec)
+  (cond
+    ((symbol-t? spec)
+     (let ((fqn (symbol-t-name spec)))
+       (if (chez-class-dotted? fqn)
+           (list (cons (chez-class-last-segment fqn) fqn))
+           '())))
+    ((or (pvec? spec) (and (cseq? spec) (cseq-list? spec)))
+     (let ((items (seq->list spec)))
+       (if (and (pair? items) (symbol-t? (car items)))
+           (let ((package (symbol-t-name (car items))))
+             (if (null? (cdr items))
+                 (if (chez-class-dotted? package)
+                     (list (cons (chez-class-last-segment package) package))
+                     '())
+                 (fold-right
+                   (lambda (class acc)
+                     (if (symbol-t? class)
+                         (let* ((name (symbol-t-name class))
+                                (fqn (if (chez-class-dotted? name)
+                                         name
+                                         (string-append package "." name))))
+                           (cons (cons (chez-class-last-segment fqn) fqn) acc))
+                         acc))
+                   '()
+                   (cdr items))))
+           '())))
+    (else '())))
+
+(define (chez-register-import-spec! cns spec)
+  (let ((pairs (chez-import-spec-pairs spec)))
+    (chez-register-class-imports! cns pairs)))
+
+(define (chez-register-import-specs! cns specs)
+  (let ((pairs '()))
+    (for-each
+      (lambda (spec)
+        (for-each
+          (lambda (p) (set! pairs (cons p pairs)))
+          (chez-import-spec-pairs spec)))
+      specs)
+    (chez-register-class-imports! cns (reverse pairs))))
+
 ;; :refer brings an UNQUALIFIED name into cns, resolving to target-ns/name.
 (define ns-refer-table (make-hashtable equal-hash equal?))
 (define (chez-register-refer! cns name target)
@@ -267,7 +385,38 @@
     (if (null? ns) m
         (loop (cdr ns)
               (jolt-assoc m (jolt-symbol #f (car ns)) (string-append "java.lang." (car ns)))))))
-(define (jolt-ns-imports . _) jolt-default-imports)
+
+;; Canonicalize a class token for analyzer/reader use.  Explicit imports are
+;; namespace-local and win over java.lang defaults; already-qualified class
+;; names remain exact.  Unknown bare names are deliberately not guessed.
+(define (chez-resolve-class-name cns name)
+  (or (chez-resolve-class-import cns name)
+      (and (member name jolt-default-import-names)
+           (string-append "java.lang." name))
+      (resolve-class-hint name)
+      ;; A few legacy core shims (URLEncoder, Files, Paths, ...) are registered
+      ;; only under their short spelling and are not part of the modeled class
+      ;; hierarchy. Preserve that existing source surface without inventing a
+      ;; package. Dependency-owned providers still arrive through exact imports
+      ;; and canonical keys, and therefore take the paths above.
+      (and (host-class-registered? name) name)
+      (and (chez-class-dotted? name) name)))
+
+(define (jolt-ns-imports . desig)
+  (let ((cns (if (pair? desig)
+                 (ns-desig->name (car desig))
+                 (chez-current-ns)))
+        (m jolt-default-imports))
+    (vector-for-each
+      (lambda (key)
+        (when (string=? (car key) cns)
+          (set! m
+                (jolt-assoc
+                  m
+                  (jolt-symbol #f (cdr key))
+                  (hashtable-ref class-import-table key #f)))))
+      (hashtable-keys class-import-table))
+    m))
 
 ;; ns-map: every mapping visible in the ns — the java.lang imports, the refers
 ;; (including the implicit clojure.core publics), and the ns's own interns,
@@ -320,6 +469,7 @@
          (c   (var-cell-lookup cns nm)))
     (when c (var-cell-defined?-set! c #f)
             (var-cell-root-set! c (make-jolt-var-unbound (var-cell-ns c) (var-cell-name c))))
+    (hashtable-delete! class-import-table (cons cns nm))
     ;; tombstone: block resolution of this name in this ns via refers/all
     (hashtable-set! ns-refer-table (cons cns nm) 'unmapped))
   jolt-nil)
@@ -347,6 +497,11 @@
     (hashtable-delete! ns-registry nm)
     (hashtable-delete! ns-has-vars-set nm)  ; keep the O(1) index honest, else a
                                             ; later require of nm would no-op
+    (vector-for-each
+      (lambda (key)
+        (when (string=? (car key) nm)
+          (hashtable-delete! class-import-table key)))
+      (hashtable-keys class-import-table))
     (vector-for-each
       (lambda (k) (let ((c (hashtable-ref var-table k #f)))
                     (when (and c (string=? (var-cell-ns c) nm)) (hashtable-delete! var-table k))))

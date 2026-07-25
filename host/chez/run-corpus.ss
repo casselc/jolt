@@ -59,6 +59,7 @@
   (hashtable-clear! ns-alias-table)
   (hashtable-clear! ns-refer-table)
   (hashtable-clear! ns-refer-all-table)
+  (hashtable-clear! class-import-table)
   (when zj-ghier (jolt-invoke (var-deref "clojure.core" "reset!")
                    (var-cell-root zj-ghier) (jolt-invoke (var-deref "clojure.core" "make-hierarchy"))))
   (set-chez-ns! "user"))

@@ -316,6 +316,16 @@
   (or (hc-fq-class-name? nm)
       (host-class-registered? nm)))
 
+;; Resolve a source class token to the canonical FQN carried by interop IR.
+;; Explicit imports are namespace-local; java.lang defaults and already-dotted
+;; class names are handled by the shared namespace resolver.  Unknown bare names
+;; return nil instead of becoming process-global aliases.
+(define (hc-resolve-class-name ctx token)
+  (let ((nm (cond ((string? token) token)
+                  ((symbol-t? token) (symbol-t-name token))
+                  (else (jolt-str-render-one token)))))
+    (or (chez-resolve-class-name (hc-current-ns ctx) nm) jolt-nil)))
+
 (define (hc-resolve-global ctx sym)
   (let* ((nm (symbol-t-name sym))
          (cell (hc-resolve-cell ctx sym)))
@@ -326,6 +336,11 @@
               (nr (hc-cell-num-ret cell)))
           (if nr (jolt-assoc base hc-kw-num-ret nr) base))
         (cond
+          ;; An explicit namespace-local import is a class mapping even before
+          ;; the import macro's runtime value binding executes.
+          ((chez-resolve-class-import (chez-actx-cns ctx) nm)
+           => (lambda (fqn)
+                (jolt-hash-map hc-kw-kind hc-kw-class hc-kw-name fqn)))
           ;; java.util.Map / clojure.lang.Named — a dotted class name.
           ((hc-fq-class-name? nm) (jolt-hash-map hc-kw-kind hc-kw-class hc-kw-name nm))
           ;; a bare Capitalized name that names a registered host class — an
@@ -572,6 +587,7 @@
   (def-var! "jolt.host" "form-macro?" hc-macro?)
   (def-var! "jolt.host" "form-expand-1" hc-expand-1)
   (def-var! "jolt.host" "resolve-global" hc-resolve-global)
+  (def-var! "jolt.host" "resolve-class-name" hc-resolve-class-name)
   (def-var! "jolt.host" "resolvable-names" hc-resolvable-names)
   (def-var! "jolt.host" "host-class-name?" hc-host-class-name?)
   (def-var! "jolt.host" "host-intern!" hc-intern!)

@@ -740,6 +740,32 @@
           (dfs (cdr ns)))))
     (reverse order)))
 
+;; Provider metadata is an explicit closed-world build input. Every declared
+;; registration namespace must exist now; silently omitting one would produce a
+;; binary whose first class lookup fails only at runtime.
+(define (bld-provider-closure names)
+  (for-each
+    (lambda (name)
+      (unless (find-ns-file name)
+        (error
+          'jolt-build
+          (string-append "class-provider namespace not found: " name))))
+    names)
+  (bld-require-closure names))
+
+(define (bld-emit-class-providers out mappings)
+  (when (pair? mappings)
+    (put-string out "\n;; === frozen class-provider metadata ===\n")
+    (put-string out "(class-provider-register-many! (list")
+    (for-each
+      (lambda (p)
+        (put-string
+          out
+          (string-append "\n  (cons " (ei-str-lit (car p)) " "
+                         (ei-str-lit (cdr p)) ")")))
+      mappings)
+    (put-string out "))\n")))
+
 ;; Bake the *data-readers* table into the binary so a runtime (read-string
 ;; "#my/tag …") resolves its reader fn like it does under jolt run. Tag and
 ;; reader are symbols; the reader path var-derefs the fn at use time.
@@ -760,13 +786,20 @@
         #f)
       (put-string out "))\n"))))
 
-(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? library?)
+(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots
+                      provider-pairs direct-link? tree-shake? library?)
+  ;; Discard ambient interactive/add-deps state. The resolved project graph is
+  ;; the sole provider authority for this build, just like roots and natives.
+  (class-provider-reset-many! provider-pairs)
   ;; Windows executables carry .exe; normalize here so the append-payload and
   ;; cc paths agree and the shell can run the result. A library keeps its own
   ;; suffix (.dll/.so/.dylib) — never rewrite it to .exe.
-  (let ((out-path (if (and (bld-tgt-nt?) (not library?) (not (bld-suffix? out-path ".exe")))
-                      (string-append out-path ".exe")
-                      out-path)))
+  (let* ((frozen-provider-mappings (class-provider-mappings))
+         (frozen-provider-generation (class-provider-generation))
+         (out-path (if (and (bld-tgt-nt?) (not library?)
+                            (not (bld-suffix? out-path ".exe")))
+                       (string-append out-path ".exe")
+                       out-path)))
   ;; The self-contained path (jolt-embedded-bytes "stub/launcher") needs no csv
   ;; kernel files, no Chez, no cc — only the legacy cc path does. A --library build
   ;; ALWAYS takes the cc path (build-shared), and a cross build (--target) always
@@ -791,6 +824,12 @@
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (load-namespace entry-ns)
     (set-ns-loaded-hook! (lambda (name file) #f))
+    (unless
+      (and (= frozen-provider-generation (class-provider-generation))
+           (equal? frozen-provider-mappings (class-provider-mappings)))
+      (error
+        'jolt-build
+        "class-provider metadata changed while loading the application; declare every provider in resolved deps.edn metadata"))
     ;; Build ordered ns list from the require graph (static scan of source files)
     ;; merged with the hook's load order. The graph gives post-order deps; the
     ;; hook captures dynamic requires the static scan can't see.
@@ -810,24 +849,22 @@
                        (not (or (assoc (car p) graph-rest)
                                 (assoc (car p) walked))))
                      reader-pairs))
-           ;; Class-provider catalogs are evaluated while entry-ns loads.  Bundle
-           ;; every namespace they map even when the first class use is deferred
-           ;; until -main; otherwise a standalone binary would have the registry
-           ;; entry but no source/AOT body for its provider.
-           (provider-ns-names (class-provider-namespaces))
-           (provider-pairs (bld-require-closure provider-ns-names))
-           ;; graph-rest precedes provider-pairs so a catalog required by the app
-           ;; is initialized before the provider it names.  The provider closure
-           ;; remains dependency-ordered internally.
-           (provider-pairs
+           ;; Bundle the explicit provider namespace closure even when the first
+           ;; class use is deferred until -main. These registration namespaces
+           ;; therefore initialize eagerly in a standalone binary and must keep
+           ;; heavyweight/native initialization behind their member functions.
+           (provider-ns-names
+             (map cdr frozen-provider-mappings))
+           (provider-ns-pairs (bld-provider-closure provider-ns-names))
+           (provider-ns-pairs
              (filter (lambda (p)
                        (not (or (assoc (car p) reader-pairs)
                                 (assoc (car p) graph-rest)
                                 (assoc (car p) walked))))
-                     provider-pairs))
+                     provider-ns-pairs))
            ;; merge: readers + app graph + provider closure + dynamic-load
            ;; novelties (preserving walked order for requires the scan missed)
-           (merged (append reader-pairs graph-rest provider-pairs))
+           (merged (append reader-pairs graph-rest provider-ns-pairs))
            (merged
              (let loop ((w walked) (m merged))
                (if (null? w)
@@ -960,6 +997,7 @@
         ;; 3. flat source = runtime + app + launcher.
         (let ((out (open-output-file flat-ss 'replace)))
           (bld-emit-runtime out drop-compiler? core-strs)
+          (bld-emit-class-providers out frozen-provider-mappings)
           ;; Load native libs, bake embedded resources, and point source roots at
           ;; the build-time app roots — all BEFORE the app forms. The app's
           ;; top-level forms run at binary startup (Sbuild_heap), and they include
@@ -1378,17 +1416,23 @@
           ((= i 0) (and (not (jolt-nil? (car o))) (jolt-str-render-one (car o))))
           (else (loop (cdr o) (- i 1))))))
 (def-var! "jolt.host" "build-binary"
-  (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
+  (lambda (entry out mode natives embed-dirs ext-roots providers
+           direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
-                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #f))
+                    natives embed-dirs ext-roots
+                    (jmap->static-alist providers)
+                    (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #f))
     jolt-nil))
 (def-var! "jolt.host" "build-library"
-  (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake?)
+  (lambda (entry out mode natives embed-dirs ext-roots providers
+           direct-link? tree-shake?)
     (build-binary (jolt-str-render-one entry)
                   (jolt-str-render-one out)
                   (jolt-str-render-one mode)
-                  natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t)
+                  natives embed-dirs ext-roots
+                  (jmap->static-alist providers)
+                  (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t)
     jolt-nil))
