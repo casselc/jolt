@@ -53,22 +53,30 @@
 ;;
 ;; POSIX calls use errno; Windows calls use GetLastError, which is also the slot
 ;; Winsock exposes through WSAGetLastError. The back end wraps the two values as
-;; a Jolt [result error-code] vector. Keep target selection in syntax so an
-;; unsupported __get_last_error convention never reaches a non-Windows Chez
-;; expander.
+;; a Jolt [result error-code] vector.
+;;
+;; Keep target selection in syntax so an unsupported __get_last_error
+;; convention never reaches a non-Windows Chez expander. Consult the compiler's
+;; $target-machine parameter, not machine-type: xpatch cross compilation changes
+;; the former while the latter continues to describe the Chez process doing the
+;; compiling. This case macro also gives the regression suite an observable
+;; control for both cross-target directions without duplicating the selector.
+(define-syntax jolt-ffi-native-error-convention-case
+  (lambda (x)
+    (syntax-case x ()
+      ((_ get-last-error-form errno-form)
+       (if (memq (eval '(#%$target-machine))
+                 '(i3nt ti3nt a6nt ta6nt arm64nt tarm64nt))
+           #'get-last-error-form
+           #'errno-form)))))
+
 (define-syntax jolt-ffi-native-error-procedure
   (lambda (x)
     (syntax-case x ()
       ((_ (conv ...) name args res)
-       (with-syntax
-         ((error-conv
-            (datum->syntax
-              #'foreign-procedure
-              (if (memq (machine-type)
-                        '(i3nt ti3nt a6nt ta6nt arm64nt tarm64nt))
-                  '__get_last_error
-                  '__errno))))
-         #'(foreign-procedure error-conv conv ... name args res))))))
+       #'(jolt-ffi-native-error-convention-case
+           (foreign-procedure __get_last_error conv ... name args res)
+           (foreign-procedure __errno conv ... name args res))))))
 
 ;; WinAPI uses __stdcall on 32-bit Windows but the platform's single x64/ARM64
 ;; calling convention on 64-bit Windows. Chez rejects __stdcall on the latter,
