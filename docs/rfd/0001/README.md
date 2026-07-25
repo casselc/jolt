@@ -192,6 +192,14 @@ cross-build remains a distinct validation lane. The contract, bounded ordering
 argument, and cross-target evidence are recorded in
 [`ffi-native-error-capture.md`](../../ffi-native-error-capture.md).
 
+Consumers must preserve that distinction in their own call surface. Ordinary
+calls return scalars; captured calls return `[result native-error]`. An
+operation-keyed wrapper that sometimes returns one shape and sometimes the
+other is rejected because callers can silently forget the atomic contract.
+Direct-return APIs such as `WSAStartup` remain scalar. A blocking API such as
+POSIX `getaddrinfo`, whose `EAI_SYSTEM` result delegates detail to `errno`, must
+use the pair and consult the captured code only for the delegated case.
+
 ### jolt-net
 
 On verified POSIX targets, jolt-net provides endpoints, DNS, owned sockets,
@@ -213,9 +221,11 @@ The first blocking-Winsock implementation is under review rather than accepted:
 its native suite exposed that a collect-safe foreign call followed by a
 separate `WSAGetLastError` can observe zero instead of the matching `10061`.
 The core atomic return/error FFI prerequisite is now implemented. W1 must
-consume it and still add a failure-terminal initialization path,
-forced-contention tests, bounded watchdogs, and strengthened proof controls
-before the nonblocking W2 slice starts.
+consume it through separate scalar and captured dispatch surfaces for blocking
+`accept`, `connect`, `poll`, and `getaddrinfo`'s `EAI_SYSTEM` path. It must also
+add a failure-terminal initialization path, forced-contention tests, bounded
+watchdogs, and strengthened proof controls before the nonblocking W2 slice
+starts.
 
 ### jolt-tcp and jolt-http
 
@@ -864,6 +874,9 @@ examples, but neither should define the base API.
 
 - A native return value and its matching error are captured atomically before
   allocation, cleanup, callback, or another foreign call can overwrite it.
+- Scalar and captured foreign-call dispatch have invariant, distinct result
+  shapes; a failure-sensitive blocking call never falls back to a later error
+  accessor.
 - Every owned native handle closes once.
 - Old descriptor generations and registration revisions cannot produce current
   events.
