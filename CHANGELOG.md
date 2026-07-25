@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a future fresh-process, closed-world whole-image concern rather than a
   namespace-by-namespace runtime lookup.
 
+### Fixed
+
+- **Fresh compile passes retain the selected Chez executable.** Source and make
+  launchers export `JOLT_CHEZ`; `build.ss` resolves and quotes that exact
+  executable, derives its installation from the same path, and rejects a child
+  compiler whose version differs from the running Chez. This prevents a host
+  with multiple Chez installations from compiling a FASL with one version and
+  embedding boot/kernel files from another.
+
 ### Notes
 
 - Bulk `ffi/read-array!`/`write-array` transfers are still a byte-at-a-time loop

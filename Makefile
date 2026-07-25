@@ -5,6 +5,8 @@
 # source change.
 
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
+JOLT_CHEZ := $(CHEZ)
+export JOLT_CHEZ
 DEPSTEST_JOLTC ?= bin/jolt
 
 .PHONY: test ci testbin values targetfacts monotonic hostclass corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint aotcacheperf namespaceeffectsmoke submodules httpsfetch mvnhttp depssmoke depsunit depstest
@@ -71,7 +73,7 @@ TESTBIN_INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src ve
 testbin:
 	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
 	   [ -n "$$(find $(TESTBIN_INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
-	  $(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt; \
+	  "$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt; \
 	else \
 	  echo "testbin: target/release/jolt up to date"; \
 	fi
@@ -150,9 +152,9 @@ depstest:
 # JOLT_CROSS_TARGET (optional) cross-compiles jolt for another Chez machine — it is
 # passed as build-jolt.ss's 3rd arg and needs $JOLT_TARGET_PACK (empty = native).
 jolt-release:
-	@$(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
+	@"$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
 jolt-debug:
-	@$(CHEZ) --script host/chez/build-jolt.ss debug target/debug/jolt
+	@"$(CHEZ)" --script host/chez/build-jolt.ss debug target/debug/jolt
 # Re-mint the seed first so the embedded compiler image is current, then both builds.
 jolt: selfhost jolt-release jolt-debug
 	@echo "OK: target/release/jolt and target/debug/jolt built"
@@ -358,7 +360,7 @@ remint:
 # Precompile the runtime to target/dev/flat.so so dev bin/jolt boots ~10x faster
 # (loads the .so instead of compiling ~50 .ss files from source every invocation).
 devboot: submodules
-	@$(CHEZ) --script host/chez/make-devboot.ss
+	@"$(CHEZ)" --script host/chez/make-devboot.ss
 
 # Precompile the gate boot preamble to target/dev/gate.so so a pass gate boots in
 # ~0.2s instead of ~1.5s (it spends nearly all of that loading the same six
@@ -367,7 +369,7 @@ devboot: submodules
 # otherwise, so nothing depends on this target and CI is unaffected. Worth it
 # when iterating on one pass gate; `make ci` runs them in parallel anyway.
 gateboot: submodules
-	@$(CHEZ) --script host/chez/make-gateboot.ss
+	@"$(CHEZ)" --script host/chez/make-gateboot.ss
 
 # Smoke test: the gate boot image's staleness predicate. Drives
 # gate-boot-image-fresh? over synthetic input lists, so it boots no runtime,

@@ -197,6 +197,7 @@ For an interactive validation handoff, record:
 - `where.exe scheme`, `where.exe chez`, `where.exe gcc`, and `where.exe cl`;
 - `scheme --version` or `chez --version`;
 - the Chez machine type;
+- the exact `JOLT_CHEZ` executable selected for fresh compile passes;
 - the path containing the Chez boot files and kernel development artifacts;
 - the Git-for-Windows `sh.exe` path; and
 - whether WSL can invoke the Windows executables and access the checkout under

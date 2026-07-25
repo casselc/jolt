@@ -133,10 +133,21 @@
           (string-append "sh " qf " && rm -f " qf)))
       cmd))
 
-;; The Chez executable, for the isolated compile pass (see build-binary step 4).
+;; The Chez executable for isolated compile passes (see build-binary step 4).
+;; The launcher/build recipe exports JOLT_CHEZ so the child compiler is the
+;; exact executable running this image. Re-discovering from PATH can select a
+;; different installed Chez and create a fasl/boot/kernel version mixture.
 (define bld-chez
-  (let ((p (bld-sh-capture "command -v chez || command -v scheme || command -v petite")))
-    (if (> (string-length p) 0) p "chez")))
+  (let* ((env (getenv "JOLT_CHEZ"))
+         (requested (and env (> (string-length env) 0) env))
+         (p (if requested
+                (bld-sh-capture
+                  (string-append "command -v " (bld-sh-quote requested)))
+                (bld-sh-capture
+                  "command -v chez || command -v chezscheme || command -v scheme || command -v petite"))))
+    (cond ((> (string-length p) 0) p)
+          (requested requested)
+          (else "chez"))))
 
 ;; Chez version off (scheme-version) "Chez Scheme Version X.Y.Z" — last token.
 (define bld-version
@@ -146,12 +157,26 @@
           (substring s i n)
           (loop (- i 1))))))
 
+;; Version reported by the selected child compiler. Empty means discovery will
+;; fail later with the ordinary missing-toolchain diagnostic.
+(define bld-chez-version
+  (let ((s (bld-sh-capture
+             (string-append (bld-sh-quote bld-chez) " --version"))))
+    (if (= (string-length s) 0)
+        ""
+        (let ((n (string-length s)))
+          (let loop ((i n))
+            (if (or (= i 0) (char=? (string-ref s (- i 1)) #\space))
+                (substring s i n)
+                (loop (- i 1))))))))
+
 ;; The HOST csv<ver>/<machine> dir holding scheme.h, libkernel.a, *.boot. Derived
 ;; from the chez executable's location; JOLT_CHEZ_CSV overrides.
 (define bld-host-csv-dir
   (let ((env (getenv "JOLT_CHEZ_CSV")))
     (or (and env (> (string-length env) 0) env)
-        (let* ((bindir (bld-sh-capture "dirname \"$(command -v chez || command -v scheme || command -v petite)\""))
+        (let* ((bindir (bld-sh-capture
+                         (string-append "dirname " (bld-sh-quote bld-chez))))
                (cand (string-append bindir "/../lib/csv" bld-version "/" bld-machine)))
           cand))))
 ;; The csv dir supplying the boots + kernel + scheme.h that get baked into the
@@ -165,10 +190,20 @@
 (define (bld-have-cc?)
   (> (string-length (bld-sh-capture "command -v cc")) 0))
 
+(define (bld-check-chez-version)
+  (when (and (> (string-length bld-chez-version) 0)
+             (not (string=? bld-chez-version bld-version)))
+    (error 'jolt-build
+      (string-append
+        "selected child Chez " bld-chez " reports " bld-chez-version
+        ", but the running Chez reports " bld-version
+        ". Set JOLT_CHEZ to the same executable used to launch Jolt."))))
+
 (define (bld-check-toolchain)
   (let ((hint (if (bld-cross?)
                   "\nProvide a target pack (--target-pack DIR) — see tools/cross-compile/README.md."
                   "\nSet JOLT_CHEZ_CSV to the csv<ver>/<machine> dir.")))
+    (bld-check-chez-version)
     (for-each
       (lambda (f)
         (let ((p (string-append (bld-csv-dir) "/" f)))
@@ -1214,7 +1249,7 @@
               (string-append (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "))
           (ei-str-lit flat-so) ")\n"))
       (close-port p))
-    (bld-system (string-append bld-chez " --script '" cs "'")))
+    (bld-system (string-append (bld-sh-quote bld-chez) " --script '" cs "'")))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   ;; The xxd symbol is derived from the path; normalize to jolt_boot.
   (bld-system (string-append
@@ -1301,7 +1336,7 @@
           (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
           (ei-str-lit flat-so) ")\n"))
       (close-port p))
-    (bld-system (string-append bld-chez " --script '" cs "'")))
+    (bld-system (string-append (bld-sh-quote bld-chez) " --script '" cs "'")))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   (bld-system (string-append
     "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "
