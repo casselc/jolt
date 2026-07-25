@@ -92,6 +92,21 @@ Reproduce the semantic oracle with:
 make depstest CHEZ=/home/chuck/.local/chez-10.4.1/bin/chez
 ```
 
+On native Windows, use the PowerShell runner rather than asking PowerShell to
+drive the POSIX Make recipe:
+
+```powershell
+.\tools\test-windows-deps.ps1 `
+  -Chez D:\chez-10.4.1\bin\scheme.exe `
+  -GitSh "C:\Program Files\Git\bin\sh.exe"
+```
+
+The runner invokes Chez directly, uses Git's `sh.exe` only for the documented
+`jolt.host/sh` contract inside the test process, supplies a source-mode child
+launcher for the interprocess publication case, rejects a generated cache root
+longer than the proved 80-character domain, and has a ten-minute outer
+watchdog. It never relies on WSL path or environment translation.
+
 Run each `.smt2` file through Chiasmus `chiasmus_lint` and
 `chiasmus_verify` with `solver=z3`; those tools supply the final solver commands
 that are deliberately omitted from the checked-in models. The recorded sequence
