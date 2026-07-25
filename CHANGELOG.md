@@ -39,6 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selecting a fixed call ABI. Types after the boundary are explicit ABI types
   after C default argument promotion; Jolt does not guess those promotions.
 
+### Removed
+
+- **The per-namespace runtime AOT cache.** A cache hit restored namespace
+  definitions without reliably replaying process-local top-level effects; a
+  concrete downstream witness loaded `deftest` Vars but left
+  `clojure.test`'s registry empty, so a cold process ran 60 tests and the next
+  process ran zero. `JOLT_AOT_CACHE` and `JOLT_CACHE_DIR` no longer affect
+  namespace loading, and the cache smoke/performance targets are gone.
+  `namespaceeffectsmoke` now preserves the correctness boundary. Reuse remains
+  a future fresh-process, closed-world whole-image concern rather than a
+  namespace-by-namespace runtime lookup.
+
 ### Notes
 
 - Bulk `ffi/read-array!`/`write-array` transfers are still a byte-at-a-time loop

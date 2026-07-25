@@ -316,9 +316,9 @@
 (define (load-jolt-file path)
   (load-jolt-file* path (ldr-read-source path)))
 
-;; load-jolt-file* — the read/compile/eval loop over a PRE-READ source string.
-;; Split out so the AOT cache (below) reads source once for both keying and the
-;; capture load, instead of re-reading inside the loop.
+;; load-jolt-file* — the read/compile/eval loop over a pre-read source string.
+;; Keeping source acquisition separate also lets closed-world builds use the
+;; same parser/compiler path after resolving their complete input graph.
 (define (load-jolt-file* path src)
   (let* ((end (string-length src))
          ;; Restore the current-source position on NORMAL return only. Loading a
@@ -346,146 +346,6 @@
                                             (chez-current-ns)))
                   (loop j))))))))
     (jolt-current-source saved-source)))
-
-;; --- AOT / compile cache for required namespaces ----------------------------
-;; A disk-backed namespace is recompiled from source on EVERY run (load-jolt-file
-;; → analyze+emit+eval per form). This cache fasls the emitted Scheme on the first
-;; load of a namespace and `load`s the .so on subsequent loads, recovering most of
-;; that per-run compile cost. The cache FILENAME embeds a content hash of the
-;; source, so any edit (same path, different bytes) misses automatically — no
-;; mtime tracking needed. Gated by JOLT_AOT_CACHE; OFF for install-owned source
-;; (embedded in the binary) and bypassed on :reload / :reload-all (live editing).
-(define (aot-cache-dir)
-  (or (getenv "JOLT_CACHE_DIR")
-      (string-append (let ((home (jolt-home-directory)))
-                       (if (string=? home "") "." home))
-                     "/.jolt/aot-cache")))
-;; Default ON — a built joltc benefits every run (ys-style startup pulling many
-;; library namespaces). JOLT_AOT_CACHE=0/false/no/off opts out. The dev bin/joltc
-;; script exports JOLT_AOT_CACHE=0, so source-mode dev (a volatile compiler whose
-;; "dev" version tag would NOT invalidate the cache across edits, and whose
-;; startup is already covered by the devboot cache) stays OFF by default.
-(define (aot-cache-enabled?)
-  (let ((e (getenv "JOLT_AOT_CACHE")))
-    (if (and (string? e) (fx>? (string-length e) 0))
-        (not (or (string=? e "0") (string-ci=? e "false")
-                 (string-ci=? e "no") (string-ci=? e "off")))
-        #t)))   ; unset/empty → default ON
-;; <dir>/<jolt-version>/v1 — the version isolates a different joltc build's output
-;; (the emitted Scheme is compiler-version-dependent).
-(define (aot-cache-subdir)
-  (string-append (aot-cache-dir) "/" (jolt-version-string) "/v1"))
-(define (aot-cache-sanitize s)
-  (list->string
-    (map (lambda (c)
-           (let ((n (char->integer c)))
-             (if (or (and (>= n 48) (<= n 57))    ; 0-9
-                     (and (>= n 65) (<= n 90))    ; A-Z
-                     (and (>= n 97) (<= n 122))   ; a-z
-                     (char=? c #\-) (char=? c #\.) (char=? c #\_))
-                 c #\_)))
-         (string->list s))))
-;; length (hex) + content hash (equal-hash, 32-bit, hex). The length prefix is a
-;; cheap collision guard: two sources must share BOTH byte length AND the 32-bit
-;; hash to collide and falsely share a fasl — astronomically unlikely for distinct
-;; library sources. equal-hash is process-STABLE (not randomized), so the key is
-;; reproducible across runs (required for the cache to hit). A full content digest
-;; would need a bytevector hash jolt doesn't expose cheaply; this is the accepted
-;; tradeoff. (A collision would load wrong compiled code — the worst case — but
-;; the length guard + 32-bit hash put it far below other realistic failure rates.)
-(define (aot-cache-key src)
-  (string-append (number->string (string-length src) 16) "-"
-                 (number->string (equal-hash src) 16)))
-(define (aot-info msg)
-  (when (getenv "JOLT_DEBUG")
-    (display (string-append "[jolt.aot] " msg "\n") (current-error-port))))
-;; Tee the per-form emitted Scheme (compile-eval.ss jolt-aot-capture) while running
-;; the normal load loop, so a cache miss reproduces the EXACT interleaved analyze
-;; →eval semantics (forward macro refs and same-file requires expand correctly).
-;; The captured Scheme, loaded in order, reproduces every top-level effect — the
-;; same property `jolt build` / the seed mint rely on.
-;; parameterize (not a bare set!) so a require fired by this ns's forms — which
-;; itself triggers a nested aot-capture-load — restores OUR capture port on
-;; return. A bare thread-parameter set would be clobbered by the nested capture
-;; and reset to #f, dropping this ns's forms AFTER the require (the require's
-;; target would cache, but the requiring ns's own defs would vanish from its .so).
-(define (aot-capture-load file src)
-  (let ((cap (open-output-string)))
-    (parameterize ((jolt-aot-capture cap))
-      (load-jolt-file* file src)
-      (get-output-string cap))))
-;; On a miss: run the capture load (which also evals the ns into the running
-;; image), then fasl the captured Scheme. A compile-file failure is non-fatal —
-;; the ns is already loaded; we just skip caching this run and miss again next.
-;; mkdir -p without a subprocess. The built Windows joltc runs jolt-sh via
-;; cmd.exe, where `mkdir -p <forward/slash/path>` is invalid syntax, so the
-;; cache dir was never created and open-output-file failed. Native mkdir +
-;; path-parent recursion is portable (mirrors build.ss bld-mkdir-p).
-(define (aot-mkdir-p dir)
-  (unless (or (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
-    (aot-mkdir-p (path-parent dir))
-    ;; tolerate the benign race (created concurrently); re-raise a real failure.
-    (guard (e (#t (unless (file-exists? dir) (raise e))))
-      (mkdir dir))))
-;; Publish the cached .scm/.so atomically. Parallel joltc processes (e.g. the cts
-;; gate's workers) share one cache dir and can compile the SAME namespace at once;
-;; writing straight to base.so let a reader's (file-exists? so)+load see a fasl
-;; another process was mid-write, loading a truncated image that defined nothing
-;; ("No namespace: X found"). So each process compiles to a pid-unique temp and
-;; rename(2)s it into place — atomic within a filesystem, so the .so appears
-;; complete-or-not-at-all. The .so (the cache-hit signal) is published LAST.
-(define (aot-compile-and-cache name file src base)
-  (let* ((scm (string-append base ".scm"))
-         (so  (string-append base ".so"))
-         (pid (number->string (get-process-id)))
-         (tmp-scm (string-append base ".tmp" pid ".scm"))
-         (tmp-so  (string-append base ".tmp" pid ".so")))
-    (aot-mkdir-p (path-parent base))
-    (let ((captured (aot-capture-load file src)))
-      (when (and (string? captured) (fx>? (string-length captured) 0))
-        (guard (e (else (aot-info (string-append "compile failed for " name))
-                        (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
-          (let ((out (open-output-file tmp-scm 'replace)))
-            (put-string out captured) (close-output-port out))
-          ;; compile-file prints "compiling X with output to Y" per file to
-          ;; current-output-port by default — swallow it so a cache miss can't
-          ;; corrupt the running program's stdout.
-          (parameterize ((current-output-port (open-output-string)))
-            (compile-file tmp-scm tmp-so))
-          (jolt-replace-file! tmp-scm scm)
-          (jolt-replace-file! tmp-so so))
-        (unless (file-exists? so)
-          (aot-info (string-append "no .so produced for " name)))))))
-;; A truncated/corrupt .so (a killed process left a partial write, or a concurrent
-;; joltc is mid-write) would make `load` throw. Fall back to recompile: delete the
-;; bad files so the miss path rebuilds them. Safe because a truncated fasl fails at
-;; its header before any top-level define runs, so the image carries no half-loaded
-;; state from the failed load. Non-fatal — a repeated failure just misses every run.
-(define (aot-safe-load-or-recompile name file src base)
-  (let ((so (string-append base ".so")))
-    (guard (e (else
-                (aot-info (string-append "corrupt cache for " name ", recompiling"))
-                (delete-file so #f)           ; best-effort; ignore if already gone
-                (let ((scm (string-append base ".scm")))
-                  (delete-file scm #f))
-                (aot-compile-and-cache name file src base)))
-      (load so))))
-;; Dispatch for load-namespace*: cache hit (load .so) / miss (compile+cache) /
-;; bypass (plain load). `file` is the resolved on-disk path. force? (:reload) and
-;; ldr-reload-all? bypass entirely — live editing must win over a stale cache.
-(define (aot-load-or-compile name file force?)
-  (if (and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
-           (not (ldr-install-file? file)))
-      (let* ((src (ldr-read-source file))
-             (base (string-append (aot-cache-subdir) "/"
-                                  (aot-cache-sanitize name) "-" (aot-cache-key src)))
-             (so (string-append base ".so")))
-        (if (file-exists? so)
-            (begin (aot-info (string-append "hit " name))
-                   (aot-safe-load-or-recompile name file src base))
-            (begin (aot-info (string-append "miss " name))
-                   (aot-compile-and-cache name file src base))))
-      (load-jolt-file file)))
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
 (define (ldr-mark-loaded! name)
@@ -543,7 +403,7 @@
                          (set-chez-ns! saved)          ; restore ns, then roll the mark back
                          (unless was-loaded? (ldr-unmark-loaded! name))
                          (raise e)))
-                (aot-load-or-compile name file force?))
+               (load-jolt-file file))
               (set-chez-ns! saved)             ; restore the current ns (thread-local)
               (ns-loaded-hook name file)))
           ;; No source file but the namespace exists in memory (AOT'd into a built

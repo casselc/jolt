@@ -30,12 +30,6 @@
 ;; {:line :column :file?} position map (jolt.host/form-position's shape).
 ;; Top-level granularity — one set per top-level form, nothing per call.
 (define jolt-current-source (make-thread-parameter #f))
-;; AOT compile-cache capture port (#f or an open output string port), set by
-;; loader.ss aot-capture-load. When set, jolt-compile-eval-form* tees each form's
-;; emitted Scheme here so a cache miss records exactly what was eval'd (preserving
-;; the interleaved analyze→eval semantics the cache later replays via `load`).
-(define jolt-aot-capture (make-thread-parameter #f))
-
 ;; clojure.lang.Compiler/LINE and /COLUMN — derefable cells (Vars on the JVM)
 ;; holding the line/column of the form being compiled. Macros read @Compiler/LINE
 ;; as a fallback when &form carries no position (jolt's reader stamps :line on list
@@ -351,10 +345,8 @@
      ;; drop tail-frame history from earlier top-level forms, so an error's trace
      ;; shows only this form's own call history (a no-op unless JOLT_TRACE is on).
      (jolt-trace-reset!)
-     (let* ((scm (jolt-analyze-emit-form form ns))
-            (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
-       (when cap (put-string cap scm) (newline cap))
-       (eval (read (open-input-string scm)) (interaction-environment))))))
+     (eval (read (open-input-string (jolt-analyze-emit-form form ns)))
+           (interaction-environment)))))
 
 ;; Source string -> value (read one form, compile + eval on Chez, in the
 ;; top-level environment where rt.ss's runtime procedures live).

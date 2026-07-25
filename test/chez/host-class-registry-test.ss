@@ -1,7 +1,7 @@
 ;; Central host-class registration coherence. Each table row checks that one
 ;; predicate/FQN registration drives class, instance?, and protocol dispatch.
 ;;
-;;   JOLT_AOT_CACHE=0 chez --script test/chez/host-class-registry-test.ss
+;;   chez --script test/chez/host-class-registry-test.ss
 
 (import (chezscheme))
 (load "host/chez/run-gate-harness.ss")
