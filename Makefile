@@ -7,7 +7,7 @@
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
 DEPSTEST_JOLTC ?= bin/jolt
 
-.PHONY: test ci testbin values targetfacts monotonic hostclass corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot devbootsmoke aotcachesmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit depstest
+.PHONY: test ci testbin values targetfacts monotonic hostclass corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot devbootsmoke aotcachesmoke aotcacheperf namespaceeffectsmoke submodules httpsfetch mvnhttp depssmoke depsunit depstest
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -23,7 +23,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values targetfacts monotonic hostclass corpus unit mvnhttp depssmoke depsunit depstest smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke aotcachesmoke certify
+ci: submodules values targetfacts monotonic hostclass corpus unit mvnhttp depssmoke depsunit depstest smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke namespaceeffectsmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -52,11 +52,9 @@ hostclass:
 corpus:
 	@$(CHEZ) --script host/chez/run-corpus.ss
 
-# Host-specific unit cases. This is a source-mode dev runner, so keep its
-# dynamically-created fixture namespaces out of the persistent AOT cache just as
-# bin/jolt does; the dedicated aotcachesmoke target covers cache behavior.
+# Host-specific unit cases.
 unit:
-	@JOLT_AOT_CACHE=0 $(CHEZ) --script host/chez/run-unit.ss
+	@$(CHEZ) --script host/chez/run-unit.ss
 
 # Real-CLI smoke over bin/jolt.
 # smoke and cts spawn a jolt process per case; a prebuilt binary boots ~10x
@@ -118,7 +116,7 @@ depstest:
 	  esac; \
 	  root="$$(mktemp -d "$$base/jolt-deps-test.XXXXXX")"; \
 	  trap 'rm -rf "$$root"' EXIT INT TERM; \
-	  JOLT_AOT_CACHE=0 GIT_ALLOW_PROTOCOL=file GIT_CONFIG_NOSYSTEM=1 \
+	  GIT_ALLOW_PROTOCOL=file GIT_CONFIG_NOSYSTEM=1 \
 	    GIT_CONFIG_GLOBAL="$$root/gitconfig" \
 	  JOLT_DEPSTEST_JOLTC="$(DEPSTEST_JOLTC)" \
 	  JOLT_GITLIBS="$$root/jolt-cache" GITLIBS="$$root/tools-gitlibs" \
@@ -347,7 +345,9 @@ devbootsmoke: devboot
 	@sh test/chez/devboot-smoke.sh
 
 # Smoke test: the per-namespace AOT/compile cache (miss/hit/invalidate, edge
-# cases, bypass semantics). Drives dev bin/jolt; no Maven jars required. The
+# cases, bypass semantics). Retained as characterization evidence while the
+# cache is retired from namespace loading; it is not part of the default gate.
+# Drives dev bin/jolt; no Maven jars required. The
 # built binary is a second, genuinely different runtime — case (k) needs it to
 # check that two runtimes sharing a version string still key separately.
 aotcachesmoke: testbin
@@ -357,3 +357,9 @@ aotcachesmoke: testbin
 # require. Needs Maven jars locally; NOT in the default ci gate (timing budget).
 aotcacheperf:
 	@sh test/chez/aot-cache-perf.sh
+
+# A fresh process must execute a required namespace's top-level effects. The
+# obsolete JOLT_AOT_CACHE input is intentionally set by this regression so it
+# cannot silently revive the retired per-namespace artifact cache.
+namespaceeffectsmoke: testbin
+	@sh test/chez/namespace-load-effects-smoke.sh target/release/jolt

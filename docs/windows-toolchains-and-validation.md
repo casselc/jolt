@@ -202,10 +202,11 @@ For an interactive validation handoff, record:
 - whether WSL can invoke the Windows executables and access the checkout under
   `/mnt/c/...`.
 
-Use a fresh `JOLT_CACHE_DIR` for each core/library revision. Put `TEMP` and
-`TMP` under a path containing a space for the host-shell smoke. Preserve the
-complete command log and the HTTP progress log when a bounded test times out;
-redirected Jolt output may otherwise remain buffered until process exit.
+Use fresh `JOLT_GITLIBS` and `GITLIBS` roots when validating dependency-cache
+behavior for a new core/library revision. Put `TEMP` and `TMP` under a path
+containing a space for the host-shell smoke. Preserve the complete command log
+and the HTTP progress log when a bounded test times out; redirected Jolt output
+may otherwise remain buffered until process exit.
 
 When driving Win32 executables from a WSL checkout, a UNC current directory is
 not a valid `cmd.exe` current directory. Use `cmd.exe /c "pushd
