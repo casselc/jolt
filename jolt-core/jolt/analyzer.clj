@@ -906,6 +906,11 @@
                                       :suggestions (vec sugg)
                                       :ns (compile-ns ctx)}}))))
 
+(defn- late-bind-context? [env]
+  (or *allow-unresolved-vars*
+      (:recur env)
+      (seq (:locals env))))
+
 (defn- analyze-symbol [ctx form env]
   (let [nm (form-sym-name form) ns (form-sym-ns form)]
     (cond
@@ -919,13 +924,26 @@
          (str "Qualified instance method " (str ns "/" nm)
               " used as value; value form not yet supported. Use (.method target ...) or (Class/.method target ...) instead."))
       ns (let [r (resolve-global ctx form)]
-           (if (= :var (:kind r))
+           (case (:kind r)
+             :var
              (or (macro-value-fn ctx form r)
                  (do (deny-macro-value ctx form r)
-                     (cond-> (var-ref (:ns r) (:name r)) (:num-ret r) (assoc :num-ret (:num-ret r)))))
+                     (cond-> (var-ref (:ns r) (:name r))
+                       (:num-ret r) (assoc :num-ret (:num-ret r)))))
+
+             ;; A known namespace alias cannot denote a class. Match Jolt's
+             ;; existing scoped forward-reference policy, but retain the
+             ;; resolved target namespace instead of late-binding in the
+             ;; consumer namespace. A top-level missing alias-qualified var is
+             ;; still a compile error.
+             :alias-var
+             (if (late-bind-context? env)
+               (var-ref (:ns r) (:name r))
+               (resolve-error ctx (str ns "/" nm) env))
+
              ;; A non-var qualified ref `Class/member` is a host class static
              ;; (Math/sqrt, Long/MAX_VALUE, System/getenv). The Chez back end
-             ;; lowers it to an exact-FQN runtime static dispatch.
+             ;; lowers only an exact class token to runtime static dispatch.
              (if-let [class (resolve-class-name ctx ns)]
                (host-static class nm)
                (resolve-error ctx (str ns "/" nm) env))))
@@ -946,9 +964,7 @@
                 ;; scope (fn / loop / let body — indicated by :recur or non-empty
                 ;; :locals), late-bind so defmulti/defmethod forward references
                 ;; still work. *allow-unresolved-vars* overrides for nREPL.
-                (if (or *allow-unresolved-vars*
-                        (:recur env)
-                        (seq (:locals env)))
+                (if (late-bind-context? env)
                   (var-ref (compile-ns ctx) nm)
                   (resolve-error ctx nm env)))))))
 
