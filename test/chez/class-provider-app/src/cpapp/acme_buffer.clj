@@ -12,3 +12,6 @@
 
 (defn protocol-value []
   (marker/provider-marker (ByteBuffer. :protocol-payload)))
+
+(defn imported-instance? []
+  (instance? ByteBuffer (ByteBuffer. :instance-payload)))
