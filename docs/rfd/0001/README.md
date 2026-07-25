@@ -12,15 +12,15 @@ Integrate the proposal fork's host, FFI, networking, and Java-interop work into
 one explicit Jolt architecture:
 
 ```text
-Jolt host/runtime primitives
-       |
-    jolt.ffi
-       |
-    jolt-net
-       |
-    jolt-tcp
-       |
-    jolt-http
+          Jolt host/runtime primitives
+             /                 \
+        jolt.ffi          incubating jolt.bytes
+             \                 /
+                  jolt-net
+                      |
+                  jolt-tcp
+                      |
+                  jolt-http
 ```
 
 `jolt-hegel` remains a separate library that consumes the reviewed FFI surface.
@@ -167,7 +167,8 @@ The proposal branch already contains or has validated:
 
 - a fail-closed target descriptor;
 - a real monotonic clock;
-- immediate POSIX `errno` and Winsock `WSAGetLastError` capture;
+- direct POSIX `errno` and Winsock `WSAGetLastError` retrieval, with the public
+  atomic return-value/error FFI option still to land;
 - signed and unsigned 8- and 16-bit foreign scalars;
 - overlap-safe array copy and scoped borrowed byte-array slices;
 - by-value aggregate/struct support;
@@ -198,6 +199,13 @@ native implementation is sequenced as:
 5. native runtime CI promotion.
 
 Each capability remains unadvertised until the corresponding real calls pass.
+The first blocking-Winsock implementation is under review rather than accepted:
+its native suite exposed that a collect-safe foreign call followed by a
+separate `WSAGetLastError` can observe zero instead of the matching `10061`.
+W1 therefore depends on the core atomic return/error FFI option, a
+failure-terminal initialization path, forced-contention tests, bounded
+watchdogs, and strengthened proof controls before the nonblocking W2 slice
+starts.
 
 ### jolt-tcp and jolt-http
 
@@ -240,18 +248,19 @@ Important missing or incorrect semantics include:
 
 ```text
 host/chez and Jolt core
-  target, clocks, byte storage, process, Java host shims
-                |
-             jolt.ffi
-                |
-             jolt-net
-  addresses, owned sockets, native errors, byte I/O, readiness
-                |
-             jolt-tcp
-  scheduling, backpressure, streams, connection lifecycle
-                |
-             jolt-http
-  HTTP parsing, framing, messages, bodies, Ring-shaped integration
+  targets, clocks, arrays/copy/borrow, process, Java host shims
+           /                                  \
+        jolt.ffi                    incubating jolt.bytes
+  calls, ABI, native memory       Window and provisional Cursor
+           \                                  /
+                         jolt-net
+       addresses, owned sockets, native errors, byte I/O, readiness
+                              |
+                          jolt-tcp
+       scheduling, backpressure, completion, streams, lifecycle
+                              |
+                          jolt-http
+       HTTP parsing, framing, messages, bodies, Ring-shaped integration
 ```
 
 Raw pointers, descriptors, native layouts, and error slots do not cross above
@@ -331,14 +340,16 @@ The selected placement and exposure are:
 
 | Capability | Canonical implementation | Native Jolt exposure | Java-interop exposure | Destination |
 | --- | --- | --- | --- | --- |
-| Target, ABI, monotonic clock, byte representation, host errors | `host/chez` with `jolt-core` wrappers | `jolt.host/*`, byte arrays, and narrow public helpers | `System/nanoTime`, array, and host-class shims where already idiomatic | Core; **both** facades over one implementation |
-| Foreign calls, native memory, callbacks, aggregates, borrowed slices | `jolt.ffi` | `jolt.ffi` is canonical | No JNA/JNI emulation | Core; **native only** |
+| Target, ABI, monotonic clock, and host errors | `host/chez` with `jolt-core` wrappers | `jolt.host/*` and narrow public helpers | `System/nanoTime` and host-class shims where already idiomatic | Core; **both** facades over one implementation |
+| Byte arrays, indexed access, signed-byte fidelity, overlap-safe copy, and scoped FFI borrow | Existing core array/runtime support | Byte arrays and narrow bulk-copy/borrow primitives | Array and `ByteBuffer` adapters over the same storage rules | Core; **both** facades over one implementation |
+| Validated byte views and traversal | Incubating dependency-free `jolt.bytes` | Stable immutable `Window`; provisional strict `Cursor` | A `ByteBuffer` adapter may use the same storage, but is not the native abstraction | Incubate outside networking, then consider stdlib; **native**, with a separate interop adapter |
+| Foreign calls, native memory, callbacks, aggregates, borrowed slices, and atomic native-error capture | `jolt.ffi` | `jolt.ffi` is canonical | No JNA/JNI emulation | Core; **native only** |
 | Child process lifecycle and argv spawning | POSIX/Win32 backends behind one process engine | Proposed argv-oriented host operation; `jolt.host/sh` remains shell-oriented | Bounded `ProcessBuilder`, `Process`, and `ProcessHandle` adapters | Core; **both** facades over one process engine |
 | Class/member registration and provider loading | Host-class registry plus loader/build integration | Registration/provider functions for libraries and build tooling | Constructor/static/instance retry mechanism | Core; **both**, because this is the bridge |
 | Fundamental concurrency needed by common Clojure libraries | Chez/Jolt concurrency engine | Futures, promises, and small Jolt-native primitives | Audited `java.util.concurrent` members | Core; **both** facades over one semantic implementation |
 | File, stream, charset, and bulk-copy basics | Existing host I/O and dependency-free Clojure wrappers | `clojure.java.io`, byte arrays, and stream protocols remain Clojure APIs despite historical names | Selected File, stream, writer, channel, and charset adapters | Core/stdlib according to current ownership; **both** facades over shared representations |
-| Addresses, DNS, owned sockets, native byte I/O, readiness, connect completion | `jolt.net` | `jolt.net` is canonical | None in this namespace | Incubate in jolt-net, then upstream to stdlib after runtime gates; **native only** |
-| TCP scheduling, backpressure, and stream lifecycle | jolt-tcp over jolt.net | Existing Clojure/Teensyp-shaped API; a cleaner native facade may be additive | Consumed by the optional NIO facade, never reimplemented there | External ecosystem library; native API plus an adapter consumer |
+| Addresses, DNS, owned sockets, native errors, byte-I/O attempts, readiness, and connect completion | `jolt.net` | `jolt.net` is canonical; readiness stays a substrate concern | None in this namespace | Incubate in jolt-net, then upstream to stdlib after runtime gates; **native only** |
+| TCP scheduling, deadlines, backpressure, completion, cancellation, operation-length leases, and stream lifecycle | jolt-tcp over jolt.net | Existing Clojure/Teensyp-shaped API; a cleaner native facade may be additive | Consumed by the optional NIO facade, never reimplemented there | External ecosystem library; native API plus an adapter consumer |
 | HTTP parsing, framing, streaming bodies, Ring integration | jolt-http over jolt-tcp | `jolt.http.*` and Ring/Capra-shaped Clojure APIs | No Java HTTP-client/server emulation; exact Capra may consume lower interop internally | External ecosystem library; **native/Clojure only** |
 | Socket channels, selectors, keys, options, Teensyp proxy streams | Optional facade over jolt-net/jolt-tcp | No competing native transport API | Selected `java.nio.*`, `java.net.*`, and Teensyp helper classes | External `jolt.compat.*` library initially; **interop only** |
 | Time implementation and Java time registrations | jolt-lang/time | `jolt.time` namespaces | Selected `java.time` classes, constants, and formatters | External ecosystem library; **both** facades |
@@ -370,6 +381,104 @@ Java names are therefore not the abstraction boundary. They are source
 compatibility entry points. Native APIs remain free to express Jolt ownership,
 deadline, byte-window, and lifecycle rules directly, while adapters translate
 the bounded Java contract into those operations.
+
+### Bytes are not networking
+
+The fact that byte windows were first needed by sockets does not make them a
+networking abstraction. Core owns the representations and unsafe mechanisms:
+arrays, indexed access, signed-byte fidelity, overlap-safe copy, and a scoped
+borrow that cannot escape an FFI call. An incubating, dependency-free
+`jolt.bytes` namespace may build the first safe view over those mechanisms:
+
+```clojure
+(bytes/window array)
+(bytes/window array start end)
+(bytes/slice window start)
+(bytes/slice window start end)
+```
+
+`Window` is an immutable descriptor over mutable, aliased storage. Its bounds
+do not change; its contents are neither a snapshot nor value-equal by default.
+The relative `start` and `end` arguments to `slice` are strict half-open bounds.
+A valid slice is O(1), shares the same backing storage, and cannot escape its
+parent window.
+
+`Window` implements `Seqable`, `Counted`, `Indexed`, `IReduce`, and
+`IReduceInit`, with signed byte values matching Clojure/JVM byte-array
+semantics. It does not claim `Sequential`, persistent-collection operations, or
+content equality. Core `drop` and `take` remain useful sequence projections,
+but they produce lazy sequences, may traverse to find their first result, and
+discard backing-store and lease identity. They are not the
+ownership-preserving slice operation. This RFD therefore does not define a
+public `drop-prefix`.
+
+`Cursor` is provisionally an immutable `{window, position}` pair with strict
+bounds and no collection protocols. Its public shape is not frozen until
+allocation and throughput evidence shows that a cursor abstraction is better
+than explicit offsets.
+
+Java `ByteBuffer` remains an interop type with Java cursor semantics; making it
+`Seqable` would create behavior absent on the JVM and is rejected. It may share
+the same underlying byte representation and copy implementation without
+becoming the canonical native view.
+
+Before `Window` can claim idiomatic collection behavior, core must correct four
+generic protocol-dispatch gaps:
+
+- `seqable?`, `counted?`, and `indexed?` must recognize custom protocol
+  implementations just as `seq`, `count`, and `nth` already do;
+- two-argument `reduce` must honor custom `IReduce`;
+- timed `deref` must honor custom `IBlockingDeref`; and
+- `realized?` must honor custom `IPending`.
+
+Those are general Clojure compatibility fixes, not byte-window special cases.
+
+### Completions are future-shaped, not native-I/O Futures
+
+A native I/O operation may retain access to a submitted byte window after a
+caller requests cancellation. Jolt's current Future cancellation can mark a
+Future done even when its worker cannot be interrupted. Consequently,
+`future-cancel`, `future-done?`, or an observation timeout cannot be treated as
+permission to reuse leased storage.
+
+The initial completion abstraction therefore belongs with the operation and
+lease policy in jolt-tcp, not jolt-net. A completion implements `IDeref`, timed
+`IBlockingDeref`, and `IPending`, and exposes an explicit nonblocking
+`outcome`. Its terminal data is:
+
+```clojure
+{:status :succeeded :value value}
+{:status :failed :exception ex}
+{:status :cancelled :exception cancellation-ex}
+```
+
+Untimed or timed deref returns the success value and throws the stored failure
+or cancellation exception. A timed deref timeout ends only that observation:
+it does not cancel the operation or release the window. `cancel!` is a
+two-phase request. `realized?` stays false, `outcome` stays nil, and the window
+stays unavailable to the caller until native access has ended and exactly one
+terminal outcome has been published.
+
+This contract deliberately does not implement Jolt Future or promise
+cancellation. Exact Future compatibility would require copying submitted
+bytes, blocking until cancellation is acknowledged, or a backend guarantee
+that cancellation has synchronously ended every native access.
+
+The abstraction should remain local, for example `teensyp.completion`, until a
+second independent consumer demonstrates a generic home such as
+`jolt.io.completion`. Likewise, exact/all/copy loops may be explored as pure
+`jolt.io.transfer` functions over private handler maps, but this RFD does not
+freeze public `TryByteSource` or `TryByteSink` protocols. jolt-net readiness is
+a legitimate native substrate API; it remains private beneath any later
+portable TCP operation/completion API.
+
+Completion vocabulary must stay exact. “Bytes accepted” means that the owning
+layer accepted or queued bytes under its documented ownership contract; it
+does not prove peer delivery. “Flushed” means that the documented in-process
+or OS buffer boundary was crossed; it does not imply remote observation,
+filesystem visibility, or durable storage unless a separate capability says
+so. Operation deadline, observer timeout, cancellation request, terminal
+cancellation, EOF, reset, and close are distinct outcomes.
 
 ### jolt-net should graduate to stdlib; TCP and HTTP should not move with it
 
@@ -461,6 +570,47 @@ This could maximize source reuse, but it would force jolt-net and future native
 backends through Java object/readiness semantics and make a large compatibility
 surface load-bearing. It also risks inheriting source defects. Rejected.
 
+### Put byte windows and cursors in jolt-net
+
+Sockets were the first consumer, but codecs, files, FFI calls, in-memory
+structures, and disk formats need the same bounds and traversal semantics.
+Networking ownership would either force those users to depend on an unrelated
+transport library or invite duplicate view types. Core byte mechanisms plus an
+incubating dependency-free `jolt.bytes` view are selected. Rejected.
+
+### Use `drop` as the byte-window slice operation
+
+`drop` is idiomatic when a sequence projection is wanted, and `Window`
+deliberately supports it through `Seqable`. It is not an O(1),
+structure-preserving operation: the result is a lazy sequence without the
+window's backing-store, bounds, or lease identity. `slice` is selected for
+window-preserving views; a public `drop-prefix` synonym is unnecessary.
+Rejected.
+
+### Make Java `ByteBuffer` Seqable
+
+This would make some native-looking Clojure expressions convenient but would
+invent behavior that Java `ByteBuffer` does not have on the JVM. It also
+confuses a mutable Java cursor with the immutable native `Window` descriptor.
+The interop facade keeps Java semantics. Rejected.
+
+### Expose readiness or would-block through a portable I/O API
+
+Readiness is a valid jolt-net substrate contract and a useful implementation
+tool for POSIX pollers. It is not shared naturally by completion-oriented
+backends such as IOCP or `io_uring`, and it exposes retry policy to otherwise
+pure Clojure state machines. A future portable API should expose operations,
+completion, deadlines, and cancellation while keeping readiness beneath its
+backend. Rejected.
+
+### Treat Future cancellation as terminal native-I/O cancellation
+
+Jolt may report a Future cancelled even when its worker cannot be interrupted.
+Publishing that state as permission to reuse a zero-copy byte window creates a
+use-after-release race. Explicit two-phase `cancel!` with terminal
+acknowledgement is selected. Exact Future compatibility requires copying,
+synchronous native cancellation, or a stronger backend guarantee. Rejected.
+
 ### Replace jolt-tcp with jolt-net
 
 jolt-net deliberately owns the native substrate, not TCP scheduling,
@@ -515,6 +665,16 @@ would double the proof and platform matrix while giving differential results
 no clear oracle. Thin Java-shaped adapters over the canonical native facility
 are selected wherever both exposures exist. Rejected.
 
+### Freeze generic byte source and sink protocols now
+
+The operation shapes required by jolt-net, JVM streams, files, deterministic
+fakes, and completion-oriented backends have not yet been shown equivalent.
+Freezing `TryByteSource` or `TryByteSink` from the first socket use case would
+make readiness and would-block semantics unnecessarily public. Private handler
+maps and experimental pure `jolt.io.transfer` algorithms are sufficient until
+at least Jolt, JVM, and fake implementations pass one conformance corpus.
+Rejected.
+
 ## Implementation plan
 
 Each slice is independently reviewable. Existing working implementations stay
@@ -523,6 +683,12 @@ available until the replacement passes its gates.
 ### Phase 1: finish core proposal foundations
 
 - Land the reviewed host/FFI stack in dependency order.
+- Add atomic native-error capture to the FFI declaration surface and verify
+  that callers receive the return value and matching error from one foreign
+  transition.
+- Correct custom `Seqable`/`Counted`/`Indexed` predicates, two-argument
+  `IReduce`, timed `IBlockingDeref`, and `IPending` dispatch before higher
+  layers depend on them.
 - Complete transactional Git dependency behavior on native Windows.
 - Add a genuine argv-oriented Windows process backend while retaining
   `jolt.host/sh` for actual shell programs.
@@ -537,6 +703,8 @@ available until the replacement passes its gates.
 - Prove source mode, add-deps, load-order, and built-application behavior.
 - Complete strict `ByteBuffer`, charsets, `ThreadLocal`, null input stream,
   `TimeUnit`, and streaming bulk copy.
+- Incubate signed-byte `Window` and structure-preserving `slice`; keep `Cursor`
+  provisional and do not add collection semantics to `ByteBuffer`.
 - Add an exact Teensyp/Capra API manifest test.
 
 The runtime registry can land before project/deps metadata plumbing if the
@@ -544,6 +712,8 @@ latter would entangle unrelated dependency work.
 
 ### Phase 3: concurrency semantics
 
+- Implement and model the jolt-tcp-local completion outcome and two-phase
+  cancellation contract before any submitted window is reused.
 - Implement the required bounded queue and concurrent set subset.
 - Add reentrant conditions with exact hold-count restoration.
 - Add one-permit park/unpark.
@@ -604,10 +774,10 @@ capability complete before its prerequisite gate passes.
 
 | Order | Repository or proposal slice | Delivers | May depend on | Exit gate |
 | --- | --- | --- | --- | --- |
-| 1 | `casselc/jolt`: target, clock, byte, FFI, host identity, and dependency slices | Universal mechanisms and reviewed ABI surface | Upstream Jolt baseline | Existing unit/AOT/FFI suites plus native target gates |
-| 2 | `casselc/jolt`: provider registry and universal host shims | Demand-loaded external providers and shared semantic fixes | Order 1 | Conflict, cycle, exact-one-retry, source, add-deps, and built-application tests |
+| 1 | `casselc/jolt`: target, clock, byte mechanisms, generic protocol dispatch, FFI, host identity, and dependency slices | Universal mechanisms and reviewed ABI surface | Upstream Jolt baseline | Existing unit/AOT/FFI suites plus native target gates |
+| 2 | `casselc/jolt`: provider registry, universal host shims, and incubating byte views | Demand-loaded external providers, shared semantic fixes, stable `Window`, and provisional `Cursor` | Order 1 | Conflict, cycle, exact-one-retry, source, add-deps, built-application, and byte-view conformance tests |
 | 3 | `jolt-net` | Canonical socket substrate on Linux, macOS, and Windows | Pinned orders 1-2 | Real blocking, nonblocking, readiness, wake, close, and lifecycle suites on each claimed platform |
-| 4 | `jolt-tcp` | Scheduling, backpressure, streams, and connection lifecycle over jolt-net | Pinned order 3 | Existing TCP proofs, deterministic failure controls, and real loopback suites |
+| 4 | `jolt-tcp` | Scheduling, backpressure, completion/cancellation, streams, and connection lifecycle over jolt-net | Pinned order 3 | Existing TCP and completion-lease proofs, deterministic failure controls, and real loopback suites |
 | 5 | `jolt-http` | Hardened HTTP and Ring-shaped integration over jolt-tcp | Pinned order 4 | Parser/framing proofs, body/producer lifecycle, pipelining, and cross-platform functional tests |
 | 6 | `jolt-hegel` | Direct use of the upstreamed FFI surface while remaining separately released | Pinned order 1 | Native libhegel matrix, AOT identity, shrinking, stateful, and `clojure.test` integration |
 | 7 | `jolt-time` and core I/O/concurrency follow-ups | Exact broadly useful semantics needed by audited source | Pinned order 2 | Focused semantic models and regression tests |
@@ -649,6 +819,11 @@ examples, but neither should define the base API.
 
 ### Buffers and concurrency
 
+- Every valid `Window` slice stays within both the parent bounds and backing
+  capacity, including empty and full-window boundaries.
+- `Window` sequence, indexed, and reduced traversals yield the same signed
+  byte sequence without changing its descriptor.
+- A provisional cursor never advances before zero or beyond its window.
 - `0 <= position <= limit <= capacity` always holds.
 - Duplicate buffers share bytes but not cursor state.
 - `compact` preserves the exact remaining sequence.
@@ -659,7 +834,8 @@ examples, but neither should define the base API.
 
 ### Native I/O and lifecycle
 
-- Native errors are captured before any cleanup call.
+- A native return value and its matching error are captured atomically before
+  allocation, cleanup, callback, or another foreign call can overwrite it.
 - Every owned native handle closes once.
 - Old descriptor generations and registration revisions cannot produce current
   events.
@@ -667,6 +843,14 @@ examples, but neither should define the base API.
 - EOF, half-close, reset, cancellation, timeout, and close remain distinct.
 - Wake and close retire active waits and wake resources within bounded time.
 - Submitted byte windows remain owned until their operation completes.
+- A completion publishes exactly one terminal outcome using a linearizable
+  transition.
+- Native access and the lease end before terminal notification; terminal
+  observation is the first point at which the caller may reuse the window.
+- A cancel request and an observer timeout cannot publish terminal
+  cancellation or release a window by themselves.
+- Close, cancellation, and native completion races preserve one terminal
+  publication and one release.
 
 ### TCP and HTTP
 
@@ -679,8 +863,10 @@ examples, but neither should define the base API.
 
 Every solver proof records source anchors, assumptions, a corrected model, a
 buggy control with a witness, a non-vacuity control, and reproduction commands.
-Models complement real native and concurrency tests; they do not substitute for
-them.
+The byte-window containment and completion-lease models are recorded with the
+RFD's supplementary invariant note. Models complement real native and
+concurrency tests; they do not substitute for them or prove behavior through a
+retained raw-array alias.
 
 ## Performance considerations
 
@@ -751,5 +937,6 @@ already reviewed lower layers.
 - `jolt-http/docs/proofs/http-fail-closed.md`.
 - `jolt-http/docs/proofs/inline-resume-capacity.md`.
 - `jolt-hegel/docs/CORE-JOLT-INTEGRATION-SPIKE.md`.
+- `docs/bytes-io-completion-invariants.md`.
 - `docs/aot-cache-provenance-invariants.md`.
 - `docs/audit-index-2026-07-24.md`.
