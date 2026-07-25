@@ -23,6 +23,7 @@
 (define class-provider-eval-owner #f)
 (define class-provider-attempt-counter 0)
 (define class-provider-registry-generation 0)
+(define class-provider-registry-frozen? #f)
 (define class-provider-load-stack (make-thread-parameter '()))
 
 ;; A provider's Clojure-visible registration hooks append mutations here while
@@ -94,6 +95,18 @@
       (keyword #f "existing-provider") old
       (keyword #f "new-provider") provider)))
 
+(define (class-provider-frozen! class provider)
+  (class-provider-error
+    "class-provider-registry-frozen"
+    (string-append
+      "Class-provider registry is frozen; declare " class
+      " in resolved deps.edn metadata")
+    (jolt-hash-map
+      (keyword #f "class") class
+      (keyword #f "provider") provider
+      (keyword #f "registry-generation")
+      class-provider-registry-generation)))
+
 (define (class-provider-wait-evaluator-locked! self)
   (let loop ()
     (when (and class-provider-eval-owner
@@ -115,7 +128,10 @@
                  (old (or (hashtable-ref pending class #f)
                           (hashtable-ref class-providers-tbl class #f))))
             (cond
-              ((not old) (hashtable-set! pending class provider))
+              ((not old)
+               (if class-provider-registry-frozen?
+                   (class-provider-frozen! class provider)
+                   (hashtable-set! pending class provider)))
               ((string=? old provider) #f)
               (else (class-provider-conflict! class old provider)))))
         (with-mutex class-provider-mu
@@ -123,9 +139,12 @@
           (let ((old (hashtable-ref class-providers-tbl class #f)))
             (cond
               ((not old)
-               (hashtable-set! class-providers-tbl class provider)
-               (set! class-provider-registry-generation
-                     (+ class-provider-registry-generation 1)))
+               (if class-provider-registry-frozen?
+                   (class-provider-frozen! class provider)
+                   (begin
+                     (hashtable-set! class-providers-tbl class provider)
+                     (set! class-provider-registry-generation
+                           (+ class-provider-registry-generation 1)))))
               ((string=? old provider) #f)
               (else (class-provider-conflict! class old provider))))))
     jolt-nil))
@@ -154,7 +173,10 @@
                                 (hashtable-ref pending class #f)
                                 (hashtable-ref class-providers-tbl class #f))))
                   (cond
-                    ((not old) (hashtable-set! batch class provider))
+                    ((not old)
+                     (if class-provider-registry-frozen?
+                         (class-provider-frozen! class provider)
+                         (hashtable-set! batch class provider)))
                     ((string=? old provider) #f)
                     (else (class-provider-conflict! class old provider)))))
               normalized)
@@ -174,7 +196,10 @@
                        (old (or (hashtable-ref pending class #f)
                                 (hashtable-ref class-providers-tbl class #f))))
                   (cond
-                    ((not old) (hashtable-set! pending class provider))
+                    ((not old)
+                     (if class-provider-registry-frozen?
+                         (class-provider-frozen! class provider)
+                         (hashtable-set! pending class provider)))
                     ((string=? old provider) #f)
                     (else (class-provider-conflict! class old provider)))))
               normalized)
@@ -196,9 +221,19 @@
     (hashtable-clear! class-providers-tbl)
     (hashtable-clear! class-provider-states-tbl)
     (hashtable-clear! class-provider-stable-waiters)
+    (set! class-provider-registry-frozen? #f)
     (set! class-provider-registry-generation
           (+ class-provider-registry-generation 1)))
   (class-provider-register-many! pairs))
+
+;; Close the provider world around the resolved dependency graph. Identical
+;; declarations remain idempotent, but no new class key may be introduced after
+;; this point. Source/REPL/add-deps execution deliberately never calls this.
+(define (class-provider-freeze!)
+  (with-mutex class-provider-mu
+    (class-provider-wait-evaluator-locked! (get-thread-id))
+    (set! class-provider-registry-frozen? #t))
+  jolt-nil)
 
 ;; Append one provider-owned registration mutation to the current evaluation
 ;; stage.  Returns #t when staged and #f outside provider evaluation.
@@ -260,7 +295,10 @@
               class-providers-tbl (lambda (x) x))))
         (provider-generation
           (with-mutex class-provider-mu
-            class-provider-registry-generation)))
+            class-provider-registry-generation))
+        (provider-frozen?
+          (with-mutex class-provider-mu
+            class-provider-registry-frozen?)))
     (vector
       provider-table
       provider-generation
@@ -280,12 +318,14 @@
       jolt-pr-readable-arms
       jolt-compare-arms
       jolt-class-arms
-      jt-user-value-tags-arms)))
+      jt-user-value-tags-arms
+      provider-frozen?)))
 
 (define (class-provider-world-restore! snapshot)
   (with-mutex class-provider-mu
     (set! class-providers-tbl (vector-ref snapshot 0))
-    (set! class-provider-registry-generation (vector-ref snapshot 1)))
+    (set! class-provider-registry-generation (vector-ref snapshot 1))
+    (set! class-provider-registry-frozen? (vector-ref snapshot 16)))
   (set! class-statics-tbl (vector-ref snapshot 2))
   (set! class-ctors-tbl (vector-ref snapshot 3))
   (set! mutable-statics-tbl (vector-ref snapshot 4))
@@ -301,11 +341,7 @@
   (set! jolt-class-arms (vector-ref snapshot 14))
   (set! jt-user-value-tags-arms (vector-ref snapshot 15))
   ;; The restored hierarchy is authoritative; discard every derived cache.
-  (with-mutex jch-cache-mutex
-    (set! jch-closure-cache (make-hashtable string-hash string=?))
-    (set! jch-tags-cache (make-hashtable string-hash string=?)))
-  (set! jch-known-cache #f)
-  (set! jch-simple->fqn-cache #f))
+  (jch-invalidate-caches!))
 
 (define (class-provider-commit-stage! stage)
   (let ((snapshot (class-provider-world-snapshot)))

@@ -89,4 +89,35 @@
               (ev "(java.io.ByteArrayInputStream. (byte-array [1]))"))
             #f)
 
+;; A provider may extend the class graph after all four derived caches have
+;; answered a miss. The new row must become visible immediately and its simple
+;; name must resolve to the newly registered canonical FQN.
+(define dynamic-provider-class "fixture.ProviderAddedInterface")
+(define dynamic-provider-simple "ProviderAddedInterface")
+(gate-check "dynamic class initial known miss"
+            (jch-known? dynamic-provider-class)
+            #f)
+(gate-check "dynamic class initial simple-name miss"
+            (jch-fqn-of-simple dynamic-provider-simple)
+            dynamic-provider-simple)
+(gate-check "dynamic class initial tag miss"
+            (contains-string?
+              (jch-tags dynamic-provider-class)
+              "java.lang.AutoCloseable")
+            #f)
+(jch-register-supers!
+  dynamic-provider-class
+  '("java.lang.AutoCloseable"))
+(gate-check "dynamic class invalidates known cache"
+            (jch-known? dynamic-provider-class)
+            #t)
+(gate-check "dynamic class invalidates simple-name cache"
+            (jch-fqn-of-simple dynamic-provider-simple)
+            dynamic-provider-class)
+(gate-check "dynamic class invalidates closure/tag caches"
+            (contains-string?
+              (jch-tags dynamic-provider-class)
+              "java.lang.AutoCloseable")
+            #t)
+
 (gate-summary "host-class-registry")
