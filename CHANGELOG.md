@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports; callers must still read it *before* any cleanup call, since
   `close`/`free` will overwrite it. Unknown targets fail closed rather than
   guessing a symbol. `jolt.ffi/errno-source` reports which strategy is live.
+  This accessor is not a failure boundary for a collect-safe call, because
+  runtime reactivation may already have overwritten the slot; such bindings
+  use the atomic option below.
 - **Atomic native-error FFI results.** `jolt.ffi/foreign-fn` and `defcfn` accept
   `{:capture-native-error true}` and return `[native-result error-code]` for
   that binding. Chez captures `errno` on POSIX or the Windows last-error slot in
