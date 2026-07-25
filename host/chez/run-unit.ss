@@ -15,6 +15,12 @@
 ;; ns-has-vars? arm and the overlay fns are missing at analysis.
 (load "host/chez/loader.ss")
 (set-source-roots! ldr-install-roots)
+;; Match cli.ss: the loader snapshots baked namespaces before the host FFI
+;; primitives are installed. Requiring jolt.ffi must then load its Clojure macro
+;; side while resolving load-library/alloc/etc to these real vars. The older
+;; analyzer's arbitrary qualified-symbol fallback accidentally hid this missing
+;; harness step by compiling ffi/load-library as a fictitious host static.
+(load "host/chez/java/ffi.ss")
 ;; The base java.time API (stdlib/jolt/time) autoloads on first java.time.* use at
 ;; runtime; here we load it once BEFORE the per-case snapshot below so its
 ;; value-semantics arms (impl/install-seams!) and class registrations are part of
@@ -67,6 +73,7 @@
   (hashtable-clear! ns-alias-table)
   (hashtable-clear! ns-refer-table)
   (hashtable-clear! ns-refer-all-table)
+  (hashtable-clear! class-import-table)
   (clear-thread-interrupt!)   ; a case that set the runner thread's interrupt flag mustn't leak
   (when zj-ghier (jolt-invoke (var-deref "clojure.core" "reset!")
                    (var-cell-root zj-ghier) (jolt-invoke (var-deref "clojure.core" "make-hierarchy"))))

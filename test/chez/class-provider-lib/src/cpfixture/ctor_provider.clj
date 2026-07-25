@@ -1,7 +1,7 @@
 (ns cpfixture.ctor-provider
-  (:require [cpfixture.catalog :as catalog]))
+  (:require [cpfixture.state :as state]))
 
-(catalog/note-load! :ctor)
+(state/note-load! :ctor)
 
 (defn- lazy-ctor? [x]
   (and (jolt.host/table? x)

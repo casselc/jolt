@@ -40,11 +40,15 @@
                                    " not found — tried " (pr-str cands) " for " (name plat))
                               {:native spec})))))))))
 
-;; Apply a resolved project's roots on top of the current (jolt-core) roots so app
-;; namespaces resolve while jolt.* stays loadable, then load its native deps.
-(defn- apply-project! [{:keys [roots natives]}]
-  (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
-  (load-natives! natives))
+;; Establish dependency-owned host facilities before exposing source roots.
+;; set-source-roots! may immediately scan/load data readers, so provider metadata
+;; and native libraries must already be available to any namespace it reaches.
+(defn- apply-project! [{:keys [roots natives class-providers]}]
+  (when (seq class-providers)
+    (jolt.host/register-class-providers! class-providers))
+  (load-natives! natives)
+  (jolt.host/set-source-roots!
+    (vec (distinct (concat roots (jolt.host/source-roots))))))
 
 ;; Consume the first standalone "--" (POSIX end-of-options marker); everything
 ;; else — including any later "--" — is left as literal program data.
@@ -175,8 +179,13 @@
 (defn- repl []
   ;; resolve the project so deps (git libs) are on the roots and native libs are
   ;; loaded — same context a run gets, so (require '[some.lib]) works in the REPL.
-  (try (apply-project! (deps/resolve-project (project-dir)))
-       (catch :default _ nil))
+  (try
+    (apply-project! (deps/resolve-project (project-dir)))
+    (catch :default e
+      ;; A missing/empty project is still a friendly bare REPL fallback. A
+      ;; provider conflict is a deterministic graph error and must not disappear.
+      (when (= :jolt.deps/class-provider-conflict (:type (ex-data e)))
+        (throw e))))
   ;; REPL-driven development: trace by default so an uncaught error in evaluated
   ;; code shows a tail-frame backtrace, no JOLT_TRACE needed (JOLT_TRACE=0 opts out).
   (jolt.host/enable-trace!)
@@ -332,8 +341,13 @@
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake?)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack))))))
+          (jolt.host/build-library
+            entry out mode natives embed-dirs project-paths
+            (:class-providers resolved) direct-link? tree-shake?)
+          (jolt.host/build-binary
+            entry out mode natives embed-dirs project-paths
+            (:class-providers resolved) direct-link? tree-shake?
+            target target-pack))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the

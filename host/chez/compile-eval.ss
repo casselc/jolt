@@ -176,12 +176,15 @@
             (cadr items) x))
       x))
 
-;; Pre-register any (require ...)/(use ...) :as aliases under `ns` BEFORE analysis,
-;; so a qualified s/foo resolves while compiling (analysis precedes the runtime
-;; require). Walks the whole form (a require may be nested in a do/let).
+;; Pre-register require/use aliases and class imports under `ns` BEFORE analysis,
+;; so qualified vars and imported constructor/static tokens resolve while
+;; compiling (analysis precedes the runtime setup form). Walks the whole form.
 (define (ce-clause-require? cl)          ; (:require ...) / (:use ...) ns clause
   (and (pair? cl) (keyword? (car cl))
        (let ((kn (keyword-t-name (car cl)))) (or (string=? kn "require") (string=? kn "use")))))
+(define (ce-clause-import? cl)
+  (and (pair? cl) (keyword? (car cl))
+       (string=? (keyword-t-name (car cl)) "import")))
 (define (ce-scan-requires! form ns)
   (when (and (cseq? form) (cseq-list? form))
     (let ((items (seq->list form)))
@@ -193,6 +196,12 @@
             ;; (require spec...) / (use spec...) — specs are quoted
             ((and hn (or (string=? hn "require") (string=? hn "use")))
              (for-each (lambda (a) (chez-register-spec! ns (ce-unquote a))) (cdr items)))
+            ;; (import [pkg Class ...]) — the macro later performs value-position
+            ;; bindings; canonical class identity must exist for this analysis.
+            ((and hn (string=? hn "import"))
+             (chez-register-import-specs!
+               ns
+               (map ce-unquote (cdr items))))
             ;; (ns name (:require [a :as x]) ...) — clause specs are literal. Register
             ;; the aliases under NAME (the ns being defined), not the passed `ns`:
             ;; when a file is loaded its ns form compiles while (chez-current-ns) is
@@ -200,15 +209,36 @@
             ;; aliases into its requirer and clobber a same-named alias there
             ;; (rewrite-clj.zip.base's [node.protocols :as node] over the caller's node).
             ((and hn (string=? hn "ns"))
-             (let ((ns-name (if (and (pair? (cdr items)) (symbol-t? (ce-unwrap-meta (cadr items))))
-                                (symbol-t-name (ce-unwrap-meta (cadr items)))
-                                ns)))
-               (for-each (lambda (clause)
-                           (when (and (cseq? clause) (cseq-list? clause))
-                             (let ((cl (seq->list clause)))
-                               (when (ce-clause-require? cl)
-                                 (for-each (lambda (spec) (chez-register-spec! ns-name spec)) (cdr cl))))))
-                         (if (pair? (cdr items)) (cddr items) '()))))
+             (let* ((ns-name
+                      (if (and (pair? (cdr items))
+                               (symbol-t? (ce-unwrap-meta (cadr items))))
+                          (symbol-t-name (ce-unwrap-meta (cadr items)))
+                          ns))
+                    (clauses
+                      (if (pair? (cdr items)) (cddr items) '())))
+               (for-each
+                 (lambda (clause)
+                   (when (and (cseq? clause) (cseq-list? clause))
+                     (let ((cl (seq->list clause)))
+                       (when (ce-clause-require? cl)
+                         (for-each
+                           (lambda (spec)
+                             (chez-register-spec! ns-name spec))
+                           (cdr cl))))))
+                 clauses)
+               ;; Treat every :import clause in the ns form as one declaration
+               ;; batch. If any alias conflicts, none of the mappings survive
+               ;; the failed compilation.
+               (chez-register-import-specs!
+                 ns-name
+                 (apply append
+                        (map
+                          (lambda (clause)
+                            (if (and (cseq? clause) (cseq-list? clause))
+                                (let ((cl (seq->list clause)))
+                                  (if (ce-clause-import? cl) (cdr cl) '()))
+                                '()))
+                          clauses)))))
             (else (for-each (lambda (x) (ce-scan-requires! x ns)) items))))))))
 
 ;; --- success-type lint (RFC 0006), opt-in via JOLT_CHECK --------------------

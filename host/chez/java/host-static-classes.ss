@@ -887,16 +887,28 @@
     (if (jolt-nil? s) acc
         (let ((e (jolt-first s)))
           (loop (jolt-seq (jolt-rest s)) (cons (cons (jolt-nth e 0) (jolt-nth e 1)) acc))))))
+
+;; Provider-owned registrations are transactional: evaluating a provider
+;; namespace stages every registry mutation, and the coordinator publishes the
+;; batch only after the namespace returns successfully.  Ordinary application
+;; registrations still take effect immediately.
+(define (class-provider-register-operation! proc)
+  (unless (class-provider-stage-operation! proc) (proc))
+  jolt-nil)
+
 (def-var! "clojure.core" "__register-class-ctor!"
-  (lambda (name proc) (register-class-ctor! name proc) jolt-nil))
+  (lambda (name proc)
+    (class-provider-register-operation!
+      (lambda () (register-class-ctor-exact! name proc)))))
 (def-var! "clojure.core" "__register-class-statics!"
-  (lambda (name members) (register-class-statics! name (jmap->static-alist members)) jolt-nil))
+  (lambda (name members)
+    (let ((pairs (jmap->static-alist members)))
+      (class-provider-register-operation!
+        (lambda () (register-class-statics-exact! name pairs))))))
 (def-var! "jolt.host" "register-class-providers!"
   (lambda (providers)
-    (for-each
-      (lambda (p) (class-provider-register-one! (car p) (cdr p)))
-      (jmap->static-alist providers))
-    jolt-nil))
+    (class-provider-register-many! (jmap->static-alist providers))))
+(def-var! "jolt.host" "class-provider-state" class-provider-state)
 
 ;; ---- tagged-table method dispatch + pluggable instance? --------------------
 ;; A jolt library can build stateful host objects with (jolt.host/tagged-table
@@ -929,7 +941,10 @@
             'pass)))))
 
 (def-var! "clojure.core" "__register-class-methods!"
-  (lambda (tag members) (register-tagged-methods! tag (jmap->static-alist members)) jolt-nil))
+  (lambda (tag members)
+    (let ((pairs (jmap->static-alist members)))
+      (class-provider-register-operation!
+        (lambda () (register-tagged-methods! tag pairs))))))
 
 ;; String/symbol tags passed to __register-class-methods! are class extensions.
 ;; They are resolved through value-host-tags, so extension dispatch uses the same
@@ -938,8 +953,12 @@
 (define (class-extension-method obj method-name)
   (let loop ((tags (value-host-tags obj)))
     (and (pair? tags)
-         (let* ((mh (hashtable-ref tagged-methods-tbl (car tags) #f))
-                (f (and mh (hashtable-ref mh method-name #f))))
+         (let* ((tag (car tags))
+                (f (class-provider-call-stable
+                     tag
+                     (lambda (_)
+                       (let ((mh (hashtable-ref tagged-methods-tbl tag #f)))
+                         (and mh (hashtable-ref mh method-name #f)))))))
            (or f (loop (cdr tags)))))))
 (set! record-method-extension-dispatch
   (lambda (obj method-name rest-args)
@@ -980,7 +999,11 @@
             (let ((r ((car fs) tname val)))
               (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f))))))))
 (def-var! "clojure.core" "__register-instance-check!"
-  (lambda (f) (set! user-instance-checks (append user-instance-checks (list f))) jolt-nil))
+  (lambda (f)
+    (class-provider-register-operation!
+      (lambda ()
+        (set! user-instance-checks
+              (append user-instance-checks (list f)))))))
 
 ;; ---- value-semantics seams -------------------------------------------------
 ;; A library that models its own host values (java.time via jolt-lang/time) needs
@@ -992,29 +1015,39 @@
 ;; =/hash/compare/print.
 (def-var! "clojure.core" "__register-eq!"
   (lambda (pred handler)
-    (register-eq-arm! (lambda (a b) (jolt-truthy? (jolt-invoke pred a b)))
-                      (lambda (a b) (jolt-truthy? (jolt-invoke handler a b))))
-    jolt-nil))
+    (class-provider-register-operation!
+      (lambda ()
+        (register-eq-arm!
+          (lambda (a b) (jolt-truthy? (jolt-invoke pred a b)))
+          (lambda (a b) (jolt-truthy? (jolt-invoke handler a b))))))))
 (def-var! "clojure.core" "__register-hash!"
   (lambda (pred handler)
-    (register-hash-arm! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
-                        (lambda (x) (jolt-invoke handler x)))
-    jolt-nil))
+    (class-provider-register-operation!
+      (lambda ()
+        (register-hash-arm!
+          (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
+          (lambda (x) (jolt-invoke handler x)))))))
 (def-var! "clojure.core" "__register-str!"
   (lambda (pred render)
-    (register-str-render! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
-                          (lambda (x) (jolt-invoke render x)))
-    jolt-nil))
+    (class-provider-register-operation!
+      (lambda ()
+        (register-str-render!
+          (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
+          (lambda (x) (jolt-invoke render x)))))))
 (def-var! "clojure.core" "__register-pr!"
   (lambda (pred render)
-    (register-pr-arm! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
-                      (lambda (x) (jolt-invoke render x)))
-    jolt-nil))
+    (class-provider-register-operation!
+      (lambda ()
+        (register-pr-arm!
+          (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
+          (lambda (x) (jolt-invoke render x)))))))
 (def-var! "clojure.core" "__register-compare!"
   (lambda (pred handler)
-    (register-compare-arm! (lambda (a b) (jolt-truthy? (jolt-invoke pred a b)))
-                           (lambda (a b) (jolt-invoke handler a b)))
-    jolt-nil))
+    (class-provider-register-operation!
+      (lambda ()
+        (register-compare-arm!
+          (lambda (a b) (jolt-truthy? (jolt-invoke pred a b)))
+          (lambda (a b) (jolt-invoke handler a b)))))))
 
 ;; __register-class! makes a library's own host values answer (class x)/(type x)
 ;; AND dispatch protocols extended to their class. class-fn returns the class name;
@@ -1032,14 +1065,20 @@
 (define (jt-jolt-strs->list v)
   (let loop ((s (jolt-seq v)) (acc '()))
     (if (jolt-nil? s) (reverse acc) (loop (jolt-seq (jolt-rest s)) (cons (jolt-first s) acc)))))
+(define (register-user-class! pred class-fn tags-fn)
+  (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
+    (register-class-arm! p (lambda (x) (jolt-invoke class-fn x)))
+    (set! jt-user-value-tags-arms
+          (append jt-user-value-tags-arms
+                  (list
+                    (cons
+                      p
+                      (lambda (x)
+                        (jt-jolt-strs->list (jolt-invoke tags-fn x)))))))))
 (def-var! "clojure.core" "__register-class!"
   (lambda (pred class-fn tags-fn)
-    (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
-      (register-class-arm! p (lambda (x) (jolt-invoke class-fn x)))
-      (set! jt-user-value-tags-arms
-            (append jt-user-value-tags-arms
-                    (list (cons p (lambda (x) (jt-jolt-strs->list (jolt-invoke tags-fn x))))))))
-    jolt-nil))
+    (class-provider-register-operation!
+      (lambda () (register-user-class! pred class-fn tags-fn)))))
 
 ;; (instance? clojure.lang.IFoo x) for the core clojure.lang interfaces libraries
 ;; branch on — jolt's value model satisfies them, so report it. Matched by the

@@ -139,7 +139,7 @@
         nm (when (and (= :var (get fnode :op)) (= "clojure.core" (get fnode :ns)))
              (get fnode :name))
         math-op (when (and (= :host-static (get fnode :op))
-                           (= "Math" (get fnode :class)))
+                           (= "java.lang.Math" (get fnode :class)))
                   (get math-fl-ops (get fnode :member)))
         ars (mapv (fn [a] (an a tenv)) (get node :args))
         argnodes (mapv (fn [r] (nth r 1)) ars)

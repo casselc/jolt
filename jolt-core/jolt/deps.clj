@@ -889,12 +889,10 @@
 (defn- dep-source-roots
   "Source roots a resolved dep contributes. A Maven extraction's classpath root IS
   its source root; a git/local dep uses its deps.edn :paths (default [\"src\"])."
-  [root maven?]
+  [root maven? edn]
   (if maven?
     [root]
-    (let [edn (try (read-edn (str root "/deps.edn"))
-                   (catch :default e (warn (ex-message e)) nil))
-          paths (or (:paths edn) ["src"])]
+    (let [paths (or (:paths edn) ["src"])]
       (map #(abspath root %) paths))))
 
 ;; --- reconciliation ---------------------------------------------------------
@@ -921,11 +919,109 @@
       [:process (:name spec)]
       [:native (or (:name spec) (vec (sort (concat (cands :darwin) (cands :linux) (cands :win)))))])))
 
+;; A dependency may declaratively provide a Java compatibility class without
+;; requiring a global catalog namespace:
+;;
+;;   :jolt/class-providers {"com.acme.Widget" acme.widget-provider}
+;;
+;; Keep declarations with their origin through the graph walk. Reconcile only
+;; after traversal so conflicts cannot depend on BFS order or partially register.
+(defn- provider-token [x what origin]
+  (let [s (cond (string? x) x
+                (symbol? x) (str x)
+                :else nil)]
+    (when (or (nil? s) (str/blank? s))
+      (throw
+        (ex-info
+          (str what " must be a non-empty string or symbol")
+          {:type :jolt.deps/invalid-class-provider
+           :origin origin :value x :field what})))
+    s))
+
+(defn- canonical-provider-class? [s]
+  (and (str/includes? s ".")
+       (not (str/starts-with? s "."))
+       (not (str/ends-with? s "."))
+       (not (str/includes? s ".."))
+       (not (str/includes? s "/"))))
+
+(defn- provider-declarations [providers origin]
+  (when (and (some? providers) (not (map? providers)))
+    (throw
+      (ex-info
+        ":jolt/class-providers must be a map of canonical class name to provider namespace"
+        {:type :jolt.deps/invalid-class-providers
+         :origin origin :value providers})))
+  (mapv
+    (fn [[class provider]]
+      (let [class (provider-token class "class-provider class" origin)
+            provider (provider-token provider "class-provider namespace" origin)]
+        (when-not (canonical-provider-class? class)
+          (throw
+            (ex-info
+              (str "class-provider key must be a canonical fully-qualified class name: "
+                   class)
+              {:type :jolt.deps/invalid-class-provider
+               :origin origin :class class :provider provider})))
+        {:class class :provider provider :origin origin}))
+    (seq providers)))
+
+(defn- provider-declaration-sort-key
+  [{:keys [class provider origin]}]
+  ;; Make both reconciliation and conflict diagnostics independent of deps map
+  ;; iteration/BFS discovery order. Project/inline authority sorts before
+  ;; dependency declarations; the remaining fields provide stable provenance
+  ;; ordering within each class.
+  [class
+   (case (:kind origin)
+     :project 0
+     :add-deps 1
+     :dependency 2
+     3)
+   (str (:coord origin))
+   (str (:deps-file origin))
+   (str (:root origin))
+   (str (:project-dir origin))
+   (str (:base-dir origin))
+   provider])
+
+(defn- reconcile-class-providers
+  "Return one exact class->provider map plus all declaration origins. Identical
+  declarations dedupe; differing providers for one class fail closed with both
+  provenance records."
+  [declarations]
+  (reduce
+    (fn [{:keys [class-providers class-provider-origins] :as acc} declaration]
+      (let [{:keys [class provider origin]} declaration
+            old (get class-providers class)]
+        (cond
+          (nil? old)
+          {:class-providers (assoc class-providers class provider)
+           :class-provider-origins
+           (assoc class-provider-origins class [origin])}
+
+          (= old provider)
+          (assoc acc :class-provider-origins
+                 (update class-provider-origins class conj origin))
+
+          :else
+          (throw
+            (ex-info
+              (str "conflicting class providers for " class ": " old
+                   " and " provider)
+              {:type :jolt.deps/class-provider-conflict
+               :class class
+               :existing {:provider old
+                          :origins (get class-provider-origins class)}
+               :incoming {:provider provider :origin origin}})))))
+    {:class-providers {} :class-provider-origins {}}
+    (sort-by provider-declaration-sort-key declarations)))
+
 (defn- resolve-deps
-  "Breadth-first walk of a deps map; returns {:roots [...] :natives [...]} — the
-  source-root directories and the collected :jolt/native declarations from every
-  dep's deps.edn (raw, in walk order; reconcile-project dedups them). `base-dir`
-  resolves :local/root and is replaced by a dep's own root as the walk descends."
+  "Breadth-first walk of a deps map. Returns roots, native declarations, and
+  provenance-bearing class-provider declarations from every resolved deps.edn.
+  `base-dir` resolves :local/root and is replaced by a dep's own root as the walk
+  descends."
   [deps base-dir]
   ;; queue grows by appending children at the tail; an index cursor walks it so
   ;; each dequeue is O(1) (was (subvec (vec queue) 1) per pop -> O(n^2)).
@@ -933,43 +1029,59 @@
          i 0
          seen #{}
          roots []
-         natives []]
+         natives []
+         class-provider-declarations []]
     (if (>= i (count queue))
-      {:roots roots :natives natives}
+      {:roots roots
+       :natives natives
+       :class-provider-declarations class-provider-declarations}
       (let [[coord spec bd] (nth queue i)
             i (inc i)]
         (if (contains? seen coord)
-          (recur queue i seen roots natives)
+          (recur queue i seen roots natives class-provider-declarations)
           (let [root (coord-root coord spec bd)]
             (if (nil? root)
-              (recur queue i (conj seen coord) roots natives)
+              (recur queue i (conj seen coord) roots natives
+                     class-provider-declarations)
               ;; a DEP repo's malformed deps.edn warns and contributes nothing;
               ;; only the project's own deps.edn is a hard error (resolve-project).
-              ;; A Maven dep has no deps.edn — its children come from its pom.xml.
+              ;; Maven children still come from pom.xml, but an extracted
+              ;; deps.edn may contribute Jolt metadata.
               (let [maven? (boolean (:mvn/version spec))
                     ;; a Maven dep with no jolt-loadable source contributes nothing
                     ;; and its transitive deps are cljs/JVM tooling — don't walk them.
                     usable? (or (not maven?) (has-clj-source? root))
-                    edn (when (and usable? (not maven?))
+                    deps-file (str root "/deps.edn")
+                    edn (when usable?
                           (try (read-edn (str root "/deps.edn"))
                                (catch :default e (warn (ex-message e)) nil)))
                     deps (when usable? (if maven? (pom-deps root coord) (:deps edn)))
                     _ (when (and edn deps (not (map? deps)))
                         (throw (ex-info (str "malformed :deps in " root "/deps.edn: expected a map")
                                         {:path root :given (class deps)})))
-                    child (mapv (fn [[c s]] [c s root]) (seq deps))]
+                    child (mapv (fn [[c s]] [c s root]) (seq deps))
+                    origin {:kind :dependency
+                            :coord coord
+                            :root root
+                            :deps-file deps-file}
+                    provider-declarations
+                    (provider-declarations (:jolt/class-providers edn) origin)]
                 (recur (into queue child)
                        i
                        (conj seen coord)
-                       (into roots (if usable? (dep-source-roots root maven?) []))
-                       (into natives (:jolt/native edn)))))))))))
+                       (into roots
+                             (if usable?
+                               (dep-source-roots root maven? edn)
+                               []))
+                       (into natives (:jolt/native edn))
+                       (into class-provider-declarations
+                             provider-declarations))))))))))
 
 ;; --- public -----------------------------------------------------------------
 (defn resolve-project
   "Resolve `project-dir`'s deps.edn with the selected alias keywords. Returns
-  {:roots [...] :main-opts [...] :tasks {...} :natives [...]}; :main-opts is the
-  last selected alias's, else nil; :natives are the project's + deps' :jolt/native
-  shared-library declarations."
+  roots, launch/build metadata, native declarations, and the reconciled exact
+  :class-providers map discovered across the complete dependency graph."
   ([project-dir] (resolve-project project-dir []))
   ([project-dir alias-kws]
    (let [edn (read-edn (str project-dir "/deps.edn"))
@@ -981,10 +1093,21 @@
          project-paths (concat (or (:paths edn) ["src"]) extra-paths)
          project-roots (map #(abspath project-dir %) project-paths)
          all-deps (merge (:deps edn) extra-deps)
-         {dep-roots :roots dep-natives :natives}
+         {dep-roots :roots
+          dep-natives :natives
+          dep-provider-declarations :class-provider-declarations}
          (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo edn)]
                                       (abspath project-dir r))]
-           (resolve-deps all-deps project-dir))]
+           (resolve-deps all-deps project-dir))
+         project-provider-declarations
+         (provider-declarations
+           (:jolt/class-providers edn)
+           {:kind :project
+            :project-dir project-dir
+            :deps-file (str project-dir "/deps.edn")})
+         {:keys [class-providers class-provider-origins]}
+         (reconcile-class-providers
+           (concat project-provider-declarations dep-provider-declarations))]
      ;; reconcile: the project's own roots/natives + every dep's, deduped once.
      {:roots (dedup-by identity (concat project-roots dep-roots))
       :main-opts main-opts
@@ -998,6 +1121,8 @@
       :embed-dirs (mapv #(abspath project-dir %) (:embed (:jolt/build edn)))
       :tasks (:tasks edn)
       :natives (dedup-by native-key (concat (:jolt/native edn) dep-natives))
+      :class-providers class-providers
+      :class-provider-origins class-provider-origins
       ;; nREPL middleware a library contributes (jolt.nrepl composes them over its
       ;; built-in handler) — symbols resolving to a middleware fn or a vector of them.
       :nrepl-middleware (:nrepl/middleware edn)})))
@@ -1019,19 +1144,32 @@
   namespace the runtime already resolves. Returns the vector of roots added
   (empty when everything was already on the roots).
 
-  :jolt/native declarations carried by added deps are NOT auto-loaded (that is
+  Class providers are reconciled and registered atomically before source roots
+  change, so no catalog require is needed. :jolt/native declarations carried by
+  added deps are NOT auto-loaded (that is
   a project-launch concern — see jolt.main); a warning names them so the
   caller can load via jolt.ffi. The second arity accepts an options map for
   babashka call-shape compatibility; no options are currently honored."
   ([deps-map] (add-deps deps-map nil))
   ([{:keys [deps] :as m} _opts]
    (let [base (or (jolt.host/getenv "JOLT_PWD") ".")
-         {:keys [roots natives]}
+         {:keys [roots natives class-provider-declarations]}
          (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo m)]
                                       (abspath base r))]
            (resolve-deps deps base))
+         inline-provider-declarations
+         (provider-declarations
+           (:jolt/class-providers m)
+           {:kind :add-deps :base-dir base})
+         {:keys [class-providers]}
+         (reconcile-class-providers
+           (concat inline-provider-declarations class-provider-declarations))
          current (vec (jolt.host/source-roots))
          added (vec (remove (set current) (dedup-by identity roots)))]
+     ;; Whole-map preflight in the host makes this atomic. Registration precedes
+     ;; set-source-roots!: that operation may discover and load data readers.
+     (when (seq class-providers)
+       (jolt.host/register-class-providers! class-providers))
      (when (seq added)
        (jolt.host/set-source-roots! (into current added)))
      (when (seq natives)

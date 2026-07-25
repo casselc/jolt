@@ -1,7 +1,7 @@
 (ns cpfixture.standard-charsets-provider
-  (:require [cpfixture.catalog :as catalog]))
+  (:require [cpfixture.state :as state]))
 
-(catalog/note-load! :standard-charsets)
+(state/note-load! :standard-charsets)
 
 (__register-class-statics!
  "java.nio.charset.StandardCharsets"
