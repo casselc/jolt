@@ -25,6 +25,10 @@
 (def publish-checkout!  (var jolt.deps/publish-git-checkout!))
 (def lock-wait-attempts (var jolt.deps/git-lock-wait-attempts))
 (def lock-wait-ms       (var jolt.deps/git-lock-wait-ms))
+(def windows-host?      (var jolt.deps/windows-host?))
+(def msys-native-path   (var jolt.deps/msys-native-path))
+(def origin-config-equivalent?
+  (var jolt.deps/git-origin-config-equivalent?))
 
 (def ^:private failures (atom []))
 (def ^:private checks (atom 0))
@@ -87,6 +91,48 @@
 
 (defn- parent-path [path]
   (subs path 0 (.lastIndexOf path "/")))
+
+(defn- test-windows-msys-local-origin-equivalence! [_root]
+  ;; Model the process boundary deterministically on every host. Only one
+  ;; drive-rooted and one MSYS-rooted spelling may enter the translation seam;
+  ;; the fake translator then stands in for the active shell's `cygpath -am`.
+  (let [native "D:/a/_temp/msys64/tmp/origin"
+        msys "/tmp/origin"
+        other-native "D:/a/_temp/msys64/tmp/other"
+        other-msys "/tmp/other"
+        translations {native native
+                      msys native
+                      other-native other-native
+                      other-msys other-native}]
+    (with-redefs-fn
+      {windows-host? true
+       msys-native-path (fn [path] (get translations path))}
+      (fn []
+        (check (origin-config-equivalent? native msys)
+               "native Windows and MSYS spellings of one local path are equivalent")
+        (check (origin-config-equivalent? msys native)
+               "local path equivalence is symmetric across the shell boundary")
+        (check (not (origin-config-equivalent? native other-msys))
+               "different translated local paths remain distinct")
+        (check (not (origin-config-equivalent? native other-native))
+               "two native path spellings never enter the MSYS exception")
+        (check (not (origin-config-equivalent? msys other-msys))
+               "two MSYS path spellings remain literal")
+        (check (not (origin-config-equivalent?
+                      "https://example.invalid/a.git"
+                      "https://example.invalid/b.git"))
+               "remote URLs remain literal and distinct")
+        (check (not (origin-config-equivalent?
+                      "file:///D:/a/_temp/msys64/tmp/origin" msys))
+               "file URLs do not masquerade as native filesystem paths")
+        (check (not (origin-config-equivalent? "relative/origin" msys))
+               "relative local coordinates stay outside the equivalence seam")
+        (check (not (origin-config-equivalent? native "/missing/origin"))
+               "failed shell translation remains fail-closed")
+        (check (origin-config-equivalent?
+                 "ssh://example.invalid/a.git"
+                 "ssh://example.invalid/a.git")
+               "exact remote identity remains valid without translation")))))
 
 (defn- test-private-cache-paths-stay-shallow! [root]
   (let [target (str root "/private-layout/final")
@@ -980,6 +1026,7 @@
     (when-not (and root (jolt.host/getenv "JOLT_GITLIBS")
                    (jolt.host/getenv "GITLIBS"))
       (throw (ex-info "deps-test requires fixture root, JOLT_GITLIBS, and GITLIBS" {})))
+    (test-windows-msys-local-origin-equivalence! root)
     (test-private-cache-paths-stay-shallow! root)
     (test-windows-git-dir-path-budget! root)
     (test-windows-backslash-mkdirs! root)

@@ -125,6 +125,65 @@
 (defn- result-lines [result]
   (if (str/blank? (:out result)) [] (vec (str/split-lines (:out result)))))
 
+(def ^:private windows-host?
+  (= :windows (:os (jolt.host/target))))
+
+(defn- ascii-letter? [c]
+  (let [n (int c)]
+    (or (and (>= n 65) (<= n 90))
+        (and (>= n 97) (<= n 122)))))
+
+(defn- windows-drive-rooted-path?
+  "True only for a native drive-rooted local path such as C:/src or C:\\src."
+  [s]
+  (and (string? s)
+       (>= (count s) 3)
+       (ascii-letter? (first s))
+       (= \: (nth s 1))
+       (let [sep (nth s 2)]
+         (or (= \/ sep) (= \\ sep)))))
+
+(defn- msys-rooted-path?
+  "True only for an MSYS-rooted local path. UNC paths stay literal: this
+  equivalence seam is solely for the native-drive/MSYS spelling boundary."
+  [s]
+  (and (string? s)
+       (str/starts-with? s "/")
+       (not (str/starts-with? s "//"))))
+
+(defn- msys-native-path
+  "Ask the active POSIX shell's MSYS runtime for one absolute mixed-style
+  Windows path. Failure, multiple output lines, or a non-drive result is nil."
+  [path]
+  (let [result (shell-result
+                 (str "cygpath -am " (shell-quote path)))
+        lines (result-lines result)]
+    (when (and (result-ok? result) (= 1 (count lines)))
+      (let [native (str/replace (first lines) "\\" "/")]
+        (when (windows-drive-rooted-path? native)
+          native)))))
+
+(defn- git-origin-config-equivalent?
+  "Compare expected dependency URL with one literal remote.origin.url.
+
+  Remote URLs, relative paths, UNC paths, and two same-style local paths remain
+  byte-for-byte identities. On a Windows host only, one drive-rooted path and
+  one MSYS-rooted path may compare equal when the active shell independently
+  translates both to the same absolute native path. The durable cache ownership
+  marker is intentionally not routed through this compatibility seam."
+  [expected actual]
+  (or (= expected actual)
+      (and windows-host?
+           (or (and (windows-drive-rooted-path? expected)
+                    (msys-rooted-path? actual))
+               (and (msys-rooted-path? expected)
+                    (windows-drive-rooted-path? actual)))
+           (let [expected-native (msys-native-path expected)
+                 actual-native (msys-native-path actual)]
+             (and expected-native
+                  actual-native
+                  (= expected-native actual-native))))))
+
 (defn- git-sha?
   "Accept a hexadecimal commit-object prefix, never a ref or path. Seven
   characters preserves the tools.deps ecosystem convention (including Jolt's
@@ -247,8 +306,10 @@
 
   `expected-url`, when non-nil, is compared with the literal remote.origin.url;
   unlike `git remote get-url`, this does not expand a user's url.*.insteadOf
-  mirror or transport rules. Origin mismatch is distinct because it may mean a
-  URL-key collision and must never enter destructive repair."
+  mirror or transport rules. The sole equivalence exception is a
+  shell-demonstrated native-Windows/MSYS spelling pair for one local path.
+  Origin mismatch is distinct because it may mean a URL-key collision and must
+  never enter destructive repair."
   [dir sha expected-url]
   (if-not (file-exists? dir)
     {:valid? false :reason :missing :path dir}
@@ -264,13 +325,18 @@
         ;; never classify it as ordinary repairable residue first.
         (let [origins (when expected-url
                         (git-result dir ["config" "--local" "--get-all"
-                                         "remote.origin.url"]))]
+                                         "remote.origin.url"]))
+              actual-urls (if origins (result-lines origins) [])
+              matching-origin?
+              (and (= 1 (count actual-urls))
+                   (git-origin-config-equivalent?
+                     expected-url (first actual-urls)))]
           (if (and expected-url
                    (or (not (result-ok? origins))
-                       (not= [expected-url] (result-lines origins))))
+                       (not matching-origin?)))
             {:valid? false :reason :origin-mismatch :path dir
              :expected-url expected-url
-             :actual-urls (if origins (result-lines origins) [])}
+             :actual-urls actual-urls}
             (let [kind (git-result dir ["cat-file" "-t" sha])
                   head (git-result dir ["rev-parse" "--verify"
                                         "HEAD^{commit}"])
