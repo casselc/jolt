@@ -6,11 +6,15 @@ Native error slots are per-thread, mutable state. POSIX functions conventionally
 write `errno`; Windows functions, including Winsock, write the thread's last-error
 slot. Any later native call can replace that value.
 
-Calling `jolt.ffi/errno` immediately after an ordinary foreign call is sufficient
-only when nothing runs between the native return and the accessor. It is not a
-sound boundary for a `:blocking` foreign call: Chez must reactivate a
-collect-safe Scheme thread before Jolt code can invoke the accessor, and that
-return path can disturb the Windows last-error slot.
+Calling `jolt.ffi/errno` immediately after a foreign call is sufficient only
+when the complete return boundary guarantees that nothing runs between the
+native return and the accessor. A `:blocking` foreign call demonstrably lacks
+that guarantee because Chez must reactivate a collect-safe Scheme thread before
+Jolt code can invoke the accessor. Native Windows jolt-net validation found the
+broader rule: after blocking `connect` was paired, the first ordinary duplicate
+`bind` still exposed a zero last-error while a later attempt happened to retain
+`10048`. Call kind and source-level adjacency are therefore not a sound
+classification boundary.
 
 ## Public contract
 
@@ -72,7 +76,10 @@ executes `close(-1)`, which changes current `errno` to `9`; the saved vector
 remains `[-1 2]`. The collect-safe control obtains `[-1 9]` directly from an
 opted-in `:blocking` call. This proves ordering under Chez's documented capture
 semantics; it cannot prove that a particular C API sets its documented error
-channel correctly.
+channel correctly. The jolt-net Windows W1 gate supplies the complementary
+native evidence: one process preserves exact `WSAECONNREFUSED` `10061` and
+first-attempt `WSAEADDRINUSE` `10048` only after both calls consume captured
+pairs.
 
 ## Cross-target selection invariant
 
@@ -100,9 +107,8 @@ convention.
 ## Choosing between the two APIs
 
 Use `{:capture-native-error true}` whenever a caller interprets a native failure
-sentinel and needs its associated error code. This is mandatory for
-failure-sensitive `:blocking` calls and avoids a fragile call/capture ordering
-dependency for non-blocking calls as well.
+sentinel and needs its associated error code. This is mandatory independently
+of `:blocking`; a separate source-level accessor is not part of the same result.
 
 `jolt.ffi/errno` remains available for code that must inspect the current slot
 independently of a particular call. Its caller is responsible for ensuring that
