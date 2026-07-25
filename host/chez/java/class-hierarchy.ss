@@ -130,15 +130,19 @@
         result)))
 
 ;; Is WANTED (canonical or simple) the class CHILD (canonical) or one of its
-;; ancestors? Object is every class's root. Matched by full name or last segment so
-;; "IOException" and "java.io.IOException" both hit.
+;; ancestors? Object is every class's root. A qualified wanted name matches only
+;; the exact canonical identity; last-segment matching is reserved for an
+;; explicitly simple query. Otherwise user.Counted would satisfy
+;; clojure.lang.Counted merely because both end in the same segment.
 (define (jch-isa? child wanted)
-  (let ((wseg (jch-last-segment wanted)))
+  (let ((wseg (jch-last-segment wanted))
+        (simple? (string=? wanted (jch-last-segment wanted))))
     (or (string=? wanted "java.lang.Object") (string=? wanted "Object")
         (let loop ((names (cons child (jch-closure child))))
           (cond ((null? names) #f)
                 ((or (string=? wanted (car names))
-                     (string=? wseg (jch-last-segment (car names)))) #t)
+                     (and simple?
+                          (string=? wseg (jch-last-segment (car names))))) #t)
                 (else (loop (cdr names))))))))
 
 ;; Does the graph model WANTED at all (as a class or as any class's ancestor)? Used
@@ -209,7 +213,9 @@
             "clojure.lang.IPersistentStack" "clojure.lang.IPersistentVector"
             "clojure.lang.IPersistentMap" "clojure.lang.IPersistentSet"
             "clojure.lang.IPersistentList" "clojure.lang.IObj" "clojure.lang.IMeta"
-            "clojure.lang.IDeref" "clojure.lang.IRecord" "clojure.lang.IType"
+            "clojure.lang.IDeref" "clojure.lang.IBlockingDeref"
+            "clojure.lang.IPending" "clojure.lang.IReduce"
+            "clojure.lang.IRecord" "clojure.lang.IType"
             "clojure.lang.IHashEq" "clojure.lang.IEditableCollection"
             "clojure.lang.IExceptionInfo" "clojure.lang.IReduceInit"
             "java.util.List" "java.util.Set" "java.util.Collection" "java.util.Map"

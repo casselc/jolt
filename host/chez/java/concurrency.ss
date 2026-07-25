@@ -529,6 +529,12 @@
 (define %pre-conc-deref jolt-deref)
 (set! jolt-deref
   (lambda (x . opts)
+    ;; deref has exactly one- and three-argument public arities. Reject other
+    ;; calls before inspecting the target so extra arguments cannot be ignored
+    ;; and a raw Chez arity condition cannot escape.
+    (unless (or (null? opts)
+                (and (pair? opts) (pair? (cdr opts)) (null? (cddr opts))))
+      (jolt-arity-error-name "clojure.core/deref" (+ 1 (length opts))))
     (cond
       ((jolt-future? x)
        (if (null? opts) (jolt-future-deref x)
@@ -536,14 +542,31 @@
       ((jolt-promise? x)
        (if (null? opts) (jolt-promise-deref x)
            (jolt-promise-deref-timed x (car opts) (cadr opts))))
-      ((jolt-agent? x) (jolt-agent-state x))
-      ((jolt-delay? x) (jolt-delay-force x))
-      ;; a record/reify implementing clojure.lang.IDeref: @x calls its `deref`
-      ;; method with the value itself as the leading `this`.
-      ((and (jrec? x) (find-method-any-protocol (jrec-tag x) "deref"))
+      ((and (null? opts) (jolt-agent? x)) (jolt-agent-state x))
+      ((and (null? opts) (jolt-delay? x)) (jolt-delay-force x))
+      ;; IDeref and IBlockingDeref use the same method name. Select by exact
+      ;; interface arity so (deref x ms timeout) cannot silently call the
+      ;; untimed method and discard its timeout arguments.
+      ((and (null? opts)
+            (iface-method x "clojure.lang.IDeref" "deref" 1))
        => (lambda (m) (jolt-invoke m x)))
-      ((and (reified-methods x) (hashtable-ref (reified-methods x) "deref" #f))
-       => (lambda (m) (jolt-invoke m x)))
+      ((and (= (length opts) 2)
+            (iface-method x "clojure.lang.IBlockingDeref" "deref" 3))
+       => (lambda (m) (jolt-invoke m x (car opts) (cadr opts))))
+      ((and (null? opts) (iface-declared? x "clojure.lang.IDeref"))
+       (iface-abstract-method-error x "deref"))
+      ((and (pair? opts)
+            (iface-declared? x "clojure.lang.IBlockingDeref"))
+       (iface-abstract-method-error x "deref"))
+      ;; Timed observation requires IBlockingDeref for every target. IDeref-only
+      ;; built-ins and custom values must fail rather than pretending an
+      ;; untimed result satisfied a bounded observation.
+      ((pair? opts)
+       (jolt-throw
+        (jolt-host-throwable
+         "java.lang.ClassCastException"
+         (string-append "class " (jolt-class-name x)
+                        " cannot be cast to class clojure.lang.IBlockingDeref"))))
       (else (apply %pre-conc-deref x opts)))))
 
 ;; realized? for a future/promise/delay. Wrapped over the overlay version in
@@ -1167,6 +1190,9 @@
              (if (or (jolt-atom? val) (jolt-ref? val) (jolt-agent? val) (var-cell? val)
                      (jvol? val) (jolt-delay? val) (jolt-future? val) (jolt-promise? val))
                  #t 'pass))
+            ((or (string=? tn "IBlockingDeref")
+                 (string=? tn "clojure.lang.IBlockingDeref"))
+             (if (or (jolt-future? val) (jolt-promise? val)) #t 'pass))
             ((or (string=? tn "IRef") (string=? tn "clojure.lang.IRef"))
              (if (or (jolt-atom? val) (jolt-ref? val) (jolt-agent? val) (var-cell? val))
                  #t 'pass))
