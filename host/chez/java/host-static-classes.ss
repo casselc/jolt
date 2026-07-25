@@ -1095,12 +1095,19 @@
       (jolt-lazyseq? x) (jrec? x) (jreify? x) (procedure? x) (symbol-t? x)))
 (register-instance-check-arm!
   (lambda (type-sym val)
-    (let ((iface (hsc-last-segment (symbol-t-name type-sym))))
+    (let* ((tname (symbol-t-name type-sym))
+           (iface (hsc-last-segment tname))
+           ;; A source-level simple token may use the compatibility tags emitted
+           ;; by value-host-tags. A canonical FQN must not: com.acme.ByteBuffer
+           ;; and java.nio.ByteBuffer are distinct classes even though both
+           ;; values may expose the historic "ByteBuffer" compatibility tag.
+           (simple-request? (string=? tname iface)))
       ;; the value's own class-graph tags (value-host-tags) are authoritative — the
       ;; SAME source protocol dispatch reads, so instance? and extend-protocol can't
       ;; disagree about the interfaces a builtin implements.
       (if (let ((tags (value-host-tags val)))
-            (or (member (symbol-t-name type-sym) tags) (member iface tags)))
+            (or (member tname tags)
+                (and simple-request? (member iface tags))))
           #t
       (let ((hit (cond
                    ;; IObj/IMeta — metadata-bearing values not tagged via jch-tags
@@ -1322,39 +1329,29 @@
 ;; fn classes (ns$name) inherit AFunction (handled by jch-direct-supers).
 
 ;; (instance? Class e) on a throwable tagged-table carrying a JVM :class matches the
-;; carried class or any of its ancestors (full name or last segment), so a library's
-;; (catch UnknownHostException e …) / (catch IOException e …) matches the ex-info
+;; carried class or any of its ancestors. Canonical requests stay exact; genuinely
+;; simple requests retain the compatibility match. Thus a library's (catch
+;; UnknownHostException e …) / (catch IOException e …) matches the ex-info
 ;; envelope it threw. Mirrors the (class e) arm (host-table.ss) for catch dispatch,
 ;; which lowers to (instance? C e). Non-match returns 'pass so other arms still run.
 (register-instance-check-arm!
   (lambda (type-sym val)
     (if (and (htable? val) (string? (hashtable-ref (htable-h val) "class" #f)))
         (let* ((cls (hashtable-ref (htable-h val) "class" #f))
-               (want (symbol-t-name type-sym))
-               (want-seg (hsc-last-segment want)))
-          (let loop ((names (cons cls (jch-closure cls))))
-            (cond ((null? names) 'pass)
-                  ((or (string=? want (car names))
-                       (string=? want-seg (hsc-last-segment (car names)))) #t)
-                  (else (loop (cdr names))))))
+               (want (symbol-t-name type-sym)))
+          (if (jch-isa? cls want) #t 'pass))
         'pass)))
 
 ;; JVM class assignability for isa? (20-coll): true when child and parent are both
 ;; class values and parent is child, java.lang.Object (every class's root), or a
-;; modeled ancestor of child (full name or last segment). nil for non-class args, so
-;; isa? falls through to its hierarchy/vector logic.
+;; modeled ancestor of child. Canonical names stay exact and simple names retain
+;; their compatibility match. nil for non-class args, so isa? falls through to its
+;; hierarchy/vector logic.
 (def-var! "jolt.host" "class-isa?"
   (lambda (child parent)
     (let ((cc (class-key child)) (pp (class-key parent)))
       (if (and cc pp)
-          (let ((pseg (hsc-last-segment pp)))
-            (if (let loop ((names (cons cc (jch-closure cc))))
-                  (cond ((string=? pp "java.lang.Object") #t)
-                        ((null? names) #f)
-                        ((or (string=? pp (car names))
-                             (string=? pseg (hsc-last-segment (car names)))) #t)
-                        (else (loop (cdr names)))))
-                #t jolt-nil))
+          (if (jch-isa? cc pp) #t jolt-nil)
           jolt-nil))))
 
 ;; is NAME a class the host models (registered in the class graph, or a fn class)?

@@ -20,6 +20,9 @@
     (.position b 3)
     (marker/provider-marker b)))
 
+(defn imported-instance? []
+  (instance? ByteBuffer (ByteBuffer/allocate 1)))
+
 (defn canonical-import-forms []
   [(str (first `(ByteBuffer. 1)))
    (str (first `(ByteBuffer/allocate 1)))
