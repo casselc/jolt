@@ -23,6 +23,8 @@
 (set-source-roots! ldr-install-roots)
 (load "host/chez/build.ss")
 
+(bld-check-chez-version)
+
 (define jb-build "target/dev")
 (bld-system (string-append "mkdir -p '" jb-build "'"))
 
@@ -122,7 +124,7 @@
         "(fasl-compressed #t)\n"
         "(compile-file " (ei-str-lit jb-flat-ss) " " (ei-str-lit jb-flat-so-tmp) ")\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'")))
+  (bld-system (string-append (bld-sh-quote bld-chez) " --script '" cs "'")))
 (jolt-replace-file! jb-flat-so-tmp jb-flat-so)
 
 (display (string-append "make-devboot: wrote " jb-flat-so "\n"))

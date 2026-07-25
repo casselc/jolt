@@ -25,6 +25,7 @@ if [ -z "$chez_bin" ] || ! command -v cc >/dev/null 2>&1 ||
   exit 0
 fi
 export JOLT_CHEZ_CSV="$csv"
+export JOLT_CHEZ="$chez_bin"
 
 # 1. Build joltc (debug profile — faster; the self-contained app-build mechanism
 # is identical to release, only Chez compile settings differ).

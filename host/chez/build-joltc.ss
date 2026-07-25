@@ -58,6 +58,8 @@
       (bld-target tgt)
       (bld-target-pack pack))))
 
+(bld-check-toolchain)
+
 ;; Version baked into the binary's saved heap. Prefer $JOLT_VERSION (CI sets it to
 ;; the release tag); else derive it from git in this checkout; else "dev".
 (define jb-version
@@ -324,7 +326,7 @@
         (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
         (ei-str-lit jb-flat-so) ")\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'")))
+  (bld-system (string-append (bld-sh-quote bld-chez) " --script '" cs "'")))
 
 ;; --- 3. embed boots/stub as C arrays + cc-link ------------------------------
 ;; xxd a file into header H and rename its symbol to NAME / NAME_len.
