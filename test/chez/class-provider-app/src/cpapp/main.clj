@@ -52,6 +52,20 @@
     (check :acme-byte-buffer-protocol
            (= [:acme-protocol :protocol-payload]
               (acme-buffer/protocol-value)))
+    (let [java-value (java.nio.ByteBuffer/allocate 1)
+          acme-value (com.acme.ByteBuffer. :instance-payload)]
+      (check :java-byte-buffer-instance
+             (instance? java.nio.ByteBuffer java-value))
+      (check :java-byte-buffer-not-acme
+             (not (instance? com.acme.ByteBuffer java-value)))
+      (check :acme-byte-buffer-instance
+             (instance? com.acme.ByteBuffer acme-value))
+      (check :acme-byte-buffer-not-java
+             (not (instance? java.nio.ByteBuffer acme-value))))
+    (check :java-byte-buffer-imported-instance
+           (java-buffer/imported-instance?))
+    (check :acme-byte-buffer-imported-instance
+           (acme-buffer/imported-instance?))
     (check :canonical-import-forms
            (= ["java.nio.ByteBuffer."
                "java.nio.ByteBuffer/allocate"

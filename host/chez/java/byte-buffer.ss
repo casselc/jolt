@@ -96,6 +96,10 @@
 (register-class-arm! bb? (lambda (x) "java.nio.ByteBuffer"))
 (register-instance-check-arm!
   (lambda (type-sym val)
-    (if (and (symbol-t? type-sym) (bb? val)
-             (member (last-dot (symbol-t-name type-sym)) '("ByteBuffer")))
-        #t 'pass)))
+    (if (and (symbol-t? type-sym) (bb? val))
+        (let ((tname (symbol-t-name type-sym)))
+          (if (or (string=? tname "ByteBuffer")
+                  (string=? tname "java.nio.ByteBuffer"))
+              #t
+              'pass))
+        'pass)))
