@@ -1109,5 +1109,6 @@ already reviewed lower layers.
 - `jolt-http/docs/proofs/inline-resume-capacity.md`.
 - `jolt-hegel/docs/CORE-JOLT-INTEGRATION-SPIKE.md`.
 - `docs/bytes-io-completion-invariants.md`.
+- `docs/proof-custody-2026-07-26.md`.
 - `docs/aot-cache-provenance-invariants.md`.
 - `docs/audit-index-2026-07-24.md`.
