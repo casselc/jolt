@@ -6,10 +6,13 @@ assumptions, and implementation gates behind those decisions.
 
 The models have different implementation status. Core protocol dispatch and
 the deftype/defrecord representation boundary have runtime controls in this
-fork. `Window` and strict `Cursor` implementations are incubating in the
-separate `jolt-bytes` package. The jolt-tcp completion lifecycle remains a
-design contract. In every case, a solver result establishes only the property
-encoded by its bounded or abstract model; it is not a proof of the runtime.
+fork. `Window`, strict `Cursor`, and bounded whole-Window copy are implemented
+on the separate `jolt-bytes` branch `codex/window-cursor-runtime` at
+`b63603b`. The external `jolt-bencode` and nREPL incubation branches are the
+first codec and transport consumers. The jolt-tcp completion lifecycle remains
+a design contract. In every case, a solver result establishes only the
+property encoded by its bounded or abstract model; it is not a proof of the
+runtime.
 
 ## Byte-window containment
 
@@ -48,6 +51,8 @@ Runtime conformance must additionally check:
   sequence;
 - empty, full, nested, and boundary slices preserve their parent bounds;
 - invalid ranges fail without constructing a descriptor; and
+- whole-Window copies validate the destination before mutation and preserve
+  overlap as `memmove` would; and
 - `drop`/`take` produce ordinary sequence projections while `slice` preserves
   backing identity in O(1).
 
@@ -70,7 +75,7 @@ constructive dependent generators   runtime assertions
 pinned theorem/environment --> exhaustive bounded EDN oracle
 ```
 
-The proposed initial pure theorem is over unbounded naturals:
+The initial pure target was the following statement over unbounded naturals:
 
 ```text
 offset + length <= capacity
@@ -82,9 +87,15 @@ implies
   child-offset + child-length <= capacity
 ```
 
+The direct inequality proof was not admitted because its transitive closure
+reaches the `propext` axiom. The accepted constructive closure instead takes
+the parent tail and backing room as witnesses and proves the same endpoint and
+containment conclusions without axioms, foreign declarations, opaque
+declarations, Quot, partial, or unsafe definitions.
+
 The theorem does not prove Jolt's integer coercions, allocation bounds, byte
 sign, mutation behavior, or backing identity. Those remain runtime
-obligations. The first oracle lane will enumerate capacities `0..16`: 969 valid
+obligations. The checked oracle lane enumerates capacities `0..16`: 969 valid
 parent descriptors and all 20,349 valid relative slices. It retains the known
 buggy empty-tail witness for parent `[0,1)` and slice `[1,1)`.
 
@@ -149,6 +160,16 @@ negative bounds, reversed ranges, parent escape, and child escape. Machine
 overflow is also a separate property because the natural-number theorem does
 not decide signed fixed-width arithmetic or feasible allocation size.
 
+At `jolt-bytes` commit `b63603b`, the JVM and proposal-Jolt gates each execute
+132,671 assertions. That includes 2,601 Cursor reads, 4,845 accepted two-read
+compositions, and 825 bounded overlapping whole-Window copies in addition to
+the Window rows above. Six Hegel properties run 500 cases each. The Cursor
+failure-consumption control shrinks non-flakily to
+`{:limit 0 :position 0 :size 1}`; the Window control retains the empty-tail
+witness above. Chiasmus verifies corrected, buggy, and non-vacuity models for
+Cursor commit and copy bounds. These counts and source pins live with the
+package rather than being inferred from this summary.
+
 The same division generalizes without making networking the organizing
 example:
 
@@ -161,6 +182,19 @@ example:
 - mutation, callbacks, native completion, cleanup, scheduling, fairness, and
   durability remain runtime or environmental evidence rather than consequences
   of the pure theorem.
+
+The codec pattern now has an implemented first consumer. `jolt-bencode` commit
+`1ef16d1` supplies a strict UTF-8 nREPL profile over `jolt.bytes/Cursor` with
+explicit `:ok`, `:need-more`, and `:invalid` results. Failure returns the
+identical Cursor. Its Ansatz slice kernel-checks framing size, containment, and
+commit geometry; its bounded differential oracle checks 9,537 rows; its
+runtime oracle exhausts 162 modeled values, every proper prefix, and all
+26,244 ordered pairs; JVM and Jolt each execute 109,209 assertions; and three
+Hegel properties run 500 cases each. The external nREPL branch
+`codex/byte-native-bencode` at `12e7170` then retains a Cursor across socket
+reads, copies only an unread partial suffix, bounds an accumulated frame, and
+distinguishes clean EOF from truncation. This is composition evidence, not a
+claim that Ansatz proves UTF-8, recursive parsing, sockets, or middleware.
 
 ### Provenance manifest and trust boundary
 
@@ -197,12 +231,13 @@ A reviewed manifest may record:
  :omissions [:negative-nat :machine-overflow :concurrency :leases]}
 ```
 
-Automation may validate the manifest schema, pins, named tests, case count, and
-digests. It must not yet synthesize executable generators or assertions:
-theorem types do not determine Nat-to-Long representation, allocation policy,
-effects, invalid-input behavior, or sound shrinking. The theorem, oracle, and
-manifest are proposed follow-on artifacts; the checked-in evidence today is the
-solver trio and its runtime controls.
+Automation validates the checked Window and Cursor artifact digests, pins,
+named tests, and case counts. It must not synthesize executable generators or
+assertions: theorem types do not determine Nat-to-Long representation,
+allocation policy, effects, invalid-input behavior, or sound shrinking. The
+exact proof closures, provenance manifests, bounded EDN, and runtime mapping
+live in `jolt-bytes`; the solver trios and runtime controls remain independent
+semantic companions.
 
 ## Protocol and core-interface dispatch
 
