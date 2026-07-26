@@ -420,14 +420,23 @@ the bounded Java contract into those operations.
 The fact that byte windows were first needed by sockets does not make them a
 networking abstraction. Core owns the representations and unsafe mechanisms:
 arrays, indexed access, signed-byte fidelity, overlap-safe copy, and a scoped
-borrow that cannot escape an FFI call. An incubating, dependency-free
-`jolt.bytes` namespace may build the first safe view over those mechanisms:
+borrow that cannot escape an FFI call. The incubating, dependency-free
+`jolt.bytes` namespace now builds the first safe view over those mechanisms:
 
 ```clojure
 (bytes/window array)
 (bytes/window array start end)
 (bytes/slice window start)
 (bytes/slice window start end)
+(bytes/copy-into! window target-array)
+(bytes/copy-into! window target-array target-offset)
+
+(bytes/cursor window)
+(bytes/cursor window position)
+(bytes/cursor-window cursor)
+(bytes/cursor-position cursor)
+(bytes/remaining cursor)
+(bytes/read-window cursor size)
 ```
 
 `Window` is an immutable descriptor over mutable, aliased storage. Its bounds
@@ -445,10 +454,20 @@ discard backing-store and lease identity. They are not the
 ownership-preserving slice operation. This RFD therefore does not define a
 public `drop-prefix`.
 
+`copy-into!` copies the entire validated Window into a byte-array destination.
+It validates the complete destination range before mutation, preserves
+overlap-safe `System/arraycopy` semantics, returns the destination, and does not
+expose the Window's backing array. More general partial-copy or leased native
+transfer belongs in a later measured slice rather than in this first API.
+
 `Cursor` is provisionally an immutable `{window, position}` pair with strict
-bounds and no collection protocols. Its public shape is not frozen until
-allocation and throughput evidence shows that a cursor abstraction is better
-than explicit offsets.
+bounds and no collection protocols. Its public shape is not frozen. Bounded
+microbenchmarks now show that its result-map and descriptor allocation is
+materially more expensive than explicit offset arithmetic, especially on
+Jolt. The first parser-level consumer (`jolt-bencode`) demonstrates exact
+transactional framing and avoids rebuilding a Window between concatenated
+messages, but does not yet establish that this Cursor shape is the right stable
+hot-path API.
 
 Java `ByteBuffer` remains an interop type with Java cursor semantics; making it
 `Seqable` would create behavior absent on the JVM and is rejected. It may share
@@ -795,8 +814,10 @@ available until the replacement passes its gates.
 - Prove source mode, add-deps, load-order, and built-application behavior.
 - Complete strict `ByteBuffer`, charsets, `ThreadLocal`, null input stream,
   `TimeUnit`, and streaming bulk copy.
-- Incubate signed-byte `Window` and structure-preserving `slice`; keep `Cursor`
-  provisional and do not add collection semantics to `ByteBuffer`.
+- Retain the implemented signed-byte `Window`, structure-preserving `slice`,
+  bounded whole-Window copy, and proof-derived gates in the external incubator;
+  keep `Cursor` provisional and do not add collection semantics to
+  `ByteBuffer`.
 - Add an exact Teensyp/Capra API manifest test.
 
 The runtime registry can land before project/deps metadata plumbing if the
@@ -854,6 +875,10 @@ latter would entangle unrelated dependency work.
 - Move jolt-hegel to the reviewed core FFI surface while keeping it external.
 - Update nREPL, Maven/HTTP tooling, Ring adapters, and other ecosystem
   consumers to validate the resulting dependency graph.
+- Use the byte-native bencode/nREPL branch as the first codec/transport
+  composition gate: preserve the compatibility facade while incremental
+  framing uses `jolt.bytes/Cursor`, bounded copy, and explicit tri-state
+  results.
 - Run real functional tests across every platform where the underlying runtime
   capability exists; run portable namespace/ABI gates separately where it does
   not.
@@ -874,7 +899,7 @@ capability complete before its prerequisite gate passes.
 | 6 | `jolt-hegel` | Direct use of the upstreamed FFI surface while remaining separately released | Pinned order 1 | Native libhegel matrix, AOT identity, shrinking, stateful, and `clojure.test` integration |
 | 7 | `jolt-time` and core I/O/concurrency follow-ups | Exact broadly useful semantics needed by audited source | Pinned order 2 | Focused semantic models and regression tests |
 | 8 | External `jolt.compat.*` experiment | Bounded NIO/stream adapters and exact Teensyp/Capra loading | Orders 2-4 and 7 | Exact API manifest plus source, lifecycle, and differential gates |
-| 9 | nREPL, Maven/HTTP, Ring, and other ecosystem consumers | Composition evidence and removal of private substrate copies | Relevant released or pinned orders above | Each consumer's native tests on every supported runtime |
+| 9 | nREPL, Maven/HTTP, Ring, and other ecosystem consumers | Composition evidence and removal of private substrate copies; nREPL bencode is the first local byte/Cursor consumer | Relevant released or pinned orders above | Each consumer's native tests on every supported runtime |
 
 Upstream incorporation should preserve these review boundaries. Core proposal
 slices can be presented as stacked changes; independent libraries transfer
@@ -913,10 +938,12 @@ Proof-derived testing uses four distinct evidence lanes:
 Theorem hypotheses guide constructive dependent generators; theorem conclusions
 identify runtime assertions. Positive-domain cases are generated valid by
 construction rather than filtered with assumptions, so shrinking must preserve
-the hypotheses. The proposed first byte-window slice pins an Ansatz environment,
-enumerates all 969 valid parents and 20,349 valid slices at capacities `0..16`,
-then uses Hegel to explore larger descriptors, signed contents, nesting,
-invalid inputs, and backing aliasing.
+the hypotheses. The implemented first byte-window slice pins Ansatz `0.2.75`
+and its environment, enumerates all 969 valid parents and 20,349 valid slices
+at capacities `0..16`, then uses Hegel to explore larger descriptors, signed
+contents, nesting, invalid inputs, and backing aliasing. The companion Cursor
+oracle exhausts 2,601 reads and 4,845 accepted compositions; bounded copy
+coverage adds all 825 overlapping cases through capacity eight.
 
 A versioned manifest records theorem and environment hashes, named
 obligations, oracle digest and count, hypothesis-to-generator mappings,
@@ -956,6 +983,10 @@ in [`bytes-io-completion-invariants.md`](../../bytes-io-completion-invariants.md
 - `Window` sequence, indexed, and reduced traversals yield the same signed
   byte sequence without changing its descriptor.
 - A provisional cursor never advances before zero or beyond its window.
+- An insufficient Cursor read returns no partial Window and the identical
+  original Cursor.
+- A validated whole-Window copy stays inside its destination and preserves
+  overlapping bytes with `memmove` semantics.
 - `0 <= position <= limit <= capacity` always holds.
 - Duplicate buffers share bytes but not cursor state.
 - `compact` preserves the exact remaining sequence.
@@ -1009,6 +1040,11 @@ oracles; they do not close those trust boundaries.
 
 - Core buffer and FFI paths must avoid byte-at-a-time copies and per-operation
   temporary arrays where the current primitive supports a borrowed slice.
+- Cursor remains provisional: current bounded measurements make its allocation
+  cost visible, while the nREPL-shaped bencode baseline measures about 1,000
+  Jolt decodes/second for both fresh Windows and a concatenated Cursor stream.
+  Compare future changes on the same host and toolchain; these single samples
+  are not release thresholds.
 - Contiguous byte windows are the required baseline; vectored I/O is an
   optional follow-on using `readv`/`writev` or `WSARecv`/`WSASend`.
 - Windows IOCP, Linux `io_uring`, and Darwin kqueue/libdispatch may implement
