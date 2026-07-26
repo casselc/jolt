@@ -16,19 +16,18 @@ beside it.
 | Owner | Canonical branch and checkpoint | Repository-resident evidence | Executable companion |
 | --- | --- | --- | --- |
 | Jolt core proposal fork | `codex/upstream-improvements-6-8` | `test/chez/formal/` and the linked invariant documents cover AOT provenance, dependency-cache paths, executor admission, byte-window geometry, completion leases, protocol dispatch, and the `deftype`/`defrecord` boundary. | Chez unit, dependency, build, and platform gates cited by each invariant document. |
-| `jolt-bytes` | `codex/window-cursor-runtime` at `a07ebf0f84c81f9f3a172aa1ac3887c0ef04b743` | `spikes/ansatz-window-oracle/` and `spikes/ansatz-cursor-oracle/` now contain the complete Ansatz programs, pinned environments, audited proof closures, bounded decision tables, portable Cursor reference, controls, immutable provenance, and source digests. `proofs/models/` owns the independent copy-bounds solver trio. | `bin/verify-ansatz`, `bin/verify-oracle-sync`, 132,672-assertion JVM/Jolt exhaustive suites, and the Hegel scalar/stateful suite. |
-| `jolt-bencode` | `codex/ansatz-bencode-oracle` at `1ef16d1` | `spikes/ansatz-framing-oracle/` owns the generator and closure; `proofs/models/` owns corrected, two one-fault controls, and non-vacuity framing models. | `bin/verify-ansatz`, `bin/verify-models`, JVM/Jolt exhaustive framing suites, and Hegel properties. |
+| [`jolt-bytes`](https://github.com/casselc/jolt-bytes) | `codex/window-cursor-runtime` at `a07ebf0f84c81f9f3a172aa1ac3887c0ef04b743` | `spikes/ansatz-window-oracle/` and `spikes/ansatz-cursor-oracle/` now contain the complete Ansatz programs, pinned environments, audited proof closures, bounded decision tables, portable Cursor reference, controls, immutable provenance, and source digests. `proofs/models/` owns the independent copy-bounds solver trio. | `bin/verify-ansatz`, `bin/verify-oracle-sync`, 132,672-assertion JVM/Jolt exhaustive suites, and the Hegel scalar/stateful suite. |
+| [`jolt-bencode`](https://github.com/casselc/jolt-bencode) | `codex/ansatz-bencode-oracle` at `1ef16d122d9c8276ee2b747ee191ccb3e8c8ddba` | `spikes/ansatz-framing-oracle/` owns the generator and closure; `proofs/models/` owns corrected, two one-fault controls, and non-vacuity framing models. | `bin/verify-ansatz`, `bin/verify-models`, JVM/Jolt exhaustive framing suites, and Hegel properties. |
 | `jolt-net` | `claude/windows-runtime-ci` at `a4a4deb6b757d5e86aeb941cf646927e21420df6` | `docs/proofs/` owns socket, descriptor-generation, readiness, wake, close, error-capture, deadline, and Windows W1-W4 models and prose. | Full Linux suite, native Windows W1-W4 gates, ABI probes, and hosted platform matrix. |
 | `jolt-tcp` | `claude/windows-tcp-runtime` at `6a311ea8242c867f906ce164bd39d7f33a499a3f` | `docs/proofs/` owns reactor lifecycle, handler admission, EOF visibility, shutdown/drain, client ownership, and deadline models. | Linux Hegel-required suite, native Windows TCP loopback gate, and buffer properties. |
 | `jolt-http` | `claude/windows-http-runtime` at `94b76695d14a3d0ebd4f5c897127c59efae7a4f9` | `docs/proofs/` owns fail-closed parsing/response behavior, terminal EOF, sink finalization, and inline-resume capacity models. | Six-lane runtime matrix with real Windows x86-64 loopback and enforced generative coverage on POSIX. |
 | `jolt-hegel` | `codex/windows-runtime-checksum` at `25d7a1b7e06c7adcf12f6567fe22e32d67f5803a` | Architecture, integration, upstream-improvement, and platform-coverage documents define the native-library, cache, reporting, and target trust boundaries. | Property/model tests plus native checksum/install/consumer gates on six targets; Windows ARM64 remains a non-AOT source/runtime evidence lane. |
 | `nrepl` proposal | local `codex/byte-native-bencode` at `0a205bc` | No independent theorem is claimed. Its Hegel transport properties are the semantic composition oracle for retained Cursor framing over TCP. | JVM bencode facade, Jolt loopback suite, and Hegel chunk-regrouping, truncation, and frame-limit properties. |
 
-`jolt-bytes`, `jolt-bencode`, and the nREPL proposal are ordinary top-level Git
-repositories, not hidden worktrees. They do not yet have publication remotes;
-their checkpoints are local custody until a repository/account decision is
-made. The upstream-owned nREPL proposal must not be published without a
-separate authorization.
+`jolt-bytes` and `jolt-bencode` are public top-level Git repositories under
+`casselc`, not hidden worktrees. The nREPL proposal is also an ordinary
+top-level repository, but its checkpoint remains local because it is
+upstream-owned and must not be published without separate authorization.
 
 ## Worktree disposition
 
