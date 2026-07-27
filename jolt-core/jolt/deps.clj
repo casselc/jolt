@@ -125,6 +125,18 @@
 (defn- result-lines [result]
   (if (str/blank? (:out result)) [] (vec (str/split-lines (:out result)))))
 
+(defn- require-git!
+  "Run one Git command or throw with its captured exit status and diagnostic.
+
+  Expected failures must not inherit stderr: doing so makes a successful
+  fail-closed control look like an uncaught Git failure in CI. The diagnostic
+  remains available under :git for callers and tests."
+  [dir args message data]
+  (let [result (git-result dir args)]
+    (when-not (result-ok? result)
+      (throw (ex-info message (assoc data :git result))))
+    result))
+
 (def ^:private windows-host?
   (= :windows (:os (jolt.host/target))))
 
@@ -564,35 +576,27 @@
           ;; implementation. It is safe to repair only this exact url@sha leaf.
           (remove-own-cache-path! dir dir)
           (info "fetching " url " @ " (subs sha 0 (min 12 (count sha))))
-          (when-not (zero? (sh (str git-command-prefix
-                                    " clone --quiet --origin origin -- "
-                                    (shell-quote url)
-                                    " " (shell-quote stage))))
-            (throw (ex-info (str "git clone failed: " url)
-                            {:url url :sha sha})))
+          (require-git!
+            nil ["clone" "--quiet" "--origin" "origin" "--" url stage]
+            (str "git clone failed: " url)
+            {:url url :sha sha})
           ;; Git canonicalizes a relative/local clone source before storing it in
           ;; remote.origin.url. Cache identity is the dependency's literal URL,
           ;; so restore that exact spelling before strict origin validation.
-          (when-not
-            (zero?
-              (sh (str git-command-prefix " -C " (shell-quote stage)
-                       " config --local --replace-all remote.origin.url "
-                       (shell-quote url))))
-            (throw
-              (ex-info (str "could not record literal git origin: " url)
-                       {:url url :sha sha :path stage})))
-          (when-not
-            (zero? (sh (str git-command-prefix " -C " (shell-quote stage)
-                            " checkout --quiet " (shell-quote sha))))
-            (throw (ex-info (str "git checkout failed: " sha " in " url)
-                            {:url url :sha sha})))
+          (require-git!
+            stage ["config" "--local" "--replace-all" "remote.origin.url" url]
+            (str "could not record literal git origin: " url)
+            {:url url :sha sha :path stage})
+          (require-git!
+            stage ["checkout" "--quiet" sha]
+            (str "git checkout failed: " sha " in " url)
+            {:url url :sha sha})
           ;; Submodules are part of the pinned checkout and therefore part of
           ;; the transaction: a failure must not publish the parent repository.
-          (when-not
-            (zero? (sh (str git-command-prefix " -C " (shell-quote stage)
-                            " submodule update --init --recursive --quiet")))
-            (throw (ex-info (str "git submodule update failed for " url)
-                            {:url url :sha sha})))
+          (require-git!
+            stage ["submodule" "update" "--init" "--recursive" "--quiet"]
+            (str "git submodule update failed for " url)
+            {:url url :sha sha})
           (when-not (git-checkout-valid? stage sha url)
             (let [inspection (git-checkout-inspection stage sha url)]
               (throw

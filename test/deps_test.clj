@@ -210,8 +210,15 @@
         stage (cache-stage-dir target)]
     ;; The requested URL does not exist yet. A failed clone must leave neither
     ;; the final cache leaf nor its ownership/staging directory.
-    (check (throws? #(ensure-git 'fixture/failed url sha))
-           "missing local remote reports clone failure")
+    (let [failure (thrown-data #(ensure-git 'fixture/failed url sha))
+          git-failure (:git failure)]
+      (check (map? failure)
+             "missing local remote reports clone failure")
+      (check (and (map? git-failure)
+                  (not (zero? (:exit git-failure))))
+             "clone failure retains the non-zero Git status")
+      (check (str/includes? (or (:out git-failure) "") "does not exist")
+             "clone failure retains Git's diagnostic without inheriting stderr"))
     (check (not (jolt.host/file-exists? target))
            "failed clone does not publish its target")
     (check (not (jolt.host/file-exists? (cache-lock-dir target)))
