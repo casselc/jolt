@@ -93,6 +93,14 @@
     ((member tname '("Number" "java.lang.Number")) (number? val))
     ((member tname '("Long" "java.lang.Long" "Integer" "java.lang.Integer"))
      (and (number? val) (exact? val) (integer? val)))
+    ;; Chez has one auto-reducing exact-integer representation, so the Jolt
+    ;; integer-box contract deliberately admits both JVM arbitrary-precision
+    ;; names even when the current value fits in a long. Keep the canonical
+    ;; spellings here: the exact class-boundary registry no longer lets a
+    ;; qualified request match a value's same-short-name compatibility tag.
+    ((member tname '("BigInt" "clojure.lang.BigInt"
+                     "BigInteger" "java.math.BigInteger"))
+     (and (number? val) (exact? val) (integer? val)))
     ((member tname '("Double" "java.lang.Double" "Float" "java.lang.Float")) (and (number? val) (flonum? val)))
     ((member tname '("Ratio" "clojure.lang.Ratio")) (and (number? val) (exact? val) (rational? val) (not (integer? val))))
     ((member tname '("String" "java.lang.String" "CharSequence" "java.lang.CharSequence")) (string? val))
