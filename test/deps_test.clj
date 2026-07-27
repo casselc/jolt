@@ -1064,5 +1064,5 @@
                       {:checks @checks :failures (count @failures)})))
     (println "deps-test:" @checks "checks passed")))
 
-;; `joltc run` loads the file; it does not invoke -main automatically.
+;; `jolt run` loads the file; it does not invoke -main automatically.
 (-main)

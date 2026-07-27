@@ -12,7 +12,7 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 echo "class-provider smoke: source mode"
 source_out="$(
   JOLT_PWD="$app" JOLT_CACHE_DIR="$tmp/source-cache" \
-    bin/joltc -M:test errors
+    bin/jolt -M:test errors
 )"
 printf '%s\n' "$source_out"
 printf '%s\n' "$source_out" |
@@ -25,7 +25,7 @@ printf '%s\n' "$source_out" | grep -Fq 'class-provider PASS'
 echo "class-provider smoke: add-deps"
 add_out="$(
   JOLT_PWD="$root" JOLT_CACHE_DIR="$tmp/add-cache" \
-    bin/joltc run test/chez/class-provider-add-deps.clj
+    bin/jolt run test/chez/class-provider-add-deps.clj
 )"
 printf '%s\n' "$add_out"
 printf '%s\n' "$add_out" |
@@ -34,7 +34,7 @@ printf '%s\n' "$add_out" |
 echo "class-provider smoke: dependency conflict provenance"
 conflict_out="$(
   JOLT_PWD="$root" JOLT_CACHE_DIR="$tmp/conflict-cache" \
-    bin/joltc run test/chez/class-provider-deps-conflict.clj
+    bin/jolt run test/chez/class-provider-deps-conflict.clj
 )"
 printf '%s\n' "$conflict_out"
 printf '%s\n' "$conflict_out" |
@@ -77,7 +77,7 @@ cp -R test/chez/class-provider-nested "$tmp/class-provider-nested"
 echo "class-provider smoke: closed build rejects undeclared mappings"
 undeclared_out="$tmp/undeclared-build.out"
 if JOLT_CHEZ_CSV="$csv" JOLT_PWD="$tmp/class-provider-app" \
-     bin/joltc build -m cpapp.undeclared \
+     bin/jolt build -m cpapp.undeclared \
        -o "$tmp/class-provider-undeclared" >"$undeclared_out" 2>&1; then
   echo "class-provider smoke: undeclared mapping unexpectedly built"
   exit 1
@@ -87,7 +87,7 @@ grep -Fq 'class-provider-registry-frozen' "$undeclared_out"
 
 out="$tmp/class-provider-bin"
 JOLT_CHEZ_CSV="$csv" JOLT_PWD="$tmp/class-provider-app" \
-  bin/joltc build -m cpapp.main -o "$out" >/dev/null
+  bin/jolt build -m cpapp.main -o "$out" >/dev/null
 
 # The mapping comes only from resolved deps.edn metadata and first use lives
 # inside -main. Presence in flat.ss proves the closed build froze the metadata

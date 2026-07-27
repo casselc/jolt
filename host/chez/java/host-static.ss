@@ -44,7 +44,7 @@
           (else (loop (- i 1))))))
 
 ;; Generic dependency-owned providers.  This must remain a literal top-level
-;; load so application/joltc build flattening embeds the implementation.
+;; load so application/jolt build flattening embeds the implementation.
 (load "host/chez/java/class-providers.ss")
 
 ;; A member re-registered with a DIFFERENT value across files is drift (two
