@@ -17,9 +17,11 @@ models remain evidence about rejected designs.
 
 ## Production disposition
 
-The per-namespace runtime cache has been removed from the production loader.
-`JOLT_AOT_CACHE` and `JOLT_CACHE_DIR` are accepted only as inert legacy process
-environment; neither changes namespace loading nor creates artifacts.
+The per-namespace runtime cache has been removed from the production namespace
+load path. `JOLT_AOT_CACHE` and `JOLT_CACHE_DIR` are accepted only as inert
+legacy process environment; neither changes namespace loading nor creates
+artifacts. Any unreachable cache helpers carried while rebasing over upstream's
+new implementation are not a supported feature and do not relax this contract.
 [`namespace-load-effects-smoke.sh`](../test/chez/namespace-load-effects-smoke.sh)
 sets both adversarially and checks with two fresh processes that `deftest`
 registration runs both times and no cache files are created.
@@ -59,6 +61,42 @@ to remove namespace-level runtime reuse rather than adding
 `clojure.test`-specific replay logic. A closed-world image must contain one
 coherent post-initialization state or execute its initialization exactly once;
 it may not restore only the namespace definitions.
+
+## Upstream v0.5.4 regression check
+
+The upstream v0.5.4 namespace cache (`f514e173`) was checked independently on
+2026-07-26 after reminting and building it with Chez 10.4.1. That release adds
+useful runtime-fingerprint, transitive-`require`, and compiler-flag inputs to
+the artifact key, but it still fails the downstream-effect oracle above:
+
+```text
+cold fresh process: 1 test, 1 pass
+warm fresh process: 0 tests, 0 passes
+```
+
+The warm process loaded cached artifacts for both `fixture.sample-test` and
+`fixture.runner`; seven files were present in the cache, including both
+namespaces' generated Scheme, compiled objects, dependency sidecars, and the
+generation-use marker. To reproduce against a pristine upstream worktree, build
+that worktree with one Chez toolchain on `PATH`, then pass its packaged runtime
+to this fork's oracle:
+
+```sh
+git worktree add --detach /tmp/jolt-v054-cache-audit f514e173
+git -C /tmp/jolt-v054-cache-audit submodule update --init --recursive
+env PATH="/path/to/chez-10.4.1/bin:$PATH" \
+    CHEZ=chez \
+    JOLT_CHEZ_CSV=/path/to/csv10.4.1/ta6le \
+    make -C /tmp/jolt-v054-cache-audit remint testbin
+test/chez/namespace-load-effects-smoke.sh \
+  /tmp/jolt-v054-cache-audit/target/release/jolt
+```
+
+This is behavioral evidence, not an inference from the older cache design.
+The v0.5.4 keying changes fix genuine invalidation defects but do not reconstruct
+top-level runtime registration effects. They therefore do not change the
+production disposition or discharge the consumed-input/effect, generation
+routing, or whole-image obligations modeled below.
 
 ## Production invariant: fresh-process closed-world whole image
 
