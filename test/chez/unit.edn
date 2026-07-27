@@ -75,6 +75,8 @@
   {:suite "hostobj" :expr "(class (ex-info \"x\" {}))" :expected "clojure.lang.ExceptionInfo"}
   {:suite "hostobj" :expr "[(instance? Double 1.5) (Double. \"3.5\") (Double/parseDouble \"2.5\")]" :expected "[true 3.5 2.5]"}
   {:suite "hostobj" :label "canonical arbitrary-precision class names honor the unified exact-integer representation" :expr "[(instance? clojure.lang.BigInt 0) (instance? java.math.BigInteger 0) (instance? clojure.lang.BigInt (inc' 9223372036854775807))]" :expected "[true true true]"}
+  {:suite "hostobj" :label "typed variadic arithmetic lowers through binary folds" :expr "(do (defn typed-nary [^long a ^long b ^long c ^double x ^double y ^double z] [(+ a b c) (- a b c) (* a b c) (min a b c) (max a b c) (+ x y z) (- x y z) (* x y z) (/ x y z) (min x y z) (max x y z)]) (typed-nary 20 3 2 20.0 4.0 2.0))" :expected "[25 15 120 2 20 26.0 14.0 160.0 2.5 2.0 20.0]"}
+  {:suite "hostobj" :label "typed unary arithmetic keeps Clojure arities" :expr "(do (defn typed-unary [^long a ^double x] [(+ a) (* a) (- a) (min a) (max a) (+ x) (* x) (- x) (/ x) (min x) (max x)]) (typed-unary 4 4.0))" :expected "[4 4 -4 4 4 4.0 4.0 -4.0 0.25 4.0 4.0]"}
   {:suite "hostobj" :expr "(instance? java.util.regex.Pattern #\"x\")" :expected "true"}
   {:suite "hostobj" :expr "(class #\"x\")" :expected "java.util.regex.Pattern"}
   ;; instance? usable as a value (a plain fn on the JVM; a macro on jolt that the

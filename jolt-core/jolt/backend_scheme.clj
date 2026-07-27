@@ -833,6 +833,11 @@
 ;; ops run is redundant there — emit the per-site unsafe #3% variant. There is no
 ;; matching unsafe variant for ^long +/-/*: a ^long is 64-bit and a Chez fixnum is
 ;; 61, so those map to the widening jolt-l+/-/* rather than any fx op.
+(defn- emit-left-fold [op args]
+  (reduce (fn [acc arg] (str "(" op " " acc " " arg ")"))
+          (first args)
+          (rest args)))
+
 (defn- emit-numeric [kind nm args order-args]
   (cond
     (and (= kind :double) (= nm "inc")) (str "(#3%fl+ " (first args) " 1.0)")
@@ -845,14 +850,38 @@
     (and (= kind :long) (= nm "unchecked-dec")) (str "(jolt-uncdec " (first args) ")")
     :else
     (let [op (case kind :double (dbl-ops nm) :long (lng-ops nm) :bigdec (bd-ops nm))
-          op (if (= kind :double) (str "#3%" op) op)]
-      (if (and (contains? #{"<" "<=" ">" ">=" "==" "="} nm) (> (count args) 2))
+          op (if (= kind :double) (str "#3%" op) op)
+          n (count args)
+          ;; The specialized Chez flonum primitives and the widening ^long
+          ;; helpers are binary even though Clojure's arithmetic is variadic.
+          ;; BigDecimal helpers already own their complete variadic semantics.
+          binary-fold? (and (> n 2)
+                            (or (and (= kind :double)
+                                     (contains? #{"+" "-" "*" "/" "min" "max"} nm))
+                                (and (= kind :long)
+                                     (contains? #{"+" "-" "*" "min" "max"} nm))))]
+      (cond
+        (and (contains? #{"<" "<=" ">" ">=" "==" "="} nm) (> n 2))
         ;; a chained comparison (<= a b c) means (and (<= a b) (<= b c)); the fast
         ;; binary op is 2-ary, so expand rather than pass 3+ args to it. order-args
         ;; binds each operand to a temp once, so reusing a temp across pairs is safe.
         (order-args (fn [as]
           (str "(and " (str/join " " (map (fn [pair] (str "(" op " " (first pair) " " (second pair) ")"))
                                           (partition 2 1 as))) ")")))
+        binary-fold?
+        ;; Function-call arguments all evaluate before the arithmetic body.
+        ;; ordered-call preserves that source order, then this left fold matches
+        ;; Clojure's variadic reduction and checks ^long overflow at each step.
+        (order-args (fn [as] (emit-left-fold op as)))
+        (and (= n 1) (contains? #{"+" "*" "min" "max"} nm))
+        ;; These one-argument arities are identity. The operand is already proven
+        ;; to have KIND, so bypassing a fixed-binary primitive loses no check.
+        (order-args first)
+        (and (= kind :double) (= n 1) (= nm "-"))
+        (order-args (fn [as] (str "(#3%fl- 0.0 " (first as) ")")))
+        (and (= kind :double) (= n 1) (= nm "/"))
+        (order-args (fn [as] (str "(#3%fl/ 1.0 " (first as) ")")))
+        :else
         (order-args (fn [as] (str "(" op " " (str/join " " as) ")")))))))
 
 ;; slot of a declared field key in a record's field-order shape, or nil.

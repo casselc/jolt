@@ -80,8 +80,9 @@
 ;; (they aren't native ops otherwise).
 (defn- lng-spec [nm n]
   (cond
-    (and (>= n 1) (contains? #{"+" "-" "*" "min" "max"
-                               "unchecked-add" "unchecked-subtract" "unchecked-multiply"} nm)) :long
+    (and (>= n 1) (contains? #{"+" "-" "*" "min" "max"} nm)) :long
+    (and (= n 2)
+         (contains? #{"unchecked-add" "unchecked-subtract" "unchecked-multiply"} nm)) :long
     (and (= n 1) (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec"} nm)) :long
     (and (= n 2) (contains? #{"quot" "rem" "mod"} nm)) :long
     (and (>= n 2) (contains? #{"<" ">" "<=" ">=" "=" "=="} nm)) :bool
