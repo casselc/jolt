@@ -74,6 +74,7 @@
   {:suite "hostobj" :expr "(.toString true)" :expected "true"}
   {:suite "hostobj" :expr "(class (ex-info \"x\" {}))" :expected "clojure.lang.ExceptionInfo"}
   {:suite "hostobj" :expr "[(instance? Double 1.5) (Double. \"3.5\") (Double/parseDouble \"2.5\")]" :expected "[true 3.5 2.5]"}
+  {:suite "hostobj" :label "canonical arbitrary-precision class names honor the unified exact-integer representation" :expr "[(instance? clojure.lang.BigInt 0) (instance? java.math.BigInteger 0) (instance? clojure.lang.BigInt (inc' 9223372036854775807))]" :expected "[true true true]"}
   {:suite "hostobj" :expr "(instance? java.util.regex.Pattern #\"x\")" :expected "true"}
   {:suite "hostobj" :expr "(class #\"x\")" :expected "java.util.regex.Pattern"}
   ;; instance? usable as a value (a plain fn on the JVM; a macro on jolt that the
