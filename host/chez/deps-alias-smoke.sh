@@ -252,10 +252,12 @@ case "$out" in
   *) check "short sha not matching the tag errors" "sha/tag mismatch error" "$(printf '%s' "$out" | head -1)" ;;
 esac
 
-# git cache integrity: only a finished checkout counts as cached. An interrupted
-# fetch used to leave the pre-created sha directory behind empty, and every later
-# run took it for a valid checkout — the dep contributed no source root and the
-# failure surfaced as a "Could not locate" on one of its namespaces.
+# Git cache integrity: only a validated checkout counts as cached. The obsolete
+# sanitize/sha layout is ignored, and a claimed v3 entry that loses its checkout
+# is repaired transactionally. An interrupted fetch used to leave a pre-created
+# sha directory behind empty, and every later run took it for a valid checkout —
+# the dep contributed no source root and the failure surfaced as a "Could not
+# locate" on one of its namespaces.
 sha="$(git -C "$tmp/gitrepo" rev-parse HEAD)"
 san="$(printf '%s' "file://$tmp/gitrepo" | sed 's/[^A-Za-z0-9.-]/_/g')"
 cat > "$tmp/gitproj/deps.edn" <<EOF
@@ -263,7 +265,7 @@ cat > "$tmp/gitproj/deps.edn" <<EOF
  :deps {local/gitdep {:git/url "file://$tmp/gitrepo" :git/sha "$sha"}}}
 EOF
 mkdir -p "$tmp/gitlibs3/$san/$sha"
-check "an empty cached checkout is re-fetched" "git dep: tagged" \
+check "an obsolete empty cached checkout is ignored" "git dep: tagged" \
       "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS="$tmp/gitlibs3" "$JOLT" run -m gapp 2>&1 | tail -1)"
 # and the re-fetch is durable: the second run reuses it without cloning again
 out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_DEBUG=1 JOLT_GITLIBS="$tmp/gitlibs3" "$JOLT" run -m gapp 2>&1)"
@@ -271,15 +273,42 @@ case "$out" in
   *fetching*) check "a complete checkout is reused" "no re-fetch" "$(printf '%s' "$out" | grep fetching)" ;;
   *) check "a complete checkout is reused" ok ok ;;
 esac
+# A matching durable claim grants repair authority over exactly its v3 checkout
+# leaf. Recreate that leaf as the residue an interrupted older writer might
+# leave, then require a fresh validated checkout rather than trusting it.
+entry="$(find "$tmp/gitlibs3/git-v3" -mindepth 1 -maxdepth 1 -type d -name 'dep-*' 2>/dev/null | head -1)"
+if [ -n "$entry" ]; then
+  rm -rf "$entry"
+  mkdir -p "$entry"
+  check "a claimed empty cached checkout is re-fetched" "git dep: tagged" \
+        "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS="$tmp/gitlibs3" "$JOLT" run -m gapp 2>&1 | tail -1)"
+else
+  check "a claimed empty cached checkout is re-fetched" "v3 checkout" "missing"
+fi
 
-# a failed fetch leaves nothing the next run would trust
+# A failed fetch retains only the exact-coordinate ownership claim. It must
+# leave no checkout, lock, or staging payload that a later run could trust.
 cat > "$tmp/gitproj/deps.edn" <<EOF
 {:paths ["src"]
  :deps {local/gitdep {:git/url "file://$tmp/not-a-repo" :git/sha "$sha"}}}
 EOF
-JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS="$tmp/gitlibs4" "$JOLT" run -m gapp >/dev/null 2>&1
-check "a failed fetch caches no checkout" "" \
-      "$(find "$tmp/gitlibs4" -mindepth 2 -maxdepth 2 2>/dev/null)"
+if JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS="$tmp/gitlibs4" "$JOLT" run -m gapp >/dev/null 2>&1; then
+  check "a failed fetch reports failure" "failed" "succeeded"
+else
+  check "a failed fetch reports failure" "failed" "failed"
+fi
+claim_count="$(find "$tmp/gitlibs4/git-v3" -mindepth 1 -maxdepth 1 -type f -name 'dep-*.jolt-origin' 2>/dev/null | wc -l | tr -d ' ')"
+check "a failed fetch retains one origin claim" "1" "$claim_count"
+claim="$(find "$tmp/gitlibs4/git-v3" -mindepth 1 -maxdepth 1 -type f -name 'dep-*.jolt-origin' 2>/dev/null | head -1)"
+if [ -n "$claim" ]; then
+  case "$(cat "$claim")" in
+    *":url \"file://$tmp/not-a-repo\""*":sha \"$sha\""*)
+      check "the retained claim names the exact coordinate" ok ok ;;
+    *) check "the retained claim names the exact coordinate" "matching URL and SHA" "$(cat "$claim")" ;;
+  esac
+fi
+check "a failed fetch caches no checkout or transient payload" "" \
+      "$(find "$tmp/gitlibs4/git-v3" -mindepth 1 -maxdepth 1 ! -name 'dep-*.jolt-origin' 2>/dev/null)"
 
 echo "deps-alias smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
