@@ -53,9 +53,10 @@ artifacts. Do not translate an MSVC installation into a fake `libkernel.a`
 layout or add one-off CI conditionals that obscure which compiler owns an
 artifact.
 
-Shared prebuilt CI toolchains do not collapse this distinction. The proposed
-archive contract labels source-runtime, GNU kernel-development, and MSVC
-kernel-development capabilities separately; see
+Shared prebuilt CI toolchains do not collapse this distinction. The implemented
+archive contract labels source-runtime and GNU kernel-development capabilities
+separately. Windows ARM64 currently declares source-runtime only; it does not
+invent an MSVC kernel-development or packaged-`joltc` claim. See
 [`shared-chez-ci-toolchains.md`](shared-chez-ci-toolchains.md).
 
 Treat support for the official Chez Windows package as a second packager

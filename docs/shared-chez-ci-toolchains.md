@@ -2,9 +2,19 @@
 
 ## Status
 
-Proposed for the `casselc/jolt` fork. The Linux x86_64 archive shape has been
-prototyped locally; no toolchain asset, tag, release, or public setup action has
-been created.
+Implemented in the public
+[`casselc/jolt-toolchains`](https://github.com/casselc/jolt-toolchains)
+repository. Immutable release
+[`chez-ci-10.4.1.1`](https://github.com/casselc/jolt-toolchains/releases/tag/chez-ci-10.4.1.1)
+contains the six target archives and their manifests/checksums. The composite
+setup action is consumed by full commit rather than by a mutable branch or tag.
+
+Hosted build
+[`30387667337`](https://github.com/casselc/jolt-toolchains/actions/runs/30387667337)
+passed six native producers and six clean consumers at
+`1c3067ae6db81d412339cadc0f6d8261f29a91a6`. The immutable release tag resolves
+to that exact commit. Its signed release attestation and all 19 individual asset
+subjects were verified after publication.
 
 This is a CI provisioning design, not a Jolt or Chez distribution claim. It
 does not alter Jolt's compiler, packaging backends, supported targets, or the
@@ -13,9 +23,10 @@ separate evidence categories in
 
 ## Motivation
 
-The Jolt proposal stack currently builds official Chez Scheme 10.4.1 from
-source in core, jolt-net, jolt-tcp, jolt-http, jolt-hegel, and jolt-crypto.
-Those workflows have converged on materially the same recipes:
+Before the shared release, the Jolt proposal stack built official Chez Scheme
+10.4.1 from source independently in core, jolt-net, jolt-tcp, jolt-http,
+jolt-hegel, and jolt-crypto. Those workflows had converged on materially the
+same recipes:
 
 - Linux and macOS install to `~/chez` with threads enabled and X11 disabled;
 - Windows x86_64 builds `ta6nt` under MSYS2/MINGW64 and stages executables,
@@ -39,9 +50,10 @@ describes caches as regenerable optimization rather than durable build output:
 - <https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching>
 - <https://docs.github.com/en/actions/concepts/workflows-and-actions/dependency-caching>
 
-The missing layer is one durable, independently verifiable toolchain build
-that every repository can consume on its first run while retaining an exact
-source-build fallback.
+The shared release supplies one durable, independently verifiable toolchain
+build that every repository can consume on its first run. Migration remains
+per-repository and evidence-driven; the old source recipe remains in a consumer
+until that repository's shared-toolchain branch is green.
 
 ## Decision
 
@@ -57,9 +69,9 @@ Jolt fork release:
 - it can be transferred to the Jolt organization independently; and
 - downstream consumers name exactly the toolchain producer they trust.
 
-The provisional name is `casselc/jolt-toolchains`. Creating that repository or
-publishing a release requires an explicit owner decision; this proposal does
-neither.
+The selected repository is `casselc/jolt-toolchains`. Keeping the producer
+separate from the Jolt fork preserves the ownership and future-transfer
+boundaries above.
 
 Workflow artifacts are not the durable distribution mechanism. They are tied
 to workflow-run retention and deletion. Public immutable release assets are
@@ -82,12 +94,13 @@ not infer packaging support merely because `scheme` starts.
 | macOS x86_64 | `ta6osx` | `source-runtime`, `gnu-kernel-dev` |
 | macOS arm64 | `tarm64osx` | `source-runtime`, `gnu-kernel-dev` |
 | Windows x86_64 / MinGW | `ta6nt` | `source-runtime`, `gnu-kernel-dev` |
-| Windows ARM64 / MSVC | `tarm64nt` | `source-runtime`, `msvc-kernel-dev` |
+| Windows ARM64 / MSVC | `tarm64nt` | `source-runtime` |
 
 `gnu-kernel-dev` means the staged tree has the `scheme.h`, boot files, and
 `libkernel.a` contract the current Jolt packager consumes.
-`msvc-kernel-dev` records Chez's native `.lib`/object contract and does **not**
-claim that the current GNU-oriented `joltc` packager can use it.
+The Windows ARM64 archive deliberately makes no kernel-development claim:
+native MSVC Chez is sufficient for source-mode Jolt, while the current
+GNU-oriented `joltc` packager cannot consume its `.lib`/object contract.
 
 Archive names are versioned independently of their payload:
 
@@ -104,7 +117,7 @@ The final numeric component is the archive/recipe revision. Changing build
 flags, staged files, wrappers, compiler family, or manifest semantics requires
 a new revision even when Chez stays at 10.4.1.
 
-Every archive is accompanied by a canonical EDN or JSON manifest containing:
+Each archive contains a canonical JSON tree manifest containing:
 
 - archive schema and recipe revision;
 - Chez version, source tag, source commit, and submodule commits;
@@ -113,13 +126,18 @@ Every archive is accompanied by a canonical EDN or JSON manifest containing:
 - the expected extraction root and executable;
 - a sorted path/size/SHA-256 inventory of the extracted tree;
 - the producer repository, workflow, commit, and run;
-- the archive SHA-256; and
 - the semantic verification commands and their results.
 
-The release carries one checksum manifest covering all release assets. The
-producer also generates a build-provenance attestation. Consumers always check
-the repository-pinned SHA-256 before extraction; attestation verification is an
-additional provenance check, not a substitute for the pinned digest.
+Beside each archive, the release carries a small JSON descriptor binding the
+archive bytes and internal-manifest digest to the producer repository, commit,
+run ID, and attempt. Individual checksum files and `SHA256SUMS` cover the exact
+18 archive/descriptor/checksum assets.
+
+GitHub's immutable-release attestation covers the release tag, target commit,
+and all 19 published asset digests. Producer identity is additionally recorded
+and checked in the manifests; this first recipe does not claim a separate
+GitHub-signed build-provenance attestation for each producer job. Consumers
+always check their repository-pinned archive SHA-256 before extraction.
 
 ## Producer invariants
 
@@ -147,50 +165,65 @@ force-moved.
 Downstream workflows call an action pinned to a full producer commit:
 
 ```yaml
-- uses: casselc/jolt-toolchains/setup-chez@<full-commit>
+- uses: casselc/jolt-toolchains/setup-chez@1c3067ae6db81d412339cadc0f6d8261f29a91a6
   with:
-    version: 10.4.1
     target: linux-x86_64
+    release-tag: chez-ci-10.4.1.1
+    sha256: 16476cd98fb5cb2e2c0285e88fcd6d57ade9392ca8d7cf603ca38432b4118526
     capabilities: source-runtime,gnu-kernel-dev
 ```
 
 The action:
 
 1. validates its inputs against a checked-in target table;
-2. restores the caller repository's ordinary extracted-tree cache;
-3. on a miss, downloads the immutable release asset and manifest;
+2. restores only the checksum-keyed release archive from the caller's ordinary
+   Actions cache;
+3. on a miss, downloads the immutable release archive;
 4. verifies the pinned archive SHA-256 before extraction;
-5. validates the extracted inventory, version, machine, and capabilities;
+5. extracts into a fresh directory and validates its internal inventory,
+   source identity, version, machine, and capabilities;
 6. publishes `CHEZ`, `JOLT_CHEZ`, `JOLT_CHEZ_CSV`, and `PATH` consistently;
-7. saves the caller-local cache only after validation; and
-8. optionally performs the exact source build when the release is unavailable.
+7. saves the caller-local archive cache only after validation.
 
-The source fallback is explicit in logs and uses the same producer recipe. It
-must pass the same postconditions. A fallback does not silently weaken a
-requested capability; for example, an MSVC ARM64 tree cannot satisfy
-`gnu-kernel-dev`.
+There is no silent source-build fallback. Download, checksum, inventory,
+machine, or capability failure fails the job. A consumer may retain its old
+source recipe as an explicit separate workflow path during migration, but the
+shared action never changes compiler family or weakens a requested capability.
+For example, the MSVC ARM64 tree cannot satisfy `gnu-kernel-dev`.
 
 The action never restores or distributes Jolt AOT output, Git dependency
 caches, native application libraries, credentials, or user code. Those have
 different ownership and invalidation rules.
 
-## Local archive prototype
+## Hosted evidence
 
-The installed Linux x86_64 Chez 10.4.1 tree was copied to a new temporary root
-and exercised from that root:
+Build run `30387667337` produced and consumed all six target archives on their
+native hosted runners:
 
-```text
-installed tree: 6.0 MiB
-tar.zst archive: 3,522,653 bytes
-relocated `chez --version`: 10.4.1
-relocated `(machine-type)`: ta6le
-relocated Jolt target descriptor: 33/33 passed
-```
+| Target | Producer | Clean consumer |
+| --- | --- | --- |
+| Linux x86_64 | success | success |
+| Linux aarch64 | success | success |
+| macOS x86_64 | success | success |
+| macOS arm64 | success | success |
+| Windows x86_64 | success | success |
+| Windows ARM64 | success | success |
 
-This establishes that the selected POSIX install-tree shape is relocatable
-enough for the source-runtime consumer. It does not establish reproducible
-archive bytes, the other five targets, the producer trust chain, or a published
-asset. Those remain gates, not assumptions.
+Each producer checked exact Chez source/submodules, compiler target, native
+runner architecture, Chez version and machine type, capability files, a pinned
+Jolt source expression, relocation, and the internal inventory. Each clean
+consumer downloaded the producer artifact, extracted it into a new directory
+through the same composite action, repeated the semantic checks, and built a
+self-contained Jolt executable where `gnu-kernel-dev` is declared.
+
+The published asset set was independently downloaded after upload, compared
+byte-for-byte with the verified producer set, checked through `SHA256SUMS`, and
+revalidated as six release contracts before publication. After publication:
+
+- `refs/tags/chez-ci-10.4.1.1` resolved exactly to `1c3067ae...`;
+- GitHub reported the release immutable;
+- the signed release attestation covered that commit and all 19 assets; and
+- `gh release verify-asset` accepted each downloaded asset independently.
 
 ## Rejected approaches
 
@@ -237,28 +270,30 @@ contract.
 
 ## Implementation sequence
 
-1. Create the dedicated public toolchain repository after owner approval.
-2. Move the already-proven six recipes into one producer matrix without
-   changing their compiler families or staged layouts.
-3. Add manifest generation, relocation checks, native Jolt smoke tests, and
-   build-provenance attestations.
-4. Publish a draft `chez-ci-10.4.1.1` release, verify every asset from a clean
-   consumer job, then publish it immutably.
-5. Implement the commit-pinned composite consumer action with a source fallback.
-6. Convert jolt-crypto first as the six-target canary. Require the same 26/26
-   provider gate and compare cold/warm timings.
-7. Convert jolt-net, jolt-tcp, jolt-http, and jolt-hegel one at a time, retaining
-   their existing source-build path until each repository has a green public
-   run with the shared asset.
-8. Convert core last because its Linux and Windows x86_64 jobs additionally
-   consume `gnu-kernel-dev` for packaged-build gates.
-9. Remove duplicated recipes only after the source fallback and exact
-   capability checks are proven in every consumer.
+1. **Complete:** create the dedicated public toolchain repository.
+2. **Complete:** move the six proven recipes into one producer matrix without
+   changing compiler families or staged layouts.
+3. **Complete:** add internal manifests, release descriptors, relocation
+   checks, native Jolt smoke tests, and six clean consumers.
+4. **Complete:** build all targets at one exact commit and publish the verified
+   asset set as immutable release `chez-ci-10.4.1.1`.
+5. **Complete:** provide the commit-pinned composite action with
+   checksum-pinned archive caching and fresh extraction.
+6. **In progress:** convert jolt-hegel as the first real six-target consumer,
+   preserving its direct aggregate-FFI, checksum, and Git-dependency gates and
+   comparing cold/warm timings.
+7. Convert jolt-net, jolt-tcp, jolt-http, and jolt-crypto one at a time. Each
+   repository's migration branch is its canary; do not merge a branch whose
+   native matrix is weaker than the source-build baseline.
+8. Convert core last because its Linux, macOS, and Windows x86_64 packaged-build
+   jobs additionally consume `gnu-kernel-dev`.
+9. Remove each duplicated recipe only after that repository has exact hosted
+   evidence through the shared action.
 
-## Open owner decision
+## Future ownership
 
-Before publication, choose whether to create `casselc/jolt-toolchains` and
-enable immutable releases there. The dedicated repository is recommended.
-Keeping the producer inside `casselc/jolt` is mechanically possible but mixes
-third-party CI assets with Jolt's release namespace and makes later ownership
-transfer less clean.
+The repository is intentionally separable from the Jolt fork. If the Jolt
+organization accepts this CI substrate, transfer the repository, preserve the
+immutable recipe tag, and repin consumer action/release repository coordinates
+in ordinary reviewed commits. The archives remain CI inputs, not Jolt product
+releases.
