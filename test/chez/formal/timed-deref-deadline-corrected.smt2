@@ -48,4 +48,3 @@
               (and implementation_returns_value completion_after_deadline))
            :named post_deadline_value_definition))
 (assert (! violation :named post_deadline_value_query))
-

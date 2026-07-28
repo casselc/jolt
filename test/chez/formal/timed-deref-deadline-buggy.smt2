@@ -48,4 +48,3 @@
                    (not signaled_before_deadline)))
            :named post_deadline_value_definition))
 (assert (! violation :named post_deadline_value_query))
-

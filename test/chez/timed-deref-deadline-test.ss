@@ -76,4 +76,3 @@
               #t))
 
 (gate-summary "timed-deref-deadline")
-
