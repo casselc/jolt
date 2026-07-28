@@ -821,6 +821,12 @@
   ;; Stage D — execute/submit reject synchronously after shutdown.  Accepting
   ;; either task would strand it behind workers that have already terminated.
   {:suite "concurrency" :expr "(let [e (java.util.concurrent.Executors/newSingleThreadExecutor)] (.shutdown e) [(try (.execute e (fn [] :never)) :accepted (catch java.util.concurrent.RejectedExecutionException _ :rejected)) (try (.submit e (fn [] :never)) :accepted (catch java.util.concurrent.RejectedExecutionException _ :rejected))])" :expected "[:rejected :rejected]"}
+  ;; Stage D — timed latch operations retain the timeout outcome even though the
+  ;; producer eventually completes. The forced mutex schedule lives in the
+  ;; separate timedderef gate; these rows prove all public call paths are wired.
+  {:suite "concurrency" :label "promise timed deref returns the timeout sentinel while preserving the eventual value" :expr "(let [p (promise) producer (future (Thread/sleep 80) (deliver p :late)) first (deref p 10 :timeout) second (deref p)] @producer [first second])" :expected "[:timeout :late]"}
+  {:suite "concurrency" :label "future timed deref returns the timeout sentinel while preserving the eventual value" :expr "(let [f (future (Thread/sleep 80) :late) first (deref f 10 :timeout) second (deref f)] [first second])" :expected "[:timeout :late]"}
+  {:suite "concurrency" :label "agent await-for retains timeout before eventual drain" :expr "(let [a (agent 0) _ (send a (fn [x] (Thread/sleep 80) (inc x))) first (await-for 10 a) _ (await a)] [first @a])" :expected "[false 1]"}
   ;; Stage D — ReentrantLock reentrant lock/unlock + hold count
   {:suite "concurrency" :expr "(let [l (java.util.concurrent.locks.ReentrantLock.)] (.lock l) (.lock l) (let [locked (.isLocked l) held (.isHeldByCurrentThread l)] (.unlock l) (.unlock l) [locked held (.isLocked l)]))" :expected "[true true false]"}
   ;; Stage D — ReentrantLock tryLock
