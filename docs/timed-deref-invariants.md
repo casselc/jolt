@@ -123,6 +123,33 @@ done
 
 Expected order: `sat`, `unsat`, `sat`.
 
+## Hosted revalidation
+
+The complete fork workflow passed at exact source revision
+`8a208a82fd39425e701a00906cd5d207da12f1ec` in
+[run 30404553813](https://github.com/casselc/jolt/actions/runs/30404553813):
+
+- Linux x86_64 and aarch64 passed the full core gate;
+- native Windows x86_64 passed the source-runtime gate, packaged build,
+  POSIX-shell boundary, and transactional Git-dependency gate; and
+- native Windows aarch64 passed the source-runtime gate.
+
+Every architecture that ran the focused gate reported
+`timed-deref-deadline gate: 4/4 passed`. Linux x86_64/aarch64 and both native
+Windows architectures also reported `unit gate: 1129/1129 passed`; the Linux
+full gates retained the self-host fixpoint (`mint: 0 form(s) skipped`) and
+completed all existing compiler, dependency, CTS-baseline, CLI, devboot,
+tree-shake, and build-smoke gates.
+
+The downstream consumer check is intentionally separate evidence. jolt-tcp
+revision `1a6ce8c670d23de84dce643a9179955546cca9b8`, which changes no TCP source,
+test, timeout, or retry, pins this core and passed its complete six-target
+runtime/property matrix twice in
+[run 30404634191](https://github.com/casselc/jolt-tcp/actions/runs/30404634191).
+That includes both macOS architectures on which the historical implementation
+failed the bounded stop assertion under the same source revision with different
+scheduler pressure.
+
 ## Limits
 
 - The model assumes Chez's documented contract: `condition-wait` returns false
