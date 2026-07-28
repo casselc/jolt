@@ -53,6 +53,11 @@ artifacts. Do not translate an MSVC installation into a fake `libkernel.a`
 layout or add one-off CI conditionals that obscure which compiler owns an
 artifact.
 
+Shared prebuilt CI toolchains do not collapse this distinction. The proposed
+archive contract labels source-runtime, GNU kernel-development, and MSVC
+kernel-development capabilities separately; see
+[`shared-chez-ci-toolchains.md`](shared-chez-ci-toolchains.md).
+
 Treat support for the official Chez Windows package as a second packager
 backend. The backend boundary should own at least:
 
