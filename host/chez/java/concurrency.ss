@@ -24,6 +24,18 @@
     (make-time 'time-duration nanos secs)))
 (define (ms->deadline ms) (add-duration (current-time 'time-utc) (ms->duration ms)))
 
+;; Wait for a mutex-protected latch predicate until one absolute deadline.
+;; condition-wait returns #f only after the timeout has expired, but reacquires
+;; the mutex before returning.  Do not inspect ready? again on that branch: a
+;; producer can complete after the deadline yet win the mutex before this
+;; waiter reacquires it.  Treating that late state as success retroactively
+;; erases the timeout and reports an arbitrarily late completion as success.
+(define (jolt-wait-until-ready? ready? cv mu deadline)
+  (let loop ()
+    (cond ((ready?) #t)
+          ((condition-wait cv mu deadline) (loop)) ; signaled — recheck under mu
+          (else #f))))                            ; deadline owns the outcome
+
 ;; --- futures ----------------------------------------------------------------
 ;; A future is a mutable cell guarded by `mu`; workers/derefs coordinate on `cv`.
 ;;   done?       — result (or cancellation) is final; derefs may proceed
@@ -81,11 +93,11 @@
 (define (jolt-future-deref-timed f ms timeout-val)
   (let* ((deadline (ms->deadline ms))
          (settled (with-mutex (jolt-future-mu f)
-                    (let loop ()
-                      (cond ((jolt-future-done? f) #t)
-                            ((condition-wait (jolt-future-cv f) (jolt-future-mu f) deadline)
-                             (loop))                       ; woken — recheck
-                            (else (jolt-future-done? f))))))) ; timed out: final check
+                    (jolt-wait-until-ready?
+                      (lambda () (jolt-future-done? f))
+                      (jolt-future-cv f)
+                      (jolt-future-mu f)
+                      deadline))))
     (if settled (jolt-future-finish f) timeout-val)))
 
 ;; future-cancel: the running thread can't be interrupted, but the future object
@@ -146,11 +158,11 @@
 (define (jolt-promise-deref-timed p ms timeout-val)
   (let* ((deadline (ms->deadline ms))
          (got (with-mutex (jolt-promise-mu p)
-                (let loop ()
-                  (cond ((jolt-promise-delivered? p) #t)
-                        ((condition-wait (jolt-promise-cv p) (jolt-promise-mu p) deadline)
-                         (loop))
-                        (else (jolt-promise-delivered? p)))))))
+                (jolt-wait-until-ready?
+                  (lambda () (jolt-promise-delivered? p))
+                  (jolt-promise-cv p)
+                  (jolt-promise-mu p)
+                  deadline))))
     (if got (jolt-promise-value p) timeout-val)))
 
 ;; --- agents (async, per-agent serialized dispatch) --------------------------
@@ -372,12 +384,15 @@
         (when ok
           (with-mutex (jolt-agent-mu a)
             (unless (jolt-nil? (jolt-agent-err a)) (jolt-agent-failed-throw a))
-            (let loop ()
-              (when (or (jolt-agent-running? a) (not (jagent-q-empty? a)))
-                (if (condition-wait (jolt-agent-cv a) (jolt-agent-mu a) deadline)
-                    (loop)
-                    (when (or (jolt-agent-running? a) (not (jagent-q-empty? a)))
-                      (set! ok #f))))))))
+            (unless
+              (jolt-wait-until-ready?
+                (lambda ()
+                  (and (not (jolt-agent-running? a))
+                       (jagent-q-empty? a)))
+                (jolt-agent-cv a)
+                (jolt-agent-mu a)
+                deadline)
+              (set! ok #f)))))
       agents)
     ok))
 

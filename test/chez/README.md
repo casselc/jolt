@@ -29,6 +29,10 @@ answers with `regen-corpus.clj` and re-certify with `test/conformance/certify.cl
   refs. Each `:expr` is evaluated in-process and its printed value compared to a baked
   `:expected` (`:throws` asserts a raise).
 
+- `timed-deref-deadline-test.ss` — forces a producer to own a latch mutex
+  across a timed wait's deadline and proves that a post-deadline completion
+  cannot erase the timeout during mutex reacquisition. `make timedderef`.
+
 - `selfcheck.sh` — self-host fixpoint: `bootstrap.ss` rebuild byte-equals the
   checked-in seed (`host/chez/seed/`).
 - `smoke.sh` — real `bin/jolt -e` CLI smoke.
