@@ -157,6 +157,7 @@ jobs:
           chez --script test/chez/target-descriptor-test.ss
           chez --script test/chez/build-output-test.ss
           chez --script host/chez/run-unit.ss
+          chez --script test/chez/timed-deref-deadline-test.ss
           chez --script host/chez/cli.ss run test/mvn_http_test.clj
 
       - name: Build packaged jolt
@@ -220,6 +221,8 @@ jobs:
           & $chez --script test\chez\target-descriptor-test.ss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $chez --script host\chez\run-unit.ss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $chez --script test\chez\timed-deref-deadline-test.ss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:JOLT_PWD = $env:GITHUB_WORKSPACE
           & $chez --script host\chez\cli.ss run test\mvn_http_test.clj
