@@ -7,7 +7,7 @@
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
 JOLT_CHEZ := $(CHEZ)
 export JOLT_CHEZ
-DEPSTEST_JOLTC ?= bin/jolt
+DEPSTEST_JOLTC ?= target/release/jolt
 
 .PHONY: test ci testbin values targetfacts buildcapture monotonic hostclass classproviders corpus unit timedderef smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint aotcacheperf namespaceeffectsmoke submodules httpsfetch mvnhttp depssmoke depsunit depstest
 
@@ -143,8 +143,11 @@ depsunit:
 
 # jolt.deps transactional Git-cache tests. Every remote is a local temporary
 # repository; isolated cache roots make the failure/retry and concurrent-writer
-# cases deterministic without touching the user's dependency caches.
-depstest:
+# cases deterministic without touching the user's dependency caches. Parent and
+# child processes use the immutable release binary: the parallel devboot smoke
+# deliberately replaces target/dev/flat.so, so selecting that mutable developer
+# cache here creates a load/replacement race unrelated to Git transactions.
+depstest: testbin
 	@base="$${TMPDIR:-/tmp}"; \
 	  case "$$(uname -s)" in \
 	    MINGW*|MSYS*) [ -z "$${TEMP:-}" ] || base="$$(cygpath -u "$$TEMP")" ;; \
