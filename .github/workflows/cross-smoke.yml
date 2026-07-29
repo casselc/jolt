@@ -15,12 +15,15 @@ name: cross-smoke
 on:
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
   cross-smoke:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
         with:
           submodules: recursive   # vendor/irregex etc. — bin/jolt refuses to run without them
 
@@ -35,7 +38,7 @@ jobs:
       # kernel. Same pinned version as tests.yml/release.yml.
       - name: Cache Chez Scheme (host + cross)
         id: cache-chez
-        uses: actions/cache@v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/chez
           key: chez-cross-v10.4.1-ta6le-tarm64le-v1

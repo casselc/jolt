@@ -15,6 +15,9 @@ name: glibc-floor
 on:
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: build in ${{ matrix.name }}
@@ -41,7 +44,7 @@ jobs:
             image: quay.io/pypa/manylinux2014_x86_64
             static: 1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
         with:
           submodules: recursive
 
@@ -54,7 +57,7 @@ jobs:
 
       - name: Cache Chez install
         id: cache-chez
-        uses: actions/cache@v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/chez-opt
           key: glibc-floor-chez-v10.4.1-${{ matrix.name }}-v1
@@ -73,7 +76,7 @@ jobs:
             '${{ matrix.image }}' sh ci/glibc-floor-build.sh
 
       - name: Upload binary + report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: jolt-${{ matrix.name }}
           path: |
@@ -89,9 +92,9 @@ jobs:
       matrix:
         name: [ubuntu-20.04, manylinux_2_28, manylinux2014, manylinux2014-static]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: jolt-${{ matrix.name }}
           path: probe

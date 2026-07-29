@@ -17,6 +17,9 @@ on:
 permissions:
   contents: write   # create/update the GitHub Release and upload assets
 
+env:
+  CHEZ_TOOLCHAIN_RELEASE: chez-ci-10.4.1.1
+
 jobs:
   build:
     name: build ${{ matrix.target }}
@@ -38,6 +41,8 @@ jobs:
           - os: macos-14
             target: aarch64-macos
             shell: bash
+            toolchain-target: macos-arm64
+            toolchain-sha256: d5b5a504eed1e0f117b4a3dd23ad0030bb3e5c0da6d6b9d9f990f5f2fa32478f
           # x86_64-macos is cross-built from the arm64 macos-14 runner (GitHub
           # retired the Intel runners): `cross: ta6osx` gates the extra Chez-cross
           # + pack steps below, and the binary is smoke-tested via Rosetta 2.
@@ -45,14 +50,18 @@ jobs:
             target: x86_64-macos
             shell: bash
             cross: ta6osx
+            toolchain-target: macos-arm64
+            toolchain-sha256: d5b5a504eed1e0f117b4a3dd23ad0030bb3e5c0da6d6b9d9f990f5f2fa32478f
           - os: windows-latest
             target: x86_64-windows
             shell: msys2 {0}
+            toolchain-target: windows-x86_64
+            toolchain-sha256: 360c60496eea2f8aab0e557eb77e9e18b315bb9181938158ae57655aa541b7f8
     defaults:
       run:
         shell: ${{ matrix.shell }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
         with:
           submodules: recursive   # vendor/irregex, used by the Chez regex shim
 
@@ -71,7 +80,7 @@ jobs:
       - name: Cache Chez Scheme (Linux)
         if: runner.os == 'Linux'
         id: cache-chez
-        uses: actions/cache@v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/chez-opt
           key: chez-manylinux2014-v10.4.1-static-v1
@@ -89,18 +98,19 @@ jobs:
             -e STATIC_DEPS=1 \
             '${{ matrix.container-build }}' sh ci/glibc-floor-build.sh
 
-      # --- macOS: Homebrew chezscheme ships `chez` plus the csv kernel dev files
-      # (libkernel.a, scheme.h, *.boot), which is all build-jolt needs. ---
-      - name: Install Chez Scheme (macOS)
+      # --- macOS: lz4 is a release-link dependency. Chez itself comes from the
+      # digest-pinned shared toolchain below. Both matrix rows run natively on
+      # the ARM host; the x86_64 row separately builds its target pack. ---
+      - name: Install release link dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install chezscheme lz4
+        run: brew install lz4
 
-      # --- Windows: MSYS2/MinGW-w64 toolchain + Chez built from source (ta6nt).
-      # The whole job runs in the msys2 shell so cc/xxd/paths behave; the
+      # --- Windows: MSYS2/MinGW-w64 supplies the GNU linker and libraries;
+      # digest-pinned ta6nt Chez comes from the shared toolchain below. The
       # produced jolt.exe is a plain Windows binary (no MSYS runtime dep). ---
       - name: Set up MSYS2 (Windows)
         if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
         with:
           msystem: MINGW64
           update: false
@@ -114,49 +124,48 @@ jobs:
             mingw-w64-x86_64-zlib
             mingw-w64-x86_64-ntldd
 
-      - name: Cache Chez Scheme (Windows)
-        if: runner.os == 'Windows'
-        id: cache-chez-win
-        uses: actions/cache@v4
-        with:
-          path: chez-install
-          key: chez-${{ matrix.os }}-v10.4.1-mingw64
-
-      - name: Build Chez Scheme from source (Windows)
-        if: runner.os == 'Windows' && steps.cache-chez-win.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
-          cd /tmp/chez-src
-          ./configure --threads
-          make -j"$(nproc)"
-          # `make install` drives the unix installsh through cmd and dies; the
-          # build tree has everything — assemble the layout by hand. Boot files
-          # sit next to scheme.exe (that's where the Windows kernel looks).
-          inst="$GITHUB_WORKSPACE/chez-install"
-          mkdir -p "$inst/bin" "$inst/csv"
-          cp ta6nt/bin/ta6nt/*.exe "$inst/bin/"
-          cp ta6nt/bin/ta6nt/*.dll "$inst/bin/" 2>/dev/null || true
-          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/bin/"
-          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/csv/"
-          cp ta6nt/boot/ta6nt/scheme.h "$inst/csv/"
-          cp ta6nt/boot/ta6nt/equates.h "$inst/csv/" 2>/dev/null || true
-          cp ta6nt/boot/ta6nt/libkernel.a "$inst/csv/" || { echo "libkernel.a not found:"; find ta6nt -name "*.a" -o -name "kernel*"; exit 1; }
-
-      - name: Put chez on PATH (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          bindir="$GITHUB_WORKSPACE/chez-install/bin"
-          { echo '#!/bin/sh'; echo "exec \"$bindir/scheme.exe\" \"\$@\""; } > "$bindir/chez"
-          chmod +x "$bindir/chez"
-          echo "$bindir" >> "$GITHUB_PATH"
-          echo "JOLT_CHEZ_CSV=$GITHUB_WORKSPACE/chez-install/csv" >> "$GITHUB_ENV"
-          # cc is the build's compiler name; alias it to mingw gcc
-          { echo '#!/bin/sh'; echo 'exec gcc "$@"'; } > "$bindir/cc"
-          chmod +x "$bindir/cc"
-
-      - name: Show Chez version
+      # Native release hosts consume the same immutable toolchains as tests.yml.
+      # The action verifies the caller-pinned archive digest and internal
+      # inventory, then exports CHEZ/JOLT_CHEZ/JOLT_CHEZ_CSV/PATH. Linux is
+      # deliberately excluded: its Chez must be built inside manylinux2014 so
+      # the released binary retains the proven glibc 2.17 floor.
+      - name: Install Chez Scheme (shared toolchain)
         if: runner.os != 'Linux'
-        run: chez --version
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3
+        with:
+          target: ${{ matrix.toolchain-target }}
+          release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
+          sha256: ${{ matrix.toolchain-sha256 }}
+          capabilities: source-runtime,gnu-kernel-dev
+
+      # The action exports native Windows paths. The release job's make/build
+      # commands run in MSYS2, so translate the executable paths they resolve
+      # through sh. Keep JOLT_CHEZ_CSV native: Chez itself calls file-exists? on
+      # that path. No install layout is reconstructed here.
+      - name: Translate toolchain paths for the POSIX shell (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          chez_posix="$(cygpath -u "$CHEZ")"
+          test -x "$chez_posix"
+          echo "CHEZ=$chez_posix" >> "$GITHUB_ENV"
+          echo "JOLT_CHEZ=$chez_posix" >> "$GITHUB_ENV"
+
+      - name: Chez toolchain evidence
+        if: runner.os != 'Linux'
+        run: |
+          echo "target:         ${{ steps.chez.outputs.target }}"
+          echo "archive sha256: ${{ steps.chez.outputs.archive-sha256 }}"
+          echo "cache-hit:      ${{ steps.chez.outputs.cache-hit }}"
+          echo "CHEZ=$CHEZ"
+          echo "JOLT_CHEZ_CSV=$JOLT_CHEZ_CSV"
+          "$CHEZ" --version
+          command -v cc
+          csv="$JOLT_CHEZ_CSV"
+          if [ "${{ runner.os }}" = "Windows" ]; then csv="$(cygpath -u "$csv")"; fi
+          for f in scheme.h libkernel.a petite.boot scheme.boot; do
+            test -f "$csv/$f" || { echo "missing kernel dev file: $f"; exit 1; }
+          done
 
       # --- x86_64-macos is cross-built on the arm64 runner (matrix.cross=ta6osx):
       # build the target boots/xpatch + cross kernel, then assemble a target pack
@@ -164,7 +173,7 @@ jobs:
       - name: Cache Chez cross (ta6osx)
         if: matrix.cross
         id: cache-chez-cross
-        uses: actions/cache@v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/chez-cross
           key: chez-cross-v10.4.1-tarm64osx-${{ matrix.cross }}-v1
@@ -280,7 +289,9 @@ jobs:
 
       - name: Upload to the GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        # v2 is still a Node 20 action. Pin its exact tagged revision rather
+        # than a mutable major; replacing it awaits a tagged Node 24 release.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/*.tar.gz
@@ -323,7 +334,7 @@ jobs:
 
       - name: Checkout tap
         if: steps.tok.outputs.ok == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
         with:
           repository: jolt-lang/homebrew-jolt
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
