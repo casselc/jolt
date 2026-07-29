@@ -926,6 +926,11 @@
 ;; it. After the dispatchers it chains.
 (load "host/chez/java/natives-array.ss")
 
+;; jolt.bytes: checked endian/raw-bit scalar access and overlap-safe ranged copy
+;; over a byte-array. Immediately after natives-array.ss — it reads that file's
+;; jolt-array backing bytevector directly and adds no dispatcher of its own.
+(load "host/chez/bytes.ss")
+
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and
 ;; natives-array.ss (the byte-array <-> bytevector bridge).
