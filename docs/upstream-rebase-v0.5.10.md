@@ -10,7 +10,8 @@ not an upstream release claim or authorization to push to `jolt-lang/jolt`.
 - upstream tag: `v0.5.10`, commit `38adcc0185e23f05e096d36d661065758a5432b4`;
 - rebase branch: `codex/upstream-rebase-v0.5.10`;
 - freshly reminted seed: `5e2b4304`;
-- tested source revision: `75080987`.
+- Git transaction correction: `e11adc8263c1d68235f5fb30a3295c49b22c4edc`;
+- tested code revision: `c8de0879d336c59b4c93d6921184f7674f7f8297`.
 
 The old proposal was a linear 70-commit series over v0.5.7. Sixty-nine
 semantic, test, CI, and documentation commits were replayed. The old
@@ -41,7 +42,7 @@ v3 contract:
 - no checkout, lock, or staging payload remains publishable.
 
 The reconciled smoke reports 54/54 checks. The deeper transactional suite
-reports 183/183.
+reports 183/183 on Linux and 185/185 on native Windows x86-64.
 
 ### Namespace artifact cache
 
@@ -88,18 +89,58 @@ fixed-path devboot image is safe for every arbitrary process that selects it
 concurrently. Immutable generation-named devboot publication remains a
 separate follow-up.
 
+## Packaged Windows Git-transaction finding
+
+The first hosted rebase run
+[`30409373239`](https://github.com/casselc/jolt/actions/runs/30409373239)
+passed both Linux full gates and the Windows ARM64 source-runtime gate. The
+packaged Windows x86-64 dependency job terminated with exit 139 after Git
+reported a private `.s` stage as busy. This was a real native failure, not the
+expected missing-origin diagnostic from the failed-clone fixture.
+
+Native reduction isolated the six-writer same-process case. Serializing only
+the shell call still reproduced the busy-stage termination on the fourth
+fresh-process repetition. The durable per-entry directory lock coordinates
+publication between processes, but it cannot restore a runtime that terminates
+while concurrent threads are still inspecting or repairing cache state.
+
+The complete same-process inspection/reuse/repair transaction is therefore
+admitted through one recursive object monitor. The directory lock remains the
+separate cross-process authority. This intentionally serializes Git cache
+transactions inside one Jolt process, including different coordinates; ordinary
+dependency expansion is sequential today, and the safer native boundary is
+preferred over speculative parallel acquisition. The exact native Windows
+suite then passed 185/185, including a 60-second stress-only ceiling derived
+from the measured serialized six-writer path. Linux remains 183/183.
+
+Hosted run
+[`30413531965`](https://github.com/casselc/jolt/actions/runs/30413531965)
+at the production correction passed all four jobs: Linux x86-64, Linux
+aarch64, Windows ARM64 source runtime, and packaged Windows x86-64 Git
+transactions. The packaged lane reached and passed the complete transactional
+gate instead of terminating in native cleanup. Final-code run
+[`30414843309`](https://github.com/casselc/jolt/actions/runs/30414843309)
+repeated the same 4/4 result at `c8de0879`, including the measured
+stress-watchdog adjustment.
+
 ## Proof revalidation
 
-No modeled premise changed for timed deref or the v3 Git cache:
+No modeled premise changed for timed deref:
 
 - `host/chez/java/concurrency.ss` is byte-identical to the old proposal tip;
-- `jolt-core/jolt/deps.clj` is byte-identical to the old proposal tip; and
 - the only loader delta is v0.5.8's full-content hash helper, below the retained
   runtime rule that bypasses per-namespace artifact selection.
 
-All 65 checked SMT files under `test/chez/formal/` match their declared
-verdicts under standalone Z3: every `*-corrected.smt2` is UNSAT, and every
-buggy, witness, control, or non-vacuity model is SAT.
+`jolt-core/jolt/deps.clj` now has one deliberate post-replay delta: the
+process-local transaction monitor described above. Its bounded model asks
+whether two same-process transaction intervals can overlap. Omitting the
+monitor is SAT; serial admission plus the overlap query is UNSAT with the
+monitor/overlap/violation/query core; and useful sequential completion remains
+SAT.
+
+All 68 checked SMT files under `test/chez/formal/` match their declared
+verdicts under standalone Z3: 46 SAT controls/witnesses/non-vacuity models and
+22 UNSAT corrected queries.
 
 The directly affected timed-deadline and Git-path-budget trios were also
 linted and verified through Chiasmus:
@@ -108,10 +149,12 @@ linted and verified through Chiasmus:
 | --- | --- | --- | --- |
 | timed deref deadline | SAT | UNSAT | SAT |
 | Git cache path budget | SAT (`226`) | UNSAT | SAT (`219`) |
+| Git same-process transaction | SAT (overlap) | UNSAT | SAT (both complete) |
 
-The runtime companions pass: timed deref 4/4, dependency transactions 183/183,
-dependency smoke 54/54, namespace-effect replay, and AOT fingerprint 10/10.
-No proof or model source needed revision merely to preserve its conclusion.
+The new trio was linted and verified through Chiasmus as well as standalone
+Z3. The runtime companions pass: timed deref 4/4, dependency transactions
+183/183 on Linux and 185/185 on native Windows, dependency smoke 54/54,
+namespace-effect replay, and AOT fingerprint 10/10.
 
 ## Local verification
 
@@ -136,6 +179,7 @@ The final complete gate reports `OK: CI gates passed`. Selected evidence:
 - class-provider, build, static-native, tree-shake, devboot, gateboot,
   namespace-effect, optimizer, and manifest gates passed.
 
-Hosted platform validation and downstream net/TCP/HTTP/Hegel repins remain
-follow-ons. Nothing in this rebase was pushed to the upstream Jolt origin, and
-no pull request was opened.
+The four-job hosted platform gate is green at both the production correction
+and final tested code; downstream net/TCP/HTTP/Hegel repins remain follow-ons.
+Nothing in this rebase was pushed to the upstream Jolt origin, and no pull
+request was opened.
