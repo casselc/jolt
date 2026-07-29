@@ -1,5 +1,5 @@
-;; bytes-alloc-bench.ss — allocation and throughput evidence for jolt.bytes. Run:
-;;   chez --script test/chez/bytes-alloc-bench.ss
+;; codec-binary-alloc-bench.ss — allocation and throughput evidence for jolt.codec.binary. Run:
+;;   chez --script test/chez/codec-binary-alloc-bench.ss
 ;;
 ;; The GATE here is allocation, not speed. A scalar read or write must not build
 ;; a temporary array, bytevector or sequence — that is a hard invariant and it is
@@ -23,8 +23,10 @@
 ;;   * Chez's bytevector-ieee-single-set! costs one object that the double
 ;;     setter does not, so the f32 write path is not free on this host.
 ;;
-;; f64-bits/f32-bits reuse a per-thread scratch bytevector allocated once per
-;; thread, so no steady-state call builds a buffer.
+;; f64-bits/bits->f64 reuse a per-thread scratch bytevector allocated once per
+;; thread, so no steady-state call builds a buffer. That scratch lives in a
+;; non-inheriting thread slot (rt.ss), which is what makes "per-thread" true
+;; after a fork; the reuse it preserves is exactly what these rows measure.
 ;;
 ;; The control is a byte-at-a-time reconstruction over the same array — what a
 ;; codec writes when it has no substrate — so the comparison is against a real
@@ -117,11 +119,11 @@
 (define (bench! label thunk) (run-row label thunk #t))
 (define (report! label thunk) (run-row label thunk #f))
 
-(printf "jolt.bytes allocation and throughput\n")
+(printf "jolt.codec.binary allocation and throughput\n")
 (printf "  chez ~a, ~a iterations/trial, ~a warmup, ~a trials\n"
         (call-with-values (lambda () (scheme-version)) (lambda (v) v))
         iterations warmup trials)
-(printf "  command: chez --script test/chez/bytes-alloc-bench.ss\n\n")
+(printf "  command: chez --script test/chez/codec-binary-alloc-bench.ss\n\n")
 
 (printf "scalar reads (gated: must allocate nothing)\n")
 (bench! "get-u8" (lambda () (jb-get-u8 arr 7)))
@@ -151,7 +153,7 @@
 
 (printf "\nmeasurement floor (not the substrate: what this environment costs)\n")
 ;; A flonum handed to a primitive from interpreted script code. Nothing in
-;; jolt.bytes is involved; this is the 16 bytes every flonum-carrying row below
+;; jolt.codec.binary is involved; this is the 16 bytes every flonum-carrying row below
 ;; also pays.
 (report! "flonum -> primitive" (lambda () (bytevector-ieee-double-set! scratch 0 sample-f64 (endianness big))))
 ;; A bignum built by arithmetic, for the same reason.
@@ -167,7 +169,6 @@
 ;; never a per-call buffer.
 (report! "f64-bits" (lambda () (jb-f64-bits sample-f64)))
 (report! "bits->f64" (lambda () (jb-bits->f64 5)))
-(report! "f32-bits" (lambda () (jb-f32-bits sample-f64)))
 ;; put-f32-be! costs one object more than put-f64-le! on this host: narrowing a
 ;; binary64 flonum to binary32 goes through an intermediate that the double
 ;; setter does not need. It is a property of the Chez primitive, not of a staging

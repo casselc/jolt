@@ -1,9 +1,9 @@
-;; bytes_differential_test.clj — jolt.bytes against JVM-sourced expecteds.
+;; codec_binary_differential_test.clj — jolt.codec.binary against JVM-sourced expecteds.
 ;;
-;;   jolt run test/chez/bytes_differential_test.clj
+;;   jolt run test/chez/codec_binary_differential_test.clj
 ;;
-;; test/chez/bytes-jvm-oracle.edn is produced on the JVM by
-;; test/chez/bytes-jvm-oracle.clj (java.nio.ByteBuffer, Double/doubleToRawLongBits,
+;; test/chez/codec-binary-jvm-oracle.edn is produced on the JVM by
+;; test/chez/codec-binary-jvm-oracle.clj (java.nio.ByteBuffer, Double/doubleToRawLongBits,
 ;; Float/floatToRawIntBits, System/arraycopy) and checked in, so this gate needs
 ;; no JVM. The comparison is on BYTES and RAW BITS, never on decoded numeric
 ;; values alone: a NaN compares equal to nothing and -0.0 compares equal to 0.0,
@@ -11,7 +11,7 @@
 
 (ns bytes-differential-test
   (:require [clojure.edn :as edn]
-            [jolt.bytes :as b]))
+            [jolt.codec.binary :as b]))
 
 (def ^:private state (atom {:checks 0 :failures []}))
 
@@ -25,9 +25,9 @@
 
 (defn- num [s] (edn/read-string s))
 
-(def ^:private fixture (edn/read-string (slurp "test/chez/bytes-jvm-oracle.edn")))
+(def ^:private fixture (edn/read-string (slurp "test/chez/codec-binary-jvm-oracle.edn")))
 
-(assert (= :jolt.bytes/jvm-differential-v1 (:schema fixture)) "unexpected fixture schema")
+(assert (= :jolt.codec.binary/jvm-differential-v1 (:schema fixture)) "unexpected fixture schema")
 
 ;; --- integers ---------------------------------------------------------------
 ;; For every row: writing the JVM's signed value must produce the JVM's bytes,
@@ -83,13 +83,16 @@
 ;; --- f32 --------------------------------------------------------------------
 ;; The JVM has a native 32-bit float type, so Float/intBitsToFloat is a raw bit
 ;; move that preserves a signalling NaN. Jolt's only float type is binary64, so
-;; bits->f32 must widen — and the JVM's OWN widening of the same float is the
-;; reference for what that must produce. :widened-f64-bits is that reference, and
-;; it agrees on every pattern, signalling NaNs included.
+;; there is no raw f32 pair to compare against; what jolt.codec.binary offers is
+;; get-f32-*/put-f32-*!, which WIDEN on read and NARROW on write.
 ;;
-;; The consequence is recorded rather than hidden: re-narrowing a widened
-;; signalling NaN quiets it, on the JVM and on Chez alike, so an f32 pattern that
-;; must survive verbatim travels as u32.
+;; The JVM's own widening of the same float is the reference for what a read must
+;; produce — :widened-f64-bits — and it agrees on every pattern, signalling NaNs
+;; included. The consequence is asserted rather than hidden: a read/write pair
+;; through the numeric accessors reproduces the wire bytes for every pattern
+;; except a signalling NaN, which comes back quieted on the JVM and on Chez
+;; alike. A pattern that must survive verbatim travels as u32 instead, which the
+;; last check in each row exercises over the whole corpus.
 
 (defn- f32-signalling? [bits]
   (and (= (bit-and bits 0x7F800000) 0x7F800000)
@@ -99,32 +102,48 @@
 (doseq [{:keys [bits round-trip-raw widened-f64-bits bytes-be bytes-le]} (:f32 fixture)]
   (let [bv (num bits)
         label (str "f32 bits " bits)
-        x (b/bits->f32 bv)
+        ;; the value the wire pattern denotes, obtained the only way the API now
+        ;; allows: read the four bytes as a number, which widens exactly.
+        a (byte-array 4)
+        _ (b/put-u32-be! a 0 bv)
+        x (b/get-f32-be a 0)
         ;; what the pattern becomes after a widen/narrow pair
         narrowed (if (f32-signalling? bv) (bit-or bv 0x00400000) bv)]
     (check! (str label " / widening matches the JVM's own widening")
             (= (num widened-f64-bits) (b/f64-bits x)))
-    (check! (str label " / re-narrowing is the JVM raw pattern, quieted if signalling")
-            (= narrowed (b/f32-bits x)))
+    (check! (str label " / little-endian read widens identically")
+            (let [c (byte-array 4)]
+              (b/put-u32-le! c 0 bv)
+              (= (num widened-f64-bits) (b/f64-bits (b/get-f32-le c 0)))))
     (check! (str label " / non-signalling patterns match the JVM raw round trip")
-            (or (f32-signalling? bv) (= (num round-trip-raw) (b/f32-bits x))))
+            (or (f32-signalling? bv)
+                (let [c (byte-array 4)]
+                  (b/put-f32-be! c 0 x)
+                  (= (num round-trip-raw) (b/get-u32-be c 0)))))
     (let [expected-be (if (f32-signalling? bv)
                         (let [c (byte-array 4)] (b/put-u32-be! c 0 narrowed) (bytes-vec c))
                         bytes-be)
-          a (byte-array 4)]
-      (b/put-f32-be! a 0 x)
-      (check! (str label " / big-endian bytes") (= expected-be (bytes-vec a))))
+          c (byte-array 4)]
+      (b/put-f32-be! c 0 x)
+      (check! (str label " / big-endian bytes") (= expected-be (bytes-vec c))))
     (let [expected-le (if (f32-signalling? bv)
                         (let [c (byte-array 4)] (b/put-u32-le! c 0 narrowed) (bytes-vec c))
                         bytes-le)
-          a (byte-array 4)]
-      (b/put-f32-le! a 0 x)
-      (check! (str label " / little-endian bytes") (= expected-le (bytes-vec a))))
+          c (byte-array 4)]
+      (b/put-f32-le! c 0 x)
+      (check! (str label " / little-endian bytes") (= expected-le (bytes-vec c))))
     ;; the raw u32 path carries any pattern verbatim, signalling included
-    (let [a (byte-array 4)]
-      (b/put-u32-be! a 0 bv)
-      (check! (str label " / u32 path preserves the pattern verbatim")
-              (= bv (b/get-u32-be a 0))))))
+    (check! (str label " / u32 path preserves the pattern verbatim")
+            (= bv (b/get-u32-be a 0)))))
+
+;; The withdrawn names must be genuinely absent through the public require, not
+;; merely undocumented — `resolve` returns the var only when it is defined.
+(check! "jolt.codec.binary publishes no f32 raw-bit pair"
+        (and (nil? (resolve 'b/f32-bits))
+             (nil? (resolve 'b/bits->f32))))
+(check! "the same probe still finds the retained f64 pair"
+        (and (some? (resolve 'b/f64-bits))
+             (some? (resolve 'b/bits->f64))))
 
 ;; --- overlapping copy -------------------------------------------------------
 ;; Replay every System/arraycopy row. The forward-overlap rows are the ones a

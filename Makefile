@@ -9,7 +9,7 @@ JOLT_CHEZ := $(CHEZ)
 export JOLT_CHEZ
 DEPSTEST_JOLTC ?= target/release/jolt
 
-.PHONY: test ci bytes testbin values targetfacts buildcapture monotonic hostclass classproviders corpus unit timedderef smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint aotcacheperf namespaceeffectsmoke submodules httpsfetch mvnhttp depssmoke depsunit depstest
+.PHONY: test ci codecbinary threadslots testbin values targetfacts buildcapture monotonic hostclass classproviders corpus unit timedderef smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffistress executorprobe transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint aotcacheperf namespaceeffectsmoke submodules httpsfetch mvnhttp depssmoke depsunit depstest
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -25,7 +25,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values targetfacts buildcapture monotonic hostclass classproviders corpus unit timedderef mvnhttp depssmoke depsunit depstest smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi bytes transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke namespaceeffectsmoke certify
+ci: submodules values targetfacts buildcapture monotonic hostclass classproviders corpus unit timedderef mvnhttp depssmoke depsunit depstest smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi codecbinary threadslots transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke namespaceeffectsmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -195,17 +195,29 @@ ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@CHEZ="$(CHEZ)" sh test/chez/ffi-aggregate-test.sh
 
-# jolt.bytes: subtraction-form bounds, endian integers, IEEE-754 raw bits, and
-# overlap-safe ranged copy. Three lanes — the host-level boundary tables, the
-# differential against checked-in JVM expecteds (ByteBuffer /
+# jolt.codec.binary: subtraction-form bounds, endian integers, IEEE-754 raw
+# bits, and overlap-safe ranged copy. Three lanes — the host-level boundary
+# tables, the differential against checked-in JVM expecteds (ByteBuffer /
 # doubleToRawLongBits / System.arraycopy, so no JVM is needed to RUN it), and
 # the allocation gate asserting that no scalar path builds a temporary.
 # Regenerate the expecteds on a JVM with:
-#   clojure -M test/chez/bytes-jvm-oracle.clj > test/chez/bytes-jvm-oracle.edn
-bytes:
-	@$(CHEZ) --script test/chez/bytes-substrate-test.ss
-	@"$${JOLT_BIN:-bin/jolt}" run test/chez/bytes_differential_test.clj
-	@$(CHEZ) --script test/chez/bytes-alloc-bench.ss
+#   clojure -M test/chez/codec-binary-jvm-oracle.clj \
+#     > test/chez/codec-binary-jvm-oracle.edn
+codecbinary:
+	@$(CHEZ) --script test/chez/codec-binary-test.ss
+	@"$${JOLT_BIN:-bin/jolt}" run test/chez/codec_binary_differential_test.clj
+	@$(CHEZ) --script test/chez/codec-binary-alloc-bench.ss
+
+# Non-inheriting per-thread slots (rt.ss). A Chez thread parameter hands a
+# forked thread the parent's CURRENT value — right for dynamic context, wrong
+# for a per-thread cache. Two lanes: the host-level slot/scratch/interrupt/trace
+# controls, and the public jolt.codec.binary float race through futures. Both
+# initialize on the PARENT before forking, which is what makes the defect
+# deterministic rather than a scheduling accident, and both fail against a plain
+# thread parameter.
+threadslots:
+	@$(CHEZ) --script test/chez/thread-slot-test.ss
+	@"$${JOLT_BIN:-bin/jolt}" run test/chez/thread_isolation_test.clj
 
 # OPT-IN evidence probes. ffistress is a POSIX-only bounded concurrent
 # collect-safe/native call reduction; executorprobe characterizes the live

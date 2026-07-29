@@ -9,16 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`jolt.bytes`, a checked binary scalar substrate.** Fixed-width integer and
-  IEEE-754 access over a byte-array at an explicit offset, plus an overlap-safe
-  ranged copy: `get-u16-le` / `put-u32-be!` / `get-i64-le` and the rest of the
-  u8..u64 x signed/unsigned x little/big table, `get-f64-le` and friends,
-  raw-bit conversion (`f64-bits`, `bits->f64`, `f32-bits`, `bits->f32`), and
-  `copy!`. Every binary protocol — a length-prefixed envelope, bencode, a
-  compression or image header — otherwise rebuilds this by hand over
-  `aget`/`aset` with a shift-and-or chain per field; over Chez's bytevector
-  primitives each operation is one primitive call and allocates nothing, which
-  the `bytes` gate asserts rather than assumes.
+- **`jolt.codec.binary`, a checked binary scalar substrate.** Fixed-width
+  integer and IEEE-754 access over a byte-array at an explicit offset, plus an
+  overlap-safe ranged copy: `get-u16-le` / `put-u32-be!` / `get-i64-le` and the
+  rest of the u8..u64 x signed/unsigned x little/big table, `get-f64-le` and
+  friends, raw-bit conversion (`f64-bits`, `bits->f64`), and `copy!`. Every
+  binary protocol — a length-prefixed envelope, bencode, a compression or image
+  header — otherwise rebuilds this by hand over `aget`/`aset` with a
+  shift-and-or chain per field; over Chez's bytevector primitives each operation
+  is one primitive call and allocates nothing, which the `codecbinary` gate
+  asserts rather than assumes.
+
+  The namespace is `jolt.codec.binary`, not `jolt.bytes`: `jolt.bytes` belongs
+  to the external `casselc/jolt-bytes` package (`Window`, `Cursor`, slicing,
+  copying), and the loader seeds its loaded-namespace table from every namespace
+  that already has host vars — so publishing there would have marked
+  `jolt.bytes` loaded at startup and stopped `(require '[jolt.bytes …])` from
+  ever reading that library's source.
 
   Bounds admission is subtraction-form: after `0 <= offset <= limit`, a span is
   admitted only when `size <= limit - offset`, which needs no "and the sum did
@@ -34,12 +41,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   IEEE-754 binary64 — probed at load, failing closed rather than returning
   plausible wrong bits.
 
-  One representation limit is documented rather than papered over: Jolt's only
-  float type is binary64, so `bits->f32` must widen. The widened value matches
-  the JVM's own widening of the same float bit-for-bit, signalling NaNs
-  included, but re-narrowing quiets a signalling NaN (`0x7F800001` comes back
-  as `0x7FC00001`) exactly as it does on the JVM. An f32 pattern that must
-  survive verbatim travels as u32.
+  f64 raw bits are a bijection with the u64 domain. **There is deliberately no
+  f32 equivalent.** Jolt's only float type is binary64, so a `bits->f32` would
+  have to widen, and re-narrowing quiets a signalling NaN (`0x7F800001` comes
+  back as `0x7FC00001`) — a partial function under a total function's name, with
+  a silent and pattern-dependent failure a codec cannot detect. `get-f32-le/be`
+  and `put-f32-le/be!` remain as NUMERIC accessors that widen on read and narrow
+  on write, documented as such; an f32 wire pattern that must survive verbatim
+  travels through the u32 accessors, which never involve a float.
+
+- **Non-inheriting per-thread slots.** Chez's `make-thread-parameter` hands a
+  newly forked thread the parent's *current* value, not the parameter's initial
+  value. That is correct for dynamic context meant to propagate, and wrong for
+  per-thread storage — so `jolt-make-thread-slot` (host/chez/rt.ss) tags each
+  entry with its owning thread id and rebuilds an inherited one before it can be
+  read. Ordinary thread parameters are untouched.
+
+  Four facilities whose contracts require isolation move onto it, each of which
+  was observably wrong when a parent had touched the state before forking:
+
+  - the `jolt.codec.binary` IEEE staging scratch — one shared eight-byte buffer
+    made concurrent `f64-bits` conversions return each other's patterns (7 of 8
+    workers corrupted in the checked-in control);
+  - `java.lang.ThreadLocal` — a child's first `.get` returned the parent's value
+    instead of running `initialValue`, which is the one behaviour that
+    distinguishes it from `InheritableThreadLocal`. `InheritableThreadLocal`
+    keeps inheriting, and `proxy` now says which it is building;
+  - per-thread interrupt boxes — futures shared one box, so `.interrupt` on one
+    interrupted all of them and `Thread/interrupted` on any could swallow
+    another's pending interrupt;
+  - per-thread trace rings — threads interleaved frame names into each other's
+    ribs, in the history that exists to disambiguate a backtrace.
+
+  A fifth used the same owner tag in `parameterize` shape: an agent action's
+  nested-send list. A `future` spawned inside an action inherited the list,
+  concluded it was itself running in an action, and had its own sends **held**
+  until the parent action completed — so a future that waited on the effect of
+  its own send waited on the action that spawned it.
 
 - **A real monotonic clock.** `jolt.host/monotonic-nanos` returns a monotonic
   counter (Chez's `time-monotonic`), and `System/nanoTime` now projects it

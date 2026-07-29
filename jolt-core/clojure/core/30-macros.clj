@@ -668,8 +668,12 @@
 (defmacro proxy [supers ctor-args & methods]
   (if (and (vector? supers) (= 1 (count supers))
            (let [s (name (first supers))] (or (= s "ThreadLocal") (= s "InheritableThreadLocal"))))
-    (let [init (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
-      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))))
+    ;; ThreadLocal is defined NOT to inherit across a thread fork;
+    ;; InheritableThreadLocal is. That is the only difference between the two,
+    ;; so it is the only thing passed along here.
+    (let [init (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)
+          inheritable? (= "InheritableThreadLocal" (name (first supers)))]
+      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init))) ~inheritable?))
     `(reify ~@supers
        ~@(map (fn [m] (list* (first m) (vec (cons 'this (second m))) (nnext m))) methods))))
 ;; definterface is JVM-only; bind the name to a marker and return the name (not a

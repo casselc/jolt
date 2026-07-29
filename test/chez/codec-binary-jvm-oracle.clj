@@ -1,10 +1,10 @@
-;; bytes-jvm-oracle.clj — generate the JVM-sourced expecteds for jolt.bytes.
+;; codec-binary-jvm-oracle.clj — generate the JVM-sourced expecteds for jolt.codec.binary.
 ;;
 ;; Run on the JVM, NOT on jolt:
-;;   clojure -M test/chez/bytes-jvm-oracle.clj > test/chez/bytes-jvm-oracle.edn
+;;   clojure -M test/chez/codec-binary-jvm-oracle.clj > test/chez/codec-binary-jvm-oracle.edn
 ;;
 ;; The fixture it prints is checked in, so the differential gate
-;; (test/chez/bytes_differential_test.clj) runs on Chez with no JVM present. The
+;; (test/chez/codec_binary_differential_test.clj) runs on Chez with no JVM present. The
 ;; JVM side is the independent implementation: java.nio.ByteBuffer lays out the
 ;; integers, Double/doubleToRawLongBits and Float/floatToRawIntBits carry the
 ;; float bits, and System/arraycopy performs the overlapping moves.
@@ -141,9 +141,9 @@
 
 (defn -main []
   (binding [*print-length* nil *print-level* nil]
-    (prn {:schema :jolt.bytes/jvm-differential-v1
-          :generator {:tool "test/chez/bytes-jvm-oracle.clj"
-                      :command "clojure -M test/chez/bytes-jvm-oracle.clj"
+    (prn {:schema :jolt.codec.binary/jvm-differential-v1
+          :generator {:tool "test/chez/codec-binary-jvm-oracle.clj"
+                      :command "clojure -M test/chez/codec-binary-jvm-oracle.clj"
                       :java-version (System/getProperty "java.version")
                       :clojure-version (clojure-version)}
           :ints (vec (mapcat int-rows [8 16 32 64]))

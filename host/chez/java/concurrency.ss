@@ -189,7 +189,18 @@
 ;; running on this thread (#f outside an action). Holds nested sends until the
 ;; action completes, like the JVM's ThreadLocal `nested`. Its box-ness is also
 ;; the signal that *agent* is bound (an action is in flight on this thread).
-(define *agent-nested* (make-thread-parameter #f))
+;;
+;; The parameter's VALUE is owner-tagged (rt.ss). `parameterize` is the right
+;; shape here — the hold must end exactly when the action's dynamic extent does —
+;; but a plain parameter is INHERITED: a future spawned from inside an action saw
+;; the parent's box, concluded it was itself running in an action, and had its
+;; own sends held in the parent's list rather than dispatched. Those sends were
+;; then flushed only when the PARENT action completed, so a future that waited on
+;; the effect of its own send was really waiting on the action that spawned it.
+;; The JVM's `nested` is a plain ThreadLocal and does not inherit; the owner tag
+;; restores that while leaving the parameterize scoping exactly as it was.
+(define *agent-nested-cell* (make-thread-parameter #f))
+(define (*agent-nested*) (jolt-thread-owned-ref (*agent-nested-cell*)))
 (define (jolt-in-agent-action?) (box? (*agent-nested*)))
 
 ;; (agent state :meta m :validator f :error-handler h :error-mode e): the ARef
@@ -296,7 +307,7 @@
                             (condition-broadcast (jolt-agent-cv a)) #f)
                      (jagent-q-pop! a)))))
       (when act
-        (parameterize ((*agent-nested* (box '())))
+        (parameterize ((*agent-nested-cell* (jolt-thread-owned (box '()))))
           (let ((err #f))
             (guard (e (#t (set! err (jolt-unwrap-throw e))))
               (let* ((old (jolt-agent-state a))
@@ -313,7 +324,7 @@
                 (let ((handler (jolt-agent-err-handler a)))
                   (when (not (jolt-nil? handler))
                     ;; the handler runs as if outside the action: its sends go direct
-                    (parameterize ((*agent-nested* #f))
+                    (parameterize ((*agent-nested-cell* #f))
                       (guard (_ (#t #f)) (jolt-invoke handler a err))))
                   (when (eq? (jolt-agent-err-mode a) 'fail)
                     (with-mutex (jolt-agent-mu a)

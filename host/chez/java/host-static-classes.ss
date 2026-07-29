@@ -978,20 +978,53 @@
 ;; only after the class-provider registry is available.
 (set! record-method-miss-retry! class-provider-try-load-for-value!)
 
-;; java.lang.ThreadLocal via a Chez thread-parameter: real per-thread storage with
-;; a lazy initialValue (the proxy macro lowers (proxy [ThreadLocal] …) to this).
-;; .get returns the thread's value, computing initialValue once; .set / .remove.
+;; java.lang.ThreadLocal over a non-inheriting per-thread slot: real per-thread
+;; storage with a lazy initialValue (the proxy macro lowers
+;; (proxy [ThreadLocal] …) to this). .get returns the thread's value, computing
+;; initialValue once; .set / .remove.
+;;
+;; The slot rather than a bare thread parameter is the whole point of the class.
+;; fork-thread copies the parent's current parameter value, so a ThreadLocal the
+;; parent had already read would be INHERITED by every child — a child's first
+;; .get would return the parent's object instead of running initialValue, and a
+;; mutable one would then be shared. java.lang.ThreadLocal is defined not to
+;; inherit (that is what InheritableThreadLocal is for), so the slot's owner
+;; check restores the documented contract: each thread's first .get runs
+;; initialValue for itself, and .remove restores that state.
+;; java.lang.InheritableThreadLocal lowers to the same constructor and DOES
+;; inherit — that is the entire difference between the two classes — so the
+;; storage is chosen per instance rather than globally. A cell is just a
+;; get/set pair, so the methods below are identical for both.
 (define tl-unset (list 'tl-unset))
-(define (jolt-make-thread-local init-thunk)
-  (make-jhost "threadlocal" (vector (make-thread-parameter tl-unset) init-thunk)))
+(define (make-noninheriting-tl-cell)
+  (let ((s (jolt-make-thread-slot (lambda () tl-unset))))
+    (vector (lambda () (jolt-thread-slot-ref s))
+            (lambda (v) (jolt-thread-slot-set! s v)))))
+(define (make-inheriting-tl-cell)
+  (let ((p (make-thread-parameter tl-unset)))
+    (vector (lambda () (p)) (lambda (v) (p v)))))
+
+(define (jolt-make-thread-local init-thunk . opt)
+  (make-jhost "threadlocal"
+              (vector (if (and (pair? opt) (jolt-truthy? (car opt)))
+                          (make-inheriting-tl-cell)
+                          (make-noninheriting-tl-cell))
+                      init-thunk)))
 (register-host-methods! "threadlocal"
   (list (cons "get" (lambda (self)
-                      (let* ((st (jhost-state self)) (tp (vector-ref st 0)) (v (tp)))
+                      (let* ((st (jhost-state self))
+                             (cell (vector-ref st 0))
+                             (v ((vector-ref cell 0))))
                         (if (eq? v tl-unset)
-                            (let ((nv (jolt-invoke (vector-ref st 1)))) (tp nv) nv)
+                            (let ((nv (jolt-invoke (vector-ref st 1))))
+                              ((vector-ref cell 1) nv) nv)
                             v))))
-        (cons "set" (lambda (self v) ((vector-ref (jhost-state self) 0) v) jolt-nil))
-        (cons "remove" (lambda (self) ((vector-ref (jhost-state self) 0) tl-unset) jolt-nil))))
+        (cons "set" (lambda (self v)
+                      ((vector-ref (vector-ref (jhost-state self) 0) 1) v)
+                      jolt-nil))
+        (cons "remove" (lambda (self)
+                         ((vector-ref (vector-ref (jhost-state self) 0) 1) tl-unset)
+                         jolt-nil))))
 (def-var! "jolt.host" "make-thread-local" jolt-make-thread-local)
 
 ;; Pluggable instance? — a library registers (fn [class-name-string val] -> true

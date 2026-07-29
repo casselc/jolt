@@ -1,4 +1,14 @@
-;; bytes.ss — jolt.bytes: a checked binary scalar substrate over byte arrays.
+;; codec-binary.ss — jolt.codec.binary: a checked binary scalar substrate over
+;; byte arrays.
+;;
+;; The namespace is jolt.codec.binary, NOT jolt.bytes. jolt.bytes is owned by the
+;; external casselc/jolt-bytes package (Window, Cursor, slicing, copying), and
+;; the loader seeds its loaded-ns table from every namespace that already has
+;; host vars — so publishing these vars into jolt.bytes would mark that namespace
+;; loaded at startup and stop (require '[jolt.bytes …]) from ever reading the
+;; library's Clojure source at all. This substrate is the codec layer's scalar
+;; floor; jolt.bytes is a separate, higher-level view abstraction that may sit on
+;; top of it.
 ;;
 ;; Every binary protocol implementation (a length-prefixed RPC envelope, bencode,
 ;; a compression header, an image or audio container) needs the same three
@@ -24,7 +34,7 @@
 ;;     exact 1 and stores 1.0; that reinterpretation is rejected here.)
 ;;
 ;; The exception taxonomy is part of the API and is documented in
-;; stdlib/jolt/bytes.clj:
+;; stdlib/jolt/codec/binary.clj:
 ;;
 ;;   IndexOutOfBoundsException     invalid range
 ;;   IllegalArgumentException      invalid value (type or domain)
@@ -36,7 +46,7 @@
 
 ;; --- argument validation -----------------------------------------------------
 
-(define (jb-who who) (string-append "jolt.bytes/" who))
+(define (jb-who who) (string-append "jolt.codec.binary/" who))
 
 ;; The backing bytevector of a jolt byte-array. Any other value — an object
 ;; array, a bytevector that never went through byte-array, nil — is an invalid
@@ -97,10 +107,18 @@
 ;; is checked once at load and re-asserted per call as a single boolean test, so
 ;; a host that cannot honour the claim fails closed with the documented
 ;; unsupported-representation error instead of returning plausible wrong bits.
-(define jb-ieee-scratch (make-thread-parameter #f))
-(define (jb-scratch)
-  (or (jb-ieee-scratch)
-      (let ((b (make-bytevector 8 0))) (jb-ieee-scratch b) b)))
+;;
+;; --- the staging scratch ---
+;; The raw-bit conversions stage through one reusable eight-byte bytevector so a
+;; steady-state conversion allocates nothing beyond its result. That buffer is
+;; MUTABLE and must never be shared, so it lives in a non-inheriting thread slot
+;; (rt.ss) rather than a plain thread parameter: fork-thread copies the parent's
+;; current parameter value, so a parent that had converted a single float before
+;; spawning futures would hand every worker the SAME eight bytes, and concurrent
+;; conversions would read each other's patterns. The slot's owner check replaces
+;; an inherited entry before it can be read; same-thread reuse is unchanged.
+(define jb-ieee-scratch (jolt-make-thread-slot (lambda () (make-bytevector 8 0))))
+(define (jb-scratch) (jolt-thread-slot-ref jb-ieee-scratch))
 
 (define (jb-probe-ieee)
   (let ((b (make-bytevector 8 0)))
@@ -235,6 +253,20 @@
 ;; (put-u64-be! a i (f64-bits x)) through a Jolt value materializes a bignum for
 ;; every negative or large-exponent double; the direct accessor writes the same
 ;; eight bytes with no intermediate number at all.
+;;
+;; The f64 accessors are exact: a Jolt float IS binary64, so the eight bytes on
+;; the wire and the value in hand are the same thing.
+;;
+;; The f32 accessors are NUMERIC, and they convert. Jolt has no binary32 value
+;; type, so get-f32-le/be reads four wire bytes as binary32 and WIDENS the result
+;; to binary64 — exactly, since every binary32 is a binary64 — while put-f32-le/be!
+;; takes a binary64 and NARROWS it to the four bytes it writes, rounding to
+;; nearest-even and overflowing to an infinity. A value that is not exactly
+;; representable in binary32 therefore does not survive a put/get round trip, and
+;; a signalling NaN read through get-f32 arrives already quieted. That is the
+;; documented contract of these four functions, not a defect in them: a caller
+;; that needs the wire's four bytes preserved verbatim reads and writes them with
+;; the u32 accessors, which never involve a float at all.
 
 (define-jb-get jb-get-f32-le "get-f32-le" 4 (bv i)
   (begin (jb-require-ieee "get-f32-le") (bytevector-ieee-single-ref bv i (endianness little))))
@@ -267,12 +299,14 @@
 ;; survives a round trip in either direction, NaN payloads and signalling bit
 ;; included, because a Chez flonum IS the binary64 pattern.
 ;;
-;; f32 is NOT. bits->f32 must widen to the host's binary64 to produce a Jolt
-;; value at all, and re-narrowing quiets a signalling NaN: 0x7F800001 returns as
-;; 0x7FC00001. Every non-NaN pattern and every quiet-NaN payload round-trips;
-;; the signalling ones do not survive the host's float type, which is a host
-;; representation fact, not a policy choice. Code that must preserve an
-;; arbitrary f32 pattern verbatim moves it as u32 and never widens it.
+;; There is deliberately NO f32 counterpart. Jolt's only float type is binary64,
+;; so a bits->f32 would have to widen to produce a value at all, and re-narrowing
+;; quiets a signalling NaN (0x7F800001 comes back as 0x7FC00001). Such a pair
+;; would be a partial function wearing a bijection's name, which is worse for a
+;; codec than not having it: the failure is silent and pattern-dependent. Code
+;; that must carry an arbitrary f32 wire pattern verbatim moves it through the
+;; u32 accessors and never widens it; code that wants the NUMBER reads it with
+;; get-f32-le/be, whose widening is documented and intended.
 
 (define (jb-f64-bits x)
   (jb-require-ieee "f64-bits")
@@ -285,18 +319,6 @@
   (let ((b (jb-scratch)))
     (bytevector-u64-set! b 0 (jb-int "bits->f64" n 0 jb-u64-max) (endianness big))
     (bytevector-ieee-double-ref b 0 (endianness big))))
-
-(define (jb-f32-bits x)
-  (jb-require-ieee "f32-bits")
-  (let ((b (jb-scratch)))
-    (bytevector-ieee-single-set! b 0 (jb-flonum "f32-bits" x) (endianness big))
-    (bytevector-u32-ref b 0 (endianness big))))
-
-(define (jb-bits->f32 n)
-  (jb-require-ieee "bits->f32")
-  (let ((b (jb-scratch)))
-    (bytevector-u32-set! b 0 (jb-int "bits->f32" n 0 jb-u32-max) (endianness big))
-    (bytevector-ieee-single-ref b 0 (endianness big))))
 
 ;; --- ranged copy -------------------------------------------------------------
 ;; memmove semantics, including src and dst being the SAME array with overlapping
@@ -339,53 +361,51 @@
 
 ;; --- publication -------------------------------------------------------------
 
-(def-var! "jolt.bytes" "in-range?" jb-in-range?)
-(def-var! "jolt.bytes" "check-range!" jb-check-range!)
+(def-var! "jolt.codec.binary" "in-range?" jb-in-range?)
+(def-var! "jolt.codec.binary" "check-range!" jb-check-range!)
 
-(def-var! "jolt.bytes" "get-u8" jb-get-u8)
-(def-var! "jolt.bytes" "get-i8" jb-get-i8)
-(def-var! "jolt.bytes" "put-u8!" jb-put-u8!)
-(def-var! "jolt.bytes" "put-i8!" jb-put-i8!)
+(def-var! "jolt.codec.binary" "get-u8" jb-get-u8)
+(def-var! "jolt.codec.binary" "get-i8" jb-get-i8)
+(def-var! "jolt.codec.binary" "put-u8!" jb-put-u8!)
+(def-var! "jolt.codec.binary" "put-i8!" jb-put-i8!)
 
-(def-var! "jolt.bytes" "get-u16-le" jb-get-u16-le)
-(def-var! "jolt.bytes" "get-u16-be" jb-get-u16-be)
-(def-var! "jolt.bytes" "get-i16-le" jb-get-i16-le)
-(def-var! "jolt.bytes" "get-i16-be" jb-get-i16-be)
-(def-var! "jolt.bytes" "put-u16-le!" jb-put-u16-le!)
-(def-var! "jolt.bytes" "put-u16-be!" jb-put-u16-be!)
-(def-var! "jolt.bytes" "put-i16-le!" jb-put-i16-le!)
-(def-var! "jolt.bytes" "put-i16-be!" jb-put-i16-be!)
+(def-var! "jolt.codec.binary" "get-u16-le" jb-get-u16-le)
+(def-var! "jolt.codec.binary" "get-u16-be" jb-get-u16-be)
+(def-var! "jolt.codec.binary" "get-i16-le" jb-get-i16-le)
+(def-var! "jolt.codec.binary" "get-i16-be" jb-get-i16-be)
+(def-var! "jolt.codec.binary" "put-u16-le!" jb-put-u16-le!)
+(def-var! "jolt.codec.binary" "put-u16-be!" jb-put-u16-be!)
+(def-var! "jolt.codec.binary" "put-i16-le!" jb-put-i16-le!)
+(def-var! "jolt.codec.binary" "put-i16-be!" jb-put-i16-be!)
 
-(def-var! "jolt.bytes" "get-u32-le" jb-get-u32-le)
-(def-var! "jolt.bytes" "get-u32-be" jb-get-u32-be)
-(def-var! "jolt.bytes" "get-i32-le" jb-get-i32-le)
-(def-var! "jolt.bytes" "get-i32-be" jb-get-i32-be)
-(def-var! "jolt.bytes" "put-u32-le!" jb-put-u32-le!)
-(def-var! "jolt.bytes" "put-u32-be!" jb-put-u32-be!)
-(def-var! "jolt.bytes" "put-i32-le!" jb-put-i32-le!)
-(def-var! "jolt.bytes" "put-i32-be!" jb-put-i32-be!)
+(def-var! "jolt.codec.binary" "get-u32-le" jb-get-u32-le)
+(def-var! "jolt.codec.binary" "get-u32-be" jb-get-u32-be)
+(def-var! "jolt.codec.binary" "get-i32-le" jb-get-i32-le)
+(def-var! "jolt.codec.binary" "get-i32-be" jb-get-i32-be)
+(def-var! "jolt.codec.binary" "put-u32-le!" jb-put-u32-le!)
+(def-var! "jolt.codec.binary" "put-u32-be!" jb-put-u32-be!)
+(def-var! "jolt.codec.binary" "put-i32-le!" jb-put-i32-le!)
+(def-var! "jolt.codec.binary" "put-i32-be!" jb-put-i32-be!)
 
-(def-var! "jolt.bytes" "get-u64-le" jb-get-u64-le)
-(def-var! "jolt.bytes" "get-u64-be" jb-get-u64-be)
-(def-var! "jolt.bytes" "get-i64-le" jb-get-i64-le)
-(def-var! "jolt.bytes" "get-i64-be" jb-get-i64-be)
-(def-var! "jolt.bytes" "put-u64-le!" jb-put-u64-le!)
-(def-var! "jolt.bytes" "put-u64-be!" jb-put-u64-be!)
-(def-var! "jolt.bytes" "put-i64-le!" jb-put-i64-le!)
-(def-var! "jolt.bytes" "put-i64-be!" jb-put-i64-be!)
+(def-var! "jolt.codec.binary" "get-u64-le" jb-get-u64-le)
+(def-var! "jolt.codec.binary" "get-u64-be" jb-get-u64-be)
+(def-var! "jolt.codec.binary" "get-i64-le" jb-get-i64-le)
+(def-var! "jolt.codec.binary" "get-i64-be" jb-get-i64-be)
+(def-var! "jolt.codec.binary" "put-u64-le!" jb-put-u64-le!)
+(def-var! "jolt.codec.binary" "put-u64-be!" jb-put-u64-be!)
+(def-var! "jolt.codec.binary" "put-i64-le!" jb-put-i64-le!)
+(def-var! "jolt.codec.binary" "put-i64-be!" jb-put-i64-be!)
 
-(def-var! "jolt.bytes" "get-f32-le" jb-get-f32-le)
-(def-var! "jolt.bytes" "get-f32-be" jb-get-f32-be)
-(def-var! "jolt.bytes" "get-f64-le" jb-get-f64-le)
-(def-var! "jolt.bytes" "get-f64-be" jb-get-f64-be)
-(def-var! "jolt.bytes" "put-f32-le!" jb-put-f32-le!)
-(def-var! "jolt.bytes" "put-f32-be!" jb-put-f32-be!)
-(def-var! "jolt.bytes" "put-f64-le!" jb-put-f64-le!)
-(def-var! "jolt.bytes" "put-f64-be!" jb-put-f64-be!)
+(def-var! "jolt.codec.binary" "get-f32-le" jb-get-f32-le)
+(def-var! "jolt.codec.binary" "get-f32-be" jb-get-f32-be)
+(def-var! "jolt.codec.binary" "get-f64-le" jb-get-f64-le)
+(def-var! "jolt.codec.binary" "get-f64-be" jb-get-f64-be)
+(def-var! "jolt.codec.binary" "put-f32-le!" jb-put-f32-le!)
+(def-var! "jolt.codec.binary" "put-f32-be!" jb-put-f32-be!)
+(def-var! "jolt.codec.binary" "put-f64-le!" jb-put-f64-le!)
+(def-var! "jolt.codec.binary" "put-f64-be!" jb-put-f64-be!)
 
-(def-var! "jolt.bytes" "f32-bits" jb-f32-bits)
-(def-var! "jolt.bytes" "bits->f32" jb-bits->f32)
-(def-var! "jolt.bytes" "f64-bits" jb-f64-bits)
-(def-var! "jolt.bytes" "bits->f64" jb-bits->f64)
+(def-var! "jolt.codec.binary" "f64-bits" jb-f64-bits)
+(def-var! "jolt.codec.binary" "bits->f64" jb-bits->f64)
 
-(def-var! "jolt.bytes" "copy!" jb-copy!)
+(def-var! "jolt.codec.binary" "copy!" jb-copy!)

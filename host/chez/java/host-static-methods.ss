@@ -84,10 +84,14 @@
 ;; Per-thread interrupt flag, lazily allocated so each OS thread gets its own box.
 ;; A thread handle (from currentThread) captures this box, so .interrupt from
 ;; another thread sets the target thread's flag.
-(define thread-interrupt-box (make-thread-parameter #f))
-(define (current-interrupt-box)
-  (or (thread-interrupt-box)
-      (let ((b (box #f))) (thread-interrupt-box b) b)))
+;;
+;; A non-inheriting slot, not a plain thread parameter: fork-thread copies the
+;; parent's current value, so a parent that had ever read its own flag would hand
+;; every worker the SAME box. Interrupting one future would then interrupt all of
+;; them, and `interrupted` (which reads-and-clears) on any worker would swallow
+;; another's pending interrupt. The JVM's flag is per-thread and never inherited.
+(define thread-interrupt-box (jolt-make-thread-slot (lambda () (box #f))))
+(define (current-interrupt-box) (jolt-thread-slot-ref thread-interrupt-box))
 (define (clear-thread-interrupt!) (set-box! (current-interrupt-box) #f))
 
 ;; libc sched_yield, resolved once; fall back to a zero-length park if the symbol

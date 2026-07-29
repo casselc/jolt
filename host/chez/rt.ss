@@ -224,6 +224,79 @@
 ;; jolt `not`: only nil and false are falsey.
 (define (jolt-not x) (if (jolt-truthy? x) #f #t))
 
+;; --- non-inheriting per-thread slots ------------------------------------------
+;; Chez's make-thread-parameter hands a newly forked thread the parent's CURRENT
+;; value — not the parameter's initial value. For dynamic context that is exactly
+;; right, and the many parameters in this runtime that carry one (the binding
+;; stack, the active transaction, the reader's source file, the print depth) keep
+;; those semantics untouched.
+;;
+;; It is exactly wrong for a per-thread CACHE. A parent that touches the slot
+;; before forking hands every child the same mutable object, and the children
+;; then race on it. Concretely: one shared eight-byte IEEE scratch is enough to
+;; make concurrent float conversions return each other's bytes.
+;;
+;; A slot stores an entry (owner-thread-id . value). A read returns the value
+;; only when the owner is the calling thread; an entry inherited across
+;; fork-thread is replaced with a freshly built one BEFORE it is ever returned.
+;; The underlying parameter still inherits — nothing can stop that — but the
+;; value it carries never escapes the thread that made it.
+;;
+;; The owner tag is sound because Chez assigns thread ids from a monotonic
+;; counter and does not recycle them, so a live parent's id can never collide
+;; with a child's. Steady-state same-thread reuse costs one parameter read, one
+;; get-thread-id, and an eqv? — no allocation, which is what keeps the scalar
+;; float path allocation-free.
+;;
+;; `init` is a thunk run ON THE OWNING THREAD to build that thread's own value.
+(define (jolt-make-thread-slot init) (vector (make-thread-parameter #f) init))
+
+;; This thread's own entry, built (or rebuilt, after inheritance) on demand.
+(define (jolt-thread-slot-entry s)
+  (let* ((p (vector-ref s 0))
+         (e (p))
+         (tid (get-thread-id)))
+    (if (and (pair? e) (eqv? (car e) tid))
+        e
+        (let ((fresh (cons tid ((vector-ref s 1)))))
+          (p fresh)
+          fresh))))
+
+(define (jolt-thread-slot-ref s) (cdr (jolt-thread-slot-entry s)))
+
+;; Overwrite without consulting `init` — a caller that is about to supply the
+;; value has no use for a lazily constructed one it would immediately discard.
+(define (jolt-thread-slot-set! s v)
+  (let* ((p (vector-ref s 0))
+         (e (p))
+         (tid (get-thread-id)))
+    (if (and (pair? e) (eqv? (car e) tid))
+        (set-cdr! e v)
+        (p (cons tid v)))
+    v))
+
+;; This thread's value if it already has one, else #f. Never runs `init`, and
+;; never adopts an inherited entry.
+(define (jolt-thread-slot-peek s)
+  (let ((e ((vector-ref s 0))))
+    (and (pair? e) (eqv? (car e) (get-thread-id)) (cdr e))))
+
+;; Forget this thread's value; the next ref rebuilds it from `init`. Dropping the
+;; whole entry (rather than clearing the cdr) also discards an inherited one.
+(define (jolt-thread-slot-clear! s) ((vector-ref s 0) #f))
+
+;; The same owner tag, for state that is SCOPED with `parameterize` rather than
+;; stored — where the dynamic-extent restore is the point and a slot would be the
+;; wrong shape. Tag the value instead of the parameter: parameterize keeps
+;; working unchanged, and a thread forked inside the extent still reads "no
+;; value", because the entry it inherited is not its own.
+;;
+;;   (parameterize ((p (jolt-thread-owned v))) …)   ; in the owning thread
+;;   (jolt-thread-owned-ref (p))                    ; v here, #f in a child
+(define (jolt-thread-owned v) (cons (get-thread-id) v))
+(define (jolt-thread-owned-ref e)
+  (and (pair? e) (eqv? (car e) (get-thread-id)) (cdr e)))
+
 ;; --- ex-info record type -----------------------------------------------------
 ;; A throwable (ex-info or host-constructed typed throwable) is a distinct
 ;; record type — NOT a pmap — so pmap?/coll?/seqable?/ifn?/associative?/
@@ -289,22 +362,34 @@
     (vector ribs 0 0)))
 ;; A global switch (all threads) plus a per-thread ring, lazily created on first
 ;; use — so code run on a spawned thread (a future/agent) records into ITS OWN
-;; history, not the enabling thread's (make-thread-parameter hands a new thread the
-;; initial #f, so we can't rely on inheritance).
+;; history, not the enabling thread's.
+;;
+;; A plain thread parameter cannot express that: fork-thread hands the child the
+;; parent's CURRENT value, so a parent that enabled tracing (or merely ran one
+;; traced form) before spawning would share its single mutable history with every
+;; worker, and their frame names would interleave into each other's ribs. These
+;; are non-inheriting slots, so each thread builds its own history the first time
+;; it records. The tail mark travels with the ring for the same reason: an
+;; inherited mark would mislabel the child's first frame as a tail rotation.
 (define jolt-trace-on? #f)
-(define jolt-trace-ring (make-thread-parameter #f))
-(define jolt-trace-tail? (make-thread-parameter #f))   ; caller-set, consumed per entry
-(define (jolt-trace-enable!) (set! jolt-trace-on? #t) (jolt-trace-ring (jolt-make-history)))
+(define jolt-trace-ring (jolt-make-thread-slot (lambda () #f)))
+(define jolt-trace-tail? (jolt-make-thread-slot (lambda () #f))) ; caller-set, consumed per entry
+(define (jolt-trace-enable!)
+  (set! jolt-trace-on? #t)
+  (jolt-thread-slot-set! jolt-trace-ring (jolt-make-history)))
 ;; this thread's ring, created on demand while tracing is on
 (define (jolt-trace-cur-ring)
-  (or (jolt-trace-ring)
-      (and jolt-trace-on? (let ((h (jolt-make-history))) (jolt-trace-ring h) h))))
+  (or (jolt-thread-slot-ref jolt-trace-ring)
+      (and jolt-trace-on?
+           (jolt-thread-slot-set! jolt-trace-ring (jolt-make-history)))))
 ;; Drop accumulated history at a top-level boundary (compile-eval.ss calls this per
 ;; top-level form) so an error's trace shows only the forms that led to it, not the
 ;; frames of earlier, already-returned REPL/eval forms.
 (define (jolt-trace-reset!)
-  (when (jolt-trace-ring) (jolt-trace-ring (jolt-make-history)) (jolt-trace-tail? #f)))
-(define (jolt-trace-mark! t) (jolt-trace-tail? t))
+  (when (jolt-thread-slot-ref jolt-trace-ring)
+    (jolt-thread-slot-set! jolt-trace-ring (jolt-make-history))
+    (jolt-thread-slot-set! jolt-trace-tail? #f)))
+(define (jolt-trace-mark! t) (jolt-thread-slot-set! jolt-trace-tail? t) jolt-nil)
 
 ;; push name into a rib's inner ring
 (define (jolt-rib-push! rib name)
@@ -333,8 +418,10 @@
 (define (jolt-trace-push! name)
   (let ((h (jolt-trace-cur-ring)))
     (when h
-      (if (jolt-trace-tail?) (jolt-history-tail! h name) (jolt-history-nontail! h name))
-      (jolt-trace-tail? #f)))
+      (if (jolt-thread-slot-ref jolt-trace-tail?)
+          (jolt-history-tail! h name)
+          (jolt-history-nontail! h name))
+      (jolt-thread-slot-set! jolt-trace-tail? #f)))
   jolt-nil)
 
 ;; a rib's inner names, most-recent (deepest) tail first
@@ -350,7 +437,7 @@
 ;; The whole history flattened to frame-names, most-recent (deepest) first:
 ;; current rib's tail-history, then its non-tail caller's, and so on outward.
 (define (jolt-trace-snapshot)
-  (let ((h (jolt-trace-ring)))
+  (let ((h (jolt-thread-slot-ref jolt-trace-ring)))
     (if (not h) '()
         (let* ((ribs (vector-ref h 0)) (oh (vector-ref h 1)) (oc (vector-ref h 2)))
           (let loop ((k 1) (acc '()))
@@ -926,10 +1013,12 @@
 ;; it. After the dispatchers it chains.
 (load "host/chez/java/natives-array.ss")
 
-;; jolt.bytes: checked endian/raw-bit scalar access and overlap-safe ranged copy
-;; over a byte-array. Immediately after natives-array.ss — it reads that file's
-;; jolt-array backing bytevector directly and adds no dispatcher of its own.
-(load "host/chez/bytes.ss")
+;; jolt.codec.binary: checked endian/raw-bit scalar access and overlap-safe
+;; ranged copy over a byte-array. Immediately after natives-array.ss — it reads
+;; that file's jolt-array backing bytevector directly and adds no dispatcher of
+;; its own. NOT jolt.bytes: that namespace belongs to the external jolt-bytes
+;; Window/Cursor package, and preseeding it here would stop its source loading.
+(load "host/chez/codec-binary.ss")
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and

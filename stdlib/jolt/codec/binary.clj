@@ -1,4 +1,4 @@
-(ns jolt.bytes
+(ns jolt.codec.binary
   "Checked binary scalar access over a byte-array.
 
   Every binary protocol reaches for the same three operations: read a
@@ -7,7 +7,7 @@
   storage — no buffer object, no cursor allocated per read, no shift/or chain
   written by hand in each codec.
 
-      (require '[jolt.bytes :as b])
+      (require '[jolt.codec.binary :as b])
       (let [a (byte-array 8)]
         (b/put-u32-be! a 0 305419896)
         (b/get-u32-be! a 0))            ;=> 305419896  (in bytes: 12 34 56 78)
@@ -64,12 +64,36 @@
   f64 is a bijection with the unsigned 64-bit domain — every pattern survives a
   round trip in either direction, NaN payloads and the signalling bit included.
 
-  f32 is not, and this is a host representation fact rather than a policy
-  choice. `bits->f32` must widen to the host float type to return a value at
-  all, and re-narrowing quiets a signalling NaN: `0x7F800001` comes back as
-  `0x7FC00001`. Every non-NaN pattern and every quiet-NaN payload round-trips.
-  Code that must preserve an arbitrary f32 pattern verbatim carries it as u32
-  and never widens it.
+  There is no f32 equivalent, deliberately. Jolt's only float type is binary64,
+  so a `bits->f32` would have to widen to return a value at all, and re-narrowing
+  quiets a signalling NaN: `0x7F800001` would come back as `0x7FC00001`. Such a
+  pair would be a partial function under a total function's name — exactly the
+  silent, pattern-dependent loss a codec has no way to detect — so it is not
+  offered rather than offered with a caveat.
+
+  ### f32 is numeric, and it converts
+
+  `get-f32-le/be` and `put-f32-le/be!` are numeric accessors, not raw-bit ones.
+  A read takes the four wire bytes as binary32 and *widens* the result to Jolt's
+  binary64, which is exact — every binary32 value is a binary64 value. A write
+  takes a binary64 and *narrows* it to the four bytes it stores, rounding to
+  nearest-even and overflowing to an infinity:
+
+      (b/put-f32-le! a 0 0.1) (b/get-f32-le a 0)  ;=> 0.10000000149011612
+
+  So a value not exactly representable in binary32 does not survive a write/read
+  round trip, and a signalling NaN on the wire arrives already quieted. Both
+  follow from the conversion; neither is a defect in these four functions.
+
+  To carry an arbitrary f32 wire pattern verbatim — a NaN payload, a signalling
+  NaN, any of the 2^32 patterns — read and write it with the u32 accessors,
+  which never involve a float at all:
+
+      (b/get-u32-le a 0)              ; the four bytes, exactly as they lie
+      (b/put-u32-le! a 0 0x7F800001)  ; travels through untouched
+
+  Reach for the f32 accessors when the number is what matters, and for u32 when
+  the bits are.
 
   ## Copying
 
@@ -106,14 +130,15 @@
     `get-u64-le` `get-u64-be` `get-i64-le` `get-i64-be`
     `put-u64-le!` `put-u64-be!` `put-i64-le!` `put-i64-be!`
 
-  Floats:
+  Floats — the f32 four convert (widen on read, narrow on write); the f64 four
+  and the raw-bit pair are exact:
     `get-f32-le` `get-f32-be` `get-f64-le` `get-f64-be`
     `put-f32-le!` `put-f32-be!` `put-f64-le!` `put-f64-be!`
-    `f32-bits` `bits->f32` `f64-bits` `bits->f64`
+    `f64-bits` `bits->f64`
 
   Copy:
     `copy!`
 
-  The functions themselves are host primitives (host/chez/bytes.ss), bound into
+  The functions themselves are host primitives (host/chez/codec-binary.ss), bound into
   this namespace at runtime startup; this file carries the contract they
   implement.")

@@ -1,5 +1,5 @@
-;; jolt.bytes regression: the checked binary scalar substrate. Run:
-;;   chez --script test/chez/bytes-substrate-test.ss
+;; jolt.codec.binary regression: the checked binary scalar substrate. Run:
+;;   chez --script test/chez/codec-binary-test.ss
 ;;
 ;; Covers, deterministically and with no host randomness:
 ;;
@@ -13,9 +13,14 @@
 ;;   * exact-tail acceptance and one-past-the-tail rejection at every width;
 ;;   * a no-partial-write sentinel for every rejected write and copy;
 ;;   * memmove overlap controls that a memcpy implementation fails;
-;;   * IEEE-754 raw-bit fidelity compared as BITS, never as numbers, including
-;;     signed zero, infinities, subnormals and NaN payloads;
+;;   * IEEE-754 f64 raw-bit fidelity compared as BITS, never as numbers,
+;;     including signed zero, infinities, subnormals and NaN payloads;
+;;   * the absence of an f32 raw-bit pair, the verbatim u32 path that replaces
+;;     it, and the documented widening/narrowing of the numeric f32 accessors;
 ;;   * the fail-closed unsupported-host-representation arm.
+;;
+;; Thread isolation for the reusable IEEE scratch lives in
+;; test/chez/thread-slot-test.ss, which needs forked threads.
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
@@ -383,53 +388,90 @@
           #x00000001 #x007FFFFF #x00800000 #x7F7FFFFF)
     (corpus 32 256)))
 
-;; Every non-signalling pattern round-trips exactly; the signalling ones are the
-;; documented exception and are pinned here rather than left to discovery.
 (define (f32-signalling? bits)
   (and (= (bitwise-and bits #x7F800000) #x7F800000)
        (not (= (bitwise-and bits #x007FFFFF) 0))      ; is a NaN
        (= (bitwise-and bits #x00400000) 0)))          ; quiet bit clear
 
-(let ((bad 0) (sig 0))
+;; There is no f32 raw-bit pair, and its absence is the contract. A widening
+;; bits->f32 could not be a bijection — re-narrowing quiets a signalling NaN —
+;; so the substrate declines to offer one under a total function's name. The
+;; check below is that the names are genuinely gone, not merely undocumented;
+;; the published-surface check in section 9 backs it from the other direction.
+(ok "no f32 raw-bit pair is defined at all"
+    (and (not (top-level-bound? 'jb-f32-bits))
+         (not (top-level-bound? 'jb-bits->f32))))
+
+;; The verbatim path for an arbitrary f32 wire pattern is u32, which never
+;; involves a float. Every pattern the removed pair could not preserve — every
+;; signalling NaN included — travels through untouched, in both endiannesses.
+(let ((a (fresh 4)) (bad 0) (sig 0))
   (for-each
     (lambda (bits)
-      (let ((rt (jb-f32-bits (jb-bits->f32 bits))))
-        (cond
-          ((f32-signalling? bits)
-           (set! sig (+ sig 1))
-           ;; quieted, and quieted by exactly the quiet bit — payload preserved
-           (unless (= rt (bitwise-ior bits #x00400000)) (set! bad (+ bad 1))))
-          (else (unless (= rt bits) (set! bad (+ bad 1)))))))
+      (when (f32-signalling? bits) (set! sig (+ sig 1)))
+      (jb-put-u32-be! a 0 bits)
+      (unless (= (jb-get-u32-be a 0) bits) (set! bad (+ bad 1)))
+      (jb-put-u32-le! a 0 bits)
+      (unless (= (jb-get-u32-le a 0) bits) (set! bad (+ bad 1))))
     f32-patterns)
-  (ok (format "f32 raw bits round-trip over ~a patterns (~a signalling)"
+  (ok (format "all ~a f32 wire patterns survive u32 verbatim (~a signalling)"
               (length f32-patterns) sig)
       (= bad 0))
   (ok "the corpus actually exercised the signalling case" (> sig 0)))
 
-(ok "f32 signalling NaN is quieted, payload intact"
-    (= (jb-f32-bits (jb-bits->f32 #x7F800001)) #x7FC00001))
+;; A signalling NaN specifically: verbatim through u32, and quieted through the
+;; numeric accessor. Both halves stated together, because the pair of them IS
+;; the reason the raw f32 conversion was removed.
+(let ((a (fresh 4)))
+  (jb-put-u32-be! a 0 #x7F800001)
+  (ok "a signalling f32 NaN is preserved exactly by u32"
+      (= (jb-get-u32-be a 0) #x7F800001))
+  (let ((x (jb-get-f32-be a 0)))                ; widens, quieting it
+    (jb-put-f32-be! a 0 x)                      ; narrows again
+    (ok "the same pattern read as a NUMBER comes back quieted"
+        (= (jb-get-u32-be a 0) #x7FC00001))))
 
+;; The numeric accessors convert, and the conversion is exactly binary32<->
+;; binary64: a value that IS representable in binary32 survives, one that is not
+;; comes back as its nearest binary32, and the round trip is idempotent from
+;; there. This is the documented contract, so it is asserted rather than avoided.
+(let ((a (fresh 4)))
+  (jb-put-f32-le! a 0 1.5)                      ; exactly representable
+  (ok "an exactly-representable value survives the f32 round trip"
+      (= (jb-get-f32-le a 0) 1.5))
+  (jb-put-f32-le! a 0 0.1)                      ; not representable in binary32
+  (let ((narrowed (jb-get-f32-le a 0)))
+    (ok "0.1 narrows to the binary32 neighbour, not to 0.1"
+        (and (not (= narrowed 0.1))
+             (= narrowed 0.10000000149011612)))
+    (jb-put-f32-le! a 0 narrowed)
+    (ok "narrowing is idempotent once the value is a binary32"
+        (= (jb-get-f32-le a 0) narrowed))))
+
+;; Widening is exact in the other direction: every binary32 IS a binary64, so a
+;; wire pattern read as f32 and written straight back reproduces its own bytes
+;; whenever the pattern was not a signalling NaN.
 (let ((a (fresh 4)) (b (fresh 4)) (bad 0))
   (for-each
     (lambda (bits)
-      (let ((x (jb-bits->f32 bits))
-            (expect (if (f32-signalling? bits) (bitwise-ior bits #x00400000) bits)))
-        (jb-put-f32-be! a 0 x)
-        (jb-put-u32-be! b 0 expect)
+      (unless (f32-signalling? bits)
+        (jb-put-u32-be! a 0 bits)
+        (jb-put-f32-be! b 0 (jb-get-f32-be a 0))
         (unless (equal? (bytes-of a) (bytes-of b)) (set! bad (+ bad 1)))
-        (jb-put-f32-le! a 0 x)
-        (jb-put-u32-le! b 0 expect)
+        (jb-put-u32-le! a 0 bits)
+        (jb-put-f32-le! b 0 (jb-get-f32-le a 0))
         (unless (equal? (bytes-of a) (bytes-of b)) (set! bad (+ bad 1)))))
     f32-patterns)
-  (ok "f32 array accessors agree with the raw-bit path, both endiannesses" (= bad 0)))
+  (ok "non-signalling f32 patterns survive a get/put through the numeric path"
+      (= bad 0)))
 
 ;; Raw-bit inputs are domain-checked like every other value.
 (ok "bits->f64 rejects a value above the u64 domain"
     (string=? "java.lang.IllegalArgumentException"
               (caught (lambda () (jb-bits->f64 18446744073709551616)))))
-(ok "bits->f32 rejects a negative pattern"
+(ok "bits->f64 rejects a negative pattern"
     (string=? "java.lang.IllegalArgumentException"
-              (caught (lambda () (jb-bits->f32 -1)))))
+              (caught (lambda () (jb-bits->f64 -1)))))
 (ok "f64-bits rejects an exact integer"
     (string=? "java.lang.IllegalArgumentException"
               (caught (lambda () (jb-f64-bits 1)))))
@@ -571,7 +613,7 @@
   (ok "rejected self-copy leaves the array untouched" (unchanged? a snap)))
 
 ;; ---------------------------------------------------------------------------
-;; 9. every accessor is reachable through the published jolt.bytes vars
+;; 9. every accessor is reachable through the published jolt.codec.binary vars
 ;; ---------------------------------------------------------------------------
 
 (define published
@@ -585,15 +627,42 @@
     "put-u64-le!" "put-u64-be!" "put-i64-le!" "put-i64-be!"
     "get-f32-le" "get-f32-be" "get-f64-le" "get-f64-be"
     "put-f32-le!" "put-f32-be!" "put-f64-le!" "put-f64-be!"
-    "f32-bits" "bits->f32" "f64-bits" "bits->f64"
+    "f64-bits" "bits->f64"
     "copy!"))
 
-(let ((missing (filter (lambda (n) (not (procedure? (var-deref "jolt.bytes" n)))) published)))
-  (ok (format "all ~a jolt.bytes vars are bound" (length published))
+(let ((missing (filter (lambda (n) (not (procedure? (var-deref "jolt.codec.binary" n)))) published)))
+  (ok (format "all ~a jolt.codec.binary vars are bound" (length published))
       (null? missing))
   (unless (null? missing) (printf "  missing: ~a\n" missing)))
 
+;; A non-interning, non-creating probe. var-deref would MATERIALIZE an empty
+;; cell and hand back a jolt-var-unbound record, which is truthy — so a
+;; presence check written with it would pass no matter what is defined.
+(define (var-published? ns name)
+  (let ((c (var-cell-lookup ns name)))
+    (and c (var-cell-defined? c) #t)))
+
+(ok "the probe itself distinguishes defined from absent"
+    (and (var-published? "jolt.codec.binary" "get-u8")
+         (not (var-published? "jolt.codec.binary" "no-such-var-xyzzy"))))
+
+;; The removed names are asserted ABSENT, so a later change that quietly
+;; reintroduces a widening f32 pair has to delete this check to pass.
+(let ((present (filter (lambda (n) (var-published? "jolt.codec.binary" n))
+                       '("f32-bits" "bits->f32"))))
+  (ok "the f32 raw-bit pair is not published" (null? present))
+  (unless (null? present) (printf "  unexpectedly present: ~a\n" present)))
+
+;; jolt.bytes belongs to the external Window/Cursor package. The substrate must
+;; publish NOTHING there: a single host var in that namespace is enough for the
+;; loader to mark it loaded at startup and stop the library's source ever being
+;; read. Probing the names this file publishes is the direct form of that check.
+(let ((leaked (filter (lambda (n) (var-published? "jolt.bytes" n))
+                      (append published '("f32-bits" "bits->f32" "window" "cursor")))))
+  (ok "nothing is published into the external jolt.bytes namespace" (null? leaked))
+  (unless (null? leaked) (printf "  leaked into jolt.bytes: ~a\n" leaked)))
+
 ;; ---------------------------------------------------------------------------
 
-(printf "bytes substrate: ~a checks, ~a failures\n" total fails)
+(printf "codec.binary substrate: ~a checks, ~a failures\n" total fails)
 (exit (if (> fails 0) 1 0))
