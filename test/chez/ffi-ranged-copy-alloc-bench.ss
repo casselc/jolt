@@ -32,9 +32,9 @@
 ;;      no lock, allocate exactly nothing.
 ;;
 ;; Honest trade-off, visible in the rows: the scope is a constant, so below
-;; roughly 128 bytes a ranged transfer now allocates MORE than the staged one
+;; roughly 176 bytes a ranged transfer now allocates MORE than the staged one
 ;; it replaces (32 B/op at len 16), and above it allocates dramatically less
-;; (65557 -> 128 B/op at 64 KiB). The transfer no longer produces GC pressure
+;; (65557 -> 176 B/op at 64 KiB). The transfer no longer produces GC pressure
 ;; proportional to the bytes moved, which is the property a codec and a socket
 ;; path need; a caller moving 16 bytes at a time is better served by the scalar
 ;; substrate than by an FFI transfer either way.

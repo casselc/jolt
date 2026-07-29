@@ -126,18 +126,27 @@
   ;; neither native code nor a callback. dynamic-wind unlocks on every exit
   ;; path: normal return, a Jolt or Scheme exception out of `receive`, and any
   ;; other nonlocal exit. The pointer is dead once the scope returns, and C must
-  ;; not retain it.
+  ;; not retain it. A Scheme continuation captured by `receive` could otherwise
+  ;; re-enter after that retirement with the old pointer argument; reject that
+  ;; re-entry before `receive` resumes instead of re-locking a possibly moved
+  ;; object around a stale address.
   ;;
   ;; `receive` is applied to (interior-pointer, cnt, arg). Threading the one
   ;; varying value through `arg` lets an internal bulk transfer name a top-level
   ;; procedure here instead of consing a Jolt closure, collection, slice,
   ;; descriptor, or temporary bytevector to reach the pointer.
   (ffi-check-array-range who bv start cnt)
-  (lock-object bv)
-  (dynamic-wind
-    void
-    (lambda () (receive (+ (object->reference-address bv) start) cnt arg))
-    (lambda () (unlock-object bv))))
+  (let ((retired? #f))
+    (lock-object bv)
+    (dynamic-wind
+      (lambda ()
+        (when retired?
+          (error 'jolt.ffi
+                 "scoped byte-array pointer continuation cannot be re-entered")))
+      (lambda () (receive (+ (object->reference-address bv) start) cnt arg))
+      (lambda ()
+        (set! retired? #t)
+        (unlock-object bv)))))
 (define (ffi-invoke-pointer-scope p cnt f) (jolt-invoke2 f p cnt))
 (define (ffi-with-byte-array-pointer arr off len f)
   ;; Public scoped loan: the private scope above, adapted to a Jolt callback.

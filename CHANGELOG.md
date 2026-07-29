@@ -131,11 +131,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytevector BASE, so a whole-array transfer could be one native call while a
   ranged one could not; it cost one `make-bytevector` of exactly `len` bytes and
   a second pass over the bytes on every call. Per-call allocation is now the
-  scope's alone and constant — measured at 128 B/op from 16 bytes to 64 KiB,
+  scope's alone and constant — measured at 176 B/op from 16 bytes to 64 KiB,
   against 65,557 B/op for the staged path at 64 KiB — and the `ffi` gate asserts
   both that it does not grow with the transfer and that it is no more than a
   bare scope over the same range, which is what "no temporary" means as a
-  measurement. The trade-off is visible and deliberate: below roughly 128 bytes
+  measurement. The trade-off is visible and deliberate: below roughly 176 bytes
   a ranged transfer now allocates more than the staging did, and it no longer
   allocates in proportion to the bytes moved.
 
@@ -157,7 +157,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both sides, 21 rejection rows, 128 same-backing overlap rows in both
   directions with an overlap-unsafe forward-copy control, lock/unlock pairing
   asserted through `locked-object?` under success, a Jolt exception, a Scheme
-  error and a nonlocal exit, and a megabyte round trip.
+  error and a nonlocal exit, fail-closed continuation re-entry, and a megabyte
+  round trip checked against an independent byte oracle.
+
+  The continuation boundary is also recorded as a corrected/one-fault/
+  non-vacuity SMT trio. The model does not stand in for Chez GC behavior; the
+  executable control is what reproduces the unlocked stale-resume shape.
 
 ### Removed
 

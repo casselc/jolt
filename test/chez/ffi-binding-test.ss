@@ -574,6 +574,46 @@
       (and (call/cc (lambda (k)
                       (ffi-with-byte-array-pointer arr 0 4 (lambda (p n) (k #t)))))
            (not (locked-object? bv)))))
+(let* ((bv (make-bytevector 8 0))
+       (saved #f)
+       (phase 0)
+       (visits '())
+       (outcome
+         (guard (e (#t (list 'raised
+                              (condition-message e)
+                              (reverse visits)
+                              (locked-object? bv))))
+           (let ((value
+                   (ffi-with-locked-byte-range
+                     "reentry" bv 0 8
+                     (lambda (pointer count argument)
+                       (call/cc
+                         (lambda (continuation)
+                           (unless saved (set! saved continuation))
+                           'first-entry))
+                       (set! visits (cons (locked-object? bv) visits))
+                       (locked-object? bv))
+                     0)))
+             (if (= phase 0)
+                 (begin
+                   (set! phase 1)
+                   (saved 'second-entry))
+                 (list 'returned value (reverse visits)
+                       (locked-object? bv)))))))
+  ;; Re-locking here would not be enough: `pointer` was computed before the
+  ;; continuation was captured and may be stale if the bytevector moved while
+  ;; the scope was retired. The only sound outcome is to refuse re-entry before
+  ;; the receiver resumes.
+  (ok "a retired pointer scope rejects continuation re-entry before the receiver resumes"
+      (and (eq? 'raised (car outcome))
+           (has? (cadr outcome) "cannot be re-entered")
+           (equal? '(#t) (caddr outcome))
+           (not (cadddr outcome))
+           (not (locked-object? bv))
+           (= 8 (ffi-with-locked-byte-range
+                  "later-scope" bv 0 8
+                  (lambda (p n arg) n) 0))
+           (not (locked-object? bv)))))
 (let ((bv (make-bytevector 8 0)))
   (ok "the private scope unlocks when the receiver throws"
       (and (throws? (lambda ()
@@ -719,15 +759,20 @@
     (ok "a megabyte survives a ranged round trip with its sentinels intact"
         (and (= wrote payload)
              (= read payload)
-             (equal? (bytevector->u8-list (bytevector-copy src-bv))
-                     (bytevector->u8-list src-bv))
-             ;; payload conserved exactly
+             ;; Both sides match an independent oracle. Comparing only source
+             ;; with destination would miss a wrong-direction write that first
+             ;; corrupts source and then faithfully copies that corruption.
              (let loop ((i 0))
                (cond ((= i payload) #t)
-                     ((= (bytevector-u8-ref src-bv (+ pad i))
-                         (bytevector-u8-ref dst-bv (+ pad i)))
-                      (loop (+ i 1)))
-                     (else #f)))
+                     (else
+                       (let ((want
+                               (bitwise-and
+                                 (+ (* i 31) (quotient i 251)) 255)))
+                         (and (= want
+                                 (bytevector-u8-ref src-bv (+ pad i)))
+                              (= want
+                                 (bytevector-u8-ref dst-bv (+ pad i)))
+                              (loop (+ i 1)))))))
              ;; prefix and suffix sentinels on the destination survived
              (let loop ((i 0))
                (cond ((= i pad) #t)

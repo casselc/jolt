@@ -398,6 +398,9 @@ primitive.
 | [`byte-window-slice-containment-buggy.smt2`](../test/chez/formal/byte-window-slice-containment-buggy.smt2) | SAT, escaping `[1,2)` child | The wrong child-length formula admits the pinned empty-tail witness. |
 | [`byte-window-slice-containment-corrected.smt2`](../test/chez/formal/byte-window-slice-containment-corrected.smt2) | UNSAT | No containment counterexample exists in the recorded `0..16` domain. |
 | [`byte-window-slice-containment-nonvacuity.smt2`](../test/chez/formal/byte-window-slice-containment-nonvacuity.smt2) | SAT, full capacity-16 slice | The corrected constraints preserve a useful boundary case. |
+| [`ffi-pointer-scope-reentry-guard-omitted-buggy.smt2`](../test/chez/formal/ffi-pointer-scope-reentry-guard-omitted-buggy.smt2) | SAT, retired backing moves and stale receiver resumes | Omitting the one-shot retirement guard lets a captured Scheme continuation resume with an address computed in the old dynamic extent. |
+| [`ffi-pointer-scope-reentry-corrected.smt2`](../test/chez/formal/ffi-pointer-scope-reentry-corrected.smt2) | UNSAT | Once the first extent exits, the receiver cannot resume, regardless of whether the unlocked backing moved. |
+| [`ffi-pointer-scope-reentry-nonvacuity.smt2`](../test/chez/formal/ffi-pointer-scope-reentry-nonvacuity.smt2) | SAT, initial live receiver runs with a valid pointer | The retirement guard preserves the useful original scoped call. |
 | [`io-completion-lease-lifecycle-buggy.pl`](../test/chez/formal/io-completion-lease-lifecycle-buggy.pl) | `premature_reuse/2` and `double_publication/2` each have a witness | Both rejected transition classes are observable. |
 | [`io-completion-lease-lifecycle-corrected.pl`](../test/chez/formal/io-completion-lease-lifecycle-corrected.pl) | `bad/2` has no solution; `valid_cancel_path/1` has one | Safety holds without eliminating valid cancellation. |
 | [`io-completion-lease-lifecycle-nonvacuity.pl`](../test/chez/formal/io-completion-lease-lifecycle-nonvacuity.pl) | `valid_cancel_path/1` has the four-transition solution | The lifecycle constraints are non-vacuous. |
@@ -425,6 +428,14 @@ valid_cancel_path(Path).
 Each SMT model trio has the expected SAT, UNSAT, SAT sequence. The buggy Prolog
 queries must produce paths, the corrected `bad/2` query must not, and both
 valid-cancel queries must produce the path shown above.
+
+The scoped-pointer trio deliberately does not prove Chez GC or continuation
+semantics. Its executable companion captures a continuation inside
+`ffi-with-locked-byte-range`, exits the scope, and attempts to re-enter it. The
+old helper resumed with `locked-object?` false; the corrected helper raises
+before the receiver runs again, remains unlocked, and admits a later fresh
+scope. Re-locking alone is insufficient because the receiver's pointer
+argument was computed before capture and may already be stale.
 
 ## Source and implementation anchors
 
