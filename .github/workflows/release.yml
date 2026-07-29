@@ -41,8 +41,6 @@ jobs:
           - os: macos-14
             target: aarch64-macos
             shell: bash
-            toolchain-target: macos-arm64
-            toolchain-sha256: d5b5a504eed1e0f117b4a3dd23ad0030bb3e5c0da6d6b9d9f990f5f2fa32478f
           # x86_64-macos is cross-built from the arm64 macos-14 runner (GitHub
           # retired the Intel runners): `cross: ta6osx` gates the extra Chez-cross
           # + pack steps below, and the binary is smoke-tested via Rosetta 2.
@@ -50,8 +48,6 @@ jobs:
             target: x86_64-macos
             shell: bash
             cross: ta6osx
-            toolchain-target: macos-arm64
-            toolchain-sha256: d5b5a504eed1e0f117b4a3dd23ad0030bb3e5c0da6d6b9d9f990f5f2fa32478f
           - os: windows-latest
             target: x86_64-windows
             shell: msys2 {0}
@@ -98,12 +94,13 @@ jobs:
             -e STATIC_DEPS=1 \
             '${{ matrix.container-build }}' sh ci/glibc-floor-build.sh
 
-      # --- macOS: lz4 is a release-link dependency. Chez itself comes from the
-      # digest-pinned shared toolchain below. Both matrix rows run natively on
-      # the ARM host; the x86_64 row separately builds its target pack. ---
-      - name: Install release link dependencies (macOS)
+      # --- macOS: Homebrew Chez currently preserves the release's macOS 14
+      # deployment floor. The shared archive was built on macOS 15 without an
+      # explicit min-version flag, so its libkernel.a remains valid for
+      # source-runtime CI but is not yet a release-link input. ---
+      - name: Install Chez Scheme (macOS)
         if: runner.os == 'macOS'
-        run: brew install lz4
+        run: brew install chezscheme lz4
 
       # --- Windows: MSYS2/MinGW-w64 supplies the GNU linker and libraries;
       # digest-pinned ta6nt Chez comes from the shared toolchain below. The
@@ -124,13 +121,13 @@ jobs:
             mingw-w64-x86_64-zlib
             mingw-w64-x86_64-ntldd
 
-      # Native release hosts consume the same immutable toolchains as tests.yml.
-      # The action verifies the caller-pinned archive digest and internal
-      # inventory, then exports CHEZ/JOLT_CHEZ/JOLT_CHEZ_CSV/PATH. Linux is
-      # deliberately excluded: its Chez must be built inside manylinux2014 so
-      # the released binary retains the proven glibc 2.17 floor.
+      # Windows consumes the same immutable toolchain as tests.yml. The action
+      # verifies the caller-pinned archive digest and internal inventory, then
+      # exports CHEZ/JOLT_CHEZ/JOLT_CHEZ_CSV/PATH. Linux remains inside
+      # manylinux2014 for the glibc floor; macOS retains its release-floor-aware
+      # producer until the shared archive records a deployment minimum.
       - name: Install Chez Scheme (shared toolchain)
-        if: runner.os != 'Linux'
+        if: runner.os == 'Windows'
         id: chez
         uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3
         with:
@@ -152,7 +149,7 @@ jobs:
           echo "JOLT_CHEZ=$chez_posix" >> "$GITHUB_ENV"
 
       - name: Chez toolchain evidence
-        if: runner.os != 'Linux'
+        if: runner.os == 'Windows'
         run: |
           echo "target:         ${{ steps.chez.outputs.target }}"
           echo "archive sha256: ${{ steps.chez.outputs.archive-sha256 }}"
@@ -236,6 +233,11 @@ jobs:
         run: |
           make depstest \
             DEPSTEST_JOLTC="$JOLT_RUN_PREFIX ./target/release/jolt"
+        env:
+          # Git's Windows path budget is a portable contract. macOS runners set
+          # TMPDIR to a long randomized path, so anchor the isolated cache at
+          # the documented short runner temp root instead of weakening it.
+          TMPDIR: ${{ runner.temp }}
 
       # The binary is a self-contained COMPILER: it must `build` an app with no
       # jolt source on disk. Run from an isolated dir (nothing but the tiny app)
