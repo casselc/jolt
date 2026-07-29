@@ -197,6 +197,43 @@ jobs:
           "$CHEZ" --script test/chez/timed-deref-deadline-test.ss
           "$CHEZ" --script host/chez/cli.ss run test/mvn_http_test.clj
 
+      # HK0B moved every ranged read-array!/write-array onto one memmove through
+      # a locked interior pointer, so the Windows CRT and the Windows
+      # continuation/unwind behavior are now load-bearing for the FFI. Neither
+      # is observable from Linux. Source mode is sufficient: this exercises the
+      # real memmove symbol and real native memory.
+      #
+      # The gate is not trusted on its printed text. It is run without a pipe so
+      # the child's real exit status survives, and the pass line is then required
+      # explicitly: the script skips ten POSIX-only checks on Windows (fcntl and
+      # POSIX errno semantics, which jolt.ffi deliberately does not provide
+      # there) and fails closed on its own check floor, so a silently shrinking
+      # Windows gate cannot report success.
+      - name: HK0B ranged FFI gate
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          log="$RUNNER_TEMP/hk0b-ffi-binding.log"
+          set +e
+          "$CHEZ" --script test/chez/ffi-binding-test.ss >"$log" 2>&1
+          rc=$?
+          set -e
+          cat "$log"
+          echo "ffi-binding-test child exit: $rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+          grep -qx '60/60 passed' "$log" || {
+            echo "the Windows FFI gate did not run its full check set"; exit 1; }
+          alloc="$RUNNER_TEMP/hk0b-ffi-alloc.log"
+          set +e
+          "$CHEZ" --script test/chez/ffi-ranged-copy-alloc-bench.ss >"$alloc" 2>&1
+          arc=$?
+          set -e
+          cat "$alloc"
+          echo "ffi-ranged-copy-alloc-bench child exit: $arc"
+          [ "$arc" -eq 0 ] || exit "$arc"
+          grep -q '0 gated failures' "$alloc" || {
+            echo "the ranged allocation gate did not report its verdict"; exit 1; }
+
       - name: Build packaged jolt
         run: |
           "$CHEZ" --version
@@ -211,6 +248,28 @@ jobs:
           JOLT_SH='C:/Program Files/Git/bin/sh.exe' \
             TEMP="$shell_tmp_win" TMP="$shell_tmp_win" \
             ./target/release/jolt run test/windows_shell_test.clj
+
+      # The self-contained half of HK0B: read-array/read-array!/write-array and
+      # with-byte-array-pointer are host vars, so a tree shake that dropped one
+      # would silently degrade the FFI in a packaged binary rather than fail to
+      # build. shakelocal builds each fixture twice and requires identical
+      # output. It deliberately exits 0 with a "skipped" line when the Chez
+      # kernel-dev files or `cc` are missing, which is right on a distro Chez but
+      # indistinguishable from a pass here — so require the passed line.
+      - name: HK0B tree-shake transfer fixture
+        run: |
+          log="$RUNNER_TEMP/hk0b-shakelocal.log"
+          set +e
+          make shakelocal JOLT_BIN=./target/release/jolt >"$log" 2>&1
+          rc=$?
+          set -e
+          cat "$log"
+          echo "shakelocal child exit: $rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+          grep -q 'shake smoke: skipped' "$log" && {
+            echo "tree-shake smoke skipped; it must run on this job"; exit 1; }
+          grep -q 'shake smoke: passed' "$log" || {
+            echo "tree-shake smoke did not report a pass"; exit 1; }
 
       - name: Transactional Git dependency cache
         run: make depstest DEPSTEST_JOLTC=./target/release/jolt
@@ -280,3 +339,43 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $chez --script host\chez\cli.ss run test\windows_shell_test.clj
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The ARM64 half of the HK0B evidence. This is the only lane that observes
+      # the ranged interior-pointer transfer, its memmove resolution, and the
+      # retired-scope re-entry refusal under the Windows ARM64 ABI and unwinder.
+      # The machine-type assertion above already proved this Chez is native
+      # tarm64nt rather than x64 under emulation, so these results are ARM64
+      # results.
+      #
+      # $LASTEXITCODE is checked after every child, and the pass line is then
+      # required explicitly, so neither a lost exit status nor a gate that
+      # quietly stopped running checks can be read as success. There is no
+      # tree-shake or packaged lane here: the ARM64 archive publishes only
+      # source-runtime, so a shake smoke would take its documented skip path and
+      # prove nothing.
+      - name: HK0B ranged FFI gate (ARM64)
+        shell: pwsh
+        env:
+          HOME: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          $chez = $env:CHEZ
+          $log = Join-Path $env:RUNNER_TEMP 'hk0b-ffi-binding-arm64.log'
+          & $chez --script test\chez\ffi-binding-test.ss *>&1 |
+            Tee-Object -FilePath $log
+          $rc = $LASTEXITCODE
+          Write-Host "ffi-binding-test child exit: $rc"
+          if ($rc -ne 0) { exit $rc }
+          if (-not (Select-String -LiteralPath $log -Pattern '^60/60 passed$' -Quiet)) {
+            throw "the Windows ARM64 FFI gate did not run its full check set"
+          }
+
+          $alloc = Join-Path $env:RUNNER_TEMP 'hk0b-ffi-alloc-arm64.log'
+          & $chez --script test\chez\ffi-ranged-copy-alloc-bench.ss *>&1 |
+            Tee-Object -FilePath $alloc
+          $arc = $LASTEXITCODE
+          Write-Host "ffi-ranged-copy-alloc-bench child exit: $arc"
+          if ($arc -ne 0) { exit $arc }
+          if (-not (Select-String -LiteralPath $alloc -Pattern '0 gated failures' -Quiet)) {
+            throw "the ranged allocation gate did not report its verdict"
+          }

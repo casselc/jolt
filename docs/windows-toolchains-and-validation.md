@@ -154,6 +154,92 @@ around its already token-quoted `sh.exe` and script paths. The regression suite
 covers paths with spaces, metacharacters, compound POSIX syntax, and nonzero
 exit propagation.
 
+## HK0B ranged-FFI native Windows validation (HK0B.1)
+
+HK0B replaced the temporary-bytevector staging in ranged
+`jolt.ffi/read-array!` and `write-array` with one `memmove` through a locked
+interior pointer, and the independent review added a retirement guard that
+refuses continuation re-entry into a scope whose dynamic extent already exited.
+Both make the platform C runtime and the platform unwinder load-bearing for the
+FFI in a way Linux cannot demonstrate. HK0B.1 is that Windows evidence.
+Revision `856ecd2e202f489d0531d0efb217b2d5617edd88`.
+
+On 2026-07-29, native Windows x86-64 (`ta6nt`, Cisco/MSVC Chez 10.4.1, source
+mode, AOT disabled, fresh checkout with no `target/` artifacts) reported:
+
+- `memmove` resolves as a process symbol and `object->reference-address`
+  returns a usable interior pointer — the scoped path executes real native
+  code, it is not inferred;
+- the FFI binding gate passed 60/60 with child exit 0, covering the 930-row
+  ranged offset/length/native-offset table, 21 rejection rows, 128 same-backing
+  overlap rows in both API directions, exact-tail and zero-length rows,
+  prefix/suffix sentinels on both the array and the native side, lock balance
+  through `locked-object?`, unlock under a Scheme error, a Jolt exception and a
+  nonlocal exit, the retired-scope re-entry refusal, a fresh working scope after
+  that refusal, and the megabyte round trip;
+- the overlap controls behave as they do on Linux: the overlap-unsafe forward
+  byte loop diverged on 26 of 64 control rows, so the overlap evidence is
+  discriminating on this host. `memcpy` diverged on 0, i.e. this Windows CRT
+  also routes `memcpy` through a move-safe implementation. That is a host
+  observation, not a guarantee, and it is exactly why the production code
+  specifies `memmove`;
+- the unit gate passed 1129/1129 and the timed-deref gate 4/4, both exit 0.
+
+The allocation gate does run trustworthily on Windows: Chez reports the same
+cumulative `sstats-bytes` semantics there, and the numbers reproduce the Linux
+reference exactly — 176.00 B/op constant for ranged transfers from 16 B through
+64 KiB, 0.00 B/op for whole-array transfers, and 65557.12 B/op for the staged
+comparator at 64 KiB, with 0 gated failures. No threshold was derived from the
+Windows run, and throughput remains reported, never gated.
+
+### What this validation had to fix, and what it did not
+
+No production change was required. `host/chez/java/ffi.ss` is byte-identical to
+the reviewed revision; the diff is test and CI only.
+
+The defect this validation did demonstrate is in the gate itself:
+`test/chez/ffi-binding-test.ss` could not run on Windows at all. It aborted at
+its first POSIX-only binding, so every HK0B check behind it was unreachable.
+Ten checks are genuinely POSIX-only:
+
+- three depend on `fcntl`/`F_SETFL`, which has no Windows equivalent; and
+- seven assert POSIX errno codes, which `jolt.ffi` deliberately does not
+  provide on Windows — there `errno` is `WSAGetLastError`, a Winsock error, and
+  cannot report a CRT file error such as `ENOENT`. That is a different
+  contract, not a weaker one, and changing it is not HK0B work.
+
+Those ten are now named and printed as skips rather than silently dropped.
+Where a real native equivalent exists the symbol is selected instead of skipped
+(`read` → `_read`, `usleep` → `Sleep` from kernel32, and `ws2_32` loaded for
+`htons`/`ntohs`), so those checks still execute native code on Windows. The
+file fails closed on a check floor and on an unexpected skip count, so a
+Windows gate that quietly stopped running its HK0B checks turns red instead of
+printing a smaller pass line. Non-Windows behavior is unchanged: nothing is
+skipped and the same 70 checks run.
+
+Two lanes were not run locally and are covered in CI instead:
+
+- `test/chez/ffi-aggregate-test.sh` fails closed with "not configured for
+  $(uname -s)" on Windows; it needs a C compiler and a POSIX shell, and it is
+  not part of the HK0B evidence set; and
+- the tree-shake transfer fixture needs the GNU `libkernel.a` kernel-dev files,
+  which the Cisco/MSVC install does not ship, so locally it would take its
+  documented skip path. The Windows x86-64 CI job has `gnu-kernel-dev` and runs
+  it with an assertion that it did **not** skip.
+
+Windows ARM64 has no local hardware here, so it is hosted-only. Both Windows
+jobs in `tests.yml` gained a source-mode HK0B gate that checks the child exit
+status directly and then requires the pass line, so neither a lost exit status
+nor a shrinking gate can be read as success. The ARM64 job makes no packaged or
+tree-shake claim, because the shared toolchain publishes only `source-runtime`
+for that target; its existing `machine-type` assertion is what keeps an
+emulated x64 Chez from being mistaken for ARM64 evidence.
+
+No semantic premise changed on Windows, so no new formal model was required.
+All 71 SMT models were re-run on this revision and each produced its expected
+verdict, including the re-entry trio: `-corrected` unsat,
+`-guard-omitted-buggy` sat, `-nonvacuity` sat.
+
 ## Local Windows evidence that is most useful
 
 The most useful local x86_64 setup has both of these lanes:

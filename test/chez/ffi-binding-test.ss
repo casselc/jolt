@@ -25,8 +25,40 @@
     (let ((ctx (make-analyze-ctx ns)))
       (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
 
+;; --- platform selection -------------------------------------------------------
+;; Every byte-array, ranged-transfer, pointer-scope, lock and re-entry check in
+;; this file is OS-neutral and runs on every target. A few older checks reach
+;; for entry points or semantics that are POSIX-only:
+;;
+;;   * fcntl/F_SETFL has no Windows equivalent at all; and
+;;   * jolt.ffi/errno is WSAGetLastError on Windows by design (see the contract
+;;     on ffi-errno-thunk), so it reports a Winsock error and cannot report a
+;;     CRT file error such as ENOENT. The POSIX errno-ordering property is a
+;;     different contract there, not a weaker one.
+;;
+;; Those are named and reported as skipped rather than silently dropped, and the
+;; summary below fails closed if the portable set did not actually run. Where a
+;; genuine native equivalent does exist the symbol is selected, not skipped, so
+;; the check still executes real native code on Windows.
+(define windows?
+  (and (memq (machine-type) '(a6nt ta6nt i3nt ti3nt arm64nt tarm64nt)) #t))
+(define skipped '())
+(define (skip name why) (set! skipped (cons (cons name why) skipped)))
+;; read(2) -> _read in the MSVC CRT; usleep(3) has no CRT counterpart, so the
+;; collect-safe blocking probe uses Sleep from kernel32 (milliseconds).
+(define c-read-symbol   (if windows? "_read" "read"))
+(define sleep-symbol    (if windows? "Sleep" "usleep"))
+(define sleep-rettype   (if windows? ":void" ":int"))
+(define sleep-argument  (if windows? 2000 2000000))   ; ms on Windows, us on POSIX
+
 ;; load libc (process symbols) and bind typed foreign functions
 (ev "(jolt.ffi/load-library)")
+;; htons/ntohs live in ws2_32 on Windows, and Sleep in kernel32; neither is a
+;; process symbol there. Loading them is library selection, not a semantic
+;; branch.
+(when windows?
+  (load-shared-object "ws2_32.dll")
+  (load-shared-object "kernel32.dll"))
 (ev "(def c-strlen (jolt.ffi/__cfn \"strlen\" [:string] :size_t))")
 (ev "(def c-abs (jolt.ffi/__cfn \"abs\" [:int] :int))")
 
@@ -58,6 +90,15 @@
 (ev "(def c-fcntl-all-options
        (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
          {:blocking true :varargs-after 2 :capture-native-error true}))")
+(if windows?
+    (begin
+      (skip "variadic fcntl applies and reports O_NONBLOCK"
+            "fcntl/F_SETFL does not exist on Windows")
+      (skip "variadic boundary composes with collect-safe calls"
+            "fcntl/F_SETFL does not exist on Windows")
+      (skip "native-error capture executes with collect-safe and variadic conventions"
+            "fcntl/F_SETFL does not exist on Windows"))
+    (begin
 (ev "(def c-open-va
        (jolt.ffi/__cfn \"open\" [:string :int] :int
                          {:varargs-after 2}))")
@@ -88,7 +129,7 @@
               (and (= 2 (count result))
                    (integer? (nth result 0))
                    (not (neg? (nth result 0)))
-                   (integer? (nth result 1)))))")))
+                   (integer? (nth result 1)))))")))))
 (ok "varargs boundary must be positive and within the declared arguments"
     (and
       (guard (e (#t #t))
@@ -223,6 +264,23 @@
            #t)))
 
 ;; a failing call sets a specific, recognizable code
+(if windows?
+    (begin
+      (skip "failed open returns -1"
+            "jolt.ffi/errno is WSAGetLastError on Windows, not CRT errno")
+      (skip "errno reports ENOENT (2) for the failed open"
+            "jolt.ffi/errno is WSAGetLastError on Windows, not CRT errno")
+      (skip "a failing cleanup call does overwrite errno"
+            "jolt.ffi/errno is WSAGetLastError on Windows, not CRT errno")
+      (skip "the value captured before cleanup survives it"
+            "jolt.ffi/errno is WSAGetLastError on Windows, not CRT errno")
+      (skip "atomic native-error binding returns [result error-code]"
+            "POSIX errno codes; Windows capture returns a Win32/WSA code")
+      (skip "atomic native-error pair survives later native cleanup"
+            "POSIX errno codes; Windows capture returns a Win32/WSA code")
+      (skip "atomic native-error capture composes with collect-safe calls"
+            "POSIX errno codes; Windows capture returns a Win32/WSA code"))
+    (begin
 (ev "(def c-open (jolt.ffi/__cfn \"open\" [:string :int] :int))")
 (ev "(def rc-missing (c-open \"/nonexistent-zzz/nope\" 0))")
 (ok "failed open returns -1" (= -1 (jnum->exact (var-deref "user" "rc-missing"))))
@@ -266,7 +324,7 @@
        (jolt.ffi/__cfn \"close\" [:int] :int
          {:blocking true :capture-native-error true}))")
 (ok "atomic native-error capture composes with collect-safe calls"
-    (jolt-truthy? (ev "(= [-1 9] (c-close-with-error-blocking -1))")))
+    (jolt-truthy? (ev "(= [-1 9] (c-close-with-error-blocking -1))")))))
 
 ;; byte-array buffer I/O: write a byte-array into foreign memory and read it back
 ;; byte-exact (high bytes preserved, no UTF-8 mangling).
@@ -336,7 +394,9 @@
                 (catch IllegalArgumentException _ true))")))
 (ok "typed byte-array arguments fail closed on collect-safe calls"
     (guard (e (#t #t))
-      (ev "(jolt.ffi/__cfn \"read\" [:int :byte-array :size_t] :ssize_t :blocking)")
+      (ev (string-append
+            "(jolt.ffi/__cfn \"" c-read-symbol
+            "\" [:int :byte-array :size_t] :ssize_t :blocking)"))
       #f))
 (ok "byte-array roundtrip (binary-faithful)"
     (jolt-truthy?
@@ -795,9 +855,10 @@
 ;; a :blocking foreign call is collect-safe: a thread parked in it must not pin
 ;; the stop-the-world collector. (collect) here would throw "cannot collect when
 ;; multiple threads are active" if usleep weren't emitted __collect_safe.
-(ev "(def c-usleep (jolt.ffi/__cfn \"usleep\" [:uint] :int :blocking))")
+(ev (string-append "(def c-usleep (jolt.ffi/__cfn \"" sleep-symbol
+                   "\" [:uint] " sleep-rettype " :blocking))"))
 (let ((usleep (var-deref "user" "c-usleep")))
-  (fork-thread (lambda () (usleep 2000000)))           ; ~2s in a blocking call
+  (fork-thread (lambda () (usleep sleep-argument)))    ; ~2s in a blocking call
   (let loop ((i 0)) (when (fx<? i 30000000) (loop (fx+ i 1))))  ; spin so the thread enters usleep
   (ok "blocking ffi call is collect-safe" (guard (e (#t #f)) (collect) #t)))
 
@@ -825,5 +886,22 @@
 (ok "free-callable releases the callback"
     (jolt-nil? (ev "(jolt.ffi/free-callable cmp)")))
 
+;; Fail closed on a silently shrinking gate. `skip` is only ever reached on
+;; Windows and only for the POSIX-only checks named above, so the number of
+;; checks that actually ran has a known floor on every target. A future edit
+;; that skipped a byte-array, ranged-transfer, pointer-scope or re-entry check
+;; -- the HK0B evidence this file exists to carry -- would drop `total` below
+;; that floor and turn the gate red instead of printing a smaller pass line.
+(define expected-skips (if windows? 10 0))
+(define check-floor 60)   ; 70 total - the 10 POSIX-only checks
+(for-each (lambda (s) (printf "SKIP (~a): ~a~n" (cdr s) (car s)))
+          (reverse skipped))
+(when (not (= (length skipped) expected-skips))
+  (printf "FAIL: expected ~a skipped checks on this target, saw ~a~n"
+          expected-skips (length skipped))
+  (set! fails (+ fails 1)))
+(when (< total check-floor)
+  (printf "FAIL: only ~a checks ran; the gate floor is ~a~n" total check-floor)
+  (set! fails (+ fails 1)))
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
