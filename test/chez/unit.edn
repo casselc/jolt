@@ -900,6 +900,10 @@
    :expr "(eval '(defn auv-strict [] auv-missing))"}
   {:suite "resolution / allow-unresolved-vars" :label "a qualified symbol is unaffected" :expected :throws
    :expr "(binding [*allow-unresolved-vars* true] (eval 'no.such.ns/auv-q))"}
+  {:suite "target" :label "descriptor has exactly the stable public keys" :expected "true" :expr "(= #{:os :arch :abi :libc :endian :pointer-bits :file-separator :path-separator :processors} (set (keys (jolt.host/target))))"}
+  {:suite "target" :label "native scalar facts are typed and explicit" :expected "true" :expr "(let [{:keys [os arch abi libc endian pointer-bits file-separator path-separator processors]} (jolt.host/target)] (and (every? keyword? [os arch abi libc endian]) (contains? #{32 64} pointer-bits) (string? file-separator) (= 1 (count file-separator)) (string? path-separator) (= 1 (count path-separator)) (integer? processors) (pos? processors)))"}
+  {:suite "target" :label "System and Runtime compatibility views are coherent" :expected "true" :expr "(let [t (jolt.host/target)] (and (= (:file-separator t) (System/getProperty \"file.separator\")) (= (:path-separator t) (System/getProperty \"path.separator\")) (= (:processors t) (.availableProcessors (Runtime/getRuntime))) (= (System/getProperty \"os.arch\") (get (System/getProperties) \"os.arch\"))))"}
+  {:suite "target" :label "normalized OS and architecture project to JVM property spellings" :expected "true" :expr "(let [{:keys [os arch]} (jolt.host/target)] (and (= (case os :linux \"Linux\" :darwin \"Mac OS X\" :windows \"Windows\" \"Unknown\") (System/getProperty \"os.name\")) (= (case arch :x86-64 \"amd64\" :aarch64 \"aarch64\" :x86 \"x86\" :arm \"arm\" :riscv64 \"riscv64\" :loongarch64 \"loongarch64\" :ppc64 \"ppc64\" :ppc \"ppc\" \"unknown\") (System/getProperty \"os.arch\"))))"}
   ;; clojure.core/compile writes the namespace's compiled artifact under
   ;; *compile-path* and returns the lib, like core.clj's compile; a nil
   ;; *compile-path* raises "*compile-path* not set", like Compiler.compile.
