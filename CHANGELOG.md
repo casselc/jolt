@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.bytes`, a checked binary scalar substrate.** Fixed-width integer and
+  IEEE-754 access over a byte-array at an explicit offset, plus an overlap-safe
+  ranged copy: `get-u16-le` / `put-u32-be!` / `get-i64-le` and the rest of the
+  u8..u64 x signed/unsigned x little/big table, `get-f64-le` and friends,
+  raw-bit conversion (`f64-bits`, `bits->f64`, `f32-bits`, `bits->f32`), and
+  `copy!`. Every binary protocol — a length-prefixed envelope, bencode, a
+  compression or image header — otherwise rebuilds this by hand over
+  `aget`/`aset` with a shift-and-or chain per field; over Chez's bytevector
+  primitives each operation is one primitive call and allocates nothing, which
+  the `bytes` gate asserts rather than assumes.
+
+  Bounds admission is subtraction-form: after `0 <= offset <= limit`, a span is
+  admitted only when `size <= limit - offset`, which needs no "and the sum did
+  not overflow" side condition. Argument validation precedes admission and
+  admission precedes mutation, so a rejected write or copy leaves the
+  destination byte-for-byte unchanged. Values are never silently narrowed:
+  70000 as a u16, -1 as a u32, and the exact integer 1 where a float is
+  required are all errors — the last of which Chez's own
+  `bytevector-ieee-double-set!` would have accepted and stored as 1.0. Three
+  exception classes are contractual: `IndexOutOfBoundsException` for an invalid
+  range, `IllegalArgumentException` for an invalid value, and
+  `UnsupportedOperationException` for a host whose float representation is not
+  IEEE-754 binary64 — probed at load, failing closed rather than returning
+  plausible wrong bits.
+
+  One representation limit is documented rather than papered over: Jolt's only
+  float type is binary64, so `bits->f32` must widen. The widened value matches
+  the JVM's own widening of the same float bit-for-bit, signalling NaNs
+  included, but re-narrowing quiets a signalling NaN (`0x7F800001` comes back
+  as `0x7FC00001`) exactly as it does on the JVM. An f32 pattern that must
+  survive verbatim travels as u32.
+
 - **A real monotonic clock.** `jolt.host/monotonic-nanos` returns a monotonic
   counter (Chez's `time-monotonic`), and `System/nanoTime` now projects it
   instead of `currentTimeMillis * 1e6`. The old value was wall-clock *and*
