@@ -1,7 +1,7 @@
 #!/bin/sh
 # Smoke a built jolt across runtime containers, bare first (out-of-the-box)
 # and, when bare fails, again after installing the runtime shared libs
-# (liblz4/zlib/libtinfo) — so the summary distinguishes "glibc too old, will
+# (liblz4/zlib/libtinfo/legacy ncurses) — so the summary distinguishes "glibc too old, will
 # never run" from "runs once the usual libs are present" (container images are
 # more minimal than real installs: on desktop/server distros systemd drags in
 # liblz4 and bash drags in libtinfo, so 'with deps' approximates a real box).
@@ -11,7 +11,7 @@ set -eu
 jolt="$1"; summary="$2"
 dir="$(cd "$(dirname "$jolt")" && pwd)"
 
-DEB='export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null 2>&1; apt-get install -y -qq liblz4-1 zlib1g libtinfo6 >/dev/null 2>&1'
+DEB='export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null 2>&1; apt-get install -y -qq liblz4-1 zlib1g libtinfo6 libncurses5 >/dev/null 2>&1'
 RPM='( dnf install -y -q lz4-libs ncurses-libs zlib || dnf install -y -q lz4-libs ncurses-libs zlib-ng-compat || yum install -y -q lz4 ncurses-libs zlib ) >/dev/null 2>&1'
 
 # image | glibc note | dep install for the retry
