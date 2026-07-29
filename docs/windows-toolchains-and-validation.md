@@ -224,8 +224,33 @@ Two lanes were not run locally and are covered in CI instead:
   not part of the HK0B evidence set; and
 - the tree-shake transfer fixture needs the GNU `libkernel.a` kernel-dev files,
   which the Cisco/MSVC install does not ship, so locally it would take its
-  documented skip path. The Windows x86-64 CI job has `gnu-kernel-dev` and runs
-  it with an assertion that it did **not** skip.
+  documented skip path.
+
+### Unmet: the self-contained/tree-shaken fixture on Windows
+
+HK0B.1 asks for the plain and tree-shaken transfer fixture on each Windows
+architecture. That is **not met**, on either, and no step asserts it:
+
+- **ARM64** cannot build a self-contained binary at all. The shared toolchain
+  publishes only `source-runtime` for that target, so there are no kernel-dev
+  files to link against.
+- **x86-64** has `gnu-kernel-dev`, but `make shakelocal` fails before any
+  shaking happens. `jolt build -o` does not recognize a Windows drive-letter
+  path as absolute: it joins the output path to the project directory, and
+  `bld-mkdir-p` then fails with
+  `cannot create ".../ffi-transfer-app/D:": invalid argument`. All nine
+  fixtures fail identically at their first build — including `ns-publics-app`
+  and `defonce-app`, which contain no FFI — with both an absolute POSIX
+  `JOLT_PWD` and a `cygpath -w` one, so the output path is the variable, not
+  `JOLT_PWD`.
+
+That is a real Windows portability defect in the core build path, not in the
+FFI helper layer and not introduced by HK0B: it blocks every
+`jolt build -o <absolute>` on Windows regardless of the app. Repairing it is
+separate work from this slice, so it is reported here rather than fixed, and
+the CI job carries no tree-shake step — a green step there would assert
+coverage that does not exist. The fixture's plain-versus-shaken evidence
+remains Linux-only until that defect is fixed.
 
 Windows ARM64 has no local hardware here, so it is hosted-only. Both Windows
 jobs in `tests.yml` gained a source-mode HK0B gate that checks the child exit

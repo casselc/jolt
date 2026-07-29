@@ -249,47 +249,18 @@ jobs:
             TEMP="$shell_tmp_win" TMP="$shell_tmp_win" \
             ./target/release/jolt run test/windows_shell_test.clj
 
-      # The self-contained half of HK0B: read-array/read-array!/write-array and
-      # with-byte-array-pointer are host vars, so a tree shake that dropped one
-      # would silently degrade the FFI in a packaged binary rather than fail to
-      # build. shakelocal builds each fixture twice and requires identical
-      # output. It deliberately exits 0 with a "skipped" line when the Chez
-      # kernel-dev files or `cc` are missing, which is right on a distro Chez but
-      # indistinguishable from a pass here — so require the passed line.
-      - name: HK0B tree-shake transfer fixture
-        run: |
-          log="$RUNNER_TEMP/hk0b-shakelocal.log"
-          set +e
-          make shakelocal JOLT_BIN=./target/release/jolt >"$log" 2>&1
-          rc=$?
-          set -e
-          cat "$log"
-          echo "shakelocal child exit: $rc"
-          if ! grep -q 'shake smoke: passed' "$log"; then
-            # run_local_case passes an ABSOLUTE app dir as JOLT_PWD; reproduce
-            # that exactly, then the same thing with a native Windows path, to
-            # separate "POSIX path not understood by the Win32 binary" from a
-            # genuine build failure.
-            app="$PWD/test/chez/ffi-transfer-app"
-            echo "--- diagnostic A: absolute POSIX JOLT_PWD (as run_local_case) ---"
-            echo "JOLT_PWD=$app"
-            set +e
-            JOLT_PWD="$app" ./target/release/jolt build \
-              -m app.core -o "$RUNNER_TEMP/ffi-transfer-diagA"
-            echo "diagnostic A exit: $?"
-            echo "--- diagnostic B: native Windows JOLT_PWD ---"
-            app_win="$(cygpath -w "$app")"
-            echo "JOLT_PWD=$app_win"
-            JOLT_PWD="$app_win" ./target/release/jolt build \
-              -m app.core -o "$(cygpath -w "$RUNNER_TEMP")\\ffi-transfer-diagB.exe"
-            echo "diagnostic B exit: $?"
-            set -e
-          fi
-          [ "$rc" -eq 0 ] || exit "$rc"
-          grep -q 'shake smoke: skipped' "$log" && {
-            echo "tree-shake smoke skipped; it must run on this job"; exit 1; }
-          grep -q 'shake smoke: passed' "$log" || {
-            echo "tree-shake smoke did not report a pass"; exit 1; }
+      # The self-contained/tree-shaken half of the HK0B evidence is NOT gated
+      # here, and deliberately so. `make shakelocal` cannot run on Windows at
+      # all: `jolt build -o` does not treat a Windows drive-letter path as
+      # absolute, joins it to the project directory, and bld-mkdir-p then fails
+      # trying to create a directory component named `D:`. All nine fixtures
+      # fail identically at their first build, including ones containing no FFI,
+      # so this is a core build-path defect independent of HK0B rather than
+      # anything the ranged transfer introduced. See
+      # docs/windows-toolchains-and-validation.md; fixing it is separate work,
+      # and adding a passing-looking step here would assert coverage that does
+      # not exist. The fixture's plain-versus-shaken evidence therefore remains
+      # Linux-only for now.
 
       - name: Transactional Git dependency cache
         run: make depstest DEPSTEST_JOLTC=./target/release/jolt
