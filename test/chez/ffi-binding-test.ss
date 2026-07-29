@@ -423,6 +423,330 @@
               (jolt.ffi/free p)
               (= (vec src) (vec dst)))")))
 
+;; --- HK0B: ranged transfers copy through a scoped interior pointer ----------
+;; A ranged read-array!/write-array no longer stages the bytes through a
+;; temporary bytevector; it locks the destination/source range and moves the
+;; bytes with one memmove between native memory and the interior pointer. The
+;; checks below are the semantic boundary that change has to preserve: the
+;; complete offset/length table with sentinels on BOTH sides, every rejection
+;; leaving the whole geometry untouched, lock/unlock pairing observable through
+;; Chez's locked-object?, and same-backing overlap.
+
+(define (mk-bytes lst) (make-jolt-array (u8-list->bytevector lst) 'byte))
+(define (arr-bytes a) (bytevector->u8-list (jolt-array-vec a)))
+(define (fill-native! p n v) (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i v)))
+(define (native-bytes p n)
+  (let loop ((i (- n 1)) (acc '()))
+    (if (< i 0) acc (loop (- i 1) (cons (foreign-ref 'unsigned-8 p i) acc)))))
+(define (throws? thunk) (guard (e (#t #t)) (thunk) #f))
+(define (slice lst off len) (list-head (list-tail lst off) len))
+
+;; Exhaustive small table. For every array offset, length, and native offset:
+;; the transferred window is exact, the untouched prefix and suffix on both the
+;; array side and the native side keep their sentinels, and the count is the
+;; requested length. Zero-length rows and the exact-tail row (offset = length,
+;; length 0) are included by construction.
+(let* ((asize 8)
+       (nsize 12)
+       (nsentinel 238)                        ; native fill
+       (dsentinel 249)                        ; destination-array fill
+       (pat (lambda (i) (bit-and (+ 16 (* 37 i)) 255)))
+       (src-list (map pat (iota asize)))
+       (native-list (map (lambda (i) (pat (+ 100 i))) (iota nsize)))
+       (p (foreign-alloc nsize))
+       (rows 0) (bad 0))
+  (do ((off 0 (+ off 1))) ((> off asize))
+    (do ((len 0 (+ len 1))) ((> len (- asize off)))
+      (do ((noff 0 (+ noff 1))) ((> noff (- nsize len)))
+        ;; array range -> native
+        (let ((src (mk-bytes src-list)))
+          (fill-native! p nsize nsentinel)
+          (let ((n (ffi-write-array (+ p noff) src off len)))
+            (set! rows (+ rows 1))
+            (unless (and (= n len)
+                         (equal? (arr-bytes src) src-list)
+                         (equal? (native-bytes (+ p noff) len) (slice src-list off len))
+                         (equal? (native-bytes p noff) (make-list noff nsentinel))
+                         (equal? (native-bytes (+ p noff len) (- nsize noff len))
+                                 (make-list (- nsize noff len) nsentinel)))
+              (set! bad (+ bad 1)))))
+        ;; native -> array range
+        (let ((dst (mk-bytes (make-list asize dsentinel))))
+          (do ((i 0 (+ i 1))) ((= i nsize))
+            (foreign-set! 'unsigned-8 p i (list-ref native-list i)))
+          (let ((n (ffi-read-array! (+ p noff) len dst off)))
+            (set! rows (+ rows 1))
+            (unless (and (= n len)
+                         (equal? (native-bytes p nsize) native-list)
+                         (equal? (slice (arr-bytes dst) off len) (slice native-list noff len))
+                         (equal? (list-head (arr-bytes dst) off) (make-list off dsentinel))
+                         (equal? (list-tail (arr-bytes dst) (+ off len))
+                                 (make-list (- asize off len) dsentinel)))
+              (set! bad (+ bad 1))))))))
+  (foreign-free p)
+  (printf "ranged transfer table: ~a rows, ~a failures~n" rows bad)
+  (ok "exhaustive ranged transfer table preserves prefix/suffix sentinels"
+      (and (= rows 930) (= bad 0))))
+
+;; Every rejection is complete before the first native access or destination
+;; mutation, so the whole destination AND source geometry survives it.
+(let* ((asize 4)
+       (nsize 4)
+       (dsentinel 249)
+       (nsentinel 238)
+       (p (foreign-alloc nsize))
+       (arr (mk-bytes (make-list asize dsentinel)))
+       (bv (jolt-array-vec arr))
+       (huge (expt 2 62))
+       (intact? (lambda ()
+                  (and (equal? (arr-bytes arr) (make-list asize dsentinel))
+                       (equal? (native-bytes p nsize) (make-list nsize nsentinel))
+                       (not (locked-object? bv)))))
+       (rows 0) (bad 0)
+       (row (lambda (name thunk)
+              (set! rows (+ rows 1))
+              (fill-native! p nsize nsentinel)
+              (unless (and (throws? thunk) (intact?))
+                (set! bad (+ bad 1))
+                (printf "FAIL rejection row: ~a~n" name))))
+       (bad-array "not-a-byte-array"))
+  (row "read negative length"    (lambda () (ffi-read-array! p -1 arr 0)))
+  (row "read negative offset"    (lambda () (ffi-read-array! p 1 arr -1)))
+  (row "read length past end"    (lambda () (ffi-read-array! p 5 arr 0)))
+  (row "read offset past end"    (lambda () (ffi-read-array! p 0 arr 5)))
+  (row "read exact tail plus 1"  (lambda () (ffi-read-array! p 1 arr 4)))
+  (row "read overflow-shaped"    (lambda () (ffi-read-array! p huge arr 1)))
+  (row "read null non-empty"     (lambda () (ffi-read-array! 0 1 arr 0)))
+  (row "read wrong array kind"   (lambda () (ffi-read-array! p 1 bad-array 0)))
+  (row "write negative length"   (lambda () (ffi-write-array p arr 0 -1)))
+  (row "write negative offset"   (lambda () (ffi-write-array p arr -1 1)))
+  (row "write length past end"   (lambda () (ffi-write-array p arr 0 5)))
+  (row "write offset past end"   (lambda () (ffi-write-array p arr 5 0)))
+  (row "write exact tail plus 1" (lambda () (ffi-write-array p arr 4 1)))
+  (row "write overflow-shaped"   (lambda () (ffi-write-array p arr 1 huge)))
+  (row "write null non-empty"    (lambda () (ffi-write-array 0 arr 0 1)))
+  (row "write wrong array kind"  (lambda () (ffi-write-array p bad-array 0 1)))
+  (row "write whole wrong kind"  (lambda () (ffi-write-array p bad-array)))
+  (row "scope negative offset"   (lambda () (ffi-with-byte-array-pointer arr -1 1 (lambda (q m) m))))
+  (row "scope length past end"   (lambda () (ffi-with-byte-array-pointer arr 1 4 (lambda (q m) m))))
+  (row "scope overflow-shaped"   (lambda () (ffi-with-byte-array-pointer arr 1 huge (lambda (q m) m))))
+  (row "scope wrong array kind"  (lambda () (ffi-with-byte-array-pointer bad-array 0 1 (lambda (q m) m))))
+  (foreign-free p)
+  (printf "rejection rows: ~a, ~a failures~n" rows bad)
+  (ok "rejected transfers and scopes leave the full geometry unchanged"
+      (and (= rows 21) (= bad 0))))
+
+;; Zero-length transfers stay valid with a null pointer, at the exact tail, and
+;; without taking a lock at all.
+(let* ((arr (mk-bytes '(1 2)))
+       (bv (jolt-array-vec arr)))
+  (ok "zero-length exact-tail transfers accept a null pointer and touch nothing"
+      (and (= 0 (ffi-read-array! 0 0 arr 2))
+           (= 0 (ffi-write-array 0 arr 2 0))
+           (= 0 (ffi-read-array! 0 0 arr 0))
+           (equal? (arr-bytes arr) '(1 2))
+           (not (locked-object? bv)))))
+
+;; Lock/unlock pairing, observed directly rather than inferred.
+(let* ((arr (mk-bytes '(1 2 3 4 5 6 7 8)))
+       (bv (jolt-array-vec arr)))
+  (ok "nested public scopes each balance one reference-counted lock"
+      (and (not (locked-object? bv))
+           (ffi-with-byte-array-pointer
+             arr 1 4
+             (lambda (p n)
+               (and (locked-object? bv)
+                    (ffi-with-byte-array-pointer
+                      arr 2 2
+                      (lambda (q m)
+                        (and (locked-object? bv) (= q (+ p 1)) (= m 2))))
+                    ;; the inner scope released only its own lock
+                    (locked-object? bv)
+                    (= n 4))))
+           (not (locked-object? bv))))
+  (ok "a throw out of the callback unlocks, and a later scope still works"
+      (and (throws? (lambda ()
+                      (ffi-with-byte-array-pointer arr 0 4 (lambda (p n) (error 'hk0b "boom")))))
+           (not (locked-object? bv))
+           (ffi-with-byte-array-pointer arr 0 4 (lambda (p n) (= n 4)))
+           (not (locked-object? bv))))
+  (ok "a nonlocal exit out of the callback unlocks"
+      (and (call/cc (lambda (k)
+                      (ffi-with-byte-array-pointer arr 0 4 (lambda (p n) (k #t)))))
+           (not (locked-object? bv)))))
+(let ((bv (make-bytevector 8 0)))
+  (ok "the private scope unlocks when the receiver throws"
+      (and (throws? (lambda ()
+                      (ffi-with-locked-byte-range "probe" bv 1 4
+                                                  (lambda (p n arg) (error 'hk0b "boom")) 0)))
+           (not (locked-object? bv))
+           (= 4 (ffi-with-locked-byte-range "probe" bv 1 4 (lambda (p n arg) n) 0))
+           (not (locked-object? bv)))))
+(ev "(def scoped-throw-arr (byte-array [1 2 3 4]))")
+(ok "a Jolt exception out of the callback unlocks the backing"
+    (and (jolt-truthy?
+           (ev "(try (jolt.ffi/with-byte-array-pointer scoped-throw-arr 0 2
+                       (fn [p n] (throw (Exception. \"hk0b\"))))
+                     false
+                     (catch Exception _ true))"))
+         (not (locked-object? (jolt-array-vec (var-deref "user" "scoped-throw-arr"))))
+         (jolt-truthy?
+           (ev "(jolt.ffi/with-byte-array-pointer scoped-throw-arr 0 2 (fn [p n] (= n 2)))"))))
+
+;; A collection inside the scope cannot move the backing storage, and a ranged
+;; transfer nested inside a live scope still lands in the right window.
+(let* ((arr (mk-bytes '(1 2 3 4 5 6 7 8)))
+       (bv (jolt-array-vec arr))
+       (p (foreign-alloc 4)))
+  (do ((i 0 (+ i 1))) ((= i 4)) (foreign-set! 'unsigned-8 p i (+ 200 i)))
+  (ok "the backing address is stable across a collection inside the scope"
+      (ffi-with-byte-array-pointer
+        arr 2 4
+        (lambda (q n)
+          (let ((before (object->reference-address bv)))
+            (collect)
+            (and (= before (object->reference-address bv))
+                 (= q (+ before 2))
+                 ;; a ranged transfer nested in the live scope
+                 (= 4 (ffi-read-array! p 4 arr 2))
+                 (equal? (arr-bytes arr) '(1 2 200 201 202 203 7 8))
+                 (locked-object? bv))))))
+  (foreign-free p)
+  (ok "the nested transfer released its own lock with the scope"
+      (not (locked-object? bv))))
+
+;; Same-backing overlap. The native pointer and the array range are the same
+;; storage, so a staged copy and a memmove agree while a memcpy need not. Both
+;; API directions are exercised at every small distance, forward and backward.
+(let* ((n 32)
+       (fresh (lambda ()
+                (let ((bv (make-bytevector n)))
+                  (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bit-and (* 7 i) 255)))
+                  bv)))
+       (memcpy-raw! (foreign-procedure "memcpy" (uptr uptr uptr) void))
+       (forward-copy! (lambda (bv soff doff len)
+                        ;; the overlap-unsafe implementation these rows exclude:
+                        ;; an in-place forward byte loop, which re-reads bytes it
+                        ;; has already overwritten when doff > soff.
+                        (do ((i 0 (+ i 1))) ((= i len))
+                          (bytevector-u8-set! bv (+ doff i) (bytevector-u8-ref bv (+ soff i))))))
+       (expected (lambda (soff doff len)
+                   ;; bytevector-copy! is specified for overlap: the reference
+                   (let ((bv (fresh)))
+                     (bytevector-copy! bv soff bv doff len)
+                     (bytevector->u8-list bv))))
+       (rows 0) (bad 0) (memcpy-divergent 0) (forward-divergent 0) (controls 0))
+  (do ((delta 1 (+ delta 1))) ((> delta 8))
+    (do ((len 4 (+ len 4))) ((> len 16))
+      (for-each
+        (lambda (pair)
+          (let* ((soff (car pair)) (doff (cdr pair)) (want (expected soff doff len)))
+            ;; read-array!: native source aliases the destination array range
+            (let* ((arr (make-jolt-array (fresh) 'byte))
+                   (bv (jolt-array-vec arr))
+                   (got (ffi-with-byte-array-pointer
+                          arr 0 n
+                          (lambda (base m)
+                            (and (= len (ffi-read-array! (+ base soff) len arr doff))
+                                 (bytevector->u8-list bv))))))
+              (set! rows (+ rows 1))
+              (unless (and (equal? got want) (not (locked-object? bv)))
+                (set! bad (+ bad 1))
+                (printf "FAIL overlap read soff=~a doff=~a len=~a~n" soff doff len)))
+            ;; write-array: native destination aliases the source array range
+            (let* ((arr (make-jolt-array (fresh) 'byte))
+                   (bv (jolt-array-vec arr))
+                   (got (ffi-with-byte-array-pointer
+                          arr 0 n
+                          (lambda (base m)
+                            (and (= len (ffi-write-array (+ base doff) arr soff len))
+                                 (bytevector->u8-list bv))))))
+              (set! rows (+ rows 1))
+              (unless (and (equal? got want) (not (locked-object? bv)))
+                (set! bad (+ bad 1))
+                (printf "FAIL overlap write soff=~a doff=~a len=~a~n" soff doff len)))
+            ;; Controls, so the gated rows above are discriminating rather than
+            ;; decorative. The forward byte loop is the overlap-unsafe shape the
+            ;; requirement excludes, and it must fail these rows on any host.
+            ;; memcpy is reported too, but not gated: its disjointness
+            ;; precondition is violated here, so a host is free to return either
+            ;; answer -- glibc x86-64 in particular reaches the same code as
+            ;; memmove, and diverges on nothing.
+            (set! controls (+ controls 1))
+            (let ((fbv (fresh)))
+              (forward-copy! fbv soff doff len)
+              (unless (equal? (bytevector->u8-list fbv) want)
+                (set! forward-divergent (+ forward-divergent 1))))
+            (let ((cbv (fresh)))
+              (lock-object cbv)
+              (memcpy-raw! (+ (object->reference-address cbv) doff)
+                           (+ (object->reference-address cbv) soff)
+                           len)
+              (unlock-object cbv)
+              (unless (equal? (bytevector->u8-list cbv) want)
+                (set! memcpy-divergent (+ memcpy-divergent 1))))))
+        (list (cons 4 (+ 4 delta)) (cons (+ 4 delta) 4)))))
+  (printf "overlap rows: ~a, ~a failures; controls ~a: forward-loop diverged on ~a, memcpy on ~a~n"
+          rows bad controls forward-divergent memcpy-divergent)
+  (ok "same-backing overlap matches memmove semantics in both directions"
+      (and (= rows 128) (= bad 0)))
+  ;; 26 of the 64 control rows have doff > soff with len > the distance, which
+  ;; is exactly the set a forward byte loop gets wrong; the rest it happens to
+  ;; get right, which is why the count is pinned rather than merely positive.
+  (ok "the overlap rows reject an overlap-unsafe forward copy"
+      (= forward-divergent 26)))
+
+;; Large-payload conservation: a megabyte moved out through a ranged window and
+;; back into a different ranged window is byte-identical, and the sentinels
+;; around both windows are untouched. One memmove per direction now carries the
+;; whole payload, so a defect in the interior-pointer arithmetic that a 5-byte
+;; row cannot see -- a wrong base, a lost offset, a truncated count -- shows up
+;; here as a mismatch rather than as a slow test.
+(let* ((payload 1048576)
+       (pad 64)
+       (asize (+ payload (* 2 pad)))
+       (sentinel 173)
+       (src-bv (make-bytevector asize sentinel))
+       (dst-bv (make-bytevector asize sentinel))
+       (p (foreign-alloc payload)))
+  (do ((i 0 (+ i 1))) ((= i payload))
+    (bytevector-u8-set! src-bv (+ pad i) (bitwise-and (+ (* i 31) (quotient i 251)) 255)))
+  (let* ((src (make-jolt-array src-bv 'byte))
+         (dst (make-jolt-array dst-bv 'byte))
+         (wrote (ffi-write-array p src pad payload))
+         (read (ffi-read-array! p payload dst pad)))
+    (foreign-free p)
+    (ok "a megabyte survives a ranged round trip with its sentinels intact"
+        (and (= wrote payload)
+             (= read payload)
+             (equal? (bytevector->u8-list (bytevector-copy src-bv))
+                     (bytevector->u8-list src-bv))
+             ;; payload conserved exactly
+             (let loop ((i 0))
+               (cond ((= i payload) #t)
+                     ((= (bytevector-u8-ref src-bv (+ pad i))
+                         (bytevector-u8-ref dst-bv (+ pad i)))
+                      (loop (+ i 1)))
+                     (else #f)))
+             ;; prefix and suffix sentinels on the destination survived
+             (let loop ((i 0))
+               (cond ((= i pad) #t)
+                     ((and (= sentinel (bytevector-u8-ref dst-bv i))
+                           (= sentinel (bytevector-u8-ref dst-bv (- asize 1 i))))
+                      (loop (+ i 1)))
+                     (else #f)))
+             (not (locked-object? src-bv))
+             (not (locked-object? dst-bv))))))
+
+;; The public API keeps the same overlap guarantee from Jolt code.
+(ok "overlapping ranged transfer through the public API is snapshot-exact"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [0 1 2 3 4 5 6 7])]
+             (jolt.ffi/with-byte-array-pointer
+               a 0 8
+               (fn [p n] (jolt.ffi/read-array! p 5 a 3)))
+             (= [0 1 2 0 1 2 3 4] (vec a)))")))
+
 ;; a :blocking foreign call is collect-safe: a thread parked in it must not pin
 ;; the stop-the-world collector. (collect) here would throw "cannot collect when
 ;; multiple threads are active" if usleep weren't emitted __collect_safe.

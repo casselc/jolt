@@ -121,6 +121,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selecting a fixed call ABI. Types after the boundary are explicit ABI types
   after C default argument promotion; Jolt does not guess those promotions.
 
+### Changed
+
+- **A ranged `jolt.ffi/read-array!` / `write-array` no longer stages the bytes
+  through a temporary bytevector.** Both directions now lock the byte-array
+  range, take its interior pointer, and issue one `memmove` between native
+  memory and that pointer, inside the same scoped loan `with-byte-array-pointer`
+  already used. The staging existed because Chez's `u8*` argument denotes the
+  bytevector BASE, so a whole-array transfer could be one native call while a
+  ranged one could not; it cost one `make-bytevector` of exactly `len` bytes and
+  a second pass over the bytes on every call. Per-call allocation is now the
+  scope's alone and constant — measured at 128 B/op from 16 bytes to 64 KiB,
+  against 65,557 B/op for the staged path at 64 KiB — and the `ffi` gate asserts
+  both that it does not grow with the transfer and that it is no more than a
+  bare scope over the same range, which is what "no temporary" means as a
+  measurement. The trade-off is visible and deliberate: below roughly 128 bytes
+  a ranged transfer now allocates more than the staging did, and it no longer
+  allocates in proportion to the bytes moved.
+
+  The bulk primitive is `memmove`, not `memcpy`. A caller may nest a transfer
+  inside `with-byte-array-pointer` on the same array — a codec writing through
+  a borrowed window, a socket path re-reading its own buffer — and then the
+  native pointer and the array range alias, which is exactly the case memcpy's
+  disjointness precondition excludes. Whole-array transfers keep the `u8*`
+  form, which needs no lock because the address is taken inside a foreign call
+  that is not collect-safe, and they moved to `memmove` for the same reason.
+
+  Public behavior is unchanged: the same subtraction-form bounds, the same
+  null-pointer rule (rejected for a non-empty transfer, allowed for a
+  zero-length one), the same exception classes, the same returned counts, and
+  `read-array`'s fresh owned result. Validation still completes before any
+  native access, callback, or destination mutation, so a rejected transfer
+  leaves the whole destination and source geometry untouched — now covered by
+  an exhaustive 930-row offset/length/native-offset table with sentinels on
+  both sides, 21 rejection rows, 128 same-backing overlap rows in both
+  directions with an overlap-unsafe forward-copy control, lock/unlock pairing
+  asserted through `locked-object?` under success, a Jolt exception, a Scheme
+  error and a nonlocal exit, and a megabyte round trip.
+
 ### Removed
 
 - **The per-namespace runtime AOT cache.** A cache hit restored namespace

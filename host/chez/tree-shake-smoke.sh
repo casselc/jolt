@@ -135,6 +135,14 @@ run_local_case multipath-app    app.core  "alt"  ""
 # duplicate-fqn regression: a twice-defined var whose first def references a
 # helper referenced nowhere else — the union (not overwrite) keeps the helper alive.
 run_local_case dupfqn-app      app.core  ""     ""
+# the ranged FFI byte transfers, which now reach native memory through a scoped
+# interior pointer: read-array / read-array! / write-array /
+# with-byte-array-pointer are host vars, so a shake that dropped one would
+# degrade the FFI in a self-contained binary rather than fail to build. The app
+# exercises all four, both directions, a zero-length and an exact-tail row,
+# same-backing overlap, and both rejection paths, printing only deterministic
+# values.
+run_local_case ffi-transfer-app app.core  ""     ""
 
 [ "$fail" = 0 ] && echo "shake smoke: passed" || echo "shake smoke: FAILED"
 exit $fail

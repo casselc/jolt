@@ -116,44 +116,68 @@
   (when (and (> len 0) (= ptr 0))
     (throw-jvm (quote NullPointerException)
                (string-append "jolt.ffi/" who ": null pointer"))))
+(define (ffi-with-locked-byte-range who bv start cnt receive arg)
+  ;; The one scoped loan of an interior pointer into a movable Jolt byte-array.
+  ;; Chez documents the reference address of a bytevector as the address of its
+  ;; first content byte; lock-object keeps that address stable across
+  ;; allocations and collections performed inside the scope. lock-object is
+  ;; reference-counted, so nested scopes over the same array each balance their
+  ;; own lock. The range check runs BEFORE the lock, so a rejected range reaches
+  ;; neither native code nor a callback. dynamic-wind unlocks on every exit
+  ;; path: normal return, a Jolt or Scheme exception out of `receive`, and any
+  ;; other nonlocal exit. The pointer is dead once the scope returns, and C must
+  ;; not retain it.
+  ;;
+  ;; `receive` is applied to (interior-pointer, cnt, arg). Threading the one
+  ;; varying value through `arg` lets an internal bulk transfer name a top-level
+  ;; procedure here instead of consing a Jolt closure, collection, slice,
+  ;; descriptor, or temporary bytevector to reach the pointer.
+  (ffi-check-array-range who bv start cnt)
+  (lock-object bv)
+  (dynamic-wind
+    void
+    (lambda () (receive (+ (object->reference-address bv) start) cnt arg))
+    (lambda () (unlock-object bv))))
+(define (ffi-invoke-pointer-scope p cnt f) (jolt-invoke2 f p cnt))
 (define (ffi-with-byte-array-pointer arr off len f)
-  ;; Scope an interior pointer to a movable Jolt byte-array. Chez documents the
-  ;; reference address of a bytevector as the address of its first content byte;
-  ;; lock-object keeps that address stable across allocations and collections
-  ;; performed by f. lock-object is reference-counted, so overlapping scopes on
-  ;; the same array remain safe. C must not retain the pointer after f returns.
-  (let* ((start (jnum->exact off))
-         (cnt (jnum->exact len))
-         (bv (ffi-byte-array-backing "with-byte-array-pointer" arr)))
-    (ffi-check-array-range "with-byte-array-pointer" bv start cnt)
-    (lock-object bv)
-    (dynamic-wind
-      void
-      (lambda ()
-        (jolt-invoke2 f (+ (object->reference-address bv) start) cnt))
-      (lambda () (unlock-object bv)))))
-;; Chez accepts bytevectors directly for u8* arguments. Keep the native call to
-;; one memcpy for whole-array transfers; ranged transfers use one temporary
-;; bytevector because a u8* argument denotes the bytevector base, then one
-;; overlap-safe Chez bytevector copy. This removes one FFI crossing per byte.
-(define ffi-memcpy-from-pointer!
-  (foreign-procedure "memcpy" (u8* uptr uptr) void*))
-(define ffi-memcpy-to-pointer!
-  (foreign-procedure "memcpy" (uptr u8* uptr) void*))
-(define (ffi-copy-from-pointer! p bv start cnt)
+  ;; Public scoped loan: the private scope above, adapted to a Jolt callback.
+  (let ((bv (ffi-byte-array-backing "with-byte-array-pointer" arr)))
+    (ffi-with-locked-byte-range "with-byte-array-pointer" bv
+                                (jnum->exact off) (jnum->exact len)
+                                ffi-invoke-pointer-scope f)))
+;; One native bulk operation per non-empty transfer, in either direction.
+;;
+;; memmove, not memcpy: a caller may nest read-array!/write-array inside
+;; with-byte-array-pointer on the SAME byte array, and then the native pointer
+;; and the array range alias, which is exactly the case memcpy's disjointness
+;; precondition excludes. memmove is specified for it.
+;;
+;; A whole-array transfer passes the bytevector itself as u8*: Chez takes its
+;; address inside the call sequence of a foreign call that is not collect-safe,
+;; so no collection can intervene and no lock is needed. A ranged transfer
+;; cannot use u8*, because that argument denotes the bytevector BASE; it takes
+;; the scoped interior pointer above and moves the bytes directly, with no
+;; temporary bytevector and no second staged copy.
+(define ffi-memmove-from-pointer!
+  (foreign-procedure "memmove" (u8* uptr uptr) void))
+(define ffi-memmove-to-pointer!
+  (foreign-procedure "memmove" (uptr u8* uptr) void))
+(define ffi-memmove-pointer!
+  (foreign-procedure "memmove" (uptr uptr uptr) void))
+(define (ffi-receive-from-pointer dst cnt src) (ffi-memmove-pointer! dst src cnt))
+(define (ffi-receive-to-pointer src cnt dst) (ffi-memmove-pointer! dst src cnt))
+(define (ffi-copy-from-pointer! who p bv start cnt)
   (when (> cnt 0)
     (if (and (= start 0) (= cnt (bytevector-length bv)))
-        (ffi-memcpy-from-pointer! bv p cnt)
-        (let ((tmp (make-bytevector cnt)))
-          (ffi-memcpy-from-pointer! tmp p cnt)
-          (bytevector-copy! tmp 0 bv start cnt)))))
-(define (ffi-copy-to-pointer! p bv start cnt)
+        (ffi-memmove-from-pointer! bv p cnt)
+        (ffi-with-locked-byte-range who bv start cnt
+                                    ffi-receive-from-pointer p))))
+(define (ffi-copy-to-pointer! who p bv start cnt)
   (when (> cnt 0)
     (if (and (= start 0) (= cnt (bytevector-length bv)))
-        (ffi-memcpy-to-pointer! p bv cnt)
-        (let ((tmp (make-bytevector cnt)))
-          (bytevector-copy! bv start tmp 0 cnt)
-          (ffi-memcpy-to-pointer! p tmp cnt)))))
+        (ffi-memmove-to-pointer! p bv cnt)
+        (ffi-with-locked-byte-range who bv start cnt
+                                    ffi-receive-to-pointer p))))
 (define (ffi-read-array! ptr n arr off)
   (let* ((cnt (jnum->exact n))
          (start (jnum->exact off))
@@ -161,7 +185,7 @@
          (bv (ffi-byte-array-backing "read-array!" arr)))
     (ffi-check-array-range "read-array!" bv start cnt)
     (ffi-check-transfer-pointer "read-array!" p cnt)
-    (ffi-copy-from-pointer! p bv start cnt)
+    (ffi-copy-from-pointer! "read-array!" p bv start cnt)
     cnt))
 (define (ffi-read-array ptr n)
   (let* ((cnt (jnum->exact n)))
@@ -185,7 +209,7 @@
             (bv (ffi-byte-array-backing "write-array" arr)))
        (ffi-check-array-range "write-array" bv start cnt)
        (ffi-check-transfer-pointer "write-array" p cnt)
-       (ffi-copy-to-pointer! p bv start cnt)
+       (ffi-copy-to-pointer! "write-array" p bv start cnt)
        cnt))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-array!" ffi-read-array!)

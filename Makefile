@@ -191,9 +191,16 @@ cts: testbin
 
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
+# The third lane is the ranged byte-transfer allocation gate: a ranged
+# read-array!/write-array copies through a scoped interior pointer, so its
+# per-call allocation must be the scope's alone and must not grow with the
+# transfer. It measures the accepted temporary-bytevector implementation
+# alongside, so the comparison is against the real predecessor rather than
+# against nothing.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@CHEZ="$(CHEZ)" sh test/chez/ffi-aggregate-test.sh
+	@$(CHEZ) --script test/chez/ffi-ranged-copy-alloc-bench.ss
 
 # jolt.codec.binary: subtraction-form bounds, endian integers, IEEE-754 raw
 # bits, and overlap-safe ranged copy. Three lanes — the host-level boundary
