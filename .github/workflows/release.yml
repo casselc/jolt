@@ -93,6 +93,10 @@ jobs:
             -e JOLT_VERSION="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}" \
             -e STATIC_DEPS=1 \
             '${{ matrix.container-build }}' sh ci/glibc-floor-build.sh
+          # The manylinux producer runs as root so it can install its build
+          # prerequisites. Return mounted outputs to the hosted-runner user;
+          # later packaged-runtime fixtures intentionally write below target/.
+          sudo chown -R "$(id -u):$(id -g)" target "$HOME/chez-opt"
 
       # --- macOS: Homebrew Chez currently preserves the release's macOS 14
       # deployment floor. The shared archive was built on macOS 15 without an
