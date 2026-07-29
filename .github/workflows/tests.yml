@@ -269,6 +269,12 @@ jobs:
           grep -q 'shake smoke: skipped' "$log" && {
             echo "tree-shake smoke skipped; it must run on this job"; exit 1; }
           grep -q 'shake smoke: passed' "$log" || {
+            echo "--- diagnostic: one build with output shown ---"
+            set +e
+            JOLT_PWD=test/chez/ffi-transfer-app ./target/release/jolt build \
+              -m app.core -o "$RUNNER_TEMP/ffi-transfer-diag"
+            echo "diagnostic build exit: $?"
+            set -e
             echo "tree-shake smoke did not report a pass"; exit 1; }
 
       - name: Transactional Git dependency cache
