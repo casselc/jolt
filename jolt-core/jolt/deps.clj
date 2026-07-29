@@ -429,6 +429,16 @@
 (def ^:private git-lock-wait-attempts 6000)
 (def ^:private git-lock-wait-ms 50)
 
+;; The directory lock below is the cross-process publication authority. Inside
+;; one Jolt process, keep the complete inspection/repair transaction on one
+;; runtime thread at a time as well. Native Windows exposed that concurrent
+;; same-process Git inspection and repair can terminate the runtime while one
+;; writer still owns an open stage; the durable directory lock cannot repair a
+;; process that died while holding it. A recursive object monitor preserves
+;; nested same-thread calls and leaves independent Jolt processes contending on
+;; the filesystem protocol exactly as before.
+(def ^:private git-cache-process-lock (Object.))
+
 (defn- git-cache-lock-dir
   "The stable per-entry ownership path. This name is part of the cache's
   cross-version synchronization protocol: transactional Jolt versions must
@@ -787,24 +797,25 @@
                   "of 7 to 64 characters, got " (pr-str sha))
              {:lib lib :url url :sha sha})))
   (let [sha (str/lower-case sha)
-        dir (git-cache-entry-dir url sha)
-        claim (git-cache-origin-claim dir url sha)
-        inspection (git-checkout-inspection dir sha url)]
-    (cond
-      (and (:claimed? claim) (not (:matches? claim)))
-      (cache-origin-mismatch! claim url sha dir)
+        dir (git-cache-entry-dir url sha)]
+    (locking git-cache-process-lock
+      (let [claim (git-cache-origin-claim dir url sha)
+            inspection (git-checkout-inspection dir sha url)]
+        (cond
+          (and (:claimed? claim) (not (:matches? claim)))
+          (cache-origin-mismatch! claim url sha dir)
 
-      (= :origin-mismatch (:reason inspection))
-      (cache-origin-mismatch! inspection url sha dir)
+          (= :origin-mismatch (:reason inspection))
+          (cache-origin-mismatch! inspection url sha dir)
 
-      (and (:valid? inspection) (:matches? claim)) dir
+          (and (:valid? inspection) (:matches? claim)) dir
 
-      :else
-      ;; Reuse is read-only. Validation shells out to git but never touches the
-      ;; tools.gitlibs bookkeeping/worktree.
-      (if-let [shared (gitlibs-shared-checkout lib sha)]
-        shared
-        (ensure-own-git url sha dir)))))
+          :else
+          ;; Reuse is read-only. Validation shells out to git but never touches
+          ;; the tools.gitlibs bookkeeping/worktree.
+          (if-let [shared (gitlibs-shared-checkout lib sha)]
+            shared
+            (ensure-own-git url sha dir)))))))
 
 ;; --- maven cache ------------------------------------------------------------
 ;; jolt has no JVM, but a Clojure library's Maven JAR carries its .clj/.cljc/.cljs

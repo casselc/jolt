@@ -1031,37 +1031,77 @@
            "non-hex ref/path is rejected before cache path construction")))
 
 (defn- run! []
-  (let [root (first *command-line-args*)]
+  (let [root (first *command-line-args*)
+        selected (jolt.host/getenv "JOLT_DEPSTEST_CASE")
+        cases [["Windows/MSYS local-origin equivalence"
+                #(test-windows-msys-local-origin-equivalence! root)]
+               ["private cache paths stay shallow"
+                #(test-private-cache-paths-stay-shallow! root)]
+               ["Windows Git path budget"
+                #(test-windows-git-dir-path-budget! root)]
+               ["Windows backslash mkdirs"
+                #(test-windows-backslash-mkdirs! root)]
+               ["failed clone is recoverable"
+                #(test-failed-clone-is-recoverable! root)]
+               ["stage-cleanup failure retains lock"
+                #(test-stage-cleanup-failure-retains-lock! root)]
+               ["incomplete and dirty entries are repaired"
+                #(test-incomplete-and-dirty-entries-are-repaired! root)]
+               ["wrong HEAD is repaired"
+                #(test-wrong-head-is-repaired! root)]
+               ["concurrent losers reuse winner"
+                #(test-concurrent-losers-reuse-winner! root)]
+               ["separate processes share one publication"
+                #(test-separate-processes-share-one-publication! root)]
+               ["waiter observes in-flight winner"
+                #(test-waiter-observes-in-flight-winner! root)]
+               ["orphan sibling stage is recovered"
+                #(test-orphan-sibling-stage-is-recovered! root)]
+               ["origin reread precedes stage cleanup"
+                #(test-post-lock-origin-reread-precedes-stage-cleanup! root)]
+               ["healthy owner may exceed ten seconds"
+                #(test-healthy-owner-may-take-longer-than-ten-seconds! root)]
+               ["stale-lock diagnostic preserves owner"
+                #(test-stale-lock-diagnostic-preserves-owner! root)]
+               ["tools.gitlibs reuse is read-only"
+                #(test-tools-gitlibs-reuse-is-read-only! root)]
+               ["submodule dirt invalidates checkout"
+                #(test-submodule-dirt-invalidates-checkout! root)]
+               ["coordinate key separates sanitize collisions"
+                #(test-coordinate-cache-key-separates-sanitize-collision! root)]
+               ["literal origin survives insteadOf"
+                #(test-literal-origin-survives-insteadof! root)]
+               ["clone default remote name cannot break origin"
+                #(test-clone-default-remote-name-cannot-break-origin! root)]
+               ["relative local origin retains literal identity"
+                #(test-relative-local-origin-retains-literal-identity! root)]
+               ["forced coordinate collision is nondestructive"
+                #(test-forced-coordinate-key-collision-is-nondestructive! root)]
+               ["index flags and sparse checkout are repaired"
+                #(test-index-flags-and-sparse-checkout-are-repaired! root)]
+               ["publish never nests and revalidates"
+                #(test-publish-never-nests-and-revalidates! root)]
+               ["annotated tag object is not a commit SHA"
+                #(test-annotated-tag-object-is-not-a-commit-sha! root)]
+               ["public resolver uses verified root"
+                #(test-public-resolver-uses-verified-root! root)]
+               ["SHA-prefix contract"
+                #(test-sha-prefix-contract! root)]]]
     (when-not (and root (jolt.host/getenv "JOLT_GITLIBS")
                    (jolt.host/getenv "GITLIBS"))
       (throw (ex-info "deps-test requires fixture root, JOLT_GITLIBS, and GITLIBS" {})))
-    (test-windows-msys-local-origin-equivalence! root)
-    (test-private-cache-paths-stay-shallow! root)
-    (test-windows-git-dir-path-budget! root)
-    (test-windows-backslash-mkdirs! root)
-    (test-failed-clone-is-recoverable! root)
-    (test-stage-cleanup-failure-retains-lock! root)
-    (test-incomplete-and-dirty-entries-are-repaired! root)
-    (test-wrong-head-is-repaired! root)
-    (test-concurrent-losers-reuse-winner! root)
-    (test-separate-processes-share-one-publication! root)
-    (test-waiter-observes-in-flight-winner! root)
-    (test-orphan-sibling-stage-is-recovered! root)
-    (test-post-lock-origin-reread-precedes-stage-cleanup! root)
-    (test-healthy-owner-may-take-longer-than-ten-seconds! root)
-    (test-stale-lock-diagnostic-preserves-owner! root)
-    (test-tools-gitlibs-reuse-is-read-only! root)
-    (test-submodule-dirt-invalidates-checkout! root)
-    (test-coordinate-cache-key-separates-sanitize-collision! root)
-    (test-literal-origin-survives-insteadof! root)
-    (test-clone-default-remote-name-cannot-break-origin! root)
-    (test-relative-local-origin-retains-literal-identity! root)
-    (test-forced-coordinate-key-collision-is-nondestructive! root)
-    (test-index-flags-and-sparse-checkout-are-repaired! root)
-    (test-publish-never-nests-and-revalidates! root)
-    (test-annotated-tag-object-is-not-a-commit-sha! root)
-    (test-public-resolver-uses-verified-root! root)
-    (test-sha-prefix-contract! root)))
+    (when (and selected
+               (not (some #(= selected (first %)) cases)))
+      (throw (ex-info "unknown JOLT_DEPSTEST_CASE"
+                      {:selected selected
+                       :available (mapv first cases)})))
+    (doseq [[label f] cases
+            :when (or (nil? selected) (= selected label))]
+      ;; This line is intentionally flushed before every scenario. If a native
+      ;; runtime terminates, hosted logs identify the in-flight transaction.
+      (println "deps-test:" label)
+      (flush)
+      (f))))
 
 (defn -main [& _]
   (run!)
