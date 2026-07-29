@@ -9,7 +9,10 @@ name: release
 # clear Gatekeeper quarantine once (`xattr -d com.apple.quarantine jolt`), or
 # install via a Homebrew tap that de-quarantines on install.
 on:
+  # Validation branch only: the delivery branch retains tag + manual triggers.
   push:
+    branches:
+      - codex/core-shared-toolchain-w13b-ci
     tags:
       - 'v*'
   workflow_dispatch: {}   # dry-run the build matrix without tagging
