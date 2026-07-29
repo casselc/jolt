@@ -14,6 +14,10 @@ name: cross-smoke
 
 on:
   workflow_dispatch: {}
+  # Validation-only trigger on the fork; absent from the delivery branch.
+  push:
+    branches:
+      - codex/core-shared-toolchain-w13b-ci
 
 permissions:
   contents: read
