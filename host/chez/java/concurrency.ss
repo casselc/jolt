@@ -976,7 +976,21 @@
 (define jolt-main-pump-active (box #f)) ; #t while run-main-pump owns this thread
 (define jolt-main-pump-stop (box #f))   ; set by stop-main-pump to drain + exit
 ;; thread-local: this thread is the pump, mid-thunk → nested calls run inline.
-(define jolt-in-main-pump? (make-thread-parameter #f))
+;;
+;; Owner-tagged (rt.ss), same shape and same reason as *agent-nested*: the marker
+;; is scoped with dynamic-wind around one job, so it wants parameter semantics,
+;; but a plain parameter is INHERITED. A thread spawned by a pump thunk would
+;; inherit #t and be misclassified as the pump — and its own call-on-main-thread
+;; would then take the reentrant branch and run the thunk INLINE ON THAT CHILD
+;; instead of marshalling it to the pump. That defeats the one thing the pump
+;; exists for: on macOS a native UI event loop must run on the main thread or the
+;; process aborts, and an nREPL eval reaches the main thread by exactly this path
+;; (jolt-core/jolt/main.clj). The owner tag keeps the dynamic-wind scoping and
+;; confines the marker to the pump thread itself.
+(define jolt-in-main-pump-cell (make-thread-parameter #f))
+(define (jolt-in-main-pump?) (jolt-thread-owned-ref (jolt-in-main-pump-cell)))
+(define (jolt-set-in-main-pump! v)
+  (jolt-in-main-pump-cell (and v (jolt-thread-owned v))))
 
 (define-record-type jolt-main-job
   (fields thunk (mutable done?) (mutable ok?) (mutable val) mu cv)
@@ -1079,11 +1093,11 @@
               ;; enqueueing. jolt-in-main-pump? makes a reentrant call-on-main-thread
               ;; run inline instead of self-deadlocking.
               (let ((r (dynamic-wind
-                         (lambda () (jolt-in-main-pump? #t))
+                         (lambda () (jolt-set-in-main-pump! #t))
                          (lambda ()
                            (guard (e (#t (cons #f e)))
                              (cons #t (jolt-invoke (jolt-main-job-thunk job)))))
-                         (lambda () (jolt-in-main-pump? #f)))))
+                         (lambda () (jolt-set-in-main-pump! #f)))))
                 (with-mutex (jolt-main-job-mu job)
                   (jolt-main-job-ok?-set! job (car r))
                   (jolt-main-job-val-set! job (cdr r))
@@ -1124,11 +1138,11 @@
                                (wait)))))))
           (when job
             (let ((r (dynamic-wind
-                       (lambda () (jolt-in-main-pump? #t))
+                       (lambda () (jolt-set-in-main-pump! #t))
                        (lambda ()
                          (guard (e (#t (cons #f e)))
                            (cons #t (jolt-invoke (jolt-main-job-thunk job)))))
-                       (lambda () (jolt-in-main-pump? #f)))))
+                       (lambda () (jolt-set-in-main-pump! #f)))))
               (with-mutex (jolt-main-job-mu job)
                 (jolt-main-job-ok?-set! job (car r))
                 (jolt-main-job-val-set! job (cdr r))

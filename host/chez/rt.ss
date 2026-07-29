@@ -226,10 +226,18 @@
 
 ;; --- non-inheriting per-thread slots ------------------------------------------
 ;; Chez's make-thread-parameter hands a newly forked thread the parent's CURRENT
-;; value — not the parameter's initial value. For dynamic context that is exactly
-;; right, and the many parameters in this runtime that carry one (the binding
-;; stack, the active transaction, the reader's source file, the print depth) keep
-;; those semantics untouched.
+;; value — not the parameter's initial value. For genuinely dynamic context that
+;; is exactly right, and the parameters in this runtime that carry one (the
+;; binding stack, the reader's source file, the print depth) keep those semantics
+;; untouched.
+;;
+;; "Untouched" is not the same as "audited". The ACTIVE TRANSACTION (*txn*,
+;; refs.ss) is still a plain thread parameter and is NOT intentionally
+;; inheritable: a thread forked inside dosync is not in that transaction on the
+;; JVM, and a checked-in public executor control already observes jolt reporting
+;; that it is ({:expected false, :actual true}). Its migration is deliberately
+;; out of scope here rather than endorsed — do not read this comment as a claim
+;; that every remaining thread parameter wants inheritance.
 ;;
 ;; It is exactly wrong for a per-thread CACHE. A parent that touches the slot
 ;; before forking hands every child the same mutable object, and the children

@@ -394,6 +394,80 @@
 (jolt-trace-mark! #f)
 
 ;; ---------------------------------------------------------------------------
+;; 6. the main-thread pump marker
+;; ---------------------------------------------------------------------------
+;; jolt-in-main-pump? says "this thread IS the pump, mid-job", and
+;; call-on-main-thread reads it to decide between running a thunk inline and
+;; marshalling it to the pump. Inherited, it is a misclassification with teeth: a
+;; thread spawned by a pump thunk would claim to be the pump and run
+;; main-thread-affine work on itself — the exact thing the pump exists to
+;; prevent.
+;;
+;; The marker is only ever set inside the pump's dynamic-wind, so the control
+;; sets it the same way the pump does and forks from inside that extent.
+
+(jolt-set-in-main-pump! #t)                       ; parent marks itself FIRST
+(ok "the parent reads its own pump marker" (eq? (jolt-in-main-pump?) #t))
+(let ((seen (vector->list (fan-out workers (lambda (i) (jolt-in-main-pump?))))))
+  (ok "no thread forked inside the pump extent inherits the marker"
+      (for-all (lambda (v) (eq? v #f)) seen)))
+(ok "the parent is still marked afterwards" (eq? (jolt-in-main-pump?) #t))
+(jolt-set-in-main-pump! #f)
+(ok "clearing the marker is visible to the parent" (eq? (jolt-in-main-pump?) #f))
+
+;; CONTROL: the plain parameter the marker used to be.
+(let ((p (make-thread-parameter #f)))
+  (p #t)
+  (let ((seen (vector->list (fan-out workers (lambda (i) (p))))))
+    (ok "control: a parameter-backed pump marker is inherited by every child"
+        (for-all (lambda (v) (eq? v #t)) seen))))
+
+;; End-to-end against a REAL pump. The barrier is a condition variable on the
+;; pump's own active flag, under the pump's own mutex — so this waits for the
+;; pump to be up rather than assuming it, with no sleep and no retry.
+(let ((ready-mu (make-mutex))
+      (ready-cv (make-condition))
+      (pump-thread-id #f)
+      (child-thread-id #f)
+      (job-thread-id #f)
+      (done #f))
+  (fork-thread
+    (lambda ()
+      ;; the driver: wait for the pump, then drive one job through it
+      (with-mutex jolt-main-queue-mu
+        (let wait ()
+          (unless (unbox jolt-main-pump-active)
+            (condition-wait jolt-main-queue-cv jolt-main-queue-mu)
+            (wait))))
+      (jolt-call-on-main-thread
+        (lambda ()
+          ;; T1 runs ON the pump. Spawn a child from inside the pump extent and
+          ;; return at once, so the pump goes back to draining rather than
+          ;; waiting on its own child.
+          (set! pump-thread-id (get-thread-id))
+          (fork-thread
+            (lambda ()
+              (set! child-thread-id (get-thread-id))
+              ;; If the child is misclassified as the pump, this runs INLINE here
+              ;; and job-thread-id is the child's. If not, the pump runs it.
+              (jolt-call-on-main-thread
+                (lambda () (set! job-thread-id (get-thread-id)) jolt-nil))
+              (with-mutex ready-mu
+                (set! done #t)
+                (condition-broadcast ready-cv))))
+          jolt-nil))
+      (with-mutex ready-mu
+        (let wait () (unless done (condition-wait ready-cv ready-mu) (wait))))
+      (jolt-stop-main-pump)))
+  (jolt-run-main-pump)
+  (ok "the pump ran the driver's job on the pump thread"
+      (and pump-thread-id (not (eqv? pump-thread-id child-thread-id))))
+  (ok "a child spawned inside a pump thunk marshals back to the pump thread"
+      (and job-thread-id (eqv? job-thread-id pump-thread-id)))
+  (ok "and specifically did NOT run it inline on itself"
+      (not (eqv? job-thread-id child-thread-id))))
+
+;; ---------------------------------------------------------------------------
 
 (printf "thread slots: ~a checks, ~a failures\n" total fails)
 (exit (if (> fails 0) 1 0))

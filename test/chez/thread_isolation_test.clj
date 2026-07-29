@@ -232,6 +232,66 @@
     (check! "the nested send is flushed once the action completes" (= @t2 1))))
 
 ;; ---------------------------------------------------------------------------
+;; 5. the main-thread pump marker
+;; ---------------------------------------------------------------------------
+;; call-on-main-thread reads a per-thread "I am the pump, mid-job" marker to
+;; decide between running a thunk inline and marshalling it to the pump.
+;; Inherited, that is a misclassification with teeth: a thread spawned by a pump
+;; thunk claims to be the pump and runs main-thread-affine work on ITSELF — the
+;; one thing the pump exists to prevent. On macOS a native UI event loop off the
+;; main thread aborts the process, and an nREPL eval reaches the main thread by
+;; exactly this path.
+;;
+;; Identity here is a ThreadLocal, not (Thread/currentThread) — the latter builds
+;; a fresh handle per call, so even (= (Thread/currentThread) (Thread/currentThread))
+;; is false on one thread. The main thread (which becomes the pump) marks itself
+;; :pump before starting; every other thread reads :other, precisely because a
+;; ThreadLocal does not inherit. So this identity also rests on the fix above.
+;;
+;; The measured property runs ONCE and cannot flake: the child under test is
+;; spawned from inside a thunk already executing on the pump, so the pump is
+;; definitionally up by then. The only loop is setup — the public API exposes no
+;; "is the pump running yet" predicate, so the driver establishes that
+;; precondition by issuing a blocking call whose thunk reports where it ran, and
+;; proceeding once the pump (not the driver) has served one. That loop is
+;; self-verifying, terminates as soon as the main thread enters the pump, and
+;; cannot mask the defect: it runs strictly before the child exists.
+
+(def ^:private who (proxy [ThreadLocal] [] (initialValue [] :other)))
+(.set who :pump)                                  ; the main thread is the pump
+
+(let [t1-ran-on (promise)
+      child-ran-on (promise)
+      job-ran-on (promise)
+      finished (promise)]
+  (future
+    ;; setup: proceed only once the pump has served one of our thunks
+    (loop []
+      (when (= :other (jolt.host/call-on-main-thread (fn [] (.get who))))
+        (recur)))
+    ;; measured once, from here on
+    (jolt.host/call-on-main-thread
+      (fn []
+        ;; T1 runs ON the pump. Spawn the child from inside the pump extent and
+        ;; return at once, so the pump keeps draining instead of awaiting it.
+        (deliver t1-ran-on (.get who))
+        (future
+          (deliver child-ran-on (.get who))
+          ;; misclassified -> runs inline on the child; correct -> on the pump
+          (jolt.host/call-on-main-thread
+            (fn [] (deliver job-ran-on (.get who))))
+          (deliver finished :done))
+        nil))
+    @finished
+    (jolt.host/stop-main-pump))
+  (jolt.host/run-main-pump)
+  (check! "the driver's job ran on the pump" (= @t1-ran-on :pump))
+  (check! "a child spawned inside a pump thunk is not itself the pump"
+          (= @child-ran-on :other))
+  (check! "that child's main-thread work is marshalled to the pump"
+          (= @job-ran-on :pump)))
+
+;; ---------------------------------------------------------------------------
 ;; Trace rings are host-internal (no public Clojure surface), so their isolation
 ;; is gated in test/chez/thread-slot-test.ss rather than here.
 ;; ---------------------------------------------------------------------------
