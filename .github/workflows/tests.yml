@@ -266,15 +266,23 @@ jobs:
           cat "$log"
           echo "shakelocal child exit: $rc"
           if ! grep -q 'shake smoke: passed' "$log"; then
-            echo "--- diagnostic: one build with output shown ---"
+            # run_local_case passes an ABSOLUTE app dir as JOLT_PWD; reproduce
+            # that exactly, then the same thing with a native Windows path, to
+            # separate "POSIX path not understood by the Win32 binary" from a
+            # genuine build failure.
+            app="$PWD/test/chez/ffi-transfer-app"
+            echo "--- diagnostic A: absolute POSIX JOLT_PWD (as run_local_case) ---"
+            echo "JOLT_PWD=$app"
             set +e
-            JOLT_PWD=test/chez/ffi-transfer-app ./target/release/jolt build \
-              -m app.core -o "$RUNNER_TEMP/ffi-transfer-diag"
-            echo "diagnostic build exit: $?"
-            echo "--- diagnostic: same build, absolute -o and .exe ---"
-            JOLT_PWD=test/chez/ffi-transfer-app ./target/release/jolt build \
-              -m app.core -o "$(cygpath -w "$RUNNER_TEMP")\\ffi-transfer-diag2.exe"
-            echo "diagnostic build 2 exit: $?"
+            JOLT_PWD="$app" ./target/release/jolt build \
+              -m app.core -o "$RUNNER_TEMP/ffi-transfer-diagA"
+            echo "diagnostic A exit: $?"
+            echo "--- diagnostic B: native Windows JOLT_PWD ---"
+            app_win="$(cygpath -w "$app")"
+            echo "JOLT_PWD=$app_win"
+            JOLT_PWD="$app_win" ./target/release/jolt build \
+              -m app.core -o "$(cygpath -w "$RUNNER_TEMP")\\ffi-transfer-diagB.exe"
+            echo "diagnostic B exit: $?"
             set -e
           fi
           [ "$rc" -eq 0 ] || exit "$rc"
