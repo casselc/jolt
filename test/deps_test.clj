@@ -33,6 +33,14 @@
 (def ^:private failures (atom []))
 (def ^:private checks (atom 0))
 
+;; The corrected process admission deliberately makes the six contenders run
+;; one complete native Git inspection/publication transaction at a time. A
+;; clean native Windows repetition measured just under the former 30-second
+;; test watchdog, and a loaded full-suite run crossed it without deadlocking.
+;; This is a test-harness ceiling, not a resolver or lock deadline; it remains
+;; well below the runner's ten-minute outer watchdog.
+(def ^:private same-process-transaction-timeout-ms 60000)
+
 (defn- check [pred label]
   (swap! checks inc)
   (when-not pred (swap! failures conj label)))
@@ -362,7 +370,8 @@
                        (ensure-git 'fixture/concurrent url sha)))
                    (range 6))]
     (deliver start true)
-    (let [results (mapv #(deref % 30000 ::timeout) jobs)]
+    (let [results (mapv #(deref % same-process-transaction-timeout-ms ::timeout)
+                        jobs)]
       (check (every? #(= target %) results)
              (str "concurrent callers all return the published checkout: "
                   (pr-str results))))
