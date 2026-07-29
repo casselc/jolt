@@ -484,17 +484,6 @@
 (define io-kw-file (keyword "jolt" "file"))
 (register-type-arm! jfile? (lambda (x) io-kw-file))
 
-;; (instance? java.io.File f): the instance? macro passes the class-name symbol;
-;; match "File" / "java.io.File" (and any *.File) against a jfile.
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (let ((tname (symbol-t-name type-sym)))
-      (if (and (jfile? val)
-               (or (string=? tname "File") (string=? tname "java.io.File")
-                   (string=? (path-last-segment tname) "File")))
-          #t
-          'pass))))
-
 ;; --- def-var! the native names the overlay file-seq + str/slurp use ----
 (def-var! "clojure.core" "__make-file" jolt-make-file)
 (def-var! "clojure.core" "__file?" jolt-file?)
@@ -906,4 +895,4 @@
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "uri"))) (lambda (x) "java.net.URI"))
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "url"))) (lambda (x) "java.net.URL"))
 (register-class-arm! juuid? (lambda (x) "java.util.UUID"))
-(register-class-arm! jfile? (lambda (x) "java.io.File"))
+(register-host-class! jfile? "java.io.File")

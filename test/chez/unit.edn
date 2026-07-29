@@ -102,6 +102,16 @@
   {:suite "destructure" :expr "(letfn [(up [s [k & ks]] (cons s ks))] (up 1 [2 3 4]))" :expected "(1 3 4)"}
   {:suite "hostctor" :expr "(.getName (java.io.File. \"/tmp/abc.txt\"))" :expected "\"abc.txt\""}
   {:suite "hostctor" :expr "(instance? java.io.File (java.io.File. \"/x\"))" :expected "true"}
+  {:suite "host-type-coherence" :expr "(let [f (java.io.File. \"/x\")] [(class f) (instance? java.io.File f)])" :expected "[java.io.File true]"}
+  {:suite "host-type-coherence" :expr "(let [f (java.io.File. \"/x\")] [(instance? java.lang.Comparable f) (instance? java.io.Serializable f)])" :expected "[true true]"}
+  {:suite "host-type-coherence" :expr "(do (defprotocol FileProtocolA (file-a [_])) (extend-protocol FileProtocolA java.io.File (file-a [_] :file) Object (file-a [_] :object)) (file-a (java.io.File. \"/x\")))" :expected ":file"}
+  {:suite "host-type-coherence" :expr "(do (defprotocol FileProtocolB (file-b [_])) (extend java.io.File FileProtocolB {:file-b (fn [_] :file)}) (extend Object FileProtocolB {:file-b (fn [_] :object)}) (file-b (java.io.File. \"/x\")))" :expected ":file"}
+  {:suite "host-type-coherence" :expr "(let [in (java.io.ByteArrayInputStream. (byte-array [1]))] [(class in) (instance? java.io.InputStream in) (instance? java.io.Closeable in) (instance? java.io.ByteArrayInputStream in)])" :expected "[java.io.InputStream true true false]"}
+  {:suite "host-type-coherence" :expr "(do (defprotocol InputStreamProtocol (input-stream-kind [_])) (extend-protocol InputStreamProtocol java.io.InputStream (input-stream-kind [_] :input) Object (input-stream-kind [_] :object)) (input-stream-kind (java.io.ByteArrayInputStream. (byte-array [1]))))" :expected ":input"}
+  {:suite "host-type-coherence" :expr "(let [out (java.io.ByteArrayOutputStream.)] [(class out) (instance? java.io.OutputStream out) (instance? java.io.Flushable out) (instance? java.io.ByteArrayOutputStream out)])" :expected "[java.io.OutputStream true true false]"}
+  {:suite "host-type-coherence" :expr "(do (defprotocol OutputStreamProtocol (output-stream-kind [_])) (extend-protocol OutputStreamProtocol java.io.OutputStream (output-stream-kind [_] :output) Object (output-stream-kind [_] :object)) (output-stream-kind (java.io.ByteArrayOutputStream.)))" :expected ":output"}
+  {:suite "host-type-coherence" :expr "(let [q (conj clojure.lang.PersistentQueue/EMPTY 1)] [(class q) (instance? clojure.lang.PersistentQueue q) (instance? clojure.lang.IPersistentStack q) (instance? clojure.lang.Counted q)])" :expected "[clojure.lang.PersistentQueue true true true]"}
+  {:suite "host-type-coherence" :expr "(do (defprotocol QueueStackProtocol (queue-stack-kind [_])) (extend-protocol QueueStackProtocol clojure.lang.IPersistentStack (queue-stack-kind [_] :stack) Object (queue-stack-kind [_] :object)) (queue-stack-kind (conj clojure.lang.PersistentQueue/EMPTY 1)))" :expected ":stack"}
   {:suite "hostctor" :expr "(uuid? (java.util.UUID/randomUUID))" :expected "true"}
   {:suite "hostctor" :expr "(instance? java.util.UUID (java.util.UUID/fromString \"12345678-1234-1234-1234-123456789abc\"))" :expected "true"}
   {:suite "hostctor" :expr "(let [u (java.net.URI. \"http://h.com:81/p?q=1#f\")] [(.getScheme u) (.getHost u) (.getPort u) (.getPath u) (.getQuery u) (.getFragment u)])" :expected "[\"http\" \"h.com\" 81 \"/p\" \"q=1\" \"f\"]"}
