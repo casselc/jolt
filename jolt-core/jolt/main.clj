@@ -40,9 +40,13 @@
                                    " not found — tried " (pr-str cands) " for " (name plat))
                               {:native spec})))))))))
 
-;; Apply a resolved project's roots on top of the current (jolt-core) roots so app
-;; namespaces resolve while jolt.* stays loadable, then load its native deps.
-(defn- apply-project! [{:keys [roots natives]}]
+;; Install dependency-owned class declarations before exposing project roots,
+;; then preserve the existing root/native ordering. Source-root changes can make
+;; project namespaces immediately reachable, so their provider map must already
+;; be complete.
+(defn- apply-project! [{:keys [roots natives class-providers]}]
+  (when (seq class-providers)
+    (jolt.host/register-class-providers! class-providers))
   (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
   (load-natives! natives))
 
@@ -283,7 +287,16 @@
   ;; resolve the project so deps (git libs) are on the roots and native libs are
   ;; loaded — same context a run gets, so (require '[some.lib]) works in the REPL.
   (try (apply-project! (resolve-current))
-       (catch :default _ nil))
+       (catch :default e
+         ;; A missing/empty project is still a friendly bare-REPL fallback.
+         ;; Provider metadata errors are deterministic graph/configuration
+         ;; failures and must not silently discard the resolved provider world.
+         (when (#{:jolt.deps/class-provider-conflict
+                  :jolt.deps/invalid-class-provider
+                  :jolt.deps/invalid-class-providers
+                  :jolt.deps/class-provider-registry-frozen}
+                (:type (ex-data e)))
+           (throw e))))
   ;; REPL-driven development: trace by default so an uncaught error in evaluated
   ;; code shows a tail-frame backtrace, no JOLT_TRACE needed (JOLT_TRACE=0 opts out).
   (jolt.host/enable-trace!)

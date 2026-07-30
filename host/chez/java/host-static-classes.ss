@@ -896,6 +896,8 @@
     (if (jolt-nil? s) acc
         (let ((e (jolt-first s)))
           (loop (jolt-seq (jolt-rest s)) (cons (cons (jolt-nth e 0) (jolt-nth e 1)) acc))))))
+(def-var! "jolt.host" "register-class-providers!"
+  (lambda (providers) (class-provider-register-many! (jmap->static-alist providers))))
 (def-var! "clojure.core" "__register-class-ctor!"
   (lambda (name proc) (register-class-ctor! name proc) jolt-nil))
 (def-var! "clojure.core" "__register-class-statics!"
