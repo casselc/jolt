@@ -34,26 +34,156 @@
   (fields (mutable done?) (mutable cancelled?) (mutable ok?) (mutable payload) mu cv)
   (nongenerative jolt-future-v1))
 
+(define-record-type jolt-hooked-future
+  (parent jolt-future)
+  (fields hook task-id parent-id (mutable settling?))
+  (nongenerative jolt-hooked-future-v1))
+
+;; --- future spawn hook (internal/test, disabled by default) -----------------
+;; A disabled-by-default observability + gating seam over the centralized
+;; fork-thread future path. With NO hook installed, jolt-future-call is exactly
+;; the original fast path (no allocation, id, or event). When a hook fn (a jolt
+;; IFn) is installed via jolt-future-hook-set!, each ordinary future-call fires
+;; three lifecycle events to it (called with jolt values):
+;;   (:spawn  id parent)  on the SPAWNING thread, before the worker forks
+;;   (:start  id parent)  on the WORKER thread, BEFORE the body runs — the hook
+;;                        MAY BLOCK here (e.g. park on a promise) so a single
+;;                        controller chooses which ordinary future begins
+;;   (:finish id parent)  on the WORKER thread, AFTER the body computes a result
+;;                        (value OR thrown condition), BEFORE it is published
+;;   (:cancel id parent)  on the CANCELLING thread, BEFORE cancellation is
+;;                        published; exactly one of :finish/:cancel wins
+;; `id` is a stable, unique, nonnegative int (1, 2, 3, …; never recycled) assigned
+;; per future-call; `parent` is the task id in effect on the spawning thread (0 for
+;; the primordial thread / any thread that is not itself a hooked future). A
+;; :spawn hook failure propagates synchronously before any worker is forked. A
+;; :start hook failure is captured as that future's failure, so deref cannot hang
+;; and the body is not run. Terminal-hook failures never replace the application
+;; result/cancellation; they are retained in a structured supervisor-error latch.
+;; Dynamic bindings, cancellation, and ExecutionException propagation are
+;; otherwise identical to the fast path. This is a TEST hook, not an application task DSL
+;; — it is deliberately kept off the clojure.core/jolt.host surface
+;; (install/clear through the Scheme procs below).
+(define jolt-future-hook (box #f))           ; #f (disabled) or a jolt hook fn
+(define jolt-future-id-mu (make-mutex))      ; guards the monotonic id counter
+(define jolt-future-next-id (box 1))
+;; This thread's task id (0 outside any hooked future). A future whose body spawns
+;; another future reports this id as the child's parent.
+(define jolt-future-task-id (make-thread-parameter 0))
+(define fhk-spawn  (keyword #f "spawn"))
+(define fhk-start  (keyword #f "start"))
+(define fhk-finish (keyword #f "finish"))
+(define fhk-cancel (keyword #f "cancel"))
+(define jolt-future-hook-error-mu (make-mutex))
+(define jolt-future-hook-errors '())
+
+(define (jolt-future-current-task-id) (jolt-future-task-id))
+(define (jolt-future-alloc-id!)
+  (with-mutex jolt-future-id-mu
+    (let ((n (unbox jolt-future-next-id)))
+      (set-box! jolt-future-next-id (+ n 1))
+      n)))
+(define (jolt-future-hook-set! f) (set-box! jolt-future-hook f) jolt-nil)
+(define (jolt-future-hook-clear!) (set-box! jolt-future-hook #f) jolt-nil)
+(define (jolt-future-hook-error-record! event id parent e)
+  (with-mutex jolt-future-hook-error-mu
+    (set! jolt-future-hook-errors
+          (cons (list event id parent e) jolt-future-hook-errors)))
+  #f)
+(define (jolt-future-hook-errors-snapshot)
+  (with-mutex jolt-future-hook-error-mu
+    (reverse jolt-future-hook-errors)))
+(define (jolt-future-hook-errors-clear!)
+  (with-mutex jolt-future-hook-error-mu
+    (set! jolt-future-hook-errors '()))
+  jolt-nil)
+(define (jolt-future-hook-invoke hook event id parent)
+  (guard (e (#t
+             (jolt-future-hook-error-record! event id parent e)
+             (raise e)))
+    (jolt-invoke hook event id parent)))
+(define (jolt-future-hook-terminal-invoke hook event id parent)
+  (guard (e (#t (jolt-future-hook-error-record! event id parent e)))
+    (jolt-invoke hook event id parent)))
+
+(define (jolt-hooked-future-claim-terminal! f)
+  (with-mutex (jolt-future-mu f)
+    (if (or (jolt-future-done? f) (jolt-hooked-future-settling? f))
+        #f
+        (begin
+          (jolt-hooked-future-settling?-set! f #t)
+          #t))))
+
+(define (jolt-hooked-future-publish-result! f r)
+  (with-mutex (jolt-future-mu f)
+    (jolt-future-ok?-set! f (car r))
+    (jolt-future-payload-set! f (cdr r))
+    (jolt-hooked-future-settling?-set! f #f)
+    (jolt-future-done?-set! f #t)
+    (condition-broadcast (jolt-future-cv f))))
+
 ;; (future-call thunk): spawn a thread running (thunk). The dynamic bindings in
 ;; effect now are conveyed into the worker (Chez inherits thread-parameters at
 ;; fork; we also install an explicit snapshot for certainty). The result — value
 ;; or thrown condition — is latched and broadcast; a cancel that already finalized
 ;; the future makes the late result a no-op.
+;;
+;; With the spawn hook DISABLED (the default) this is the original fast path.
+;; When a hook is installed it observes :spawn/:start/:finish and may block at
+;; :start so a controller can order ordinary futures — see the seam above.
 (define (jolt-future-call thunk)
-  (let ((f (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition)))
-        (snap (dyn-binding-stack)))
-    (fork-thread
-     (lambda ()
-       (*txn* #f)                          ; child thread must not inherit parent's txn
-       (dyn-binding-stack snap)
-       (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
-         (with-mutex (jolt-future-mu f)
-           (unless (jolt-future-done? f)            ; not already cancelled
-             (jolt-future-ok?-set! f (car r))
-             (jolt-future-payload-set! f (cdr r))
-             (jolt-future-done?-set! f #t))
-           (condition-broadcast (jolt-future-cv f))))))
-    f))
+  (let ((snap (dyn-binding-stack))
+        (hook (unbox jolt-future-hook)))
+    (cond
+      ((not hook)
+       ;; FAST PATH — disabled (the default): the original future record and
+       ;; worker body, with no simulation id, metadata, or extra locking.
+       (let ((f (make-jolt-future
+                 #f #f #f jolt-nil (make-mutex) (make-condition))))
+         (fork-thread
+          (lambda ()
+            (*txn* #f)                          ; child thread must not inherit parent's txn
+            (dyn-binding-stack snap)
+            (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+              (with-mutex (jolt-future-mu f)
+                (unless (jolt-future-done? f)            ; not already cancelled
+                  (jolt-future-ok?-set! f (car r))
+                  (jolt-future-payload-set! f (cdr r))
+                  (jolt-future-done?-set! f #t))
+                (condition-broadcast (jolt-future-cv f))))))
+         f))
+      (else
+       ;; HOOKED PATH — observe + gate; production behavior otherwise preserved.
+       (let* ((parent (jolt-future-task-id))
+              (id (jolt-future-alloc-id!))
+              (f (make-jolt-hooked-future
+                  #f #f #f jolt-nil (make-mutex) (make-condition)
+                  hook id parent #f)))
+         ;; :spawn fires synchronously on this thread before the worker forks,
+         ;; so any gate the hook arms for `id` is in place before :start runs.
+         ;; Fail closed before the fork: a controller that cannot register this
+         ;; task must not let the ordinary future escape uncontrolled.
+         (jolt-future-hook-invoke hook fhk-spawn id parent)
+         (fork-thread
+          (lambda ()
+            (*txn* #f)
+            (dyn-binding-stack snap)
+            (jolt-future-task-id id)        ; this body's spawns report id as parent
+            ;; :start may BLOCK so a controller chooses when this body begins.
+            ;; Capture a start-hook failure in the same result channel as a body
+            ;; failure: the body is skipped and deref observes normal future
+            ;; ExecutionException semantics instead of hanging.
+            (let ((r (guard (e (#t (cons #f e)))
+                       (jolt-future-hook-invoke hook fhk-start id parent)
+                       (cons #t (jolt-invoke thunk)))))
+              ;; Exactly one terminal claimant wins. Its hook runs before the
+              ;; result/cancellation becomes visible, and never while holding
+              ;; the future mutex, so the controller is a causal boundary
+              ;; without creating a hook/mutex deadlock.
+              (when (jolt-hooked-future-claim-terminal! f)
+                (jolt-future-hook-terminal-invoke hook fhk-finish id parent)
+                (jolt-hooked-future-publish-result! f r)))))
+         f)))))
 
 ;; Final value of a settled future (called OUTSIDE the lock): wrap a captured
 ;; throw in an ExecutionException (JVM semantics), signal a cancellation, else
@@ -92,14 +222,30 @@
 ;; reflects the cancellation — if not already settled, mark it cancelled+done so
 ;; derefs raise and the predicates flip. Returns true iff this call cancelled it.
 (define (jolt-future-cancel f)
-  (let ((cancelled (with-mutex (jolt-future-mu f)
-                     (if (jolt-future-done? f)
-                         #f
-                         (begin (jolt-future-cancelled?-set! f #t)
-                                (jolt-future-done?-set! f #t)
-                                (condition-broadcast (jolt-future-cv f))
-                                #t)))))
-    cancelled))
+  (if (jolt-hooked-future? f)
+      (if (jolt-hooked-future-claim-terminal! f)
+          (begin
+            (jolt-future-hook-terminal-invoke
+             (jolt-hooked-future-hook f)
+             fhk-cancel
+             (jolt-hooked-future-task-id f)
+             (jolt-hooked-future-parent-id f))
+            (with-mutex (jolt-future-mu f)
+              (jolt-future-cancelled?-set! f #t)
+              (jolt-hooked-future-settling?-set! f #f)
+              (jolt-future-done?-set! f #t)
+              (condition-broadcast (jolt-future-cv f)))
+            #t)
+          #f)
+      ;; Disabled fast path: preserve the original single-lock transition.
+      (with-mutex (jolt-future-mu f)
+        (if (jolt-future-done? f)
+            #f
+            (begin
+              (jolt-future-cancelled?-set! f #t)
+              (jolt-future-done?-set! f #t)
+              (condition-broadcast (jolt-future-cv f))
+              #t)))))
 
 (define (jolt-native-future-done? x)
   (if (jolt-future? x) (jolt-future-done? x)
