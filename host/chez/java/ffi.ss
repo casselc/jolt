@@ -181,6 +181,85 @@
           ((guard (e (#t #f)) (load-shared-object (car cs)) #t) #t)
           (else (loop (cdr cs)))))))
 
+;; --- FFI call interception (simulation seam) --------------------------------
+;; jolt-ffi-sim-hook, when non-#f, intercepts EVERY jolt.ffi/defcfn call before
+;; the native symbol is ever resolved: emit-ffi-fn (jolt-core/jolt/backend_scheme.clj)
+;; checks this variable on EVERY call (not just the first), and when set calls the
+;; hook with a descriptor instead of forcing the `foreign-procedure` form — so the
+;; untaken branch means the native symbol is never looked up. With no hook
+;; installed, the generated code takes the original lazy-cached foreign-procedure
+;; path unchanged (one extra variable check per call).
+;;
+;; Internal/test-oriented only: no jolt.ffi/... var exposes this, and it is not a
+;; public simulation DSL — a simulation controller installs/clears it directly
+;; from Scheme (see test/chez/ffi-sim-hook-test.ss).
+;;
+;; Installations form a strict stack. Clearing requires the token returned by
+;; install and only the current owner may clear. This gives nested simulations a
+;; precise restore operation and makes an out-of-order concurrent clear fail
+;; closed instead of silently disabling another controller.
+(define-record-type jolt-ffi-sim-hook-installation
+  (fields hook previous)
+  (nongenerative jolt-ffi-sim-hook-installation-v1))
+(define jolt-ffi-sim-hook #f) ; current hook, kept separate for the hot-path read
+(define jolt-ffi-sim-hook-top #f)
+(define jolt-ffi-sim-hook-mu (make-mutex))
+(define jolt-ffi-sim-hook-active-owner (make-thread-parameter #f))
+
+(define (jolt-ffi-install-sim-hook! h)
+  (unless h
+    (error 'jolt-ffi-install-sim-hook! "hook must be non-false"))
+  (with-mutex jolt-ffi-sim-hook-mu
+    (let ((installation
+           (make-jolt-ffi-sim-hook-installation h jolt-ffi-sim-hook-top)))
+      (set! jolt-ffi-sim-hook-top installation)
+      (set! jolt-ffi-sim-hook h)
+      installation)))
+
+(define (jolt-ffi-clear-sim-hook! installation)
+  (with-mutex jolt-ffi-sim-hook-mu
+    (unless (eq? installation jolt-ffi-sim-hook-top)
+      (error 'jolt-ffi-clear-sim-hook!
+             "simulation hooks must be cleared by their current owner"))
+    (let ((previous
+           (jolt-ffi-sim-hook-installation-previous installation)))
+      (set! jolt-ffi-sim-hook-top previous)
+      (set! jolt-ffi-sim-hook
+            (and previous
+                 (jolt-ffi-sim-hook-installation-hook previous)))))
+  jolt-nil)
+
+;; A stable plain descriptor for one intercepted call: an alist keyed by csym /
+;; argtypes / rettype / blocking / args. argtypes is a list of type-name strings
+;; (foreign-fn's keyword names, without the leading colon, e.g. "int" "string");
+;; args is the list of actual jolt arguments in call order. Descriptor metadata
+;; strings are copied on every call so a hook cannot mutate a later descriptor.
+;; Argument objects deliberately remain live: a native stub must be able to
+;; emulate writes through byte arrays/pointers. The hook's return value stands
+;; in for the call's result.
+(define (jolt-ffi-make-sim-descriptor csym argtypes rettype blocking args)
+  (list (cons 'csym (string-copy csym))
+        (cons 'argtypes (map string-copy argtypes))
+        (cons 'rettype (string-copy rettype))
+        (cons 'blocking blocking)
+        (cons 'args args)))
+
+(define (jolt-ffi-invoke-sim-hook h descriptor)
+  ;; A hook that performs FFI would otherwise recursively intercept itself.
+  ;; Fail closed until a future explicit, scoped real-call continuation exists;
+  ;; clearing/reinstalling the process-global hook is never a safe bypass.
+  ;;
+  ;; Chez thread parameters are inherited by forked threads, so retain the
+  ;; active thread id rather than a boolean. A child inheriting its parent's id
+  ;; is not permanently poisoned; only recursion on the same dynamic thread is
+  ;; rejected.
+  (let ((self (get-thread-id)))
+    (when (eqv? self (jolt-ffi-sim-hook-active-owner))
+      (error 'jolt-ffi-invoke-sim-hook
+             "reentrant FFI from a simulation hook is not supported"))
+    (parameterize ((jolt-ffi-sim-hook-active-owner self))
+      (jolt-invoke h descriptor))))
+
 ;; --- expose under jolt.ffi ---------------------------------------------------
 (def-var! "jolt.ffi" "free-callable" ffi-free-callable)
 (def-var! "jolt.ffi" "register-export" jolt-ffi-register-export!)

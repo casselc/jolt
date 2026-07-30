@@ -589,18 +589,39 @@
 (defn- emit-ffi-fn [node]
   (let [n (count (:argtypes node))
         params (mapv (fn [i] (str "a" i)) (range n))
+        call-args (str/join " " params)
         fp (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
                 (chez-str-lit (:csym node))
                 " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
-                (ffi-type->chez (:rettype node)) ")")]
-    ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
-    ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
-    ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
-    ;; evaluate to a callable closure before the shared library is loaded —
-    ;; critical for :optional :jolt/native libs whose load-object runs in the
-    ;; scheme-start launcher, after the heap is already built.
-    (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
-         "((or p (begin (set! p " fp ") p)) " (str/join " " params) ")))")))
+                (ffi-type->chez (:rettype node)) ")")
+        argtypes-lit (str "(list " (str/join " " (map chez-str-lit (:argtypes node))) ")")
+        ;; A stable plain descriptor (jolt-ffi-make-sim-descriptor, host/chez/java/ffi.ss)
+        ;; for the simulation seam below: C symbol, argument/return types, the
+        ;; :blocking flag, and the actual call arguments.
+        descriptor (str "(jolt-ffi-make-sim-descriptor "
+                         (chez-str-lit (:csym node)) " "
+                         argtypes-lit " "
+                         (chez-str-lit (:rettype node)) " "
+                         (if (:blocking node) "#t" "#f")
+                         " (list " call-args "))")
+        ;; Original lazy resolution: the foreign-procedure form is deferred
+        ;; inside a closure. On first call, the cell `p` is set to the FP and
+        ;; then invoked; subsequent calls skip the set!. This lets a defcfn's
+        ;; defining form (top-level def) evaluate to a callable closure before
+        ;; the shared library is loaded — critical for :optional :jolt/native
+        ;; libs whose load-object runs in the scheme-start launcher, after the
+        ;; heap is already built.
+        else-branch (str "((or p (begin (set! p " fp ") p)) " call-args ")")
+        ;; jolt-ffi-sim-hook (host/chez/java/ffi.ss), when installed, intercepts
+        ;; EVERY call — not just the first — before the FP form is ever forced,
+        ;; so a hook in place means the native symbol is never resolved at all.
+        ;; Snapshot the global once per call: install/clear is controller-owned,
+        ;; but a concurrent clear must never turn the second read into a call of
+        ;; #f after the first read selected the hooked branch.
+        if-expr (str "(let ((h jolt-ffi-sim-hook)) "
+                     "(if h (jolt-ffi-invoke-sim-hook h " descriptor ") "
+                     else-branch "))")]
+    (str "(let ((p #f)) (lambda (" call-args ") " if-expr "))")))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the
