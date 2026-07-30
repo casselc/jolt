@@ -1,12 +1,16 @@
 ;; run-sci.ss — SCI conformance: load borkdude/sci's own source (vendor/sci) through
 ;; jolt and require its forms to compile+eval. A real-world Clojure-compatibility
 ;; stress test. Floor-gated like the corpus: a regression below
-;; the floor (or the count today, 416/424) fails. Raise the floor as host gaps close
-;; (the tail is genuine gaps — the eight remaining failures all reference
-;; sci.impl.copy-vars, a namespace this gate's load-order doesn't cover).
+;; the floor (or the current count, 423/424) fails. The one bounded known gap is
+;; SCI's JVM SciRecord deftype referring to Clojure's private imap-cons helper,
+;; which Jolt does not currently provide.
+;; Every other file must remain failure-free. Raise the floor when that gap closes.
+;; Files in this bounded source lane are loaded after their in-lane dependencies;
+;; omitted JVM host layers have explicit stubs below rather than relying on an
+;; unresolved qualified symbol being misclassified as a host static.
 ;;
 ;;   chez --script host/chez/run-sci.ss
-;;   JOLT_SCI_FLOOR=N    override the floor (default 416)
+;;   JOLT_SCI_FLOOR=N    override the floor (default 423)
 ;;   SCI_VERBOSE=1       print each failing form's error
 (import (chezscheme))
 
@@ -51,9 +55,9 @@
                 (unless (rdr-eof? form)
                   (guard (e (#t (set! fail (+ fail 1))
                                 (when verbose
+                                  (printf "    ~a bytes ~a..~a\n" path i j)
                                   (printf "    FAIL: ~a\n" (call-with-string-output-port
-                                    (lambda (p) (display-condition (if (condition? e) e
-                                      (make-message-condition (jolt-final-str e))) p)))))))
+                                    (lambda (p) (jolt-render-throwable e p)))))))
                     (when warn-cell
                       (jolt-push-thread-bindings
                         (jolt-hash-map warn-cell (var-cell-root warn-cell)
@@ -76,23 +80,50 @@
 
 (define sci-base "vendor/sci/src/sci/")
 (define load-order
-  '("impl/macros.cljc" "impl/protocols.cljc" "impl/types.cljc" "impl/unrestrict.cljc"
-    "impl/vars.cljc" "lang.cljc" "impl/utils.cljc" "ctx_store.cljc" "impl/deftype.cljc"
-    "impl/records.cljc" "impl/core_protocols.cljc" "impl/hierarchies.cljc"
-    "impl/destructure.cljc" "impl/doseq_macro.cljc" "impl/for_macro.cljc" "impl/fns.cljc"
-    "impl/multimethods.cljc" "impl/namespaces.cljc" "core.cljc"))
+  '("impl/macros.cljc" "impl/types.cljc" "impl/unrestrict.cljc"
+    "impl/vars.cljc" "lang.cljc" "impl/utils.cljc" "ctx_store.cljc"
+    "impl/records.cljc" "impl/deftype.cljc" "impl/core_protocols.cljc"
+    "impl/hierarchies.cljc" "impl/multimethods.cljc" "impl/protocols.cljc"
+    "impl/destructure.cljc" "impl/doseq_macro.cljc" "impl/for_macro.cljc"
+    "impl/fns.cljc" "impl/namespaces.cljc" "core.cljc"))
 
 (define total-ok 0) (define total-fail 0)
+(define unexpected-fail #f)
+(define (known-failure-budget f)
+  (if (string=? f "impl/records.cljc") 1 0))
 (for-each
   (lambda (f)
     (let* ((r (load-forms (string-append sci-base f) verbose)) (ok (car r)) (fail (cdr r)))
       (set! total-ok (+ total-ok ok)) (set! total-fail (+ total-fail fail))
-      (printf "  ~a: ~a ok, ~a fail\n" f ok fail)))
+      (printf "  ~a: ~a ok, ~a fail\n" f ok fail)
+      (when (> fail (known-failure-budget f))
+        (set! unexpected-fail #t)
+        (printf "REGRESSION: ~a has ~a failure(s), expected at most ~a\n"
+                f fail (known-failure-budget f)))))
   load-order)
 
+;; The copy-vars shim is exercised while namespaces.cljc constructs its
+;; clojure.core map. Require representative copy-core-var, copy-var, macrofy,
+;; and new-var entries to contain the explicit non-nil sentinel; a no-op macro
+;; returning nil must not turn source evaluation into a false pass.
+(define copy-stub (keyword "sci.impl.copy-vars" "stub"))
+(define sci-core-map
+  (guard (_ (#t #f))
+    (var-cell-root (jolt-var "sci.impl.namespaces" "clojure-core"))))
+(define (copied-stub? name)
+  (and sci-core-map
+       (equal? copy-stub
+               (jolt-get sci-core-map (jolt-symbol #f name) jolt-nil))))
+(unless (and (copied-stub? "println")
+             (copied-stub? "pr")
+             (copied-stub? "with-out-str")
+             (copied-stub? "-reified-methods"))
+  (set! unexpected-fail #t)
+  (printf "REGRESSION: SCI copy-vars stubs did not populate clojure.core\n"))
+
 (printf "\nSCI load: ~a/~a forms ok (~a fail)\n" total-ok (+ total-ok total-fail) total-fail)
-(define floor (let ((s (getenv "JOLT_SCI_FLOOR"))) (if s (string->number s) 416)))
+(define floor (let ((s (getenv "JOLT_SCI_FLOOR"))) (if s (string->number s) 423)))
 (when (< total-ok floor)
   (printf "REGRESSION: ~a forms loaded < floor ~a\n" total-ok floor))
 (flush-output-port)
-(exit (if (< total-ok floor) 1 0))
+(exit (if (or unexpected-fail (< total-ok floor)) 1 0))

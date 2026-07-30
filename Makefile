@@ -85,9 +85,9 @@ providerinstall: testbin
 selectedchez:
 	@CHEZ="$(CHEZ)" sh test/chez/selected-chez-test.sh
 
-# Source-stage analyzer gate. Phase 6 remints the checked-in seed once after all
-# compiler-source slices; until then, build a converged seed in a temporary
-# directory and exercise the source without modifying host/chez/seed/.
+# Source-stage analyzer gate. Build a converged seed in a temporary directory so
+# later compiler-source edits are exercised even before the checked seed is
+# deliberately reminted.
 aliasresolution:
 	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/alias-resolution-test.ss
 
