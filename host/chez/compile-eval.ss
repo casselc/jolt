@@ -195,6 +195,23 @@
     (when (and e (fx>? (string-length e) 0) (not (jolt-trace-env-off? e)))
       (jolt-enable-trace!))))
 
+;; --- special simulation-instrumentation compiler flavor ---------------------
+;; jolt-sim-flavor? is a narrow Scheme-side latch, not a process-global
+;; Clojure atom (jolt.passes.types/new-unit stays reentrant and unit-scoped —
+;; see jolt-core/jolt/passes/types.clj and jolt-core/jolt/backend-scheme's
+;; set-sim-instrument!/sim-instrument?). It exists so a `jolt build` run FROM the special
+;; `sim` Jolt binary (host/chez/build-jolt.ss, target/sim/jolt) can reapply the
+;; flavor to every FRESH compilation unit the build makes (emit-image.ss's
+;; ei-fresh-unit! reads it) — a fresh unit's own sim-instrument? flag starts
+;; false, so without this the flavor would silently drop on the first build.
+;; jolt-enable-sim-instrumentation! is called once by that binary's launcher,
+;; before any app namespace compiles (see jb-emit-launcher in build-jolt.ss);
+;; an ordinary release/debug binary never calls it.
+(define jolt-sim-flavor? #f)
+(define (jolt-enable-sim-instrumentation!)
+  (set! jolt-sim-flavor? #t)
+  ((var-deref "jolt.backend-scheme" "set-sim-instrument!") #t))
+
 ;; (with-meta sym m) -> sym, else x — an (ns ^:no-doc name …) yields the name with
 ;; reader metadata as a with-meta form; strip it to read the bare ns symbol.
 (define (ce-unwrap-meta x)

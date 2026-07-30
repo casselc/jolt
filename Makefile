@@ -8,7 +8,7 @@ CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null
 JOLT_CHEZ := $(CHEZ)
 export JOLT_CHEZ
 
-.PHONY: test ci testbin values targetfacts pathfacts monotonic corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffisimhook ffinativehook futuresimhook transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint compilepathsmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
+.PHONY: test ci testbin values targetfacts pathfacts monotonic corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffisimhook ffisimflavor ffinativehook futuresimhook transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug jolt-sim simprofilesmoke joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint compilepathsmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -24,7 +24,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values targetfacts pathfacts monotonic corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffisimhook ffinativehook futuresimhook transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke certify
+ci: submodules values targetfacts pathfacts monotonic corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffisimhook ffisimflavor ffinativehook futuresimhook transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke simprofilesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -97,6 +97,16 @@ aliasresolution:
 # compiler-source slice (emit-ffi-fn), so run against a transient seed too.
 ffisimhook:
 	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/ffi-sim-hook-test.ss
+
+# The ffi-sim-hook interception seam (emit-ffi-fn) is compile-time selectable
+# per compilation unit (jolt.passes.types/new-unit's sim-instrument? flag,
+# set-sim-instrument!/sim-instrument? in jolt.backend-scheme): off by default (no
+# jolt-ffi-sim-hook reference emitted at all), on for the special `sim` Jolt
+# build. Also pins that a fresh build unit (ei-fresh-unit!) does not lose sim
+# mode once a binary's launcher has turned it on. Another compiler-source
+# slice, so run against a transient seed too.
+ffisimflavor:
+	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/ffi-sim-flavor-test.ss
 
 # Native loader/memory interception uses the same hook over ordinary jolt.ffi
 # primitives and leaves the original Chez path unchanged when disabled.
@@ -184,6 +194,22 @@ jolt-release:
 	@"$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
 jolt-debug:
 	@"$(CHEZ)" --script host/chez/build-jolt.ss debug target/debug/jolt
+# sim: a special instrumented flavor — release Chez optimization, but its
+# launcher turns the sim compiler flavor on (jolt-enable-sim-instrumentation!)
+# before any app namespace compiles, so every jolt.ffi/defcfn it (or a
+# `jolt build` run from it) compiles emits the jolt-ffi-sim-hook interception
+# seam. It is not one of `make jolt`'s ordinary release/debug artifacts, but CI
+# builds it for the normal-versus-sim profile witness below.
+jolt-sim: selfhost
+	@"$(CHEZ)" --script host/chez/build-jolt.ss sim target/sim/jolt
+
+# Build the same unchanged FFI app with ordinary and sim Jolt. Both binaries
+# must behave identically with no controller installed, but only sim emission
+# may contain the outbound-call interception branch.
+simprofilesmoke: jolt-release jolt-sim
+	@JOLT_NORMAL=target/release/jolt JOLT_SIM=target/sim/jolt \
+	  sh test/chez/sim-compiler-profile-smoke.sh
+
 # Re-mint the seed first so the embedded compiler image is current, then both builds.
 jolt: selfhost jolt-release jolt-debug
 	@echo "OK: target/release/jolt and target/debug/jolt built"

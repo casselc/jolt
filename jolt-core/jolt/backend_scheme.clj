@@ -161,6 +161,16 @@
 (defn set-source-reg! [on] (reset! (:source-reg? (cur)) (boolean on)))
 (defn- source-reg? [] @(:source-reg? (cur)))
 
+;; Special simulation-instrumentation compiler flavor. Off for ordinary runs,
+;; the seed mint, and an ordinary `jolt build` (release/debug). The first
+;; consumer is emit-ffi-fn: ordinary emission contains no sim-hook reference;
+;; the special `sim` Jolt build turns this on before application compilation.
+;; Keep one generic unit flag so future compiler-owned checkpoints and tracing
+;; do not grow independent compiler flavors.
+(defn set-sim-instrument! [on]
+  (reset! (:sim-instrument? (cur)) (boolean on)))
+(defn- sim-instrument? [] @(:sim-instrument? (cur)))
+
 ;; A direct-link Scheme binding name for a var. The fqn maps to a unique identifier
 ;; jv$<ns>$<name>; chars that break a Scheme identifier or the `$` separator are
 ;; escaped so distinct vars never collide.
@@ -594,16 +604,6 @@
                 (chez-str-lit (:csym node))
                 " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
                 (ffi-type->chez (:rettype node)) ")")
-        argtypes-lit (str "(list " (str/join " " (map chez-str-lit (:argtypes node))) ")")
-        ;; A stable plain descriptor (jolt-ffi-make-sim-descriptor, host/chez/java/ffi.ss)
-        ;; for the simulation seam below: C symbol, argument/return types, the
-        ;; :blocking flag, and the actual call arguments.
-        descriptor (str "(jolt-ffi-make-sim-descriptor "
-                         (chez-str-lit (:csym node)) " "
-                         argtypes-lit " "
-                         (chez-str-lit (:rettype node)) " "
-                         (if (:blocking node) "#t" "#f")
-                         " (list " call-args "))")
         ;; Original lazy resolution: the foreign-procedure form is deferred
         ;; inside a closure. On first call, the cell `p` is set to the FP and
         ;; then invoked; subsequent calls skip the set!. This lets a defcfn's
@@ -612,16 +612,35 @@
         ;; libs whose load-object runs in the scheme-start launcher, after the
         ;; heap is already built.
         else-branch (str "((or p (begin (set! p " fp ") p)) " call-args ")")
-        ;; jolt-ffi-sim-hook (host/chez/java/ffi.ss), when installed, intercepts
-        ;; EVERY call — not just the first — before the FP form is ever forced,
-        ;; so a hook in place means the native symbol is never resolved at all.
-        ;; Snapshot the global once per call: install/clear is controller-owned,
-        ;; but a concurrent clear must never turn the second read into a call of
-        ;; #f after the first read selected the hooked branch.
-        if-expr (str "(let ((h jolt-ffi-sim-hook)) "
-                     "(if h (jolt-ffi-invoke-sim-hook h " descriptor ") "
-                     else-branch "))")]
-    (str "(let ((p #f)) (lambda (" call-args ") " if-expr "))")))
+        ;; The jolt-ffi-sim-hook seam (host/chez/java/ffi.ss) is emitted ONLY
+        ;; when this compilation unit's sim-instrument? flag is on
+        ;; (set-sim-instrument!, above — the special `sim` Jolt build's compiler
+        ;; flavor). Off, this body is exactly else-branch: the ordinary emission
+        ;; carries no jolt-ffi-sim-hook reference at all.
+        body (if (sim-instrument?)
+               (let [argtypes-lit (str "(list " (str/join " " (map chez-str-lit (:argtypes node))) ")")
+                     ;; A stable plain descriptor (jolt-ffi-make-sim-descriptor,
+                     ;; host/chez/java/ffi.ss) for the simulation seam: C symbol,
+                     ;; argument/return types, the :blocking flag, and the
+                     ;; actual call arguments.
+                     descriptor (str "(jolt-ffi-make-sim-descriptor "
+                                      (chez-str-lit (:csym node)) " "
+                                      argtypes-lit " "
+                                      (chez-str-lit (:rettype node)) " "
+                                      (if (:blocking node) "#t" "#f")
+                                      " (list " call-args "))")]
+                 ;; jolt-ffi-sim-hook, when installed, intercepts EVERY call —
+                 ;; not just the first — before the FP form is ever forced, so a
+                 ;; hook in place means the native symbol is never resolved at
+                 ;; all. Snapshot the global once per call: install/clear is
+                 ;; controller-owned, but a concurrent clear must never turn the
+                 ;; second read into a call of #f after the first read selected
+                 ;; the hooked branch.
+                 (str "(let ((h jolt-ffi-sim-hook)) "
+                      "(if h (jolt-ffi-invoke-sim-hook h " descriptor ") "
+                      else-branch "))"))
+               else-branch)]
+    (str "(let ((p #f)) (lambda (" call-args ") " body "))")))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the

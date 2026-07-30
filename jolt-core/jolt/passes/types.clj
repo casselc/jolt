@@ -95,6 +95,12 @@
    :var-cache? (atom false)
    :trace-frames? (atom false)
    :source-reg? (atom false)
+   ;; Special simulation-instrumentation compiler flavor: off by default. The
+   ;; first consumer is emit-ffi-fn (jolt.backend-scheme), which additionally
+   ;; emits the jolt-ffi-sim-hook interception branch around a defcfn's lazy
+   ;; foreign-procedure call. Future compiler-owned checkpoints and tracing use
+   ;; this same unit flag instead of adding subsystem-specific build modes.
+   :sim-instrument? (atom false)
    :direct-link-defined (atom #{})
    :direct-link-fns (atom #{})
    ;; the back-end gensym label counter and the per-def cache-cell collector — emit

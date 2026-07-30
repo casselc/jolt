@@ -17,8 +17,12 @@
 ;; OS loader or Chez's foreign-memory primitives.
 ;;
 ;; This is a runtime slice (host/chez/java/ffi.ss, loaded from source) — not a
-;; compiler-source slice — so it runs against the checked-in seed. A caller may
-;; instead hand a converged seed pair:
+;; compiler-source slice — so it normally runs against the checked-in seed.
+;; After the shared seed learns the special sim compiler flavor, this gate opts
+;; into it so the defcfn discrimination below retains its interception branch.
+;; The guarded lookup keeps the gate compatible with the pre-remint seed, whose
+;; emitter still includes that branch unconditionally. A caller may instead hand
+;; a converged seed pair:
 ;;   chez --script test/chez/ffi-native-sim-hook-test.ss
 ;;   chez --script test/chez/ffi-native-sim-hook-test.ss PRELUDE IMAGE
 
@@ -49,6 +53,13 @@
 (load "host/chez/loader.ss")
 (set-source-roots! ldr-install-roots)
 (load "host/chez/java/ffi.ss")
+
+;; Current pre-remint seeds have no setter and emit the hook branch
+;; unconditionally. Reminted seeds default to ordinary direct FFI emission, so
+;; explicitly select the special compiler flavor when the setter exists.
+(let ((ssi (guard (e (#t #f))
+             (var-deref "jolt.backend-scheme" "set-sim-instrument!"))))
+  (when (procedure? ssi) (ssi #t)))
 
 (define total 0) (define fails 0)
 (define (ok name pred) (set! total (+ total 1)) (unless pred (set! fails (+ fails 1)) (printf "FAIL: ~a\n" name)))

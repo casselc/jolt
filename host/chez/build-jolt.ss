@@ -1,7 +1,17 @@
 ;; build-jolt.ss — build jolt itself as a self-contained native binary (jolt-eaj).
 ;;
 ;;   chez --script host/chez/build-jolt.ss <profile> <out-path>
-;;   profile: "release" | "debug"   out-path: e.g. target/release/jolt
+;;   profile: "release" | "debug" | "sim"   out-path: e.g. target/release/jolt
+;;
+;; "sim" is a special instrumented flavor: same release Chez optimization as
+;; "release" (optimize-level, fasl-compressed, no inspector/debug info), but its
+;; launcher turns the simulation-instrumentation compiler flavor on
+;; (jolt-enable-sim-instrumentation!,
+;; compile-eval.ss) before any app namespace compiles, so every jolt.ffi/defcfn
+;; it compiles — including one compiled by a `jolt build` run FROM this binary —
+;; emits the jolt-ffi-sim-hook interception seam (emit-ffi-fn, jolt-core/jolt/
+;; backend_scheme.clj). An ordinary release/debug binary never sets this, so its
+;; emission is unchanged (no jolt-ffi-sim-hook reference at all).
 ;;
 ;; Runs on a dev/CI machine that HAS Chez + cc. Produces a binary that needs
 ;; NEITHER: it bakes the full runtime + compiler image + all jolt-core/stdlib
@@ -47,9 +57,12 @@
 (define jb-profile (if (pair? jb-args) (car jb-args) "release"))
 (define jb-out (if (and (pair? jb-args) (pair? (cdr jb-args))) (cadr jb-args)
                    (string-append "target/" jb-profile "/jolt")))
-(define jb-release? (string=? jb-profile "release"))
+(define jb-sim? (string=? jb-profile "sim"))
+;; sim shares release's Chez optimization settings (see the header comment); it
+;; is a distinct compiler FLAVOR, not a distinct Chez optimize profile.
+(define jb-release? (or (string=? jb-profile "release") jb-sim?))
 (unless (or jb-release? (string=? jb-profile "debug"))
-  (error 'build-jolt "profile must be \"release\" or \"debug\"" jb-profile))
+  (error 'build-jolt "profile must be \"release\", \"debug\", or \"sim\"" jb-profile))
 
 ;; Cross-compilation: an optional 3rd arg is the target Chez machine, and the
 ;; target pack comes from $JOLT_TARGET_PACK — cross-builds jolt itself for
@@ -132,6 +145,21 @@
         (ei-bytes-lit (read-file-string path)) ")\n")))
     (jb-collect-load-paths)))
 
+;; sim-only launcher init, spliced into the scheme-start body below: turns the
+;; simulation compiler flavor on (jolt-enable-sim-instrumentation!,
+;; compile-eval.ss) before any
+;; app namespace compiles — including one this binary itself later `build`s
+;; (ei-fresh-unit!, emit-image.ss, reapplies it per build). Empty for
+;; release/debug, so their emission is byte-identical to before this profile
+;; existed.
+(define jb-sim-init-form
+  (if jb-sim?
+      (string-append
+        ";; The sim compiler flavor (jolt-ffi-sim-hook interception seam,\n"
+        "    ;; emit-ffi-fn) — see the header comment above.\n"
+        "    (jolt-enable-sim-instrumentation!)")
+      ""))
+
 ;; The launcher (Chez scheme-start): replicates host/chez/cli.ss but reads argv
 ;; from the scheme-start lambda and has no repo root to cd into (all source is
 ;; embedded; JOLT_PWD defaults to cwd via io/jolt.main). build.ss is already
@@ -168,6 +196,7 @@
 (scheme-start
   (lambda args
     (set-source-roots! " (ldr-install-roots-str) ")
+    " jb-sim-init-form "
     ;; JOLT_TRACE at RUNTIME (the env is unset at heap-build), before any app ns
     ;; compiles, so a `-M:run` traces the app's own code.
     (jolt-trace-init-from-env!)

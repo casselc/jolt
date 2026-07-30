@@ -75,7 +75,25 @@
 ;; a build creates one unit per build and publishes it immediately, so the mode flags
 ;; a build then sets (set-direct-link!/set-var-cache!) land on THIS unit — the same one
 ;; the per-form emit reads its emit-session state from.
-(define (ei-fresh-unit!) (set! ei-unit-box (jolt-ei-new-unit)) (ei-publish-unit!) ei-unit-box)
+;;
+;; jolt-sim-flavor? (compile-eval.ss, loaded before this file) is set once by
+;; the special `sim` Jolt build's launcher, before this build subsystem ever
+;; loads. A fresh unit's own sim-instrument? flag defaults false
+;; (jolt.passes.types/new-unit), so reapply it whenever that binary makes a unit.
+;; Publish the new unit BEFORE calling the backend setter: the setter operates
+;; on the published current unit, and calling it earlier would mutate the
+;; previous unit instead.
+;;
+;; This is
+;; the narrow, explicit mechanism that carries the flavor across builds with no
+;; second generated seed and no process-global Clojure atom.
+(define (ei-fresh-unit!)
+  (set! ei-unit-box (jolt-ei-new-unit))
+  (ei-publish-unit!)
+  (when jolt-sim-flavor?
+    (let ((sfs (var-deref "jolt.backend-scheme" "set-sim-instrument!")))
+      (when (procedure? sfs) (sfs #t))))
+  ei-unit-box)
 ;; publish the current unit to the backend so the emit reads its emit-session state
 ;; (flags, gensym, cache-cells, ctor-shapes) and the contagion clone reaches it.
 ;; Guarded for the first re-mint off an older seed (no set-emit-unit! yet).

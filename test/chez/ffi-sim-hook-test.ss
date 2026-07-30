@@ -8,6 +8,13 @@
 ;; installed, ordinary defcfn code is unchanged: a lazily cached
 ;; foreign-procedure, resolved on first call.
 ;;
+;; The interception seam itself is only EMITTED for a compilation unit whose
+;; sim-instrument? flag is on (set-sim-instrument!, jolt.backend-scheme — see
+;; ffi-sim-flavor-test.ss for that compile-time gate); ordinary jolt code
+;; compiles with no jolt-ffi-sim-hook reference at all. This gate is about the
+;; runtime install/clear behavior of the seam once it IS emitted, so it turns
+;; the flavor on for its whole spine below.
+;;
 ;; This exercises a compiler-source slice (emit-ffi-fn, jolt-core/jolt/
 ;; backend_scheme.clj), so — like alias-resolution-test.ss — it runs against a
 ;; transient seed rather than the checked-in one:
@@ -39,6 +46,11 @@
 (load "host/chez/loader.ss")
 (set-source-roots! ldr-install-roots)
 (load "host/chez/java/ffi.ss")
+
+;; This gate exercises the RUNTIME install/clear behavior of the interception
+;; seam, so turn the compile-time flavor on for every defcfn compiled below —
+;; ffi-sim-flavor-test.ss pins that it is off by default and gated per unit.
+((var-deref "jolt.backend-scheme" "set-sim-instrument!") #t)
 
 (define total 0) (define fails 0)
 (define (ok name pred) (set! total (+ total 1)) (unless pred (set! fails (+ fails 1)) (printf "FAIL: ~a\n" name)))
