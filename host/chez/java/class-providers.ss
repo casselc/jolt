@@ -1,12 +1,16 @@
-;; class-providers.ss — the class-provider REGISTRY CORE.
+;; class-providers.ss — the class-provider registry and evaluation coordinator.
 ;;
 ;; A provider maps a canonical Java class name to the namespace that owns its
-;; host interop (constructors, statics, instance? tags). This file holds ONLY the
-;; registry: one canonical-class -> provider-namespace table guarded by a mutex,
-;; a generation counter, and a freeze flag. There is deliberately NO lazy class
-;; loading, NO provider evaluation, NO attempt counters or wait queues, and NO
-;; world snapshot/restore here — those are evaluation-time concerns layered on
-;; later. This is the bounded registry bookkeeping every later layer shares.
+;; host interop (constructors, statics, instance? tags). This file owns the
+;; exact canonical-class -> provider-namespace registry and the serialized
+;; provider-namespace evaluation state machine shared by every later dispatch
+;; site.
+;;
+;; The evaluator is deliberately not wired to constructor/static/member misses
+;; in this slice. Provider-owned host registrations are not staged or rolled
+;; back here either. Those behaviors must land together later so a failed
+;; provider can never leak a partial host world. Until then the coordinator is
+;; exercised only through its direct Scheme gate.
 ;;
 ;; Invariants:
 ;;   - a class key is a canonical Java name: it contains a dot, has no leading,
@@ -20,12 +24,20 @@
 ;;     :jolt.deps/class-provider-conflict and changes nothing;
 ;;   - once frozen, no NEW class key may enter; identical re-declarations remain
 ;;     harmless, and reset-many! thaws the registry.
+;;   - at most one thread owns a provider evaluation graph process-wide;
+;;   - that owner may recursively evaluate a different provider, while every
+;;     other thread waits;
+;;   - owner re-entry into a provider already loading on its stack is a bounded
+;;     structured cycle error;
+;;   - callers waiting on one attempt observe that exact success or failure;
+;;     only a later independent caller may replace a failed attempt and retry.
 ;;
 ;; Structured failures are raised as jolt ex-info whose ex-data carries a
 ;; :type keyword naming the category:
 ;;   :jolt.deps/invalid-class-provider        malformed class/provider token
 ;;   :jolt.deps/class-provider-conflict        same class, differing provider
 ;;   :jolt.deps/class-provider-registry-frozen a new key after freeze
+;;   :jolt.deps/class-provider-cycle           owner re-entry while loading
 ;;
 ;; Loaded after the value/collection/error layers of rt.ss (it needs jolt-throw,
 ;; jolt-ex-info, jolt-hash-map, keyword, and the symbol accessors) and sits in
@@ -36,6 +48,18 @@
 ;; mutex so reads (class-provider-for/mappings/namespaces) see a consistent table.
 (define class-providers-tbl (make-hashtable string-hash string=?))
 (define class-provider-mu (make-mutex))
+;; provider namespace -> 'loaded | attempt vector. An attempt is
+;; [id provider owner status error waiter-count], where status is loading,
+;; succeeded, or failed. Failed attempts remain reachable by their waiters; a
+;; later independent claim replaces the table entry with a fresh attempt.
+(define class-provider-states-tbl (make-hashtable string-hash string=?))
+(define class-provider-cv (make-condition))
+;; One process-wide evaluation graph. The owner may nest provider loads on the
+;; same thread; a different thread waits for the complete outer graph.
+(define class-provider-eval-owner #f)
+(define class-provider-attempt-counter 0)
+(define class-provider-global-waiters 0)
+(define class-provider-load-stack (make-thread-parameter '()))
 ;; Bumped when registration adds keys and once for every successful reset; never
 ;; decrements. A reset is an explicit world boundary even if its map is identical.
 (define class-provider-registry-generation 0)
@@ -47,6 +71,7 @@
 (define cp-type-invalid (keyword "jolt.deps" "invalid-class-provider"))
 (define cp-type-conflict (keyword "jolt.deps" "class-provider-conflict"))
 (define cp-type-frozen (keyword "jolt.deps" "class-provider-registry-frozen"))
+(define cp-type-cycle (keyword "jolt.deps" "class-provider-cycle"))
 (define cp-kw-type (keyword #f "type"))
 (define cp-kw-class (keyword #f "class"))
 (define cp-kw-provider (keyword #f "provider"))
@@ -54,6 +79,7 @@
 (define cp-kw-new (keyword #f "new-provider"))
 (define cp-kw-reason (keyword #f "reason"))
 (define cp-kw-generation (keyword #f "registry-generation"))
+(define cp-kw-path (keyword #f "path"))
 
 (define (cp-invalid! class provider reason)
   (jolt-throw
@@ -87,6 +113,23 @@
         cp-kw-class class
         cp-kw-provider provider
         cp-kw-generation class-provider-registry-generation))))
+
+(define (cp-cycle! provider)
+  (let ((path (reverse (cons provider (class-provider-load-stack)))))
+    (jolt-throw
+      (jolt-ex-info
+        (string-append
+          "Re-entrant class-provider load: "
+          (let loop ((xs path) (out ""))
+            (cond
+              ((null? xs) out)
+              ((string=? out "") (loop (cdr xs) (car xs)))
+              (else
+                (loop (cdr xs) (string-append out " -> " (car xs)))))))
+        (jolt-hash-map
+          cp-kw-type cp-type-cycle
+          cp-kw-provider provider
+          cp-kw-path (list->cseq path))))))
 
 ;; --- normalization ----------------------------------------------------------
 ;; Accept a string or a (jolt) symbol and reduce it to its canonical string
@@ -170,6 +213,20 @@
              (else (cons class provider)))))))
     pairs))
 
+;; Wait until a different thread's entire provider-evaluation graph is stable.
+;; The owner itself must pass through so a nested provider can claim work and,
+;; in the later transactional slice, publish its staged commit.
+(define (class-provider-wait-evaluator-locked! self)
+  (let loop ()
+    (when (and class-provider-eval-owner
+               (not (eqv? class-provider-eval-owner self)))
+      (set! class-provider-global-waiters
+            (+ class-provider-global-waiters 1))
+      (condition-wait class-provider-cv class-provider-mu)
+      (set! class-provider-global-waiters
+            (- class-provider-global-waiters 1))
+      (loop))))
+
 ;; --- atomic preflighted registration ----------------------------------------
 ;; Preflight under the mutex: validate the batch cumulatively (intra-batch AND
 ;; against the live table), collect new keys, then commit only if nothing
@@ -178,6 +235,7 @@
 (define (class-provider-register-many! pairs)
   (let ((normalized (cp-normalize-and-validate-pairs pairs)))
     (with-mutex class-provider-mu
+      (class-provider-wait-evaluator-locked! (get-thread-id))
       (let ((batch (make-hashtable string-hash string=?))
             (new? #f)
             (first-new #f))
@@ -228,7 +286,10 @@
             (else (cp-conflict! class old provider)))))
       normalized)
     (with-mutex class-provider-mu
+      (class-provider-wait-evaluator-locked! (get-thread-id))
       (set! class-providers-tbl replacement)
+      (set! class-provider-states-tbl
+            (make-hashtable string-hash string=?))
       (set! class-provider-frozen? #f)
       (set! class-provider-registry-generation
             (+ class-provider-registry-generation 1))))
@@ -239,6 +300,7 @@
 ;; :jolt.deps/class-provider-registry-frozen. reset-many! reopens the world.
 (define (class-provider-freeze!)
   (with-mutex class-provider-mu
+    (class-provider-wait-evaluator-locked! (get-thread-id))
     (set! class-provider-frozen? #t))
   jolt-nil)
 
@@ -280,3 +342,205 @@
 (define (class-provider-generation)
   (with-mutex class-provider-mu
     class-provider-registry-generation))
+
+;; --- serialized provider evaluation -----------------------------------------
+;; Attempt vector slots. Named accessors keep the state machine auditable and
+;; make it harder for a later diagnostic to read the wrong mutable field.
+(define cp-attempt-id-index 0)
+(define cp-attempt-provider-index 1)
+(define cp-attempt-owner-index 2)
+(define cp-attempt-status-index 3)
+(define cp-attempt-error-index 4)
+(define cp-attempt-waiters-index 5)
+
+(define (cp-attempt-status attempt)
+  (vector-ref attempt cp-attempt-status-index))
+(define (cp-attempt-status-set! attempt status)
+  (vector-set! attempt cp-attempt-status-index status))
+(define (cp-attempt-failed? state)
+  (and (vector? state) (eq? (cp-attempt-status state) 'failed)))
+
+;; Claim one provider evaluation. Results:
+;;   already-loaded              provider completed before this call
+;;   retry                       caller waited for another graph that loaded it
+;;   cycle                       this owner re-entered its active provider
+;;   (wait . attempt)            wait for this exact active attempt
+;;   (failed . attempt)          graph joined by this caller failed this provider
+;;   (load attempt root-owner?)  this thread owns a fresh attempt
+(define (class-provider-claim provider)
+  (with-mutex class-provider-mu
+    (let* ((initial-state
+             (hashtable-ref class-provider-states-tbl provider #f))
+           (initial-failed-id
+             (and (cp-attempt-failed? initial-state)
+                  (vector-ref initial-state cp-attempt-id-index))))
+      (let loop ((waited-evaluator? #f))
+        (let ((state
+                (hashtable-ref class-provider-states-tbl provider #f))
+              (self (get-thread-id)))
+          (cond
+            ;; A caller joining this exact in-flight attempt keeps the attempt
+            ;; object, so a later retry cannot replace the error it must observe.
+            ((and (vector? state)
+                  (eq? (cp-attempt-status state) 'loading))
+             (if (eqv? (vector-ref state cp-attempt-owner-index) self)
+                 'cycle
+                 (begin
+                   (vector-set!
+                     state cp-attempt-waiters-index
+                     (+ 1 (vector-ref state cp-attempt-waiters-index)))
+                   (cons 'wait state))))
+
+            ;; A different provider may be active in the same outer evaluation
+            ;; graph. Wait for the whole graph, not merely one nested namespace.
+            ((and class-provider-eval-owner
+                  (not (eqv? class-provider-eval-owner self)))
+             (set! class-provider-global-waiters
+                   (+ class-provider-global-waiters 1))
+             (condition-wait class-provider-cv class-provider-mu)
+             (set! class-provider-global-waiters
+                   (- class-provider-global-waiters 1))
+             (loop #t))
+
+            ((eq? state 'loaded)
+             (if waited-evaluator? 'retry 'already-loaded))
+
+            ;; If the graph this caller joined attempted and failed its provider,
+            ;; share that exact failure. An unchanged failure that predates the
+            ;; wait remains independently retryable.
+            ((and waited-evaluator?
+                  (cp-attempt-failed? state)
+                  (not (and initial-failed-id
+                            (= initial-failed-id
+                               (vector-ref state cp-attempt-id-index)))))
+             (cons 'failed state))
+
+            (else
+              (let ((root? (not class-provider-eval-owner)))
+                (when root? (set! class-provider-eval-owner self))
+                (set! class-provider-attempt-counter
+                      (+ class-provider-attempt-counter 1))
+                (let ((attempt
+                        (vector
+                          class-provider-attempt-counter
+                          provider
+                          self
+                          'loading
+                          #f
+                          0)))
+                  (hashtable-set!
+                    class-provider-states-tbl provider attempt)
+                  (list 'load attempt root?))))))))))
+
+(define (class-provider-finish! provider attempt root?)
+  (with-mutex class-provider-mu
+    (cp-attempt-status-set! attempt 'succeeded)
+    (hashtable-set! class-provider-states-tbl provider 'loaded)
+    (when root? (set! class-provider-eval-owner #f))
+    (condition-broadcast class-provider-cv)))
+
+(define (class-provider-abort! provider attempt root? error)
+  (with-mutex class-provider-mu
+    (vector-set! attempt cp-attempt-error-index error)
+    (cp-attempt-status-set! attempt 'failed)
+    (hashtable-set! class-provider-states-tbl provider attempt)
+    (when root? (set! class-provider-eval-owner #f))
+    (condition-broadcast class-provider-cv)))
+
+(define (class-provider-wait-attempt attempt)
+  (let ((outcome
+          (with-mutex class-provider-mu
+            (let loop ()
+              (if (eq? (cp-attempt-status attempt) 'loading)
+                  (begin
+                    (condition-wait class-provider-cv class-provider-mu)
+                    (loop))
+                  (begin
+                    ;; A nested provider can finish while its outer provider is
+                    ;; still evaluating. Do not expose that half-stable graph.
+                    (class-provider-wait-evaluator-locked! (get-thread-id))
+                    (let ((status (cp-attempt-status attempt))
+                          (error
+                            (vector-ref attempt cp-attempt-error-index)))
+                      (vector-set!
+                        attempt cp-attempt-waiters-index
+                        (- (vector-ref attempt cp-attempt-waiters-index) 1))
+                      (cons status error))))))))
+    (if (eq? (car outcome) 'succeeded)
+        #t
+        (raise (cdr outcome)))))
+
+;; Evaluate PROVIDER with LOAD!, which receives the provider namespace string.
+;; LOAD! is explicit so the direct coordinator gate does not need loader.ss;
+;; the production wrapper below supplies load-namespace.
+(define (class-provider-load-provider-with! provider load!)
+  (let ((claim (class-provider-claim provider)))
+    (cond
+      ((eq? claim 'already-loaded) #f)
+      ((eq? claim 'retry) #t)
+      ((eq? claim 'cycle) (cp-cycle! provider))
+      ((and (pair? claim) (eq? (car claim) 'wait))
+       (class-provider-wait-attempt (cdr claim)))
+      ((and (pair? claim) (eq? (car claim) 'failed))
+       (raise
+         (vector-ref (cdr claim) cp-attempt-error-index)))
+      ((and (pair? claim) (eq? (car claim) 'load))
+       (let ((attempt (cadr claim))
+             (root? (caddr claim)))
+         (guard (e (else
+                     (class-provider-abort!
+                       provider attempt root? e)
+                     (raise e)))
+           (parameterize
+             ((class-provider-load-stack
+                (cons provider (class-provider-load-stack))))
+             (load! provider))
+           (class-provider-finish! provider attempt root?)
+           #t)))
+      (else #f))))
+
+(define (class-provider-load-provider! provider)
+  (class-provider-load-provider-with!
+    provider
+    (lambda (namespace) (load-namespace namespace))))
+
+;; Exact class lookup followed by one coordinated provider evaluation. This is
+;; intentionally not called by host dispatch yet.
+(define (class-provider-try-load-with! class load!)
+  (let ((provider (class-provider-for class)))
+    (and (not (jolt-nil? provider))
+         (class-provider-load-provider-with! provider load!))))
+(define (class-provider-try-load! class)
+  (let ((provider (class-provider-for class)))
+    (and (not (jolt-nil? provider))
+         (class-provider-load-provider! provider))))
+
+;; Read-only Scheme diagnostics used by the direct state-machine gate.
+(define (class-provider-provider-status provider)
+  (with-mutex class-provider-mu
+    (let ((state
+            (hashtable-ref class-provider-states-tbl provider #f)))
+      (cond
+        ((eq? state 'loaded) 'loaded)
+        ((vector? state) (cp-attempt-status state))
+        (else 'unloaded)))))
+(define (class-provider-provider-attempt-id provider)
+  (with-mutex class-provider-mu
+    (let ((state
+            (hashtable-ref class-provider-states-tbl provider #f)))
+      (if (vector? state)
+          (vector-ref state cp-attempt-id-index)
+          #f))))
+(define (class-provider-provider-waiters provider)
+  (with-mutex class-provider-mu
+    (let ((state
+            (hashtable-ref class-provider-states-tbl provider #f)))
+      (if (vector? state)
+          (vector-ref state cp-attempt-waiters-index)
+          0))))
+(define (class-provider-evaluator-owner)
+  (with-mutex class-provider-mu class-provider-eval-owner))
+(define (class-provider-evaluator-waiters)
+  (with-mutex class-provider-mu class-provider-global-waiters))
+(define (class-provider-evaluator-attempt-count)
+  (with-mutex class-provider-mu class-provider-attempt-counter))
