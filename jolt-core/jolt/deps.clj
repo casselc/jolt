@@ -441,6 +441,18 @@
 (defmethod ext/dep-id :git [_ coord] (select-keys coord [:git/url :git/sha :git/tag]))
 (defmethod ext/dep-id :local [_ coord] (select-keys coord [:local/root]))
 
+(defn- artifact-deps-edn
+  "Read optional Jolt metadata from an extracted Maven/local-JAR artifact.
+  Maven dependency children still come from pom.xml; deps.edn contributes only
+  Jolt-owned metadata such as :jolt/native and :jolt/class-providers."
+  [root]
+  (when (file-exists? (str root "/deps.edn"))
+    (try
+      (some-> (read-edn (str root "/deps.edn")) dedn/canonicalize)
+      (catch :default e
+        (warn (ex-message e))
+        nil))))
+
 (defn- mvn-info [lib coord]
   (memoized [:info lib (ext/dep-id lib coord)]
     (fn []
@@ -451,6 +463,7 @@
           ;; its transitive deps are cljs/JVM tooling — don't walk them.
           (not (has-clj-source? root)) {:root nil :manifest :none}
           :else {:root root :manifest :mvn
+                 :edn (artifact-deps-edn root)
                  :pom (str root "/META-INF/maven/" (mvn-group lib) "/" (name lib) "/pom.xml")})))))
 
 (defn- git-info [lib coord]
@@ -484,7 +497,9 @@
             (if (or (cache-fresh? dir path false)
                     (extract-jar! path dir))
               (let [pom (sh-out (str "find " (pr-str dir) "/META-INF -name pom.xml -print -quit 2>/dev/null"))]
-                {:root dir :manifest :mvn :pom (when (and pom (not (str/blank? pom))) pom)})
+                {:root dir :manifest :mvn
+                 :edn (artifact-deps-edn dir)
+                 :pom (when (and pom (not (str/blank? pom))) pom)})
               {:root nil :manifest :none}))
           (manifest-info path))))))
 
@@ -773,12 +788,106 @@
       [:process (:name spec)]
       [:native (or (:name spec) (vec (sort (concat (cands :darwin) (cands :linux) (cands :win)))))])))
 
+;; A dependency may declaratively provide a Java compatibility class without
+;; requiring a global catalog namespace:
+;;
+;;   :jolt/class-providers {"com.acme.Widget" acme.widget-provider}
+;;
+;; Keep declarations with their origin through dependency selection. Reconcile
+;; only after the complete graph is selected so conflicts cannot depend on
+;; traversal order or partially affect the resolved project basis.
+(defn- provider-token [x what origin]
+  (let [s (cond (string? x) x
+                (symbol? x) (str x)
+                :else nil)]
+    (when (or (nil? s) (str/blank? s))
+      (throw
+        (ex-info
+          (str what " must be a non-empty string or symbol")
+          {:type :jolt.deps/invalid-class-provider
+           :origin origin :value x :field what})))
+    s))
+
+(defn- canonical-provider-class? [s]
+  (and (str/includes? s ".")
+       (not (str/starts-with? s "."))
+       (not (str/ends-with? s "."))
+       (not (str/includes? s ".."))
+       (not (str/includes? s "/"))))
+
+(defn- provider-declarations [providers origin]
+  (when (and (some? providers) (not (map? providers)))
+    (throw
+      (ex-info
+        ":jolt/class-providers must be a map of canonical class name to provider namespace"
+        {:type :jolt.deps/invalid-class-providers
+         :origin origin :value providers})))
+  (mapv
+    (fn [[class provider]]
+      (let [class (provider-token class "class-provider class" origin)
+            provider (provider-token provider "class-provider namespace" origin)]
+        (when-not (canonical-provider-class? class)
+          (throw
+            (ex-info
+              (str "class-provider key must be a canonical fully-qualified class name: "
+                   class)
+              {:type :jolt.deps/invalid-class-provider
+               :origin origin :class class :provider provider})))
+        {:class class :provider provider :origin origin}))
+    (seq providers)))
+
+(defn- provider-declaration-sort-key
+  [{:keys [class provider origin]}]
+  [class
+   (case (:kind origin)
+     :project 0
+     :add-deps 1
+     :dependency 2
+     3)
+   (str (:coord origin))
+   (str (:deps-file origin))
+   (str (:root origin))
+   (str (:project-dir origin))
+   (str (:base-dir origin))
+   provider])
+
+(defn- reconcile-class-providers
+  "Return one exact class->provider map plus all declaration origins. Identical
+  declarations dedupe; differing providers for one class fail closed with both
+  provenance records."
+  [declarations]
+  (reduce
+    (fn [{:keys [class-providers class-provider-origins] :as acc} declaration]
+      (let [{:keys [class provider origin]} declaration
+            old (get class-providers class)]
+        (cond
+          (nil? old)
+          {:class-providers (assoc class-providers class provider)
+           :class-provider-origins
+           (assoc class-provider-origins class [origin])}
+
+          (= old provider)
+          (assoc acc :class-provider-origins
+                 (update class-provider-origins class conj origin))
+
+          :else
+          (throw
+            (ex-info
+              (str "conflicting class providers for " class ": " old
+                   " and " provider)
+              {:type :jolt.deps/class-provider-conflict
+               :class class
+               :existing {:provider old
+                          :origins (get class-provider-origins class)}
+               :incoming {:provider provider :origin origin}})))))
+    {:class-providers {} :class-provider-origins {}}
+    (sort-by provider-declaration-sort-key declarations)))
+
 (defn resolve-deps
   "Expand a deps map through the tools.deps expansion engine, then collect the
-  selected libraries' source roots and :jolt/native declarations in stable
-  first-inclusion order. Returns {:roots [...] :natives [...] :prep [...]
-  :libs {lib coord}} — :libs is the tools.deps lib map (selected coordinate
-  per library).
+  selected libraries' source roots, :jolt/native declarations, and
+  provenance-bearing class-provider declarations in stable first-inclusion
+  order. :libs is the tools.deps lib map (selected coordinate per library).
 
   `opts` carries the alias-combined coordinate maps applied at every node like
   tools.deps: :override-deps replaces a lib's coordinate wherever it appears
@@ -805,6 +914,19 @@
                                 [root]))
                             infos))
         :natives (vec (mapcat (fn [{:keys [edn]}] (:jolt/native edn)) infos))
+        ;; Per-dependency :jolt/class-providers declarations retain provenance
+        ;; until resolve-project reconciles the complete selected graph.
+        :class-provider-declarations
+        (vec
+          (mapcat
+            (fn [{:keys [lib root edn]}]
+              (provider-declarations
+                (:jolt/class-providers edn)
+                {:kind :dependency
+                 :coord lib
+                 :root root
+                 :deps-file (str root "/deps.edn")}))
+            infos))
         ;; libs whose deps.edn declares :deps/prep-lib — jolt runs no prep
         ;; steps, so their compiled/generated assets will be missing; the
         ;; caller warns with the lib names.
@@ -831,8 +953,8 @@
 
 (defn resolve-project
   "Resolve `project-dir`'s deps.edn with the selected alias keywords. Returns
-  {:roots [...] :main-opts [...] :tasks {...} :natives [...]}; :natives are the
-  project's + deps' :jolt/native shared-library declarations.
+  roots, launch/build metadata, native declarations, and the reconciled exact
+  :class-providers map discovered across the complete dependency graph.
 
   The deps.edn chain merges like tools.deps (jolt.deps.edn/merge-edns): the
   user deps.edn ($CLJ_CONFIG / $XDG_CONFIG_HOME/clojure / ~/.clojure — skipped
@@ -883,13 +1005,29 @@
          all-deps (merge (or (:replace-deps argmap) (:deps argmap)
                              (if tool? {} (:deps edn)))
                          (:extra-deps argmap))
-         {dep-roots :roots dep-natives :natives prep-libs :prep}
+         {dep-roots :roots
+          dep-natives :natives
+          dep-provider-declarations :class-provider-declarations
+          prep-libs :prep}
          (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo edn)]
                                       (abspath project-dir r))
                    *mvn-repos* (mvn-repo-urls edn)]
            (resolve-deps all-deps project-dir
                          {:override-deps (:override-deps argmap)
                           :default-deps (:default-deps argmap)}))
+         ;; `edn` is the tools.deps-style merged user/project/-Sdeps basis. Its
+         ;; map precedence is established before provider reconciliation; this
+         ;; slice detects conflicts between that resolved project basis and the
+         ;; selected dependency graph without changing merge-edns semantics.
+         project-provider-declarations
+         (provider-declarations
+           (:jolt/class-providers edn)
+           {:kind :project
+            :project-dir project-dir
+            :deps-file (str project-dir "/deps.edn")})
+         {:keys [class-providers class-provider-origins]}
+         (reconcile-class-providers
+           (concat project-provider-declarations dep-provider-declarations))
          _ (when (seq prep-libs)
              (warn "deps declare :deps/prep-lib steps jolt does not run "
                    "(their compiled/generated assets will be missing): "
@@ -910,6 +1048,8 @@
       :embed-dirs (mapv #(abspath project-dir %) (:embed (:jolt/build edn)))
       :tasks (:tasks edn)
       :natives (dedup-by native-key (concat (:jolt/native edn) dep-natives))
+      :class-providers class-providers
+      :class-provider-origins class-provider-origins
       ;; nREPL middleware a library contributes (jolt.nrepl composes them over its
       ;; built-in handler) — symbols resolving to a middleware fn or a vector of them.
       :nrepl-middleware (:nrepl/middleware edn)})))
