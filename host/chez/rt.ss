@@ -712,6 +712,14 @@
 ;; value-host-tags can build on jch-tags.
 (load "host/chez/java/class-hierarchy.ss")
 
+;; the class-provider REGISTRY CORE: one canonical-class -> provider-namespace
+;; table + mutex + generation + freeze flag, with atomic preflighted registration
+;; and structured :jolt.deps/* errors. Registry-only — no lazy loading or provider
+;; evaluation. After the value/collection/error layers (jolt-throw/jolt-ex-info/
+;; jolt-hash-map/keyword) and beside class-hierarchy.ss in the host java/ layer;
+;; before records.ss so later protocol/extend integration can read class-provider-for.
+(load "host/chez/java/class-providers.ss")
+
 ;; records + protocols: defrecord/deftype/defprotocol/
 ;; extend-type/reify. A jrec record type set!-extended into the collection
 ;; dispatchers + a protocol registry. After multimethods.ss (chez-current-ns) and
