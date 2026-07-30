@@ -106,4 +106,36 @@
               (ev "(java.io.ByteArrayOutputStream.)"))
             #f)
 
+;; Libraries extend this graph through the public Jolt seam after derived
+;; caches may already have answered a miss. Every derived view must observe the
+;; new row immediately.
+(define dynamic-provider-class "fixture.ProviderAddedInterface")
+(define dynamic-provider-simple "ProviderAddedInterface")
+(gate-check "dynamic class initial known miss"
+            (jch-known? dynamic-provider-class)
+            #f)
+(gate-check "dynamic class initial simple-name miss"
+            (jch-fqn-of-simple dynamic-provider-simple)
+            dynamic-provider-simple)
+(gate-check "dynamic class initial tag miss"
+            (contains-string?
+              (jch-tags dynamic-provider-class)
+              "java.lang.AutoCloseable")
+            #f)
+(ev
+  "(jolt.host/register-class-supers!
+     \"fixture.ProviderAddedInterface\"
+     [\"java.lang.AutoCloseable\"])")
+(gate-check "public registration invalidates known cache"
+            (jch-known? dynamic-provider-class)
+            #t)
+(gate-check "public registration invalidates simple-name cache"
+            (jch-fqn-of-simple dynamic-provider-simple)
+            dynamic-provider-class)
+(gate-check "public registration invalidates closure and tag caches"
+            (contains-string?
+              (jch-tags dynamic-provider-class)
+              "java.lang.AutoCloseable")
+            #t)
+
 (gate-summary "host-class-registry")

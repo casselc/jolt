@@ -20,6 +20,17 @@
 (define jch-cache-mutex (make-mutex))
 (define jch-closure-cache (make-hashtable string-hash string=?))
 (define jch-tags-cache (make-hashtable string-hash string=?))
+;; Lazily derived membership and simple-name indices. They share the graph's
+;; mutation boundary with the closure and tag caches.
+(define jch-known-cache #f)
+(define jch-simple->fqn-cache #f)
+
+(define (jch-invalidate-caches!)
+  (with-mutex jch-cache-mutex
+    (hashtable-clear! jch-closure-cache)
+    (hashtable-clear! jch-tags-cache))
+  (set! jch-known-cache #f)
+  (set! jch-simple->fqn-cache #f))
 
 ;; Dedicated host representations (records or otherwise non-jhost values) map to
 ;; one canonical JVM class here. Both host-class.ss and records.ss consult this
@@ -57,9 +68,7 @@
                       (cond ((null? ss) acc)
                             ((member (car ss) acc) (add (cdr ss) acc))
                             (else (add (cdr ss) (append acc (list (car ss)))))))))
-  (with-mutex jch-cache-mutex
-    (hashtable-clear! jch-closure-cache)
-    (hashtable-clear! jch-tags-cache)))
+  (jch-invalidate-caches!))
 
 ;; A munged fn class name "ns$name" (jolt-class for a def'd fn) isn't in the
 ;; table; like the JVM (a fn extends clojure.lang.AFunction) its super is
@@ -78,11 +87,7 @@
 ;; deftype half registered). Same cache invalidation as a register.
 (define (jch-set-supers! name supers)
   (hashtable-set! jvm-class-parents name supers)
-  (with-mutex jch-cache-mutex
-    (hashtable-clear! jch-closure-cache)
-    (hashtable-clear! jch-tags-cache))
-  (set! jch-known-cache #f)
-  (set! jch-simple->fqn-cache #f))
+  (jch-invalidate-caches!))
 
 ;; transitive supers of NAME (canonical), excluding NAME and Object; Object is the
 ;; universal root supplied by callers. Breadth-first, deduped, stable order.
@@ -143,7 +148,6 @@
 
 ;; Does the graph model WANTED at all (as a class or as any class's ancestor)? Used
 ;; by instance? to decide between a definitive #f and 'pass (defer to other arms).
-(define jch-known-cache #f)
 (define (jch-known? wanted)
   (when (not jch-known-cache)
     (set! jch-known-cache (make-hashtable string-hash string=?))
@@ -163,7 +167,6 @@
 ;; simple last-segment -> canonical FQN for a modeled class (first registered
 ;; wins). Lets a simple exception name (from chez-condition-exc-class) resolve to
 ;; its graph key so the exception hierarchy answers through the one graph.
-(define jch-simple->fqn-cache #f)
 (define (jch-fqn-of-simple name)
   (when (not jch-simple->fqn-cache)
     (set! jch-simple->fqn-cache (make-hashtable string-hash string=?))
@@ -177,14 +180,6 @@
                    (cons k supers)))
        keys vals)))
   (or (hashtable-ref jch-simple->fqn-cache name #f) name))
-
-;; A register also invalidates the derived caches.
-(define jch-register-supers!-inner jch-register-supers!)
-(set! jch-register-supers!
-  (lambda (name supers)
-    (set! jch-known-cache #f)
-    (set! jch-simple->fqn-cache #f)
-    (jch-register-supers!-inner name supers)))
 
 ;; throw-jvm (rt.ss) resolves an unlisted simple exception name through this graph
 ;; now that it exists — so (throw-jvm 'RuntimeException …) reports
