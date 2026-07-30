@@ -1048,18 +1048,23 @@
                          (set-chez-ns! saved)          ; restore ns, then roll the mark back
                          (unless was-loaded? (ldr-unmark-loaded! name))
                          (raise e)))
-                (cond
-                  (art (load (cpath-so-file art)))
-                  ;; inside a compile, loading from source also emits the artifact
-                  ;; — RT.load's COMPILE_FILES branch, which is what carries a
-                  ;; compile through to the whole load closure.
-                  ((cpath-compiling-dir file)
-                   => (lambda (dir) (cpath-compile-load name file dir)))
-                  (else (aot-load-or-compile name file force?))))
-              (set-chez-ns! saved)             ; restore the current ns (thread-local)
-              ;; the hook feeds `jolt build`, which needs the SOURCE path; an
-              ;; artifact-only namespace has none to give.
-              (ns-loaded-hook name (or file art))))
+               (class-provider-load-namespace-with-stage!
+                 name
+                 (lambda ()
+                   (cond
+                     (art (load (cpath-so-file art)))
+                     ;; inside a compile, loading from source also emits the artifact
+                     ;; — RT.load's COMPILE_FILES branch, which is what carries a
+                     ;; compile through to the whole load closure.
+                     ((cpath-compiling-dir file)
+                      => (lambda (dir) (cpath-compile-load name file dir)))
+                     (else (aot-load-or-compile name file force?)))
+                   (set-chez-ns! saved)         ; restore the current ns (thread-local)
+                   ;; the hook feeds `jolt build`, which needs the SOURCE path; an
+                   ;; artifact-only namespace has none to give.
+                   (ns-loaded-hook name (or file art)))
+                 (lambda (_namespace _stage)
+                   (unless was-loaded? (ldr-unmark-loaded! name)))))))
           ;; No source file but the namespace exists in memory (AOT'd into a built
           ;; binary): it's already defined — mark loaded and move on.
           ((ns-has-vars? name)

@@ -1,8 +1,8 @@
 ;; class-provider EVALUATION COORDINATOR gate.
 ;;
 ;; Covers the direct Scheme state machine only. Host static/constructor/member
-;; misses do not call the evaluator in this slice, and provider-owned host
-;; registrations are not yet staged or published.
+;; misses do not call the evaluator in this slice. Provider-owned host
+;; registrations are covered separately by class-provider-transaction-test.ss.
 ;;
 ;;   CHEZ=/path/to/chez make providerevaluator
 

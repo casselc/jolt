@@ -185,7 +185,9 @@
                (and create? (let ((c (vector jolt-nil))) (hashtable-set! h member c) c))))))
 (def-var! "jolt.host" "set-static-field!"
   (lambda (class member val)
-    (vector-set! (mutable-static-cell class member #t) 0 val)
+    (class-provider-register-operation!
+      (lambda ()
+        (vector-set! (mutable-static-cell class member #t) 0 val)))
     val))
 ;; clojure.lang.RT.checkSpecAsserts — a JVM-internal flag clojure.spec.alpha reads
 ;; and writes; default false. Pre-seed the cell so a read before any write works.
@@ -337,4 +339,3 @@
                     (string-append "For input string: \""
                                    (if (string? s) s (jolt-str-render-one s)) "\"")))))
 (define (->double x) (if (number? x) (exact->inexact x) (parse-double-or-throw x)))
-

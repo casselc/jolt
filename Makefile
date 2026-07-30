@@ -8,7 +8,7 @@ CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null
 JOLT_CHEZ := $(CHEZ)
 export JOLT_CHEZ
 
-.PHONY: test ci testbin values targetfacts pathfacts corpus unit hostclass providerregistry providerevaluator providerinstall selectedchez aliasresolution smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint compilepathsmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
+.PHONY: test ci testbin values targetfacts pathfacts corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint compilepathsmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -24,7 +24,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values targetfacts pathfacts corpus unit hostclass providerregistry providerevaluator providerinstall selectedchez aliasresolution mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke certify
+ci: submodules values targetfacts pathfacts corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -61,10 +61,16 @@ providerregistry:
 	@$(CHEZ) --script test/chez/class-provider-registry-test.ss
 
 # Serialized provider evaluation, cycle, retry, and shared-failure coordinator.
-# Host interop misses are intentionally not wired to it until registrations can
-# be committed transactionally in the next slice.
 providerevaluator:
 	@$(CHEZ) --script test/chez/class-provider-evaluator-test.ss
+
+# Dedicated provider-registration hooks remain invisible during namespace
+# evaluation; the atomic mapping batch publishes before source-ordered host
+# operations, and covered writes roll back together on commit failure. Ordinary
+# type/protocol definitions are outside this boundary, and host retry-on-miss
+# dispatch is deliberately still unwired.
+providertransactions:
+	@$(CHEZ) --script test/chez/class-provider-transaction-test.ss
 
 # Resolved project/dependency metadata is installed before project code runs.
 providerinstall: testbin

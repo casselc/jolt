@@ -508,7 +508,10 @@
 
 ;; Public seam: libraries extend the modeled hierarchy.
 (def-var! "jolt.host" "register-class-supers!"
-  (lambda (name supers) (jch-register-supers! name (seq->list supers)) jolt-nil))
+  (lambda (name supers)
+    (let ((direct (seq->list supers)))
+      (class-provider-register-operation!
+        (lambda () (jch-register-supers! name direct))))))
 
 ;; transitive ancestry rooted at Object for a concrete class; an interface's chain
 ;; has no Object (its getSuperclass is null). '() for Object itself.

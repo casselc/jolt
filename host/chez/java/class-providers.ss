@@ -7,10 +7,12 @@
 ;; site.
 ;;
 ;; The evaluator is deliberately not wired to constructor/static/member misses
-;; in this slice. Provider-owned host registrations are not staged or rolled
-;; back here either. Those behaviors must land together later so a failed
-;; provider can never leak a partial host world. Until then the coordinator is
-;; exercised only through its direct Scheme gate.
+;; yet. Calls through the dedicated provider-registration hooks are staged during
+;; namespace evaluation, published only after successful evaluation, and rolled
+;; back as one covered registration transaction if publication fails. Ordinary
+;; namespace definitions (including type/protocol forms) and arbitrary
+;; application side effects are outside this boundary. Exact retry-on-miss
+;; dispatch lands only after the boundary is independently gated.
 ;;
 ;; Invariants:
 ;;   - a class key is a canonical Java name: it contains a dot, has no leading,
@@ -23,14 +25,36 @@
 ;;   - a conflicting declaration (same class, different provider) raises
 ;;     :jolt.deps/class-provider-conflict and changes nothing;
 ;;   - once frozen, no NEW class key may enter; identical re-declarations remain
-;;     harmless, and reset-many! thaws the registry.
+;;     harmless, and reset-many! thaws the registry;
 ;;   - at most one thread owns a provider evaluation graph process-wide;
 ;;   - that owner may recursively evaluate a different provider, while every
 ;;     other thread waits;
 ;;   - owner re-entry into a provider already loading on its stack is a bounded
 ;;     structured cycle error;
 ;;   - callers waiting on one attempt observe that exact success or failure;
-;;     only a later independent caller may replace a failed attempt and retry.
+;;     only a later independent caller may replace a failed attempt and retry;
+;;   - dedicated Clojure-visible provider-registration hooks append mutations
+;;     to an owner-thread, namespace-local stage instead of publishing during
+;;     namespace evaluation;
+;;   - an ordinary helper namespace required by a provider commits its own
+;;     registrations before returning, so a later provider-root failure cannot
+;;     leave the helper marked loaded with its registrations discarded;
+;;   - a forked child cannot mutate its parent's active or aborted private stage;
+;;     a child of a committed stage falls back to ordinary registration only
+;;     after the complete evaluation graph is stable;
+;;   - one accumulated mapping batch publishes first, then host operations
+;;     preserve source order; a commit-time exception restores every mutable
+;;     registry reachable through those hooks;
+;;   - ordinary calls through the same dedicated hooks wait for the active
+;;     evaluation graph, so rollback cannot erase one of those unrelated
+;;     concurrent mutations.
+;;
+;; This unwired slice proves failure atomicity for the covered writes. Covered
+;; readers do not yet join class-provider-mu, so concurrent reader isolation and
+;; every raw definition mutator that overlaps these registries are hard
+;; prerequisites for activating retry-on-miss dispatch. Activation must also
+;; reject or otherwise make nonblocking a provider load triggered by a child
+;; that inherited an active stage, because its parent may be joining that child.
 ;;
 ;; Structured failures are raised as jolt ex-info whose ex-data carries a
 ;; :type keyword naming the category:
@@ -38,6 +62,8 @@
 ;;   :jolt.deps/class-provider-conflict        same class, differing provider
 ;;   :jolt.deps/class-provider-registry-frozen a new key after freeze
 ;;   :jolt.deps/class-provider-cycle           owner re-entry while loading
+;;   :jolt.deps/class-provider-cross-thread-registration
+;;                                                forked child registration
 ;;
 ;; Loaded after the value/collection/error layers of rt.ss (it needs jolt-throw,
 ;; jolt-ex-info, jolt-hash-map, keyword, and the symbol accessors) and sits in
@@ -60,6 +86,20 @@
 (define class-provider-attempt-counter 0)
 (define class-provider-global-waiters 0)
 (define class-provider-load-stack (make-thread-parameter '()))
+;; A provider stage is
+;; [reverse-ordered operations, pending provider mappings, owner thread id,
+;;  exact namespace, active | committed | aborted].
+;; Chez thread parameters are inherited by forked threads, so the explicit owner
+;; prevents a child from mutating its parent's private stage. Ordinary required
+;; namespaces and nested providers shadow the outer stage and publish
+;; independently; this keeps each loader dedup mark coherent with the
+;; registrations produced by that exact namespace.
+(define class-provider-registration-stage (make-thread-parameter #f))
+(define cp-stage-operations-index 0)
+(define cp-stage-mappings-index 1)
+(define cp-stage-owner-index 2)
+(define cp-stage-namespace-index 3)
+(define cp-stage-state-index 4)
 ;; Bumped when registration adds keys and once for every successful reset; never
 ;; decrements. A reset is an explicit world boundary even if its map is identical.
 (define class-provider-registry-generation 0)
@@ -72,6 +112,8 @@
 (define cp-type-conflict (keyword "jolt.deps" "class-provider-conflict"))
 (define cp-type-frozen (keyword "jolt.deps" "class-provider-registry-frozen"))
 (define cp-type-cycle (keyword "jolt.deps" "class-provider-cycle"))
+(define cp-type-cross-thread
+  (keyword "jolt.deps" "class-provider-cross-thread-registration"))
 (define cp-kw-type (keyword #f "type"))
 (define cp-kw-class (keyword #f "class"))
 (define cp-kw-provider (keyword #f "provider"))
@@ -80,6 +122,10 @@
 (define cp-kw-reason (keyword #f "reason"))
 (define cp-kw-generation (keyword #f "registry-generation"))
 (define cp-kw-path (keyword #f "path"))
+(define cp-kw-namespace (keyword #f "namespace"))
+(define cp-kw-owner-thread (keyword #f "owner-thread"))
+(define cp-kw-current-thread (keyword #f "current-thread"))
+(define cp-kw-stage-state (keyword #f "stage-state"))
 
 (define (cp-invalid! class provider reason)
   (jolt-throw
@@ -130,6 +176,24 @@
           cp-kw-type cp-type-cycle
           cp-kw-provider provider
           cp-kw-path (list->cseq path))))))
+
+(define (cp-cross-thread-registration! stage)
+  (let ((owner (vector-ref stage cp-stage-owner-index))
+        (current (get-thread-id))
+        (namespace (vector-ref stage cp-stage-namespace-index))
+        (state (vector-ref stage cp-stage-state-index)))
+    (jolt-throw
+      (jolt-ex-info
+        (string-append
+          "Provider registration from a forked thread is not allowed for "
+          namespace " while its stage is "
+          (symbol->string state))
+        (jolt-hash-map
+          cp-kw-type cp-type-cross-thread
+          cp-kw-namespace namespace
+          cp-kw-owner-thread owner
+          cp-kw-current-thread current
+          cp-kw-stage-state state)))))
 
 ;; --- normalization ----------------------------------------------------------
 ;; Accept a string or a (jolt) symbol and reduce it to its canonical string
@@ -214,8 +278,8 @@
     pairs))
 
 ;; Wait until a different thread's entire provider-evaluation graph is stable.
-;; The owner itself must pass through so a nested provider can claim work and,
-;; in the later transactional slice, publish its staged commit.
+;; The owner itself must pass through so a nested provider can claim work and
+;; publish its staged commit.
 (define (class-provider-wait-evaluator-locked! self)
   (let loop ()
     (when (and class-provider-eval-owner
@@ -228,45 +292,62 @@
       (loop))))
 
 ;; --- atomic preflighted registration ----------------------------------------
-;; Preflight under the mutex: validate the batch cumulatively (intra-batch AND
-;; against the live table), collect new keys, then commit only if nothing
-;; rejected. A conflict or freeze raises before any hashtable-set! on the live
-;; table, so a failed batch is a no-op.
+;; Build the genuinely new portion of NORMALIZED while the provider mutex is
+;; held. PENDING is either the current evaluation stage's private mapping table
+;; or #f. The private BATCH makes a caught conflict/freeze a true no-op: no prefix
+;; reaches PENDING or the live table.
+(define (cp-preflight-new-mappings-locked normalized pending)
+  (let ((batch (make-hashtable string-hash string=?)))
+    (for-each
+      (lambda (p)
+        (let* ((class (car p))
+               (provider (cdr p))
+               (old
+                 (or (hashtable-ref batch class #f)
+                     (and pending (hashtable-ref pending class #f))
+                     (hashtable-ref class-providers-tbl class #f))))
+          (cond
+            ((not old)
+             (when class-provider-frozen?
+               (cp-frozen! class provider))
+             (hashtable-set! batch class provider))
+            ((string=? old provider) #f)
+            (else (cp-conflict! class old provider)))))
+      normalized)
+    batch))
+
+(define (cp-merge-string-table! target additions)
+  (let-values (((ks vs) (hashtable-entries additions)))
+    (let loop ((i 0) (n (vector-length ks)))
+      (when (fx<? i n)
+        (hashtable-set! target (vector-ref ks i) (vector-ref vs i))
+        (loop (fx+ i 1) n)))))
+
+;; Publish one normalized batch. The caller owns class-provider-mu. A batch is
+;; one registry generation even when it adds several keys, preserving the
+;; current v0.5.11 registry contract.
+(define (cp-publish-normalized-mappings-locked! normalized)
+  (let ((batch (cp-preflight-new-mappings-locked normalized #f)))
+    (unless (fx=? (hashtable-size batch) 0)
+      (cp-merge-string-table! class-providers-tbl batch)
+      (set! class-provider-registry-generation
+            (+ class-provider-registry-generation 1)))))
+
+;; Whole-map registration is atomic both outside and inside provider evaluation.
+;; A provider stage accumulates only its effective new mappings; successful
+;; publication treats that private map as one transaction generation.
 (define (class-provider-register-many! pairs)
-  (let ((normalized (cp-normalize-and-validate-pairs pairs)))
-    (with-mutex class-provider-mu
-      (class-provider-wait-evaluator-locked! (get-thread-id))
-      (let ((batch (make-hashtable string-hash string=?))
-            (new? #f)
-            (first-new #f))
-        (for-each
-          (lambda (p)
-            (let* ((class (car p))
-                   (provider (cdr p))
-                   (batch-old (hashtable-ref batch class #f))
-                   (table-old (hashtable-ref class-providers-tbl class #f))
-                   (old (or batch-old table-old)))
-              (cond
-                ((not old)
-                 (hashtable-set! batch class provider)
-                 (unless new?
-                   (set! first-new p))
-                 (set! new? #t))
-                ((string=? old provider)
-                 (hashtable-set! batch class provider))
-                (else
-                 (cp-conflict! class old provider)))))
-          normalized)
-        (when (and class-provider-frozen? new?)
-          (cp-frozen! (car first-new) (cdr first-new)))
-        (let-values (((ks vs) (hashtable-entries batch)))
-          (let loop ((i 0) (n (vector-length ks)))
-            (when (fx<? i n)
-              (hashtable-set! class-providers-tbl (vector-ref ks i) (vector-ref vs i))
-              (loop (fx+ i 1) n))))
-        (when new?
-          (set! class-provider-registry-generation
-                (+ class-provider-registry-generation 1)))))
+  (let* ((stage (class-provider-registration-stage-for-hook))
+         (normalized (cp-normalize-and-validate-pairs pairs)))
+    (if stage
+        (with-mutex class-provider-mu
+          (let* ((pending (vector-ref stage cp-stage-mappings-index))
+                 (batch
+                   (cp-preflight-new-mappings-locked normalized pending)))
+            (cp-merge-string-table! pending batch)))
+        (with-mutex class-provider-mu
+          (class-provider-wait-evaluator-locked! (get-thread-id))
+          (cp-publish-normalized-mappings-locked! normalized)))
     jolt-nil))
 
 ;; Atomically replace the registry and thaw it. Build and conflict-check the
@@ -303,6 +384,268 @@
     (class-provider-wait-evaluator-locked! (get-thread-id))
     (set! class-provider-frozen? #t))
   jolt-nil)
+
+;; --- failure-atomic dedicated-hook publication ------------------------------
+(define (class-provider-make-registration-stage namespace)
+  (vector
+    '()
+    (make-hashtable string-hash string=?)
+    (get-thread-id)
+    namespace
+    'active))
+
+(define (class-provider-registration-stage-active? stage)
+  (eq? (vector-ref stage cp-stage-state-index) 'active))
+
+(define (class-provider-registration-stage-state-set! stage state)
+  (vector-set! stage cp-stage-state-index state))
+
+;; Forked children retain their inherited stage vector. Keep only the small
+;; ownership/provenance fields after completion; otherwise a long-lived worker
+;; would pin every staged closure and pending mapping.
+(define (class-provider-registration-stage-finalize! stage state)
+  (class-provider-registration-stage-state-set! stage state)
+  (vector-set! stage cp-stage-operations-index '())
+  (vector-set! stage cp-stage-mappings-index #f))
+
+;; Return the active stage only to its owning thread. A forked child inherits
+;; the thread parameter value but must not mutate it.
+(define (class-provider-owned-registration-stage)
+  (let ((stage (class-provider-registration-stage)))
+    (and stage
+         (class-provider-registration-stage-active? stage)
+         (eqv? (vector-ref stage cp-stage-owner-index) (get-thread-id))
+         stage)))
+
+;; Registration from a forked child must fail immediately. Treating it as an
+;; ordinary external mutation could deadlock when the provider joins the child,
+;; or publish work caused by a provider that later fails.
+(define (class-provider-registration-stage-for-hook)
+  (let ((stage (class-provider-registration-stage)))
+    (cond
+      ((not stage) #f)
+      ((and
+         (class-provider-registration-stage-active? stage)
+         (eqv? (vector-ref stage cp-stage-owner-index) (get-thread-id)))
+       stage)
+      ((eq? (vector-ref stage cp-stage-state-index) 'committed)
+       ;; A helper can commit while its outer provider graph is still active.
+       ;; Its child must not fall through to a blocking ordinary registration
+       ;; that the outer owner might join.
+       (if
+         (with-mutex class-provider-mu
+           (and class-provider-eval-owner
+                (not
+                  (eqv? class-provider-eval-owner (get-thread-id)))))
+         (cp-cross-thread-registration! stage)
+         #f))
+      (else (cp-cross-thread-registration! stage)))))
+
+;; Append one provider-owned mutation to the current evaluation stage. Returns
+;; #t when staged and #f for an ordinary call outside provider evaluation.
+(define (class-provider-stage-operation! proc)
+  (let ((stage (class-provider-registration-stage-for-hook)))
+    (and stage
+         (begin
+           (vector-set!
+             stage
+             cp-stage-operations-index
+             (cons proc (vector-ref stage cp-stage-operations-index)))
+           #t))))
+
+;; Ordinary calls through the covered hooks must not race a provider transaction:
+;; otherwise rollback could restore an older snapshot over an unrelated
+;; successful mutation. The operation stays under the coordinator mutex from the
+;; stable check through publication, so a provider cannot claim between them.
+(define (class-provider-run-operation! proc)
+  (with-mutex class-provider-mu
+    (class-provider-wait-evaluator-locked! (get-thread-id))
+    (proc)))
+
+;; Shared adapter for the dedicated Clojure-visible hooks. The raw mutation PROC
+;; is staged for a provider and otherwise executes against a stable covered
+;; registration world.
+(define (class-provider-register-operation! proc)
+  (unless (class-provider-stage-operation! proc)
+    (class-provider-run-operation! proc))
+  jolt-nil)
+
+(define (class-provider-copy-string-table table copy-value)
+  (let ((result (make-hashtable string-hash string=?)))
+    (let-values (((keys vals) (hashtable-entries table)))
+      (let loop ((i 0) (n (vector-length keys)))
+        (when (fx<? i n)
+          (hashtable-set!
+            result
+            (vector-ref keys i)
+            (copy-value (vector-ref vals i)))
+          (loop (fx+ i 1) n))))
+    result))
+
+;; Copy a string table whose values are string tables. Preserve shared inner
+;; identity: core's historic short/FQN aliases intentionally point at one member
+;; table, and rollback must not split them.
+(define (class-provider-copy-nested-string-table table copy-leaf)
+  (let ((result (make-hashtable string-hash string=?))
+        (seen (make-eq-hashtable)))
+    (let-values (((keys vals) (hashtable-entries table)))
+      (let loop ((i 0) (n (vector-length keys)))
+        (when (fx<? i n)
+          (let* ((key (vector-ref keys i))
+                 (inner (vector-ref vals i))
+                 (copy
+                   (or (hashtable-ref seen inner #f)
+                       (let ((new
+                               (class-provider-copy-string-table
+                                 inner copy-leaf)))
+                         (hashtable-set! seen inner new)
+                         new))))
+            (hashtable-set! result key copy))
+          (loop (fx+ i 1) n))))
+    result))
+
+(define (class-provider-copy-vector value)
+  (list->vector (vector->list value)))
+
+;; Named fields make the rollback coverage auditable as registries evolve.
+(define-record-type cp-world-snapshot
+  (fields
+    provider-table
+    provider-generation
+    provider-frozen
+    class-statics
+    class-ctors
+    mutable-statics
+    tagged-methods
+    class-hierarchy
+    user-instance-checks
+    eq-arms
+    hash-arms
+    str-arms
+    pr-str-arms
+    pr-readable-arms
+    compare-arms
+    class-arms
+    value-tag-arms)
+  (nongenerative jolt-class-provider-world-snapshot-v1))
+
+;; Snapshot exactly the mutable registries reachable through the dedicated
+;; provider-registration hooks. Vars, type/record/protocol definitions, extend
+;; state, and arbitrary provider top-level side effects remain outside the
+;; transaction. The caller owns class-provider-mu.
+(define (class-provider-world-snapshot-locked)
+  (make-cp-world-snapshot
+    (class-provider-copy-string-table
+      class-providers-tbl (lambda (x) x))
+    class-provider-registry-generation
+    class-provider-frozen?
+    (class-provider-copy-nested-string-table
+      class-statics-tbl (lambda (x) x))
+    (class-provider-copy-string-table class-ctors-tbl (lambda (x) x))
+    (class-provider-copy-nested-string-table
+      mutable-statics-tbl class-provider-copy-vector)
+    (class-provider-copy-nested-string-table
+      tagged-methods-tbl (lambda (x) x))
+    (class-provider-copy-string-table jvm-class-parents (lambda (x) x))
+    user-instance-checks
+    jolt-eq-arms
+    jolt-hash-arms
+    str-render-registry
+    jolt-pr-str-arms
+    jolt-pr-readable-arms
+    jolt-compare-arms
+    jolt-class-arms
+    jt-user-value-tags-arms))
+
+;; Restore a failed commit while class-provider-mu is held. Hierarchy caches are
+;; derived rather than snapshotted; invalidating all four classes of cache makes
+;; the restored graph authoritative again.
+(define (class-provider-world-restore-locked! snapshot)
+  (set! class-providers-tbl
+        (cp-world-snapshot-provider-table snapshot))
+  (set! class-provider-registry-generation
+        (cp-world-snapshot-provider-generation snapshot))
+  (set! class-provider-frozen?
+        (cp-world-snapshot-provider-frozen snapshot))
+  (set! class-statics-tbl
+        (cp-world-snapshot-class-statics snapshot))
+  (set! class-ctors-tbl
+        (cp-world-snapshot-class-ctors snapshot))
+  (set! mutable-statics-tbl
+        (cp-world-snapshot-mutable-statics snapshot))
+  (set! tagged-methods-tbl
+        (cp-world-snapshot-tagged-methods snapshot))
+  (set! jvm-class-parents
+        (cp-world-snapshot-class-hierarchy snapshot))
+  (set! user-instance-checks
+        (cp-world-snapshot-user-instance-checks snapshot))
+  (set! jolt-eq-arms (cp-world-snapshot-eq-arms snapshot))
+  (set! jolt-hash-arms (cp-world-snapshot-hash-arms snapshot))
+  (set! str-render-registry (cp-world-snapshot-str-arms snapshot))
+  (set! jolt-pr-str-arms (cp-world-snapshot-pr-str-arms snapshot))
+  (set! jolt-pr-readable-arms
+        (cp-world-snapshot-pr-readable-arms snapshot))
+  (set! jolt-compare-arms (cp-world-snapshot-compare-arms snapshot))
+  (set! jolt-class-arms (cp-world-snapshot-class-arms snapshot))
+  (set! jt-user-value-tags-arms
+        (cp-world-snapshot-value-tag-arms snapshot))
+  (jch-invalidate-caches!))
+
+;; Publish one successful provider namespace. Pending mappings go first, then
+;; host operations in source order. A commit-time exception restores the entire
+;; covered registration world before it escapes to the evaluator.
+(define (class-provider-commit-stage! stage)
+  (with-mutex class-provider-mu
+    (let ((snapshot (class-provider-world-snapshot-locked)))
+      (guard (e (else
+                  (class-provider-world-restore-locked! snapshot)
+                  (raise e)))
+        (let ((pending (vector-ref stage cp-stage-mappings-index)))
+          (unless (fx=? (hashtable-size pending) 0)
+            (let-values (((keys vals) (hashtable-entries pending)))
+              (cp-publish-normalized-mappings-locked!
+                (let loop ((i 0) (acc '()))
+                  (if (fx=? i (vector-length keys))
+                      (reverse acc)
+                      (loop
+                        (fx+ i 1)
+                        (cons
+                          (cons (vector-ref keys i) (vector-ref vals i))
+                          acc))))))))
+        (for-each
+          (lambda (proc) (proc))
+          (reverse (vector-ref stage cp-stage-operations-index)))))))
+
+;; LOAD! evaluates one namespace inside an active provider graph. Reuse the
+;; provider-created stage only for that exact provider root. An ordinary helper
+;; gets a private shadow stage and commits before its loader call returns, so its
+;; successful dedup mark and registrations cannot be split by a later outer
+;; failure. CLEANUP! restores the helper's pre-call loaded state if either source
+;; evaluation or staged publication fails.
+(define (class-provider-load-namespace-with-stage!
+          namespace load! cleanup!)
+  (let ((outer (class-provider-owned-registration-stage)))
+    (cond
+      ((not outer) (load!))
+      ((string=?
+         namespace
+         (vector-ref outer cp-stage-namespace-index))
+       (load!))
+      (else
+        (let ((stage (class-provider-make-registration-stage namespace)))
+          (guard (e (else
+                      (class-provider-registration-stage-state-set!
+                        stage 'aborted)
+                      (guard (ignored (else #f))
+                        (cleanup! namespace stage))
+                      (class-provider-registration-stage-finalize!
+                        stage 'aborted)
+                      (raise e)))
+            (parameterize ((class-provider-registration-stage stage))
+              (load!))
+            (class-provider-commit-stage! stage)
+            (class-provider-registration-stage-finalize!
+              stage 'committed)))))))
 
 ;; --- readers ----------------------------------------------------------------
 ;; Exact lookup: the provider string for CLASS, or jolt-nil when absent. No class
@@ -432,19 +775,21 @@
                     class-provider-states-tbl provider attempt)
                   (list 'load attempt root?))))))))))
 
-(define (class-provider-finish! provider attempt root?)
+(define (class-provider-finish! provider attempt root? stage)
   (with-mutex class-provider-mu
     (cp-attempt-status-set! attempt 'succeeded)
     (hashtable-set! class-provider-states-tbl provider 'loaded)
     (when root? (set! class-provider-eval-owner #f))
+    (class-provider-registration-stage-finalize! stage 'committed)
     (condition-broadcast class-provider-cv)))
 
-(define (class-provider-abort! provider attempt root? error)
+(define (class-provider-abort! provider attempt root? error stage)
   (with-mutex class-provider-mu
     (vector-set! attempt cp-attempt-error-index error)
     (cp-attempt-status-set! attempt 'failed)
     (hashtable-set! class-provider-states-tbl provider attempt)
     (when root? (set! class-provider-eval-owner #f))
+    (class-provider-registration-stage-finalize! stage 'aborted)
     (condition-broadcast class-provider-cv)))
 
 (define (class-provider-wait-attempt attempt)
@@ -471,9 +816,11 @@
         (raise (cdr outcome)))))
 
 ;; Evaluate PROVIDER with LOAD!, which receives the provider namespace string.
-;; LOAD! is explicit so the direct coordinator gate does not need loader.ss;
-;; the production wrapper below supplies load-namespace.
-(define (class-provider-load-provider-with! provider load!)
+;; CLEANUP! receives the provider and its stage. The production loader reopens
+;; the provider root when namespace evaluation returned successfully but its
+;; staged publication then failed.
+(define (class-provider-load-provider-with-cleanup!
+          provider load! cleanup!)
   (let ((claim (class-provider-claim provider)))
     (cond
       ((eq? claim 'already-loaded) #f)
@@ -486,23 +833,44 @@
          (vector-ref (cdr claim) cp-attempt-error-index)))
       ((and (pair? claim) (eq? (car claim) 'load))
        (let ((attempt (cadr claim))
-             (root? (caddr claim)))
+             (root? (caddr claim))
+             (stage (class-provider-make-registration-stage provider)))
          (guard (e (else
+                     ;; load-namespace clears its own mark on a source exception.
+                     ;; A provider-root commit exception occurs after its normal
+                     ;; return, so restore the root's pre-call loaded state for a
+                     ;; later independent provider retry.
+                     (guard (ignored (else #f))
+                       (cleanup! provider stage))
                      (class-provider-abort!
-                       provider attempt root? e)
+                       provider attempt root? e stage)
                      (raise e)))
            (parameterize
              ((class-provider-load-stack
-                (cons provider (class-provider-load-stack))))
+                (cons provider (class-provider-load-stack)))
+              (class-provider-registration-stage stage))
              (load! provider))
-           (class-provider-finish! provider attempt root?)
+           ;; Publish while this thread still owns the process-wide evaluator.
+           ;; Another provider may be nested inside an outer stage; commit uses
+           ;; raw locked publication so the inner transaction cannot be
+           ;; accidentally appended to that outer stage.
+           (class-provider-commit-stage! stage)
+           (class-provider-finish! provider attempt root? stage)
            #t)))
       (else #f))))
 
+;; Test seam: the direct coordinator/transaction gates provide a loader closure
+;; without needing to model loader.ss's loaded-namespace bookkeeping.
+(define (class-provider-load-provider-with! provider load!)
+  (class-provider-load-provider-with-cleanup!
+    provider load! (lambda (_ __) #f)))
+
 (define (class-provider-load-provider! provider)
-  (class-provider-load-provider-with!
+  (class-provider-load-provider-with-cleanup!
     provider
-    (lambda (namespace) (load-namespace namespace))))
+    (lambda (namespace) (load-namespace namespace))
+    (lambda (namespace _stage)
+      (ldr-unmark-loaded! namespace))))
 
 ;; Exact class lookup followed by one coordinated provider evaluation. This is
 ;; intentionally not called by host dispatch yet.
