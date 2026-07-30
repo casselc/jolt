@@ -120,15 +120,100 @@
          0)
         (else (system (string-append "chmod 755 '" path "'")))))))
 
+;; Path classification without touching the filesystem.  Keep the Java
+;; File.isAbsolute contract separate from project resolution:
+;;
+;; * POSIX absolute paths begin with "/".
+;; * Windows absolute paths are drive-absolute (C:/x, C:\x) or UNC
+;;   (\\server\share).  A drive-less /x or \x is rooted on the current drive,
+;;   but java.io.File.isAbsolute returns false for it.
+;; * C:x is drive-relative, neither absolute nor rooted.  Project/deps/build
+;;   reject it rather than silently resolving it under the wrong drive.
+(define (jolt-ascii-alpha? c)
+  (or (and (char>=? c #\a) (char<=? c #\z))
+      (and (char>=? c #\A) (char<=? c #\Z))))
+(define (jolt-path-separator? c)
+  (or (char=? c #\/) (char=? c #\\)))
+(define (jolt-windows-drive-designator? p)
+  (and (>= (string-length p) 2)
+       (jolt-ascii-alpha? (string-ref p 0))
+       (char=? (string-ref p 1) #\:)))
+(define (jolt-windows-drive-absolute? p)
+  (and (>= (string-length p) 3)
+       (jolt-windows-drive-designator? p)
+       (jolt-path-separator? (string-ref p 2))))
+(define (jolt-windows-drive-relative? p)
+  (and (jolt-windows-drive-designator? p)
+       (or (= (string-length p) 2)
+           (not (jolt-path-separator? (string-ref p 2))))))
+(define (jolt-windows-unc? p)
+  (and (>= (string-length p) 2)
+       (jolt-path-separator? (string-ref p 0))
+       (jolt-path-separator? (string-ref p 1))))
+(define (jolt-windows-root-relative? p)
+  (and (> (string-length p) 0)
+       (jolt-path-separator? (string-ref p 0))
+       (not (jolt-windows-unc? p))))
+(define (jolt-path-absolute-for? windows? p)
+  (if windows?
+      (or (jolt-windows-drive-absolute? p)
+          (jolt-windows-unc? p))
+      (and (> (string-length p) 0)
+           (char=? (string-ref p 0) #\/))))
+(define (jolt-path-rooted-for? windows? p)
+  (or (jolt-path-absolute-for? windows? p)
+      (and windows? (jolt-windows-root-relative? p))))
+(define (jolt-path-absolute? p)
+  (jolt-path-absolute-for?
+    (jolt-windows-machine-type? (machine-type))
+    p))
+(define (jolt-path-rooted? p)
+  (jolt-path-rooted-for?
+    (jolt-windows-machine-type? (machine-type))
+    p))
+
+;; Pure cross-target project resolution. #f is the fail-closed result for a
+;; Windows drive-relative path, or a root-relative path whose project base has
+;; no drive to supply. The native wrapper below turns that into a typed error.
+(define (jolt-resolve-project-path-for windows? base p)
+  (cond
+    ((= (string-length p) 0) p)
+    ((jolt-path-absolute-for? windows? p) p)
+    ((and windows? (jolt-windows-drive-relative? p)) #f)
+    ((and windows? (jolt-windows-root-relative? p))
+     (and (jolt-windows-drive-designator? base)
+          (string-append (substring base 0 2) p)))
+    ((= (string-length base) 0) p)
+    (else (string-append base "/" p))))
+
+(define (jolt-resolve-project-path base p)
+  (let ((resolved
+         (jolt-resolve-project-path-for
+           (jolt-windows-machine-type? (machine-type))
+           base
+           p)))
+    (if resolved
+        resolved
+        (jolt-throw
+          (jolt-host-throwable
+            "java.lang.IllegalArgumentException"
+            (if (jolt-windows-drive-relative? p)
+                (string-append
+                  "drive-relative project paths are unsupported; use a drive-absolute path: "
+                  p)
+                (string-append
+                  "Windows root-relative project path needs a drive-qualified JOLT_PWD: "
+                  p)))))))
+
 ;; A user-facing relative path resolves against JOLT_PWD — the user's cwd before
-;; the launcher cd'd to the jolt repo root — matching the JVM, where io/file is
-;; cwd-relative. (io/resource builds jfiles from the source roots directly, so it
-;; isn't routed through here.)
+;; the launcher cd'd to the jolt repo root. Windows root-relative paths resolve
+;; against that project's drive; drive-relative paths fail closed. io/resource
+;; builds jfiles from source roots directly, so it is not routed through here.
 (define (project-relative p)
-  (if (or (= (string-length p) 0) (char=? (string-ref p 0) #\/))
-      p
-      (let ((pwd (getenv "JOLT_PWD")))
-        (if (and pwd (> (string-length pwd) 0)) (string-append pwd "/" p) p))))
+  (jolt-resolve-project-path
+    (let ((pwd (getenv "JOLT_PWD")))
+      (if (and pwd (> (string-length pwd) 0)) pwd ""))
+    p))
 
 ;; (io/file path) / (io/file parent child) — join children with "/". The File
 ;; keeps the path AS GIVEN (like the JVM: new File("rel").getPath() is "rel");
@@ -161,7 +246,7 @@
 ;; getAbsolutePath are user.dir-relative.
 (define (jfile-abs p)
   (cond ((= (string-length p) 0) (or (getenv "JOLT_PWD") (getenv "PWD") "."))
-        ((char=? (string-ref p 0) #\/) p)
+        ((jolt-path-absolute? p) p)
         (else (project-relative p))))
 
 ;; --- file metadata over Chez filesystem ops ---------------------------------
@@ -243,9 +328,16 @@
         (cons "getFile"        (lambda (self) (url-strip-scheme (url-spec self))))))
 
 ;; --- File method surface (record-method-dispatch arm) -----------------------
+(define jfile-path-only-methods
+  '("getPath" "getName" "toString" "getProtocol" "isAbsolute" "isHidden"
+    "deleteOnExit" "getParentFile" "toPath" "compareTo" "equals" "hashCode"
+    "getParent"))
 (define (jfile-method f name args)        ; -> boxed result, or #f to fall through
-  (let ((p (jfile-path f))               ; the path as given (display methods)
-        (fp (jfile-fs f)))               ; JOLT_PWD-resolved on-disk path (FS methods)
+  (let* ((p (jfile-path f))              ; the path as given (display methods)
+         ;; Classification/display methods must not resolve first: in particular,
+         ;; File.isAbsolute("C:x") is false on Windows, not a drive-relative
+         ;; project-resolution error. Only filesystem-touching methods need fp.
+         (fp (if (member name jfile-path-only-methods) p (jfile-fs f))))
     (cond
       ((string=? name "getPath")        (list p))
       ((string=? name "getName")        (list (path-last-segment p)))
@@ -263,7 +355,7 @@
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
-      ((string=? name "isAbsolute")     (list (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/)) #t #f)))
+      ((string=? name "isAbsolute")     (list (jolt-path-absolute? p)))
       ((string=? name "listFiles")      (list (list->cseq (map make-jfile (jolt-list-dir fp)))))
       ;; .list -> the child NAMES (a String[]), nil if not a directory.
       ((string=? name "list")

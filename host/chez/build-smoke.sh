@@ -37,6 +37,27 @@ app="$root/test/chez/build-app"
 out="$(mktemp -d)/app-bin"
 trap 'rm -rf "$(dirname "$out")"' EXIT
 
+# Exercise cmd-build's output policy through the real CLI before the larger
+# build matrix. Work on a copy so the default target/ directory never dirties
+# the checked-in fixture.
+path_app="$(dirname "$out")/path-project"
+cp -R "$app" "$path_app"
+default_path_out="$path_app/target/release/path-project"
+echo "build smoke: default output -> $default_path_out"
+if ! JOLT_PWD="$path_app" "$jolt" build -m app.core >/dev/null 2>&1; then
+  echo "  FAIL: default-output jolt build exited non-zero"
+  exit 1
+fi
+[ -x "$default_path_out" ] || { echo "  FAIL: default output missing"; exit 1; }
+
+relative_path_out="$path_app/dist/path-app"
+echo "build smoke: relative output -> $relative_path_out"
+if ! JOLT_PWD="$path_app" "$jolt" build -m app.core -o "dist/path-app" >/dev/null 2>&1; then
+  echo "  FAIL: relative-output jolt build exited non-zero"
+  exit 1
+fi
+[ -x "$relative_path_out" ] || { echo "  FAIL: relative output missing"; exit 1; }
+
 echo "build smoke: compiling app.core -> $out"
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" >/dev/null 2>&1; then
   echo "  FAIL: jolt build exited non-zero"
@@ -612,4 +633,4 @@ if [ "$got_aa" != ":kw :app.other/x :aliased true" ]; then
   echo "  FAIL: as-alias-app — want ':kw :app.other/x :aliased true', got \`$got_aa\`"; exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + scan-alias-set + as-alias)"
+echo "build smoke: passed (default+relative-output + release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + scan-alias-set + as-alias)"
