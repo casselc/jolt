@@ -19,7 +19,10 @@
 ;; The entries are stable, so the var cell bound below stays current as arms register.
 (define jolt-class-arms '())
 (define (register-class-arm! pred handler)
-  (set! jolt-class-arms (cons (cons pred handler) jolt-class-arms)))
+  (class-provider-run-raw-registration!
+    (lambda ()
+      (set! jolt-class-arms
+            (cons (cons pred handler) jolt-class-arms)))))
 (define (jolt-class-base x)
   (cond
     ((jolt-nil? x) jolt-nil)

@@ -47,14 +47,17 @@
 ;;     registry reachable through those hooks;
 ;;   - ordinary calls through the same dedicated hooks wait for the active
 ;;     evaluation graph, so rollback cannot erase one of those unrelated
-;;     concurrent mutations.
+;;     concurrent mutations;
+;;   - raw mutators for every snapshotted host registry use the same serialized
+;;     write boundary. Provider-owner raw definition effects remain deliberately
+;;     outside the stage, but an unrelated writer cannot race a rollback.
 ;;
 ;; This unwired slice proves failure atomicity for the covered writes. Covered
-;; readers do not yet join class-provider-mu, so concurrent reader isolation and
-;; every raw definition mutator that overlaps these registries are hard
-;; prerequisites for activating retry-on-miss dispatch. Activation must also
-;; reject or otherwise make nonblocking a provider load triggered by a child
-;; that inherited an active stage, because its parent may be joining that child.
+;; readers do not yet join class-provider-mu, so concurrent reader isolation is
+;; still a hard prerequisite for activating retry-on-miss dispatch. Activation
+;; must also reject or otherwise make nonblocking a provider load triggered by a
+;; child that inherited an active stage, because its parent may be joining that
+;; child.
 ;;
 ;; Structured failures are raised as jolt ex-info whose ex-data carries a
 ;; :type keyword naming the category:
@@ -95,6 +98,8 @@
 ;; independently; this keeps each loader dedup mark coherent with the
 ;; registrations produced by that exact namespace.
 (define class-provider-registration-stage (make-thread-parameter #f))
+(define class-provider-registration-world-lock-held?
+  (make-thread-parameter #f))
 (define cp-stage-operations-index 0)
 (define cp-stage-mappings-index 1)
 (define cp-stage-owner-index 2)
@@ -457,10 +462,26 @@
 ;; otherwise rollback could restore an older snapshot over an unrelated
 ;; successful mutation. The operation stays under the coordinator mutex from the
 ;; stable check through publication, so a provider cannot claim between them.
+(define (class-provider-run-serialized-registration! proc)
+  (if (class-provider-registration-world-lock-held?)
+      (proc)
+      (with-mutex class-provider-mu
+        (class-provider-wait-evaluator-locked! (get-thread-id))
+        (parameterize ((class-provider-registration-world-lock-held? #t))
+          (proc)))))
+
 (define (class-provider-run-operation! proc)
-  (with-mutex class-provider-mu
-    (class-provider-wait-evaluator-locked! (get-thread-id))
-    (proc)))
+  (class-provider-run-serialized-registration! proc))
+
+;; Runtime definition forms and host bootstrap code also call the underlying
+;; registry mutators directly. They remain outside the provider stage so an
+;; owning provider retains its historical immediate definition behavior, but
+;; they share the evaluator's write boundary. Checking the inherited stage first
+;; preserves the dedicated-hook fail-closed rule for a forked child instead of
+;; letting a parent/child join become a mutex wait cycle.
+(define (class-provider-run-raw-registration! proc)
+  (class-provider-registration-stage-for-hook)
+  (class-provider-run-serialized-registration! proc))
 
 ;; Shared adapter for the dedicated Clojure-visible hooks. The raw mutation PROC
 ;; is staged for a provider and otherwise executes against a stable covered
@@ -469,6 +490,36 @@
   (unless (class-provider-stage-operation! proc)
     (class-provider-run-operation! proc))
   jolt-nil)
+
+;; The value, printer, comparison, and class-hierarchy mutators are defined
+;; before this coordinator loads. Install their raw-write adapters now; all
+;; later bootstrap registrations and runtime definition forms therefore share
+;; the rollback write boundary. Composite mutators such as register-pr-arm! may
+;; call another wrapped mutator while the thread parameter is set and execute
+;; directly without reacquiring the nonrecursive mutex.
+(define (class-provider-wrap-raw-registration proc)
+  (lambda args
+    (class-provider-run-raw-registration!
+      (lambda () (apply proc args)))))
+
+(set! register-eq-arm!
+  (class-provider-wrap-raw-registration register-eq-arm!))
+(set! register-hash-arm!
+  (class-provider-wrap-raw-registration register-hash-arm!))
+(set! register-str-render!
+  (class-provider-wrap-raw-registration register-str-render!))
+(set! register-pr-str-arm!
+  (class-provider-wrap-raw-registration register-pr-str-arm!))
+(set! register-pr-readable-arm!
+  (class-provider-wrap-raw-registration register-pr-readable-arm!))
+(set! register-pr-arm!
+  (class-provider-wrap-raw-registration register-pr-arm!))
+(set! register-compare-arm!
+  (class-provider-wrap-raw-registration register-compare-arm!))
+(set! jch-register-supers!
+  (class-provider-wrap-raw-registration jch-register-supers!))
+(set! jch-set-supers!
+  (class-provider-wrap-raw-registration jch-set-supers!))
 
 (define (class-provider-copy-string-table table copy-value)
   (let ((result (make-hashtable string-hash string=?)))
@@ -596,25 +647,26 @@
 ;; covered registration world before it escapes to the evaluator.
 (define (class-provider-commit-stage! stage)
   (with-mutex class-provider-mu
-    (let ((snapshot (class-provider-world-snapshot-locked)))
-      (guard (e (else
-                  (class-provider-world-restore-locked! snapshot)
-                  (raise e)))
-        (let ((pending (vector-ref stage cp-stage-mappings-index)))
-          (unless (fx=? (hashtable-size pending) 0)
-            (let-values (((keys vals) (hashtable-entries pending)))
-              (cp-publish-normalized-mappings-locked!
-                (let loop ((i 0) (acc '()))
-                  (if (fx=? i (vector-length keys))
-                      (reverse acc)
-                      (loop
-                        (fx+ i 1)
-                        (cons
-                          (cons (vector-ref keys i) (vector-ref vals i))
-                          acc))))))))
-        (for-each
-          (lambda (proc) (proc))
-          (reverse (vector-ref stage cp-stage-operations-index)))))))
+    (parameterize ((class-provider-registration-world-lock-held? #t))
+      (let ((snapshot (class-provider-world-snapshot-locked)))
+        (guard (e (else
+                    (class-provider-world-restore-locked! snapshot)
+                    (raise e)))
+          (let ((pending (vector-ref stage cp-stage-mappings-index)))
+            (unless (fx=? (hashtable-size pending) 0)
+              (let-values (((keys vals) (hashtable-entries pending)))
+                (cp-publish-normalized-mappings-locked!
+                  (let loop ((i 0) (acc '()))
+                    (if (fx=? i (vector-length keys))
+                        (reverse acc)
+                        (loop
+                          (fx+ i 1)
+                          (cons
+                            (cons (vector-ref keys i) (vector-ref vals i))
+                            acc))))))))
+          (for-each
+            (lambda (proc) (proc))
+            (reverse (vector-ref stage cp-stage-operations-index))))))))
 
 ;; LOAD! evaluates one namespace inside an active provider graph. Reuse the
 ;; provider-created stage only for that exact provider root. An ordinary helper

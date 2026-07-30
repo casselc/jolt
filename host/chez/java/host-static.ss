@@ -58,24 +58,28 @@
              kind class member)))
 
 (define (register-class-statics! name members)  ; members: list of (str . val/proc)
-  (let* ((short (short-class-name name))
-         (h (or (hashtable-ref class-statics-tbl name #f)
-                (hashtable-ref class-statics-tbl short #f)
-                (let ((h (make-hashtable string-hash string=?)))
-                  h))))
-    ;; Both the FQN and short name share the same member table — registration
-    ;; under either name lands in the merged table, so re-registrations under one
-    ;; name are visible through the other.
-    (hashtable-set! class-statics-tbl name h)
-    (unless (string=? name short)
-      (hashtable-set! class-statics-tbl short h))
-    (for-each (lambda (p)
-                (let ((old (hashtable-ref h (car p) #f)))
-                  (when old (registry-collision! "static" name (car p) old (cdr p))))
-                (hashtable-set! h (car p) (cdr p)))
-              members)))
+  (class-provider-run-raw-registration!
+    (lambda ()
+      (let* ((short (short-class-name name))
+             (h (or (hashtable-ref class-statics-tbl name #f)
+                    (hashtable-ref class-statics-tbl short #f)
+                    (let ((h (make-hashtable string-hash string=?)))
+                      h))))
+        ;; Both the FQN and short name share the same member table — registration
+        ;; under either name lands in the merged table, so re-registrations under one
+        ;; name are visible through the other.
+        (hashtable-set! class-statics-tbl name h)
+        (unless (string=? name short)
+          (hashtable-set! class-statics-tbl short h))
+        (for-each (lambda (p)
+                    (let ((old (hashtable-ref h (car p) #f)))
+                      (when old (registry-collision! "static" name (car p) old (cdr p))))
+                    (hashtable-set! h (car p) (cdr p)))
+                  members)))))
 
-(define (register-class-ctor! name proc) (hashtable-set! class-ctors-tbl name proc))
+(define (register-class-ctor! name proc)
+  (class-provider-run-raw-registration!
+    (lambda () (hashtable-set! class-ctors-tbl name proc))))
 
 (define (register-host-methods! tag members)
   (let ((h (or (hashtable-ref host-methods-tbl tag #f)
@@ -177,12 +181,17 @@
 ;; checkSpecAsserts) flag) — lands here; the analyzer lowers the set! to a
 ;; set-static-field! call and a plain Class/member read consults the cell first.
 (define mutable-statics-tbl (make-hashtable string-hash string=?))
-(define (mutable-static-cell class member create?)
+(define (mutable-static-cell-raw class member create?)
   (let ((h (or (hashtable-ref mutable-statics-tbl class #f)
                (and create? (let ((nh (make-hashtable string-hash string=?)))
                               (hashtable-set! mutable-statics-tbl class nh) nh)))))
     (and h (or (hashtable-ref h member #f)
                (and create? (let ((c (vector jolt-nil))) (hashtable-set! h member c) c))))))
+(define (mutable-static-cell class member create?)
+  (if create?
+      (class-provider-run-raw-registration!
+        (lambda () (mutable-static-cell-raw class member #t)))
+      (mutable-static-cell-raw class member #f)))
 (def-var! "jolt.host" "set-static-field!"
   (lambda (class member val)
     (class-provider-register-operation!

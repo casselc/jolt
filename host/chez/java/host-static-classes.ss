@@ -921,11 +921,15 @@
         (if (and ns (not (jolt-nil? ns))) (string-append ns "/" (keyword-t-name tag)) (keyword-t-name tag)))
       (jolt-str-render-one tag)))
 (define (register-tagged-methods! tag members)
-  (let* ((key (tag->method-key tag))
-         (h (or (hashtable-ref tagged-methods-tbl key #f)
-                (let ((nh (make-hashtable string-hash string=?)))
-                  (hashtable-set! tagged-methods-tbl key nh) nh))))
-    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
+  (class-provider-run-raw-registration!
+    (lambda ()
+      (let* ((key (tag->method-key tag))
+             (h (or (hashtable-ref tagged-methods-tbl key #f)
+                    (let ((nh (make-hashtable string-hash string=?)))
+                      (hashtable-set! tagged-methods-tbl key nh) nh))))
+        (for-each
+          (lambda (p) (hashtable-set! h (car p) (cdr p)))
+          members)))))
 
 ;; htable arm: dispatch (.method obj a*) through the table's tag method registry;
 ;; an unregistered method falls through (sorted colls are htables too).
@@ -1039,16 +1043,19 @@
   (let loop ((s (jolt-seq v)) (acc '()))
     (if (jolt-nil? s) (reverse acc) (loop (jolt-seq (jolt-rest s)) (cons (jolt-first s) acc)))))
 (define (register-user-class! pred class-fn tags-fn)
-  (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
-    (register-class-arm! p (lambda (x) (jolt-invoke class-fn x)))
-    (set! jt-user-value-tags-arms
-          (append
-            jt-user-value-tags-arms
-            (list
-              (cons
-                p
-                (lambda (x)
-                  (jt-jolt-strs->list (jolt-invoke tags-fn x)))))))))
+  (class-provider-run-raw-registration!
+    (lambda ()
+      (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
+        (register-class-arm! p (lambda (x) (jolt-invoke class-fn x)))
+        (set! jt-user-value-tags-arms
+              (append
+                jt-user-value-tags-arms
+                (list
+                  (cons
+                    p
+                    (lambda (x)
+                      (jt-jolt-strs->list
+                        (jolt-invoke tags-fn x)))))))))))
 (def-var! "clojure.core" "__register-class!"
   (lambda (pred class-fn tags-fn)
     (class-provider-register-operation!

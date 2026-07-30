@@ -781,6 +781,139 @@
   (gate-check "concurrent rollback clears evaluator owner"
     (class-provider-evaluator-owner) #f))
 
+;; A provider-owner raw definition write is intentionally not converted into a
+;; dedicated-hook stage: later source forms may need a deftype constructor or
+;; hierarchy row immediately. It executes under the mutex and remains an
+;; explicitly nontransactional definition effect if source evaluation fails.
+(class-provider-reset-many! '())
+(let ((marker (list 'provider-owner-raw-definition-failure))
+      (raw-ctor (lambda args 'owner-raw)))
+  (let ((result
+          (t-capture
+            (lambda ()
+              (class-provider-load-provider-with!
+                "tx.RawOwner.provider"
+                (lambda (_)
+                  (register-class-ctor! "tx.RawOwner.Host" raw-ctor)
+                  (gate-check "provider owner observes raw definition immediately"
+                    (hashtable-ref class-ctors-tbl "tx.RawOwner.Host" #f)
+                    raw-ctor)
+                  (raise marker)))))))
+    (gate-check "raw-definition source failure preserves exact error"
+      (and (not (t-ok? result))
+           (eq? (t-value result) marker))
+      #t))
+  (gate-check "raw provider-owner definition remains outside rollback"
+    (hashtable-ref class-ctors-tbl "tx.RawOwner.Host" #f)
+    raw-ctor)
+  (gate-check "raw-definition failure clears evaluator owner"
+    (class-provider-evaluator-owner) #f)
+  (gate-check "raw-definition failure leaves no evaluator waiter"
+    (class-provider-evaluator-waiters) 0))
+
+;; A raw definition in a forked child inherits the parent's private stage just
+;; like a dedicated hook. Reject it immediately rather than letting the parent
+;; join a child blocked on the evaluator mutex.
+(class-provider-reset-many! '())
+(let ((done-child (t-make-latch))
+      (child-result (box #f)))
+  (gate-check "provider can join rejected raw-definition child"
+    (class-provider-load-provider-with!
+      "tx.RawChild.provider"
+      (lambda (_)
+        (fork-thread
+          (lambda ()
+            (set-box!
+              child-result
+              (t-capture
+                (lambda ()
+                  (register-class-ctor!
+                    "tx.RawChild.Host"
+                    (lambda args 'raw-child)))))
+            (t-open-latch! done-child)))
+        (t-await-latch!
+          "provider joins raw-definition child without deadlock"
+          done-child)))
+    #t)
+  (gate-check "raw-definition child fails with structured category"
+    (t-captured-error-type (unbox child-result))
+    t-cross-thread)
+  (gate-check "rejected raw-definition child publishes nothing"
+    (hashtable-ref class-ctors-tbl "tx.RawChild.Host" #f)
+    #f)
+  (gate-check "raw-definition child leaves evaluator owner clear"
+    (class-provider-evaluator-owner) #f)
+  (gate-check "raw-definition child creates no evaluator waiter"
+    (class-provider-evaluator-waiters) 0))
+
+;; --- raw registry mutation waits, then survives provider rollback ------------
+;; Runtime definition forms and host bootstrap code call these lower-level
+;; mutators directly rather than through a Clojure-visible provider hook. They
+;; remain outside the staged transaction, but must share its serialized write
+;; boundary so rollback cannot restore an older snapshot over their success.
+(class-provider-reset-many! '())
+(let ((entered (t-make-latch))
+      (release (t-make-latch))
+      (done-owner (t-make-latch))
+      (done-raw (t-make-latch))
+      (owner-result (box #f))
+      (raw-result (box #f))
+      (marker (list 'concurrent-provider-raw-write-failure))
+      (raw-ctor (lambda args 'raw-external)))
+  (fork-thread
+    (lambda ()
+      (set-box!
+        owner-result
+        (t-capture
+          (lambda ()
+            (class-provider-load-provider-with!
+              "tx.RawConcurrentOwner.provider"
+              (lambda (_)
+                (t-call
+                  "clojure.core" "__register-class-ctor!"
+                  "tx.RawConcurrentOwner.Host"
+                  (lambda args 'owner))
+                (class-provider-stage-operation!
+                  (lambda () (raise marker)))
+                (t-open-latch! entered)
+                (t-await-latch-raw! release))))))
+      (t-open-latch! done-owner)))
+  (t-await-latch! "raw-write provider owner entered" entered)
+  (fork-thread
+    (lambda ()
+      (set-box!
+        raw-result
+        (t-capture
+          (lambda ()
+            (register-class-ctor!
+              "tx.RawConcurrentExternal.Host" raw-ctor))))
+      (t-open-latch! done-raw)))
+  (t-await-predicate!
+    "raw registry mutation waits behind provider evaluator"
+    (lambda () (> (class-provider-evaluator-waiters) 0)))
+  (gate-check "waiting raw mutation is not published early"
+    (hashtable-ref class-ctors-tbl "tx.RawConcurrentExternal.Host" #f)
+    #f)
+  (t-open-latch! release)
+  (t-await-latch! "raw-write provider owner completed" done-owner)
+  (t-await-latch! "raw external mutation completed" done-raw)
+  (gate-check "raw-write owner receives commit error"
+    (and (not (t-ok? (unbox owner-result)))
+         (eq? (t-value (unbox owner-result)) marker))
+    #t)
+  (gate-check "raw-write provider prefix rolled back"
+    (hashtable-ref class-ctors-tbl "tx.RawConcurrentOwner.Host" #f)
+    #f)
+  (gate-check "raw external mutation succeeds after rollback"
+    (t-ok? (unbox raw-result)) #t)
+  (gate-check "raw external mutation survives rollback boundary"
+    (hashtable-ref class-ctors-tbl "tx.RawConcurrentExternal.Host" #f)
+    raw-ctor)
+  (gate-check "raw-write rollback drains evaluator waiters"
+    (class-provider-evaluator-waiters) 0)
+  (gate-check "raw-write rollback clears evaluator owner"
+    (class-provider-evaluator-owner) #f))
+
 ;; --- real loader: root commit failure reopens exactly the provider root -------
 ;; A malformed staged static member key fails after the root loader returns. Its
 ;; counter is an intentionally nontransactional side effect proving that cleanup
