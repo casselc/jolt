@@ -235,11 +235,37 @@
   (let ((t (current-time 'time-utc)))
     (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
 
+(define chez-monotonic-api?
+  (guard (e (#t #f))
+    (eq? 'time-monotonic
+         (time-type (current-time 'time-monotonic)))))
+
+(define (now-monotonic-nanos)
+  (if chez-monotonic-api?
+      (let ((t (current-time 'time-monotonic)))
+        (+ (* 1000000000 (time-second t))
+           (time-nanosecond t)))
+      ;; Preserve the previous behavior on a Chez platform without a
+      ;; monotonic source, but expose that degradation to callers below.
+      (* 1000000 (now-millis))))
+
+(def-var! "jolt.host" "monotonic-nanos"
+  (lambda () (->num (now-monotonic-nanos))))
+(def-var! "jolt.host" "monotonic-source"
+  (lambda ()
+    (keyword #f
+             (if chez-monotonic-api?
+                 ;; This reports the Chez API selected, not an unverifiable
+                 ;; promise about its OS backend. Chez may internally degrade
+                 ;; to realtime on a port without a working monotonic clock.
+                 "chez-time-monotonic"
+                 "wall-clock-fallback"))))
+
 ;; clojure.core/current-time-ms — epoch milliseconds; backs the `time` macro.
 (def-var! "clojure.core" "current-time-ms" (lambda () (->num (now-millis))))
 (register-class-statics! "System"
   (list (cons "currentTimeMillis" (lambda () (->num (now-millis))))
-        (cons "nanoTime" (lambda () (->num (* 1000000 (now-millis)))))
+        (cons "nanoTime" (lambda () (->num (now-monotonic-nanos))))
         (cons "exit" (lambda args (exit (if (null? args) 0 (jnum->exact (car args))))))
         ;; System/gc -> a full Chez collection (so weak references clear and their
         ;; guardians fire); Runtime.gc() routes here too.
