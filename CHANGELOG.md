@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Builds retain the explicitly selected Chez toolchain.** The launcher
+  exports the resolved compiler as `JOLT_CHEZ`; isolated compile passes and
+  smoke gates reuse it instead of rediscovering another `chez` from `PATH`.
+  Relative selections remain stable across the launcher's directory change,
+  and shell metacharacters in executable paths stay literal. A child whose
+  version or host machine differs from the running Chez—or whose identity
+  cannot be probed successfully—now fails before any output is linked,
+  preventing mixed boot, fasl, and kernel files.
+
 ## [0.5.12] - 2026-07-29
 
 Stack traces from a build, and from a binary built without direct-linking, now
@@ -73,7 +84,6 @@ and `:as-alias` aliases without loading — both at the REPL and through a build
   registers procedure sources, so on the open-world path a frame maps to a bare
   name; that is the documented trade-off in `source-registry.ss`, and the location
   line is what carries the actionable part.
-
 ## [0.5.11] - 2026-07-29
 
 A warm AOT cache no longer replays a second copy of the stdlib namespaces a

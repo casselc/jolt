@@ -58,10 +58,15 @@
             ((string=? (substring s i (+ i nsub)) sub) #t)
             (else (loop (+ i 1)))))))
 
-;; Shell-quote a path: wrap in single quotes. Paths in this project are assumed
-;; to not contain single quotes (which would break the quoting).
+;; POSIX-shell-quote one argument.  Build commands run through sh on every
+;; platform (bld-sh-wrap supplies it on Windows), so the standard '\'' splice
+;; keeps spaces, apostrophes, and metacharacters literal.
 (define (bld-sh-quote s)
-  (string-append "'" s "'"))
+  (string-append "'"
+    (apply string-append
+      (map (lambda (c) (if (char=? c #\') "'\\''" (string c)))
+           (string->list s)))
+    "'"))
 
 ;; --- toolchain discovery ----------------------------------------------------
 ;; bld-machine / bld-osx? / bld-nt? describe the HOST — the machine the build
@@ -125,33 +130,121 @@
         (let ((p (open-output-file f 'replace)))
           (put-string p cmd)
           (close-port p))
-        (let ((qf (string-append "'"
-                    (apply string-append
-                      (map (lambda (c) (if (char=? c #\') "'\\''" (string c)))
-                           (string->list f)))
-                    "'")))
+        (let ((qf (bld-sh-quote f)))
           (string-append "sh " qf " && rm -f " qf)))
       cmd))
 
-;; The Chez executable, for the isolated compile pass (see build-binary step 4).
+;; Capture stdout and the real shell status in one invocation.  `process`
+;; exposes stdout but not the child's status, so the ordinary bld-sh-capture
+;; cannot establish a fail-closed toolchain probe.  Redirecting to a
+;; process-unique temporary file lets `system` supply the status without
+;; invoking a selected compiler twice.
+(define bld-probe-counter 0)
+(define (bld-probe-temp-path tag)
+  (set! bld-probe-counter (+ bld-probe-counter 1))
+  (let* ((dir (or (getenv "TMPDIR") (getenv "TEMP") (getenv "TMP") "."))
+         (n (string-length dir))
+         (sep (if (and (> n 0)
+                       (let ((c (string-ref dir (- n 1))))
+                         (or (char=? c #\/) (char=? c #\\))))
+                  ""
+                  (if bld-nt? "\\" "/"))))
+    (string-append dir sep "jolt-chez-probe-"
+      (number->string (get-process-id)) "-"
+      (number->string (real-time)) "-"
+      (number->string bld-probe-counter) "-" tag)))
+
+(define (bld-sh-capture/status cmd)
+  (let ((out (bld-probe-temp-path "stdout")) (rc #f) (text ""))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda ()
+        (set! rc
+          (system
+            (bld-sh-wrap
+              (string-append cmd " > " (bld-sh-quote out)))))
+        (when (file-exists? out)
+          (set! text (read-file-string out))))
+      (lambda ()
+        (when (file-exists? out) (delete-file out))))
+    (cons rc text)))
+
+(define (bld-last-token s)
+  (let ((n (string-length s)))
+    (let skip ((i n))
+      (cond
+        ((= i 0) #f)
+        ((char-whitespace? (string-ref s (- i 1))) (skip (- i 1)))
+        (else
+          (let scan ((j (- i 1)))
+            (if (or (= j 0) (char-whitespace? (string-ref s (- j 1))))
+                (substring s j i)
+                (scan (- j 1)))))))))
+
+;; The Chez executable for isolated compile passes (see build-binary step 4).
+;; The launcher/build recipe exports JOLT_CHEZ so the child compiler is the
+;; exact executable running this image. Re-discovering from PATH can select a
+;; different installed Chez and create a fasl/boot/kernel version mixture.
+(define bld-chez-requested
+  (let ((env (getenv "JOLT_CHEZ")))
+    (and env (> (string-length env) 0) env)))
+(define bld-chez-resolved
+  (let ((p (if bld-chez-requested
+               (bld-sh-capture
+                 (string-append
+                   "command -v " (bld-sh-quote bld-chez-requested)))
+               (bld-sh-capture
+                 "command -v chez || command -v chezscheme || command -v scheme || command -v petite"))))
+    (and (> (string-length p) 0) p)))
 (define bld-chez
-  (let ((p (bld-sh-capture "command -v chez || command -v scheme || command -v petite")))
-    (if (> (string-length p) 0) p "chez")))
+  (or bld-chez-resolved bld-chez-requested "chez"))
 
 ;; Chez version off (scheme-version) "Chez Scheme Version X.Y.Z" — last token.
 (define bld-version
-  (let* ((s (scheme-version)) (n (string-length s)))
-    (let loop ((i n))
-      (if (or (= i 0) (char=? (string-ref s (- i 1)) #\space))
-          (substring s i n)
-          (loop (- i 1))))))
+  (or (bld-last-token (scheme-version))
+      (error 'jolt-build "running Chez did not report a parseable version")))
+
+;; Probe the selected child lazily: a self-contained jolt can build an app
+;; wholly in-process and needs no external Chez.  External compile passes check
+;; both version and HOST machine type.  The latter is deliberately independent
+;; of bld-target: a cross build still needs its host compiler to match the
+;; running host Chez; xpatch + the target pack determine the output machine.
+(define bld-chez-probe #f)
+(define (bld-probe-chez)
+  (or bld-chez-probe
+      (let* ((version-result
+               (bld-sh-capture/status
+                 (string-append (bld-sh-quote bld-chez) " --version")))
+             (machine-script (bld-probe-temp-path "machine.ss"))
+             (machine-result
+               (dynamic-wind
+                 (lambda ()
+                   (let ((p (open-output-file machine-script 'replace)))
+                     (put-string p
+                       "(import (chezscheme))\n(display (machine-type))\n(newline)\n")
+                     (close-port p)))
+                 (lambda ()
+                   (bld-sh-capture/status
+                     (string-append (bld-sh-quote bld-chez)
+                       " --script " (bld-sh-quote machine-script))))
+                 (lambda ()
+                   (when (file-exists? machine-script)
+                     (delete-file machine-script)))))
+             (probe (vector
+                      (car version-result)
+                      (bld-last-token (cdr version-result))
+                      (car machine-result)
+                      (bld-last-token (cdr machine-result)))))
+        (set! bld-chez-probe probe)
+        probe)))
 
 ;; The HOST csv<ver>/<machine> dir holding scheme.h, libkernel.a, *.boot. Derived
 ;; from the chez executable's location; JOLT_CHEZ_CSV overrides.
 (define bld-host-csv-dir
   (let ((env (getenv "JOLT_CHEZ_CSV")))
     (or (and env (> (string-length env) 0) env)
-        (let* ((bindir (bld-sh-capture "dirname \"$(command -v chez || command -v scheme || command -v petite)\""))
+        (let* ((bindir (bld-sh-capture
+                         (string-append "dirname " (bld-sh-quote bld-chez))))
                (cand (string-append bindir "/../lib/csv" bld-version "/" bld-machine)))
           cand))))
 ;; The csv dir supplying the boots + kernel + scheme.h that get baked into the
@@ -165,10 +258,56 @@
 (define (bld-have-cc?)
   (> (string-length (bld-sh-capture "command -v cc")) 0))
 
+(define (bld-check-chez-version)
+  (when (and bld-chez-requested (not bld-chez-resolved))
+    (error 'jolt-build
+      (string-append
+        "selected child Chez is not executable: " bld-chez-requested)))
+  (unless bld-chez-resolved
+    (error 'jolt-build
+      "no child Chez executable found for the external compile pass"))
+  (when bld-chez-resolved
+    (let* ((probe (bld-probe-chez))
+           (version-rc (vector-ref probe 0))
+           (version (vector-ref probe 1))
+           (machine-rc (vector-ref probe 2))
+           (machine (vector-ref probe 3)))
+      (unless (zero? version-rc)
+        (error 'jolt-build
+          (string-append
+            "selected child Chez version probe failed: " bld-chez)))
+      (unless version
+        (error 'jolt-build
+          (string-append
+            "selected child Chez did not report a parseable version: "
+            bld-chez)))
+      (unless (string=? version bld-version)
+        (error 'jolt-build
+          (string-append
+            "selected child Chez " bld-chez " reports " version
+            ", but the running Chez reports " bld-version
+            ". Set JOLT_CHEZ to the same executable used to launch Jolt.")))
+      (unless (zero? machine-rc)
+        (error 'jolt-build
+          (string-append
+            "selected child Chez machine probe failed: " bld-chez)))
+      (unless machine
+        (error 'jolt-build
+          (string-append
+            "selected child Chez did not report a machine type: " bld-chez)))
+      (unless (string=? machine bld-machine)
+        (error 'jolt-build
+          (string-append
+            "selected child Chez " bld-chez " reports machine " machine
+            ", but the running Chez reports " bld-machine
+            ". The external compiler must match the running host; "
+            "use --target with a target pack for cross-compilation."))))))
+
 (define (bld-check-toolchain)
   (let ((hint (if (bld-cross?)
                   "\nProvide a target pack (--target-pack DIR) — see tools/cross-compile/README.md."
                   "\nSet JOLT_CHEZ_CSV to the csv<ver>/<machine> dir.")))
+    (bld-check-chez-version)
     (for-each
       (lambda (f)
         (let ((p (string-append (bld-csv-dir) "/" f)))
@@ -1264,7 +1403,8 @@
               (string-append (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "))
           (ei-str-lit flat-so) ")\n"))
       (close-port p))
-    (bld-system (string-append bld-chez " --script '" cs "'")))
+    (bld-system (string-append
+                  (bld-sh-quote bld-chez) " --script " (bld-sh-quote cs))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   ;; The xxd symbol is derived from the path; normalize to jolt_boot.
   (bld-system (string-append
@@ -1351,7 +1491,8 @@
           (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
           (ei-str-lit flat-so) ")\n"))
       (close-port p))
-    (bld-system (string-append bld-chez " --script '" cs "'")))
+    (bld-system (string-append
+                  (bld-sh-quote bld-chez) " --script " (bld-sh-quote cs))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   (bld-system (string-append
     "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "
