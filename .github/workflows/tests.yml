@@ -6,71 +6,244 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+# Every job pins both the setup action revision and the promoted archive digest.
+# The action verifies the archive inventory, requested capabilities, Chez
+# version, and native machine before exporting CHEZ, JOLT_CHEZ,
+# JOLT_CHEZ_CSV, and PATH.
+env:
+  CHEZ_TOOLCHAIN_RELEASE: chez-ci-10.4.1.1
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: full gate (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            toolchain-target: linux-x86_64
+            toolchain-machine: ta6le
+            toolchain-sha256: 16476cd98fb5cb2e2c0285e88fcd6d57ade9392ca8d7cf603ca38432b4118526
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            toolchain-target: linux-aarch64
+            toolchain-machine: tarm64le
+            toolchain-sha256: b5b2306d3d6468b5fc7d5836721b09c704c7750f887a6232f1aeeb567d55f5d9
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
         with:
+          persist-credentials: false
           submodules: recursive   # vendor/irregex, used by the Chez regex shim
 
-      # Build Chez from source rather than the distro package: the apt
-      # chezscheme ships petite+scheme only, with no kernel dev files
-      # (libkernel.a, scheme.h), so `jolt build` (the buildsmoke gate) can't link
-      # a binary and would skip. The source build provides them, plus the libs the
-      # kernel links against.
+      # These are the C toolchain and libraries used when Jolt links a
+      # standalone binary from the archive's verified libkernel.a.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev
 
-      - name: Cache Chez Scheme
-        id: cache-chez
-        uses: actions/cache@v4
+      - name: Install Chez Scheme (shared immutable toolchain)
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3
         with:
-          path: /opt/chez
-          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off
+          target: ${{ matrix.toolchain-target }}
+          release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
+          sha256: ${{ matrix.toolchain-sha256 }}
+          capabilities: source-runtime,gnu-kernel-dev
 
-      - name: Build Chez Scheme from source
-        if: steps.cache-chez.outputs.cache-hit != 'true'
+      - name: Chez toolchain evidence
         run: |
-          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
-          cd /tmp/chez-src
-          # --disable-x11: the expression editor's X11 clipboard isn't needed and
-          # would pull an X11 build/link dep.
-          ./configure --installprefix=/opt/chez --threads --disable-x11
-          make -j"$(nproc)"
-          sudo make install
-          sudo chown -R "$USER" /opt/chez
-
-      - name: Put chez on PATH
-        run: |
-          # Installed as `scheme`; the gate invokes `chez`. A wrapper that execs
-          # scheme keeps argv0 so Chez finds its boot files. Placed next to scheme
-          # so build.ss derives the csv dir (libkernel.a/scheme.h) from it.
-          printf '#!/bin/sh\nexec /opt/chez/bin/scheme "$@"\n' > /opt/chez/bin/chez
-          chmod +x /opt/chez/bin/chez
-          echo '/opt/chez/bin' >> "$GITHUB_PATH"
-          /opt/chez/bin/chez --version
+          echo "target:         ${{ steps.chez.outputs.target }}"
+          echo "archive sha256: ${{ steps.chez.outputs.archive-sha256 }}"
+          echo "cache-hit:      ${{ steps.chez.outputs.cache-hit }}"
+          echo "root:           ${{ steps.chez.outputs.root }}"
+          echo "CHEZ=$CHEZ"
+          echo "JOLT_CHEZ=$JOLT_CHEZ"
+          echo "JOLT_CHEZ_CSV=$JOLT_CHEZ_CSV"
+          "$CHEZ" --version
+          command -v chez
+          command -v cc
+          printf '(import (chezscheme))\n(display (machine-type))\n(newline)\n' \
+            > "$RUNNER_TEMP/machine-type.ss"
+          machine="$("$CHEZ" --script "$RUNNER_TEMP/machine-type.ss")"
+          test "$machine" = "${{ matrix.toolchain-machine }}" || {
+            echo "expected ${{ matrix.toolchain-machine }}, got $machine"; exit 1; }
+          for file in scheme.h libkernel.a petite.boot scheme.boot; do
+            test -f "$JOLT_CHEZ_CSV/$file" || {
+              echo "missing kernel development file: $file"; exit 1; }
+          done
 
       - name: Install JDK + Clojure (certify oracle)
         run: |
           sudo apt-get install -y default-jdk rlwrap
-          # --retry + --fail so a transient CDN error retries instead of handing
-          # bash an HTML error page (a 2min timeout page flaked a run)
+          # Retry transport failures and reject an HTML error page masquerading
+          # as the installer.
           curl --fail --retry 5 --retry-delay 10 --retry-all-errors -L -O \
             https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-          head -1 linux-install.sh | grep -q '^#!' || { echo "installer download corrupt"; cat linux-install.sh | head -5; exit 1; }
+          head -1 linux-install.sh | grep -q '^#!' || {
+            echo "installer download corrupt"; head -5 linux-install.sh; exit 1; }
           sudo bash linux-install.sh
           clojure --version
 
       - name: Gate
-        # `make test` = the self-host byte-fixpoint (the rebuilt seed must equal
-        # the checked-in seed byte-for-byte — holds cross-platform on the pinned
-        # source-built Chez) + the behavior gates (`make ci`: corpus/unit/smoke/
-        # buildsmoke/sci/certify). buildsmoke links a real binary (the source
-        # build ships the kernel dev files).
-        # -j overlaps the independent gates (ci is a plain dependency list);
-        # -Oline keeps per-recipe output contiguous for failure reading.
-        run: make -j"$(nproc)" -Oline test
+        shell: bash
+        # `make test` includes the self-host byte fixpoint and the behavior gate.
+        # Tee the output so the next step can prove that buildsmoke consumed the
+        # kernel-development capability instead of taking its skip path.
+        run: make -j"$(nproc)" -Oline test 2>&1 | tee "$RUNNER_TEMP/gate.log"
 
+      - name: Assert buildsmoke linked a real binary
+        run: |
+          log="$RUNNER_TEMP/gate.log"
+          if grep -q 'build smoke: skipped' "$log"; then
+            echo "FAIL: buildsmoke skipped despite gnu-kernel-dev"
+            exit 1
+          fi
+          grep -q 'build smoke: passed' "$log" || {
+            echo "FAIL: buildsmoke did not report a pass"; exit 1; }
+          echo "buildsmoke consumed gnu-kernel-dev and linked a binary"
+
+  # Native Windows source execution is a separate boundary from the later
+  # packaged dependency and release lanes. This Phase 1 job exercises only the
+  # target, path, host-class, selected-compiler, unit, and Maven HTTP contracts
+  # that are present on the v0.5.11 rebase.
+  windows-x86-source:
+    name: source runtime (Windows x86_64)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      # MSYS2 supplies the POSIX shell and make used by the source gates. No
+      # Chez source checkout or compiler build occurs in this workflow.
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: inherit
+          install: git make
+
+      - name: Install Chez Scheme (shared immutable toolchain)
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3
+        with:
+          target: windows-x86_64
+          release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
+          sha256: 360c60496eea2f8aab0e557eb77e9e18b315bb9181938158ae57655aa541b7f8
+          capabilities: source-runtime
+
+      # The action exports native Windows paths. Scheme consumes the native CSV
+      # path, while make and build.ss resolve CHEZ/JOLT_CHEZ through POSIX sh.
+      - name: Translate executable paths for the POSIX shell
+        run: |
+          chez_posix="$(cygpath -u "$CHEZ")"
+          test -x "$chez_posix"
+          echo "CHEZ=$chez_posix" >> "$GITHUB_ENV"
+          echo "JOLT_CHEZ=$chez_posix" >> "$GITHUB_ENV"
+
+      - name: Chez toolchain evidence
+        run: |
+          echo "target:         ${{ steps.chez.outputs.target }}"
+          echo "archive sha256: ${{ steps.chez.outputs.archive-sha256 }}"
+          echo "cache-hit:      ${{ steps.chez.outputs.cache-hit }}"
+          echo "CHEZ=$CHEZ"
+          echo "JOLT_CHEZ=$JOLT_CHEZ"
+          "$CHEZ" --version
+          printf '(import (chezscheme))\n(display (machine-type))\n(newline)\n' \
+            > "$RUNNER_TEMP/machine-type.ss"
+          machine="$("$CHEZ" --script "$RUNNER_TEMP/machine-type.ss" | tr -d '\r')"
+          test "$machine" = ta6nt || {
+            echo "expected ta6nt, got $machine"; exit 1; }
+
+      - name: Native Windows Phase 1 source gate
+        env:
+          HOME: ${{ runner.temp }}
+          JOLT_AOT_CACHE: "0"
+          JOLT_SH: C:/Program Files/Git/bin/sh.exe
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          make -j1 targetfacts pathfacts hostclass selectedchez unit
+          JOLT_PWD="$GITHUB_WORKSPACE" \
+            "$CHEZ" --script host/chez/cli.ss run test/mvn_http_test.clj
+
+  # The hosted ARM64 image is still a preview, so an image outage does not block
+  # established lanes. The job nevertheless fails its own source gate unless the
+  # archive is native tarm64nt and the Phase 1 contracts pass.
+  windows-arm64-source:
+    name: source runtime (Windows aarch64 preview)
+    runs-on: windows-11-vs2026-arm
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Chez Scheme (shared immutable toolchain)
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3
+        with:
+          target: windows-arm64
+          release-tag: ${{ env.CHEZ_TOOLCHAIN_RELEASE }}
+          sha256: 9bc28462823a1447de6d849e129758a6317cc9deafb8e87414817e7244f149c8
+          capabilities: source-runtime
+
+      - name: Native Windows ARM64 Phase 1 source gate
+        shell: pwsh
+        env:
+          HOME: ${{ runner.temp }}
+          JOLT_AOT_CACHE: "0"
+          JOLT_SH: C:/Program Files/Git/bin/sh.exe
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          Write-Host "target:         ${{ steps.chez.outputs.target }}"
+          Write-Host "archive sha256: ${{ steps.chez.outputs.archive-sha256 }}"
+          Write-Host "cache-hit:      ${{ steps.chez.outputs.cache-hit }}"
+          $chez = $env:CHEZ
+          if (-not (Test-Path -LiteralPath $chez)) {
+            throw "Chez ARM64 executable not found: $chez"
+          }
+          & $chez --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $probe = Join-Path $env:RUNNER_TEMP 'machine-type.ss'
+          Set-Content -LiteralPath $probe -Value @(
+            '(import (chezscheme))'
+            '(display (machine-type))'
+            '(newline)'
+          )
+          $machine = (& $chez --script $probe | Select-Object -First 1).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "machine-type:   $machine"
+          if ($machine -ne 'tarm64nt') {
+            throw "expected native tarm64nt Chez, got '$machine'"
+          }
+
+          $gates = @(
+            'test\chez\target-descriptor-test.ss'
+            'test\chez\path-contract-test.ss'
+            'test\chez\host-class-registry-test.ss'
+            'host\chez\run-unit.ss'
+          )
+          foreach ($gate in $gates) {
+            & $chez --script $gate
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+          $env:JOLT_PWD = $env:GITHUB_WORKSPACE
+          & $chez --script host\chez\cli.ss run test\mvn_http_test.clj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
