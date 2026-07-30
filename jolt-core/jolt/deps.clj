@@ -1071,6 +1071,9 @@
   namespace the runtime already resolves. Returns the vector of roots added
   (empty when everything was already on the roots).
 
+  :jolt/class-providers declarations from the inline map and selected
+  dependencies are reconciled and registered before roots change.
+
   :jolt/native declarations carried by added deps are NOT auto-loaded (that is
   a project-launch concern — see jolt.main); a warning names them so the
   caller can load via jolt.ffi. The second arity accepts an options map for
@@ -1078,12 +1081,21 @@
   ([deps-map] (add-deps deps-map nil))
   ([{:keys [deps] :as m} _opts]
    (let [base (or (getenv "JOLT_PWD") ".")
-         {:keys [roots natives]}
+         {:keys [roots natives class-provider-declarations]}
          (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo m)]
                                       (abspath base r))]
            (resolve-deps deps base))
+         inline-provider-declarations
+         (provider-declarations
+           (:jolt/class-providers m)
+           {:kind :add-deps :base-dir base})
+         {:keys [class-providers]}
+         (reconcile-class-providers
+           (concat inline-provider-declarations class-provider-declarations))
          current (vec (jolt.host/source-roots))
          added (vec (remove (set current) (dedup-by identity roots)))]
+     (when (seq class-providers)
+       (jolt.host/register-class-providers! class-providers))
      (when (seq added)
        (jolt.host/set-source-roots! (into current added)))
      (when (seq natives)

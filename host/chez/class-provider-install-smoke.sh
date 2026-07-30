@@ -1,5 +1,5 @@
 #!/bin/sh
-# Project-aware CLI installation of resolved :jolt/class-providers metadata.
+# Project-aware CLI and add-deps installation of :jolt/class-providers metadata.
 set -u
 
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
@@ -54,6 +54,41 @@ check "conflicting registration is atomic and preserves the installed provider" 
   ":jolt.deps/class-provider-conflict" \
   "$(run_expr "$app" \
       '(try (jolt.host/register-class-providers! {"provider.install.Widget" "provider.install.other"}) :missing-conflict (catch Throwable e (let [t (:type (ex-data e))] (jolt.host/register-class-providers! {"provider.install.Widget" "provider.install.impl"}) t)))')"
+
+check "add-deps installs inline provider metadata" \
+  ":installed" \
+  "$(run_expr "$app" \
+      '(do (require (quote jolt.deps)) (jolt.deps/add-deps {:jolt/class-providers {"provider.add.Inline" "provider.add.inline"}}) (jolt.host/register-class-providers! {"provider.add.Inline" "provider.add.inline"}) :installed)')"
+
+add_dep="$tmp/add-deps-lib"
+mkdir -p "$add_dep/src/provideradd"
+cat >"$add_dep/deps.edn" <<'EOF'
+{:jolt/class-providers
+ {"provider.add.Dependency" provider.add.dependency}}
+EOF
+cat >"$add_dep/src/provideradd/core.clj" <<'EOF'
+(ns provideradd.core)
+(defn ping [] :pong)
+EOF
+check "add-deps installs selected dependency provider metadata" \
+  ":installed" \
+  "$(run_expr "$app" \
+      '(do (require (quote jolt.deps)) (jolt.deps/add-deps (quote {:deps {provider.add/lib {:local/root "../add-deps-lib"}}})) (jolt.host/register-class-providers! {"provider.add.Dependency" "provider.add.dependency"}) :installed)')"
+
+atomic_dep="$tmp/atomic-lib"
+mkdir -p "$atomic_dep/src/provideratomic"
+cat >"$atomic_dep/deps.edn" <<'EOF'
+{:jolt/class-providers
+ {"provider.add.Atomic" provider.add.dependency}}
+EOF
+cat >"$atomic_dep/src/provideratomic/core.clj" <<'EOF'
+(ns provideratomic.core)
+(defn ping [] :pong)
+EOF
+check "add-deps provider conflict leaves dependency roots unpublished" \
+  "[:jolt.deps/class-provider-conflict true]" \
+  "$(run_expr "$app" \
+      '(do (require (quote jolt.deps)) (let [t (try (jolt.deps/add-deps (quote {:jolt/class-providers {"provider.add.Atomic" provider.add.inline} :deps {provider.add/atomic {:local/root "../atomic-lib"}}})) :missing-conflict (catch Throwable e (:type (ex-data e)))) absent? (try (require (quote provideratomic.core)) false (catch Throwable _ true))] [t absent?]))')"
 
 conflict_dep="$tmp/conflict-lib"
 conflict_app="$tmp/conflict-app"
