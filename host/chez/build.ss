@@ -450,7 +450,16 @@
         ((memq entry '(image compile-eval))
          (unless drop-compiler? (bld-inline-line (cdr (assq entry bld-tagged-loads)) out 0)))
         (else (bld-inline-line entry out 0))))
-    bld-runtime-manifest))
+    bld-runtime-manifest)
+  ;; jolt-sim-flavor? (compile-eval.ss) is set once, at startup, by the special
+  ;; `sim` Jolt build's own launcher — never by an ordinary release/debug
+  ;; binary. When it IS set, this binary's own `jolt build` (of itself or of an
+  ;; app) must carry the sim-only overlay too, so the future/FFI vars it
+  ;; rebinds — and any defcfn emission that references jolt-ffi-sim-hook — are
+  ;; defined in what gets built. bld-runtime-manifest above is intentionally
+  ;; unchanged, so an ordinary binary's emission here is unaffected.
+  (when jolt-sim-flavor?
+    (bld-inline-line "(load \"host/chez/sim/runtime.ss\")" out 0)))
 
 ;; --- app emission -----------------------------------------------------------
 ;; Re-emit one app namespace to a list of Scheme strings: run-passes (const-fold +

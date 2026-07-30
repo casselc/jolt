@@ -42,7 +42,7 @@ build_one() {
 build_one "$normal_abs" normal
 build_one "$sim_abs" sim
 
-want='[40 2]'
+want='[40 2 42]'
 normal_got="$("$work/normal-app")"
 sim_got="$("$work/sim-app")"
 [ "$normal_got" = "$want" ] || {
@@ -98,6 +98,28 @@ normal_cfn="$(find_definition "normal c-abs" 'define jv$app.core$c-abs ' "$work/
 normal_blocking="$(find_definition "normal c-abs-blocking" 'define jv$app.core$c-abs-blocking ' "$work/normal-flat.ss")"
 sim_cfn="$(find_definition "sim c-abs" 'define jv$app.core$c-abs ' "$work/sim-flat.ss")"
 sim_blocking="$(find_definition "sim c-abs-blocking" 'define jv$app.core$c-abs-blocking ' "$work/sim-flat.ss")"
+
+# The real app images must also prove the runtime packaging boundary: the
+# ordinary image contains neither hook definition, while the sim image carries
+# both overlay subsystems. Match exact definition shapes because the shared
+# compiler image legitimately contains the hook names as emitter string data.
+for definition in \
+  '(define jolt-future-hook (box #f))' \
+  '(define jolt-ffi-sim-hook #f)'; do
+  if grep -Fq "$definition" "$work/normal-flat.ss"; then
+    echo "sim compiler profile smoke: normal app included sim runtime overlay: $definition" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$definition" "$work/sim-flat.ss"; then
+    echo "sim compiler profile smoke: sim app omitted runtime overlay: $definition" >&2
+    exit 1
+  fi
+  count="$(grep -F -c "$definition" "$work/sim-flat.ss")"
+  if [ "$count" -ne 1 ]; then
+    echo "sim compiler profile smoke: sim app included runtime overlay $count times: $definition" >&2
+    exit 1
+  fi
+done
 
 for line in "$normal_cfn" "$normal_blocking"; do
   reject_text "normal app definition" "$line" "jolt-ffi-sim-hook"

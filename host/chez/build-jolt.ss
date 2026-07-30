@@ -64,6 +64,13 @@
 (unless (or jb-release? (string=? jb-profile "debug"))
   (error 'build-jolt "profile must be \"release\", \"debug\", or \"sim\"" jb-profile))
 
+;; The sim-only runtime overlay (host/chez/sim/runtime.ss) rebinds the future/
+;; FFI vars concurrency.ss and java/ffi.ss keep branch-free for ordinary
+;; release/debug. Load it into THIS process only for the sim profile — it is
+;; also inlined into the emitted flat.ss below (jb-sim-init-form's neighbor,
+;; the runtime-embed step) so target/sim/jolt carries it at every startup.
+(when jb-sim? (load "host/chez/sim/runtime.ss"))
+
 ;; Cross-compilation: an optional 3rd arg is the target Chez machine, and the
 ;; target pack comes from $JOLT_TARGET_PACK — cross-builds jolt itself for
 ;; another platform (e.g. restoring the x86_64-macos release artifact from an
@@ -135,6 +142,11 @@
     (for-each (lambda (entry) (when (string? entry) (walk (bld-load-path entry))))
               bld-runtime-manifest)
     (for-each (lambda (kv) (walk (bld-load-path (cdr kv)))) bld-tagged-loads)
+    ;; The sim-only overlay is NOT part of bld-runtime-manifest (ordinary
+    ;; manifests stay strict and unchanged) — add it to this profile's own
+    ;; closure only, so a self-contained build FROM this sim binary can also
+    ;; embed it (bld-source-string's embedded-resource lookup in build.ss).
+    (when jb-sim? (walk "host/chez/sim/runtime.ss"))
     (reverse order)))
 
 (define (jb-emit-runtime-embeds out)
@@ -277,6 +289,14 @@
                                  (ei-str-lit jb-version) ")\n"))
   ;; full runtime + compiler image: keep the compiler (jolt evals at runtime).
   (bld-emit-runtime out #f #f)
+  ;; The sim-only runtime overlay — ONLY for the "sim" profile, inlined right
+  ;; after the ordinary runtime so its def-var! rebindings (future-call,
+  ;; future-cancel, the jolt.ffi ops) run at every startup of this binary.
+  ;; bld-runtime-manifest itself is untouched, so a release/debug build's
+  ;; emitted flat.ss is byte-identical to before this overlay existed.
+  (when jb-sim?
+    (put-string out "\n;; === simulation-only runtime overlay ===\n")
+    (bld-inline-line "(load \"host/chez/sim/runtime.ss\")" out 0))
   ;; The build subsystem (build.ss + emit-image.ss + dce.ss, fully inlined) and the
   ;; runtime .ss source embeds it reads are needed ONLY by `jolt build`. As eager
   ;; top-level forms they cost ~45ms at EVERY startup (build.ss defines ~18ms, the

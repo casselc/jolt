@@ -53,6 +53,11 @@
 (load "host/chez/loader.ss")
 (set-source-roots! ldr-install-roots)
 (load "host/chez/java/ffi.ss")
+;; The native-op interception this gate drives (jolt-ffi-sim-hook,
+;; jolt-ffi-install-sim-hook!/-clear-sim-hook!, the ffi-sim-* wrappers) lives
+;; in the simulation-only overlay, not in java/ffi.ss itself — an ordinary
+;; release/debug binary never loads it and its raw ops stay branch-free.
+(load "host/chez/sim/runtime.ss")
 
 ;; Current pre-remint seeds have no setter and emit the hook branch
 ;; unconditionally. Reminted seeds default to ordinary direct FFI emission, so
@@ -342,10 +347,12 @@
 ;; A native operation must keep using the shared fail-closed invocation helper:
 ;; if the hook itself performs another intercepted native operation on the same
 ;; thread, reject it instead of recursing or reaching real foreign memory.
+;; ffi-sim-sizeof (not the base, branch-free ffi-sizeof) is the entry point
+;; jolt.ffi/sizeof is rebound to, so it is what re-enters the seam here.
 (define reentrant-installation
   (jolt-ffi-install-sim-hook!
    (lambda (desc)
-     (ffi-sizeof (car (dget desc 'args))))))
+     (ffi-sim-sizeof (car (dget desc 'args))))))
 (ok "native operation reentrancy fails closed"
     (guard (e (#t #t))
       (ev "(ffi/sizeof :int)")

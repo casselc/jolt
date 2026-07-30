@@ -4,9 +4,17 @@
 ;; The application forms below use clojure.core/future, deref, atoms, and
 ;; exceptions unchanged. Scheme is only the test controller that installs the
 ;; internal hook and releases task-start permits.
+;;
+;; The hook itself (jolt-future-hook-set!/-clear!, the id allocator, the
+;; jolt-hooked-future record) lives in the simulation-only overlay
+;; (host/chez/sim/runtime.ss), loaded explicitly below — NOT in
+;; host/chez/java/concurrency.ss, which an ordinary release/debug binary loads
+;; branch-free with no hook global at all. See
+;; ordinary-future-no-sim-hook-test.ss for that base-image gate.
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
+(load "host/chez/sim/runtime.ss")
 
 (define total 0)
 (define fails 0)

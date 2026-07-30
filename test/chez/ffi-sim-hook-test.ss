@@ -46,6 +46,12 @@
 (load "host/chez/loader.ss")
 (set-source-roots! ldr-install-roots)
 (load "host/chez/java/ffi.ss")
+;; The install/clear/invoke machinery this gate drives (jolt-ffi-sim-hook,
+;; jolt-ffi-install-sim-hook!, jolt-ffi-invoke-sim-hook, …) lives in the
+;; simulation-only overlay, not in java/ffi.ss itself — an ordinary
+;; release/debug binary never loads it. See ordinary-ffi-no-sim-hook-test.ss
+;; for the gate proving java/ffi.ss alone carries none of it.
+(load "host/chez/sim/runtime.ss")
 
 ;; This gate exercises the RUNTIME install/clear behavior of the interception
 ;; seam, so turn the compile-time flavor on for every defcfn compiled below —

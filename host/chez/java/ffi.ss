@@ -17,18 +17,12 @@
 ;; at load with a platform-specific name. (load-library) with no name (or #f)
 ;; loads the running process's own symbols (libc, sockets).
 (define (ffi-load-library . args)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "load-library" args)
-        (if (or (null? args) (jolt-nil? (car args)))
-            (begin (load-shared-object #f) jolt-nil)
-            (begin (load-shared-object (jolt-str-render-one (car args))) jolt-nil)))))
+  (if (or (null? args) (jolt-nil? (car args)))
+      (begin (load-shared-object #f) jolt-nil)
+      (begin (load-shared-object (jolt-str-render-one (car args))) jolt-nil)))
 
 (define (ffi-loaded? name)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "loaded?" (list name))
-        (guard (e (#t #f)) (load-shared-object (jolt-str-render-one name)) #t))))
+  (guard (e (#t #f)) (load-shared-object (jolt-str-render-one name)) #t))
 
 ;; --- foreign type keywords ---------------------------------------------------
 ;; The keyword type names jolt.ffi accepts (in foreign-fn signatures and the
@@ -63,36 +57,14 @@
 ;; --- foreign memory ----------------------------------------------------------
 ;; alloc returns a pointer (integer address). The caller frees it. read/write take
 ;; a type keyword and an optional byte offset.
-(define (ffi-alloc nbytes)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "alloc" (list nbytes))
-        (foreign-alloc (jnum->exact nbytes)))))
-(define (ffi-free ptr)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "free" (list ptr))
-        (begin (foreign-free (jnum->exact ptr)) jolt-nil))))
+(define (ffi-alloc nbytes) (foreign-alloc (jnum->exact nbytes)))
+(define (ffi-free ptr) (foreign-free (jnum->exact ptr)) jolt-nil)
 (define (ffi-read ptr ty . off)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "read" (cons ptr (cons ty off)))
-        (foreign-ref (ffi-type->chez ty) (jnum->exact ptr)
-                     (if (pair? off) (jnum->exact (car off)) 0)))))
+  (foreign-ref (ffi-type->chez ty) (jnum->exact ptr) (if (pair? off) (jnum->exact (car off)) 0)))
 (define (ffi-write ptr ty off val)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "write" (list ptr ty off val))
-        (begin
-          (foreign-set! (ffi-type->chez ty) (jnum->exact ptr)
-                        (jnum->exact off) val)
-          jolt-nil))))
+  (foreign-set! (ffi-type->chez ty) (jnum->exact ptr) (jnum->exact off) val) jolt-nil)
 ;; sizeof a foreign type (for laying out structs / arrays).
-(define (ffi-sizeof ty)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "sizeof" (list ty))
-        (foreign-sizeof (ffi-type->chez ty)))))
+(define (ffi-sizeof ty) (foreign-sizeof (ffi-type->chez ty)))
 (define (ffi-null? ptr) (and (number? ptr) (= (jnum->exact ptr) 0)))
 (define ffi-null 0)
 
@@ -100,31 +72,14 @@
 ;; read n bytes at ptr as a string (UTF-8, falling back to latin1 for invalid
 ;; sequences) — for a socket recv buffer and similar fixed-length reads.
 (define (ffi-read-bytes ptr n)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "read-bytes" (list ptr n))
-        (let* ((n (jnum->exact n)) (p (jnum->exact ptr))
-               (bv (make-bytevector n)))
-          (do ((i 0 (+ i 1)))
-              ((= i n))
-            (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 p i)))
-          (guard
-            (e (#t
-                (list->string
-                 (map integer->char (bytevector->u8-list bv)))))
-            (utf8->string bv))))))
+  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n)))
+    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 p i)))
+    (guard (e (#t (list->string (map integer->char (bytevector->u8-list bv))))) (utf8->string bv))))
 ;; write a string's UTF-8 bytes into ptr (no NUL terminator); return the count.
 (define (ffi-write-bytes ptr s)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "write-bytes" (list ptr s))
-        (let* ((bv (string->utf8 (jolt-str-render-one s)))
-               (n (bytevector-length bv))
-               (p (jnum->exact ptr)))
-          (do ((i 0 (+ i 1)))
-              ((= i n))
-            (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
-          n))))
+  (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv)) (p (jnum->exact ptr)))
+    (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+    n))
 (def-var! "jolt.ffi" "read-bytes" ffi-read-bytes)
 (def-var! "jolt.ffi" "write-bytes" ffi-write-bytes)
 
@@ -135,26 +90,13 @@
 ;; fresh byte-array of n bytes; write-array copies a byte-array's bytes into ptr
 ;; and returns the count.
 (define (ffi-read-array ptr n)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "read-array" (list ptr n))
-        (let* ((n (jnum->exact n)) (p (jnum->exact ptr))
-               (v (make-vector n 0)))
-          (do ((i 0 (+ i 1)))
-              ((= i n))
-            (vector-set! v i (foreign-ref 'unsigned-8 p i)))
-          (make-jolt-array v 'byte)))))
+  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
+    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (foreign-ref 'unsigned-8 p i)))
+    (make-jolt-array v 'byte)))
 (define (ffi-write-array ptr arr)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "write-array" (list ptr arr))
-        (let* ((v (jolt-array-vec arr)) (n (vector-length v))
-               (p (jnum->exact ptr)))
-          (do ((i 0 (+ i 1)))
-              ((= i n))
-            (foreign-set! 'unsigned-8 p i
-                          (bitwise-and (exact (vector-ref v i)) #xff)))
-          n))))
+  (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
+    (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
+    n))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
 
@@ -162,33 +104,22 @@
 ;; A C string result already comes back as a jolt string (the `string` foreign
 ;; type). For a `void*` that points at a NUL-terminated C string, read it here.
 (define (ffi-ptr->string ptr)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "ptr->string" (list ptr))
-        (if (ffi-null? ptr)
-            jolt-nil
-            (let ((p (jnum->exact ptr)))
-              (let loop ((i 0) (acc '()))
-                (let ((b (foreign-ref 'unsigned-8 p i)))
-                  (if (= b 0)
-                      (utf8->string (u8-list->bytevector (reverse acc)))
-                      (loop (+ i 1) (cons b acc))))))))))
+  (if (ffi-null? ptr) jolt-nil
+      (let ((p (jnum->exact ptr)))
+        (let loop ((i 0) (acc '()))
+          (let ((b (foreign-ref 'unsigned-8 p i)))
+            (if (= b 0) (utf8->string (u8-list->bytevector (reverse acc)))
+                (loop (+ i 1) (cons b acc))))))))
 ;; Copy a jolt string's UTF-8 bytes into a freshly alloc'd NUL-terminated buffer;
 ;; the caller frees it. Returns the pointer.
 (define (ffi-string->ptr s)
-  (let ((h jolt-ffi-sim-hook))
-    (if h
-        (jolt-ffi-invoke-native-sim-op h "string->ptr" (list s))
-        (let* ((bv (string->utf8 (jolt-str-render-one s)))
-               (n (bytevector-length bv))
-               (p (foreign-alloc (+ n 1))))
-          ;; free on a mid-copy throw — the caller only ever sees a whole buffer
-          (guard (e (#t (guard (_ (#t #f)) (foreign-free p)) (raise e)))
-            (do ((i 0 (+ i 1)))
-                ((= i n))
-              (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
-            (foreign-set! 'unsigned-8 p n 0)
-            p)))))
+  (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv))
+         (p (foreign-alloc (+ n 1))))
+    ;; free on a mid-copy throw — the caller only ever sees a whole buffer
+    (guard (e (#t (guard (_ (#t #f)) (foreign-free p)) (raise e)))
+      (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+      (foreign-set! 'unsigned-8 p n 0)
+      p)))
 
 ;; --- callbacks: receive calls FROM C ----------------------------------------
 ;; jolt.ffi/foreign-callable lowers to (jolt-ffi-register-callable! (foreign-callable …)).
@@ -249,112 +180,6 @@
            #f)
           ((guard (e (#t #f)) (load-shared-object (car cs)) #t) #t)
           (else (loop (cdr cs)))))))
-
-;; --- FFI call interception (simulation seam) --------------------------------
-;; jolt-ffi-sim-hook, when non-#f, intercepts EVERY jolt.ffi/defcfn call before
-;; the native symbol is ever resolved: emit-ffi-fn (jolt-core/jolt/backend_scheme.clj)
-;; checks this variable on EVERY call (not just the first), and when set calls the
-;; hook with a descriptor instead of forcing the `foreign-procedure` form — so the
-;; untaken branch means the native symbol is never looked up. With no hook
-;; installed, the generated code takes the original lazy-cached foreign-procedure
-;; path unchanged (one extra variable check per call).
-;;
-;; Internal/test-oriented only: no jolt.ffi/... var exposes this, and it is not a
-;; public simulation DSL — a simulation controller installs/clears it directly
-;; from Scheme (see test/chez/ffi-sim-hook-test.ss).
-;;
-;; Installations form a strict stack. Clearing requires the token returned by
-;; install and only the current owner may clear. This gives nested simulations a
-;; precise restore operation and makes an out-of-order concurrent clear fail
-;; closed instead of silently disabling another controller.
-(define-record-type jolt-ffi-sim-hook-installation
-  (fields hook previous)
-  (nongenerative jolt-ffi-sim-hook-installation-v1))
-(define jolt-ffi-sim-hook #f) ; current hook, kept separate for the hot-path read
-(define jolt-ffi-sim-hook-top #f)
-(define jolt-ffi-sim-hook-mu (make-mutex))
-(define jolt-ffi-sim-hook-active-owner (make-thread-parameter #f))
-
-(define (jolt-ffi-install-sim-hook! h)
-  (unless h
-    (error 'jolt-ffi-install-sim-hook! "hook must be non-false"))
-  (with-mutex jolt-ffi-sim-hook-mu
-    (let ((installation
-           (make-jolt-ffi-sim-hook-installation h jolt-ffi-sim-hook-top)))
-      (set! jolt-ffi-sim-hook-top installation)
-      (set! jolt-ffi-sim-hook h)
-      installation)))
-
-(define (jolt-ffi-clear-sim-hook! installation)
-  (with-mutex jolt-ffi-sim-hook-mu
-    (unless (eq? installation jolt-ffi-sim-hook-top)
-      (error 'jolt-ffi-clear-sim-hook!
-             "simulation hooks must be cleared by their current owner"))
-    (let ((previous
-           (jolt-ffi-sim-hook-installation-previous installation)))
-      (set! jolt-ffi-sim-hook-top previous)
-      (set! jolt-ffi-sim-hook
-            (and previous
-                 (jolt-ffi-sim-hook-installation-hook previous)))))
-  jolt-nil)
-
-;; A stable plain descriptor for one intercepted call: an alist keyed by csym /
-;; argtypes / rettype / blocking / args. argtypes is a list of type-name strings
-;; (foreign-fn's keyword names, without the leading colon, e.g. "int" "string");
-;; args is the list of actual jolt arguments in call order. Descriptor metadata
-;; strings are copied on every call so a hook cannot mutate a later descriptor.
-;; Argument objects deliberately remain live: a native stub must be able to
-;; emulate writes through byte arrays/pointers. The hook's return value stands
-;; in for the call's result.
-(define (jolt-ffi-make-sim-descriptor csym argtypes rettype blocking args)
-  (list (cons 'csym (string-copy csym))
-        (cons 'argtypes (map string-copy argtypes))
-        (cons 'rettype (string-copy rettype))
-        (cons 'blocking blocking)
-        (cons 'args args)))
-
-(define (jolt-ffi-invoke-sim-hook h descriptor)
-  ;; A hook that performs FFI would otherwise recursively intercept itself.
-  ;; Fail closed until a future explicit, scoped real-call continuation exists;
-  ;; clearing/reinstalling the process-global hook is never a safe bypass.
-  ;;
-  ;; Chez thread parameters are inherited by forked threads, so retain the
-  ;; active thread id rather than a boolean. A child inheriting its parent's id
-  ;; is not permanently poisoned; only recursion on the same dynamic thread is
-  ;; rejected.
-  (let ((self (get-thread-id)))
-    (when (eqv? self (jolt-ffi-sim-hook-active-owner))
-      (error 'jolt-ffi-invoke-sim-hook
-             "reentrant FFI from a simulation hook is not supported"))
-    (parameterize ((jolt-ffi-sim-hook-active-owner self))
-      (jolt-invoke h descriptor))))
-
-;; A native-op interception extends the SAME hook (and so its stack ownership +
-;; reentrancy guard above) to the runtime primitives a jolt library uses to load
-;; shared objects and manage raw foreign memory: load-library, loaded?, alloc,
-;; free, read, write, read-bytes, write-bytes, read-array, write-array,
-;; ptr->string, string->ptr, sizeof. Each primitive reads the same hot-path
-;; variable and, when a hook is installed, routes the call through it instead of
-;; the OS loader / Chez foreign-memory ops; with no hook the original body runs
-;; unchanged and NO descriptor is allocated, so a disabled seam has exactly its
-;; prior behavior (one extra variable read per call).
-;;
-;; The descriptor is a stable plain alist with kind `native-op`, `op` (a
-;; snapshot of the operation name), and `args` (the live jolt call arguments, in
-;; call order). The kind/op keys distinguish it from a defcfn call descriptor,
-;; which is keyed by `csym`. Argument objects deliberately remain live so a hook
-;; can emulate writes through byte arrays / pointers (out-param emulation); the
-;; hook's return value stands in for the primitive's result. Under a hook,
-;; nonexistent libraries and the fake pointers a hook may hand back therefore
-;; never reach the OS loader or Chez's foreign memory primitives.
-(define (jolt-ffi-make-native-sim-descriptor op args)
-  (list (cons 'kind 'native-op)
-        (cons 'op (string-copy op))
-        (cons 'args args)))
-
-(define (jolt-ffi-invoke-native-sim-op h op args)
-  (jolt-ffi-invoke-sim-hook h
-                            (jolt-ffi-make-native-sim-descriptor op args)))
 
 ;; --- expose under jolt.ffi ---------------------------------------------------
 (def-var! "jolt.ffi" "free-callable" ffi-free-callable)
