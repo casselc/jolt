@@ -808,10 +808,22 @@
          (str "Qualified instance method " (str ns "/" nm)
               " used as value; value form not yet supported. Use (.method target ...) or (Class/.method target ...) instead."))
       ns (let [r (resolve-global ctx form)]
-           (if (= :var (:kind r))
+           (case (:kind r)
+             :var
              (or (macro-value-fn ctx form r)
                  (do (deny-macro-value ctx form r)
-                     (cond-> (var-ref (:ns r) (:name r)) (:num-ret r) (assoc :num-ret (:num-ret r)))))
+                     (cond-> (var-ref (:ns r) (:name r))
+                       (:num-ret r) (assoc :num-ret (:num-ret r)))))
+
+             ;; A known namespace alias is a var namespace, not a class token.
+             ;; Missing qualified vars stay strict even when
+             ;; *allow-unresolved-vars* is true, matching Compiler.resolveIn:
+             ;; that opt-out applies only to an unqualified symbol with no
+             ;; mapping. `declare` or an earlier def remains the forward-ref
+             ;; mechanism.
+             :alias-var
+             (resolve-error ctx (str ns "/" nm) env)
+
              ;; A non-var qualified ref `Class/member` is a host class static
              ;; (Math/sqrt, Long/MAX_VALUE, System/getenv). The Chez back end
              ;; lowers it to a runtime static dispatch.

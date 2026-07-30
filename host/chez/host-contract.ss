@@ -31,6 +31,7 @@
 (define hc-kw-ns    (keyword #f "ns"))
 (define hc-kw-name  (keyword #f "name"))
 (define hc-kw-var   (keyword #f "var"))
+(define hc-kw-alias-var (keyword #f "alias-var"))
 (define hc-kw-unresolved (keyword #f "unresolved"))
 (define hc-kw-class (keyword #f "class"))
 (define hc-kw-num-ret (keyword #f "num-ret"))
@@ -287,8 +288,10 @@
 
 ;; Classify a global (non-local) symbol reference against the var registry:
 ;;   {:kind :var :ns NS :name NAME}   — a defined var (compile ns / clojure.core)
-;;   {:kind :unresolved :name NAME}   — not found (late-bind -> var-ref @ compile ns;
-;;                                      a qualified one -> host-static in the analyzer)
+;;   {:kind :alias-var :ns NS :name NAME}
+;;                                    — a missing member under a known namespace
+;;                                      alias; never a host class/static token
+;;   {:kind :unresolved :name NAME}   — no var or known alias mapping
 ;; No :host branch: there is no separate native-op env — the hot
 ;; clojure.core primitives (+,-,map,...) are declared in clojure.core below so
 ;; they classify as :var and the emitter's native-op path lowers them.
@@ -327,6 +330,11 @@
 
 (define (hc-resolve-global ctx sym)
   (let* ((nm (symbol-t-name sym))
+         (sns (symbol-t-ns sym))
+         (qualified (and sns (not (jolt-nil? sns)) (not (null? sns)) sns))
+         (alias-target
+           (and qualified
+                (chez-resolve-alias (chez-actx-cns ctx) qualified)))
          (cell (hc-resolve-cell ctx sym)))
     (if (and cell (var-cell-defined? cell))
         (let ((base (jolt-hash-map hc-kw-kind hc-kw-var
@@ -335,6 +343,13 @@
               (nr (hc-cell-num-ret cell)))
           (if nr (jolt-assoc base hc-kw-num-ret nr) base))
         (cond
+          ;; Namespace aliases are categorical: `a/name` denotes a var in the
+          ;; aliased namespace, never a class named `a`. This branch must precede
+          ;; name-based class recognition so `a/String` cannot become a static
+          ;; reference merely because its missing member is capitalized.
+          (alias-target
+           (jolt-hash-map hc-kw-kind hc-kw-alias-var
+                          hc-kw-ns alias-target hc-kw-name nm))
           ;; java.util.Map / clojure.lang.Named — a dotted class name.
           ((hc-fq-class-name? nm) (jolt-hash-map hc-kw-kind hc-kw-class hc-kw-name nm))
           ;; a bare Capitalized name that names a registered host class — an
