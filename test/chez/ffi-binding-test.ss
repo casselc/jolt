@@ -1,12 +1,32 @@
 ;; jolt.ffi regression: a compile-time-typed foreign binding lowers to a real
 ;; Chez foreign-procedure and calls native code. Run:
 ;;   chez --script test/chez/ffi-binding-test.ss
+;; Or validate compiler-source changes against a caller-supplied seed pair:
+;;   chez --script test/chez/ffi-binding-test.ss PRELUDE IMAGE
 ;; Binds a few libc functions (process symbols, always present) through the
 ;; jolt.ffi/__cfn special form + the host memory primitives — the same path a
 ;; library uses to bind its native deps.
 
 (import (chezscheme))
-(load "host/chez/gate-boot.ss")
+
+(define seed-args (cdr (command-line)))
+(cond
+  ((null? seed-args)
+   (load "host/chez/gate-boot.ss"))
+  ((= (length seed-args) 2)
+   (load "host/chez/rt.ss")
+   (set-chez-ns! "clojure.core")
+   (load (car seed-args))
+   (load "host/chez/post-prelude.ss")
+   (set-chez-ns! "user")
+   (load "host/chez/host-contract.ss")
+   (load (cadr seed-args))
+   (load "host/chez/compile-eval.ss"))
+  (else
+    (display "usage: ffi-binding-test.ss [PRELUDE IMAGE]\n"
+             (current-error-port))
+    (exit 2)))
+
 (load "host/chez/java/ffi.ss")
 
 (define total 0) (define fails 0)
@@ -31,6 +51,89 @@
                      (jolt.ffi/write p :int 0 4242)
                      (let [v (jolt.ffi/read p :int)] (jolt.ffi/free p) v))"))))
 (ok "sizeof :pointer is a word" (let ((n (jnum->exact (ev "(jolt.ffi/sizeof :pointer)")))) (or (= n 8) (= n 4))))
+
+;; Exact scalar widths used by native structures and protocols. In particular,
+;; pollfd and sockaddr fields cannot be modeled portably by packing shorts into
+;; an :int: that silently reverses the fields on a big-endian host.
+(ok "16-bit aliases have exact width 2"
+    (equal? '(2 2 2 2)
+            (map (lambda (t)
+                   (jnum->exact
+                     (ev (string-append "(jolt.ffi/sizeof " t ")"))))
+                 '(":int16" ":short" ":uint16" ":ushort"))))
+(ok "signed 8-bit aliases have exact width 1"
+    (equal? '(1 1)
+            (map (lambda (t)
+                   (jnum->exact
+                     (ev (string-append "(jolt.ffi/sizeof " t ")"))))
+                 '(":int8" ":i8"))))
+
+(ok "uint16 roundtrips its maximum value"
+    (= 65535
+       (jnum->exact
+         (ev "(let [p (jolt.ffi/alloc 2)]
+                (jolt.ffi/write p :uint16 0 65535)
+                (let [v (jolt.ffi/read p :uint16 0)]
+                  (jolt.ffi/free p)
+                  v))"))))
+(ev "(def p16 (jolt.ffi/alloc 2))")
+(ev "(jolt.ffi/write p16 :int16 0 -1)")
+(ok "the same 16 bits retain signed and unsigned interpretations"
+    (and (= -1 (jnum->exact (ev "(jolt.ffi/read p16 :int16 0)")))
+         (= 65535 (jnum->exact (ev "(jolt.ffi/read p16 :uint16 0)")))))
+(ev "(jolt.ffi/free p16)")
+(ok "int16 roundtrips its minimum value"
+    (= -32768
+       (jnum->exact
+         (ev "(let [p (jolt.ffi/alloc 2)]
+                (jolt.ffi/write p :short 0 -32768)
+                (let [v (jolt.ffi/read p :int16 0)]
+                  (jolt.ffi/free p)
+                  v))"))))
+
+(ev "(def p8 (jolt.ffi/alloc 1))")
+(ev "(jolt.ffi/write p8 :i8 0 -1)")
+(ok "signed 8-bit aliases preserve sign"
+    (= -1 (jnum->exact (ev "(jolt.ffi/read p8 :int8 0)"))))
+(ev "(jolt.ffi/free p8)")
+
+;; Store-width check is endian-neutral: the two bytes may be in either order,
+;; but the sentinel immediately after them must remain untouched.
+(ev "(def p-width (jolt.ffi/alloc 3))")
+(ev "(jolt.ffi/write p-width :uint8 2 171)")
+(ev "(jolt.ffi/write p-width :uint16 0 4660)")
+(ok "a uint16 store occupies exactly two bytes"
+    (let ((b0 (jnum->exact (ev "(jolt.ffi/read p-width :uint8 0)")))
+          (b1 (jnum->exact (ev "(jolt.ffi/read p-width :uint8 1)")))
+          (b2 (jnum->exact (ev "(jolt.ffi/read p-width :uint8 2)")))
+          (v (jnum->exact (ev "(jolt.ffi/read p-width :uint16 0)"))))
+      (and (equal? '(18 52) (sort < (list b0 b1)))
+           (= 171 b2)
+           (= 4660 v))))
+(ev "(jolt.ffi/free p-width)")
+
+;; Exercise the compiler-side signature table as well as the runtime accessors.
+(ev "(def c-htons (jolt.ffi/__cfn \"htons\" [:uint16] :uint16))")
+(ev "(def c-ntohs (jolt.ffi/__cfn \"ntohs\" [:ushort] :ushort))")
+(ok "typed uint16 native calls roundtrip"
+    (= 4660 (jnum->exact (ev "(c-ntohs (c-htons 4660))"))))
+(ok "typed uint16 native calls accept the unsigned maximum"
+    (= 65535 (jnum->exact (ev "(c-ntohs (c-htons 65535))"))))
+(ev "(def signed-byte-id
+       (jolt.ffi/__ccallable (fn [x] x) [:int8] :i8))")
+(ok "signed 8-bit callback signature compiles"
+    (let ((p (jnum->exact (var-deref "user" "signed-byte-id"))))
+      (and (integer? p) (> p 0))))
+(ev "(jolt.ffi/free-callable signed-byte-id)")
+
+(ok "unknown runtime memory types fail closed"
+    (guard (e (#t #t))
+      (ev "(jolt.ffi/sizeof :int128)")
+      #f))
+(ok "unknown compile-time signature types fail closed"
+    (guard (e (#t #t))
+      (ev "(jolt.ffi/__cfn \"strlen\" [:int128] :int)")
+      #f))
 
 ;; byte-array buffer I/O: write a byte-array into foreign memory and read it back
 ;; byte-exact (high bytes preserved, no UTF-8 mangling).
