@@ -19,6 +19,11 @@
 ;; ns-has-vars? arm and the overlay fns are missing at analysis.
 (load "host/chez/loader.ss")
 (set-source-roots! ldr-install-roots)
+;; Match cli.ss's loader boundary: source-side jolt.ffi declares macros, while
+;; its memory/library primitives are host vars installed only after the loader
+;; exists. Without this, a strict source analyzer sees `ffi/load-library` in
+;; jolt.mvn-http before that mapped var has been installed.
+(load "host/chez/java/ffi.ss")
 ;; The base java.time API (stdlib/jolt/time) autoloads on first java.time.* use at
 ;; runtime; here we load it once BEFORE the per-case snapshot below so its
 ;; value-semantics arms (impl/install-seams!) and class registrations are part of
