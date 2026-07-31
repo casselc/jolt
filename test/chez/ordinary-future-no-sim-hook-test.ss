@@ -45,7 +45,33 @@
    fhk-spawn
    fhk-start
    fhk-finish
-   fhk-cancel))
+   fhk-cancel
+   ;; the jolt.internal.sim controller ABI (host/chez/sim/runtime.ss's
+   ;; "=== controller ABI ===" section) is layered over the hook above, so it
+   ;; is equally absent from an ordinary image.
+   jolt-sim-controller-installation?
+   make-jolt-sim-controller-installation
+   jolt-sim-controller-top
+   jolt-sim-controller-mu
+   jolt-sim-install-controller!
+   jolt-sim-restore-controller!
+   jolt-sim-capabilities
+   jolt-sim-controller-errors
+   jolt-sim-kw-abi-version
+   jolt-sim-kw-event
+   jolt-sim-kw-task
+   jolt-sim-kw-parent
+   jolt-sim-kw-error))
+
+;; --- the jolt.internal.sim namespace itself carries no vars ------------------
+(ok "ordinary image has registered no vars under jolt.internal.sim"
+    (not (var-cell-lookup "jolt.internal.sim" "capabilities")))
+
+;; --- fully-qualified resolution from ordinary Jolt source fails closed too ---
+(ok "ordinary Jolt source cannot resolve jolt.internal.sim/capabilities"
+    (guard (e (#t #t))
+      (ev "(jolt.internal.sim/capabilities)")
+      #f))
 
 ;; --- ordinary future/deref/cancel behavior is unaffected ---------------------
 (is "future works with no overlay loaded"

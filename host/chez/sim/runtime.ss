@@ -369,3 +369,86 @@
 (def-var! "jolt.ffi" "write-array" ffi-sim-write-array)
 (def-var! "jolt.ffi" "ptr->string" ffi-sim-ptr->string)
 (def-var! "jolt.ffi" "string->ptr" ffi-sim-string->ptr)
+
+;; === controller ABI (jolt.internal.sim, sim-image-only) =====================
+;; A small internal Jolt namespace exposing the future lifecycle hook above (and
+;; its supervisor-error latch) to ORDINARY Jolt source running inside the sim
+;; image — NOT a public application DSL, and NOT wired to the FFI interception
+;; seam above (jolt-ffi-install-sim-hook! et al. remain Scheme-only for this v1
+;; controller ABI). Every var below is def-var!'d only here, so none of them
+;; exist outside a sim build; see ordinary-future-no-sim-hook-test.ss for the
+;; base-image counterpart pinning their absence.
+;;
+;; jolt.internal.sim/capabilities — a stable descriptor a controller can probe
+;; before trusting this ABI: :abi-version (int, bumped on any breaking change to
+;; this seam), :future-lifecycle / :controller-errors (both true in v1 — no FFI
+;; installation capability yet, deliberately), and :events (the exact ordered
+;; set of lifecycle event keywords a controller fn observes).
+(define jolt-sim-kw-abi-version       (keyword #f "abi-version"))
+(define jolt-sim-kw-future-lifecycle  (keyword #f "future-lifecycle"))
+(define jolt-sim-kw-controller-errors (keyword #f "controller-errors"))
+(define jolt-sim-kw-events            (keyword #f "events"))
+(define (jolt-sim-capabilities)
+  (jolt-hash-map
+   jolt-sim-kw-abi-version 1
+   jolt-sim-kw-future-lifecycle #t
+   jolt-sim-kw-controller-errors #t
+   jolt-sim-kw-events (jolt-vector fhk-spawn fhk-start fhk-finish fhk-cancel)))
+
+;; jolt.internal.sim/install-controller! + restore-controller! — a Jolt-callable
+;; strict-LIFO stack of jolt-future-hook installations, mirroring the
+;; jolt-ffi-sim-hook-installation stack above exactly: install snapshots
+;; whatever hook is CURRENTLY active — whether it got there via a prior
+;; install-controller! or was set directly through the low-level
+;; jolt-future-hook-set! (e.g. by a test harness or another Scheme-level
+;; caller) — and restore puts back exactly that snapshot. Only the current top
+;; of the stack may restore; an out-of-order or repeated restore is rejected
+;; BEFORE it touches the active hook (fail closed), so a nested simulation can
+;; never be silently disabled by a stale or reused token.
+(define-record-type jolt-sim-controller-installation
+  (fields hook previous)
+  (nongenerative jolt-sim-controller-installation-v1))
+(define jolt-sim-controller-top #f)
+(define jolt-sim-controller-mu (make-mutex))
+(define (jolt-sim-install-controller! f)
+  (unless f
+    (error 'jolt-sim-install-controller! "controller must be non-false"))
+  (with-mutex jolt-sim-controller-mu
+    (let* ((prior (unbox jolt-future-hook))
+           (installation (make-jolt-sim-controller-installation prior jolt-sim-controller-top)))
+      (set! jolt-sim-controller-top installation)
+      (set-box! jolt-future-hook f)
+      installation)))
+(define (jolt-sim-restore-controller! installation)
+  (with-mutex jolt-sim-controller-mu
+    (unless (eq? installation jolt-sim-controller-top)
+      (error 'jolt-sim-restore-controller!
+             "simulation controllers must be restored by their current owner"))
+    (set-box! jolt-future-hook (jolt-sim-controller-installation-hook installation))
+    (set! jolt-sim-controller-top (jolt-sim-controller-installation-previous installation)))
+  jolt-nil)
+
+;; jolt.internal.sim/controller-errors + clear-controller-errors! — project the
+;; future hook's supervisor-error latch (jolt-future-hook-errors, above) into a
+;; Jolt collection of plain maps a controller can inspect from ordinary Jolt
+;; source, and clear it. :error is the ORIGINAL condition/value the failing
+;; hook raised, unwrapped — this is supervisor evidence, not a rethrow.
+(define jolt-sim-kw-event  (keyword #f "event"))
+(define jolt-sim-kw-task   (keyword #f "task"))
+(define jolt-sim-kw-parent (keyword #f "parent"))
+(define jolt-sim-kw-error  (keyword #f "error"))
+(define (jolt-sim-controller-errors)
+  (apply jolt-vector
+         (map (lambda (entry)
+                (jolt-hash-map
+                 jolt-sim-kw-event  (list-ref entry 0)
+                 jolt-sim-kw-task   (list-ref entry 1)
+                 jolt-sim-kw-parent (list-ref entry 2)
+                 jolt-sim-kw-error  (list-ref entry 3)))
+              (jolt-future-hook-errors-snapshot))))
+
+(def-var! "jolt.internal.sim" "capabilities" jolt-sim-capabilities)
+(def-var! "jolt.internal.sim" "install-controller!" jolt-sim-install-controller!)
+(def-var! "jolt.internal.sim" "restore-controller!" jolt-sim-restore-controller!)
+(def-var! "jolt.internal.sim" "controller-errors" jolt-sim-controller-errors)
+(def-var! "jolt.internal.sim" "clear-controller-errors!" jolt-future-hook-errors-clear!)
