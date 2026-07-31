@@ -135,7 +135,9 @@
 ;; :set-var      :the-var :val                    :val   (:the-var is a leaf the-var node)
 ;; :set-field    :obj :field :val                 :obj :val
 ;; :defmacro     :ns :name :fn                     :fn
-;; :ffi-fn       :csym :argtypes :rettype         —
+;; :ffi-fn       :csym :argtypes :rettype         —  (:blocking,
+;;                                                    :capture-native-error, and
+;;                                                    :varargs-after are policy)
 ;; :ffi-callable :fn :argtypes :rettype           :fn
 ;; :regex        :source                          —
 ;; :inst         :source                          —

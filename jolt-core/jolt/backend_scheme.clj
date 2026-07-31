@@ -603,7 +603,19 @@
   (let [n (count (:argtypes node))
         params (mapv (fn [i] (str "a" i)) (range n))
         call-args (str/join " " params)
-        conventions (when (:blocking node) "__collect_safe")
+        ;; Chez convention clauses in declaration order: __collect_safe (a :blocking
+        ;; call deactivates the thread so it can't pin the stop-the-world collector),
+        ;; then (__varargs_after n) marking the fixed/variadic boundary. On apple
+        ;; arm64 the variadic ABI places trailing arguments on the stack even when a
+        ;; fixed argument would use a register, so the boundary must be explicit.
+        ;; Both clauses are spelled identically in a plain foreign-procedure and in
+        ;; jolt-ffi-native-error-procedure's (conv ...) group, so one string serves
+        ;; both lowering paths. nil when neither applies keeps the original output.
+        conv-clauses (cond-> []
+                       (:blocking node) (conj "__collect_safe")
+                       (:varargs-after node) (conj (str "(__varargs_after "
+                                                         (:varargs-after node) ")")))
+        conventions (when (seq conv-clauses) (str/join " " conv-clauses))
         signature (str (chez-str-lit (:csym node))
                        " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
                        (ffi-type->chez (:rettype node)))

@@ -86,6 +86,9 @@
 (ev "(ffi/defcfn c-ghost-captured
        \"definitely_not_a_real_c_symbol_zzz9\" [:int :int] :int
        {:blocking true :capture-native-error true})")
+(ev "(ffi/defcfn c-ghost-varargs
+       \"definitely_not_a_real_c_symbol_varargs_zzz9\" [:int :int :int] :int
+       {:blocking true :capture-native-error true :varargs-after 2})")
 (ev "(ffi/defcfn c-ghost-zero \"definitely_not_a_real_c_symbol_zero_zzz9\" [] :int)")
 
 (define captured '())
@@ -192,12 +195,32 @@
            (eq? (dget captured-call 'capture-native-error) #t)
            (equal? (dget scalar 'args) (dget captured-call 'args)))))
 
+;; :varargs-after is native-lowering policy, not part of the stable v3
+;; controller descriptor. Intercept a never-resolved variadic symbol with all
+;; three options enabled and pin the descriptor's exact existing key set.
+(ok "variadic binding is intercepted without resolving its symbol"
+    (jolt-truthy? (ev "(= [-1 73] (c-ghost-varargs 11 22 33))")))
+(ok "eight descriptors captured after the variadic binding"
+    (= 8 (length captured)))
+(let ((d (list-ref captured 7)))
+  (ok "variadic binding preserves the exact v3 descriptor shape"
+      (equal? (map car d)
+              '(csym argtypes rettype blocking capture-native-error args)))
+  (ok "variadic binding descriptor retains its ordinary metadata"
+      (and (string=? (dget d 'csym)
+                     "definitely_not_a_real_c_symbol_varargs_zzz9")
+           (equal? (dget d 'argtypes) (list "int" "int" "int"))
+           (string=? (dget d 'rettype) "int")
+           (eq? (dget d 'blocking) #t)
+           (eq? (dget d 'capture-native-error) #t)
+           (equal? (dget d 'args) (list 11 22 33)))))
+
 ;; --- clearing restores the normal path ---------------------------------------
 (jolt-ffi-clear-sim-hook! record-installation)
 (ok "clear restores no-hook state" (not jolt-ffi-sim-hook))
 (ok "clearing restores the normal path for an existing harmless native symbol"
     (= 7 (jnum->exact (ev "(c-abs -7)"))))
-(ok "a cleared hook is not called again" (= 7 (length captured)))
+(ok "a cleared hook is not called again" (= 8 (length captured)))
 (ok "a binding first called under the hook resolves natively after clear"
     (= 13 (jnum->exact (ev "(c-abs-lazy -13)"))))
 (ok "fresh-emitter blocking native branch remains callable"

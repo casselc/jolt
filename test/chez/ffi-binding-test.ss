@@ -45,6 +45,17 @@
       (cond ((> (+ i nsub) ns) #f)
             ((string=? (substring s i (+ i nsub)) sub) #t)
             (else (loop (+ i 1)))))))
+;; emit one form (string) to its lowered Chez source WITHOUT evaluating it, so
+;; exact lowering — foreign-procedure convention order, native-error grouping —
+;; can be asserted directly. Mirrors compile-eval's analyze->run-passes->emit.
+(define (emitf ns str)
+  (let-values (((f j) (rdr-read-form str 0 (string-length str))))
+    (let ((ctx (make-analyze-ctx ns)))
+      (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
+(define (emit-fails? ns str)
+  (guard (e (#t #t))
+    (emitf ns str)
+    #f))
 
 ;; load libc (process symbols) and bind typed foreign functions
 (ev "(jolt.ffi/load-library)")
@@ -509,6 +520,79 @@
     (jolt-truthy?
       (ev "(or (not= :windows (:os (jolt.host/target)))
                (= [0 6] (c-close-handle-with-error-blocking 0)))")))
+
+;; --- variadic ABI boundary --------------------------------------------------
+;; A typed FFI still has to distinguish fixed from variadic C parameters. Apple
+;; arm64 passes arguments after C's `...` on the stack even while a fixed
+;; argument would use a register, so the analyzer carries :varargs-after (the
+;; positive count of fixed params before `...`) and the back end lowers it to
+;; (__varargs_after n) AFTER __collect_safe. Both clauses are spelled the same in
+;; a plain foreign-procedure and inside jolt-ffi-native-error-procedure's
+;; convention group. Assert the exact lowered text for both lowering paths before
+;; exercising the real ABI below.
+(ok "lowering orders collect-safe before (__varargs_after n) in a plain call"
+    (has? (emitf "user"
+             "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+                                    {:blocking true :varargs-after 2})")
+          "(foreign-procedure __collect_safe (__varargs_after 2) \"fcntl\""))
+(ok "lowering groups both conventions inside the native-error capture"
+    (has? (emitf "user"
+             "(jolt.ffi/__cfn \"open\" [:string :int] :int
+                                    {:blocking true :capture-native-error true
+                                     :varargs-after 2})")
+          "(jolt-ffi-native-error-procedure (__collect_safe (__varargs_after 2)) \"open\""))
+
+;; fcntl's third argument is past C's `...`; a fixed three-arg call can report
+;; success without applying F_SETFL on Apple arm64. /dev/null is present on every
+;; POSIX target the gate runs on, so the witness is POSIX-only (Windows short
+;; circuits). O_NONBLOCK differs by OS; F_GETFL=3 / F_SETFL=4 are stable POSIX.
+(ev "(def c-fcntl-va
+       (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int {:varargs-after 2}))")
+(ev "(def c-fcntl-va-all
+       (jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int
+         {:blocking true :capture-native-error true :varargs-after 2}))")
+(ev "(def c-open-va
+       (jolt.ffi/__cfn \"open\" [:string :int] :int {:varargs-after 2}))")
+(ev "(def c-close-va (jolt.ffi/__cfn \"close\" [:int] :int))")
+(ok "variadic fcntl applies and reports O_NONBLOCK (POSIX witness)"
+    (jolt-truthy?
+      (ev "(or (= :windows (:os (jolt.host/target)))
+               (let [fd (c-open-va \"/dev/null\" 0)
+                     nonblock (case (:os (jolt.host/target))
+                                :darwin 4 :linux 2048 2048)
+                     before (c-fcntl-va fd 3 0)
+                     rc (c-fcntl-va fd 4 (bit-or before nonblock))
+                     after (c-fcntl-va fd 3 0)]
+                 (c-close-va fd)
+                 (and (not (neg? before)) (zero? rc) (not (neg? after))
+                      (not (zero? (bit-and after nonblock)))))))")))
+(ok "blocking + capture + varargs lower and call together (POSIX)"
+    (jolt-truthy?
+      (ev "(or (= :windows (:os (jolt.host/target)))
+               (let [fd (c-open-va \"/dev/null\" 0)
+                     nonblock (case (:os (jolt.host/target))
+                                :darwin 4 :linux 2048 2048)
+                     before (c-fcntl-va fd 3 0)
+                     v (c-fcntl-va-all fd 4 (bit-or before nonblock))
+                     after (c-fcntl-va fd 3 0)]
+                 (c-close-va fd)
+                 (and (vector? v) (= 2 (count v))
+                      (not (neg? before)) (zero? (nth v 0))
+                      (integer? (nth v 1)) (not (neg? after))
+                      (not (zero? (bit-and after nonblock))))))")))
+
+;; analyzer fails closed on every malformed :varargs-after and on a non-Boolean
+;; existing policy, before any native symbol is resolved.
+(ok "reject :varargs-after 0 (must be positive)"
+    (emit-fails? "user" "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int {:varargs-after 0})"))
+(ok "reject :varargs-after above the declared argument count"
+    (emit-fails? "user" "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int {:varargs-after 4})"))
+(ok "reject non-integer :varargs-after"
+    (emit-fails? "user" "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int {:varargs-after 1.5})"))
+(ok "reject an unknown option key alongside :varargs-after"
+    (emit-fails? "user" "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int {:varargs-after 2 :typo true})"))
+(ok "reject a non-Boolean :blocking alongside :varargs-after"
+    (emit-fails? "user" "(jolt.ffi/__cfn \"fcntl\" [:int :int :int] :int {:blocking :yes :varargs-after 2})"))
 
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

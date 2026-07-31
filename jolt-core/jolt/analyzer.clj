@@ -616,62 +616,86 @@
 ;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)            ; non-blocking
 ;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)  ; legacy keyword
 ;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype
-;;                   {:blocking bool :capture-native-error bool})
+;;                   {:blocking bool :capture-native-error bool
+;;                    :varargs-after positive-int})
 ;; The C symbol is a string literal and the types are literal keywords, read here
 ;; at compile time; the Chez back end lowers it to a real `foreign-procedure`
 ;; (typed marshaling, no runtime eval). A :blocking call is emitted __collect_safe
 ;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
 ;; must not pin the stop-the-world collector. :capture-native-error asks the back
-;; end to atomically return [native-result error-code]. A leaf IR node.
+;; end to atomically return [native-result error-code]. :varargs-after is the
+;; positive count of fixed C parameters before `...`; the back end lowers it to
+;; (__varargs_after n) after __collect_safe, because some targets (Apple arm64)
+;; place variadic arguments on the stack even when fixed arguments still use a
+;; register. It may not exceed the declared argument count; omission stays nil.
+;; A leaf IR node.
 (defn- parse-ffi-options [items rettype]
-  (if (= 4 (count items))
-    {:blocking false :capture-native-error false}
-    (let [opt (nth items 4)]
-      (cond
-        (and (form-keyword? opt)
-             (nil? (namespace opt))
-             (= "blocking" (name opt)))
-        {:blocking true :capture-native-error false}
+  (let [arg-count (count (form-vec-items (nth items 2)))]
+    (if (= 4 (count items))
+      {:blocking false :capture-native-error false :varargs-after nil}
+      (let [opt (nth items 4)]
+        (cond
+          (and (form-keyword? opt)
+               (nil? (namespace opt))
+               (= "blocking" (name opt)))
+          {:blocking true :capture-native-error false :varargs-after nil}
 
-        (form-map? opt)
-        (let [pairs (form-map-pairs opt)
-              allowed #{"blocking" "capture-native-error"}]
-          (loop [i 0 blocking false capture-native-error false]
-            (if (< i (count pairs))
-              (let [pair (nth pairs i)
-                    k (nth pair 0)
-                    v (nth pair 1)]
-                (when-not (and (form-keyword? k) (nil? (namespace k)))
-                  (throw (str "jolt.ffi foreign-fn option key must be an "
-                              "unqualified keyword: " k)))
-                (let [kn (name k)]
-                  (when-not (allowed kn)
-                    (throw (str "jolt.ffi foreign-fn unknown option :" kn)))
-                  (when-not (boolean? v)
-                    (throw (str "jolt.ffi foreign-fn option :" kn
-                                " must be a literal boolean: " v)))
-                  (recur (inc i)
-                         (if (= kn "blocking") v blocking)
-                         (if (= kn "capture-native-error")
-                           v
-                           capture-native-error))))
-              (do
-                (when (and capture-native-error (= rettype "void"))
-                  (throw (str "jolt.ffi foreign-fn :capture-native-error true "
-                              "is incompatible with a :void return")))
-                {:blocking blocking
-                 :capture-native-error capture-native-error}))))
+          (form-map? opt)
+          (let [pairs (form-map-pairs opt)
+                allowed #{"blocking" "capture-native-error" "varargs-after"}]
+            (loop [i 0 blocking false capture-native-error false varargs-after nil]
+              (if (< i (count pairs))
+                (let [pair (nth pairs i)
+                      k (nth pair 0)
+                      v (nth pair 1)]
+                  (when-not (and (form-keyword? k) (nil? (namespace k)))
+                    (throw (str "jolt.ffi foreign-fn option key must be an "
+                                "unqualified keyword: " k)))
+                  (let [kn (name k)]
+                    (when-not (allowed kn)
+                      (throw (str "jolt.ffi foreign-fn unknown option :" kn)))
+                    (if (= kn "varargs-after")
+                      ;; The variadic boundary is the positive count of fixed C
+                      ;; parameters before `...`, not a Boolean policy. Chez needs
+                      ;; the exact boundary on targets whose variadic ABI differs
+                      ;; from fixed calls (Apple arm64); fail closed on anything
+                      ;; that is not a literal in-range positive integer.
+                      (do (when-not (and (integer? v)
+                                         (pos? v)
+                                         (<= v arg-count))
+                            (throw (str "jolt.ffi foreign-fn :varargs-after must be "
+                                        "a positive integer no greater than the "
+                                        "argument count (" arg-count "): " v)))
+                          (recur (inc i) blocking capture-native-error v))
+                      (do (when-not (boolean? v)
+                            (throw (str "jolt.ffi foreign-fn option :" kn
+                                        " must be a literal boolean: " v)))
+                          (recur (inc i)
+                                 (if (= kn "blocking") v blocking)
+                                 (if (= kn "capture-native-error")
+                                   v
+                                   capture-native-error)
+                                 varargs-after)))))
+                (do
+                  (when (and capture-native-error (= rettype "void"))
+                    (throw (str "jolt.ffi foreign-fn :capture-native-error true "
+                                "is incompatible with a :void return")))
+                  {:blocking blocking
+                   :capture-native-error capture-native-error
+                   :varargs-after varargs-after}))))
 
-        :else
-        (throw (str "jolt.ffi foreign-fn options must be omitted, :blocking, "
-                    "or a literal {:blocking bool :capture-native-error bool}: "
-                    opt))))))
+          :else
+          (throw (str "jolt.ffi foreign-fn options must be omitted, :blocking, "
+                      "or a literal {:blocking bool :capture-native-error bool "
+                      ":varargs-after positive-int}: "
+                      opt)))))))
 
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
     (throw (str "jolt.ffi/foreign-fn expects "
                 "(foreign-fn \"sym\" [argtypes] rettype "
-                "[:blocking | {:blocking bool :capture-native-error bool}])")))
+                "[:blocking | {:blocking bool :capture-native-error bool "
+                ":varargs-after positive-int}])")))
   (let [rettype (name (nth items 3))
         opts (parse-ffi-options items rettype)]
     {:op :ffi-fn
@@ -679,7 +703,8 @@
      :argtypes (mapv name (form-vec-items (nth items 2)))
      :rettype rettype
      :blocking (:blocking opts)
-     :capture-native-error (:capture-native-error opts)}))
+     :capture-native-error (:capture-native-error opts)
+     :varargs-after (:varargs-after opts)}))
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
 ;; macro) — the inverse of __cfn. It wraps a jolt fn as a C-callable function

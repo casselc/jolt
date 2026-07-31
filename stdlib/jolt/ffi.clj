@@ -26,12 +26,16 @@
   foreign-procedure. Its optional final argument is the legacy :blocking keyword
   or a literal options map:
 
-      {:blocking true :capture-native-error true}
+      {:blocking true :capture-native-error true :varargs-after 2}
 
   :blocking makes the call collect-safe. :capture-native-error atomically returns
   [native-result error-code], using errno on supported POSIX targets and
   GetLastError on supported Windows targets; the code is meaningful only when
   the result reports failure. Capture requires a non-:void return.
+  :varargs-after is the positive number of fixed C parameters before `...`;
+  it may not exceed the declared argument count. Types after that boundary
+  must be their default-promoted C ABI types (for example, use :double for a
+  promoted C float); Jolt does not infer those promotions.
 
   foreign-callable is the inverse — it wraps a jolt fn as a C-callable function
   pointer so C can call back into jolt (e.g. GTK signal handlers);
@@ -41,7 +45,8 @@
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; The optional final argument is the legacy :blocking keyword or a literal map
-;; containing only :blocking and :capture-native-error Boolean values.
+;; containing :blocking and :capture-native-error Boolean values and/or a
+;; positive integer :varargs-after boundary.
 (defn- opt->cfn-arg [opts]
   (cond
     (empty? opts) nil
@@ -51,7 +56,8 @@
     (map? (first opts)) (first opts)
     :else
     (throw (str "jolt.ffi foreign-fn/defcfn options must be :blocking or a "
-                "literal {:blocking bool :capture-native-error bool}; got: "
+                "literal {:blocking bool :capture-native-error bool "
+                ":varargs-after positive-int}; got: "
                 (first opts)))))
 
 (defmacro foreign-fn [csym argtypes rettype & opts]
