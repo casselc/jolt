@@ -46,7 +46,44 @@
    ffi-sim-read-array
    ffi-sim-write-array
    ffi-sim-ptr->string
-   ffi-sim-string->ptr))
+   ffi-sim-string->ptr
+   ;; the jolt.internal.sim FFI controller projection (host/chez/sim/
+   ;; runtime.ss's "jolt.internal.sim/install-ffi-controller! +
+   ;; restore-ffi-controller!" section) is layered over the hook above, so it
+   ;; is equally absent from an ordinary image.
+   jolt-ffi-sim-cfn-desc-keys
+   jolt-ffi-sim-native-desc-keys
+   jolt-sim-ffi-descriptor-keys
+   jolt-sim-ffi-native-operation-names
+   jolt-sim-ffi-project-descriptor
+   jolt-sim-make-ffi-controller-wrapper
+   jolt-sim-install-ffi-controller!
+   jolt-sim-restore-ffi-controller!
+   jolt-sim-kw-kind
+   jolt-sim-kw-foreign-function
+   jolt-sim-kw-native-operation
+   jolt-sim-kw-symbol
+   jolt-sim-kw-argument-types
+   jolt-sim-kw-return-type
+   jolt-sim-kw-blocking?
+   jolt-sim-kw-operation
+   jolt-sim-kw-ffi-interception
+   jolt-sim-kw-descriptor-version
+   jolt-sim-kw-kinds
+   jolt-sim-kw-arguments
+   jolt-sim-kw-live
+   jolt-sim-kw-task-identity
+   jolt-sim-kw-native-operations))
+
+;; --- the jolt.internal.sim namespace itself carries no vars ------------------
+(ok "ordinary image has registered no vars under jolt.internal.sim"
+    (not (var-cell-lookup "jolt.internal.sim" "install-ffi-controller!")))
+
+;; --- fully-qualified resolution from ordinary Jolt source fails closed too ---
+(ok "ordinary Jolt source cannot resolve jolt.internal.sim/install-ffi-controller!"
+    (guard (e (#t #t))
+      (ev "(jolt.internal.sim/install-ffi-controller! (fn [d] d))")
+      #f))
 
 ;; --- ordinary FFI binding/calling behavior is unaffected ---------------------
 (ev "(jolt.ffi/load-library)")

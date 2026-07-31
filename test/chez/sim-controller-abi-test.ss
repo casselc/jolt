@@ -5,10 +5,9 @@
 ;; ordinary defn unchanged. jolt.internal.sim/* is a sim-image-only internal
 ;; namespace layered over the future lifecycle hook (host/chez/sim/runtime.ss,
 ;; "=== future lifecycle hook ===") that lets ORDINARY Jolt source resolve and
-;; drive a simulation controller (capabilities probe, install/restore, error
-;; projection) instead of a test harness reaching into Scheme internals — NOT
-;; a public application DSL and NOT wired to the FFI interception seam (v1
-;; intentionally omits FFI installation). See
+;; drive a simulation controller (capabilities probe, lifecycle + FFI
+;; install/restore, error projection) instead of a test harness reaching into
+;; Scheme internals — NOT a public application DSL. See
 ;; ordinary-future-no-sim-hook-test.ss for the base-image gate proving this
 ;; whole namespace and its Scheme internals are absent with the overlay
 ;; unloaded.
@@ -31,18 +30,33 @@
       (string=? (render s) expected)))
 (define (jget m k) (pmap-get m k jolt-nil))
 
-;; === capabilities: exact and stable ==========================================
-(is "abi-version is exactly integer 1"
-    "(:abi-version (jolt.internal.sim/capabilities))" "1")
-(is "future-lifecycle capability is true"
+;; === capabilities: exact ABI v2 and stable ===================================
+(is "abi-version is exactly integer 2"
+    "(:abi-version (jolt.internal.sim/capabilities))" "2")
+(is "future-lifecycle capability is unchanged true"
     "(:future-lifecycle (jolt.internal.sim/capabilities))" "true")
 (is "controller-errors capability is true"
     "(:controller-errors (jolt.internal.sim/capabilities))" "true")
 (is "events capability is the exact ordered lifecycle set"
     "(:events (jolt.internal.sim/capabilities))"
     "[:spawn :start :finish :cancel]")
-(is "capabilities map carries exactly four keys"
-    "(count (jolt.internal.sim/capabilities))" "4")
+(is "ffi-interception descriptor-version is exactly integer 1"
+    "(:descriptor-version (:ffi-interception (jolt.internal.sim/capabilities)))" "1")
+(is "ffi-interception kinds is the exact set"
+    "(:kinds (:ffi-interception (jolt.internal.sim/capabilities)))"
+    "[:foreign-function :native-operation]")
+(is "ffi-interception arguments capability is exactly :live"
+    "(:arguments (:ffi-interception (jolt.internal.sim/capabilities)))" ":live")
+(is "ffi-interception task identities are future-lifecycle ids"
+    "(:task-identity (:ffi-interception (jolt.internal.sim/capabilities)))"
+    ":future-lifecycle")
+(is "ffi-interception native-operations is the exact ordered set"
+    "(:native-operations (:ffi-interception (jolt.internal.sim/capabilities)))"
+    "[:load-library :loaded? :alloc :free :read :write :sizeof :read-bytes :write-bytes :read-array :write-array :ptr->string :string->ptr]")
+(is "ffi-interception map carries exactly five keys"
+    "(count (:ffi-interception (jolt.internal.sim/capabilities)))" "5")
+(is "capabilities map carries exactly five keys"
+    "(count (jolt.internal.sim/capabilities))" "5")
 (is "capabilities is stable across repeated calls"
     "(= (jolt.internal.sim/capabilities) (jolt.internal.sim/capabilities))" "true")
 
@@ -52,7 +66,7 @@
 ;; and an aliased require resolves + invokes the SAME ABI.
 (ev "(require '[jolt.internal.sim :as sim])")
 (is "aliased capabilities call resolves and invokes the same ABI"
-    "(:abi-version (sim/capabilities))" "1")
+    "(:abi-version (sim/capabilities))" "2")
 
 ;; === lifecycle observation through install-controller! =======================
 (ev "(def sim-abi-events (atom []))")

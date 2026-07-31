@@ -371,29 +371,71 @@
 (def-var! "jolt.ffi" "string->ptr" ffi-sim-string->ptr)
 
 ;; === controller ABI (jolt.internal.sim, sim-image-only) =====================
-;; A small internal Jolt namespace exposing the future lifecycle hook above (and
-;; its supervisor-error latch) to ORDINARY Jolt source running inside the sim
-;; image — NOT a public application DSL, and NOT wired to the FFI interception
-;; seam above (jolt-ffi-install-sim-hook! et al. remain Scheme-only for this v1
-;; controller ABI). Every var below is def-var!'d only here, so none of them
-;; exist outside a sim build; see ordinary-future-no-sim-hook-test.ss for the
-;; base-image counterpart pinning their absence.
+;; A small internal Jolt namespace exposing the future lifecycle hook and the
+;; FFI call-interception seam above (and the future hook's supervisor-error
+;; latch) to ORDINARY Jolt source running inside the sim image — NOT a public
+;; application DSL. The FFI half (install-ffi-controller!/
+;; restore-ffi-controller!) is a thin projection over the existing
+;; jolt-ffi-install-sim-hook!/-clear-sim-hook! strict-LIFO stack + reentrancy
+;; guard, not a second hook — see that section below for the install/clear/
+;; invoke machinery itself. Every var below is def-var!'d only here, so none of
+;; them exist outside a sim build; see ordinary-future-no-sim-hook-test.ss and
+;; ordinary-ffi-no-sim-hook-test.ss for the base-image counterparts pinning
+;; their absence.
 ;;
 ;; jolt.internal.sim/capabilities — a stable descriptor a controller can probe
 ;; before trusting this ABI: :abi-version (int, bumped on any breaking change to
-;; this seam), :future-lifecycle / :controller-errors (both true in v1 — no FFI
-;; installation capability yet, deliberately), and :events (the exact ordered
-;; set of lifecycle event keywords a controller fn observes).
-(define jolt-sim-kw-abi-version       (keyword #f "abi-version"))
-(define jolt-sim-kw-future-lifecycle  (keyword #f "future-lifecycle"))
-(define jolt-sim-kw-controller-errors (keyword #f "controller-errors"))
-(define jolt-sim-kw-events            (keyword #f "events"))
+;; this seam), :future-lifecycle / :controller-errors (both true), :events (the
+;; exact ordered set of lifecycle event keywords a controller fn observes), and
+;; :ffi-interception — a nested, exact descriptor of the FFI controller ABI
+;; below (jolt.internal.sim/install-ffi-controller!): :descriptor-version (int,
+;; independent of :abi-version so the FFI projection shape can evolve on its
+;; own), :kinds (the exact set of projected descriptor :kind values), :arguments
+;; :live (arguments reaching a controller are the SAME live jolt objects the
+;; call site passed, never copies), :task-identity :future-lifecycle (every
+;; descriptor carries the current hooked-future task id, or 0 outside one), and
+;; :native-operations (the exact ordered set of native-op names a
+;; native-operation descriptor's :operation may be).
+(define jolt-sim-kw-abi-version        (keyword #f "abi-version"))
+(define jolt-sim-kw-future-lifecycle   (keyword #f "future-lifecycle"))
+(define jolt-sim-kw-controller-errors  (keyword #f "controller-errors"))
+(define jolt-sim-kw-events             (keyword #f "events"))
+(define jolt-sim-kw-ffi-interception   (keyword #f "ffi-interception"))
+(define jolt-sim-kw-descriptor-version (keyword #f "descriptor-version"))
+(define jolt-sim-kw-kinds              (keyword #f "kinds"))
+(define jolt-sim-kw-arguments          (keyword #f "arguments"))
+(define jolt-sim-kw-live               (keyword #f "live"))
+(define jolt-sim-kw-task-identity      (keyword #f "task-identity"))
+(define jolt-sim-kw-native-operations  (keyword #f "native-operations"))
+(define jolt-sim-kw-kind               (keyword #f "kind"))
+(define jolt-sim-kw-foreign-function   (keyword #f "foreign-function"))
+(define jolt-sim-kw-native-operation   (keyword #f "native-operation"))
+(define jolt-sim-kw-symbol             (keyword #f "symbol"))
+(define jolt-sim-kw-argument-types     (keyword #f "argument-types"))
+(define jolt-sim-kw-return-type        (keyword #f "return-type"))
+(define jolt-sim-kw-blocking?          (keyword #f "blocking?"))
+(define jolt-sim-kw-operation          (keyword #f "operation"))
 (define (jolt-sim-capabilities)
   (jolt-hash-map
-   jolt-sim-kw-abi-version 1
+   jolt-sim-kw-abi-version 2
    jolt-sim-kw-future-lifecycle #t
    jolt-sim-kw-controller-errors #t
-   jolt-sim-kw-events (jolt-vector fhk-spawn fhk-start fhk-finish fhk-cancel)))
+   jolt-sim-kw-events (jolt-vector fhk-spawn fhk-start fhk-finish fhk-cancel)
+   jolt-sim-kw-ffi-interception
+   (jolt-hash-map
+    jolt-sim-kw-descriptor-version 1
+    jolt-sim-kw-kinds (jolt-vector jolt-sim-kw-foreign-function
+                                    jolt-sim-kw-native-operation)
+    jolt-sim-kw-arguments jolt-sim-kw-live
+    jolt-sim-kw-task-identity jolt-sim-kw-future-lifecycle
+    jolt-sim-kw-native-operations
+    (jolt-vector (keyword #f "load-library") (keyword #f "loaded?")
+                 (keyword #f "alloc") (keyword #f "free")
+                 (keyword #f "read") (keyword #f "write")
+                 (keyword #f "sizeof") (keyword #f "read-bytes")
+                 (keyword #f "write-bytes") (keyword #f "read-array")
+                 (keyword #f "write-array") (keyword #f "ptr->string")
+                 (keyword #f "string->ptr")))))
 
 ;; jolt.internal.sim/install-controller! + restore-controller! — a Jolt-callable
 ;; strict-LIFO stack of jolt-future-hook installations, mirroring the
@@ -447,8 +489,89 @@
                  jolt-sim-kw-error  (list-ref entry 3)))
               (jolt-future-hook-errors-snapshot))))
 
+;; jolt.internal.sim/install-ffi-controller! + restore-ffi-controller! — expose
+;; the FFI call-interception seam above (jolt-ffi-install-sim-hook!/
+;; jolt-ffi-clear-sim-hook!, "=== FFI call interception (simulation seam) ===")
+;; to a Jolt-callable controller. This is a thin projection over that EXACT
+;; existing strict-LIFO stack + reentrancy guard: install wraps the supplied
+;; Jolt IFn in a Scheme lambda that projects the raw alist descriptor
+;; (jolt-ffi-make-sim-descriptor / jolt-ffi-make-native-sim-descriptor) into one
+;; stable, immutable Jolt map BEFORE invoking it, then installs that wrapper via
+;; jolt-ffi-install-sim-hook! and returns the EXACT installation record it
+;; produces — the same opaque token type the low-level Scheme API uses, not a
+;; new one — so nesting, ordering, and restore-by-owner behave identically to a
+;; caller using jolt-ffi-install-sim-hook!/-clear-sim-hook! directly. restore
+;; passes that exact token straight to jolt-ffi-clear-sim-hook!, unchanged.
+;;
+;; A projected descriptor's :kind selects its exact key set:
+;;   {:kind :foreign-function :task :symbol :argument-types :return-type
+;;    :blocking? :arguments}
+;;                    — one jolt.ffi/defcfn call (jolt-ffi-make-sim-descriptor)
+;;   {:kind :native-operation :task :operation :arguments}
+;;                      — one raw native op (jolt-ffi-make-native-sim-descriptor)
+;; :task is jolt-future-current-task-id at interception time: the positive,
+;; stable future-lifecycle id while inside a hooked future, or 0 on the
+;; primordial/unregistered thread. This correlates effect observations with the
+;; lifecycle controller without adding a second task registry.
+;; :symbol/:argument-types/:return-type are copied metadata (already snapshotted
+;; per call by the makers above); :arguments is the SAME live jolt call
+;; arguments in call order, not copies — a controller must be able to emulate
+;; writes through a live byte array or pointer. An internal descriptor that
+;; matches neither exact shape is rejected outright rather than guessed at.
+(define jolt-ffi-sim-cfn-desc-keys '(csym argtypes rettype blocking args))
+(define jolt-ffi-sim-native-desc-keys '(kind op args))
+(define jolt-sim-ffi-native-operation-names
+  '("load-library" "loaded?" "alloc" "free" "read" "write" "sizeof"
+    "read-bytes" "write-bytes" "read-array" "write-array" "ptr->string"
+    "string->ptr"))
+(define (jolt-sim-ffi-descriptor-keys desc)
+  (and (list? desc) (for-all pair? desc) (map car desc)))
+(define (jolt-sim-ffi-project-descriptor desc)
+  (let ((ks (jolt-sim-ffi-descriptor-keys desc)))
+    (cond
+      ((and (equal? ks jolt-ffi-sim-cfn-desc-keys)
+            (string? (cdr (assq 'csym desc)))
+            (list? (cdr (assq 'argtypes desc)))
+            (for-all string? (cdr (assq 'argtypes desc)))
+            (string? (cdr (assq 'rettype desc)))
+            (boolean? (cdr (assq 'blocking desc)))
+            (list? (cdr (assq 'args desc))))
+       (jolt-hash-map
+        jolt-sim-kw-kind jolt-sim-kw-foreign-function
+        jolt-sim-kw-task (jolt-future-current-task-id)
+        jolt-sim-kw-symbol (cdr (assq 'csym desc))
+        jolt-sim-kw-argument-types
+        (apply jolt-vector (map (lambda (t) (keyword #f t)) (cdr (assq 'argtypes desc))))
+        jolt-sim-kw-return-type (keyword #f (cdr (assq 'rettype desc)))
+        jolt-sim-kw-blocking? (cdr (assq 'blocking desc))
+        jolt-sim-kw-arguments (apply jolt-vector (cdr (assq 'args desc)))))
+      ((and (equal? ks jolt-ffi-sim-native-desc-keys)
+            (eq? (cdr (assq 'kind desc)) 'native-op)
+            (string? (cdr (assq 'op desc)))
+            (member (cdr (assq 'op desc))
+                    jolt-sim-ffi-native-operation-names)
+            (list? (cdr (assq 'args desc))))
+       (jolt-hash-map
+        jolt-sim-kw-kind jolt-sim-kw-native-operation
+        jolt-sim-kw-task (jolt-future-current-task-id)
+        jolt-sim-kw-operation (keyword #f (cdr (assq 'op desc)))
+        jolt-sim-kw-arguments (apply jolt-vector (cdr (assq 'args desc)))))
+      (else
+       (error 'jolt-sim-ffi-project-descriptor
+              "malformed or ambiguous FFI simulation descriptor" desc)))))
+(define (jolt-sim-make-ffi-controller-wrapper f)
+  (lambda (desc) (jolt-invoke f (jolt-sim-ffi-project-descriptor desc))))
+(define (jolt-sim-install-ffi-controller! f)
+  (unless f
+    (error 'jolt-sim-install-ffi-controller! "controller must be non-false"))
+  (jolt-ffi-install-sim-hook! (jolt-sim-make-ffi-controller-wrapper f)))
+(define (jolt-sim-restore-ffi-controller! installation)
+  (jolt-ffi-clear-sim-hook! installation))
+
 (def-var! "jolt.internal.sim" "capabilities" jolt-sim-capabilities)
 (def-var! "jolt.internal.sim" "install-controller!" jolt-sim-install-controller!)
 (def-var! "jolt.internal.sim" "restore-controller!" jolt-sim-restore-controller!)
 (def-var! "jolt.internal.sim" "controller-errors" jolt-sim-controller-errors)
 (def-var! "jolt.internal.sim" "clear-controller-errors!" jolt-future-hook-errors-clear!)
+(def-var! "jolt.internal.sim" "install-ffi-controller!" jolt-sim-install-ffi-controller!)
+(def-var! "jolt.internal.sim" "restore-ffi-controller!" jolt-sim-restore-ffi-controller!)
