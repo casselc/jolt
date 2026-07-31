@@ -1185,8 +1185,8 @@
 
 ;; --- java.util.Arrays -------------------------------------------------------
 ;; Arrays/sort sorts IN PLACE and returns void, so it writes back through the
-;; array's own backing (a Chez vector, or an flvector for the double/float element
-;; kinds) rather than building a new array — orchard.profile relies on
+;; array's own backing (a Chez vector, a bytevector for bytes, or an flvector for
+;; the double/float element kinds) rather than building a new array — orchard.profile relies on
 ;; (doto (Arrays/copyOfRange …) Arrays/sort). list-sort is a stable merge sort,
 ;; matching Arrays.sort over objects. The comparator goes through cmp->less, the
 ;; shared comparator seam, so a reify/deftype Comparator works here exactly as it
@@ -1278,8 +1278,8 @@
     (cons "nextBytes" (lambda (self ba)
                         (let ((v (jolt-array-vec ba))
                               (st (jhost-state self)))
-                          (do ((i 0 (fx+ i 1))) ((fx=? i (vector-length v)))
-                            (vector-set! v i (random-next 8 st)))
+                          (do ((i 0 (fx+ i 1))) ((fx=? i (ja-len v)))
+                            (ja-set! v i (random-next 8 st)))
                           jolt-nil)))
     (cons "nextInt" (lambda (self . a)
                       (let ((st (jhost-state self)))

@@ -89,13 +89,21 @@
 ;; zlib / OpenSSL buffers an HTTP client passes through. read-array returns a
 ;; fresh byte-array of n bytes; write-array copies a byte-array's bytes into ptr
 ;; and returns the count.
+(define (ffi-byte-array-backing who arr)
+  (if (and (jolt-array? arr) (eq? (jolt-array-kind arr) 'byte))
+      (jolt-array-vec arr)
+      (throw-jvm 'IllegalArgumentException
+                 (string-append "jolt.ffi/" who ": expected byte-array"))))
 (define (ffi-read-array ptr n)
-  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (foreign-ref 'unsigned-8 p i)))
-    (make-jolt-array v 'byte)))
+  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n 0)))
+    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 p i)))
+    (make-jolt-array bv 'byte)))
 (define (ffi-write-array ptr arr)
-  (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
-    (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
+  (let* ((bv (ffi-byte-array-backing "write-array" arr))
+         (n (bytevector-length bv))
+         (p (jnum->exact ptr)))
+    (do ((i 0 (+ i 1))) ((= i n))
+      (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
     n))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
