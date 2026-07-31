@@ -30,9 +30,9 @@
       (string=? (render s) expected)))
 (define (jget m k) (pmap-get m k jolt-nil))
 
-;; === capabilities: exact ABI v4 and stable ===================================
-(is "abi-version is exactly integer 4"
-    "(:abi-version (jolt.internal.sim/capabilities))" "4")
+;; === capabilities: exact ABI v5 and stable ===================================
+(is "abi-version is exactly integer 5"
+    "(:abi-version (jolt.internal.sim/capabilities))" "5")
 (is "future-lifecycle capability is unchanged true"
     "(:future-lifecycle (jolt.internal.sim/capabilities))" "true")
 (is "controller-errors capability is true"
@@ -40,8 +40,8 @@
 (is "events capability is the exact ordered lifecycle set"
     "(:events (jolt.internal.sim/capabilities))"
     "[:spawn :start :finish :cancel :exit :abort]")
-(is "ffi-interception descriptor-version is exactly integer 3"
-    "(:descriptor-version (:ffi-interception (jolt.internal.sim/capabilities)))" "3")
+(is "ffi-interception descriptor-version is exactly integer 4"
+    "(:descriptor-version (:ffi-interception (jolt.internal.sim/capabilities)))" "4")
 (is "ffi-interception kinds is the exact set"
     "(:kinds (:ffi-interception (jolt.internal.sim/capabilities)))"
     "[:foreign-function :native-operation]")
@@ -80,7 +80,7 @@
 ;; and an aliased require resolves + invokes the SAME ABI.
 (ev "(require '[jolt.internal.sim :as sim])")
 (is "aliased capabilities call resolves and invokes the same ABI"
-    "(:abi-version (sim/capabilities))" "4")
+    "(:abi-version (sim/capabilities))" "5")
 
 ;; === lifecycle observation through install-controller! =======================
 (ev "(def sim-abi-events (atom []))")

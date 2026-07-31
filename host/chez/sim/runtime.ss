@@ -283,19 +283,69 @@
   jolt-nil)
 
 ;; A stable plain descriptor for one intercepted call: an alist keyed by csym /
-;; argtypes / rettype / blocking / capture-native-error / args. argtypes is a
-;; list of type-name strings (foreign-fn's keyword names, without the leading
-;; colon, e.g. "int" "string"); args is the list of actual jolt arguments in
-;; call order. Descriptor metadata strings are copied on every call so a hook
-;; cannot mutate a later descriptor. Argument objects deliberately remain live:
+;; argtypes / rettype / blocking / capture-native-error / args. Each argtype is
+;; either a primitive type-name string or the recursive string-tagged form
+;;   ("by-value" ("struct" ((field-name field-type) ...)))
+;; where a nested field-type may itself be a struct. This is inert metadata, not
+;; an ftype pointer or native value. Descriptor metadata strings are deep-copied
+;; on every call so a hook cannot mutate a later descriptor. Argument objects
+;; deliberately remain live:
 ;; a native stub must be able to emulate writes through byte arrays/pointers.
 ;; The hook's return value stands in for the complete public binding result:
 ;; scalar for an ordinary binding, or [native-result error-code] for one with
 ;; :capture-native-error enabled.
+(define (jolt-ffi-struct-type-descriptor? t)
+  (and (list? t)
+       (= (length t) 2)
+       (string? (car t))
+       (string=? (car t) "struct")
+       (list? (cadr t))
+       (pair? (cadr t))
+       (for-all
+        (lambda (field)
+          (and (list? field)
+               (= (length field) 2)
+               (string? (car field))
+               (jolt-ffi-field-type-descriptor? (cadr field))))
+        (cadr t))))
+(define (jolt-ffi-field-type-descriptor? t)
+  (or (string? t) (jolt-ffi-struct-type-descriptor? t)))
+(define (jolt-ffi-argument-type-descriptor? t)
+  (or (string? t)
+      (and (list? t)
+           (= (length t) 2)
+           (string? (car t))
+           (string=? (car t) "by-value")
+           (jolt-ffi-struct-type-descriptor? (cadr t)))))
+(define (jolt-ffi-copy-field-type-descriptor t)
+  (if (string? t)
+      (string-copy t)
+      (jolt-ffi-copy-struct-type-descriptor t)))
+(define (jolt-ffi-copy-struct-type-descriptor t)
+  (list (string-copy (car t))
+        (map (lambda (field)
+               (list (string-copy (car field))
+                     (jolt-ffi-copy-field-type-descriptor (cadr field))))
+             (cadr t))))
+(define (jolt-ffi-copy-argument-type-descriptor t)
+  (if (string? t)
+      (string-copy t)
+      (list (string-copy (car t))
+            (jolt-ffi-copy-struct-type-descriptor (cadr t)))))
 (define (jolt-ffi-make-sim-descriptor
          csym argtypes rettype blocking capture-native-error args)
+  (unless (and (string? csym)
+               (list? argtypes)
+               (for-all jolt-ffi-argument-type-descriptor? argtypes)
+               (string? rettype)
+               (boolean? blocking)
+               (boolean? capture-native-error)
+               (list? args)
+               (= (length argtypes) (length args)))
+    (error 'jolt-ffi-make-sim-descriptor
+           "malformed FFI simulation descriptor metadata"))
   (list (cons 'csym (string-copy csym))
-        (cons 'argtypes (map string-copy argtypes))
+        (cons 'argtypes (map jolt-ffi-copy-argument-type-descriptor argtypes))
         (cons 'rettype (string-copy rettype))
         (cons 'blocking blocking)
         (cons 'capture-native-error capture-native-error)
@@ -349,16 +399,12 @@
                     (lambda () (jolt-invoke2 h descriptor proceed))
                     (lambda () (set! live? #f)))))))))))
 
-;; Retain the two-argument entry point for code compiled by descriptor-v1/v2/v3
-;; sim compilers. It remains fully usable with the established one-argument
-;; hook; a new routing hook fails closed rather than pretending such a call has
-;; a native continuation.
-(define jolt-ffi-invoke-sim-hook
-  (case-lambda
-    ((installation descriptor)
-     (jolt-ffi-invoke-sim-hook* installation descriptor #f))
-    ((installation descriptor native-call)
-     (jolt-ffi-invoke-sim-hook* installation descriptor native-call))))
+;; This unreleased ABI has one exact invocation shape. Every instrumented call
+;; carries its native thunk even when the installed one-argument controller will
+;; not consume it; version bumps replace the old shape instead of accumulating a
+;; compatibility ladder before the first public release.
+(define (jolt-ffi-invoke-sim-hook installation descriptor native-call)
+  (jolt-ffi-invoke-sim-hook* installation descriptor native-call))
 
 ;; A native-op interception extends the SAME hook (and so its stack ownership +
 ;; reentrancy guard above) to the runtime primitives a jolt library uses to load
@@ -611,11 +657,13 @@
 ;; call site passed, never copies), :task-identity :future-lifecycle (every
 ;; descriptor carries the current hooked-future task id, or 0 outside one), and
 ;; :native-operations (the exact ordered set of native-op names a
-;; native-operation descriptor's :operation may be). ABI v4 preserves the
-;; descriptor-v3 shapes and established one-argument controller exactly, and
-;; adds :proceed-routing plus install-ffi-routing-controller!: a two-argument
-;; controller receives [descriptor proceed], where proceed is a zero-argument,
-;; single-use, dynamic-extent, owner-thread thunk for the exact native branch.
+;; native-operation descriptor's :operation may be). ABI v5 replaces the
+;; foreign-function type metadata with descriptor v4: primitive keywords remain
+;; unchanged while by-value aggregate arguments project recursively as
+;; [:by-value [:struct [[:field :type] ...]]]. The existing one-argument and
+;; routing controllers remain current, first-class choices. A routing controller
+;; receives [descriptor proceed], where proceed is a zero-argument, single-use,
+;; dynamic-extent, owner-thread thunk for the exact native branch.
 (define jolt-sim-kw-abi-version        (keyword #f "abi-version"))
 (define jolt-sim-kw-future-lifecycle   (keyword #f "future-lifecycle"))
 (define jolt-sim-kw-controller-errors  (keyword #f "controller-errors"))
@@ -648,7 +696,7 @@
 (define jolt-sim-kw-operation          (keyword #f "operation"))
 (define (jolt-sim-capabilities)
   (jolt-hash-map
-   jolt-sim-kw-abi-version 4
+   jolt-sim-kw-abi-version 5
    jolt-sim-kw-future-lifecycle #t
    jolt-sim-kw-controller-errors #t
    jolt-sim-kw-events
@@ -656,10 +704,10 @@
     fhk-spawn fhk-start fhk-finish fhk-cancel fhk-exit fhk-abort)
    jolt-sim-kw-ffi-interception
    (jolt-hash-map
-    ;; ABI v4 does not change descriptor v3: it keeps v2's exact descriptor
-    ;; shapes and native-error flag plus v3's staged scoped byte-array loan
-    ;; lifecycle. Proceed is a separate controller calling convention.
-    jolt-sim-kw-descriptor-version 3
+    ;; Descriptor v4 keeps the existing map keys, native-error flag, scoped
+    ;; byte-array lifecycle, and live argument identity. Only type values expand
+    ;; from primitive keywords to the recursive aggregate form documented above.
+    jolt-sim-kw-descriptor-version 4
     jolt-sim-kw-kinds (jolt-vector jolt-sim-kw-foreign-function
                                     jolt-sim-kw-native-operation)
     jolt-sim-kw-arguments jolt-sim-kw-live
@@ -749,7 +797,7 @@
 ;; produces — the same opaque token type the low-level Scheme API uses, not a
 ;; new one — so nesting, ordering, and restore-by-owner behave identically to a
 ;; caller using the low-level hook stack directly. The established installer
-;; invokes f with the exact descriptor-v3 map. The routing installer invokes f
+;; invokes f with the exact descriptor-v4 map. The routing installer invokes f
 ;; with [descriptor proceed]; restore accepts either installation token and
 ;; passes it straight to jolt-ffi-clear-sim-hook!, unchanged.
 ;;
@@ -763,8 +811,10 @@
 ;; stable future-lifecycle id while inside a hooked future, or 0 on the
 ;; primordial/unregistered thread. This correlates effect observations with the
 ;; lifecycle controller without adding a second task registry.
-;; :symbol/:argument-types/:return-type are copied metadata (already snapshotted
-;; per call by the makers above); :capture-native-error? is part of handler
+;; :symbol/:argument-types/:return-type are copied metadata (already deep-
+;; snapshotted per call by the makers above). Primitive type values are keywords;
+;; a by-value aggregate retains its recursive vector shape and field-name/type
+;; pairs. :capture-native-error? is part of handler
 ;; identity so otherwise-identical scalar and captured bindings cannot collide;
 ;; :arguments is the SAME live jolt call arguments in call order, not copies —
 ;; a controller must be able to emulate writes through a live byte array or
@@ -779,13 +829,34 @@
     "borrow-byte-array" "release-byte-array" "ptr->string" "string->ptr"))
 (define (jolt-sim-ffi-descriptor-keys desc)
   (and (list? desc) (for-all pair? desc) (map car desc)))
+(define (jolt-sim-project-ffi-field-type t)
+  (if (string? t)
+      (keyword #f t)
+      (jolt-sim-project-ffi-struct-type t)))
+(define (jolt-sim-project-ffi-struct-type t)
+  (jolt-vector
+   (keyword #f "struct")
+   (apply
+    jolt-vector
+    (map (lambda (field)
+           (jolt-vector
+            (keyword #f (car field))
+            (jolt-sim-project-ffi-field-type (cadr field))))
+         (cadr t)))))
+(define (jolt-sim-project-ffi-argument-type t)
+  (if (string? t)
+      (keyword #f t)
+      (jolt-vector
+       (keyword #f "by-value")
+       (jolt-sim-project-ffi-struct-type (cadr t)))))
 (define (jolt-sim-ffi-project-descriptor desc)
   (let ((ks (jolt-sim-ffi-descriptor-keys desc)))
     (cond
       ((and (equal? ks jolt-ffi-sim-cfn-desc-keys)
             (string? (cdr (assq 'csym desc)))
             (list? (cdr (assq 'argtypes desc)))
-            (for-all string? (cdr (assq 'argtypes desc)))
+            (for-all jolt-ffi-argument-type-descriptor?
+                     (cdr (assq 'argtypes desc)))
             (string? (cdr (assq 'rettype desc)))
             (boolean? (cdr (assq 'blocking desc)))
             (boolean? (cdr (assq 'capture-native-error desc)))
@@ -797,7 +868,9 @@
         jolt-sim-kw-task (jolt-future-current-task-id)
         jolt-sim-kw-symbol (cdr (assq 'csym desc))
         jolt-sim-kw-argument-types
-        (apply jolt-vector (map (lambda (t) (keyword #f t)) (cdr (assq 'argtypes desc))))
+        (apply jolt-vector
+               (map jolt-sim-project-ffi-argument-type
+                    (cdr (assq 'argtypes desc))))
         jolt-sim-kw-return-type (keyword #f (cdr (assq 'rettype desc)))
         jolt-sim-kw-blocking? (cdr (assq 'blocking desc))
         jolt-sim-kw-capture-native-error?

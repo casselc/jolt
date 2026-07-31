@@ -8,7 +8,7 @@ CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null
 JOLT_CHEZ := $(CHEZ)
 export JOLT_CHEZ
 
-.PHONY: test ci testbin values targetfacts pathfacts monotonic corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffisimhook ffisimflavor ffinativehook futuresimhook ordinaryfuturenosim ordinaryffinosim simcontrollerabi simfficontrollerabi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug jolt-sim simprofilesmoke joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint compilepathsmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
+.PHONY: test ci testbin values targetfacts pathfacts monotonic corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi ffiaggregate ffisimhook ffisimflavor ffinativehook futuresimhook ordinaryfuturenosim ordinaryffinosim simcontrollerabi simfficontrollerabi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug jolt-sim simprofilesmoke joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint compilepathsmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -24,7 +24,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values targetfacts pathfacts monotonic corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffisimhook ffisimflavor ffinativehook futuresimhook ordinaryfuturenosim ordinaryffinosim simcontrollerabi simfficontrollerabi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke simprofilesmoke certify
+ci: submodules values targetfacts pathfacts monotonic corpus unit hostclass providerregistry providerevaluator providertransactions providerinstall selectedchez aliasresolution mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffiaggregate ffisimhook ffisimflavor ffinativehook futuresimhook ordinaryfuturenosim ordinaryffinosim simcontrollerabi simfficontrollerabi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke simprofilesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -232,6 +232,13 @@ cts: testbin
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+
+# Compiler/native ABI evidence for exact-width scalars and recursively described
+# pointer-backed structs passed by value. It builds a tiny C oracle and uses a
+# converged transient source seed so the gate exercises the source compiler and
+# also detects a stale checked bootstrap image independently.
+ffiaggregate:
+	@CHEZ="$(CHEZ)" sh test/chez/ffi-aggregate-test.sh
 
 # Ordinary future/future-call code is observable and start-gateable through a
 # disabled-by-default internal runtime hook. This loads the host from source,

@@ -41,21 +41,28 @@ while [ "$i" -lt 8 ]; do
   if ! "$CHEZ" --script host/chez/bootstrap.ss \
       "$tmp/cur-p.ss" "$tmp/cur-i.ss" "$tmp/new-p.ss" "$tmp/new-i.ss" \
       >"$tmp/out" 2>"$tmp/err"; then
+    cat "$tmp/out" >&2
     cat "$tmp/err" >&2
     exit 1
   fi
 
   if diff -q "$tmp/cur-p.ss" "$tmp/new-p.ss" >/dev/null \
      && diff -q "$tmp/cur-i.ss" "$tmp/new-i.ss" >/dev/null; then
-    skipped="$(sed -n 's/^mint: \([0-9][0-9]*\) form(s) skipped$/\1/p' "$tmp/err" | tail -1)"
-    if [ -z "$skipped" ]; then
-      echo "transient seed gate could not verify the converged skip count" >&2
+    # Native Chez writes this record to stderr on POSIX and stdout on Windows.
+    # Require one unambiguous record across both captured channels.
+    sed -n 's/^mint: \([0-9][0-9]*\) form(s) skipped$/\1/p' \
+      "$tmp/out" "$tmp/err" >"$tmp/skip-counts"
+    skip_records="$(wc -l <"$tmp/skip-counts" | tr -d '[:space:]')"
+    if [ "$skip_records" -ne 1 ]; then
+      echo "transient seed gate expected exactly one converged skip count" >&2
+      cat "$tmp/out" >&2
       cat "$tmp/err" >&2
       exit 1
     fi
+    skipped="$(cat "$tmp/skip-counts")"
     if [ "$skipped" -ne 0 ]; then
       echo "transient seed gate: $skipped form(s) failed to compile:" >&2
-      grep '^mint: skipped ' "$tmp/err" >&2 || true
+      grep '^mint: skipped ' "$tmp/out" "$tmp/err" >&2 || true
       exit 1
     fi
     echo "transient seed gate: converged after $i pass(es)"

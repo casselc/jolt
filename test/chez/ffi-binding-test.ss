@@ -77,6 +77,12 @@
 ;; Exact scalar widths used by native structures and protocols. In particular,
 ;; pollfd and sockaddr fields cannot be modeled portably by packing shorts into
 ;; an :int: that silently reverses the fields on a big-endian host.
+(ok "32-bit aliases have exact width 4"
+    (equal? '(4 4)
+            (map (lambda (t)
+                   (jnum->exact
+                     (ev (string-append "(jolt.ffi/sizeof " t ")"))))
+                 '(":int32" ":uint32"))))
 (ok "16-bit aliases have exact width 2"
     (equal? '(2 2 2 2)
             (map (lambda (t)

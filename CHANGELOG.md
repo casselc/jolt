@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Foreign calls accept exact-width scalar types and recursively described
+  structs passed by value.** `:int32` and `:uint32` map to four-byte C ABI
+  scalars on every supported target. An argument such as
+  `[:by-value [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]`
+  describes the value layout while the Jolt caller supplies a pointer to its
+  storage. Nested structs compose with blocking calls, atomic native-error
+  capture, and fixed/variadic boundaries. Simulation ABI 5 projects the same
+  recursive metadata without resolving the symbol or dereferencing the pointer.
+  Aggregate results and callbacks remain deliberately unsupported.
+
 - **Variadic foreign bindings declare their fixed-argument boundary.**
   `jolt.ffi/foreign-fn` and `defcfn` accept
   `{:varargs-after n}`, where `n` is the positive number of declared fixed C

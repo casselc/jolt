@@ -90,6 +90,28 @@
              (cons 'capture-native-error #f)
              (cons 'args (list 1 2))))
       #f))
+(ok "a foreign descriptor with a bare struct argument is rejected"
+    (guard (e (#t #t))
+      (jolt-sim-ffi-project-descriptor
+       (list (cons 'csym "sym")
+             (cons 'argtypes
+                   (list (list "struct" (list (list "x" "int")))))
+             (cons 'rettype "int")
+             (cons 'blocking #f)
+             (cons 'capture-native-error #f)
+             (cons 'args (list 1))))
+      #f))
+(ok "a foreign descriptor with an empty by-value struct is rejected"
+    (guard (e (#t #t))
+      (jolt-sim-ffi-project-descriptor
+       (list (cons 'csym "sym")
+             (cons 'argtypes
+                   (list (list "by-value" (list "struct" '()))))
+             (cons 'rettype "int")
+             (cons 'blocking #f)
+             (cons 'capture-native-error #f)
+             (cons 'args (list 1))))
+      #f))
 (ok "a foreign descriptor with a non-string return type is rejected"
     (guard (e (#t #t))
       (jolt-sim-ffi-project-descriptor
@@ -165,9 +187,9 @@
                  (and (eq? (pvec-nth-d advertised i jolt-nil)
                            (keyword #f (car names)))
                       (loop (cdr names) (+ i 1)))))))
-  (ok "outer lifecycle ABI is v4 while the nested FFI descriptor remains v3"
-      (and (= 4 (jget caps jolt-sim-kw-abi-version))
-           (= 3 (jget ffi-caps jolt-sim-kw-descriptor-version)))))
+  (ok "outer lifecycle ABI is v5 with recursive FFI descriptor v4"
+      (and (= 5 (jget caps jolt-sim-kw-abi-version))
+           (= 4 (jget ffi-caps jolt-sim-kw-descriptor-version)))))
 
 ;; === ordinary jolt code: require jolt.ffi, bind a ghost + a real symbol =====
 (ev "(require '[jolt.ffi :as ffi])")
@@ -187,6 +209,13 @@
 (ev "(ffi/defcfn c-abs-blocking \"abs\" [:int] :int :blocking)")
 (ev "(ffi/defcfn c-abs-captured \"abs\" [:int] :int
        {:capture-native-error true})")
+(ev "(ffi/defcfn c-ghost-aggregate
+       \"definitely_not_a_real_c_aggregate_symbol_zzz9\"
+       [[:by-value
+         [:struct
+          [[:date [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]
+           [:zone :int16]]]]]
+       :int)")
 
 (ok "no hook installed by default" (not jolt-ffi-sim-hook))
 (ok "with no controller, ordinary defcfn code calls native code unchanged"
@@ -308,7 +337,7 @@
            (= task-id (jget future-desc jolt-sim-kw-task)))))
 
 ;; A scalar and captured binding intentionally share every existing signature
-;; field. Descriptor v3 retains v2's capture-aware identity, and the
+;; field. Descriptor v4 retains capture-aware identity, and the
 ;; controller returns the captured binding's complete public pair as one value.
 (ok "captured ghost call receives the controller's complete public pair"
     (jolt-truthy? (ev "(= [-1 73] (c-ghost-captured 43 8))")))
@@ -398,7 +427,29 @@
 (ok "restoring reinstates native execution for an existing harmless symbol"
     (= 7 (jnum->exact (ev "(c-abs -7)"))))
 
-;; === ABI v4 routing controller: explicit scoped real-call continuation ======
+;; === descriptor v4 recursive aggregate projection ===========================
+;; A null pointer is deliberately safe on the modeled route: projection occurs
+;; before the native wrapper's pointer conversion, and the ghost symbol remains
+;; unresolved. Ordinary source sees the same recursive vector form it declared.
+(ev "(def sim-ffi-aggregate-events (atom []))")
+(ev "(defn sim-ffi-aggregate-controller [desc]
+       (swap! sim-ffi-aggregate-events conj desc)
+       818)")
+(ev "(def sim-ffi-aggregate-token
+       (jolt.internal.sim/install-ffi-controller!
+        sim-ffi-aggregate-controller))")
+(ok "controller models an aggregate call without native pointer conversion"
+    (= 818 (jnum->exact (ev "(c-ghost-aggregate 0)"))))
+(is "aggregate argument type projects to the exact recursive public shape"
+    "(:argument-types (first @sim-ffi-aggregate-events))"
+    "[[:by-value [:struct [[:date [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]] [:zone :int16]]]]]")
+(is "aggregate descriptor preserves the live pointer argument"
+    "(:arguments (first @sim-ffi-aggregate-events))" "[0]")
+(is "aggregate descriptor retains the exact existing key set"
+    "(count (first @sim-ffi-aggregate-events))" "8")
+(ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-aggregate-token)")
+
+;; === ABI v5 routing controller: explicit scoped real-call continuation ======
 (ev "(def sim-ffi-real-int-size (ffi/sizeof :int))")
 (ev "(def sim-ffi-routing-events (atom []))")
 (ev "(defn sim-ffi-routing-controller [desc proceed]
@@ -425,7 +476,7 @@
     (= (jnum->exact (ev "sim-ffi-real-int-size"))
        (jnum->exact (ev "(ffi/sizeof :int)"))))
 (let ((d (pvec-nth-d (ev "@sim-ffi-routing-events") 0 jolt-nil)))
-  (ok "routing preserves the exact descriptor-v3 foreign-function map shape"
+  (ok "routing preserves the exact descriptor-v4 foreign-function map shape"
       (= 8 (pmap-cnt d))))
 (ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-routing-token)")
 

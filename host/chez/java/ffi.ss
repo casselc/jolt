@@ -34,6 +34,11 @@
     (cond
       ((string=? n "int") 'int)
       ((string=? n "uint") 'unsigned-int)
+      ;; Exact-width names remain meaningful even on targets where C int is
+      ;; currently 32 bits. Aggregate descriptors and wire layouts must name
+      ;; their width rather than inherit a platform typedef assumption.
+      ((string=? n "int32") 'integer-32)
+      ((string=? n "uint32") 'unsigned-32)
       ((or (string=? n "int16") (string=? n "short")) 'integer-16)
       ((or (string=? n "uint16") (string=? n "ushort")) 'unsigned-16)
       ((string=? n "long") 'long)

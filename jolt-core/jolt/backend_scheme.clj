@@ -590,6 +590,7 @@
 ;; host/chez/java/ffi.ss, which serves the runtime memory accessors.
 (def ^:private ffi-types
   {"int" "int" "uint" "unsigned-int" "long" "long" "ulong" "unsigned-long"
+   "int32" "integer-32" "uint32" "unsigned-32"
    "int16" "integer-16" "short" "integer-16"
    "uint16" "unsigned-16" "ushort" "unsigned-16"
    "int64" "integer-64" "uint64" "unsigned-64" "size_t" "size_t" "ssize_t" "ssize_t"
@@ -599,10 +600,94 @@
    "int8" "integer-8" "i8" "integer-8"})
 (defn- ffi-type->chez [t]
   (or (ffi-types t) (throw (ex-info (str "jolt.ffi: unknown foreign type :" t) {}))))
+
+(defn- ffi-by-value? [t]
+  (and (map? t) (= :by-value (:ffi-kind t))))
+
+(defn- emit-ffi-ftype [t]
+  (cond
+    (string? t)
+    (ffi-type->chez t)
+
+    (and (map? t) (= :struct (:ffi-kind t)))
+    (str "(struct "
+         (str/join
+          " "
+          (map-indexed
+           (fn [i field]
+             ;; Source field names stay in the controller descriptor. Generated
+             ;; ftype identifiers use stable indices so arbitrary C names never
+             ;; become Scheme syntax.
+             (str "[f" i " " (emit-ffi-ftype (:type field)) "]"))
+           (:fields t)))
+         ")")
+
+    :else
+    (throw (ex-info (str "jolt.ffi: unsupported aggregate descriptor "
+                         (pr-str t)) {}))))
+
+;; Emit one compile-time FFI type as inert Scheme data for the simulation
+;; descriptor. Primitive types remain strings. Aggregate descriptors retain the
+;; exact public recursive shape as string-tagged lists; the simulation overlay
+;; validates, snapshots, and projects those into Jolt keywords/vectors.
+(defn- emit-ffi-type-descriptor [t]
+  (cond
+    (string? t)
+    (chez-str-lit t)
+
+    (ffi-by-value? t)
+    (str "(list \"by-value\" " (emit-ffi-type-descriptor (:type t)) ")")
+
+    (and (map? t) (= :struct (:ffi-kind t)))
+    (str "(list \"struct\" (list "
+         (str/join
+          " "
+          (map (fn [field]
+                 (str "(list " (chez-str-lit (:name field)) " "
+                      (emit-ffi-type-descriptor (:type field)) ")"))
+               (:fields t)))
+         "))")
+
+    :else
+    (throw (ex-info (str "jolt.ffi: unsupported descriptor metadata "
+                         (pr-str t)) {}))))
+
 (defn- emit-ffi-fn [node]
   (let [n (count (:argtypes node))
         params (mapv (fn [i] (str "a" i)) (range n))
         call-args (str/join " " params)
+        aggregate-types
+        (->> (:argtypes node)
+             (map-indexed
+              (fn [i t]
+                (when (ffi-by-value? t)
+                  {:index i
+                   :name (fresh-label "jolt_ffi_struct")
+                   :type (:type t)})))
+             (remove nil?)
+             vec)
+        aggregate-by-index
+        (into {} (map (fn [entry] [(:index entry) entry]) aggregate-types))
+        emitted-argtypes
+        (mapv (fn [i t]
+                (if-let [entry (aggregate-by-index i)]
+                  (str "(& " (:name entry) ")")
+                  (ffi-type->chez t)))
+              (range n)
+              (:argtypes node))
+        emitted-native-args
+        (mapv (fn [i param]
+                (if-let [entry (aggregate-by-index i)]
+                  (str "(let ((address (jnum->exact " param "))) "
+                       "(if (= address 0) "
+                       "(throw-jvm 'NullPointerException "
+                       (chez-str-lit "jolt.ffi: null by-value aggregate pointer")
+                       ") "
+                       "(make-ftype-pointer " (:name entry) " address)))")
+                  param))
+              (range n)
+              params)
+        native-call-args (str/join " " emitted-native-args)
         ;; Chez convention clauses in declaration order: __collect_safe (a :blocking
         ;; call deactivates the thread so it can't pin the stop-the-world collector),
         ;; then (__varargs_after n) marking the fixed/variadic boundary. On apple
@@ -617,7 +702,7 @@
                                                          (:varargs-after node) ")")))
         conventions (when (seq conv-clauses) (str/join " " conv-clauses))
         signature (str (chez-str-lit (:csym node))
-                       " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
+                       " (" (str/join " " emitted-argtypes) ") "
                        (ffi-type->chez (:rettype node)))
         fp (if (:capture-native-error node)
              (str "(jolt-ffi-native-error-procedure ("
@@ -626,7 +711,7 @@
                   (when conventions (str conventions " "))
                   signature ")"))
         foreign-call (str "((or p (begin (set! p " fp ") p)) "
-                          call-args ")")
+                          native-call-args ")")
         native-result
         (if (:capture-native-error node)
           (str "(call-with-values (lambda () " foreign-call ") "
@@ -647,7 +732,12 @@
         ;; flavor). Off, this body is exactly else-branch: the ordinary emission
         ;; carries no jolt-ffi-sim-hook reference at all.
         body (if (sim-instrument?)
-               (let [argtypes-lit (str "(list " (str/join " " (map chez-str-lit (:argtypes node))) ")")
+               (let [argtypes-lit
+                     (str "(list "
+                          (str/join " "
+                                    (map emit-ffi-type-descriptor
+                                         (:argtypes node)))
+                          ")")
                      ;; A stable plain descriptor (jolt-ffi-make-sim-descriptor,
                      ;; host/chez/java/ffi.ss) for the simulation seam: C symbol,
                      ;; argument/return types, the :blocking and
@@ -673,8 +763,18 @@
                       "(if h (jolt-ffi-invoke-sim-hook h " descriptor
                       " (lambda () " else-branch ")) "
                       else-branch "))"))
-               else-branch)]
-    (str "(let ((p #f)) (lambda (" call-args ") " body "))")))
+               else-branch)
+        binding (str "(let ((p #f)) (lambda (" call-args ") " body "))")]
+    (if (seq aggregate-types)
+      (str "(let () "
+           (str/join
+            " "
+            (map (fn [entry]
+                   (str "(define-ftype " (:name entry) " "
+                        (emit-ffi-ftype (:type entry)) ")"))
+                 aggregate-types))
+           " " binding ")")
+      binding)))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the

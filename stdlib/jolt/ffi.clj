@@ -11,8 +11,18 @@
         (let [db (ffi/read pp :pointer)] ...)
         (ffi/free pp))
 
-  Types (keywords): :int :uint :long :ulong :int64 :uint64 :size_t :ssize_t
-  :iptr :uptr :double :float :pointer :string :void :uint8 :char.
+  Types (keywords): :int :uint :int32 :uint32 :long :ulong :int64 :uint64
+  :size_t :ssize_t :iptr :uptr :double :float :pointer :string :void :uint8
+  :char. A C struct argument passed by value is described inline:
+
+      [:by-value
+       [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]
+
+  The Jolt argument remains a native pointer to caller-owned storage holding
+  that layout; the generated wrapper passes the pointed-to value by C value.
+  Nested [:struct ...] field types are supported. Aggregate results and
+  aggregate callbacks are deliberately rejected until their ownership and
+  lifetime contracts are explicit.
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. Binary data can
@@ -37,6 +47,10 @@
   must be their default-promoted C ABI types (for example, use :double for a
   promoted C float); Jolt does not infer those promotions.
 
+  Aggregate argument descriptors compose with these options. The native pointer
+  is dereferenced only on the native/proceed route; a simulation controller can
+  model the call without touching caller memory or resolving the C symbol.
+
   foreign-callable is the inverse — it wraps a jolt fn as a C-callable function
   pointer so C can call back into jolt (e.g. GTK signal handlers);
   free-callable releases it.")
@@ -46,7 +60,8 @@
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; The optional final argument is the legacy :blocking keyword or a literal map
 ;; containing :blocking and :capture-native-error Boolean values and/or a
-;; positive integer :varargs-after boundary.
+;; positive integer :varargs-after boundary. Aggregate arguments use the inline
+;; descriptor documented above.
 (defn- opt->cfn-arg [opts]
   (cond
     (empty? opts) nil

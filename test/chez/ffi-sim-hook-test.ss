@@ -90,6 +90,13 @@
        \"definitely_not_a_real_c_symbol_varargs_zzz9\" [:int :int :int] :int
        {:blocking true :capture-native-error true :varargs-after 2})")
 (ev "(ffi/defcfn c-ghost-zero \"definitely_not_a_real_c_symbol_zero_zzz9\" [] :int)")
+(ev "(ffi/defcfn c-ghost-aggregate
+       \"definitely_not_a_real_c_aggregate_symbol_zzz9\"
+       [[:by-value
+         [:struct
+          [[:date [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]
+           [:zone :int16]]]]]
+       :int)")
 
 (define captured '())
 (define (record-hook! desc)
@@ -195,7 +202,7 @@
            (eq? (dget captured-call 'capture-native-error) #t)
            (equal? (dget scalar 'args) (dget captured-call 'args)))))
 
-;; :varargs-after is native-lowering policy, not part of the stable v3
+;; :varargs-after is native-lowering policy, not part of the descriptor-v4
 ;; controller descriptor. Intercept a never-resolved variadic symbol with all
 ;; three options enabled and pin the descriptor's exact existing key set.
 (ok "variadic binding is intercepted without resolving its symbol"
@@ -203,7 +210,7 @@
 (ok "eight descriptors captured after the variadic binding"
     (= 8 (length captured)))
 (let ((d (list-ref captured 7)))
-  (ok "variadic binding preserves the exact v3 descriptor shape"
+  (ok "variadic binding preserves the exact descriptor-v4 shape"
       (equal? (map car d)
               '(csym argtypes rettype blocking capture-native-error args)))
   (ok "variadic binding descriptor retains its ordinary metadata"
@@ -226,6 +233,76 @@
 (ok "fresh-emitter blocking native branch remains callable"
     (= 17 (jnum->exact (ev "(c-abs-blocking -17)"))))
 
+;; Recursive aggregate metadata is inert on the modeled route. A null pointer
+;; would fail before native entry, but the controller can substitute a result
+;; without resolving the ghost symbol or dereferencing caller memory.
+(define aggregate-captured '())
+(define aggregate-installation
+  (jolt-ffi-install-sim-hook!
+   (lambda (desc)
+     (set! aggregate-captured (append aggregate-captured (list desc)))
+     919)))
+(ok "aggregate call is modeled without resolving or dereferencing native state"
+    (= 919 (jnum->exact (ev "(c-ghost-aggregate 0)"))))
+(define expected-aggregate-type
+  (list "by-value"
+        (list "struct"
+              (list
+               (list "date"
+                     (list "struct"
+                           (list (list "year" "int32")
+                                 (list "month" "uint8")
+                                 (list "day" "uint8"))))
+               (list "zone" "int16")))))
+(let ((d (car aggregate-captured)))
+  (ok "raw aggregate descriptor retains its exact recursive type shape"
+      (equal? (dget d 'argtypes) (list expected-aggregate-type)))
+  (ok "raw aggregate descriptor retains the live null argument"
+      (equal? (dget d 'args) '(0)))
+  ;; Mutate tags, field names, and primitive leaves in one delivered snapshot.
+  (let* ((aggregate (car (dget d 'argtypes)))
+         (struct (cadr aggregate))
+         (fields (cadr struct))
+         (date-field (car fields))
+         (date-struct (cadr date-field))
+         (date-fields (cadr date-struct)))
+    (string-set! (car aggregate) 0 #\X)
+    (string-set! (car date-field) 0 #\X)
+    (string-set! (cadr (car date-fields)) 0 #\X)))
+(ok "a later aggregate call still receives pristine recursive metadata"
+    (= 919 (jnum->exact (ev "(c-ghost-aggregate 0)"))))
+(ok "recursive metadata is deep-snapshotted per intercepted call"
+    (equal? (dget (cadr aggregate-captured) 'argtypes)
+            (list expected-aggregate-type)))
+(jolt-ffi-clear-sim-hook! aggregate-installation)
+
+;; The raw maker is internal, but rejecting malformed shapes here pins the
+;; projector boundary against ambiguous metadata supplied by Scheme-level tests.
+(ok "raw descriptor rejects a bare top-level struct"
+    (guard (e (#t #t))
+      (jolt-ffi-make-sim-descriptor
+       "bad" (list (list "struct" (list (list "x" "int"))))
+       "int" #f #f '(1))
+      #f))
+(ok "raw descriptor rejects an empty struct"
+    (guard (e (#t #t))
+      (jolt-ffi-make-sim-descriptor
+       "bad" (list (list "by-value" (list "struct" '())))
+       "int" #f #f '(1))
+      #f))
+(ok "raw descriptor rejects nested by-value field markers"
+    (guard (e (#t #t))
+      (jolt-ffi-make-sim-descriptor
+       "bad"
+       (list (list "by-value"
+                   (list "struct"
+                         (list (list "x"
+                                     (list "by-value"
+                                           (list "struct"
+                                                 (list (list "y" "int")))))))))
+       "int" #f #f '(1))
+      #f))
+
 ;; Nested installs restore exactly their predecessor. An out-of-order clear is
 ;; rejected and must not disable the current owner.
 (define outer-installation
@@ -247,30 +324,8 @@
 (ok "clearing the outer hook restores native execution"
     (= 7 (jnum->exact (ev "(c-abs -7)"))))
 
-;; Code emitted by descriptor-v1/v2/v3 sim compilers calls the shared helper
-;; with only [installation descriptor]. Preserve that old form for established
-;; hooks, and fail closed if a routing hook is paired with no native thunk.
-(define legacy-direct-desc
-  (jolt-ffi-make-sim-descriptor "legacy-direct" '() "int" #f #f '()))
-(define legacy-direct-installation
-  (jolt-ffi-install-sim-hook! (lambda (desc) 616)))
-(ok "legacy two-argument invocation still reaches an established hook"
-    (= 616
-       (jolt-ffi-invoke-sim-hook jolt-ffi-sim-hook legacy-direct-desc)))
-(jolt-ffi-clear-sim-hook! legacy-direct-installation)
-(define legacy-routing-call-count 0)
-(define legacy-routing-installation
-  (jolt-ffi-install-routing-hook!
-   (lambda (desc proceed)
-     (set! legacy-routing-call-count (+ legacy-routing-call-count 1))
-     717)))
-(ok "legacy invocation under a routing hook fails for missing proceed thunk"
-    (guard (e (#t #t))
-      (jolt-ffi-invoke-sim-hook jolt-ffi-sim-hook legacy-direct-desc)
-      #f))
-(ok "missing legacy proceed fails before invoking the routing controller"
-    (= 0 legacy-routing-call-count))
-(jolt-ffi-clear-sim-hook! legacy-routing-installation)
+(define direct-desc
+  (jolt-ffi-make-sim-descriptor "direct" '() "int" #f #f '()))
 
 ;; Consumption happens before the native thunk. Catch a deliberate native
 ;; failure inside the controller, retry the same proceed, and prove the thunk
@@ -293,7 +348,7 @@
 (ok "native failure leaves the same proceed consumed"
     (eq? 'retry-rejected
          (jolt-ffi-invoke-sim-hook
-          jolt-ffi-sim-hook legacy-direct-desc
+          jolt-ffi-sim-hook direct-desc
           (lambda ()
             (set! failing-native-call-count (+ failing-native-call-count 1))
             (raise failing-native-sentinel)))))

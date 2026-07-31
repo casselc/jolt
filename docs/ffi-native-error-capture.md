@@ -51,9 +51,10 @@ The option has these exact semantics:
 This option changes only the opted-in binding. It does not change the C ABI or
 the behavior of another binding for the same native symbol and signature.
 
-Variadic boundaries, aggregate arguments, and scoped byte-array loans are
-separate FFI slices. This contract does not claim those features until their
-v0.5.11 remints land.
+Variadic boundaries, aggregate arguments, and scoped byte-array loans remain
+separate FFI contracts. The current implementation composes captured calls with
+fixed/variadic boundaries and pointer-backed structs passed by value; their own
+documents and executable gates define the additional semantics.
 
 ## Target selection
 
@@ -83,23 +84,23 @@ complete public binding value:
 - a scalar for an ordinary binding; or
 - `[native-result error-code]` for a captured binding.
 
-ABI v4 additionally exposes a two-argument routing controller. Its second
+ABI v5 exposes both the established one-argument controller and a two-argument
+routing controller. The routing controller's second
 argument is a scoped `proceed` thunk for the exact lazy native branch; for a
 captured binding that branch still collects `[native-result error-code]`
 atomically before returning to the controller. The thunk is single-use,
 dynamic-extent-only, and bound to the controller thread.
 
-Nested FFI descriptor version 2 introduced the exact Boolean
-`:capture-native-error?` field, and descriptor version 3 retains it unchanged.
+Nested FFI descriptor version 4 retains the exact Boolean
+`:capture-native-error?` field and adds recursive type metadata for by-value
+struct arguments.
 Handler identity includes that field, so scalar and captured bindings with
-otherwise identical symbol, type, and blocking metadata cannot collide. ABI v4
-changes the controller calling convention without changing descriptor-v3 maps.
+otherwise identical symbol, type, and blocking metadata cannot collide.
 
-The separate external `jolt-sim` adapter accepts the prior descriptor version
-as capture disabled, preserves the original descriptor in effect traces, and
-validates that a captured handler returns a two-element vector. The core
-projector itself emits and validates only its current descriptor version.
-Simulation does not read the host OS error slot.
+An external simulator must explicitly negotiate ABI 5 and descriptor version 4.
+The core projector emits and validates only that current prerelease contract;
+it does not retain obsolete raw invocation shapes. A captured handler must
+return a two-element vector. Simulation does not read the host OS error slot.
 
 ## Ordering invariant
 

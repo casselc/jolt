@@ -47,7 +47,7 @@ release-byte-array [pointer]
 ```
 
 The established one-argument controller returns a positive modeled pointer as
-before. ABI v4's routing controller may instead call the borrow descriptor's
+before. ABI v5's routing controller may instead call the borrow descriptor's
 zero-argument `proceed` thunk. That exact native branch validates and locks the
 live bytevector and returns its real interior address. Once a real borrow has
 proceeded, the controller must return that same address; substituting a modeled
@@ -60,8 +60,9 @@ attempted from the `dynamic-wind` after thunk on return, throw, or nonlocal
 exit. For a proceeded real borrow the runtime owns the paired unlock: the
 release observer may proceed with it, but a normal return or throw without
 proceeding still forces exactly one unlock. Proceeding the release of a modeled
-loan fails before Chez sees an unmatched unlock. Descriptor version 3 and its
-exact ordered 15-operation set remain unchanged; the separate ABI-v4
+loan fails before Chez sees an unmatched unlock. Descriptor version 4 retains
+the exact ordered 15-operation set and adds recursive foreign-function type
+metadata; the separate ABI-v5
 `:proceed-routing` capability describes the controller/thunk calling contract.
 
 ## Bounded continuation-safety claim
@@ -129,18 +130,18 @@ The focused Scheme gates establish the source facts abstracted by the model:
 - a routing controller cannot replace a proceeded real pointer;
 - nested FFI calls occur outside handler re-entry;
 - nested loans release in LIFO order and callback throws still release once;
-- descriptor-version 3 validation and advertised operation registries agree;
+- descriptor-version 4 validation and advertised operation registries agree;
   and
 - the ordinary release image contains no simulation pointer wrapper.
 
 At this slice's focused checkpoint:
 
 ```text
-make ffi                    72/72
+make ffi                    73/73
 make ffinativehook          65/65
 make simcontrollerabi       64/64
-make simfficontrollerabi    96/96
-make ffisimhook             55/55
+make simfficontrollerabi    102/102
+make ffisimhook             60/60
 make ffisimflavor           21/21
 make ordinaryffinosim       61/61
 make simprofilesmoke        passed
@@ -159,7 +160,7 @@ unchanged against real native memory and the modeled byte-array loan.
 - A modeled borrow handler must return one positive fake pointer. After calling
   real `proceed`, it must return the exact proceeded pointer. Arbitrary pointer
   provenance across separate modeled and real effects is a controller-policy
-  responsibility; ABI v4 directly guards only this scoped-loan boundary.
+  responsibility; ABI v5 directly guards only this scoped-loan boundary.
 - Cleanup is attempted exactly once. A throwing release handler is reported as
   a controller failure; a real array is still unlocked, but this claim does not
   prove the handler completed its own modeled state transition. If both the
