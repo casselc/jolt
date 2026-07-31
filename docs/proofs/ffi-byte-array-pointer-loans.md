@@ -37,22 +37,32 @@ each balance their own lock:
 - <https://cisco.github.io/ChezScheme/csug10.1.0/csug.pdf>
 - <https://cisco.github.io/ChezScheme/csug9.5/smgmt.html>
 
-The simulation-only overlay in `host/chez/sim/runtime.ss` does not expose a
-real address while a controller is installed. It stages two native-operation
-descriptors around the unchanged callback:
+The simulation-only overlay in `host/chez/sim/runtime.ss` stages two
+native-operation descriptors around the unchanged callback:
 
 ```text
-borrow-byte-array [same-live-array offset length] -> positive fake pointer
-callback [fake-pointer length]
-release-byte-array [fake-pointer]
+borrow-byte-array [same-live-array offset length] -> positive pointer
+callback [pointer length]
+release-byte-array [pointer]
 ```
+
+The established one-argument controller returns a positive modeled pointer as
+before. ABI v4's routing controller may instead call the borrow descriptor's
+zero-argument `proceed` thunk. That exact native branch validates and locks the
+live bytevector and returns its real interior address. Once a real borrow has
+proceeded, the controller must return that same address; substituting a modeled
+pointer is rejected before the callback.
 
 The callback runs after the borrow handler returns. Nested `defcfn` and raw FFI
 operations therefore reach the controller normally instead of re-entering the
 same handler invocation. Cleanup uses the hook that issued the loan and is
 attempted from the `dynamic-wind` after thunk on return, throw, or nonlocal
-exit. The nested FFI descriptor is version 3 and advertises the exact ordered
-15-operation set.
+exit. For a proceeded real borrow the runtime owns the paired unlock: the
+release observer may proceed with it, but a normal return or throw without
+proceeding still forces exactly one unlock. Proceeding the release of a modeled
+loan fails before Chez sees an unmatched unlock. Descriptor version 3 and its
+exact ordered 15-operation set remain unchanged; the separate ABI-v4
+`:proceed-routing` capability describes the controller/thunk calling contract.
 
 ## Bounded continuation-safety claim
 
@@ -113,6 +123,10 @@ The focused Scheme gates establish the source facts abstracted by the model:
 - return, exception, and nonlocal exit unlock;
 - a captured continuation cannot resume a retired real or simulated pointer;
 - the staged simulator protocol preserves live array identity and range;
+- routing may use the real address without moving the callback inside the hook;
+- real borrow plus modeled or throwing release still leaves the array unlocked;
+- modeled release cannot proceed into an unmatched real unlock;
+- a routing controller cannot replace a proceeded real pointer;
 - nested FFI calls occur outside handler re-entry;
 - nested loans release in LIFO order and callback throws still release once;
 - descriptor-version 3 validation and advertised operation registries agree;
@@ -122,13 +136,13 @@ The focused Scheme gates establish the source facts abstracted by the model:
 At this slice's focused checkpoint:
 
 ```text
-make ffi                    63/63
-make ffinativehook          52/52
-make simcontrollerabi       60/60
-make simfficontrollerabi    81/81
-make ffisimhook             46/46
-make ffisimflavor           19/19
-make ordinaryffinosim       54/54
+make ffi                    72/72
+make ffinativehook          65/65
+make simcontrollerabi       64/64
+make simfficontrollerabi    96/96
+make ffisimhook             55/55
+make ffisimflavor           21/21
+make ordinaryffinosim       61/61
 make simprofilesmoke        passed
 self-host fixpoint          passed
 ```
@@ -142,12 +156,15 @@ unchanged against real native memory and the modeled byte-array loan.
   runtime cannot make that retained address safe after callback return.
 - The simulator detects accesses made through its modeled operations after
   release. It cannot police raw uninstrumented host memory.
-- A conforming borrow handler must return one positive fake pointer. A handler
-  that allocates a loan and then returns malformed data has already violated
-  the controller contract.
+- A modeled borrow handler must return one positive fake pointer. After calling
+  real `proceed`, it must return the exact proceeded pointer. Arbitrary pointer
+  provenance across separate modeled and real effects is a controller-policy
+  responsibility; ABI v4 directly guards only this scoped-loan boundary.
 - Cleanup is attempted exactly once. A throwing release handler is reported as
-  a controller failure; this claim does not prove the handler completed its
-  own state transition.
+  a controller failure; a real array is still unlocked, but this claim does not
+  prove the handler completed its own modeled state transition. If both the
+  callback and release observer throw, ordinary `dynamic-wind` semantics make
+  the cleanup exception the visible one.
 - Concurrent unsynchronized ordinary mutation of the loaned array remains an
   application data race. The simulator memory model makes each modeled native
   operation atomic; broader schedule control is a separate layer.

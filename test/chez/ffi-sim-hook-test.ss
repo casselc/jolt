@@ -247,6 +247,60 @@
 (ok "clearing the outer hook restores native execution"
     (= 7 (jnum->exact (ev "(c-abs -7)"))))
 
+;; Code emitted by descriptor-v1/v2/v3 sim compilers calls the shared helper
+;; with only [installation descriptor]. Preserve that old form for established
+;; hooks, and fail closed if a routing hook is paired with no native thunk.
+(define legacy-direct-desc
+  (jolt-ffi-make-sim-descriptor "legacy-direct" '() "int" #f #f '()))
+(define legacy-direct-installation
+  (jolt-ffi-install-sim-hook! (lambda (desc) 616)))
+(ok "legacy two-argument invocation still reaches an established hook"
+    (= 616
+       (jolt-ffi-invoke-sim-hook jolt-ffi-sim-hook legacy-direct-desc)))
+(jolt-ffi-clear-sim-hook! legacy-direct-installation)
+(define legacy-routing-call-count 0)
+(define legacy-routing-installation
+  (jolt-ffi-install-routing-hook!
+   (lambda (desc proceed)
+     (set! legacy-routing-call-count (+ legacy-routing-call-count 1))
+     717)))
+(ok "legacy invocation under a routing hook fails for missing proceed thunk"
+    (guard (e (#t #t))
+      (jolt-ffi-invoke-sim-hook jolt-ffi-sim-hook legacy-direct-desc)
+      #f))
+(ok "missing legacy proceed fails before invoking the routing controller"
+    (= 0 legacy-routing-call-count))
+(jolt-ffi-clear-sim-hook! legacy-routing-installation)
+
+;; Consumption happens before the native thunk. Catch a deliberate native
+;; failure inside the controller, retry the same proceed, and prove the thunk
+;; itself ran only once while the retry failed at the single-use guard.
+(define failing-native-call-count 0)
+(define failing-native-sentinel (list 'failing-native-sentinel))
+(define failing-native-retry-rejected? #f)
+(define failing-native-installation
+  (jolt-ffi-install-routing-hook!
+   (lambda (desc proceed)
+     (guard
+      (e ((eq? e failing-native-sentinel)
+          (guard (e2 (#t
+                      (set! failing-native-retry-rejected? #t)
+                      'retry-rejected))
+            (proceed)
+            'retry-unexpected))
+         (#t (raise e)))
+      (proceed)))))
+(ok "native failure leaves the same proceed consumed"
+    (eq? 'retry-rejected
+         (jolt-ffi-invoke-sim-hook
+          jolt-ffi-sim-hook legacy-direct-desc
+          (lambda ()
+            (set! failing-native-call-count (+ failing-native-call-count 1))
+            (raise failing-native-sentinel)))))
+(ok "native failure plus retry executes the native thunk exactly once"
+    (and failing-native-retry-rejected? (= 1 failing-native-call-count)))
+(jolt-ffi-clear-sim-hook! failing-native-installation)
+
 ;; A hook that itself invokes FFI fails promptly instead of recursing forever.
 (define c-abs-fn (ev "c-abs"))
 (define reentrant-installation

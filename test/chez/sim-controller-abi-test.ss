@@ -30,9 +30,9 @@
       (string=? (render s) expected)))
 (define (jget m k) (pmap-get m k jolt-nil))
 
-;; === capabilities: exact ABI v3 and stable ===================================
-(is "abi-version is exactly integer 3"
-    "(:abi-version (jolt.internal.sim/capabilities))" "3")
+;; === capabilities: exact ABI v4 and stable ===================================
+(is "abi-version is exactly integer 4"
+    "(:abi-version (jolt.internal.sim/capabilities))" "4")
 (is "future-lifecycle capability is unchanged true"
     "(:future-lifecycle (jolt.internal.sim/capabilities))" "true")
 (is "controller-errors capability is true"
@@ -53,8 +53,22 @@
 (is "ffi-interception native-operations is the exact ordered set"
     "(:native-operations (:ffi-interception (jolt.internal.sim/capabilities)))"
     "[:load-library :loaded? :alloc :free :read :write :sizeof :read-bytes :write-bytes :read-array :write-array :borrow-byte-array :release-byte-array :ptr->string :string->ptr]")
-(is "ffi-interception map carries exactly five keys"
-    "(count (:ffi-interception (jolt.internal.sim/capabilities)))" "5")
+(is "proceed routing advertises its exact controller and thunk arities"
+    "(let [r (:proceed-routing (:ffi-interception (jolt.internal.sim/capabilities)))]
+       [(:controller-arity r) (:proceed-arity r)])"
+    "[2 0]")
+(is "proceed routing is single-use, scoped, and owner-thread-bound"
+    "(let [r (:proceed-routing (:ffi-interception (jolt.internal.sim/capabilities)))]
+       [(:single-use r) (:dynamic-extent r) (:owner-thread r)])"
+    "[true true true]")
+(is "proceeded scoped byte-array release remains runtime-owned"
+    "(:scoped-byte-array-release
+       (:proceed-routing (:ffi-interception (jolt.internal.sim/capabilities))))"
+    ":runtime-owned")
+(is "proceed-routing descriptor carries exactly six keys"
+    "(count (:proceed-routing (:ffi-interception (jolt.internal.sim/capabilities))))" "6")
+(is "ffi-interception map carries exactly six keys"
+    "(count (:ffi-interception (jolt.internal.sim/capabilities)))" "6")
 (is "capabilities map carries exactly five keys"
     "(count (jolt.internal.sim/capabilities))" "5")
 (is "capabilities is stable across repeated calls"
@@ -66,7 +80,7 @@
 ;; and an aliased require resolves + invokes the SAME ABI.
 (ev "(require '[jolt.internal.sim :as sim])")
 (is "aliased capabilities call resolves and invokes the same ABI"
-    "(:abi-version (sim/capabilities))" "3")
+    "(:abi-version (sim/capabilities))" "4")
 
 ;; === lifecycle observation through install-controller! =======================
 (ev "(def sim-abi-events (atom []))")

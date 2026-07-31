@@ -165,8 +165,8 @@
                  (and (eq? (pvec-nth-d advertised i jolt-nil)
                            (keyword #f (car names)))
                       (loop (cdr names) (+ i 1)))))))
-  (ok "outer lifecycle ABI remains v3 while the nested FFI descriptor is v3"
-      (and (= 3 (jget caps jolt-sim-kw-abi-version))
+  (ok "outer lifecycle ABI is v4 while the nested FFI descriptor remains v3"
+      (and (= 4 (jget caps jolt-sim-kw-abi-version))
            (= 3 (jget ffi-caps jolt-sim-kw-descriptor-version)))))
 
 ;; === ordinary jolt code: require jolt.ffi, bind a ghost + a real symbol =====
@@ -184,6 +184,9 @@
        {:blocking true :capture-native-error true})")
 (ev "(ffi/defcfn c-ghost-zero \"definitely_not_a_real_c_symbol_zero_zzz9\" [] :int)")
 (ev "(ffi/defcfn c-abs \"abs\" [:int] :int)")
+(ev "(ffi/defcfn c-abs-blocking \"abs\" [:int] :int :blocking)")
+(ev "(ffi/defcfn c-abs-captured \"abs\" [:int] :int
+       {:capture-native-error true})")
 
 (ok "no hook installed by default" (not jolt-ffi-sim-hook))
 (ok "with no controller, ordinary defcfn code calls native code unchanged"
@@ -393,6 +396,110 @@
 (ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-token)")
 (ok "restoring returns to the unhooked baseline" (not jolt-ffi-sim-hook))
 (ok "restoring reinstates native execution for an existing harmless symbol"
+    (= 7 (jnum->exact (ev "(c-abs -7)"))))
+
+;; === ABI v4 routing controller: explicit scoped real-call continuation ======
+(ev "(def sim-ffi-real-int-size (ffi/sizeof :int))")
+(ev "(def sim-ffi-routing-events (atom []))")
+(ev "(defn sim-ffi-routing-controller [desc proceed]
+       (swap! sim-ffi-routing-events conj desc)
+       (cond
+         (= \"definitely_not_a_real_c_symbol_zzz9\" (:symbol desc)) 444
+         (and (= \"abs\" (:symbol desc))
+              (not (:capture-native-error? desc))) (inc (proceed))
+         :else (proceed)))")
+(ev "(def sim-ffi-routing-token
+       (jolt.internal.sim/install-ffi-routing-controller!
+        sim-ffi-routing-controller))")
+(ok "routing controller may model a ghost without resolving its C symbol"
+    (= 444 (jnum->exact (ev "(c-ghost 1 2)"))))
+(ok "routing controller may proceed with and wrap the exact native result"
+    (= 8 (jnum->exact (ev "(c-abs -7)"))))
+(ok "routing proceed preserves a blocking binding's collect-safe native branch"
+    (= 8 (jnum->exact (ev "(c-abs-blocking -7)"))))
+(ok "routing proceed preserves captured native result/error transport"
+    (jolt-truthy?
+     (ev "(let [result (c-abs-captured -7)]
+            (and (= 2 (count result)) (= 7 (first result))))")))
+(ok "routing proceed reaches the exact native primitive branch"
+    (= (jnum->exact (ev "sim-ffi-real-int-size"))
+       (jnum->exact (ev "(ffi/sizeof :int)"))))
+(let ((d (pvec-nth-d (ev "@sim-ffi-routing-events") 0 jolt-nil)))
+  (ok "routing preserves the exact descriptor-v3 foreign-function map shape"
+      (= 8 (pmap-cnt d))))
+(ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-routing-token)")
+
+;; A proceeded effect is consumed before entering native code, so even a
+;; native exception cannot make it eligible for a second execution.
+(ev "(defn sim-ffi-double-proceed-controller [desc proceed]
+       (let [first-result (proceed)] (proceed)))")
+(ev "(def sim-ffi-double-proceed-token
+       (jolt.internal.sim/install-ffi-routing-controller!
+        sim-ffi-double-proceed-controller))")
+(ok "routing proceed is single-use"
+    (guard (e (#t #t)) (ev "(c-abs -7)") #f))
+(ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-double-proceed-token)")
+
+;; Leaking the thunk never becomes an ambient bypass after its controller call.
+(ev "(def sim-ffi-leaked-proceed (atom nil))")
+(ev "(defn sim-ffi-stash-proceed-controller [desc proceed]
+       (reset! sim-ffi-leaked-proceed proceed)
+       555)")
+(ev "(def sim-ffi-stash-proceed-token
+       (jolt.internal.sim/install-ffi-routing-controller!
+        sim-ffi-stash-proceed-controller))")
+(ok "routing controller may return a modeled result without proceeding"
+    (= 555 (jnum->exact (ev "(c-abs -7)"))))
+(ok "a retained proceed thunk fails outside its dynamic extent"
+    (guard (e (#t #t)) (ev "(@sim-ffi-leaked-proceed)") #f))
+(ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-stash-proceed-token)")
+
+;; Chez thread parameters are inherited, so owner identity — not a Boolean —
+;; distinguishes an explicitly authorized call from a child-thread attempt.
+(ev "(def sim-ffi-worker-proceed-outcome (atom nil))")
+(ev "(defn sim-ffi-thread-proceed-controller [desc proceed]
+       (reset! sim-ffi-worker-proceed-outcome
+               (deref (future
+                        (try (proceed) :unexpected
+                             (catch :default _ :rejected)))))
+       (proceed))")
+(ev "(def sim-ffi-thread-proceed-token
+       (jolt.internal.sim/install-ffi-routing-controller!
+        sim-ffi-thread-proceed-controller))")
+(ok "owner-thread proceed succeeds after a child-thread attempt is rejected"
+    (= 7 (jnum->exact (ev "(c-abs -7)"))))
+(ok "a child thread cannot consume its parent's proceed thunk"
+    (eq? (ev "@sim-ffi-worker-proceed-outcome") (keyword #f "rejected")))
+(ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-thread-proceed-token)")
+
+;; Proceed authorizes only this exact native branch. Any separate FFI call made
+;; by the controller remains reentrant and fails closed.
+(ev "(defn sim-ffi-proceed-then-reenter-controller [desc proceed]
+       (if (= :sizeof (:operation desc))
+         4
+         (let [result (proceed)] (ffi/sizeof :int) result)))")
+(ev "(def sim-ffi-proceed-then-reenter-token
+       (jolt.internal.sim/install-ffi-routing-controller!
+        sim-ffi-proceed-then-reenter-controller))")
+(ok "proceed does not authorize another reentrant FFI operation"
+    (guard (e (#t #t)) (ev "(c-abs -7)") #f))
+(ev "(jolt.internal.sim/restore-ffi-controller!
+      sim-ffi-proceed-then-reenter-token)")
+
+;; Established and routing controllers share the same strict-LIFO stack.
+(ev "(defn sim-ffi-mixed-outer [desc] 111)")
+(ev "(defn sim-ffi-mixed-inner [desc proceed] (proceed))")
+(ev "(def sim-ffi-mixed-outer-token
+       (jolt.internal.sim/install-ffi-controller! sim-ffi-mixed-outer))")
+(ev "(def sim-ffi-mixed-inner-token
+       (jolt.internal.sim/install-ffi-routing-controller! sim-ffi-mixed-inner))")
+(ok "routing controller nests over an established controller on one stack"
+    (= 7 (jnum->exact (ev "(c-abs -7)"))))
+(ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-mixed-inner-token)")
+(ok "restoring routing controller reinstates the established controller"
+    (= 111 (jnum->exact (ev "(c-abs -7)"))))
+(ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-mixed-outer-token)")
+(ok "mixed-stack restoration returns to native execution"
     (= 7 (jnum->exact (ev "(c-abs -7)"))))
 
 ;; === exact restoration of a preexisting raw Scheme hook ======================

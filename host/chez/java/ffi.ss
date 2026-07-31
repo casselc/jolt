@@ -102,6 +102,17 @@
       (throw-jvm 'IndexOutOfBoundsException
                  (string-append "jolt.ffi/" who
                                 ": byte-array range out of bounds")))))
+(define (ffi-borrow-locked-byte-range who bv start cnt)
+  ;; Internal half of the scoped loan. The simulation routing overlay needs to
+  ;; expose the exact real borrow as a proceed thunk while keeping ownership of
+  ;; the matching release. Never export either half as a Jolt var.
+  (ffi-check-array-range who bv start cnt)
+  (lock-object bv)
+  (guard (e (#t (unlock-object bv) (raise e)))
+    (+ (object->reference-address bv) start)))
+(define (ffi-release-locked-byte-range bv)
+  (unlock-object bv))
+
 (define (ffi-with-locked-byte-range who bv start cnt receive arg)
   ;; The one real scoped loan of an interior pointer into a movable Jolt
   ;; byte-array. Chez defines object->reference-address for a bytevector as the
@@ -116,6 +127,9 @@
   ;; entry, after the unlocked backing may have moved. Reject such re-entry
   ;; before receive resumes; merely re-locking would not repair the stale
   ;; pointer argument.
+  ;; Keep the ordinary hot path inline. The two internal helpers above exist
+  ;; only so the simulation overlay can split a routed borrow from its
+  ;; runtime-owned release; ordinary Jolt pays no additional procedure calls.
   (ffi-check-array-range who bv start cnt)
   (let ((retired? #f))
     (lock-object bv)

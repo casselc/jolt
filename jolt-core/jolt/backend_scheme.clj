@@ -670,7 +670,8 @@
                  ;; second read into a call of #f after the first read selected
                  ;; the hooked branch.
                  (str "(let ((h jolt-ffi-sim-hook)) "
-                      "(if h (jolt-ffi-invoke-sim-hook h " descriptor ") "
+                      "(if h (jolt-ffi-invoke-sim-hook h " descriptor
+                      " (lambda () " else-branch ")) "
                       else-branch "))"))
                else-branch)]
     (str "(let ((p #f)) (lambda (" call-args ") " body "))")))

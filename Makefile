@@ -260,13 +260,15 @@ ordinaryffinosim:
 simcontrollerabi:
 	@$(CHEZ) --script test/chez/sim-controller-abi-test.ss
 
-# jolt.internal.sim FFI controller ABI: install-ffi-controller!/
-# restore-ffi-controller! project the FFI call-interception seam's raw alist
+# jolt.internal.sim FFI controller ABI: install-ffi-controller! and the additive
+# install-ffi-routing-controller!/restore-ffi-controller! project the FFI
+# call-interception seam's raw alist
 # descriptors (jolt-ffi-make-sim-descriptor / jolt-ffi-make-native-sim-descriptor)
 # into one stable, immutable Jolt map for a controller written as ORDINARY Jolt
 # source, while reusing the existing jolt-ffi-install-sim-hook!/
-# jolt-ffi-clear-sim-hook! strict-LIFO stack + reentrancy guard unchanged — no
-# separate hook state of its own. Exercises a compiler-source slice
+# jolt-ffi-clear-sim-hook! strict-LIFO stack. Routing adds a scoped real-call
+# continuation while all separate controller FFI remains fail-closed reentry;
+# there is no second hook state. Exercises a compiler-source slice
 # (emit-ffi-fn compiling a real defcfn under set-sim-instrument!), so — like
 # ffisimhook — it runs against a transient seed rather than the checked-in one.
 simfficontrollerabi:

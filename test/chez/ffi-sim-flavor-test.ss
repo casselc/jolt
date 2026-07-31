@@ -91,6 +91,8 @@
 (let ((e (emit-form "app" non-blocking)))
   (ok "sim emission references the sim hook" (contains? e "jolt-ffi-sim-hook"))
   (ok "sim emission builds a sim descriptor" (contains? e "jolt-ffi-make-sim-descriptor"))
+  (ok "sim emission supplies the exact lazy native branch as a proceed thunk"
+      (contains? e "(lambda () ((or p (begin (set! p "))
   (ok "sim emission still falls through to the lazy foreign-procedure shape"
       (and (contains? e "(or p (begin (set! p ") (contains? e "(foreign-procedure "))))
 (let ((eb (emit-form "app" blocking)))
@@ -103,7 +105,9 @@
       (and (contains? ec "jolt-ffi-native-error-procedure")
            (contains? ec "call-with-values")))
   (ok "sim captured emission lets the hook return one complete public value"
-      (contains? ec "(if h (jolt-ffi-invoke-sim-hook h ")))
+      (contains? ec "(if h (jolt-ffi-invoke-sim-hook h "))
+  (ok "sim captured proceed retains atomic result/error collection"
+      (contains? ec "(lambda () (call-with-values")))
 
 ;; --- U1 unaffected by U2 (per-unit isolation, the property unit-context-test
 ;; pins for the other emit-session flags) ------------------------------------

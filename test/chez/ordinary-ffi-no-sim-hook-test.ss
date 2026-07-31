@@ -28,10 +28,13 @@
    jolt-ffi-sim-hook-active-owner
    jolt-ffi-sim-hook-installation?
    make-jolt-ffi-sim-hook-installation
+   jolt-ffi-install-sim-hook-mode!
    jolt-ffi-install-sim-hook!
+   jolt-ffi-install-routing-hook!
    jolt-ffi-clear-sim-hook!
    jolt-ffi-make-sim-descriptor
    jolt-ffi-invoke-sim-hook
+   jolt-ffi-invoke-sim-hook*
    jolt-ffi-make-native-sim-descriptor
    jolt-ffi-invoke-native-sim-op
    ffi-sim-load-library
@@ -59,7 +62,9 @@
    jolt-sim-ffi-native-operation-names
    jolt-sim-ffi-project-descriptor
    jolt-sim-make-ffi-controller-wrapper
+   jolt-sim-make-ffi-routing-controller-wrapper
    jolt-sim-install-ffi-controller!
+   jolt-sim-install-ffi-routing-controller!
    jolt-sim-restore-ffi-controller!
    jolt-sim-kw-kind
    jolt-sim-kw-foreign-function
@@ -75,16 +80,23 @@
    jolt-sim-kw-arguments
    jolt-sim-kw-live
    jolt-sim-kw-task-identity
-   jolt-sim-kw-native-operations))
+   jolt-sim-kw-native-operations
+   jolt-sim-kw-proceed-routing))
 
 ;; --- the jolt.internal.sim namespace itself carries no vars ------------------
 (ok "ordinary image has registered no vars under jolt.internal.sim"
-    (not (var-cell-lookup "jolt.internal.sim" "install-ffi-controller!")))
+    (and (not (var-cell-lookup "jolt.internal.sim" "install-ffi-controller!"))
+         (not (var-cell-lookup
+               "jolt.internal.sim" "install-ffi-routing-controller!"))))
 
 ;; --- fully-qualified resolution from ordinary Jolt source fails closed too ---
 (ok "ordinary Jolt source cannot resolve jolt.internal.sim/install-ffi-controller!"
     (guard (e (#t #t))
       (ev "(jolt.internal.sim/install-ffi-controller! (fn [d] d))")
+      #f))
+(ok "ordinary Jolt source cannot resolve the routing-controller installer"
+    (guard (e (#t #t))
+      (ev "(jolt.internal.sim/install-ffi-routing-controller! (fn [d p] d))")
       #f))
 
 ;; --- ordinary FFI binding/calling behavior is unaffected ---------------------

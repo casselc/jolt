@@ -242,22 +242,34 @@
 ;; precise restore operation and makes an out-of-order concurrent clear fail
 ;; closed instead of silently disabling another controller.
 (define-record-type jolt-ffi-sim-hook-installation
-  (fields hook previous)
-  (nongenerative jolt-ffi-sim-hook-installation-v1))
-(define jolt-ffi-sim-hook #f) ; current hook, kept separate for the hot-path read
+  (fields hook routing? previous)
+  (nongenerative jolt-ffi-sim-hook-installation-v2))
+;; The hot-path value is the current immutable installation snapshot, not just
+;; its callback. Keeping callback mode and strict-stack identity in one object
+;; prevents a concurrent install/restore from pairing a hook with the wrong
+;; invocation contract.
+(define jolt-ffi-sim-hook #f)
 (define jolt-ffi-sim-hook-top #f)
 (define jolt-ffi-sim-hook-mu (make-mutex))
 (define jolt-ffi-sim-hook-active-owner (make-thread-parameter #f))
 
-(define (jolt-ffi-install-sim-hook! h)
+(define (jolt-ffi-install-sim-hook-mode! h routing?)
   (unless h
-    (error 'jolt-ffi-install-sim-hook! "hook must be non-false"))
+    (error 'jolt-ffi-install-sim-hook-mode! "hook must be non-false"))
   (with-mutex jolt-ffi-sim-hook-mu
     (let ((installation
-           (make-jolt-ffi-sim-hook-installation h jolt-ffi-sim-hook-top)))
+           (make-jolt-ffi-sim-hook-installation
+            h routing? jolt-ffi-sim-hook-top)))
       (set! jolt-ffi-sim-hook-top installation)
-      (set! jolt-ffi-sim-hook h)
+      (set! jolt-ffi-sim-hook installation)
       installation)))
+
+;; The established one-argument hook contract remains exact. Only the new
+;; routing installer opts into receiving a second, scoped native continuation.
+(define (jolt-ffi-install-sim-hook! h)
+  (jolt-ffi-install-sim-hook-mode! h #f))
+(define (jolt-ffi-install-routing-hook! h)
+  (jolt-ffi-install-sim-hook-mode! h #t))
 
 (define (jolt-ffi-clear-sim-hook! installation)
   (with-mutex jolt-ffi-sim-hook-mu
@@ -267,9 +279,7 @@
     (let ((previous
            (jolt-ffi-sim-hook-installation-previous installation)))
       (set! jolt-ffi-sim-hook-top previous)
-      (set! jolt-ffi-sim-hook
-            (and previous
-                 (jolt-ffi-sim-hook-installation-hook previous)))))
+      (set! jolt-ffi-sim-hook previous)))
   jolt-nil)
 
 ;; A stable plain descriptor for one intercepted call: an alist keyed by csym /
@@ -291,10 +301,11 @@
         (cons 'capture-native-error capture-native-error)
         (cons 'args args)))
 
-(define (jolt-ffi-invoke-sim-hook h descriptor)
+(define (jolt-ffi-invoke-sim-hook* installation descriptor native-call)
   ;; A hook that performs FFI would otherwise recursively intercept itself.
-  ;; Fail closed until a future explicit, scoped real-call continuation exists;
-  ;; clearing/reinstalling the process-global hook is never a safe bypass.
+  ;; The routing API authorizes only its supplied native-call continuation;
+  ;; clearing/reinstalling the process-global hook is never a safe bypass, and
+  ;; any separate FFI made by a controller remains reentrant and fails closed.
   ;;
   ;; Chez thread parameters are inherited by forked threads, so retain the
   ;; active thread id rather than a boolean. A child inheriting its parent's id
@@ -305,7 +316,49 @@
       (error 'jolt-ffi-invoke-sim-hook
              "reentrant FFI from a simulation hook is not supported"))
     (parameterize ((jolt-ffi-sim-hook-active-owner self))
-      (jolt-invoke h descriptor))))
+      (let ((h (jolt-ffi-sim-hook-installation-hook installation)))
+        (if (not (jolt-ffi-sim-hook-installation-routing? installation))
+            (jolt-invoke h descriptor)
+            (begin
+              (unless native-call
+                (error 'jolt-ffi-invoke-sim-hook
+                       "instrumented call does not carry a native proceed thunk"))
+              (let ((live? #t)
+                    (used? #f))
+                (let ((proceed
+                       (lambda ()
+                         (unless live?
+                           (error 'jolt-ffi-proceed
+                                  "native proceed is outside its dynamic extent"))
+                         (unless (eqv? self (get-thread-id))
+                           (error 'jolt-ffi-proceed
+                                  "native proceed must run on its controller thread"))
+                         (when used?
+                           (error 'jolt-ffi-proceed
+                                  "native proceed may be invoked only once"))
+                         ;; Consumption is failure-atomic: a native exception
+                         ;; does not make the same effect eligible to run twice.
+                         (set! used? #t)
+                         (native-call))))
+                  (dynamic-wind
+                    (lambda ()
+                      (unless live?
+                        (error
+                         'jolt-ffi-invoke-sim-hook
+                         "routing controller continuation cannot be re-entered")))
+                    (lambda () (jolt-invoke2 h descriptor proceed))
+                    (lambda () (set! live? #f)))))))))))
+
+;; Retain the two-argument entry point for code compiled by descriptor-v1/v2/v3
+;; sim compilers. It remains fully usable with the established one-argument
+;; hook; a new routing hook fails closed rather than pretending such a call has
+;; a native continuation.
+(define jolt-ffi-invoke-sim-hook
+  (case-lambda
+    ((installation descriptor)
+     (jolt-ffi-invoke-sim-hook* installation descriptor #f))
+    ((installation descriptor native-call)
+     (jolt-ffi-invoke-sim-hook* installation descriptor native-call))))
 
 ;; A native-op interception extends the SAME hook (and so its stack ownership +
 ;; reentrancy guard above) to the runtime primitives a jolt library uses to load
@@ -330,64 +383,78 @@
         (cons 'op (string-copy op))
         (cons 'args args)))
 
-(define (jolt-ffi-invoke-native-sim-op h op args)
+(define (jolt-ffi-invoke-native-sim-op h op args native-call)
   (jolt-ffi-invoke-sim-hook h
-                            (jolt-ffi-make-native-sim-descriptor op args)))
+                            (jolt-ffi-make-native-sim-descriptor op args)
+                            native-call))
 
 (define (ffi-sim-load-library . args)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "load-library" args)
+        (jolt-ffi-invoke-native-sim-op
+         h "load-library" args (lambda () (apply ffi-load-library args)))
         (apply ffi-load-library args))))
 (define (ffi-sim-loaded? name)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "loaded?" (list name))
+        (jolt-ffi-invoke-native-sim-op
+         h "loaded?" (list name) (lambda () (ffi-loaded? name)))
         (ffi-loaded? name))))
 (define (ffi-sim-alloc nbytes)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "alloc" (list nbytes))
+        (jolt-ffi-invoke-native-sim-op
+         h "alloc" (list nbytes) (lambda () (ffi-alloc nbytes)))
         (ffi-alloc nbytes))))
 (define (ffi-sim-free ptr)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "free" (list ptr))
+        (jolt-ffi-invoke-native-sim-op
+         h "free" (list ptr) (lambda () (ffi-free ptr)))
         (ffi-free ptr))))
 (define (ffi-sim-read ptr ty . off)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "read" (cons ptr (cons ty off)))
+        (jolt-ffi-invoke-native-sim-op
+         h "read" (cons ptr (cons ty off))
+         (lambda () (apply ffi-read ptr ty off)))
         (apply ffi-read ptr ty off))))
 (define (ffi-sim-write ptr ty off val)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "write" (list ptr ty off val))
+        (jolt-ffi-invoke-native-sim-op
+         h "write" (list ptr ty off val)
+         (lambda () (ffi-write ptr ty off val)))
         (ffi-write ptr ty off val))))
 (define (ffi-sim-sizeof ty)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "sizeof" (list ty))
+        (jolt-ffi-invoke-native-sim-op
+         h "sizeof" (list ty) (lambda () (ffi-sizeof ty)))
         (ffi-sizeof ty))))
 (define (ffi-sim-read-bytes ptr n)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "read-bytes" (list ptr n))
+        (jolt-ffi-invoke-native-sim-op
+         h "read-bytes" (list ptr n) (lambda () (ffi-read-bytes ptr n)))
         (ffi-read-bytes ptr n))))
 (define (ffi-sim-write-bytes ptr s)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "write-bytes" (list ptr s))
+        (jolt-ffi-invoke-native-sim-op
+         h "write-bytes" (list ptr s) (lambda () (ffi-write-bytes ptr s)))
         (ffi-write-bytes ptr s))))
 (define (ffi-sim-read-array ptr n)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "read-array" (list ptr n))
+        (jolt-ffi-invoke-native-sim-op
+         h "read-array" (list ptr n) (lambda () (ffi-read-array ptr n)))
         (ffi-read-array ptr n))))
 (define (ffi-sim-write-array ptr arr)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "write-array" (list ptr arr))
+        (jolt-ffi-invoke-native-sim-op
+         h "write-array" (list ptr arr) (lambda () (ffi-write-array ptr arr)))
         (ffi-write-array ptr arr))))
 (define (ffi-sim-with-byte-array-pointer-range arr off len f)
   ;; Stage a modeled loan around, not inside, the hook. borrow-byte-array sees
@@ -398,8 +465,11 @@
   ;; the fake pointer on every exit.
   ;;
   ;; Capture the issuing hook once: cleanup belongs to the controller that
-  ;; created the pointer. As in the real scope, a continuation cannot re-enter
-  ;; after its first exit because the pointer has already been retired.
+  ;; created the pointer. A routing controller may proceed with the exact real
+  ;; borrow, but the runtime then owns and unconditionally balances its real
+  ;; lock; a separate release decision can delay or observe cleanup, never leak
+  ;; the lock or unlock a modeled pointer. As in the real scope, a continuation
+  ;; cannot re-enter after its first exit because the pointer is retired.
   (let* ((start (jnum->exact off))
          (cnt (jnum->exact len))
          (bv (ffi-byte-array-backing "with-byte-array-pointer" arr))
@@ -407,24 +477,77 @@
     (ffi-check-array-range "with-byte-array-pointer" bv start cnt)
     (if (not h)
         (ffi-with-byte-array-pointer-range arr start cnt f)
-        (let ((p (jnum->exact
-                  (jolt-ffi-invoke-native-sim-op
-                   h "borrow-byte-array" (list arr start cnt))))
+        (let ((p #f)
+              (real-p #f)
+              (real-bv #f)
+              (borrowed? #f)
               (retired? #f))
-          (when (<= p 0)
-            (error 'jolt.ffi
-                   "simulated byte-array loan must return a positive pointer"))
-          (dynamic-wind
-            (lambda ()
-              (when retired?
-                (error
-                 'jolt.ffi
-                 "scoped byte-array pointer continuation cannot be re-entered")))
-            (lambda () (jolt-invoke2 f p cnt))
-            (lambda ()
-              (set! retired? #t)
-              (jolt-ffi-invoke-native-sim-op
-               h "release-byte-array" (list p))))))))
+          (letrec
+              ((release-real!
+                (lambda ()
+                  (unless real-bv
+                    (error 'jolt-ffi-proceed
+                           "real byte-array loan is already released"))
+                  (ffi-release-locked-byte-range real-bv)
+                  (set! real-bv #f)
+                  jolt-nil)))
+            (dynamic-wind
+              (lambda ()
+                (when retired?
+                  (error
+                   'jolt.ffi
+                   "scoped byte-array pointer continuation cannot be re-entered")))
+              (lambda ()
+                (set! p
+                      (jnum->exact
+                       (jolt-ffi-invoke-native-sim-op
+                        h "borrow-byte-array" (list arr start cnt)
+                        (lambda ()
+                          (let ((rp
+                                 (ffi-borrow-locked-byte-range
+                                  "with-byte-array-pointer" bv start cnt)))
+                            (set! real-p rp)
+                            (set! real-bv bv)
+                            rp)))))
+                (when (<= p 0)
+                  (error 'jolt.ffi
+                         "simulated byte-array loan must return a positive pointer"))
+                ;; Once the controller performs a real borrow it may observe or
+                ;; wrap the result, but it may not substitute a different
+                ;; pointer and strand the runtime-owned real lock.
+                (when (and real-bv (not (= p real-p)))
+                  (error 'jolt.ffi
+                         "routing controller changed a real byte-array pointer"))
+                (set! borrowed? #t)
+                ;; This callback remains outside either controller invocation,
+                ;; so its own FFI effects are intercepted normally rather than
+                ;; rejected as same-thread controller reentrancy.
+                (jolt-invoke2 f p cnt))
+              (lambda ()
+                (set! retired? #t)
+                (cond
+                  (real-bv
+                   ;; If borrow completed, report the paired release and offer
+                   ;; its exact real unlock. Whether the controller proceeds,
+                   ;; returns a modeled value, or raises, force the unlock once.
+                   (if borrowed?
+                       (guard
+                        (e (#t
+                            (when real-bv (release-real!))
+                            (raise e)))
+                        (jolt-ffi-invoke-native-sim-op
+                         h "release-byte-array" (list p) release-real!)
+                        (when real-bv (release-real!)))
+                       (release-real!)))
+                  (borrowed?
+                   ;; A modeled borrow has no real lock. Calling proceed on its
+                   ;; release is rejected before Chez can see an unmatched
+                   ;; unlock; returning normally preserves the v3 model path.
+                   (jolt-ffi-invoke-native-sim-op
+                    h "release-byte-array" (list p)
+                    (lambda ()
+                      (error 'jolt-ffi-proceed
+                             "cannot proceed release of a modeled byte-array loan"))))))))))))
 (define ffi-sim-with-byte-array-pointer
   (case-lambda
     ((arr f)
@@ -436,12 +559,14 @@
 (define (ffi-sim-ptr->string ptr)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "ptr->string" (list ptr))
+        (jolt-ffi-invoke-native-sim-op
+         h "ptr->string" (list ptr) (lambda () (ffi-ptr->string ptr)))
         (ffi-ptr->string ptr))))
 (define (ffi-sim-string->ptr s)
   (let ((h jolt-ffi-sim-hook))
     (if h
-        (jolt-ffi-invoke-native-sim-op h "string->ptr" (list s))
+        (jolt-ffi-invoke-native-sim-op
+         h "string->ptr" (list s) (lambda () (ffi-string->ptr s)))
         (ffi-string->ptr s))))
 
 (def-var! "jolt.ffi" "load-library" ffi-sim-load-library)
@@ -465,7 +590,8 @@
 ;; FFI call-interception seam above (and the future hook's supervisor-error
 ;; latch) to ORDINARY Jolt source running inside the sim image — NOT a public
 ;; application DSL. The FFI half (install-ffi-controller!/
-;; restore-ffi-controller!) is a thin projection over the existing
+;; install-ffi-routing-controller!/restore-ffi-controller!) is a thin projection
+;; over the existing
 ;; jolt-ffi-install-sim-hook!/-clear-sim-hook! strict-LIFO stack + reentrancy
 ;; guard, not a second hook — see that section below for the install/clear/
 ;; invoke machinery itself. Every var below is def-var!'d only here, so none of
@@ -485,7 +611,11 @@
 ;; call site passed, never copies), :task-identity :future-lifecycle (every
 ;; descriptor carries the current hooked-future task id, or 0 outside one), and
 ;; :native-operations (the exact ordered set of native-op names a
-;; native-operation descriptor's :operation may be).
+;; native-operation descriptor's :operation may be). ABI v4 preserves the
+;; descriptor-v3 shapes and established one-argument controller exactly, and
+;; adds :proceed-routing plus install-ffi-routing-controller!: a two-argument
+;; controller receives [descriptor proceed], where proceed is a zero-argument,
+;; single-use, dynamic-extent, owner-thread thunk for the exact native branch.
 (define jolt-sim-kw-abi-version        (keyword #f "abi-version"))
 (define jolt-sim-kw-future-lifecycle   (keyword #f "future-lifecycle"))
 (define jolt-sim-kw-controller-errors  (keyword #f "controller-errors"))
@@ -497,6 +627,15 @@
 (define jolt-sim-kw-live               (keyword #f "live"))
 (define jolt-sim-kw-task-identity      (keyword #f "task-identity"))
 (define jolt-sim-kw-native-operations  (keyword #f "native-operations"))
+(define jolt-sim-kw-proceed-routing    (keyword #f "proceed-routing"))
+(define jolt-sim-kw-controller-arity  (keyword #f "controller-arity"))
+(define jolt-sim-kw-proceed-arity     (keyword #f "proceed-arity"))
+(define jolt-sim-kw-single-use        (keyword #f "single-use"))
+(define jolt-sim-kw-dynamic-extent    (keyword #f "dynamic-extent"))
+(define jolt-sim-kw-owner-thread      (keyword #f "owner-thread"))
+(define jolt-sim-kw-scoped-byte-array-release
+  (keyword #f "scoped-byte-array-release"))
+(define jolt-sim-kw-runtime-owned     (keyword #f "runtime-owned"))
 (define jolt-sim-kw-kind               (keyword #f "kind"))
 (define jolt-sim-kw-foreign-function   (keyword #f "foreign-function"))
 (define jolt-sim-kw-native-operation   (keyword #f "native-operation"))
@@ -509,7 +648,7 @@
 (define jolt-sim-kw-operation          (keyword #f "operation"))
 (define (jolt-sim-capabilities)
   (jolt-hash-map
-   jolt-sim-kw-abi-version 3
+   jolt-sim-kw-abi-version 4
    jolt-sim-kw-future-lifecycle #t
    jolt-sim-kw-controller-errors #t
    jolt-sim-kw-events
@@ -517,9 +656,9 @@
     fhk-spawn fhk-start fhk-finish fhk-cancel fhk-exit fhk-abort)
    jolt-sim-kw-ffi-interception
    (jolt-hash-map
-    ;; Descriptor v3 keeps v2's exact descriptor shapes and native-error flag,
-    ;; while extending the exact native-operation set with the staged scoped
-    ;; byte-array loan lifecycle.
+    ;; ABI v4 does not change descriptor v3: it keeps v2's exact descriptor
+    ;; shapes and native-error flag plus v3's staged scoped byte-array loan
+    ;; lifecycle. Proceed is a separate controller calling convention.
     jolt-sim-kw-descriptor-version 3
     jolt-sim-kw-kinds (jolt-vector jolt-sim-kw-foreign-function
                                     jolt-sim-kw-native-operation)
@@ -535,7 +674,15 @@
                  (keyword #f "borrow-byte-array")
                  (keyword #f "release-byte-array")
                  (keyword #f "ptr->string")
-                 (keyword #f "string->ptr")))))
+                 (keyword #f "string->ptr"))
+    jolt-sim-kw-proceed-routing
+    (jolt-hash-map
+     jolt-sim-kw-controller-arity 2
+     jolt-sim-kw-proceed-arity 0
+     jolt-sim-kw-single-use #t
+     jolt-sim-kw-dynamic-extent #t
+     jolt-sim-kw-owner-thread #t
+     jolt-sim-kw-scoped-byte-array-release jolt-sim-kw-runtime-owned))))
 
 ;; jolt.internal.sim/install-controller! + restore-controller! — a Jolt-callable
 ;; strict-LIFO stack of jolt-future-hook installations, mirroring the
@@ -589,7 +736,8 @@
                  jolt-sim-kw-error  (list-ref entry 3)))
               (jolt-future-hook-errors-snapshot))))
 
-;; jolt.internal.sim/install-ffi-controller! + restore-ffi-controller! — expose
+;; jolt.internal.sim/install-ffi-controller! +
+;; install-ffi-routing-controller! + restore-ffi-controller! — expose
 ;; the FFI call-interception seam above (jolt-ffi-install-sim-hook!/
 ;; jolt-ffi-clear-sim-hook!, "=== FFI call interception (simulation seam) ===")
 ;; to a Jolt-callable controller. This is a thin projection over that EXACT
@@ -600,8 +748,10 @@
 ;; jolt-ffi-install-sim-hook! and returns the EXACT installation record it
 ;; produces — the same opaque token type the low-level Scheme API uses, not a
 ;; new one — so nesting, ordering, and restore-by-owner behave identically to a
-;; caller using jolt-ffi-install-sim-hook!/-clear-sim-hook! directly. restore
-;; passes that exact token straight to jolt-ffi-clear-sim-hook!, unchanged.
+;; caller using the low-level hook stack directly. The established installer
+;; invokes f with the exact descriptor-v3 map. The routing installer invokes f
+;; with [descriptor proceed]; restore accepts either installation token and
+;; passes it straight to jolt-ffi-clear-sim-hook!, unchanged.
 ;;
 ;; A projected descriptor's :kind selects its exact key set:
 ;;   {:kind :foreign-function :task :symbol :argument-types :return-type
@@ -669,10 +819,19 @@
               "malformed or ambiguous FFI simulation descriptor" desc)))))
 (define (jolt-sim-make-ffi-controller-wrapper f)
   (lambda (desc) (jolt-invoke f (jolt-sim-ffi-project-descriptor desc))))
+(define (jolt-sim-make-ffi-routing-controller-wrapper f)
+  (lambda (desc proceed)
+    (jolt-invoke2 f (jolt-sim-ffi-project-descriptor desc) proceed)))
 (define (jolt-sim-install-ffi-controller! f)
   (unless f
     (error 'jolt-sim-install-ffi-controller! "controller must be non-false"))
   (jolt-ffi-install-sim-hook! (jolt-sim-make-ffi-controller-wrapper f)))
+(define (jolt-sim-install-ffi-routing-controller! f)
+  (unless f
+    (error 'jolt-sim-install-ffi-routing-controller!
+           "controller must be non-false"))
+  (jolt-ffi-install-routing-hook!
+   (jolt-sim-make-ffi-routing-controller-wrapper f)))
 (define (jolt-sim-restore-ffi-controller! installation)
   (jolt-ffi-clear-sim-hook! installation))
 
@@ -682,4 +841,6 @@
 (def-var! "jolt.internal.sim" "controller-errors" jolt-sim-controller-errors)
 (def-var! "jolt.internal.sim" "clear-controller-errors!" jolt-future-hook-errors-clear!)
 (def-var! "jolt.internal.sim" "install-ffi-controller!" jolt-sim-install-ffi-controller!)
+(def-var! "jolt.internal.sim" "install-ffi-routing-controller!"
+          jolt-sim-install-ffi-routing-controller!)
 (def-var! "jolt.internal.sim" "restore-ffi-controller!" jolt-sim-restore-ffi-controller!)

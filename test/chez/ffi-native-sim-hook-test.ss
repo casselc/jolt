@@ -540,6 +540,142 @@
       #f))
 (jolt-ffi-clear-sim-hook! reentrant-installation)
 
+;; --- routing proceed over real scoped byte-array loans ----------------------
+;; The modeled borrow/release events still bracket a callback outside the hook.
+;; Proceeding borrow acquires the exact real lock/address, while the overlay
+;; owns the matching unlock even when the release observer does not proceed.
+(define routed-real-ops '())
+(define (routed-real-hook desc proceed)
+  (cond
+    ((assq 'op desc)
+     (let ((op (dget desc 'op)))
+       (set! routed-real-ops (append routed-real-ops (list op)))
+       (if (string=? op "release-byte-array") jolt-nil (proceed))))
+    (else (proceed))))
+(ev "(def routed-real-arr (byte-array [10 20 30]))")
+(define routed-real-bv
+  (ffi-byte-array-backing "routing-test" (ev "routed-real-arr")))
+(define routed-real-installation
+  (jolt-ffi-install-routing-hook! routed-real-hook))
+(ok "routing borrow proceed exposes the real array and preserves callback result"
+    (jolt-truthy?
+     (ev "(= [:done 3]
+             (ffi/with-byte-array-pointer
+              routed-real-arr
+              (fn [p n]
+                (ffi/write p :uint8 0 99)
+                [:done n])))")))
+(ok "real routed callback effects are independently intercepted and proceeded"
+    (equal? '("borrow-byte-array" "write" "release-byte-array")
+            routed-real-ops))
+(ok "runtime forces the real release when its observer does not proceed"
+    (and (= 99 (bytevector-u8-ref routed-real-bv 0))
+         (not (locked-object? routed-real-bv))))
+(set! routed-real-ops '())
+(ok "real routed callback failure still propagates"
+    (guard (e (#t #t))
+      (ev "(ffi/with-byte-array-pointer
+            routed-real-arr
+            (fn [_ _] (throw (Exception. \"routed callback boom\"))))")
+      #f))
+(ok "callback failure still reports release and unlocks the real array"
+    (and (equal? '("borrow-byte-array" "release-byte-array")
+                 routed-real-ops)
+         (not (locked-object? routed-real-bv))))
+(jolt-ffi-clear-sim-hook! routed-real-installation)
+
+;; Exercise controller-performed release, not only the runtime fallback. An
+;; outer lock makes Chez's reference count observable: after the inner routed
+;; scope the object must still be locked, and one outer unlock must clear it.
+(define routed-release-proceed-ops '())
+(lock-object routed-real-bv)
+(define routed-release-proceed-installation
+  (jolt-ffi-install-routing-hook!
+   (lambda (desc proceed)
+     (when (assq 'op desc)
+       (set! routed-release-proceed-ops
+             (append routed-release-proceed-ops (list (dget desc 'op)))))
+     (proceed))))
+(ok "routing controller may proceed both real borrow and real release"
+    (eq? (ev "(ffi/with-byte-array-pointer
+               routed-real-arr (fn [_ _] :released))")
+         (keyword #f "released")))
+(define routed-outer-lock-remains? (locked-object? routed-real-bv))
+(jolt-ffi-clear-sim-hook! routed-release-proceed-installation)
+(when routed-outer-lock-remains? (unlock-object routed-real-bv))
+(define routed-one-outer-unlock-clears? (not (locked-object? routed-real-bv)))
+;; Keep later gates isolated if a regression leaked one extra reference.
+(when (locked-object? routed-real-bv) (unlock-object routed-real-bv))
+(ok "proceeded release runs exactly once against a nested Chez lock"
+    (and (equal? '("borrow-byte-array" "release-byte-array")
+                 routed-release-proceed-ops)
+         routed-outer-lock-remains?
+         routed-one-outer-unlock-clears?))
+
+;; A modeled loan has no Chez lock. Its release continuation is deliberately
+;; unusable, so a mistaken proceed raises a controlled error instead of asking
+;; Chez to unlock an object that was never locked.
+(define modeled-release-proceed-installation
+  (jolt-ffi-install-routing-hook!
+   (lambda (desc proceed)
+     (let ((op (and (assq 'op desc) (dget desc 'op))))
+       (cond
+         ((and op (string=? op "borrow-byte-array")) 424242)
+         ((and op (string=? op "release-byte-array")) (proceed))
+         (else (proceed)))))))
+(ev "(def routed-modeled-arr (byte-array [1 2]))")
+(define routed-modeled-bv
+  (ffi-byte-array-backing "routing-test" (ev "routed-modeled-arr")))
+(ok "release proceed over a modeled loan fails safely"
+    (guard (e (#t #t))
+      (ev "(ffi/with-byte-array-pointer
+            routed-modeled-arr (fn [_ n] n))")
+      #f))
+(ok "failed modeled release never locks the array"
+    (not (locked-object? routed-modeled-bv)))
+(jolt-ffi-clear-sim-hook! modeled-release-proceed-installation)
+
+;; Once borrow proceeds, substituting a different pointer would mix real and
+;; modeled provenance. Reject it before the callback and still balance the lock.
+(ev "(def routed-mismatch-callback-ran (atom false))")
+(define routed-mismatch-installation
+  (jolt-ffi-install-routing-hook!
+   (lambda (desc proceed)
+     (let ((op (and (assq 'op desc) (dget desc 'op))))
+       (if (and op (string=? op "borrow-byte-array"))
+           (+ 1 (proceed))
+           (proceed))))))
+(ok "routing controller cannot substitute a fake pointer after real borrow"
+    (guard (e (#t #t))
+      (ev "(ffi/with-byte-array-pointer
+            routed-real-arr
+            (fn [_ _] (reset! routed-mismatch-callback-ran true)))")
+      #f))
+(ok "pointer mismatch rejects before callback and releases the real lock"
+    (and (not (jolt-truthy? (ev "@routed-mismatch-callback-ran")))
+         (not (locked-object? routed-real-bv))))
+(jolt-ffi-clear-sim-hook! routed-mismatch-installation)
+
+;; Release observation may itself fail. Cleanup is runtime-owned and occurs
+;; before that controller failure escapes.
+(define routed-release-failure (condition (make-message-condition "release boom")))
+(define routed-release-failure-installation
+  (jolt-ffi-install-routing-hook!
+   (lambda (desc proceed)
+     (let ((op (and (assq 'op desc) (dget desc 'op))))
+       (cond
+         ((and op (string=? op "borrow-byte-array")) (proceed))
+         ((and op (string=? op "release-byte-array"))
+          (raise routed-release-failure))
+         (else (proceed)))))))
+(ok "release-controller failure still propagates"
+    (guard (e ((eq? e routed-release-failure) #t) (#t #f))
+      (ev "(ffi/with-byte-array-pointer routed-real-arr (fn [_ _] :done))")
+      #f))
+(ok "release-controller failure cannot leak the real array lock"
+    (not (locked-object? routed-real-bv)))
+(jolt-ffi-clear-sim-hook! routed-release-failure-installation)
+
 ;; --- clearing restores the exact native behavior -----------------------------
 ;; The hook is gone: the original bodies run, real foreign memory works, and the
 ;; controller is not consulted again.

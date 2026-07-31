@@ -77,16 +77,23 @@ every target. Native Windows execution remains a separate platform gate.
 ## Simulation contract
 
 An instrumented binding still chooses its installed controller before forcing
-the lazy native procedure. The controller returns the complete public binding
-value:
+the lazy native procedure. The established one-argument controller returns the
+complete public binding value:
 
 - a scalar for an ordinary binding; or
 - `[native-result error-code]` for a captured binding.
 
-The nested FFI descriptor version is 2 and adds the exact Boolean
-`:capture-native-error?` field. Handler identity includes that field, so scalar
-and captured bindings with otherwise identical symbol, type, and blocking
-metadata cannot collide. The outer lifecycle ABI remains version 3.
+ABI v4 additionally exposes a two-argument routing controller. Its second
+argument is a scoped `proceed` thunk for the exact lazy native branch; for a
+captured binding that branch still collects `[native-result error-code]`
+atomically before returning to the controller. The thunk is single-use,
+dynamic-extent-only, and bound to the controller thread.
+
+Nested FFI descriptor version 2 introduced the exact Boolean
+`:capture-native-error?` field, and descriptor version 3 retains it unchanged.
+Handler identity includes that field, so scalar and captured bindings with
+otherwise identical symbol, type, and blocking metadata cannot collide. ABI v4
+changes the controller calling convention without changing descriptor-v3 maps.
 
 The separate external `jolt-sim` adapter accepts the prior descriptor version
 as capture disabled, preserves the original descriptor in effect traces, and
