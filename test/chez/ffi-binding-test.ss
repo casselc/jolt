@@ -27,6 +27,10 @@
              (current-error-port))
     (exit 2)))
 
+;; Match cli.ss's loader boundary so the public jolt.ffi macros are exercised
+;; from source under both the checked seed and caller-supplied transient seeds.
+(load "host/chez/loader.ss")
+(set-source-roots! ldr-install-roots)
 (load "host/chez/java/ffi.ss")
 
 (define total 0) (define fails 0)
@@ -34,6 +38,7 @@
 ;; eval one form (string) in `user`, like the loader does form-by-form, so a def
 ;; is visible to a later form.
 (define (ev s) (jolt-compile-eval s "user"))
+(define (ev-fails? s) (guard (e (#t #t)) (ev s) #f))
 
 ;; load libc (process symbols) and bind typed foreign functions
 (ev "(jolt.ffi/load-library)")
@@ -180,6 +185,150 @@
 ;; free-callable unlocks + drops the code object, returning nil.
 (ok "free-callable releases the callback"
     (jolt-nil? (ev "(jolt.ffi/free-callable cmp)")))
+
+;; --- public option boundary + atomic native-error capture --------------------
+;; Exercise the public macros from stdlib source as well as direct __cfn forms.
+;; The analyzer must fail closed on every nonliteral/unknown option, while
+;; omission and explicit false retain the original scalar contract.
+(ev "(require '[jolt.ffi :as ffi])")
+(ev "(def opt-abs (ffi/foreign-fn \"abs\" [:int] :int))")
+(ev "(def opt-abs-legacy (ffi/foreign-fn \"abs\" [:int] :int :blocking))")
+(ev "(def opt-abs-blocking
+       (ffi/foreign-fn \"abs\" [:int] :int {:blocking true}))")
+(ev "(def opt-abs-captured
+       (ffi/foreign-fn \"abs\" [:int] :int {:capture-native-error true}))")
+(ev "(def opt-abs-both
+       (ffi/foreign-fn \"abs\" [:int] :int
+         {:blocking true :capture-native-error true}))")
+(ev "(def opt-abs-false
+       (ffi/foreign-fn \"abs\" [:int] :int
+         {:blocking false :capture-native-error false}))")
+(ev "(def opt-abs-empty (ffi/foreign-fn \"abs\" [:int] :int {}))")
+
+(ok "foreign-fn omitted options retain scalar semantics"
+    (= 9 (jnum->exact (ev "(opt-abs -9)"))))
+(ok "foreign-fn legacy :blocking retains scalar semantics"
+    (= 8 (jnum->exact (ev "(opt-abs-legacy -8)"))))
+(ok "foreign-fn {:blocking true} retains scalar semantics"
+    (= 7 (jnum->exact (ev "(opt-abs-blocking -7)"))))
+(ok "foreign-fn explicit false flags retain scalar semantics"
+    (= 6 (jnum->exact (ev "(opt-abs-false -6)"))))
+(ok "foreign-fn empty options map defaults both flags to false"
+    (= 5 (jnum->exact (ev "(opt-abs-empty -5)"))))
+(ok "foreign-fn capture returns a two-element result-first vector"
+    (jolt-truthy?
+      (ev "(let [v (opt-abs-captured -4)]
+             (and (vector? v) (= 2 (count v))
+                  (= 4 (nth v 0)) (integer? (nth v 1))))")))
+(ok "foreign-fn capture composes with collect-safe lowering"
+    (jolt-truthy?
+      (ev "(let [v (opt-abs-both -3)]
+             (and (vector? v) (= 2 (count v))
+                  (= 3 (nth v 0)) (integer? (nth v 1))))")))
+
+(ev "(ffi/defcfn opt-defcfn-abs \"abs\" [:int] :int
+       {:capture-native-error true})")
+(ok "defcfn forwards capture options to the same result contract"
+    (jolt-truthy?
+      (ev "(let [v (opt-defcfn-abs -2)]
+             (and (vector? v) (= 2 (count v))
+                  (= 2 (nth v 0)) (integer? (nth v 1))))")))
+
+(ev "(def opt-cfn-map
+       (jolt.ffi/__cfn \"abs\" [:int] :int
+         {:blocking true :capture-native-error false}))")
+(ok "direct __cfn accepts the literal options map"
+    (= 1 (jnum->exact (ev "(opt-cfn-map -1)"))))
+(ev "(def opt-cfn-void-false
+       (jolt.ffi/__cfn \"unused_void_symbol_zzz9\" [] :void
+         {:capture-native-error false}))")
+(ok "capture false leaves a void binding valid"
+    (procedure? (var-deref "user" "opt-cfn-void-false")))
+
+(ok "reject numeric macro options"
+    (ev-fails? "(ffi/foreign-fn \"abs\" [:int] :int 5)"))
+(ok "reject explicit nil macro options"
+    (ev-fails? "(ffi/foreign-fn \"abs\" [:int] :int nil)"))
+(ok "reject multiple macro option arguments"
+    (ev-fails? "(ffi/foreign-fn \"abs\" [:int] :int :blocking {})"))
+(ok "reject numeric direct __cfn options"
+    (ev-fails? "(jolt.ffi/__cfn \"abs\" [:int] :int 5)"))
+(ok "reject non-:blocking keyword options"
+    (ev-fails? "(jolt.ffi/__cfn \"abs\" [:int] :int :collect-safe)"))
+(ok "reject symbolic options"
+    (ev-fails? "(jolt.ffi/__cfn \"abs\" [:int] :int not-an-option)"))
+(ok "reject non-keyword option-map keys"
+    (ev-fails? "(jolt.ffi/__cfn \"abs\" [:int] :int {\"blocking\" true})"))
+(ok "reject namespaced option-map keys"
+    (ev-fails? "(jolt.ffi/__cfn \"abs\" [:int] :int {:other/blocking true})"))
+(ok "reject unknown option-map keys"
+    (ev-fails? "(jolt.ffi/__cfn \"abs\" [:int] :int {:bogus true})"))
+(ok "reject non-boolean option values"
+    (ev-fails? "(jolt.ffi/__cfn \"abs\" [:int] :int {:blocking 1})"))
+(ok "reject nonliteral option values"
+    (ev-fails? "(jolt.ffi/__cfn \"abs\" [:int] :int
+                 {:capture-native-error flag})"))
+(ok "reject duplicate literal option keys at the reader boundary"
+    (ev-fails? "(jolt.ffi/__cfn \"abs\" [:int] :int
+                 {:blocking true :blocking false})"))
+(ok "reject captured void bindings"
+    (ev-fails? "(jolt.ffi/__cfn \"free\" [:pointer] :void
+                 {:capture-native-error true})"))
+
+;; POSIX control: open a definitely absent path (ENOENT=2), then call close(-1)
+;; (EBADF=9). The first pair must survive the later error-slot mutation.
+(ev "(def c-open-with-error
+       (jolt.ffi/__cfn \"open\" [:string :int] :int
+         {:capture-native-error true}))")
+(ev "(def c-close (jolt.ffi/__cfn \"close\" [:int] :int))")
+(ev "(def c-close-with-error-blocking
+       (jolt.ffi/__cfn \"close\" [:int] :int
+         {:blocking true :capture-native-error true}))")
+(ev "(def saved-posix-error
+       (when (not= :windows (:os (jolt.host/target)))
+         (c-open-with-error \"/definitely-absent-jolt-ffi-capture/nope\" 0)))")
+(ok "POSIX capture obtains the native result and ENOENT atomically"
+    (jolt-truthy?
+      (ev "(or (= :windows (:os (jolt.host/target)))
+               (= [-1 2] saved-posix-error))")))
+(ev "(when (not= :windows (:os (jolt.host/target))) (c-close -1))")
+(ok "POSIX captured pair survives a later native cleanup failure"
+    (jolt-truthy?
+      (ev "(or (= :windows (:os (jolt.host/target)))
+               (= [-1 2] saved-posix-error))")))
+(ok "POSIX native-error capture composes with collect-safe calls"
+    (jolt-truthy?
+      (ev "(or (= :windows (:os (jolt.host/target)))
+               (= [-1 9] (c-close-with-error-blocking -1)))")))
+
+;; Windows control: CloseHandle(NULL) fails with ERROR_INVALID_HANDLE=6.
+;; SetLastError mutates the ambient slot afterward; the saved pair is immutable.
+(ev "(when (= :windows (:os (jolt.host/target)))
+       (jolt.ffi/load-library \"kernel32.dll\"))")
+(ev "(def c-close-handle-with-error
+       (jolt.ffi/__cfn \"CloseHandle\" [:uptr] :int
+         {:capture-native-error true}))")
+(ev "(def c-close-handle-with-error-blocking
+       (jolt.ffi/__cfn \"CloseHandle\" [:uptr] :int
+         {:blocking true :capture-native-error true}))")
+(ev "(def c-set-last-error
+       (jolt.ffi/__cfn \"SetLastError\" [:uint] :void))")
+(ev "(def saved-windows-error
+       (when (= :windows (:os (jolt.host/target)))
+         (c-close-handle-with-error 0)))")
+(ok "Windows capture obtains the native result and last-error atomically"
+    (jolt-truthy?
+      (ev "(or (not= :windows (:os (jolt.host/target)))
+               (= [0 6] saved-windows-error))")))
+(ev "(when (= :windows (:os (jolt.host/target))) (c-set-last-error 1234))")
+(ok "Windows captured pair survives a later last-error mutation"
+    (jolt-truthy?
+      (ev "(or (not= :windows (:os (jolt.host/target)))
+               (= [0 6] saved-windows-error))")))
+(ok "Windows native-error capture composes with collect-safe calls"
+    (jolt-truthy?
+      (ev "(or (not= :windows (:os (jolt.host/target)))
+               (= [0 6] (c-close-handle-with-error-blocking 0)))")))
 
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

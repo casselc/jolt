@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Foreign bindings can capture native failure codes atomically.**
+  `jolt.ffi/foreign-fn` and `defcfn` accept
+  `{:capture-native-error true}` and return `[native-result error-code]`.
+  Chez captures POSIX `errno` or Windows `GetLastError` in the foreign-call
+  return path, including for collect-safe calls, before cleanup or runtime work
+  can overwrite it. Cross-compilation selects the convention from the exact
+  target machine and rejects unknown targets. Simulation descriptors expose
+  capture mode as distinct handler identity so a controller can supply the same
+  public pair without reaching the OS.
+
 ### Fixed
 
 - **Builds retain the explicitly selected Chez toolchain.** The launcher

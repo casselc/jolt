@@ -3,10 +3,10 @@
 ;; A disabled-by-default hook lets an internal/test-oriented controller
 ;; intercept every jolt.ffi/defcfn call BEFORE the native symbol is ever
 ;; resolved. The hook receives a stable plain descriptor (C symbol, argument
-;; types, return type, the :blocking flag, and the actual jolt call arguments)
-;; and its return value stands in for the call's result. With no hook
-;; installed, ordinary defcfn code is unchanged: a lazily cached
-;; foreign-procedure, resolved on first call.
+;; types, return type, the :blocking and :capture-native-error flags, and the
+;; actual jolt call arguments) and its return value stands in for the complete
+;; public call result. With no hook installed, ordinary defcfn code is
+;; unchanged: a lazily cached foreign-procedure, resolved on first call.
 ;;
 ;; The interception seam itself is only EMITTED for a compilation unit whose
 ;; sim-instrument? flag is on (set-sim-instrument!, jolt.backend-scheme — see
@@ -83,10 +83,17 @@
 ;; at compile time regardless of whether the branch calling it ever runs, so a
 ;; :blocking probe must avoid :string to isolate what this seam actually tests.)
 (ev "(ffi/defcfn c-ghost \"definitely_not_a_real_c_symbol_zzz9\" [:int :int] :int :blocking)")
+(ev "(ffi/defcfn c-ghost-captured
+       \"definitely_not_a_real_c_symbol_zzz9\" [:int :int] :int
+       {:blocking true :capture-native-error true})")
 (ev "(ffi/defcfn c-ghost-zero \"definitely_not_a_real_c_symbol_zero_zzz9\" [] :int)")
 
 (define captured '())
-(define (record-hook! desc) (set! captured (append captured (list desc))) 999)
+(define (record-hook! desc)
+  (set! captured (append captured (list desc)))
+  (if (dget desc 'capture-native-error)
+      (jolt-vector -1 73)
+      999))
 
 (define record-installation (jolt-ffi-install-sim-hook! record-hook!))
 (ok "hook intercepts a call to a nonexistent C symbol without resolving it"
@@ -98,6 +105,8 @@
   (ok "descriptor argtypes are exact" (equal? (dget d 'argtypes) (list "int" "int")))
   (ok "descriptor rettype is exact" (string=? (dget d 'rettype) "int"))
   (ok "descriptor blocking flag is exact" (eq? (dget d 'blocking) #t))
+  (ok "ordinary descriptor disables native-error capture"
+      (eq? (dget d 'capture-native-error) #f))
   (ok "descriptor args are the exact jolt call arguments" (equal? (dget d 'args) (list 42 7))))
 
 ;; Metadata strings are snapshots, not shared compiler literals. Corrupt this
@@ -120,7 +129,9 @@
   (ok "zero-argument descriptor args are empty"
       (equal? (dget d 'args) '()))
   (ok "zero-argument descriptor blocking flag is false"
-      (eq? (dget d 'blocking) #f)))
+      (eq? (dget d 'blocking) #f))
+  (ok "zero-argument descriptor capture flag is false"
+      (eq? (dget d 'capture-native-error) #f)))
 
 ;; repeated calls are intercepted, not just the first
 (ok "a second call is also intercepted"
@@ -158,12 +169,35 @@
 (ok "five descriptors captured, including the unresolved valid binding"
     (= 5 (length captured)))
 
+;; Capture mode is part of the descriptor even when every other signature field
+;; is identical. The hook returns the complete public pair as one Jolt value;
+;; the emitter must not feed that one value to the native branch's two-value
+;; continuation.
+(ok "paired scalar binding is intercepted with matching call arguments"
+    (= 999 (jnum->exact (ev "(c-ghost 42 7)"))))
+(ok "six descriptors captured before the paired captured binding"
+    (= 6 (length captured)))
+(ok "captured binding accepts the hook's complete public [result error] value"
+    (jolt-truthy? (ev "(= [-1 73] (c-ghost-captured 42 7))")))
+(ok "seven descriptors captured after the otherwise-identical captured binding"
+    (= 7 (length captured)))
+(let ((scalar (list-ref captured 5))
+      (captured-call (list-ref captured 6)))
+  (ok "capture mode is the only metadata difference between paired bindings"
+      (and (string=? (dget scalar 'csym) (dget captured-call 'csym))
+           (equal? (dget scalar 'argtypes) (dget captured-call 'argtypes))
+           (string=? (dget scalar 'rettype) (dget captured-call 'rettype))
+           (eq? (dget scalar 'blocking) (dget captured-call 'blocking))
+           (eq? (dget scalar 'capture-native-error) #f)
+           (eq? (dget captured-call 'capture-native-error) #t)
+           (equal? (dget scalar 'args) (dget captured-call 'args)))))
+
 ;; --- clearing restores the normal path ---------------------------------------
 (jolt-ffi-clear-sim-hook! record-installation)
 (ok "clear restores no-hook state" (not jolt-ffi-sim-hook))
 (ok "clearing restores the normal path for an existing harmless native symbol"
     (= 7 (jnum->exact (ev "(c-abs -7)"))))
-(ok "a cleared hook is not called again" (= 5 (length captured)))
+(ok "a cleared hook is not called again" (= 7 (length captured)))
 (ok "a binding first called under the hook resolves natively after clear"
     (= 13 (jnum->exact (ev "(c-abs-lazy -13)"))))
 (ok "fresh-emitter blocking native branch remains callable"

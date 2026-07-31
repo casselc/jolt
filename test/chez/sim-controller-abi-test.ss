@@ -40,8 +40,8 @@
 (is "events capability is the exact ordered lifecycle set"
     "(:events (jolt.internal.sim/capabilities))"
     "[:spawn :start :finish :cancel :exit :abort]")
-(is "ffi-interception descriptor-version is exactly integer 1"
-    "(:descriptor-version (:ffi-interception (jolt.internal.sim/capabilities)))" "1")
+(is "ffi-interception descriptor-version is exactly integer 2"
+    "(:descriptor-version (:ffi-interception (jolt.internal.sim/capabilities)))" "2")
 (is "ffi-interception kinds is the exact set"
     "(:kinds (:ffi-interception (jolt.internal.sim/capabilities)))"
     "[:foreign-function :native-operation]")

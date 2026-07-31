@@ -62,6 +62,8 @@
 
 (define non-blocking "(jolt.ffi/__cfn \"abs\" [:int] :int)")
 (define blocking     "(jolt.ffi/__cfn \"recv\" [:int] :int :blocking)")
+(define captured
+  "(jolt.ffi/__cfn \"close\" [:int] :int {:capture-native-error true})")
 
 ;; --- U1: a fresh unit, sim never turned on — normal is the default ----------
 (define U1 (new-unit))
@@ -74,6 +76,13 @@
 (let ((eb (emit-form "app" blocking)))
   (ok "normal blocking emission still uses __collect_safe" (contains? eb "__collect_safe"))
   (ok "normal blocking emission has no sim-hook reference" (not (contains? eb "jolt-ffi-sim-hook"))))
+(let ((ec (emit-form "app" captured)))
+  (ok "normal captured emission uses the target-native error procedure"
+      (contains? ec "jolt-ffi-native-error-procedure"))
+  (ok "normal captured emission collects the native call's two values"
+      (contains? ec "call-with-values"))
+  (ok "normal captured emission has no sim-hook reference"
+      (not (contains? ec "jolt-ffi-sim-hook"))))
 
 ;; --- U2: sim mode explicitly turned on for this unit only -------------------
 (define U2 (new-unit))
@@ -87,6 +96,14 @@
 (let ((eb (emit-form "app" blocking)))
   (ok "sim blocking emission still uses __collect_safe" (contains? eb "__collect_safe"))
   (ok "sim blocking emission references the sim hook" (contains? eb "jolt-ffi-sim-hook")))
+(let ((ec (emit-form "app" captured)))
+  (ok "sim captured emission advertises capture mode to its descriptor"
+      (contains? ec "jolt-ffi-make-sim-descriptor"))
+  (ok "sim captured emission preserves the target-native fallback"
+      (and (contains? ec "jolt-ffi-native-error-procedure")
+           (contains? ec "call-with-values")))
+  (ok "sim captured emission lets the hook return one complete public value"
+      (contains? ec "(if h (jolt-ffi-invoke-sim-hook h ")))
 
 ;; --- U1 unaffected by U2 (per-unit isolation, the property unit-context-test
 ;; pins for the other emit-session flags) ------------------------------------

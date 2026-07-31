@@ -112,5 +112,41 @@
 (ok "POSIX targets do not use the Windows FFI path"
     (not (jolt-windows-machine-type? 'ta6le)))
 
+;; Atomic native-error bindings must select their Chez foreign-procedure
+;; convention from the compiler target, not this process's machine-type. Drive
+;; the actual macro under every exact target row so the selector and target
+;; registry cannot drift independently.
+(define (native-error-convention-for-target target)
+  (parameterize ((#%$target-machine target))
+    ;; Construct a fresh datum under the parameterization. A literal form may be
+    ;; pre-expanded while this test procedure itself is compiled.
+    (cadr
+      (syntax->datum
+        (expand
+          (list 'jolt-ffi-native-error-convention-case
+                (list 'quote '__get_last_error)
+                (list 'quote '__errno)))))))
+(for-each
+  (lambda (row)
+    (let* ((machine-name (car row))
+           (os (cadr row))
+           (expected (if (eq? os 'windows)
+                         '__get_last_error
+                         '__errno)))
+      (ok (string-append "native-error convention follows target: "
+                         machine-name)
+          (eq? expected
+               (native-error-convention-for-target
+                 (string->symbol machine-name))))))
+  target-machine-fact-names)
+(ok "native-error convention rejects portable-bytecode target"
+    (guard (e (#t #t))
+      (native-error-convention-for-target 'tpb)
+      #f))
+(ok "native-error convention rejects unknown target"
+    (guard (e (#t #t))
+      (native-error-convention-for-target 'future-a6le)
+      #f))
+
 (printf "target-descriptor-test: ~a/~a passed\n" (- total fails) total)
 (exit (if (> fails 0) 1 0))

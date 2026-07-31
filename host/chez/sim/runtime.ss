@@ -272,18 +272,22 @@
   jolt-nil)
 
 ;; A stable plain descriptor for one intercepted call: an alist keyed by csym /
-;; argtypes / rettype / blocking / args. argtypes is a list of type-name strings
-;; (foreign-fn's keyword names, without the leading colon, e.g. "int" "string");
-;; args is the list of actual jolt arguments in call order. Descriptor metadata
-;; strings are copied on every call so a hook cannot mutate a later descriptor.
-;; Argument objects deliberately remain live: a native stub must be able to
-;; emulate writes through byte arrays/pointers. The hook's return value stands
-;; in for the call's result.
-(define (jolt-ffi-make-sim-descriptor csym argtypes rettype blocking args)
+;; argtypes / rettype / blocking / capture-native-error / args. argtypes is a
+;; list of type-name strings (foreign-fn's keyword names, without the leading
+;; colon, e.g. "int" "string"); args is the list of actual jolt arguments in
+;; call order. Descriptor metadata strings are copied on every call so a hook
+;; cannot mutate a later descriptor. Argument objects deliberately remain live:
+;; a native stub must be able to emulate writes through byte arrays/pointers.
+;; The hook's return value stands in for the complete public binding result:
+;; scalar for an ordinary binding, or [native-result error-code] for one with
+;; :capture-native-error enabled.
+(define (jolt-ffi-make-sim-descriptor
+         csym argtypes rettype blocking capture-native-error args)
   (list (cons 'csym (string-copy csym))
         (cons 'argtypes (map string-copy argtypes))
         (cons 'rettype (string-copy rettype))
         (cons 'blocking blocking)
+        (cons 'capture-native-error capture-native-error)
         (cons 'args args)))
 
 (define (jolt-ffi-invoke-sim-hook h descriptor)
@@ -452,6 +456,8 @@
 (define jolt-sim-kw-argument-types     (keyword #f "argument-types"))
 (define jolt-sim-kw-return-type        (keyword #f "return-type"))
 (define jolt-sim-kw-blocking?          (keyword #f "blocking?"))
+(define jolt-sim-kw-capture-native-error?
+                                          (keyword #f "capture-native-error?"))
 (define jolt-sim-kw-operation          (keyword #f "operation"))
 (define (jolt-sim-capabilities)
   (jolt-hash-map
@@ -463,7 +469,7 @@
     fhk-spawn fhk-start fhk-finish fhk-cancel fhk-exit fhk-abort)
    jolt-sim-kw-ffi-interception
    (jolt-hash-map
-    jolt-sim-kw-descriptor-version 1
+    jolt-sim-kw-descriptor-version 2
     jolt-sim-kw-kinds (jolt-vector jolt-sim-kw-foreign-function
                                     jolt-sim-kw-native-operation)
     jolt-sim-kw-arguments jolt-sim-kw-live
@@ -545,7 +551,7 @@
 ;;
 ;; A projected descriptor's :kind selects its exact key set:
 ;;   {:kind :foreign-function :task :symbol :argument-types :return-type
-;;    :blocking? :arguments}
+;;    :blocking? :capture-native-error? :arguments}
 ;;                    — one jolt.ffi/defcfn call (jolt-ffi-make-sim-descriptor)
 ;;   {:kind :native-operation :task :operation :arguments}
 ;;                      — one raw native op (jolt-ffi-make-native-sim-descriptor)
@@ -554,11 +560,14 @@
 ;; primordial/unregistered thread. This correlates effect observations with the
 ;; lifecycle controller without adding a second task registry.
 ;; :symbol/:argument-types/:return-type are copied metadata (already snapshotted
-;; per call by the makers above); :arguments is the SAME live jolt call
-;; arguments in call order, not copies — a controller must be able to emulate
-;; writes through a live byte array or pointer. An internal descriptor that
-;; matches neither exact shape is rejected outright rather than guessed at.
-(define jolt-ffi-sim-cfn-desc-keys '(csym argtypes rettype blocking args))
+;; per call by the makers above); :capture-native-error? is part of handler
+;; identity so otherwise-identical scalar and captured bindings cannot collide;
+;; :arguments is the SAME live jolt call arguments in call order, not copies —
+;; a controller must be able to emulate writes through a live byte array or
+;; pointer. An internal descriptor that matches neither exact shape is rejected
+;; outright rather than guessed at.
+(define jolt-ffi-sim-cfn-desc-keys
+  '(csym argtypes rettype blocking capture-native-error args))
 (define jolt-ffi-sim-native-desc-keys '(kind op args))
 (define jolt-sim-ffi-native-operation-names
   '("load-library" "loaded?" "alloc" "free" "read" "write" "sizeof"
@@ -575,7 +584,10 @@
             (for-all string? (cdr (assq 'argtypes desc)))
             (string? (cdr (assq 'rettype desc)))
             (boolean? (cdr (assq 'blocking desc)))
-            (list? (cdr (assq 'args desc))))
+            (boolean? (cdr (assq 'capture-native-error desc)))
+            (list? (cdr (assq 'args desc)))
+            (= (length (cdr (assq 'argtypes desc)))
+               (length (cdr (assq 'args desc)))))
        (jolt-hash-map
         jolt-sim-kw-kind jolt-sim-kw-foreign-function
         jolt-sim-kw-task (jolt-future-current-task-id)
@@ -584,6 +596,8 @@
         (apply jolt-vector (map (lambda (t) (keyword #f t)) (cdr (assq 'argtypes desc))))
         jolt-sim-kw-return-type (keyword #f (cdr (assq 'rettype desc)))
         jolt-sim-kw-blocking? (cdr (assq 'blocking desc))
+        jolt-sim-kw-capture-native-error?
+        (cdr (assq 'capture-native-error desc))
         jolt-sim-kw-arguments (apply jolt-vector (cdr (assq 'args desc)))))
       ((and (equal? ks jolt-ffi-sim-native-desc-keys)
             (eq? (cdr (assq 'kind desc)) 'native-op)

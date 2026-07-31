@@ -334,8 +334,11 @@
                   ;; (emit-def-cached, :forward-decl, :the-ns).
                   "define" "def-var!" "def-var-with-meta!"
                   "declare-var!" "intern-ns!"
-                  ;; ffi lowering (emit-ffi-fn: a Chez foreign-procedure).
-                  "foreign-procedure"}]
+                  ;; ffi lowering (emit-ffi-fn): an ordinary Chez
+                  ;; foreign-procedure, or the target-native error-capturing
+                  ;; variant whose two values are collected into a Jolt vector.
+                  "foreign-procedure" "jolt-ffi-native-error-procedure"
+                  "call-with-values"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is
@@ -600,10 +603,24 @@
   (let [n (count (:argtypes node))
         params (mapv (fn [i] (str "a" i)) (range n))
         call-args (str/join " " params)
-        fp (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
-                (chez-str-lit (:csym node))
-                " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
-                (ffi-type->chez (:rettype node)) ")")
+        conventions (when (:blocking node) "__collect_safe")
+        signature (str (chez-str-lit (:csym node))
+                       " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
+                       (ffi-type->chez (:rettype node)))
+        fp (if (:capture-native-error node)
+             (str "(jolt-ffi-native-error-procedure ("
+                  conventions ") " signature ")")
+             (str "(foreign-procedure "
+                  (when conventions (str conventions " "))
+                  signature ")"))
+        foreign-call (str "((or p (begin (set! p " fp ") p)) "
+                          call-args ")")
+        native-result
+        (if (:capture-native-error node)
+          (str "(call-with-values (lambda () " foreign-call ") "
+               "(lambda (result native-error) "
+               "(jolt-vector result native-error)))")
+          foreign-call)
         ;; Original lazy resolution: the foreign-procedure form is deferred
         ;; inside a closure. On first call, the cell `p` is set to the FP and
         ;; then invoked; subsequent calls skip the set!. This lets a defcfn's
@@ -611,7 +628,7 @@
         ;; the shared library is loaded — critical for :optional :jolt/native
         ;; libs whose load-object runs in the scheme-start launcher, after the
         ;; heap is already built.
-        else-branch (str "((or p (begin (set! p " fp ") p)) " call-args ")")
+        else-branch native-result
         ;; The jolt-ffi-sim-hook seam (host/chez/java/ffi.ss) is emitted ONLY
         ;; when this compilation unit's sim-instrument? flag is on
         ;; (set-sim-instrument!, above — the special `sim` Jolt build's compiler
@@ -621,13 +638,17 @@
                (let [argtypes-lit (str "(list " (str/join " " (map chez-str-lit (:argtypes node))) ")")
                      ;; A stable plain descriptor (jolt-ffi-make-sim-descriptor,
                      ;; host/chez/java/ffi.ss) for the simulation seam: C symbol,
-                     ;; argument/return types, the :blocking flag, and the
-                     ;; actual call arguments.
+                     ;; argument/return types, the :blocking and
+                     ;; :capture-native-error flags, and the actual call
+                     ;; arguments. A controller returns the complete public
+                     ;; binding value: scalar for an ordinary binding, or
+                     ;; [native-result error-code] for a captured one.
                      descriptor (str "(jolt-ffi-make-sim-descriptor "
                                       (chez-str-lit (:csym node)) " "
                                       argtypes-lit " "
                                       (chez-str-lit (:rettype node)) " "
-                                      (if (:blocking node) "#t" "#f")
+                                      (if (:blocking node) "#t" "#f") " "
+                                      (if (:capture-native-error node) "#t" "#f")
                                       " (list " call-args "))")]
                  ;; jolt-ffi-sim-hook, when installed, intercepts EVERY call —
                  ;; not just the first — before the FP form is ever forced, so a

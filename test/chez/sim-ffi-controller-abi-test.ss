@@ -77,6 +77,7 @@
              (cons 'argtypes (list "int"))
              (cons 'rettype "int")
              (cons 'blocking #f)
+             (cons 'capture-native-error #f)
              (cons 'args (list 1))))
       #f))
 (ok "a foreign descriptor with a non-string argument type is rejected"
@@ -86,6 +87,7 @@
              (cons 'argtypes (list "int" 'not-a-string))
              (cons 'rettype "int")
              (cons 'blocking #f)
+             (cons 'capture-native-error #f)
              (cons 'args (list 1 2))))
       #f))
 (ok "a foreign descriptor with a non-string return type is rejected"
@@ -95,6 +97,7 @@
              (cons 'argtypes (list "int"))
              (cons 'rettype 'not-a-string)
              (cons 'blocking #f)
+             (cons 'capture-native-error #f)
              (cons 'args (list 1))))
       #f))
 (ok "a foreign descriptor with a non-boolean blocking flag is rejected"
@@ -104,6 +107,27 @@
              (cons 'argtypes (list "int"))
              (cons 'rettype "int")
              (cons 'blocking 0)
+             (cons 'capture-native-error #f)
+             (cons 'args (list 1))))
+      #f))
+(ok "a foreign descriptor with a non-boolean capture flag is rejected"
+    (guard (e (#t #t))
+      (jolt-sim-ffi-project-descriptor
+       (list (cons 'csym "sym")
+             (cons 'argtypes (list "int"))
+             (cons 'rettype "int")
+             (cons 'blocking #f)
+             (cons 'capture-native-error 'yes)
+             (cons 'args (list 1))))
+      #f))
+(ok "a foreign descriptor with mismatched argument metadata is rejected"
+    (guard (e (#t #t))
+      (jolt-sim-ffi-project-descriptor
+       (list (cons 'csym "sym")
+             (cons 'argtypes (list "int" "int"))
+             (cons 'rettype "int")
+             (cons 'blocking #f)
+             (cons 'capture-native-error #f)
              (cons 'args (list 1))))
       #f))
 (ok "an unadvertised native operation is rejected"
@@ -113,9 +137,11 @@
       #f))
 (ok "a well-formed cfn descriptor still projects correctly"
     (let ((m (jolt-sim-ffi-project-descriptor
-              (jolt-ffi-make-sim-descriptor "sym" (list "int") "int" #f (list 1)))))
-      (and (= 7 (pmap-cnt m))
+              (jolt-ffi-make-sim-descriptor
+               "sym" (list "int") "int" #f #f (list 1)))))
+      (and (= 8 (pmap-cnt m))
            (= 0 (jget m jolt-sim-kw-task))
+           (eq? (jget m jolt-sim-kw-capture-native-error?) #f)
            (eq? (jget m jolt-sim-kw-kind) jolt-sim-kw-foreign-function))))
 (ok "a well-formed native-op descriptor still projects correctly"
     (let ((m (jolt-sim-ffi-project-descriptor
@@ -138,7 +164,10 @@
              (or (null? names)
                  (and (eq? (pvec-nth-d advertised i jolt-nil)
                            (keyword #f (car names)))
-                      (loop (cdr names) (+ i 1))))))))
+                      (loop (cdr names) (+ i 1)))))))
+  (ok "outer lifecycle ABI remains v3 while the nested FFI descriptor is v2"
+      (and (= 3 (jget caps jolt-sim-kw-abi-version))
+           (= 2 (jget ffi-caps jolt-sim-kw-descriptor-version)))))
 
 ;; === ordinary jolt code: require jolt.ffi, bind a ghost + a real symbol =====
 (ev "(require '[jolt.ffi :as ffi])")
@@ -150,6 +179,9 @@
 ;; argument at compile time regardless of whether the branch calling it ever
 ;; runs, so a :blocking probe must avoid :string.)
 (ev "(ffi/defcfn c-ghost \"definitely_not_a_real_c_symbol_zzz9\" [:int :int] :int :blocking)")
+(ev "(ffi/defcfn c-ghost-captured
+       \"definitely_not_a_real_c_symbol_zzz9\" [:int :int] :int
+       {:blocking true :capture-native-error true})")
 (ev "(ffi/defcfn c-ghost-zero \"definitely_not_a_real_c_symbol_zero_zzz9\" [] :int)")
 (ev "(ffi/defcfn c-abs \"abs\" [:int] :int)")
 
@@ -161,7 +193,9 @@
 (ev "(def sim-ffi-events (atom []))")
 (ev "(defn sim-ffi-controller [desc]
        (swap! sim-ffi-events conj desc)
-       (if (= :foreign-function (:kind desc)) 999 :native-op-sentinel))")
+       (if (= :foreign-function (:kind desc))
+         (if (:capture-native-error? desc) [-1 73] 999)
+         :native-op-sentinel))")
 (ev "(def sim-ffi-token (jolt.internal.sim/install-ffi-controller! sim-ffi-controller))")
 
 ;; --- the nonexistent symbol is never resolved; the controller's return value
@@ -175,7 +209,7 @@
 (let* ((events (ev "@sim-ffi-events"))
        (d0 (pvec-nth-d events 0 jolt-nil)))
   (ok "two foreign-function descriptors captured" (= 2 (pvec-cnt events)))
-  (ok "foreign-function descriptor carries exactly seven keys" (= 7 (pmap-cnt d0)))
+  (ok "foreign-function descriptor carries exactly eight keys" (= 8 (pmap-cnt d0)))
   (ok "descriptor :kind is exactly :foreign-function"
       (eq? (jget d0 jolt-sim-kw-kind) jolt-sim-kw-foreign-function))
   (ok "top-level descriptor carries primordial task id zero"
@@ -191,6 +225,8 @@
       (eq? (jget d0 jolt-sim-kw-return-type) (keyword #f "int")))
   (ok "descriptor :blocking? is exactly true"
       (eq? (jget d0 jolt-sim-kw-blocking?) #t))
+  (ok "ordinary descriptor :capture-native-error? is exactly false"
+      (eq? (jget d0 jolt-sim-kw-capture-native-error?) #f))
   (let ((arguments (jget d0 jolt-sim-kw-arguments)))
     (ok "descriptor :arguments preserves the exact call arguments in order"
         (and (= 2 (pvec-cnt arguments))
@@ -203,7 +239,9 @@
       (and (= 0 (pvec-cnt (jget d1 jolt-sim-kw-argument-types)))
            (= 0 (pvec-cnt (jget d1 jolt-sim-kw-arguments)))))
   (ok "zero-argument descriptor blocking? is exactly false"
-      (eq? (jget d1 jolt-sim-kw-blocking?) #f)))
+      (eq? (jget d1 jolt-sim-kw-blocking?) #f))
+  (ok "zero-argument descriptor capture flag is exactly false"
+      (eq? (jget d1 jolt-sim-kw-capture-native-error?) #f)))
 
 ;; Metadata is copied per call: mutating one descriptor's captured Scheme
 ;; string cannot corrupt a LATER descriptor's symbol name (mirrors
@@ -262,6 +300,27 @@
   (ok "the future FFI descriptor task matches the lifecycle task id"
       (and (> task-id 0)
            (= task-id (jget future-desc jolt-sim-kw-task)))))
+
+;; A scalar and captured binding intentionally share every existing signature
+;; field. Descriptor v2 makes capture mode part of their identity, and the
+;; controller returns the captured binding's complete public pair as one value.
+(ok "captured ghost call receives the controller's complete public pair"
+    (jolt-truthy? (ev "(= [-1 73] (c-ghost-captured 43 8))")))
+(let* ((events (ev "@sim-ffi-events"))
+       (scalar (pvec-nth-d events 2 jolt-nil))
+       (captured-call (pvec-nth-d events 5 jolt-nil)))
+  (ok "scalar and captured descriptors cannot collide"
+      (and (= 6 (pvec-cnt events))
+           (string=? (jget scalar jolt-sim-kw-symbol)
+                     (jget captured-call jolt-sim-kw-symbol))
+           (jolt= (jget scalar jolt-sim-kw-argument-types)
+                  (jget captured-call jolt-sim-kw-argument-types))
+           (eq? (jget scalar jolt-sim-kw-return-type)
+                (jget captured-call jolt-sim-kw-return-type))
+           (eq? (jget scalar jolt-sim-kw-blocking?)
+                (jget captured-call jolt-sim-kw-blocking?))
+           (eq? (jget scalar jolt-sim-kw-capture-native-error?) #f)
+           (eq? (jget captured-call jolt-sim-kw-capture-native-error?) #t))))
 
 ;; === native-operation interception + live argument identity =================
 (ev "(reset! sim-ffi-events [])")

@@ -614,20 +614,72 @@
 ;; jolt.ffi/__cfn: the low-level foreign-function form a jolt library
 ;; uses (via the jolt.ffi/foreign-fn macro) to bind native code. Shape:
 ;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)            ; non-blocking
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)  ; may block
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)  ; legacy keyword
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype
+;;                   {:blocking bool :capture-native-error bool})
 ;; The C symbol is a string literal and the types are literal keywords, read here
 ;; at compile time; the Chez back end lowers it to a real `foreign-procedure`
 ;; (typed marshaling, no runtime eval). A :blocking call is emitted __collect_safe
 ;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
-;; must not pin the stop-the-world collector. A leaf IR node.
+;; must not pin the stop-the-world collector. :capture-native-error asks the back
+;; end to atomically return [native-result error-code]. A leaf IR node.
+(defn- parse-ffi-options [items rettype]
+  (if (= 4 (count items))
+    {:blocking false :capture-native-error false}
+    (let [opt (nth items 4)]
+      (cond
+        (and (form-keyword? opt)
+             (nil? (namespace opt))
+             (= "blocking" (name opt)))
+        {:blocking true :capture-native-error false}
+
+        (form-map? opt)
+        (let [pairs (form-map-pairs opt)
+              allowed #{"blocking" "capture-native-error"}]
+          (loop [i 0 blocking false capture-native-error false]
+            (if (< i (count pairs))
+              (let [pair (nth pairs i)
+                    k (nth pair 0)
+                    v (nth pair 1)]
+                (when-not (and (form-keyword? k) (nil? (namespace k)))
+                  (throw (str "jolt.ffi foreign-fn option key must be an "
+                              "unqualified keyword: " k)))
+                (let [kn (name k)]
+                  (when-not (allowed kn)
+                    (throw (str "jolt.ffi foreign-fn unknown option :" kn)))
+                  (when-not (boolean? v)
+                    (throw (str "jolt.ffi foreign-fn option :" kn
+                                " must be a literal boolean: " v)))
+                  (recur (inc i)
+                         (if (= kn "blocking") v blocking)
+                         (if (= kn "capture-native-error")
+                           v
+                           capture-native-error))))
+              (do
+                (when (and capture-native-error (= rettype "void"))
+                  (throw (str "jolt.ffi foreign-fn :capture-native-error true "
+                              "is incompatible with a :void return")))
+                {:blocking blocking
+                 :capture-native-error capture-native-error}))))
+
+        :else
+        (throw (str "jolt.ffi foreign-fn options must be omitted, :blocking, "
+                    "or a literal {:blocking bool :capture-native-error bool}: "
+                    opt))))))
+
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
-    (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking])")))
-  {:op :ffi-fn
-   :csym (nth items 1)
-   :argtypes (mapv name (form-vec-items (nth items 2)))
-   :rettype (name (nth items 3))
-   :blocking (and (= 5 (count items)) (= "blocking" (name (nth items 4))))})
+    (throw (str "jolt.ffi/foreign-fn expects "
+                "(foreign-fn \"sym\" [argtypes] rettype "
+                "[:blocking | {:blocking bool :capture-native-error bool}])")))
+  (let [rettype (name (nth items 3))
+        opts (parse-ffi-options items rettype)]
+    {:op :ffi-fn
+     :csym (nth items 1)
+     :argtypes (mapv name (form-vec-items (nth items 2)))
+     :rettype rettype
+     :blocking (:blocking opts)
+     :capture-native-error (:capture-native-error opts)}))
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
 ;; macro) — the inverse of __cfn. It wraps a jolt fn as a C-callable function
