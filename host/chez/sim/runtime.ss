@@ -7,8 +7,9 @@
 ;; host/chez/java/ffi.ss), the disabled-by-default observability + interception
 ;; seams those files used to carry directly:
 ;;
-;;   - future lifecycle hook: :spawn/:start/:finish/:cancel events around every
-;;     ordinary future-call, install/clear via jolt-future-hook-set!/-clear!.
+;;   - future lifecycle hook: :spawn/:start/:finish/:cancel/:exit/:abort events
+;;     around every ordinary future-call, install/clear via
+;;     jolt-future-hook-set!/-clear!.
 ;;   - FFI call interception: every jolt.ffi/defcfn call whose compilation unit
 ;;     had sim-instrument? on (emit-ffi-fn, jolt-core/jolt/backend_scheme.clj)
 ;;     references jolt-ffi-sim-hook directly in its emitted Scheme, so that
@@ -37,8 +38,7 @@
 ;; A disabled-by-default observability + gating seam over the centralized
 ;; fork-thread future path (host/chez/java/concurrency.ss's jolt-future-call).
 ;; When a hook fn (a jolt IFn) is installed via jolt-future-hook-set!, each
-;; ordinary future-call fires three lifecycle events to it (called with jolt
-;; values):
+;; ordinary future-call fires lifecycle events to it (called with jolt values):
 ;;   (:spawn  id parent)  on the SPAWNING thread, before the worker forks
 ;;   (:start  id parent)  on the WORKER thread, BEFORE the body runs — the hook
 ;;                        MAY BLOCK here (e.g. park on a promise) so a single
@@ -47,6 +47,12 @@
 ;;                        (value OR thrown condition), BEFORE it is published
 ;;   (:cancel id parent)  on the CANCELLING thread, BEFORE cancellation is
 ;;                        published; exactly one of :finish/:cancel wins
+;;   (:exit   id parent)  on the WORKER thread, AFTER the winning result or
+;;                        cancellation is published; every forked worker
+;;                        attempts exactly one exit callback, even when start
+;;                        or the body failed or cancellation won
+;;   (:abort  id parent)  on the SPAWNING thread if :spawn registration or the
+;;                        subsequent fork fails; no worker exists for that task
 ;; `id` is a stable, unique, nonnegative int (1, 2, 3, …; never recycled) assigned
 ;; per future-call; `parent` is the task id in effect on the spawning thread (0 for
 ;; the primordial thread / any thread that is not itself a hooked future). A
@@ -73,6 +79,8 @@
 (define fhk-start  (keyword #f "start"))
 (define fhk-finish (keyword #f "finish"))
 (define fhk-cancel (keyword #f "cancel"))
+(define fhk-exit   (keyword #f "exit"))
+(define fhk-abort  (keyword #f "abort"))
 (define jolt-future-hook-error-mu (make-mutex))
 (define jolt-future-hook-errors '())
 
@@ -121,9 +129,23 @@
     (jolt-future-done?-set! f #t)
     (condition-broadcast (jolt-future-cv f))))
 
+;; A worker that loses the terminal claim to future-cancel must not publish its
+;; computed result, but its :exit acknowledgement still has to follow the
+;; canceller's :cancel callback and publication. claim-terminal! alone is not
+;; that boundary: the winner invokes its hook outside the mutex before setting
+;; done?. Wait on the future's existing condition so :exit observes the
+;; published terminal state in both winner cases.
+(define (jolt-hooked-future-await-published! f)
+  (with-mutex (jolt-future-mu f)
+    (let loop ()
+      (unless (jolt-future-done? f)
+        (condition-wait (jolt-future-cv f) (jolt-future-mu f))
+        (loop)))))
+
 ;; Hook-aware future-call: with NO hook installed this defers to the base
 ;; jolt-future-call unchanged (no id, no wrapped record, no extra locking).
-;; When a hook fn is installed it observes :spawn/:start/:finish and may block
+;; When a hook fn is installed it observes :spawn/:start, one of
+;; :finish/:cancel, and the worker's final :exit acknowledgement. It may block
 ;; at :start so a controller can order ordinary futures — see the seam above.
 (define (jolt-sim-future-call thunk)
   (let ((hook (unbox jolt-future-hook)))
@@ -138,27 +160,43 @@
           ;; :spawn fires synchronously on this thread before the worker forks,
           ;; so any gate the hook arms for `id` is in place before :start runs.
           ;; Fail closed before the fork: a controller that cannot register this
-          ;; task must not let the ordinary future escape uncontrolled.
-          (jolt-future-hook-invoke hook fhk-spawn id parent)
-          (fork-thread
-           (lambda ()
-             (*txn* #f)
-             (dyn-binding-stack snap)
-             (jolt-future-task-id id)        ; this body's spawns report id as parent
-             ;; :start may BLOCK so a controller chooses when this body begins.
-             ;; Capture a start-hook failure in the same result channel as a body
-             ;; failure: the body is skipped and deref observes normal future
-             ;; ExecutionException semantics instead of hanging.
-             (let ((r (guard (e (#t (cons #f e)))
-                        (jolt-future-hook-invoke hook fhk-start id parent)
-                        (cons #t (jolt-invoke thunk)))))
-               ;; Exactly one terminal claimant wins. Its hook runs before the
-               ;; result/cancellation becomes visible, and never while holding
-               ;; the future mutex, so the controller is a causal boundary
-               ;; without creating a hook/mutex deadlock.
-               (when (jolt-hooked-future-claim-terminal! f)
-                 (jolt-future-hook-terminal-invoke hook fhk-finish id parent)
-                 (jolt-hooked-future-publish-result! f r)))))
+          ;; task must not let the ordinary future escape uncontrolled. If
+          ;; registration or fork-thread itself fails, :abort balances the
+          ;; announced id so an external controller need not guess whether a
+          ;; worker still exists.
+          (guard (e (#t
+                     (jolt-future-hook-terminal-invoke
+                      hook fhk-abort id parent)
+                     (raise e)))
+            (jolt-future-hook-invoke hook fhk-spawn id parent)
+            (fork-thread
+             (lambda ()
+               ;; Capture worker setup and a start-hook failure in the same
+               ;; result channel as a body failure. The body is skipped and
+               ;; deref observes ordinary ExecutionException semantics instead
+               ;; of hanging, while the worker still reaches :exit.
+               (let ((r (guard (e (#t (cons #f e)))
+                          (*txn* #f)
+                          (dyn-binding-stack snap)
+                          ;; This body's spawns report id as their parent.
+                          (jolt-future-task-id id)
+                          (jolt-future-hook-invoke hook fhk-start id parent)
+                          (cons #t (jolt-invoke thunk)))))
+                 ;; Exactly one terminal claimant wins. Its hook runs before
+                 ;; the result/cancellation becomes visible, and never while
+                 ;; holding the future mutex, so the controller is a causal
+                 ;; boundary without creating a hook/mutex deadlock.
+                 (when (jolt-hooked-future-claim-terminal! f)
+                   (jolt-future-hook-terminal-invoke
+                    hook fhk-finish id parent)
+                   (jolt-hooked-future-publish-result! f r))
+                 ;; If cancellation won while this non-interruptible worker was
+                 ;; running, wait until its :cancel hook and publication finish.
+                 ;; :exit is supervisor-style: its failure is latched and cannot
+                 ;; replace the already-published result or cancellation.
+                 (jolt-hooked-future-await-published! f)
+                 (jolt-future-hook-terminal-invoke
+                  hook fhk-exit id parent)))))
           f))))
 
 ;; Hook-aware future-cancel: a hooked future's cancellation is a terminal event,
@@ -417,10 +455,12 @@
 (define jolt-sim-kw-operation          (keyword #f "operation"))
 (define (jolt-sim-capabilities)
   (jolt-hash-map
-   jolt-sim-kw-abi-version 2
+   jolt-sim-kw-abi-version 3
    jolt-sim-kw-future-lifecycle #t
    jolt-sim-kw-controller-errors #t
-   jolt-sim-kw-events (jolt-vector fhk-spawn fhk-start fhk-finish fhk-cancel)
+   jolt-sim-kw-events
+   (jolt-vector
+    fhk-spawn fhk-start fhk-finish fhk-cancel fhk-exit fhk-abort)
    jolt-sim-kw-ffi-interception
    (jolt-hash-map
     jolt-sim-kw-descriptor-version 1

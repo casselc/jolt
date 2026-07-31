@@ -230,21 +230,35 @@
 ;; by the lifecycle controller, so an external scheduler can correlate the
 ;; effect with its task without a separate registry.
 (ev "(def sim-ffi-lifecycle-events (atom []))")
+(ev "(def sim-ffi-lifecycle-exited (promise))")
 (ev "(defn sim-ffi-lifecycle-controller [event id parent]
-       (swap! sim-ffi-lifecycle-events conj [event id parent]))")
+       (swap! sim-ffi-lifecycle-events conj [event id parent])
+       (when (= event :exit)
+         (deliver sim-ffi-lifecycle-exited true)))")
 (ev "(def sim-ffi-lifecycle-token
        (jolt.internal.sim/install-controller! sim-ffi-lifecycle-controller))")
 (ok "an intercepted foreign call inside an ordinary future returns its substitution"
     (= 999 (jnum->exact (ev "(deref (future (c-ghost 44 9)))"))))
+(ok "the FFI-calling worker reaches its post-publication exit callback"
+    (eq? #t (ev "(deref sim-ffi-lifecycle-exited 5000 :timeout)")))
 (ev "(jolt.internal.sim/restore-controller! sim-ffi-lifecycle-token)")
 (let* ((events (ev "@sim-ffi-events"))
        (future-desc (pvec-nth-d events 4 jolt-nil))
        (lifecycle-events (ev "@sim-ffi-lifecycle-events"))
        (spawn (pvec-nth-d lifecycle-events 0 jolt-nil))
        (task-id (pvec-nth-d spawn 1 jolt-nil)))
-  (ok "future lifecycle emitted spawn/start/finish"
-      (and (= 3 (pvec-cnt lifecycle-events))
-           (eq? (pvec-nth-d spawn 0 jolt-nil) fhk-spawn)))
+  (ok "future lifecycle emitted exact spawn/start/finish/exit ordering"
+      (and (= 4 (pvec-cnt lifecycle-events))
+           (eq? (pvec-nth-d spawn 0 jolt-nil) fhk-spawn)
+           (eq? (pvec-nth-d (pvec-nth-d lifecycle-events 1 jolt-nil)
+                            0 jolt-nil)
+                fhk-start)
+           (eq? (pvec-nth-d (pvec-nth-d lifecycle-events 2 jolt-nil)
+                            0 jolt-nil)
+                fhk-finish)
+           (eq? (pvec-nth-d (pvec-nth-d lifecycle-events 3 jolt-nil)
+                            0 jolt-nil)
+                fhk-exit)))
   (ok "the future FFI descriptor task matches the lifecycle task id"
       (and (> task-id 0)
            (= task-id (jget future-desc jolt-sim-kw-task)))))

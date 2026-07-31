@@ -42,10 +42,13 @@
    make-jolt-hooked-future
    jolt-sim-future-call
    jolt-sim-future-cancel
+   jolt-hooked-future-await-published!
    fhk-spawn
    fhk-start
    fhk-finish
    fhk-cancel
+   fhk-exit
+   fhk-abort
    ;; the jolt.internal.sim controller ABI (host/chez/sim/runtime.ss's
    ;; "=== controller ABI ===" section) is layered over the hook above, so it
    ;; is equally absent from an ordinary image.
