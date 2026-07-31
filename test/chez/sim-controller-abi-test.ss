@@ -40,8 +40,8 @@
 (is "events capability is the exact ordered lifecycle set"
     "(:events (jolt.internal.sim/capabilities))"
     "[:spawn :start :finish :cancel :exit :abort]")
-(is "ffi-interception descriptor-version is exactly integer 2"
-    "(:descriptor-version (:ffi-interception (jolt.internal.sim/capabilities)))" "2")
+(is "ffi-interception descriptor-version is exactly integer 3"
+    "(:descriptor-version (:ffi-interception (jolt.internal.sim/capabilities)))" "3")
 (is "ffi-interception kinds is the exact set"
     "(:kinds (:ffi-interception (jolt.internal.sim/capabilities)))"
     "[:foreign-function :native-operation]")
@@ -52,7 +52,7 @@
     ":future-lifecycle")
 (is "ffi-interception native-operations is the exact ordered set"
     "(:native-operations (:ffi-interception (jolt.internal.sim/capabilities)))"
-    "[:load-library :loaded? :alloc :free :read :write :sizeof :read-bytes :write-bytes :read-array :write-array :ptr->string :string->ptr]")
+    "[:load-library :loaded? :alloc :free :read :write :sizeof :read-bytes :write-bytes :read-array :write-array :borrow-byte-array :release-byte-array :ptr->string :string->ptr]")
 (is "ffi-interception map carries exactly five keys"
     "(count (:ffi-interception (jolt.internal.sim/capabilities)))" "5")
 (is "capabilities map carries exactly five keys"

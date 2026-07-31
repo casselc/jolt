@@ -16,7 +16,8 @@
 ;;     variable — and install/clear/invoke — must exist wherever such code runs.
 ;;   - raw native-op interception: the SAME hook extended to jolt.ffi's runtime
 ;;     primitives (load-library, loaded?, alloc, free, read, write, read-bytes,
-;;     write-bytes, read-array, write-array, ptr->string, string->ptr, sizeof).
+;;     write-bytes, read-array, write-array, borrow-byte-array,
+;;     release-byte-array, ptr->string, string->ptr, sizeof).
 ;;
 ;; Each seam is expressed here as a NEW procedure that snapshots the relevant
 ;; hook once and falls through to the base (now branch-free) procedure when no
@@ -24,9 +25,9 @@
 ;; runtime's own behavior, not a re-implementation of it. The public vars
 ;; (clojure.core/future-call, future-cancel; jolt.ffi/load-library, loaded?,
 ;; alloc, free, read, write, sizeof, read-bytes, write-bytes, read-array,
-;; write-array, ptr->string, string->ptr) are then REBOUND via def-var! to
-;; these hook-aware versions, exactly as post-prelude.ss re-asserts vars over
-;; an earlier layer's.
+;; write-array, with-byte-array-pointer, ptr->string, string->ptr) are then
+;; REBOUND via def-var! to these hook-aware versions, exactly as post-prelude.ss
+;; re-asserts vars over an earlier layer's.
 ;;
 ;; Load after host/chez/java/concurrency.ss and host/chez/java/ffi.ss (both
 ;; part of the ordinary runtime chain rt.ss already loads); see
@@ -310,7 +311,8 @@
 ;; reentrancy guard above) to the runtime primitives a jolt library uses to load
 ;; shared objects and manage raw foreign memory: load-library, loaded?, alloc,
 ;; free, read, write, read-bytes, write-bytes, read-array, write-array,
-;; ptr->string, string->ptr, sizeof. Each primitive below snapshots the same
+;; borrow-byte-array, release-byte-array, ptr->string, string->ptr, sizeof. Each
+;; primitive below snapshots the same
 ;; hot-path variable ONCE and, when a hook is installed, routes the call through
 ;; it instead of the base (branch-free) OS loader / Chez foreign-memory ops in
 ;; host/chez/java/ffi.ss; with no hook the base primitive runs unchanged.
@@ -387,6 +389,50 @@
     (if h
         (jolt-ffi-invoke-native-sim-op h "write-array" (list ptr arr))
         (ffi-write-array ptr arr))))
+(define (ffi-sim-with-byte-array-pointer-range arr off len f)
+  ;; Stage a modeled loan around, not inside, the hook. borrow-byte-array sees
+  ;; the SAME live array plus its validated range and returns a fake pointer.
+  ;; The ordinary callback runs after that hook invocation has returned, so its
+  ;; nested defcfn and raw-memory calls are intercepted normally instead of
+  ;; tripping the same-thread hook reentrancy guard. release-byte-array retires
+  ;; the fake pointer on every exit.
+  ;;
+  ;; Capture the issuing hook once: cleanup belongs to the controller that
+  ;; created the pointer. As in the real scope, a continuation cannot re-enter
+  ;; after its first exit because the pointer has already been retired.
+  (let* ((start (jnum->exact off))
+         (cnt (jnum->exact len))
+         (bv (ffi-byte-array-backing "with-byte-array-pointer" arr))
+         (h jolt-ffi-sim-hook))
+    (ffi-check-array-range "with-byte-array-pointer" bv start cnt)
+    (if (not h)
+        (ffi-with-byte-array-pointer-range arr start cnt f)
+        (let ((p (jnum->exact
+                  (jolt-ffi-invoke-native-sim-op
+                   h "borrow-byte-array" (list arr start cnt))))
+              (retired? #f))
+          (when (<= p 0)
+            (error 'jolt.ffi
+                   "simulated byte-array loan must return a positive pointer"))
+          (dynamic-wind
+            (lambda ()
+              (when retired?
+                (error
+                 'jolt.ffi
+                 "scoped byte-array pointer continuation cannot be re-entered")))
+            (lambda () (jolt-invoke2 f p cnt))
+            (lambda ()
+              (set! retired? #t)
+              (jolt-ffi-invoke-native-sim-op
+               h "release-byte-array" (list p))))))))
+(define ffi-sim-with-byte-array-pointer
+  (case-lambda
+    ((arr f)
+     (let ((bv (ffi-byte-array-backing "with-byte-array-pointer" arr)))
+       (ffi-sim-with-byte-array-pointer-range
+        arr 0 (bytevector-length bv) f)))
+    ((arr off len f)
+     (ffi-sim-with-byte-array-pointer-range arr off len f))))
 (define (ffi-sim-ptr->string ptr)
   (let ((h jolt-ffi-sim-hook))
     (if h
@@ -409,6 +455,8 @@
 (def-var! "jolt.ffi" "write-bytes" ffi-sim-write-bytes)
 (def-var! "jolt.ffi" "read-array" ffi-sim-read-array)
 (def-var! "jolt.ffi" "write-array" ffi-sim-write-array)
+(def-var! "jolt.ffi" "with-byte-array-pointer"
+          ffi-sim-with-byte-array-pointer)
 (def-var! "jolt.ffi" "ptr->string" ffi-sim-ptr->string)
 (def-var! "jolt.ffi" "string->ptr" ffi-sim-string->ptr)
 
@@ -469,7 +517,10 @@
     fhk-spawn fhk-start fhk-finish fhk-cancel fhk-exit fhk-abort)
    jolt-sim-kw-ffi-interception
    (jolt-hash-map
-    jolt-sim-kw-descriptor-version 2
+    ;; Descriptor v3 keeps v2's exact descriptor shapes and native-error flag,
+    ;; while extending the exact native-operation set with the staged scoped
+    ;; byte-array loan lifecycle.
+    jolt-sim-kw-descriptor-version 3
     jolt-sim-kw-kinds (jolt-vector jolt-sim-kw-foreign-function
                                     jolt-sim-kw-native-operation)
     jolt-sim-kw-arguments jolt-sim-kw-live
@@ -480,7 +531,10 @@
                  (keyword #f "read") (keyword #f "write")
                  (keyword #f "sizeof") (keyword #f "read-bytes")
                  (keyword #f "write-bytes") (keyword #f "read-array")
-                 (keyword #f "write-array") (keyword #f "ptr->string")
+                 (keyword #f "write-array")
+                 (keyword #f "borrow-byte-array")
+                 (keyword #f "release-byte-array")
+                 (keyword #f "ptr->string")
                  (keyword #f "string->ptr")))))
 
 ;; jolt.internal.sim/install-controller! + restore-controller! — a Jolt-callable
@@ -571,8 +625,8 @@
 (define jolt-ffi-sim-native-desc-keys '(kind op args))
 (define jolt-sim-ffi-native-operation-names
   '("load-library" "loaded?" "alloc" "free" "read" "write" "sizeof"
-    "read-bytes" "write-bytes" "read-array" "write-array" "ptr->string"
-    "string->ptr"))
+    "read-bytes" "write-bytes" "read-array" "write-array"
+    "borrow-byte-array" "release-byte-array" "ptr->string" "string->ptr"))
 (define (jolt-sim-ffi-descriptor-keys desc)
   (and (list? desc) (for-all pair? desc) (map car desc)))
 (define (jolt-sim-ffi-project-descriptor desc)

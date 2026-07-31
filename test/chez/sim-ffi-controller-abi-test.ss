@@ -165,9 +165,9 @@
                  (and (eq? (pvec-nth-d advertised i jolt-nil)
                            (keyword #f (car names)))
                       (loop (cdr names) (+ i 1)))))))
-  (ok "outer lifecycle ABI remains v3 while the nested FFI descriptor is v2"
+  (ok "outer lifecycle ABI remains v3 while the nested FFI descriptor is v3"
       (and (= 3 (jget caps jolt-sim-kw-abi-version))
-           (= 2 (jget ffi-caps jolt-sim-kw-descriptor-version)))))
+           (= 3 (jget ffi-caps jolt-sim-kw-descriptor-version)))))
 
 ;; === ordinary jolt code: require jolt.ffi, bind a ghost + a real symbol =====
 (ev "(require '[jolt.ffi :as ffi])")
@@ -195,7 +195,10 @@
        (swap! sim-ffi-events conj desc)
        (if (= :foreign-function (:kind desc))
          (if (:capture-native-error? desc) [-1 73] 999)
-         :native-op-sentinel))")
+         (cond
+           (= :borrow-byte-array (:operation desc)) 424242
+           (= :release-byte-array (:operation desc)) nil
+           :else :native-op-sentinel)))")
 (ev "(def sim-ffi-token (jolt.internal.sim/install-ffi-controller! sim-ffi-controller))")
 
 ;; --- the nonexistent symbol is never resolved; the controller's return value
@@ -302,7 +305,7 @@
            (= task-id (jget future-desc jolt-sim-kw-task)))))
 
 ;; A scalar and captured binding intentionally share every existing signature
-;; field. Descriptor v2 makes capture mode part of their identity, and the
+;; field. Descriptor v3 retains v2's capture-aware identity, and the
 ;; controller returns the captured binding's complete public pair as one value.
 (ok "captured ghost call receives the controller's complete public pair"
     (jolt-truthy? (ev "(= [-1 73] (c-ghost-captured 43 8))")))
@@ -355,6 +358,36 @@
       (= 2 (pvec-cnt args)))
   (ok "descriptor :arguments preserves live byte-array object identity, not a copy"
       (eq? captured-arr live-arr)))
+
+;; A pointer loan is two ordinary native-operation descriptors around an
+;; unwrapped callback. The begin descriptor carries the SAME live byte array;
+;; the release descriptor carries only the fake pointer the controller issued.
+(ok "staged pointer-loan callback receives the controller pointer and exact length"
+    (jolt-truthy?
+     (ev "(= [424242 2]
+             (ffi/with-byte-array-pointer
+               sim-ffi-arr 1 2 (fn [p n] [p n])))")))
+(let* ((events (ev "@sim-ffi-events"))
+       (borrow (pvec-nth-d events 2 jolt-nil))
+       (release (pvec-nth-d events 3 jolt-nil))
+       (borrow-args (jget borrow jolt-sim-kw-arguments))
+       (release-args (jget release jolt-sim-kw-arguments)))
+  (ok "staged loan appends exactly borrow then release descriptors"
+      (and (= 4 (pvec-cnt events))
+           (eq? (jget borrow jolt-sim-kw-operation)
+                (keyword #f "borrow-byte-array"))
+           (eq? (jget release jolt-sim-kw-operation)
+                (keyword #f "release-byte-array"))))
+  (ok "borrow descriptor preserves live array identity and validated range"
+      (and (= 3 (pvec-cnt borrow-args))
+           (eq? (pvec-nth-d borrow-args 0 jolt-nil)
+                (ev "sim-ffi-arr"))
+           (= 1 (jnum->exact (pvec-nth-d borrow-args 1 jolt-nil)))
+           (= 2 (jnum->exact (pvec-nth-d borrow-args 2 jolt-nil)))))
+  (ok "release descriptor carries exactly the issued fake pointer"
+      (and (= 1 (pvec-cnt release-args))
+           (= 424242
+              (jnum->exact (pvec-nth-d release-args 0 jolt-nil))))))
 
 ;; --- restore returns to the unhooked baseline --------------------------------
 (ev "(jolt.internal.sim/restore-ffi-controller! sim-ffi-token)")

@@ -39,6 +39,12 @@
 ;; is visible to a later form.
 (define (ev s) (jolt-compile-eval s "user"))
 (define (ev-fails? s) (guard (e (#t #t)) (ev s) #f))
+(define (has? s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i nsub) ns) #f)
+            ((string=? (substring s i (+ i nsub)) sub) #t)
+            (else (loop (+ i 1)))))))
 
 ;; load libc (process symbols) and bind typed foreign functions
 (ev "(jolt.ffi/load-library)")
@@ -162,6 +168,170 @@
                false
                (catch IllegalArgumentException _ true)
                (finally (jolt.ffi/free p))))")))
+
+;; Scoped zero-copy loans: the callback receives a stable pointer into the
+;; bytevector-backed array. It may call native code, allocate, collect, throw,
+;; nest another loan, or leave nonlocally; the pointer dies at the first exit.
+(ev "(def c-memset-pointer
+       (jolt.ffi/__cfn \"memset\" [:pointer :int :size_t] :pointer))")
+(ok "ranged pointer loan mutates only the selected live array window"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3 4])
+                  result
+                  (jolt.ffi/with-byte-array-pointer
+                    a 1 2
+                    (fn [p n]
+                      (c-memset-pointer p 171 n)
+                      :callback-result))]
+              (and (= :callback-result result)
+                   (= [1 171 171 4] (vec a))))")))
+(ok "whole-array pointer-loan arity supplies the complete validated length"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3])]
+              (and (= 3
+                      (jolt.ffi/with-byte-array-pointer
+                        a
+                        (fn [p n]
+                          (c-memset-pointer p 205 n)
+                          n)))
+                   (= [205 205 205] (vec a))))")))
+(ok "scoped pointer stays stable across allocation and collection"
+    (let* ((a (ev "(byte-array [1 2 3 4])"))
+           (bv (jolt-array-vec a)))
+      (and
+       (ffi-with-byte-array-pointer
+        a 1 2
+        (lambda (p n)
+          (let ((before (object->reference-address bv)))
+            (make-bytevector 1048576 0)
+            (collect)
+            (foreign-set! 'unsigned-8 p 0 99)
+            (and (= n 2)
+                 (= p (+ before 1))
+                 (= before (object->reference-address bv))
+                 (locked-object? bv)))))
+       (= 99 (bytevector-u8-ref bv 1))
+       (not (locked-object? bv)))))
+(ok "empty exact-tail and whole-empty loans are valid"
+    (jolt-truthy?
+      (ev "(and
+             (let [a (byte-array [1 2])]
+               (jolt.ffi/with-byte-array-pointer
+                 a 2 0
+                 (fn [p n] (and (integer? p) (pos? p) (zero? n)))))
+             (let [a (byte-array 0)]
+               (jolt.ffi/with-byte-array-pointer
+                 a
+                 (fn [p n] (and (integer? p) (pos? p) (zero? n))))))")))
+(ok "invalid pointer-loan ranges fail before the callback"
+    (jolt-truthy?
+      (ev "(let [a (byte-array 2) calls (atom 0)
+                  f (fn [_ _] (swap! calls inc))]
+              (and
+                (try
+                  (jolt.ffi/with-byte-array-pointer a -1 1 f)
+                  false
+                  (catch IndexOutOfBoundsException _ true))
+                (try
+                  (jolt.ffi/with-byte-array-pointer a 1 2 f)
+                  false
+                  (catch IndexOutOfBoundsException _ true))
+                (try
+                  (jolt.ffi/with-byte-array-pointer
+                    a 1 4611686018427387904 f)
+                  false
+                  (catch IndexOutOfBoundsException _ true))
+                (zero? @calls)))")))
+(ok "pointer loans reject non-byte arrays"
+    (jolt-truthy?
+      (ev "(try
+             (jolt.ffi/with-byte-array-pointer
+               (int-array [1 2]) (fn [_ _] false))
+             false
+             (catch IllegalArgumentException _ true))")))
+(let* ((a (ev "(byte-array [1 2 3 4 5 6 7 8])"))
+       (bv (jolt-array-vec a)))
+  (ok "nested same-array loans balance reference-counted locks"
+      (and
+       (not (locked-object? bv))
+       (ffi-with-byte-array-pointer
+        a 1 4
+        (lambda (p n)
+          (and
+           (locked-object? bv)
+           (ffi-with-byte-array-pointer
+            a 2 2
+            (lambda (q m)
+              (and (locked-object? bv) (= q (+ p 1)) (= m 2))))
+           (locked-object? bv)
+           (= n 4))))
+       (not (locked-object? bv))))
+  (ok "callback error and nonlocal exit both retire and unlock the loan"
+      (and
+       (guard (e (#t #t))
+         (ffi-with-byte-array-pointer
+          a 0 4 (lambda (p n) (error 'pointer-loan "boom")))
+         #f)
+       (not (locked-object? bv))
+       (call/cc
+        (lambda (escape)
+          (ffi-with-byte-array-pointer
+           a 0 4 (lambda (p n) (escape #t)))))
+       (not (locked-object? bv))
+       (= 4
+          (ffi-with-byte-array-pointer
+           a 0 4 (lambda (p n) n)))
+       (not (locked-object? bv)))))
+(let* ((bv (make-bytevector 8 0))
+       (saved #f)
+       (phase 0)
+       (visits '())
+       (outcome
+        (guard (e (#t
+                   (list 'raised (condition-message e)
+                         (reverse visits) (locked-object? bv))))
+          (let ((value
+                 (ffi-with-locked-byte-range
+                  "reentry" bv 0 8
+                  (lambda (pointer count argument)
+                    (call/cc
+                     (lambda (continuation)
+                       (unless saved (set! saved continuation))
+                       'first-entry))
+                    (set! visits (cons (locked-object? bv) visits))
+                    (locked-object? bv))
+                  0)))
+            (if (= phase 0)
+                (begin (set! phase 1) (saved 'second-entry))
+                (list 'returned value (reverse visits)
+                      (locked-object? bv)))))))
+  (ok "retired pointer scope rejects continuation re-entry before callback resumes"
+      (and
+       (eq? 'raised (car outcome))
+       (has? (cadr outcome) "cannot be re-entered")
+       (equal? '(#t) (caddr outcome))
+       (not (cadddr outcome))
+       (not (locked-object? bv))
+       (= 8
+          (ffi-with-locked-byte-range
+           "later-scope" bv 0 8 (lambda (p n arg) n) 0))
+       (not (locked-object? bv)))))
+(ev "(def pointer-throw-array (byte-array [1 2 3 4]))")
+(ok "Jolt exception out of a loan unlocks before a later scope"
+    (and
+     (jolt-truthy?
+      (ev "(try
+             (jolt.ffi/with-byte-array-pointer
+               pointer-throw-array 0 2
+               (fn [_ _] (throw (Exception. \"loan boom\"))))
+             false
+             (catch Exception _ true))"))
+     (not
+      (locked-object?
+       (jolt-array-vec (var-deref "user" "pointer-throw-array"))))
+     (jolt-truthy?
+      (ev "(jolt.ffi/with-byte-array-pointer
+             pointer-throw-array 0 2 (fn [_ n] (= n 2)))"))))
 
 ;; a :blocking foreign call is collect-safe: a thread parked in it must not pin
 ;; the stop-the-world collector. (collect) here would throw "cannot collect when

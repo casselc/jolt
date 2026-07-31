@@ -15,9 +15,16 @@
   :iptr :uptr :double :float :pointer :string :void :uint8 :char.
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
-  ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers
-  a compile-time-typed signature to a real Chez foreign-procedure. Its optional
-  final argument is the legacy :blocking keyword or a literal options map:
+  ptr->string/string->ptr/null/null?) are provided by the host. Binary data can
+  be copied with read-array/write-array. For a scoped zero-copy loan,
+  `(with-byte-array-pointer arr f)` pins the whole byte array and
+  `(with-byte-array-pointer arr off len f)` pins one validated range; both call
+  `f` with the pointer and validated length. The pointer is valid only during
+  that callback and native code must not retain it.
+
+  foreign-fn lowers a compile-time-typed signature to a real Chez
+  foreign-procedure. Its optional final argument is the legacy :blocking keyword
+  or a literal options map:
 
       {:blocking true :capture-native-error true}
 

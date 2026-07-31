@@ -94,6 +94,59 @@
       (jolt-array-vec arr)
       (throw-jvm 'IllegalArgumentException
                  (string-append "jolt.ffi/" who ": expected byte-array"))))
+(define (ffi-check-array-range who bv off len)
+  (let ((n (bytevector-length bv)))
+    ;; Compare len with the remaining capacity instead of adding off + len, so
+    ;; an overflow-shaped exact integer is rejected without wrapping.
+    (when (or (< off 0) (< len 0) (> off n) (> len (- n off)))
+      (throw-jvm 'IndexOutOfBoundsException
+                 (string-append "jolt.ffi/" who
+                                ": byte-array range out of bounds")))))
+(define (ffi-with-locked-byte-range who bv start cnt receive arg)
+  ;; The one real scoped loan of an interior pointer into a movable Jolt
+  ;; byte-array. Chez defines object->reference-address for a bytevector as the
+  ;; first content byte; lock-object keeps that address stable across allocation
+  ;; and collection. Locks are reference-counted, so nested scopes over the same
+  ;; backing each balance their own lock.
+  ;;
+  ;; Validate before locking or invoking the callback. dynamic-wind unlocks on
+  ;; normal return, exception, or nonlocal exit. The pointer is retired on that
+  ;; first exit and C must not retain it. A continuation captured by receive
+  ;; could otherwise re-enter later with the address computed on the first
+  ;; entry, after the unlocked backing may have moved. Reject such re-entry
+  ;; before receive resumes; merely re-locking would not repair the stale
+  ;; pointer argument.
+  (ffi-check-array-range who bv start cnt)
+  (let ((retired? #f))
+    (lock-object bv)
+    (dynamic-wind
+      (lambda ()
+        (when retired?
+          (error 'jolt.ffi
+                 "scoped byte-array pointer continuation cannot be re-entered")))
+      (lambda ()
+        (receive (+ (object->reference-address bv) start) cnt arg))
+      (lambda ()
+        (set! retired? #t)
+        (unlock-object bv)))))
+(define (ffi-invoke-pointer-scope p cnt f) (jolt-invoke2 f p cnt))
+(define (ffi-with-byte-array-pointer-range arr off len f)
+  (let ((bv (ffi-byte-array-backing "with-byte-array-pointer" arr)))
+    (ffi-with-locked-byte-range
+     "with-byte-array-pointer" bv
+     (jnum->exact off) (jnum->exact len)
+     ffi-invoke-pointer-scope f)))
+(define ffi-with-byte-array-pointer
+  (case-lambda
+    ;; Whole-array convenience keeps the callback contract identical to the
+    ;; ranged form: f always receives [pointer validated-length].
+    ((arr f)
+     (let ((bv (ffi-byte-array-backing "with-byte-array-pointer" arr)))
+       (ffi-with-locked-byte-range
+        "with-byte-array-pointer" bv 0 (bytevector-length bv)
+        ffi-invoke-pointer-scope f)))
+    ((arr off len f)
+     (ffi-with-byte-array-pointer-range arr off len f))))
 (define (ffi-read-array ptr n)
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n 0)))
     (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 p i)))
@@ -107,6 +160,7 @@
     n))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
+(def-var! "jolt.ffi" "with-byte-array-pointer" ffi-with-byte-array-pointer)
 
 ;; --- string / bytevector marshaling ------------------------------------------
 ;; A C string result already comes back as a jolt string (the `string` foreign

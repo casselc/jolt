@@ -45,6 +45,8 @@
    ffi-sim-write-bytes
    ffi-sim-read-array
    ffi-sim-write-array
+   ffi-sim-with-byte-array-pointer-range
+   ffi-sim-with-byte-array-pointer
    ffi-sim-ptr->string
    ffi-sim-string->ptr
    ;; the jolt.internal.sim FFI controller projection (host/chez/sim/

@@ -4,7 +4,8 @@
 ;; jolt.ffi/defcfn CALL (see ffi-sim-hook-test.ss) also intercepts the runtime
 ;; primitives a jolt library uses to load shared objects and manage raw foreign
 ;; memory: load-library, loaded?, alloc, free, read, write, read-bytes,
-;; write-bytes, read-array, write-array, ptr->string, string->ptr, sizeof.
+;; write-bytes, read-array, write-array, borrow-byte-array,
+;; release-byte-array, ptr->string, string->ptr, sizeof.
 ;;
 ;; Each primitive reads the same hot-path variable and, when a hook is installed,
 ;; routes the call through it with a stable plain descriptor carrying
@@ -71,6 +72,12 @@
 ;; eval one form (string) in `user`, like the loader does form-by-form.
 (define (ev s) (jolt-compile-eval s "user"))
 (define (dget d k) (cdr (assq k d)))
+(define (has? s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i nsub) ns) #f)
+            ((string=? (substring s i (+ i nsub)) sub) #t)
+            (else (loop (+ i 1)))))))
 
 ;; --- a fully simulated native-memory controller ------------------------------
 ;; A real simulation controller: it tracks loaded libraries, hands out fake
@@ -81,6 +88,7 @@
 ;; distinguished from a native-op descriptor (op) and answered with a sentinel.
 (define native-ops '())          ; op-name strings, in capture order
 (define native-mem (make-eqv-hashtable))   ; fake ptr (exact int) -> bytevector
+(define native-loans (make-eqv-hashtable)) ; fake ptr -> [array off len released?]
 (define native-libs (make-hashtable string-hash equal?))  ; name -> #t
 (define native-next-ptr 1000000)
 (define cfn-sentinel 8888)
@@ -88,31 +96,88 @@
 (define (sim-reset!)
   (set! native-ops '())
   (set! native-mem (make-eqv-hashtable))
+  (set! native-loans (make-eqv-hashtable))
   (set! native-libs (make-hashtable string-hash equal?))
   (set! native-next-ptr 1000000))
 
 (define (sim-bv p) (hashtable-ref native-mem p #f))
 (define (sim-alloc-bytes! n)
   (let ((p native-next-ptr) (bv (make-bytevector n 0)))
-    (set! native-next-ptr (+ native-next-ptr 1))
+    ;; Leave a guard gap so fake interior addresses resolve unambiguously.
+    (set! native-next-ptr (+ native-next-ptr (max 1 n) 16))
     (hashtable-set! native-mem p bv) p))
+(define (sim-borrow-array! arr off len)
+  (let ((p native-next-ptr))
+    (set! native-next-ptr (+ native-next-ptr (max 1 len) 16))
+    (hashtable-set! native-loans p (vector arr off len #f))
+    p))
+(define (sim-find-region table p size-of)
+  (let-values (((keys vals) (hashtable-entries table)))
+    (let loop ((i 0))
+      (if (= i (vector-length keys))
+          #f
+          (let* ((base (vector-ref keys i))
+                 (value (vector-ref vals i))
+                 (size (size-of value)))
+            (if (or (and (= size 0) (= p base))
+                    (and (<= base p) (< p (+ base size))))
+                (cons base value)
+                (loop (+ i 1))))))))
+(define (sim-resolve-byte p relative-offset)
+  (let ((loan
+         (sim-find-region
+          native-loans p (lambda (record) (vector-ref record 2)))))
+    (if loan
+        (let* ((base (car loan))
+               (record (cdr loan))
+               (offset (+ (- p base) relative-offset))
+               (len (vector-ref record 2)))
+          (when (vector-ref record 3)
+            (error 'native-hook "use after byte-array loan release" p))
+          (when (or (< offset 0) (>= offset len))
+            (error 'native-hook "byte-array loan access out of bounds" p offset))
+          (list 'loan record offset))
+        (let ((owned
+               (sim-find-region native-mem p bytevector-length)))
+          (unless owned (error 'native-hook "unknown fake pointer" p))
+          (let* ((base (car owned))
+                 (bv (cdr owned))
+                 (offset (+ (- p base) relative-offset)))
+            (when (or (< offset 0) (>= offset (bytevector-length bv)))
+              (error 'native-hook "fake native access out of bounds" p offset))
+            (list 'owned bv offset))))))
+(define (sim-byte-ref p off)
+  (let ((resolved (sim-resolve-byte p off)))
+    (if (eq? (car resolved) 'loan)
+        (let* ((record (cadr resolved))
+               (index (+ (vector-ref record 1) (caddr resolved))))
+          (bytevector-u8-ref
+           (jolt-array-vec (vector-ref record 0)) index))
+        (bytevector-u8-ref (cadr resolved) (caddr resolved)))))
+(define (sim-byte-set! p off b)
+  (let ((resolved (sim-resolve-byte p off))
+        (value (bitwise-and b 255)))
+    (if (eq? (car resolved) 'loan)
+        (let* ((record (cadr resolved))
+               (index (+ (vector-ref record 1) (caddr resolved))))
+          (bytevector-u8-set!
+           (jolt-array-vec (vector-ref record 0)) index value))
+        (bytevector-u8-set! (cadr resolved) (caddr resolved) value))))
 
 (define (kw-name k) (if (keyword-t? k) (keyword-t-name k) (jolt-str-render-one k)))
 
-(define (bv-get-u8 bv off) (bytevector-u8-ref bv off))
-(define (bv-set-u8! bv off b) (bytevector-u8-set! bv off (bitwise-and b 255)))
-(define (bv-get-int bv off)          ; little-endian signed 32
-  (let ((u (+ (bv-get-u8 bv off)
-              (* (bv-get-u8 bv (+ off 1)) 256)
-              (* (bv-get-u8 bv (+ off 2)) 65536)
-              (* (bv-get-u8 bv (+ off 3)) 16777216))))
+(define (sim-get-int p off)          ; little-endian signed 32
+  (let ((u (+ (sim-byte-ref p off)
+              (* (sim-byte-ref p (+ off 1)) 256)
+              (* (sim-byte-ref p (+ off 2)) 65536)
+              (* (sim-byte-ref p (+ off 3)) 16777216))))
     (if (>= u 2147483648) (- u 4294967296) u)))
-(define (bv-set-int! bv off val)
+(define (sim-set-int! p off val)
   (let ((u (modulo val 4294967296)))
-    (bv-set-u8! bv off u)
-    (bv-set-u8! bv (+ off 1) (quotient u 256))
-    (bv-set-u8! bv (+ off 2) (quotient u 65536))
-    (bv-set-u8! bv (+ off 3) (quotient u 16777216))))
+    (sim-byte-set! p off u)
+    (sim-byte-set! p (+ off 1) (quotient u 256))
+    (sim-byte-set! p (+ off 2) (quotient u 65536))
+    (sim-byte-set! p (+ off 3) (quotient u 16777216))))
 
 (define (sim-type-size name)
   (cond
@@ -152,53 +217,69 @@
          ((string=? op "sizeof") (sim-type-size (kw-name (car args))))
          ((string=? op "read")
           (let* ((p (jnum->exact (car args))) (ty (kw-name (cadr args)))
-                 (off (if (>= (length args) 3) (jnum->exact (caddr args)) 0))
-                 (bv (sim-bv p)))
-            (cond ((or (string=? ty "int") (string=? ty "uint")) (bv-get-int bv off))
-                  (else (bv-get-u8 bv off)))))
+                 (off (if (>= (length args) 3)
+                          (jnum->exact (caddr args)) 0)))
+            (cond ((or (string=? ty "int") (string=? ty "uint"))
+                   (sim-get-int p off))
+                  (else (sim-byte-ref p off)))))
          ((string=? op "write")
           (let* ((p (jnum->exact (car args))) (ty (kw-name (cadr args)))
-                 (off (jnum->exact (caddr args))) (val (jnum->exact (cadddr args)))
-                 (bv (sim-bv p)))
-            (cond ((or (string=? ty "int") (string=? ty "uint")) (bv-set-int! bv off val))
-                  (else (bv-set-u8! bv off val)))
+                 (off (jnum->exact (caddr args)))
+                 (val (jnum->exact (cadddr args))))
+            (cond ((or (string=? ty "int") (string=? ty "uint"))
+                   (sim-set-int! p off val))
+                  (else (sim-byte-set! p off val)))
             jolt-nil))
          ((string=? op "read-bytes")
           (let* ((p (jnum->exact (car args))) (n (jnum->exact (cadr args)))
-                 (bv (sim-bv p)) (out (make-bytevector n 0)))
-            (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! out i (bytevector-u8-ref bv i)))
+                 (out (make-bytevector n 0)))
+            (do ((i 0 (+ i 1))) ((= i n))
+              (bytevector-u8-set! out i (sim-byte-ref p i)))
             (utf8->string out)))
          ((string=? op "write-bytes")
           (let* ((p (jnum->exact (car args))) (sbv (string->utf8 (jolt-str-render-one (cadr args))))
-                 (n (bytevector-length sbv)) (bv (sim-bv p)))
-            (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bytevector-u8-ref sbv i)))
+                 (n (bytevector-length sbv)))
+            (do ((i 0 (+ i 1))) ((= i n))
+              (sim-byte-set! p i (bytevector-u8-ref sbv i)))
             n))
          ((string=? op "read-array")
           (let* ((p (jnum->exact (car args))) (n (jnum->exact (cadr args)))
-                 (bv (sim-bv p)) (out (make-bytevector n 0)))
+                 (out (make-bytevector n 0)))
             (do ((i 0 (+ i 1))) ((= i n))
-              (bytevector-u8-set! out i (bytevector-u8-ref bv i)))
+              (bytevector-u8-set! out i (sim-byte-ref p i)))
             (make-jolt-array out 'byte)))
          ((string=? op "write-array")
           (let* ((p (jnum->exact (car args))) (src (jolt-array-vec (cadr args)))
-                 (n (bytevector-length src)) (bv (sim-bv p)))
+                 (n (bytevector-length src)))
             (do ((i 0 (+ i 1))) ((= i n))
-              (bytevector-u8-set! bv i (bytevector-u8-ref src i)))
+              (sim-byte-set! p i (bytevector-u8-ref src i)))
             n))
+         ((string=? op "borrow-byte-array")
+          (sim-borrow-array!
+           (car args) (jnum->exact (cadr args)) (jnum->exact (caddr args))))
+         ((string=? op "release-byte-array")
+          (let* ((p (jnum->exact (car args)))
+                 (record (hashtable-ref native-loans p #f)))
+            (unless record
+              (error 'native-hook "release of unknown byte-array loan" p))
+            (when (vector-ref record 3)
+              (error 'native-hook "byte-array loan released twice" p))
+            (vector-set! record 3 #t)
+            jolt-nil))
          ((string=? op "ptr->string")
-          (let* ((p (jnum->exact (car args))) (bv (sim-bv p)))
-            (if (not bv) jolt-nil
+          (let ((p (jnum->exact (car args))))
+            (if (= p 0) jolt-nil
                 (let loop ((i 0) (acc '()))
-                  (let ((b (bytevector-u8-ref bv i)))
+                  (let ((b (sim-byte-ref p i)))
                     (if (= b 0) (utf8->string (u8-list->bytevector (reverse acc)))
                         (loop (+ i 1) (cons b acc))))))))
          ((string=? op "string->ptr")
           (let* ((sbv (string->utf8 (jolt-str-render-one (car args)))) (n (bytevector-length sbv))
-                 (buf (make-bytevector (+ n 1) 0)))
+                 (buf (make-bytevector (+ n 1) 0))
+                 (p (sim-alloc-bytes! (+ n 1))))
             (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! buf i (bytevector-u8-ref sbv i)))
-            (sim-alloc-bytes! (+ n 1))            ; consumes a fake ptr id...
-            (let ((p (- native-next-ptr 1)))      ; ...and returns that same one
-              (hashtable-set! native-mem p buf) p)))
+            (hashtable-set! native-mem p buf)
+            p))
          (else (error 'native-hook "unknown native op" op)))))))
 
 (define (captured-op? op) (exists (lambda (o) (string=? o op)) native-ops))
@@ -275,6 +356,104 @@
          (= 30 (jnum->exact (ev "(aget sim-bar 2)")))))
 (ok "read-array/write-array descriptors captured"
     (and (captured-op? "read-array") (captured-op? "write-array")))
+
+;; Scoped byte-array loans use a staged borrow/callback/release protocol. The
+;; callback is ordinary Jolt code outside the hook invocation, so nested FFI
+;; operations are intercepted normally and operate on the same live array
+;; window rather than on a copy.
+(define loan-op-start (length native-ops))
+(ev "(def sim-loan-saved-pointer (atom nil))")
+(ok "modeled ranged loan exposes a live alias and preserves callback result"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3 4])
+                  result
+                  (ffi/with-byte-array-pointer
+                    a 1 2
+                    (fn [p n]
+                      (reset! sim-loan-saved-pointer p)
+                      (ffi/write p :uint8 0 201)
+                      (ffi/write (+ p 1) :uint8 0 202)
+                      [:done n]))]
+              (and (= [:done 2] result)
+                   (= [1 201 202 4] (vec a))))")))
+(ok "loan callback nested FFI occurs outside the hook reentrancy guard"
+    (equal? '("borrow-byte-array" "write" "write" "release-byte-array")
+            (list-tail native-ops loan-op-start)))
+(ok "released fake pointer rejects later native access"
+    (jolt-truthy?
+      (ev "(try
+             (ffi/read @sim-loan-saved-pointer :uint8 0)
+             false
+             (catch :default _ true))")))
+
+(define nested-loan-op-start (length native-ops))
+(ok "nested modeled loans release in LIFO order and keep aliases live"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [10 20 30 40])]
+              (ffi/with-byte-array-pointer
+                a
+                (fn [outer on]
+                  (ffi/with-byte-array-pointer
+                    a 1 2
+                    (fn [inner in]
+                      (ffi/write inner :uint8 0 77)
+                      (and (= 4 on) (= 2 in)
+                           (= 77 (ffi/read (+ outer 1) :uint8 0))))))))")))
+(ok "nested modeled loan protocol is borrow/begin, inner release, outer release"
+    (equal? '("borrow-byte-array" "borrow-byte-array" "write" "read"
+              "release-byte-array" "release-byte-array")
+            (list-tail native-ops nested-loan-op-start)))
+
+(define failed-loan-op-start (length native-ops))
+(ok "modeled callback exception still releases exactly once"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2])]
+              (try
+                (ffi/with-byte-array-pointer
+                  a (fn [_ _] (throw (Exception. \"sim loan boom\"))))
+                false
+                (catch Exception _ true)))")))
+(ok "exception path records one borrow and one release"
+    (equal? '("borrow-byte-array" "release-byte-array")
+            (list-tail native-ops failed-loan-op-start)))
+
+(define rejected-loan-op-start (length native-ops))
+(ok "modeled invalid range is rejected before borrow reaches the controller"
+    (jolt-truthy?
+      (ev "(try
+             (ffi/with-byte-array-pointer
+               (byte-array 2) 1 2 (fn [_ _] false))
+             false
+             (catch IndexOutOfBoundsException _ true))")))
+(ok "rejected modeled range emits no native operation"
+    (= rejected-loan-op-start (length native-ops)))
+
+(let* ((arr (ev "(byte-array [1 2 3 4])"))
+       (saved #f)
+       (phase 0)
+       (visits 0)
+       (scope-op-start (length native-ops))
+       (outcome
+        (guard (e (#t (list 'raised (condition-message e) visits)))
+          (let ((value
+                 (ffi-sim-with-byte-array-pointer
+                  arr 0 4
+                  (lambda (p n)
+                    (call/cc
+                     (lambda (continuation)
+                       (unless saved (set! saved continuation))
+                       'first-entry))
+                    (set! visits (+ visits 1))
+                    n))))
+            (if (= phase 0)
+                (begin (set! phase 1) (saved 'second-entry))
+                (list 'returned value visits))))))
+  (ok "retired modeled loan rejects continuation re-entry before callback resumes"
+      (and (eq? 'raised (car outcome))
+           (has? (cadr outcome) "cannot be re-entered")
+           (= 1 (caddr outcome))
+           (equal? '("borrow-byte-array" "release-byte-array")
+                   (list-tail native-ops scope-op-start)))))
 
 ;; string marshaling over fake pointers: string->ptr allocates a NUL-terminated
 ;; buffer; ptr->string reads it back. ptr->string of a null/unknown ptr -> nil.
