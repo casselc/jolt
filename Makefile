@@ -51,9 +51,9 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr \
-  gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
+  futuresimhook gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release jolt-sim joltsmoke libconformance mandelbrot-num mathfl monotonic mvnhttp \
-  narrow numeric numwp oparity pic protoret remint sci selfhost shakelocal \
+  narrow numeric numwp oparity ordinaryfuturenosim pic protoret remint sci selfhost shakelocal \
   shakesmoke simimagesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
   values wp ci
 
@@ -96,7 +96,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit monotonic mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke simimagesmoke certify
+ci: submodules values corpus unit monotonic mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ordinaryfuturenosim futuresimhook transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke simimagesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -212,8 +212,9 @@ jolt-release:
 jolt-debug:
 	@$(CHEZ) --script host/chez/build-jolt.ss debug target/debug/jolt
 # A release-optimized compiler/runtime image with a private simulation overlay.
-# The overlay is absent from release/debug and initially carries only the flavor
-# marker; controller hooks arrive in later, independently reviewed slices.
+# The overlay is absent from release/debug; it currently carries the flavor
+# marker and private future-lifecycle seam. The exact public controller ABI
+# arrives only after its future, clock, and FFI operations are complete.
 jolt-sim:
 	@$(CHEZ) --script host/chez/build-jolt.ss sim target/sim/jolt $(JOLT_CROSS_TARGET)
 
@@ -246,6 +247,15 @@ cts: testbin
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+
+# The ordinary runtime carries no simulator hook state or branch.
+ordinaryfuturenosim:
+	@$(CHEZ) --script test/chez/ordinary-future-no-sim-hook-test.ss
+
+# Load the private sim overlay over the source runtime, then exercise unchanged
+# ordinary future code through its start/settlement/worker-ownership boundaries.
+futuresimhook:
+	@$(CHEZ) --script test/chez/future-sim-hook-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
