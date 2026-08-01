@@ -15,6 +15,12 @@
 ;; eval one form (string) in `user`, like the loader does form-by-form, so a def
 ;; is visible to a later form.
 (define (ev s) (jolt-compile-eval s "user"))
+(define (has? s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i nsub) ns) #f)
+            ((string=? (substring s i (+ i nsub)) sub) #t)
+            (else (loop (+ i 1)))))))
 
 ;; Helpers for the native-error-capture cases. Each returns a plain boolean, so a
 ;; stale seed (whose analyzer predates the options map) reports FAIL cleanly — no
@@ -382,6 +388,155 @@
                   r (jolt.ffi/read-array! p n dest 0)]
               (jolt.ffi/free p)
               (and (= w n) (= r n) (= (vec src) (vec dest))))")))
+
+;; --- scoped in-out byte-array pointers ---------------------------------------
+;; The public pointer is an address into a private locked bytevector, never the
+;; signed vector backing the Jolt byte-array.  The portable helper performs a
+;; real C write through that pointer; the Jolt array changes only when the scope
+;; copies the native octets back at exit.
+(ev "(def c-fill-pointer
+       (jolt.ffi/__cfn \"jolt_test_fill_bytes\"
+                         [:pointer :uint8 :size_t] :pointer))")
+(ok "ranged pointer loan copies native octets back as signed bytes"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3 4])
+                  result (jolt.ffi/with-byte-array-pointer
+                           a 1 2
+                           (fn [p n]
+                             (c-fill-pointer p 200 n)
+                             [:returned n]))]
+              (and (= [:returned 2] result)
+                   (= [1 -56 -56 4] (vec a))))")))
+(ok "whole-array pointer loan supplies its validated length"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3])]
+              (and (= 3 (jolt.ffi/with-byte-array-pointer
+                          a (fn [p n] (c-fill-pointer p 255 n) n)))
+                   (= [-1 -1 -1] (vec a))))")))
+(ok "pointer loan exposes signed input bytes as exact native octets"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [-128 -1 0 127])]
+              (and
+                (jolt.ffi/with-byte-array-pointer
+                  a
+                  (fn [p n]
+                    (= [128 255 0 127]
+                       (mapv #(jolt.ffi/read p :uint8 %) (range n)))))
+                (= [-128 -1 0 127] (vec a))))")))
+(ok "exact-tail empty pointer loan is valid"
+    (jolt-truthy?
+      (ev "(jolt.ffi/with-byte-array-pointer
+             (byte-array [1 2]) 2 0
+             (fn [p n] (and (integer? p) (zero? n))))")))
+(ok "whole empty pointer loan is valid"
+    (jolt-truthy?
+      (ev "(jolt.ffi/with-byte-array-pointer
+             (byte-array 0)
+             (fn [p n] (and (integer? p) (zero? n))))")))
+(ok "pointer loan rejects invalid kind and range before callback"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2]) calls (atom 0) f (fn [_ _] (swap! calls inc))]
+              (and
+                (try (jolt.ffi/with-byte-array-pointer (int-array [1]) f)
+                     false (catch IllegalArgumentException _ true))
+                (try (jolt.ffi/with-byte-array-pointer a 1 2 f)
+                     false (catch IndexOutOfBoundsException _ true))
+                (try (jolt.ffi/with-byte-array-pointer a 1 4611686018427387904 f)
+                     false (catch IndexOutOfBoundsException _ true))
+                (zero? @calls)))")))
+;; Exercise the private scope directly for host exception/nonlocal control and
+;; pointer stability. Its receive callback gets the temporary bytevector address.
+(let* ((a (ev "(byte-array [1 2 3 4])"))
+       (v (jolt-array-vec a)))
+  (ok "temporary pointer stays stable through allocation and collection"
+      (and (= 2 (ffi-with-scoped-byte-array-pointer "test"
+                 a 1 2
+                 (lambda (p n)
+                   (make-bytevector 1048576 0)
+                   (collect)
+                   (foreign-set! 'unsigned-8 p 0 200)
+                   n)))
+           (equal? '#(1 -56 3 4) v)))
+  (ok "host exception copies back and preserves its primary exception"
+      (and
+       (guard (e (#t (and (string=? (condition-message e) "host loan boom") #t)))
+         (ffi-with-scoped-byte-array-pointer "test"
+          a 1 2
+          (lambda (p n)
+            (foreign-set! 'unsigned-8 p 0 201)
+            (error 'loan "host loan boom")))
+         #f)
+       (= -55 (vector-ref v 1))))
+  (ok "nonlocal exit copies back"
+      (and
+       (eq? 'escaped
+            (call/cc
+             (lambda (escape)
+               (ffi-with-scoped-byte-array-pointer "test"
+                a 2 1
+                (lambda (p n)
+                  (foreign-set! 'unsigned-8 p 0 202)
+                  (escape 'escaped))))))
+       (= -54 (vector-ref v 2)))))
+(ok "Jolt exception copies native changes back before propagating"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2])]
+              (and
+                (try
+                  (jolt.ffi/with-byte-array-pointer
+                    a (fn [p n]
+                        (c-fill-pointer p 203 n)
+                        (throw (Exception. \"jolt loan boom\"))))
+                  false
+                  (catch Exception e (= \"jolt loan boom\" (.getMessage e))))
+                (= [-53 -53] (vec a))))")))
+(ok "same-array nesting is rejected and cross-array nesting copies both back"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2]) b (byte-array [3 4])]
+              (and
+                (jolt.ffi/with-byte-array-pointer a
+                  (fn [_ _]
+                    (try (jolt.ffi/with-byte-array-pointer a (fn [_ _] false))
+                         false (catch IllegalStateException _ true))))
+                (jolt.ffi/with-byte-array-pointer a
+                  (fn [pa na]
+                    (jolt.ffi/with-byte-array-pointer b
+                      (fn [pb nb]
+                        (c-fill-pointer pa 204 na)
+                        (c-fill-pointer pb 205 nb)
+                        true))))
+                (= [-52 -52] (vec a)) (= [-51 -51] (vec b))))")))
+(ok "an inherited active-loan cell is ignored for a different owner thread id"
+    (let ((a (ev "(byte-array [1])")))
+      (parameterize ((ffi-byte-array-loan-cell
+                      (cons (+ (get-thread-id) 1) (list a))))
+        (null? (ffi-current-byte-array-loans)))))
+
+;; Capturing a continuation in the callback is legal once.  Calling it after the
+;; first exit must fail from the scope's before thunk, before callback code runs.
+(let* ((a (ev "(byte-array [1])")) (v (jolt-array-vec a))
+       (saved #f) (visits 0) (phase 0)
+       (outcome
+        (guard (e (#t (list 'raised (condition-message e) visits)))
+          (let ((value
+                 (ffi-with-scoped-byte-array-pointer "test"
+                  a 0 1
+                  (lambda (p n)
+                    (call/cc (lambda (k) (unless saved (set! saved k)) 'first))
+                    (set! visits (+ visits 1))
+                    n))))
+            (if (= phase 0)
+                (begin
+                  (set! phase 1)
+                  ;; A second after-thunk/copy-back would overwrite this value.
+                  (vector-set! v 0 77)
+                  (saved 'again))
+                (list 'returned value visits))))))
+  (ok "retired loan rejects continuation re-entry before callback resumes"
+      (and (eq? 'raised (car outcome))
+           (has? (cadr outcome) "cannot be re-entered")
+           (= 1 (caddr outcome))
+           (= 77 (vector-ref v 0)))))
 
 ;; A :blocking foreign call is collect-safe: a thread parked in it must not pin
 ;; the stop-the-world collector. Resolve the helper once before spawning so a

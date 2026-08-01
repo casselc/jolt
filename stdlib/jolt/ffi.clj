@@ -25,6 +25,18 @@
   wire order remains the caller's responsibility (for example via htons/ntohs
   or an explicit codec).
 
+  `with-byte-array-pointer` is a scoped, in-out bridge, not a zero-copy view:
+  `(with-byte-array-pointer arr f)` loans the whole signed byte array and
+  `(with-byte-array-pointer arr off len f)` loans one validated range. Each
+  calls f with [pointer validated-length]. It copies the selected signed bytes
+  to a temporary native-octet bytevector before f, keeps that temporary address
+  stable only for f's dynamic extent, then copies its octets back as signed
+  bytes on normal and exceptional exits. Native code must not retain pointer;
+  Jolt code must not access the loaned range concurrently because copy-back owns
+  it. A nested loan of the same array on one thread is rejected; nested loans of
+  distinct arrays are supported. A captured continuation cannot re-enter a
+  retired loan.
+
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers
   a compile-time-typed signature to a real Chez foreign-procedure. Its optional

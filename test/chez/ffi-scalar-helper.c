@@ -3,6 +3,7 @@
 #endif
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -24,6 +25,15 @@ JOLT_TEST_EXPORT int16_t jolt_test_return_i16(void) { return INT16_MIN; }
 JOLT_TEST_EXPORT uint16_t jolt_test_return_u16(void) { return UINT16_MAX; }
 JOLT_TEST_EXPORT int32_t jolt_test_return_i32(void) { return INT32_MIN; }
 JOLT_TEST_EXPORT uint32_t jolt_test_return_u32(void) { return UINT32_MAX; }
+
+JOLT_TEST_EXPORT void *jolt_test_fill_bytes(void *pointer, uint8_t value,
+                                            size_t count) {
+  uint8_t *bytes = (uint8_t *)pointer;
+  for (size_t i = 0; i < count; ++i) {
+    bytes[i] = value;
+  }
+  return pointer;
+}
 
 typedef int8_t (*jolt_test_i8_callback)(int8_t);
 typedef int16_t (*jolt_test_i16_callback)(int16_t);

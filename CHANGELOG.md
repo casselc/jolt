@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Scoped in-out byte-array pointers for `jolt.ffi`.**
+  `with-byte-array-pointer` has whole-array `(arr f)` and ranged
+  `(arr off len f)` arities; `f` receives a temporary native pointer and the
+  validated length. It validates the exact signed byte-array kind and
+  subtraction-safe range before allocating or invoking `f`, copies the selected
+  bytes to a stable temporary bytevector, then copies native octets back as
+  signed bytes on every first exit path. The pointer dies at that exit and may
+  not be retained. Copy-back owns the loaned range while the callback runs;
+  same-array nested loans on one owner thread are rejected, while distinct-array
+  nesting works. Concurrent access to the loaned range must be serialized.
+
 - **Ranged byte-array transfers for `jolt.ffi`.** `read-array!` copies an exact
   native byte range into an existing signed byte array, while the new four-arg
   `write-array` form copies an exact source window without staging another
