@@ -296,6 +296,13 @@
         (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
         (begin (put-string out line) (put-string out "\n")))))
 
+;; True only inside the special sim compiler/runtime image. The marker is
+;; deliberately absent from ordinary images; probe it dynamically so the shared
+;; build subsystem remains valid in both flavors without a second manifest.
+(define (bld-sim-runtime-image?)
+  (and (top-level-bound? 'jolt-sim-runtime-image?)
+       (eq? #t (top-level-value 'jolt-sim-runtime-image?))))
+
 ;; Inline the runtime manifest, dispatching on the manifest tags. core-strs (the
 ;; shaken clojure.core defs, or #f) replaces the 'prelude blob; drop-compiler? (a
 ;; closed AOT app that never compiles from source) omits 'image + 'compile-eval —
@@ -311,7 +318,14 @@
         ((memq entry '(image compile-eval))
          (unless drop-compiler? (bld-inline-line (cdr (assq entry bld-tagged-loads)) out 0)))
         (else (bld-inline-line entry out 0))))
-    bld-runtime-manifest))
+    bld-runtime-manifest)
+  ;; A sim compiler propagates its private overlay into every output flavor,
+  ;; including split, unsplit, tree-shaken, cross, and library builds. Because
+  ;; this runs before runtime.ss is content-hashed, upstream's existing cache
+  ;; automatically keys ordinary and sim runtime halves separately.
+  (when (bld-sim-runtime-image?)
+    (put-string out "\n;; === simulation-only runtime overlay ===\n")
+    (bld-inline-line "(load \"host/chez/sim/runtime.ss\")" out 0)))
 
 ;; --- app emission -----------------------------------------------------------
 ;; Re-emit one app namespace to a list of Scheme strings: run-passes (const-fold +

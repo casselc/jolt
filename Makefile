@@ -52,9 +52,9 @@ JOLT-TARGETS-NEEDING-DEPS := \
   compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
-  jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl monotonic mvnhttp \
+  jolt jolt-debug jolt-release jolt-sim joltsmoke libconformance mandelbrot-num mathfl monotonic mvnhttp \
   narrow numeric numwp oparity pic protoret remint sci selfhost shakelocal \
-  shakesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
+  shakesmoke simimagesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
   values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
@@ -96,7 +96,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit monotonic mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
+ci: submodules values corpus unit monotonic mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke simimagesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -211,6 +211,19 @@ jolt-release:
 	@$(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
 jolt-debug:
 	@$(CHEZ) --script host/chez/build-jolt.ss debug target/debug/jolt
+# A release-optimized compiler/runtime image with a private simulation overlay.
+# The overlay is absent from release/debug and initially carries only the flavor
+# marker; controller hooks arrive in later, independently reviewed slices.
+jolt-sim:
+	@$(CHEZ) --script host/chez/build-jolt.ss sim target/sim/jolt $(JOLT_CROSS_TARGET)
+
+# Build one unchanged app through release and sim compilers. The runtime overlay
+# must be the only pre-fingerprint source difference, and the shared runtime
+# cache must retain distinct content-addressed entries for the two flavors.
+simimagesmoke: testbin jolt-sim
+	@JOLT_NORMAL=target/release/jolt JOLT_SIM=target/sim/jolt \
+	  sh test/chez/sim-image-profile-smoke.sh
+
 # Re-mint the seed first so the embedded compiler image is current, then both builds.
 jolt: selfhost jolt-release jolt-debug
 	@echo "OK: target/release/jolt and target/debug/jolt built"
