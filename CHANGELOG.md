@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`jolt.ffi` exact scalar widths: `:int8`/`:i8`, `:int16`/`:short`,
+  `:uint16`/`:ushort`, `:int32`, `:uint32`.** A native struct or protocol field
+  narrower than `:int` (a `pollfd`/`sockaddr` short, a wire-protocol `uint16_t`)
+  previously had no faithful declarative representation: using `:int` gives the
+  wrong size and makes byte-position workarounds host-endian-dependent. Each new
+  type is a fixed-width, native-byte-order memory type (`sizeof`/`read`/`write`)
+  and signature type
+  (`defcfn`/`foreign-fn`/`foreign-callable`), added in lockstep to the runtime
+  type table (`host/chez/java/ffi.ss`) and the compiler's signature table
+  (`jolt-core/jolt/backend_scheme.clj`) so a call and a memory access agree on
+  layout. Wire byte order remains explicit through conversions such as
+  `htons`/`ntohs` or a codec. The signed and unsigned widths at each size expose
+  the same stored bits (a `:uint16` read of a `:int16 -1` write is `65535`).
+  `:uint8`/`:u8`/`:byte` are unchanged — still
+  unsigned C octets, distinct from jolt's signed `byte-array` element type. An
+  unrecognized type keyword still fails closed, at both the runtime accessor
+  and the compile-time signature.
+
 ## [0.5.13] - 2026-08-01
 
 Locale-sensitive formatting works: `NumberFormat/getCurrencyInstance`,

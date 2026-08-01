@@ -12,7 +12,14 @@
         (ffi/free pp))
 
   Types (keywords): :int :uint :long :ulong :int64 :uint64 :size_t :ssize_t
-  :iptr :uptr :double :float :pointer :string :void :uint8 :char.
+  :iptr :uptr :double :float :pointer :string :void :uint8 :char. Exact-width,
+  native-byte-order scalars for C layouts and signatures (unlike modeling a
+  short as an :int): :int8/:i8 (signed 8-bit), :int16/:short (signed 16-bit),
+  :uint16/:ushort (unsigned 16-bit), :int32 (signed 32-bit), :uint32 (unsigned
+  32-bit). :uint8/:u8/:byte stay unsigned C octets, distinct from jolt's signed
+  byte-array element type (byte-array/read-array/write-array below). Protocol
+  wire order remains the caller's responsibility (for example via htons/ntohs
+  or an explicit codec).
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers

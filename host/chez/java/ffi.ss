@@ -28,12 +28,17 @@
 ;; The keyword type names jolt.ffi accepts (in foreign-fn signatures and the
 ;; memory accessors) map to Chez foreign types. Kept in one place so the backend
 ;; (compile-time, for foreign-procedure) and these accessors (runtime, for
-;; foreign-ref/set!) agree.
+;; foreign-ref/set!) agree — see ffi-types in jolt-core/jolt/backend_scheme.clj.
 (define (ffi-type->chez kw)
   (let ((n (if (keyword-t? kw) (keyword-t-name kw) (jolt-str-render-one kw))))
     (cond
       ((string=? n "int") 'int)
       ((string=? n "uint") 'unsigned-int)
+      ((or (string=? n "int8") (string=? n "i8")) 'integer-8)
+      ((or (string=? n "int16") (string=? n "short")) 'integer-16)
+      ((or (string=? n "uint16") (string=? n "ushort")) 'unsigned-16)
+      ((string=? n "int32") 'integer-32)
+      ((string=? n "uint32") 'unsigned-32)
       ((string=? n "long") 'long)
       ((string=? n "ulong") 'unsigned-long)
       ((string=? n "int64") 'integer-64)

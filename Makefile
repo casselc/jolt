@@ -246,7 +246,7 @@ cts: testbin
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 ffi:
-	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+	@sh test/chez/ffi-binding-test.sh "$(CHEZ)"
 
 # The ordinary runtime carries no simulator hook state or branch.
 ordinaryfuturenosim:
