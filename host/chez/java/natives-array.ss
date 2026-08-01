@@ -138,6 +138,73 @@
       (make-jolt-array (ja-copy (jolt-array-vec arr)) (jolt-array-kind arr))
       (na-from-seq arr 'object)))
 
+;; System/arraycopy: copy one array range into another with JVM memmove
+;; semantics. Validate the complete operation before mutating either array.
+;; Primitive array kinds must agree even when they share one Chez backing type
+;; (float/double are both flvectors; most other kinds are vectors). Jolt has one
+;; Object[] kind, so that is the full reference-array compatibility question its
+;; current value model can represent.
+(define na-vector-copy-proc
+  (and (top-level-bound? 'vector-copy!)
+       (top-level-value 'vector-copy!)))
+(define na-flvector-copy-proc
+  (and (top-level-bound? 'flvector-copy!)
+       (top-level-value 'flvector-copy!)))
+(define na-bytevector-copy-proc
+  (and (top-level-bound? 'bytevector-copy!)
+       (top-level-value 'bytevector-copy!)))
+
+(define (na-arraycopy-fallback! sv s dv d n)
+  ;; Older Chez releases may lack one of the bulk copy procedures. Copy
+  ;; backwards only for the destructive self-overlap; every other case can copy
+  ;; forwards. This is memmove, not memcpy, behavior.
+  (if (and (eq? sv dv) (> d s) (< d (+ s n)))
+      (let loop ((i (- n 1)))
+        (when (>= i 0)
+          (ja-set! dv (+ d i) (ja-ref sv (+ s i)))
+          (loop (- i 1))))
+      (let loop ((i 0))
+        (when (< i n)
+          (ja-set! dv (+ d i) (ja-ref sv (+ s i)))
+          (loop (+ i 1))))))
+
+(define (na-system-arraycopy src src-off dst dst-off len)
+  (when (or (jolt-nil? src) (jolt-nil? dst))
+    (throw-jvm 'NullPointerException "System/arraycopy: null array"))
+  (unless (and (jolt-array? src) (jolt-array? dst)
+               (eq? (jolt-array-kind src) (jolt-array-kind dst)))
+    (throw-jvm 'ArrayStoreException
+               "System/arraycopy: source and destination must have compatible array types"))
+  (let* ((s (jnum->exact src-off))
+         (d (jnum->exact dst-off))
+         (n (jnum->exact len))
+         (sv (jolt-array-vec src))
+         (dv (jolt-array-vec dst))
+         (slen (ja-len sv))
+         (dlen (ja-len dv)))
+    ;; Subtraction avoids overflowing an offset+length sum. Offset == length is
+    ;; valid only for a zero-length copy; an offset one past the end is invalid
+    ;; even when n is zero.
+    (when (or (< s 0) (< d 0) (< n 0) (> s slen) (> d dlen)
+              (> n (- slen s)) (> n (- dlen d)))
+      (throw-jvm 'ArrayIndexOutOfBoundsException
+                 "System/arraycopy: range outside array bounds"))
+    (cond
+      ((and (flvector? sv) na-flvector-copy-proc)
+       (na-flvector-copy-proc sv s dv d n))
+      ((and (bytevector? sv) na-bytevector-copy-proc)
+       (na-bytevector-copy-proc sv s dv d n))
+      ((and (vector? sv) na-vector-copy-proc)
+       (na-vector-copy-proc sv s dv d n))
+      (else (na-arraycopy-fallback! sv s dv d n)))
+    jolt-nil))
+
+;; System was registered earlier by host-static-methods.ss. The registry merges
+;; this member into the same short/FQN table, so both System/arraycopy and
+;; java.lang.System/arraycopy resolve identically.
+(register-class-statics! "System"
+  (list (cons "arraycopy" na-system-arraycopy)))
+
 ;; --- typed aset (return the stored value) -----------------------------------
 (define (na-aset! arr i v) (ja-set! (jolt-array-vec arr) (exact (na-idx i)) v) v)
 (define (na-aset-int arr i v)     (na-aset! arr i v))
@@ -385,7 +452,7 @@
                        (vector-map (lambda (k) (make-jhost "reflect-field" (vector k)))
                                    (jrdesc-fkeys desc))
                        (vector))
-                   'objects))))
+                   'object))))
         (cons "getDeclaredField"
               (lambda (self name)
                 (cond ((lookup-static-field (jclass-name self) name)
