@@ -52,7 +52,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
-  jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
+  jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl monotonic mvnhttp \
   narrow numeric numwp oparity pic protoret remint sci selfhost shakelocal \
   shakesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
   values wp ci
@@ -96,7 +96,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
+ci: submodules values corpus unit monotonic mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -114,6 +114,11 @@ corpus:
 # Host-specific unit cases.
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
+
+# System/nanoTime and the public host clock use Chez's monotonic-time interface,
+# with sub-millisecond resolution on the supported toolchain/platform matrix.
+monotonic:
+	@JOLT_PWD="$(CURDIR)" "$(CHEZ)" --script host/chez/cli.ss run test/chez/monotonic-clock-test.clj
 
 # Real-CLI smoke over bin/jolt.
 # The CLI and build gates spawn a jolt process per case; a prebuilt binary boots
