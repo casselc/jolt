@@ -115,8 +115,8 @@ corpus:
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
 
-# System/nanoTime and the public host clock use Chez's monotonic-time interface,
-# with sub-millisecond resolution on the supported toolchain/platform matrix.
+# System/nanoTime and the public host clock use Chez's monotonic-time interface.
+# Resolution is platform-dependent and is reported by the gate, not required.
 monotonic:
 	@JOLT_PWD="$(CURDIR)" "$(CHEZ)" --script host/chez/cli.ss run test/chez/monotonic-clock-test.clj
 

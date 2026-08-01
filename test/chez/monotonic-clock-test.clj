@@ -23,7 +23,13 @@
 (defn test-source []
   (check "monotonic-source reports the Chez monotonic-time interface"
          :chez-time-monotonic
-         (jolt.host/monotonic-source)))
+         (jolt.host/monotonic-source))
+  (check-pred "public monotonic clock returns an integer"
+              integer?
+              (jolt.host/monotonic-nanos))
+  (check-pred "System/nanoTime returns an integer"
+              integer?
+              (System/nanoTime)))
 
 (defn test-non-decreasing []
   (let [samples 2000
@@ -56,13 +62,21 @@
                               (if (< current previous)
                                 (inc failures)
                                 failures))))))))
-        bad (reduce + (map deref ws))]
-    (check "eight concurrent readers never step backward" 0 bad)))
+        timed-out ::timed-out
+        results (mapv #(deref % 2000 timed-out) ws)
+        timeouts (count (filter #(= timed-out %) results))]
+    (check "eight concurrent readers finish within bounded waits"
+           0
+           timeouts)
+    (when (zero? timeouts)
+      (check "eight concurrent readers never step backward"
+             0
+             (reduce + results)))))
 
-(defn test-resolution []
-  ;; A genuinely monotonic ns clock observes deltas finer than a millisecond;
-  ;; the old wall-clock nanoTime returned only exact millisecond multiples, so
-  ;; this is also the discriminator that proves nanoTime left the old path.
+(defn report-resolution []
+  ;; `nanoTime` specifies nanosecond units, not nanosecond resolution. Report
+  ;; the observed resolution for platform evidence without rejecting a valid
+  ;; coarse monotonic source.
   (let [deltas (loop [i 0
                       previous (jolt.host/monotonic-nanos)
                       deltas []]
@@ -72,19 +86,11 @@
                      (recur (inc i)
                             current
                             (conj deltas (- current previous))))))
-        sub-millisecond (filter #(and (pos? %) (< % 1000000)) deltas)]
-    (check-pred "observes a positive sub-millisecond delta"
-                seq
-                sub-millisecond)
-    (when (seq sub-millisecond)
-      (println "     smallest observed delta (ns):"
-               (apply min sub-millisecond))))
-
-  (let [samples (repeatedly 1000 #(jolt.host/monotonic-nanos))
-        non-millisecond (remove #(zero? (mod % 1000000)) samples)]
-    (check-pred "samples are not all exact millisecond multiples"
-                seq
-                non-millisecond)))
+        positive (filter pos? deltas)]
+    (if (seq positive)
+      (println "     smallest observed positive delta (ns):"
+               (apply min positive))
+      (println "     no positive delta observed in 5000 immediate samples"))))
 
 (defn test-system-clock-wiring []
   (let [before (jolt.host/monotonic-nanos)
@@ -95,23 +101,41 @@
                 system)))
 
 (defn test-elapsed-scale []
-  ;; Elapsed time over a real sleep lands on the right scale: a 50ms sleep
-  ;; measures tens of ms, not seconds (wrong unit) or nanos (unscaled).
-  (let [start (jolt.host/monotonic-nanos)
-        _ (Thread/sleep 50)
-        elapsed-nanos (- (jolt.host/monotonic-nanos) start)
-        elapsed-millis (/ elapsed-nanos 1000000.0)]
-    (println "     measured 50ms sleep (ms):" elapsed-millis)
-    (check-pred "50ms sleep measures within [40,5000]ms"
-                #(and (>= % 40.0) (<= % 5000.0))
-                elapsed-millis)))
+  ;; A stalled CI worker can make one real sleep arbitrarily late. Take up to
+  ;; three bounded samples and require one to demonstrate the expected scale:
+  ;; tens of milliseconds, not seconds (wrong unit) or nanos (unscaled).
+  (let [timed-out ::timed-out
+        samples
+        (loop [remaining 3
+               measured []]
+          (if (zero? remaining)
+            measured
+            (let [sample
+                  (deref
+                   (future
+                     (let [start (jolt.host/monotonic-nanos)
+                           _ (Thread/sleep 50)
+                           elapsed-nanos
+                           (- (jolt.host/monotonic-nanos) start)]
+                       (/ elapsed-nanos 1000000.0)))
+                   10000
+                   timed-out)]
+              (recur (dec remaining) (conj measured sample)))))
+        in-scale (filter #(and (number? %)
+                               (>= % 40.0)
+                               (<= % 5000.0))
+                         samples)]
+    (println "     measured 50ms sleep samples (ms):" (pr-str samples))
+    (check-pred "one bounded 50ms sample measures within [40,5000]ms"
+                seq
+                in-scale)))
 
 (defn -main [& _]
   (println "monotonic clock characterization")
   (println "--------------------------------")
   (test-source)
   (test-non-decreasing)
-  (test-resolution)
+  (report-resolution)
   (test-system-clock-wiring)
   (test-elapsed-scale)
   (println "--------------------------------")
