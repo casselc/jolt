@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ranged byte-array transfers for `jolt.ffi`.** `read-array!` copies an exact
+  native byte range into an existing signed byte array, while the new four-arg
+  `write-array` form copies an exact source window without staging another
+  array. Both validate the byte-array kind, subtraction-safe bounds, and null
+  pointer rules before native access or destination mutation; zero-length
+  transfers at an array's exact tail remain valid and return zero. The existing
+  whole-array read/write forms and signed-byte/raw-octet conversion stay intact.
+
 - **Atomic native-error capture for `jolt.ffi` calls.** `foreign-fn` and
   `defcfn` accept `{:capture-native-error true}` and return
   `[native-result error-code]`, capturing POSIX `errno` or Windows

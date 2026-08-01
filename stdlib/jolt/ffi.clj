@@ -17,7 +17,11 @@
   short as an :int): :int8/:i8 (signed 8-bit), :int16/:short (signed 16-bit),
   :uint16/:ushort (unsigned 16-bit), :int32 (signed 32-bit), :uint32 (unsigned
   32-bit). :uint8/:u8/:byte stay unsigned C octets, distinct from jolt's signed
-  byte-array element type (byte-array/read-array/write-array below). Protocol
+  byte-array element type. The host byte-array buffer helpers (read-array,
+  read-array!, and write-array, exposed here as vars from the runtime) move raw
+  octets across that seam: read-array allocates a fresh byte-array, read-array!
+  copies into an existing byte-array at an offset, and write-array has a
+  whole-array form and a ranged (ptr src src-off len) form. Protocol
   wire order remains the caller's responsibility (for example via htons/ntohs
   or an explicit codec).
 
