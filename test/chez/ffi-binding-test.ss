@@ -6,6 +6,8 @@
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
+(load "host/chez/loader.ss")
+(set-source-roots! ldr-install-roots)
 (load "host/chez/java/ffi.ss")
 
 (define total 0) (define fails 0)
@@ -13,6 +15,24 @@
 ;; eval one form (string) in `user`, like the loader does form-by-form, so a def
 ;; is visible to a later form.
 (define (ev s) (jolt-compile-eval s "user"))
+
+;; Helpers for the native-error-capture cases. Each returns a plain boolean, so a
+;; stale seed (whose analyzer predates the options map) reports FAIL cleanly — no
+;; mid-suite crash, and no false green from a sentinel value. The legacy cases
+;; above keep bare `ev`.
+;; ev-bool: #t iff `src` compiles+evals to a truthy jolt value; #f on any
+;; compile/eval error or a falsy result.
+(define (ev-bool src)
+  (guard (e (#t #f))
+    (jolt-truthy? (ev src))))
+;; ev=: #t iff `src` evals to the exact integer `expected`; #f on error/mismatch.
+(define (ev= src expected)
+  (guard (e (#t #f))
+    (= expected (jnum->exact (ev src)))))
+;; rejects?: #t iff compiling `src` throws — the shape a malformed option or a
+;; captured :void must take, at compile time, in jolt.analyzer/analyze-ffi-fn.
+(define (rejects? src)
+  (guard (e (#t #t)) (ev src) #f))
 
 (define scalar-helper (getenv "JOLT_FFI_SCALAR_HELPER"))
 (unless scalar-helper
@@ -239,6 +259,104 @@
 ;; free-callable unlocks + drops the code object, returning nil.
 (ok "free-callable releases the callback"
     (jolt-nil? (ev "(jolt.ffi/free-callable cmp)")))
+
+;; --- atomic native-error capture -----------------------------------------
+;; jolt.ffi/__cfn, foreign-fn, and defcfn accept a literal options map with
+;; :blocking and :capture-native-error (literal Booleans only). capture returns
+;; [native-result error-code] (result first), composing with :blocking and the
+;; lazy native-symbol cell. ENOENT==2 (POSIX) and ERROR_FILE_NOT_FOUND==2
+;; (Windows) are the same integer, so the gate is platform-neutral: it never
+;; binds Winsock/WinAPI directly. Malformed options and capture on :void fail
+;; closed at compile time, in jolt.analyzer/analyze-ffi-fn.
+;; Each assertion uses ev-bool/ev=/rejects? so a stale seed (whose analyzer
+;; predates the options map) reports FAIL rather than crashing the suite; against
+;; a reminted image they must hold exactly as written.
+(ev "(require '[jolt.ffi :as ffi])")
+
+;; legacy scalar compatibility: omitted option, and explicit capture=false,
+;; keep the bare scalar result (no pair). The omitted-option case also passes
+;; against the current seed (no map involved), a live no-regression signal.
+(ev "(def c-set-err-scalar (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int))")
+(ok "omitted option keeps the scalar result"
+    (ev= "(c-set-err-scalar)" -1))
+(ev-bool "(def c-set-err-scalar-off (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int {:capture-native-error false}))")
+(ok "explicit :capture-native-error false keeps the scalar result"
+    (ev= "(c-set-err-scalar-off)" -1))
+(ev-bool "(def c-legacy-blocking (ffi/foreign-fn \"jolt_test_set_error_fail\" [] :int :blocking))")
+(ok "public legacy :blocking keeps the scalar result"
+    (ev= "(c-legacy-blocking)" -1))
+(ev-bool "(def c-map-blocking (ffi/foreign-fn \"jolt_test_set_error_fail\" [] :int {:blocking true}))")
+(ok "public {:blocking true} keeps the scalar result"
+    (ev= "(c-map-blocking)" -1))
+(ev-bool "(def c-empty-options (ffi/foreign-fn \"jolt_test_set_error_fail\" [] :int {}))")
+(ok "public empty options map keeps the scalar result"
+    (ev= "(c-empty-options)" -1))
+
+;; direct __cfn options map: capture returns exactly [native-result error-code].
+(ev-bool "(def c-capture (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int {:capture-native-error true}))")
+(ok "captured __cfn returns [native-result error-code], result first"
+    (ev-bool "(let [[r e] (c-capture)] (and (= r -1) (= e 2)))"))
+
+;; public foreign-fn and defcfn macros accept the same options map.
+(ev-bool "(def c-ffn (ffi/foreign-fn \"jolt_test_set_error_fail\" [] :int {:capture-native-error true}))")
+(ok "foreign-fn options map produces a captured binding"
+    (ev-bool "(let [[r e] (c-ffn)] (and (= r -1) (= e 2)))"))
+(ev-bool "(ffi/defcfn c-dfn \"jolt_test_set_error_fail\" [] :int {:capture-native-error true})")
+(ok "defcfn options map produces a captured binding"
+    (ev-bool "(let [[r e] (c-dfn)] (and (= r -1) (= e 2)))"))
+
+;; capture composes with :blocking (collect-safe), same public shape.
+(ev-bool "(def c-capture-block (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int {:blocking true :capture-native-error true}))")
+(ok "captured + :blocking returns the same [result error] shape"
+    (ev-bool "(let [[r e] (c-capture-block)] (and (= r -1) (= e 2)))"))
+(ok "captured lowering cannot be shadowed by a same-named local"
+    (ev-bool "(let [call-with-values (fn [& _] :shadowed)
+                    f (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int
+                        {:capture-native-error true})]
+                (= [-1 2] (f)))"))
+
+;; saved-pair immutability: a later failing call mutates the SAME error slot
+;; (EINVAL=22 / ERROR_INVALID_PARAMETER=87), but the pair already snapshotted in
+;; the capture's foreign-call return path stays [-1 2].
+(ev-bool "(def c-overwrite-err (jolt.ffi/__cfn \"jolt_test_overwrite_error\" [] :void))")
+(ok "saved [result error] survives a later mutation of the same slot"
+    (ev-bool "(let [pair (c-capture)] (c-overwrite-err) (and (= (nth pair 0) -1) (= (nth pair 1) 2)))"))
+
+;; malformed-option rejection: each fails closed at compile time.
+(ok "unknown option key rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {:bogus true})"))
+(ok "non-Boolean option value rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {:capture-native-error \"yes\"})"))
+(ok "nonliteral option value rejected"
+    (rejects? "(let [flag true]
+                 (jolt.ffi/__cfn \"strlen\" [] :int {:capture-native-error flag}))"))
+(ok "namespaced option key rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {:other/capture-native-error true})"))
+(ok "non-keyword option key rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {\"blocking\" true})"))
+(ok "extra trailing option rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int :blocking :extra)"))
+(ok "non-map/non-keyword trailing option rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int 42)"))
+(ok "explicit nil direct option rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int nil)"))
+(ok "namespaced legacy keyword rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int :other/blocking)"))
+(ok "non-:blocking keyword option rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int :collect-safe)"))
+(ok "duplicate literal option key rejected by the reader"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {:blocking true :blocking false})"))
+(ok "macro extra trailing option rejected"
+    (rejects? "(ffi/foreign-fn \"strlen\" [] :int :blocking :extra)"))
+(ok "macro non-map trailing option rejected"
+    (rejects? "(ffi/foreign-fn \"strlen\" [] :int 42)"))
+(ok "macro explicit nil option rejected"
+    (rejects? "(ffi/foreign-fn \"strlen\" [] :int nil)"))
+
+;; capture on :void is rejected: Chez's unspecified void result is not a stable
+;; first vector element, so there is nothing sound to pair with the error code.
+(ok "captured :void rejected"
+    (rejects? "(jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :void {:capture-native-error true})"))
 
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

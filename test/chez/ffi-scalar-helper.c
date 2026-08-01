@@ -63,3 +63,34 @@ JOLT_TEST_EXPORT void jolt_test_sleep_millis(uint32_t milliseconds) {
   }
 #endif
 }
+
+/* Atomic native-error capture helpers. Each is a default-C-ABI (cdecl) entry
+   point so Chez's foreign-procedure calls it directly. They exercise the
+   thread-local native error slot that POSIX errno and Win32 GetLastError share
+   (Winsock exposes the same slot through WSAGetLastError), keeping the test
+   platform-neutral: no direct Winsock/WinAPI binding from Jolt is needed.
+
+   jolt_test_set_error_fail writes a known code to the slot and returns a failure
+   sentinel, so a captured binding pairs [-1 code]. ENOENT (2) on POSIX and
+   ERROR_FILE_NOT_FOUND (2) on Windows are deliberately the same integer, so the
+   gate asserts (= code 2) on every host. jolt_test_overwrite_error then mutates
+   the SAME slot to a different code (EINVAL=22 / ERROR_INVALID_PARAMETER=87) to
+   prove the saved pair is immutable: a later native call can change the current
+   slot but cannot touch the values already captured in the foreign-call return
+   path. */
+JOLT_TEST_EXPORT int jolt_test_set_error_fail(void) {
+#ifdef _WIN32
+  SetLastError(ERROR_FILE_NOT_FOUND);
+#else
+  errno = ENOENT;
+#endif
+  return -1;
+}
+
+JOLT_TEST_EXPORT void jolt_test_overwrite_error(void) {
+#ifdef _WIN32
+  SetLastError(ERROR_INVALID_PARAMETER);
+#else
+  errno = EINVAL;
+#endif
+}

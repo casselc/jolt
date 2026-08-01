@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Atomic native-error capture for `jolt.ffi` calls.** `foreign-fn` and
+  `defcfn` accept `{:capture-native-error true}` and return
+  `[native-result error-code]`, capturing POSIX `errno` or Windows
+  `GetLastError` in the foreign-call return path before later runtime/native
+  work can overwrite it. Capture composes with `:blocking`, preserves lazy
+  symbol resolution, rejects `:void`, and validates its literal options map
+  fail-closed. Omitted options and legacy `:blocking` calls remain scalar.
+
 - **`jolt.ffi` exact scalar widths: `:int8`/`:i8`, `:int16`/`:short`,
   `:uint16`/`:ushort`, `:int32`, `:uint32`.** A native struct or protocol field
   narrower than `:int` (a `pollfd`/`sockaddr` short, a wire-protocol `uint16_t`)
