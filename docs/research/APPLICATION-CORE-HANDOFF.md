@@ -268,13 +268,11 @@ slice:
 
 ## Open questions
 
-- **I1 (new, from §1 review):** canonical hash algorithm strategy for the
-  Clojure.next core. Option (a): charter defines its own canonical
-  string/collection hash (all next-impls agree; JVM-compatible hashing
-  becomes a `target-dependent` interop profile). Option (b): mandate
-  JVM-compatible hashing everywhere (preserves cross-impl persisted-hash
-  behavior; drags JVM's UTF-16-unit semantics into every host). Primary
-  recommendation: (a). Pending user decision before §2's equality/hash text.
+- **I1 — RESOLVED (H5, user-approved 2026-08-01, option a):** canonical hash
+  is charter-owned per type family (strings over scalar values; collections
+  ordered vs order-independent); hash-consistency law including `-0.0`/NaN
+  canonicalization; algorithm + test-vector suite at the schema/hash stage;
+  JVM-compatible hashing = `target-dependent` interop profile only.
 
 From P1 (source-grounded):
 1. Which source is authoritative for numeric `=`: README category-aware claim or
@@ -401,9 +399,14 @@ User authorized creating bounded profiles for the new models and extending
 | 14 | `def4bcd9` | H3 derivation-hierarchy amendment + handoff state | yes (S1–S3 confirmed) |
 | 15 | `1b3840c5`+`688aaa45` | PR policy update + draft PR #12 recorded/pushed | yes (user directed PR) |
 | 16 | `315f0c0d` | H3 sub-decisions S1–S3 confirmed | yes |
-| 17 | (pending) | charter §1 revisions: Clojure.next implementation-neutrality reframing + §1.5 coverage staging | pending |
+| 17 | `152dd732` | charter §1 revisions: Clojure.next neutrality + §1.5 staging + H4 eager-first | yes (directions given in §1 review) |
+| 18 | (pending) | H5 canonical-hash decision + charter §2 full draft (evaluation order + observable semantics) | pending |
 
 ## §1 review outcome (2026-08-01)
+
+**§1 ACCEPTED** after application of all user directions (neutrality
+reframing, §1.5 staging, H4 processing model). §2 drafted and presented
+2026-08-01; review pending.
 
 User approved §1 with two directions:
 1. **Implementation-neutrality (Clojure.next core):** the charter's semantics

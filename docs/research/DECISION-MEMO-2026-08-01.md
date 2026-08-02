@@ -481,3 +481,17 @@ the bottom, with opt-in laziness**.
 - Consistent with the research plan's original guidance (strict collections
   and transducer-oriented processing by default; explicit lazy streams remain
   useful with defined semantics).
+
+### H5 (resolves I1): canonical hash is charter-owned
+
+User-decided 2026-08-01: option (a). The charter defines its own **canonical
+hash algorithm** per type family (strings hashed over the Unicode scalar-value
+sequence; collection hashes order-independent for maps/sets, ordered for
+sequentials). All Clojure.next realizations must agree by construction; a
+published test-vector suite pins the algorithm at the schema/hash stage.
+Required law: hash-consistency with `=` (`(= a b) ⇒ (= (hash a) (hash b))`),
+including double canonicalization for `-0.0`/`0.0` and NaN. JVM-compatible
+hashing (UTF-16-unit string hash, host `hashCode`) is a `target-dependent`
+interop profile for data exchange with JVM Clojure — never the canonical
+form. Jolt's current Murmur3-compatible `hasheq` is a candidate realization
+input, not the standard.

@@ -244,15 +244,221 @@ most are staged as follows (exit criteria in §9):
 
 ## 2. Deterministic evaluation order and observable semantics (first pure fragment)
 
-DRAFT PENDING — contents: literal lowering (abstract constructors, no
-representation profile selector exists today); ordinary `:invoke` observably
-left-to-right (`backend_scheme.clj:429-473,909-930`) with the `needs-order?`
-let* rule; `if`/`do`/`let*`/`loop*`/`recur`/`fn*` semantics; `def`/Var read
-order (innermost dynamic binding → `*ns*` handling → root); `quote`;
-`set!` thread-binding rule; the enumerated throw/try/catch/finally subset
-(incl. `finally` as `dynamic-wind` after-thunk, ordered catch-by-`instance?`,
-unconditional catch selectors); error values (`ex-info`, `ex-data`, cause);
-observable terminal states for the §6 comparison relation.
+**Scope:** the v1 formal-core profile of §1.2: pure data, functions, lexical
+binding, ordinary invocation, and the enumerated error subset. Every rule is
+portable (Clojure.next); realization notes cite the Jolt-on-Chez reference
+(`V17/…` per P10) or name a JVM contrast explicitly. Anything not fixed by a
+rule here is UNSPECIFIED and out of fragment, not implicitly host behavior.
+
+### 2.1 Reader and literals
+
+- **Literal set (fixed):** `nil`, `true`/`false`, integers (decimal and
+  documented radix forms), exact ratios (`1/2`), doubles, arbitrary-precision
+  decimals (`M` suffix), strings (with escape forms), characters, symbols,
+  keywords, lists, vectors, maps, sets; quote (`'`), deref (`@`),
+  unquote/splicing inside syntax quote, anonymous function literal `#()`,
+  discard `#_`, comments, reader conditionals `#?`. *(Jolt documents the same
+  surface at both baselines; no reader-semantics changelog entries in
+  0.5.14–0.5.17 — `V17/CHANGELOG.md:10-322`; v0.5.13 list at
+  `README.md:310-321`.)*
+- **No `#=` / read-eval anywhere in any lane** (D8: opaque, excluded).
+- **Tagged literals:** an unknown tag reads as an inert tagged-literal data
+  value (tag + form); a strict data reader applies registered readers,
+  built-ins, then a default handler, and throws otherwise. *(Realization:
+  Jolt core `read-string` inert vs `clojure.edn` strict, per P1;
+  `stdlib/clojure/edn.clj:28-46` [v0513].)*
+- **Reader conditionals** select by feature set. *(Realization: Jolt chooses
+  the matching branch by default rather than requiring `:allow` — P1;
+  portable feature-set definition is `specified-profile`.)*
+- **Syntax quote** is macro-authoring machinery: `specified-profile`, outside
+  the v1 formal fragment's semantics (it is supported by the reader and
+  lowered to construction code — P1; not formalized in v1).
+- **Map literals with duplicate keys and set literals with duplicate members
+  are read errors.** *(Jolt realization: UNSPECIFIED — the reader
+  implementation was outside P1/P10's fences; §6 corpus must pin it.)*
+- **Literal lowering:** literals lower to abstract constructors; the concrete
+  representation (persistent/packed/embedded) is a realization choice that
+  must not change source-level value semantics. *(No selectable
+  representation-profile mechanism exists in Jolt today — P1 divergence
+  register; semantics here are representation-agnostic by construction.)*
+
+### 2.2 Evaluation order
+
+- **Ordinary invocation is observably left-to-right:** the callee is
+  evaluated first, then arguments in source order. "Observably" means a
+  realization may reorder only when no observable difference exists;
+  side-effecting operands and order-sensitive Var reads must preserve source
+  order. *(Realization proof: the Jolt analyzer preserves operand order —
+  `V17/jolt-core/jolt/analyzer.clj:1030-1037`; the backend forces sequential
+  `let*` temporaries exactly when reordering could be observable
+  (`needs-order?`/`ordered-call`) — `V17/jolt-core/jolt/backend_scheme.clj:
+  429-473, 878-899, 1029-1086`. Chez's own application order is unspecified;
+  the compiler enforces observable order regardless —
+  `V17/jolt-core/jolt/backend_scheme.clj:429-432`.)*
+- **Collection literal evaluation:** elements evaluate in source order; map
+  keys and values evaluate in pair order; a computed collection being invoked
+  is evaluated before its key/default operands.
+  *(Realization: `V17/jolt-core/jolt/backend_scheme.clj:1051-1060`.)*
+- **Special forms:** `if` evaluates its test once, then exactly one branch
+  (absent else yields `nil`). `do` evaluates forms in order; result is the
+  last form (`nil` for empty `do`). `let*` initializers evaluate in order,
+  each before its binding is visible. `loop*` initializers evaluate in order
+  outside the recursive frame; `recur` evaluates its arguments in order
+  (same ordered mechanism as invocation) and re-enters the nearest enclosing
+  `loop*`/`fn*` frame. `fn*` bodies share these rules per arity.
+- **`fn*` arity selection:** fixed arities dispatch on exact argument count;
+  a variadic arity accepts any count at or above its fixed prefix; no
+  matching arity is an `:arity` error (§2.4). A named `fn` self-reference and
+  mutual recursion use `letrec` semantics. *(Realization:
+  `V17/jolt-core/jolt/analyzer.clj` fn/arity handling — P1 §1; mechanism
+  unchanged per P10 (a).)*
+- **`def`:** interns the Var in the current namespace, then evaluates its
+  initializer (and metadata expression, if present), and returns the Var —
+  not the root value. A declaration without initializer establishes no root.
+  *(Realization: P1 §1, `analyzer.clj` + `backend_scheme.clj` [v0513];
+  mechanism unchanged per P10 (a).)*
+- **Var reference:** reads consult the innermost dynamic binding first, then
+  the root. `(var x)` / `#'x` yields the Var cell itself. Only Vars declared
+  `:dynamic` may be dynamically bound; bindings are per-thread stacks.
+  *(Realization: `V17/host/chez/dyn-binding.ss:4-22` — P10 #9; read-order
+  detail per P1 §5 [v0513].)*
+- **`set!`:** updates only the innermost existing thread binding; throws if
+  none exists; never establishes or mutates a root binding. *(Realization:
+  P1 §1, `dyn-binding.ss` [v0513]; P10 #9 mechanism confirmed.)*
+- **Host interop is excluded from the order guarantee:** `host-new` and
+  `host-call` operand evaluation order is `opaque` (§1.2). Qualified
+  static-method invocation is an ordinary ordered invocation specialization.
+  *(Realization: `V17/jolt-core/jolt/backend_scheme.clj:1271-1273,
+  1313-1322` unordered bare application; `:1064-1068` ordered static
+  specialization.)*
+- **Determinism statement:** within the fragment, observable evaluation order
+  is fully determined by these rules; no unspecified order remains. This is
+  what makes the §6 differential relation well-defined.
+
+### 2.3 Values, equality, hashing, comparison
+
+- **Values:** per §1.2 — `nil`, booleans, unbounded exact integers, exact
+  ratios, binary64 doubles, Unicode scalar-value strings, symbols, keywords,
+  persistent lists/vectors/maps/sets. Functions are values but are **not
+  canonically comparable** (§2.6).
+- **`=` is value equality:** recursive for collections (same-kind vectors
+  positionally; maps by equal key/value entries; sets by membership).
+  Numbers compare by numeric value under the numeric-tower rules of the
+  conformance register (test authority, C3 — category-blind `1`=`1N` holds
+  for tests; **no formal numeric-`=` claim in v1**). `=` ignores metadata.
+  Doubles follow IEEE-754 equality: **NaN is not equal to itself**; `-0.0`
+  and `0.0` are equal. *(Realization pinning via §6 corpus: NaN/`-0.0`
+  behavior is a stated portable rule awaiting corpus witness, not yet
+  evidence.)*
+- **Canonical hash (H5):** the charter owns the canonical hash algorithm per
+  type family — strings hashed over their scalar-value sequence; collection
+  hashes ordered for sequentials, order-independent for maps/sets. Required
+  law: **hash-consistency** — `(= a b) ⇒ (= (hash a) (hash b))`, with double
+  canonicalization for `-0.0`/`0.0` and NaN. The exact algorithm and a
+  published test-vector suite land at the schema/hash stage (§9); until
+  then, hash semantics are specified only up to the consistency law.
+  *(Candidate realization input: Jolt's signed 32-bit wrapping
+  Murmur3-compatible `hasheq` — P1 §2 [v0513]; note 0.5.14 `hash-combine`
+  and keyword host-`hashCode` fixes — `V17/CHANGELOG.md:288-297`. Host
+  `hashCode`/JVM-compatible hashing is a `target-dependent` interop profile,
+  never canonical.)*
+- **`compare`:** a total order over `nil` (least), numbers (by value),
+  strings (scalar-value lexicographic), keywords, symbols, booleans,
+  characters, and equal-length vectors (lexicographic); NaN sorts topmost
+  among doubles and compares equal to itself (so total order is preserved).
+  Comparing unsupported pairs is a `:class-cast` error (§2.4).
+  *(Realization: P1 §2 `converters.ss:180-223` [v0513], returning exact
+  -1/0/1; 0.5.17 note: host String `.compareTo` now returns integers —
+  `V17/CHANGELOG.md:27-34`.)*
+- **Keywords** are interned (identity-stable); **symbols** are not. Equality
+  for both is by namespace + name.
+
+### 2.4 Special forms and the error model (enumerated subset)
+
+The complete special-form set of the v1 fragment is exactly: `if`, `do`,
+`let*`, `loop*`, `recur`, `fn*`, `def`, `var`, `quote`, `set!`, `throw`,
+`try`/`catch`/`finally`. Everything else is macro expansion over these or
+library functions.
+
+- **Macro expansion boundary:** expansion precedes special-form/interop/
+  invocation dispatch; expansions are re-analyzed recursively. Expanders run
+  with `&form` and `&env` available. Call-site position propagates onto
+  unpositioned expansions; **no expansion lineage exists** (identity is
+  §4's CSIR work, not the reader's job). *(Realization:
+  `V17/jolt-core/jolt/analyzer.clj:961-973`;
+  `V17/host/chez/host-contract.ss:236-253,267-295`; IR carries `:pos` (and
+  `:def :meta` location duplication) but no provenance —
+  `V17/jolt-core/jolt/ir.clj:100-108,149-168`;
+  `V17/jolt-core/jolt/analyzer.clj:417-432`.)*
+- **`quote`:** yields its form as literal data without evaluation; no
+  constructor calls, no evaluation of contents.
+- **`throw`:** evaluates one expression and throws the resulting value.
+  Arbitrary values are throwable; `ex-info` constructs an error value
+  carrying a message, a data map, and an optional cause; `ex-data` retrieves
+  the map.
+- **`try`/`catch`/`finally`:** the body evaluates first; catch clauses are
+  tested **in source order** by type match (`instance?`-style) against the
+  thrown value's runtime class; unconditional catch selectors exist
+  (Throwable/Object-class equivalents and `:default`); if no clause matches,
+  the original value is rethrown unchanged. `finally` is last-position only
+  and runs with `dynamic-wind` after-thunk semantics — on normal return, on
+  catch completion, or while an unmatched throw escapes; its value is
+  discarded. *(Realization: P1 §§1,3 [v0513] — ordered `instance?` plus a
+  broad-host-condition helper; `backend_scheme.clj:1155-1170`; mechanism
+  unchanged per P10 (a).)*
+- **Portable error kinds:** the fragment's error taxonomy is a small set of
+  named kinds — `:arity`, `:class-cast`, `:index-out-of-bounds`,
+  `:illegal-argument`, `:illegal-state`, `:unsupported`, `:ex-info` (with
+  data), plus `:host` (any host-originated condition outside these kinds;
+  host messages are `target-dependent`). The named kinds map to Jolt's
+  observed exception classes (P1 §3) and to reasonable equivalents in other
+  hosts.
+
+### 2.5 Sequence processing and opt-in laziness (H4)
+
+- **Eager-first:** default sequence operations are eager and strict, applied
+  in §2.2 order. Transducers compose transformations collection-agnostically;
+  eager drivers realize them with defined resource use and no implicit
+  retention.
+- **Opt-in lazy streams:** laziness exists only through explicit lazy
+  stream/generator constructors. For the pure fragment, a lazy stream is
+  semantically the sequence of its elements: **a pure lazy stream and its
+  eager realization are equal as values.** The observable differences are
+  *when* element-producing thunks run and whether they run at all:
+  - an exception raised by an element thunk surfaces **at the force point**,
+    not at stream construction (an eager operation raising does so at the
+    call);
+  - divergent (non-terminating) streams are definable; any total consumption
+    of one diverges (§2.6 outcome (c));
+  - abandonment of an unrealized pure stream has no resource obligation;
+    resource-holding streams require explicit scope (`specified-profile`,
+    later stage);
+  - realized-prefix retention is a memory realization detail, not semantics
+    *(JVM hosts retain the realized prefix while the head is referenced —
+    realization note, not core semantics)*.
+- The fragment's default `map`/`filter`/`concat`-class operations are eager;
+  lazy counterparts exist only as explicitly named stream forms.
+
+### 2.6 Observable terminal states (the §6 comparison relation)
+
+The observable outcome of a fragment program is exactly one of:
+
+1. **a canonical value** — normalized recursively: numbers by exact value,
+   strings by scalar-value sequence, booleans/`nil`, keywords/symbols by
+   namespace+name, collections recursively. Metadata is not part of the
+   canonical value. A value containing a function (or any host object) is
+   not canonical-comparable and classifies the program's lane per §3 (not a
+   fragment outcome).
+2. **an error outcome** — `{kind, data?}`: the portable kind (§2.4), plus
+   `ex-data` equality when the kind is `:ex-info`. Host-originated messages
+   are never compared (target-dependent text).
+3. **bounded divergence** — the harness's step/time bound expiring,
+   classified `:timeout`. A `:timeout` is never evidence of true divergence
+   or of convergence; it is an inconclusive outcome (§5).
+
+Two outcomes are equal iff: both canonical values are `=`-equal per §2.3, or
+both error outcomes have equal kinds (and equal data for `:ex-info`).
+Divergence is equal only to itself and proves nothing.
 
 ## 3. Boundary taxonomy
 
