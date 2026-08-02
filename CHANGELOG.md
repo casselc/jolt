@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An opt-in simulation compiler/runtime profile.** `make jolt-sim` builds a
+  separate image whose private `jolt.internal.sim` ABI atomically installs
+  future-lifecycle, scalar FFI, and monotonic-clock controllers. Sim-compiled
+  calls can be modeled, observed, or selectively proceeded to the real native
+  branch with scoped, single-use authority; ordinary release/debug images and
+  ordinary compilation units retain their existing paths. This prerelease
+  surface is intended for deterministic schedulers and adversarial library
+  tests, not as a compatibility-stable public runtime API yet.
+
 - **Scoped in-out byte-array pointer loans for `jolt.ffi`.**
   `with-byte-array-pointer` lends a stable pointer to a temporary native-octet
   copy of a whole signed byte array or one validated range, then copies native
