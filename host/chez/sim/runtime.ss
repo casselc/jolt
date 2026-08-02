@@ -575,19 +575,17 @@
 (define jolt-sim-clock-descriptor
   (jolt-hash-map jolt-sim-kw-kind jolt-sim-kw-clock
                  jolt-sim-kw-operation jolt-sim-kw-mono-nanos))
-(define (jolt-sim-clock-validate! installation n)
+;; Validates a raw sample against the domain's last-published value and (when
+;; accepted) publishes it as the new last. MUST run with the domain mutex
+;; already held by the caller — see jolt-sim-mono-nanos below for why the
+;; acquire has to enclose the sample itself, not just this check.
+(define (jolt-sim-clock-validate-locked! domain n)
   (unless (and (integer? n) (exact? n))
     (error 'jolt-sim-clock "monotonic clock must return exact integer nanoseconds"))
-  ;; Every nested composite installation shares the outermost scope's domain.
-  ;; A fresh outer scope may start virtual time at any origin, but an inner
-  ;; controller cannot advance the clock and then reveal an older outer value
-  ;; after restoration.
-  (let ((domain (jolt-sim-clock-installation-domain installation)))
-    (with-mutex (jolt-sim-clock-domain-mu domain)
-      (let ((last (jolt-sim-clock-domain-last domain)))
-        (when (and last (< n last))
-          (error 'jolt-sim-clock "monotonic clock moved backward"))
-        (jolt-sim-clock-domain-last-set! domain n))))
+  (let ((last (jolt-sim-clock-domain-last domain)))
+    (when (and last (< n last))
+      (error 'jolt-sim-clock "monotonic clock moved backward"))
+    (jolt-sim-clock-domain-last-set! domain n))
   n)
 (define (jolt-sim-mono-nanos)
   (let ((installation (jolt-sim-current-clock-installation)))
@@ -597,15 +595,23 @@
           (when (eqv? owner (jolt-sim-clock-active-owner))
             (error 'jolt-sim-clock "reentrant controlled clock access is not supported"))
           (parameterize ((jolt-sim-clock-active-owner owner))
-            (jolt-sim-clock-validate!
-             installation
-             (if (jolt-sim-clock-installation-routing? installation)
-                 (jolt-sim-call-routing-controller
-                  (jolt-sim-clock-installation-hook installation)
-                  jolt-sim-clock-descriptor
-                  jolt-sim-supervisor-mono-nanos-source)
-                 (jolt-invoke (jolt-sim-clock-installation-hook installation)
-                              jolt-sim-clock-descriptor))))))))
+            ;; Sampling used to precede this mutex. Two threads could sample a
+            ;; real monotonic source as n1<n2, then validate in reverse order
+            ;; and falsely reject n1 as backward. Obtain, validate, and publish
+            ;; now share one domain-wide linearization point. The owner check
+            ;; above remains outside the mutex so same-thread reentry fails
+            ;; instead of deadlocking.
+            (let ((domain (jolt-sim-clock-installation-domain installation)))
+              (with-mutex (jolt-sim-clock-domain-mu domain)
+                (jolt-sim-clock-validate-locked!
+                 domain
+                 (if (jolt-sim-clock-installation-routing? installation)
+                     (jolt-sim-call-routing-controller
+                      (jolt-sim-clock-installation-hook installation)
+                      jolt-sim-clock-descriptor
+                      jolt-sim-supervisor-mono-nanos-source)
+                     (jolt-invoke (jolt-sim-clock-installation-hook installation)
+                                  jolt-sim-clock-descriptor))))))))))
 ;; Redirect both call paths: System/nanoTime resolves jolt-mono-nanos by name
 ;; at call time (the `set!` alone covers it); jolt.host/mono-nanos was already
 ;; published by value and needs an explicit re-registration to the same
