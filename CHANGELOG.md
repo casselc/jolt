@@ -2101,6 +2101,18 @@ is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
   with `{:blocking true}`; omitted/false capture keeps the existing scalar
   result, and unsupported targets or malformed options fail closed.
 
+- **`jolt.host/target`, an exact fail-closed compiler-target descriptor.**
+  Reports `:os`, `:arch`, `:abi`, `:libc`, `:endian`, `:pointer-bits`,
+  `:file-separator`, `:path-separator`, and `:processors`. The compiler target's
+  OS, architecture, and ABI come from an exact allowlist checked against
+  `rt.ss`'s native-error convention selection; an unrecognized machine tuple
+  fails closed to `:unknown` instead of guessing, while independently measurable
+  runtime facts remain available. `System`'s `os.name`, `os.arch`, separators,
+  and properties project from the same target facts. Optional native-symbol
+  resolution also selects its Windows-safe path from the compiler target,
+  including Windows ARM64, so cross-images cannot bake POSIX relocations into
+  Windows output.
+
 ## [0.6.4] - 2026-08-05
 
 ### Changed
@@ -2413,7 +2425,6 @@ ring-core's multipart suite runs against jolt-lang/multipart, an RFC 7578
 parser, through a shim registering the commons-fileupload2 class surface ring
 reaches for. The shim is glue: it decides nothing about multipart syntax, which
 is what keeps the suite worth running.
-
 
 ## [0.5.20] - 2026-08-02
 

@@ -321,7 +321,7 @@
         ;; redirected) — the safe default here; libraries (pretty) use it to
         ;; decide whether to emit ANSI, and a nil means "not a tty".
         (cons "console" (lambda _ jolt-nil))
-        (cons "lineSeparator" (lambda _ "\n"))
+        (cons "lineSeparator" (lambda _ target-line-separator))
         (cons "identityHashCode" (lambda (x) (->num (equal-hash x))))
         ;; System.arraycopy(src, srcPos, dest, destPos, length). Specified to
         ;; behave as if the source range were copied to a temporary first, so a
@@ -743,34 +743,86 @@
                   ((forname-demunged nm) => make-class-obj)
                   (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm))))))))
 
-;; ---- System helpers (defined before use above via top-level order) ----------
-;; os.name reflects the actual platform (Chez's machine-type names it): a *osx
-;; machine is macOS, otherwise Linux. Code that branches on the OS (socket struct
-;; layout, path handling) needs the truth, not a fixed value.
-;; Optimized: character-by-character scan, no substring allocation per position.
-(define (substring-index needle hay)
-  (let ((nl (string-length needle)) (hl (string-length hay)))
-    (let outer ((i 0))
-      (if (> (+ i nl) hl)
-          #f
-          (let inner ((j 0))
-            (cond ((= j nl) i)
-                  ((char=? (string-ref hay (+ i j)) (string-ref needle j)) (inner (+ j 1)))
-                  (else (outer (+ i 1)))))))))
-(define sys-os-name
-  (case (sa-os-family)
-    ((macos) "Mac OS X")
-    ((windows) "Windows")
-    (else "Linux")))
-;; os.arch in the JVM's spelling — libraries parse these exact strings
-;; (aarch64/amd64), not Chez's. An unrecognized arch answers the host tag,
-;; which is at least truthful.
-(define sys-os-arch
-  (case (sa-arch)
-    ((arm64) "aarch64")
-    ((x86-64) "amd64")
-    ((i386) "x86")
-    (else (sa-host-tag))))
+;; ---- jolt.host/target and System target properties -------------------------
+;; Keep the compiler target behind one exact allowlist. Native layout and
+;; calling-convention consumers must not guess a nearby platform from a token.
+(define target-machine-fact-names
+  '(("i3le" linux x86 sysv-i386) ("ti3le" linux x86 sysv-i386)
+    ("a6le" linux x86-64 sysv-amd64) ("ta6le" linux x86-64 sysv-amd64)
+    ("ppc32le" linux ppc unknown) ("tppc32le" linux ppc unknown)
+    ("arm32le" linux arm unknown) ("tarm32le" linux arm unknown)
+    ("arm64le" linux aarch64 aapcs64) ("tarm64le" linux aarch64 aapcs64)
+    ("rv64le" linux riscv64 unknown) ("trv64le" linux riscv64 unknown)
+    ("la64le" linux loongarch64 unknown) ("tla64le" linux loongarch64 unknown)
+    ("i3osx" darwin x86 unknown) ("ti3osx" darwin x86 unknown)
+    ("a6osx" darwin x86-64 sysv-amd64) ("ta6osx" darwin x86-64 sysv-amd64)
+    ("ppc32osx" darwin ppc unknown) ("tppc32osx" darwin ppc unknown)
+    ("arm64osx" darwin aarch64 darwin-arm64)
+    ("tarm64osx" darwin aarch64 darwin-arm64)
+    ("i3nt" windows x86 cdecl-x86) ("ti3nt" windows x86 cdecl-x86)
+    ("a6nt" windows x86-64 win64) ("ta6nt" windows x86-64 win64)
+    ("arm64nt" windows aarch64 unknown)
+    ("tarm64nt" windows aarch64 unknown)))
+(define target-unknown-facts
+  (list (keyword #f "unknown") (keyword #f "unknown") (keyword #f "unknown")))
+(define (target-facts-for-machine-name machine-name)
+  (let loop ((rows target-machine-fact-names))
+    (cond
+      ((null? rows) target-unknown-facts)
+      ((string=? machine-name (caar rows))
+       (let ((row (car rows)))
+         (list (keyword #f (symbol->string (cadr row)))
+               (keyword #f (symbol->string (caddr row)))
+               (keyword #f (symbol->string (cadddr row))))))
+      (else (loop (cdr rows))))))
+(define target-machine-name (symbol->string (machine-type)))
+(define target-facts (target-facts-for-machine-name target-machine-name))
+(define target-os (car target-facts))
+(define target-arch (cadr target-facts))
+(define target-abi (caddr target-facts))
+(define target-os-name
+  (cond ((eq? target-os (keyword #f "linux")) "Linux")
+        ((eq? target-os (keyword #f "darwin")) "Mac OS X")
+        ((eq? target-os (keyword #f "windows")) "Windows")
+        (else "Unknown")))
+(define target-arch-name
+  (cond ((eq? target-arch (keyword #f "x86-64")) "amd64")
+        ((eq? target-arch (keyword #f "aarch64")) "aarch64")
+        ((eq? target-arch (keyword #f "x86")) "x86")
+        ((eq? target-arch (keyword #f "arm")) "arm")
+        ((eq? target-arch (keyword #f "ppc")) "ppc")
+        ((eq? target-arch (keyword #f "riscv64")) "riscv64")
+        ((eq? target-arch (keyword #f "loongarch64")) "loongarch64")
+        (else "unknown")))
+(define target-line-separator
+  (if (eq? target-os (keyword #f "windows")) "\r\n" "\n"))
+(define target-pointer-bits (* 8 (sa-foreign-sizeof 'void*)))
+(define target-endian
+  (case (sa-endian)
+    ((little) (keyword #f "little"))
+    ((big) (keyword #f "big"))
+    (else (keyword #f "unknown"))))
+(define target-file-separator (string (directory-separator)))
+(define target-windows-paths? (string=? target-file-separator "\\"))
+(define target-path-separator (if target-windows-paths? ";" ":"))
+(define target-gnu-libc-version
+  (jolt-foreign-proc-safe "gnu_get_libc_version" '() 'string))
+(define target-libc
+  (cond (target-gnu-libc-version (keyword #f "glibc"))
+        ((eq? target-os (keyword #f "darwin")) (keyword #f "libsystem"))
+        (else (keyword #f "unknown"))))
+(define (jolt-host-target)
+  (jolt-hash-map
+    (keyword #f "os") target-os
+    (keyword #f "arch") target-arch
+    (keyword #f "abi") target-abi
+    (keyword #f "libc") target-libc
+    (keyword #f "endian") target-endian
+    (keyword #f "pointer-bits") (->num target-pointer-bits)
+    (keyword #f "file-separator") target-file-separator
+    (keyword #f "path-separator") target-path-separator
+    (keyword #f "processors") (->num (jolt-available-processors))))
+(def-var! "jolt.host" "target" jolt-host-target)
 ;; user.name: the login name from the environment, as the JVM reports it.
 (define (sys-user-name)
   (or (getenv "USER") (getenv "LOGNAME") (getenv "USERNAME") jolt-nil))
@@ -834,20 +886,21 @@
   (let loop ((roots (sys-class-path-provider)) (acc ""))
     (cond ((null? roots) acc)
           ((string=? acc "") (loop (cdr roots) (car roots)))
-          (else (loop (cdr roots) (string-append acc ":" (car roots)))))))
+          (else (loop (cdr roots)
+                      (string-append acc target-path-separator (car roots)))))))
 
 (define (sys-get-property k . dflt)
   (let* ((k (jolt-need-string k))
          (set-val (hashtable-ref sys-prop-table k #f)))
     (cond (set-val set-val)
-          ((string=? k "os.name") sys-os-name)
-          ((string=? k "os.arch") sys-os-arch)
+          ((string=? k "os.name") target-os-name)
+          ((string=? k "os.arch") target-arch-name)
           ((string=? k "os.version") (sys-os-version))
           ((string=? k "user.name") (sys-user-name))
           ((string=? k "jolt.version") (jolt-version-string))
-          ((string=? k "line.separator") "\n")
-          ((string=? k "file.separator") "/")
-          ((string=? k "path.separator") ":")
+          ((string=? k "line.separator") target-line-separator)
+          ((string=? k "file.separator") target-file-separator)
+          ((string=? k "path.separator") target-path-separator)
           ((string=? k "java.class.path") (sys-class-path))
           ;; user.dir is the user's cwd (JVM: the process cwd). jolt-user-dir (io.ss)
           ;; owns that chain — JOLT_PWD, then the process's own working directory —
@@ -858,9 +911,11 @@
           ((pair? dflt) (car dflt))
           (else jolt-nil))))
 (define (sys-properties-map)
-  (let ((base (jolt-hash-map "os.name" sys-os-name "os.arch" sys-os-arch
-                             "line.separator" "\n" "file.separator" "/"
-                             "path.separator" ":" "java.class.path" (sys-class-path)
+  (let ((base (jolt-hash-map "os.name" target-os-name "os.arch" target-arch-name
+                             "line.separator" target-line-separator
+                             "file.separator" target-file-separator
+                             "path.separator" target-path-separator
+                             "java.class.path" (sys-class-path)
                              "jolt.version" (jolt-version-string)
                              "user.dir" (jolt-user-dir) "user.home" (or (getenv "HOME") "")
                              "java.io.tmpdir" (or (getenv "TMPDIR") "/tmp"))))
@@ -1019,4 +1074,3 @@
 (for-each (lambda (nm)
             (register-class-ctor! nm (lambda _ (lambda (rdr . _) (lrsr-read-literal rdr)))))
           '("LispReader$StringReader" "clojure.lang.LispReader$StringReader"))
-
