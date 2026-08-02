@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Variadic foreign bindings declare their fixed-argument boundary.**
+  `jolt.ffi/foreign-fn` and `defcfn` accept
+  `{:varargs-after n}`, where `n` is the positive number of declared fixed C
+  parameters before `...`. The boundary composes with collect-safe calls and
+  atomic native-error capture and lowers to Chez's `__varargs_after`
+  convention, which is required on targets whose variadic and fixed calling
+  conventions differ. Callers declare already-promoted C ABI types for
+  arguments after the boundary. Sim-profile FFI descriptor version 6 carries
+  the same optional boundary so controllers and traces retain the exact call
+  declaration.
+
 - **An opt-in simulation compiler/runtime profile.** `make jolt-sim` builds a
   separate image whose private `jolt.internal.sim` ABI atomically installs
   future-lifecycle, scalar FFI, and monotonic-clock controllers. Sim-compiled

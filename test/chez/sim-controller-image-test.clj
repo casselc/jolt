@@ -3,6 +3,8 @@
 
 (ffi/load-library nil)
 (ffi/defcfn missing-native "jolt_v0517_missing_native_symbol" [:int32] :int64)
+(ffi/defcfn missing-variadic "jolt_v0517_missing_variadic_symbol"
+  [:int32 :double] :int64 {:varargs-after 1})
 (ffi/defcfn close-captured "close" [:int32] :int32
   {:capture-native-error true})
 
@@ -30,8 +32,9 @@
                     (when (= event :exit) (deliver exited true)))
           :ffi (fn [descriptor proceed]
                  (swap! seen conj descriptor)
-                 (if (= "jolt_v0517_missing_native_symbol" (:symbol descriptor))
-                   77
+                 (case (:symbol descriptor)
+                   "jolt_v0517_missing_native_symbol" 77
+                   "jolt_v0517_missing_variadic_symbol" 78
                    (proceed)))
           :clock (fn [_descriptor _proceed] 424242)})]
     (try
@@ -47,6 +50,13 @@
       (check "future exit acknowledgement before restore"
              (= true (deref exited 5000 ::exit-timeout)))
       (check "modeled missing symbol never resolves" (= 77 (missing-native 9)))
+      (check "modeled missing variadic symbol never resolves"
+             (= 78 (missing-variadic 9 1.5)))
+      (let [variadic (some #(when (= "jolt_v0517_missing_variadic_symbol"
+                                      (:symbol %)) %)
+                           @seen)]
+        (check "sim image preserves exact variadic boundary"
+               (= 1 (:varargs-after variadic))))
       (let [[result native-error] (close-captured -1)
             captured (last @seen)]
         (check "native proceed result" (= -1 result))

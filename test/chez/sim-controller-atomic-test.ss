@@ -30,8 +30,8 @@
 ;; Exact public descriptor and exact ordered raw operation registry.
 (define caps (jolt-sim-capabilities))
 (ok "controller ABI is exactly prerelease 6" (= 6 (mget caps "abi-version")))
-(ok "FFI descriptor is exactly 5"
-    (= 5 (mget (mget caps "ffi-interception") "descriptor-version")))
+(ok "FFI descriptor is exactly 6"
+    (= 6 (mget (mget caps "ffi-interception") "descriptor-version")))
 (ok "clock descriptor is exactly 1"
     (= 1 (mget (mget caps "clock-interception") "descriptor-version")))
 (ok "public installation descriptor names one exact complete config"
@@ -56,7 +56,7 @@
                        :future-controller-arity 3
                        :ffi-controller-arity 2
                        :clock-controller-arity 2}
-        :ffi-interception {:descriptor-version 5
+        :ffi-interception {:descriptor-version 6
                            :kinds [:foreign-function :native-operation]
                            :arguments :live
                            :task-identity :future-lifecycle
@@ -98,6 +98,36 @@
                 (list (cons 'kind 'native-operation)
                       (cons 'operation "read-array!")
                       (cons 'arguments (list 1 2 3)))))))
+(define fixed-foreign
+  (jolt-sim-project-ffi-descriptor
+   (jolt-ffi-make-sim-descriptor
+    "fixed" '("int") "int" #f #f #f (list (->num 7)))))
+(define variadic-foreign
+  (jolt-sim-project-ffi-descriptor
+   (jolt-ffi-make-sim-descriptor
+    "variadic" '("int" "double") "int" #f #f 1
+    (list (->num 7) (->num 1.5)))))
+(ok "fixed foreign descriptor carries exact nil variadic boundary"
+    (jolt-nil? (mget fixed-foreign "varargs-after")))
+(ok "variadic foreign descriptor carries exact positive boundary"
+    (= 1 (jnum->exact (mget variadic-foreign "varargs-after"))))
+(ok "zero variadic boundary fails before controller or OS"
+    (raises? (lambda ()
+               (jolt-ffi-make-sim-descriptor
+                "bad" '("int") "int" #f #f 0 (list (->num 1))))))
+(ok "variadic boundary above argument count fails before controller or OS"
+    (raises? (lambda ()
+               (jolt-ffi-make-sim-descriptor
+                "bad" '("int") "int" #f #f 2 (list (->num 1))))))
+(ok "descriptor-v5 foreign shape fails closed"
+    (raises? (lambda ()
+               (jolt-sim-project-ffi-descriptor
+                (list (cons 'symbol "old")
+                      (cons 'argument-types '("int"))
+                      (cons 'return-type "int")
+                      (cons 'blocking? #f)
+                      (cons 'capture-native-error? #f)
+                      (cons 'arguments (list (->num 1))))))))
 
 ;; Complete config validation precedes every public mutation.
 (define pristine (controller-state))
