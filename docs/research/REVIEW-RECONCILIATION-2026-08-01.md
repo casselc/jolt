@@ -89,10 +89,28 @@ read-only, bounded to its slice:
 
 | Slice | Scope | Timing | Status |
 | --- | --- | --- | --- |
-| 1 | D1 identity spine: A3-vs-A2 judgment honesty, site-ID / macro-digest-chain / declared-anchor rule, C4 unification consequences (incl. site-IDs for eval'd/dynamically resolved code) | now | dispatched |
-| 2 | D5/F4 reconciliation + P3 mailbox transition relation, invariant, controls adequacy (incl. max-steps derivation) | after slice 1 | pending |
+| 1 | D1 identity spine: A3-vs-A2 judgment honesty, site-ID / macro-digest-chain / declared-anchor rule, C4 unification consequences (incl. site-IDs for eval'd/dynamically resolved code) | completed 2026-08-01 | report `reports/P8-FABLE-SLICE1-IDENTITY-SPINE.md`; F1–F7 user-approved and applied to memo |
+| 2 | D5/F4 reconciliation + P3 mailbox transition relation, invariant, controls adequacy (incl. max-steps derivation) | after slice 1 | dispatched |
 | 3 | site-ID ↔ descriptor unification cross-section check | after charter §4/§6 drafted | pending |
 | 4 | D3/C2 lattice soundness + one record-schema sufficiency (Hegel seed-only replay vs jolt-sim action-path replay) | before charter §5 finalized | pending |
 
 Each slice gets a cost/quality report; the user may halt remaining slices at any
 checkpoint. Fable output is advisory; primary owns acceptance.
+
+## Fable slice-1 dispositions (user-approved 2026-08-01)
+
+| Amendment | Content | Disposition |
+| --- | --- | --- |
+| F1 | CSIR v1 schema closed; anchors undeclarable in v1; anchor rule A3-conditional | **accepted** — makes the A3 promotion gate real (any A3 feature forces a remint → core-lane review) |
+| F2 | Site-ID = digest of normalized expanded form at the site; macro-definition chain demoted to provenance metadata outside the ID | **accepted** — blocker fix; also removes the uncomputable-digest problem for prebuilt macros (`host-contract.ss:285-295`) |
+| F3 | Normative normalization algorithm as charter appendix; C1 exit test gains cross-run/cross-implementation ID determinism vectors | **accepted** — F2 is unimplementable without it |
+| F4 | Prerelease remint orphans all evidence records (declared; detectable via D3 metadata); post-v1 remints emit old→new ID migration records | **accepted** |
+| F5 | Evidence never transfers across an anchor; post-anchor claims restart at `assumed`; anchor record carries old/new digests, expansion diff, differential-run evidence ID, reviewer identity, equivalence argument | **accepted** — kills the false-equivalence abuse case; reviewer judgment + mandatory differential corpus is the control |
+| F6 | Descriptor carries a CSIR site-ID or a reserved enumerated `host-origin` ID (registration site + entry-kind); absent site-id = validation failure | **accepted** — covers handwritten host-layer Scheme and native-thread callback firings |
+| F7 | Dynamic-opaque attribution declared descriptor-level; `operation-id` cardinality defined | **accepted with refinement**: `operation-id` = per-instance unique (aligns with jolt-sim stable operation-ID practice); `operation` remains the per-kind tag |
+
+Fable slice-1 verdict context preserved in P8: 1 blocker (macro-digest churn),
+4 majors (gate leak via anchors in D1 text; uncomputable definition digests;
+non-deterministic normalization spec; host-origin site-ID dangling case), 3
+minors, 2 questions. D1's core direction (structural key, never line/column)
+survived adversarial review and was verified against live source.

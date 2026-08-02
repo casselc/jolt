@@ -221,9 +221,9 @@ handoff, then by Codex.
 
 Sequential, one Claude task at a time, per-slice budget cap $10, read-only,
 bounded to its slice (never the whole memo):
-1. **Slice 1 (now):** D1 identity spine — A3-vs-A2 judgment honesty, site-ID /
-   macro-digest-chain / declared-anchor rule, C4 unification consequences
-   (incl. site-IDs for eval'd/dynamically resolved code).
+1. **Slice 1 (completed):** D1 identity spine. Report
+   `reports/P8-FABLE-SLICE1-IDENTITY-SPINE.md`; amendments F1–F7 below,
+   user-approved 2026-08-01.
 2. **Slice 2 (next):** D5/F4 reconciliation + P3 mailbox transition relation,
    invariant, and controls adequacy (incl. max-steps derivation).
 3. **Slice 3 (after charter §4/§6 exist):** site-ID ↔ descriptor unification
@@ -231,3 +231,75 @@ bounded to its slice (never the whole memo):
 4. **Slice 4 (before charter §5 final):** D3/C2 lattice soundness + one
    record-schema sufficiency across Hegel seed-only replay vs jolt-sim
    action-path replay.
+
+## F-amendments 2026-08-01 (Fable slice 1, user-approved)
+
+These amendments supersede the referenced rules above.
+
+### F1 (amends D1/C1): CSIR v1 schema is closed; anchors deferred to A3
+
+The CSIR v1 schema is **closed**: unknown fields and anchor records are
+validation failures. D1's declared-anchor sentence is removed from the
+stage-independent identity rule and applies only conditionally under A3 (after
+promotion). In v1 there are **no anchors**. Any A3 feature (anchors, expansion
+chain beyond single-step) requires a schema remint, which requires a memo
+amendment naming the consumer plus core-lane review (C5). The dangerous drift
+direction is A3-creep, not A2-ossification; the closed schema is the mechanism
+that makes the promotion gate real.
+
+### F2 (amends D1 site-ID rule): ID from the normalized expanded form, not the macro-definition chain
+
+The site-ID derives from the **digest of the normalized expanded form at the
+site** plus the remaining D1 structural components `{CSIR-schema,
+namespace/logical definition, resolved binding path, operation tag}` — the
+**macro-definition digest chain is removed from the ID**. Rationale: the chain
+breaks every downstream ID on macro edits that change nothing at the use site
+(including dependency bumps), and a definition digest may be uncomputable for
+prebuilt libraries (expanders are opaque compiled closures,
+`host-contract.ss:285-295`). The chain may be retained as CSIR **provenance
+metadata outside the ID**; keeping it even as metadata requires staging
+definition-time source capture explicitly.
+
+### F3 (amends C1): normative normalization appendix + ID determinism vectors
+
+The charter includes a **normative normalization algorithm** as an appendix:
+gensym canonicalization, sibling/child indexing, chain order for the
+re-expansion recursion, and treatment of position-propagated metadata. C1's
+exit test gains **cross-run/cross-implementation site-ID determinism
+vectors** — the same source compiled twice must yield identical site-IDs.
+
+### F4 (amends D1/D3): remint evidence policy declared
+
+A prerelease CSIR schema remint **orphans all prior evidence records** —
+detectable via D3's schema/IR-version metadata, never silently reinterpreted
+or promoted. Post-v1 remints must emit an **old-ID→new-ID migration record**
+for surviving sites.
+
+### F5 (amends D1 anchor rule, A3-conditional): evidence never crosses anchors
+
+Evidence levels **never transfer across an anchor**: post-anchor claims restart
+at `assumed` until re-evidenced against the new digest. An anchor grants
+attribution/history continuity only, never claim continuity. Anchor record
+mandatory contents: old/new CSIR digests, normalized-expansion diff,
+differential-corpus run evidence ID (the anchored operation's corpus must pass
+identically on both digests), reviewer identity, and a stated equivalence
+argument. General semantic preservation is undecidable; reviewer judgment is
+the control, backed by the mandatory differential-corpus check.
+
+### F6 (amends C4/D4): host-origin ID class; no absent site-IDs
+
+Every effect descriptor carries **either** a CSIR site-ID **or** a member of a
+reserved, enumerated `host-origin` ID class (registration site plus entry-kind
+tag) for operations issued from handwritten host-layer code that never
+traverses the analyzer (including callbacks fired from native threads). An
+absent `site-id` is a validation failure. The "when one exists" clause is
+deleted.
+
+### F7 (amends C4/D4): Dynamic-opaque attribution declared descriptor-level; `operation-id` per-instance
+
+Attribution granularity inside `Dynamic-opaque` regions is **descriptor-level**
+— declared explicitly, not left implicit (eval'd code's operations share the
+widening site's ID; discrimination comes from the descriptor). D4's
+`operation-id` is **per-instance unique** (one per operation invocation),
+aligning with jolt-sim's stable operation-ID practice; the `operation` field
+remains the per-kind tag.
