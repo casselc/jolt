@@ -272,21 +272,27 @@
         (jolt-sim-controller-installation-ffi installation)
         jolt-ffi-sim-hook)))
 
-;; Scalar metadata only in descriptor v5. Aggregate and varargs declarations
-;; are deliberately not recognized or advertised by this prerelease slice.
+;; Scalar metadata plus an optional exact variadic boundary in descriptor v6.
+;; Aggregate declarations remain outside this prerelease contract.
 (define (jolt-ffi-make-sim-descriptor
-         symbol argument-types return-type blocking? capture? arguments)
+         symbol argument-types return-type blocking? capture? varargs-after
+         arguments)
   (unless (and (string? symbol)
                (list? argument-types) (for-all string? argument-types)
                (string? return-type) (boolean? blocking?) (boolean? capture?)
+               (or (not varargs-after)
+                   (and (number? varargs-after) (exact? varargs-after)
+                        (integer? varargs-after) (> varargs-after 0)
+                        (<= varargs-after (length argument-types))))
                (list? arguments) (= (length argument-types) (length arguments)))
     (error 'jolt-ffi-make-sim-descriptor
-           "malformed scalar foreign-function descriptor"))
+           "malformed scalar/variadic foreign-function descriptor"))
   (list (cons 'symbol (string-copy symbol))
         (cons 'argument-types (map string-copy argument-types))
         (cons 'return-type (string-copy return-type))
         (cons 'blocking? blocking?)
         (cons 'capture-native-error? capture?)
+        (cons 'varargs-after varargs-after)
         (cons 'arguments arguments)))
 (define (jolt-ffi-make-native-sim-descriptor operation arguments)
   (list (cons 'kind 'native-operation)
@@ -315,7 +321,7 @@
   (jolt-ffi-invoke-sim-hook
    h (jolt-ffi-make-native-sim-descriptor operation arguments) native))
 
-;; These sixteen wrappers are the complete descriptor-v5 raw operation set.
+;; These sixteen wrappers are the complete descriptor-v6 raw operation set.
 ;; Each snapshots the installation once; malformed public descriptors are
 ;; rejected by the projection below before the native thunk can be offered.
 (define (ffi-sim-load-library . args)
@@ -682,7 +688,7 @@
     jolt-sim-kw-clock-controller-arity 2)
    jolt-sim-kw-ffi-interception
    (jolt-hash-map
-    jolt-sim-kw-descriptor-version 5
+    jolt-sim-kw-descriptor-version 6
     jolt-sim-kw-kinds (jolt-vector jolt-sim-kw-foreign-function
                                    jolt-sim-kw-native-operation)
     jolt-sim-kw-arguments jolt-sim-kw-live
@@ -796,7 +802,7 @@
                                jolt-sim-kw-error (list-ref e 3)))
               (jolt-future-hook-errors-snapshot))))
 
-;; Exact descriptor-v5 projection. Key order, kind, operation membership, and
+;; Exact descriptor-v6 projection. Key order, kind, operation membership, and
 ;; native-operation arities are checked before a public controller sees a
 ;; proceed thunk; unknown/malformed input therefore cannot reach the OS.
 (define jolt-sim-kw-symbol (keyword #f "symbol"))
@@ -804,6 +810,7 @@
 (define jolt-sim-kw-return-type (keyword #f "return-type"))
 (define jolt-sim-kw-blocking? (keyword #f "blocking?"))
 (define jolt-sim-kw-capture-native-error? (keyword #f "capture-native-error?"))
+(define jolt-sim-kw-varargs-after (keyword #f "varargs-after"))
 (define (jolt-sim-raw-keys d) (and (list? d) (for-all pair? d) (map car d)))
 (define (jolt-sim-native-arity-valid? op args)
   (let ((n (length args)))
@@ -822,13 +829,19 @@
   (let ((ks (jolt-sim-raw-keys desc)))
     (cond
       ((and (equal? ks '(symbol argument-types return-type blocking?
-                                capture-native-error? arguments))
+                                capture-native-error? varargs-after arguments))
             (string? (cdr (assq 'symbol desc)))
             (list? (cdr (assq 'argument-types desc)))
             (for-all string? (cdr (assq 'argument-types desc)))
             (string? (cdr (assq 'return-type desc)))
             (boolean? (cdr (assq 'blocking? desc)))
             (boolean? (cdr (assq 'capture-native-error? desc)))
+            (let ((varargs-after (cdr (assq 'varargs-after desc))))
+              (or (not varargs-after)
+                  (and (number? varargs-after) (exact? varargs-after)
+                       (integer? varargs-after) (> varargs-after 0)
+                       (<= varargs-after
+                           (length (cdr (assq 'argument-types desc)))))))
             (list? (cdr (assq 'arguments desc)))
             (= (length (cdr (assq 'argument-types desc)))
                (length (cdr (assq 'arguments desc)))))
@@ -842,6 +855,9 @@
         jolt-sim-kw-return-type (keyword #f (cdr (assq 'return-type desc)))
         jolt-sim-kw-blocking? (cdr (assq 'blocking? desc))
         jolt-sim-kw-capture-native-error? (cdr (assq 'capture-native-error? desc))
+        jolt-sim-kw-varargs-after
+        (let ((varargs-after (cdr (assq 'varargs-after desc))))
+          (if varargs-after (->num varargs-after) jolt-nil))
         jolt-sim-kw-arguments (apply jolt-vector (cdr (assq 'arguments desc)))))
       ((and (equal? ks '(kind operation arguments))
             (eq? (cdr (assq 'kind desc)) 'native-operation)

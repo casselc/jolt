@@ -47,9 +47,14 @@
   a compile-time-typed signature to a real Chez foreign-procedure. Its optional
   trailing map accepts :blocking and :capture-native-error literal Booleans;
   capture returns [native-result error-code] atomically and requires a non-void
-  result. foreign-callable is the inverse — it wraps a jolt fn as a C-callable
-  function pointer so C can call back into jolt (e.g. GTK signal handlers);
-  free-callable releases it.")
+  result. It also accepts {:varargs-after n}, where n is the positive number of
+  declared fixed C parameters before the "...": the declared argtypes list the
+  fixed params followed by the already-promoted variadic ones, and the boundary
+  lowers to Chez's __varargs_after convention (required where the variadic and
+  fixed calling conventions differ). It composes with :blocking and
+  :capture-native-error. foreign-callable is the inverse — it wraps a jolt fn as
+  a C-callable function pointer so C can call back into jolt (e.g. GTK signal
+  handlers); free-callable releases it.")
 
 ;; foreign-fn binds C symbol `csym` to a typed callable. Expands to the __cfn
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
@@ -58,8 +63,10 @@
 ;; so it's emitted collect-safe and won't pin the garbage collector.
 ;; An options map may instead combine :blocking with
 ;; :capture-native-error. Capture returns [native-result error-code] (result
-;; first), with the error slot read in the foreign-call return path. The analyzer
-;; validates the literal map and rejects capture on :void.
+;; first), with the error slot read in the foreign-call return path. The map may
+;; also carry {:varargs-after n} to declare a variadic C function's fixed-
+;; argument boundary, lowering to Chez's __varargs_after. The analyzer validates
+;; the literal map and rejects capture on :void.
 (defn- cfn-form [csym argtypes rettype args who]
   (let [n (count args)]
     (cond

@@ -1,4 +1,4 @@
-;; ffi-widths-test.ss — exact scalar-width FFI types gate.
+;; ffi-widths-test.ss — exact scalar-width and cross-platform variadic FFI gate.
 ;;
 ;; Exercises the v0.5.17 exact scalar widths (:int8/:i8, :int16/:short,
 ;; :uint16/:ushort, :int32, :uint32) across BOTH halves of jolt.ffi so a typed
@@ -109,6 +109,16 @@
     (equal? '(-128 -32768 65535 -2147483648 4294967295)
             (map (lambda (form) (jnum->exact (ev form)))
                  '("(r-i8)" "(r-i16)" "(r-u16)" "(r-i32)" "(r-u32)"))))
+
+;; --- variadic ABI path: project-owned helper on every supported platform -----
+;; One fixed integer precedes three promoted doubles. A binding that omits or
+;; misplaces Chez's __varargs_after convention is observably wrong on ABIs that
+;; pass floating-point variadic arguments differently from fixed arguments.
+(ev "(def sum-variadic
+       (jolt.ffi/__cfn \"jolt_w_sum_variadic\"
+         [:int :double :double :double] :double {:varargs-after 1}))")
+(ok "variadic boundary preserves promoted doubles"
+    (= 6.875 (ev "(sum-variadic 3 1.5 2.25 3.125)")))
 
 ;; --- callback path: C invokes exact-width jolt foreign-callables -------------
 (for-each
