@@ -71,7 +71,9 @@ External lanes (do not touch):
 | P3 first proof target design | `formal-methods` | `openai/gpt-5.6-terra`, high | docs + P1 register + jolt-sim kernel | **completed** — session `ses_03ffb4ccbffeEMPcSVPkOGLMRK`; report in `reports/P3-FIRST-PROOF-TARGET-DESIGN.md` |
 | Phase 1.5 model trial | `jolt-structure-auditor` via dispatcher `-m fireworks-ai/accounts/fireworks/models/deepseek-v4-flash-0731` | default | 4 research docs, read-only | **superseded** — first run timed out at 300s pre-restart (`ses_0400e39acffek30lUV0PJ2w4EZ`); retried via new profile below |
 | Phase 1.5 retry: claim-discipline checklist | `jolt-research-auditor` via dispatcher (new profile, no `-m`) | Deepseek V4 Flash 0731, profile default, 600s | 4 research docs, read-only | **completed** — session `ses_03ffb0eb6ffe7VL4SDqvMkyErG`; report in `reports/P5-RESEARCH-DOC-CLAIM-CHECKLIST.md`; trial verdict: model suitable for bounded extraction audits |
-| Phase 3 design challenge | external Claude CLI | `sonnet`, high, plan mode, read-only | decision memo + live source | pending (after Phase 2) |
+| Phase 3a design challenge (vendor-independent) | external Claude CLI | `sonnet` (latest alias, Claude Code 2.1.220), high effort, plan mode, Read/Glob/Grep only, $10 budget (user-authorized), no Fable | decision memo + reports + live v0.5.13 + jolt-sim | **in progress** |
+| Phase 3b design challenge (fresh-context internal) | `jolt-deep-reviewer` | Kimi K3 (Fireworks), profile default, read-only | same material | **in progress** |
+| Phase 3 scope rule | both reviewers may flag AT MOST 3 sections each for a later bounded Fable review; no Fable run without explicit user direction | — | — | accepted user constraint |
 | Phase 5 final review | `jolt-reviewer` | `zai-coding-plan/glm-5.2`, high | charter vs sources, read-only | pending |
 
 Selectable model IDs verified via `opencode models` (2026-08-01):
@@ -101,8 +103,34 @@ Dispatch `formal-methods` (default `openai/gpt-5.6-terra`, high), read-only:
 
 ## Decisions accepted
 
-None yet. Charter-phase semantic decisions are explicitly deferred to the user
-after the Phase 2 decision memo.
+All ten charter-phase decisions accepted by the user on 2026-08-01; full text,
+alternatives, and rejected options in `DECISION-MEMO-2026-08-01.md`:
+
+- **D1:** CSIR identity = A3 target (compiler-owned provenance graph, CSIR as
+  versioned projection), staged via A2-minimal CSIR v1 for the first pure
+  fragment; structural site IDs, never line/column hashes.
+- **D2:** boundary taxonomy = B2 (conservative lane inference: ordinary-core /
+  Dynamic-opaque / host-capability / simulation-handler; mechanical widening).
+- **D3:** evidence lattice = C2 (claim-relative partial order + compatible
+  evidence bundles + mandatory record metadata + never-promote list).
+- **D4:** effects v1 = D2 (closed schema-validated core descriptors; dynamic
+  innermost-first strict-LIFO substitution/abortive handlers; NO continuations
+  at this layer; explicit non-goals recorded).
+- **D5:** first proof target = capacity-one mailbox (send/receive/close, no
+  timeout) on the existing jolt-sim cooperative kernel; buggy
+  close-drops-slot known-SAT control; corrected/no-cap BFS; non-vacuity
+  classes; execution is a separate jolt-sim task, not this lane.
+- **D6:** initial pure fragment = P1 §§1–5 core (literals, let*/loop*/fn*/recur,
+  ordered ordinary invoke, if/do, quote, selected throw/try); excludes
+  concurrency, FFI, host interop (operand order UNSPECIFIED), eval,
+  dynamic resolution, raw host values, unresolved reader/equality corners.
+- **D7:** numeric-`=` authority = conformance register (SPEC.md +
+  known-divergences.edn), not README prose.
+- **D8:** `#=` = outside formal-core (opaque/excluded).
+- **D9:** Hegel gaps = hand-build generators in-project; concurrency/time
+  obligations route to jolt-sim, never Hegel; defer hegel API additions.
+- **D10:** charter pins 0.5.13 candidate `021b0b72`; jolt-sim lane owns its own
+  pivot; no cross-gap compatibility claims.
 
 ## Rejected alternatives
 
@@ -202,4 +230,5 @@ User authorized creating bounded profiles for the new models and extending
 | --- | --- | --- | --- |
 | 1 | `62352c15` | handoff skeleton | yes (plan approved) |
 | 2 | `9df9ec38` | P1/P2/P4 reports + handoff state + infra record | yes (restart authorized) |
-| 3 | (pending) | P3 proof-target design + P5 claim checklist + handoff state | pending |
+| 3 | `f1825664` | P3 proof-target design + P5 claim checklist + handoff state | yes (all D1–D10 recs approved) |
+| 4 | (pending) | decision memo (D1–D10 accepted) + handoff state | pending |
