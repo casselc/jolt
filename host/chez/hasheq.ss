@@ -391,13 +391,12 @@
 (define (compute-symbol-object-hasheq sym)
   (compute-symbol-hasheq (symbol-t-ns sym) (symbol-t-name sym)))
 
-;; Chez gives each active thread a private parameter location, initialized from
-;; its parent (or from the main thread for foreign activation), so the slot's
-;; immutable cell carries the table's owning thread id. An inheriting thread
-;; replaces a mismatched cell before any table operation. Distinct live thread
-;; ids therefore give each weak table exactly one mutator: ordinary insertion and
-;; adaptive resize cannot race, while repeated hashes still avoid recomputation
-;; within each thread.
+;; Chez gives each active thread a private parameter location. Whether a newly
+;; active thread observes the initial #f or an inherited cell, the immutable cell
+;; carries the table owner's thread id and a mismatch is replaced before any table
+;; operation. Distinct live thread ids therefore give each weak table exactly one
+;; mutator: ordinary insertion and adaptive resize cannot race, while repeated
+;; hashes still avoid recomputation within each thread.
 (define (thread-owned-weak-hasheq-cache slot)
   (let* ((thread-id (get-thread-id))
          (owned (slot)))
