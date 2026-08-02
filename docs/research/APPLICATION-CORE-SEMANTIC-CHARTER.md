@@ -1174,18 +1174,141 @@ No component above is `proved`; all are in the TCB.
 
 ## 8. One semantic/evidence model consumption
 
-DRAFT PENDING — canonical schema IR driving validators, compiler facts,
-Hegel domains, trace codecs, model domains, refinement contracts, solver
-inputs; sampled vs bounded-complete vs monitored routing per §5; Hegel gaps
-hand-built in-project (D9); concurrency/time obligations to jolt-sim;
-sequential-model variants remain Hegel-`sampled`; no separate user-facing
-languages; generated artifacts carry provenance headers and never assert
-correctness. P11 incorporations: singleton-type-style vacuity warnings
-(always-true/always-false contract branches flagged by the validator);
-capability rule — optional-entry access in contracts requires a prior
-presence check; contract modes (advisory / enforced / discharged-elidable)
-with Checked C erasure as the discharged-mode reference; one property
-artifact drives testing and proof (FuzzChick).
+### 8.1 The principle
+
+There is **one** semantic/evidence model — CSIR (§4), the lane taxonomy
+(§3), the canonical schema IR (§4.5), and §5 evidence records — and every
+consumer reads from and writes to those same artifacts. **No consumer
+invents a parallel vocabulary, and no consumer becomes a separate
+user-facing language:** schemas are Jolt data (Malli/spec-like syntax);
+models are Jolt declarations; monitors are Jolt folds over canonical traces;
+solver obligations are derived, never authored. Generated artifacts carry
+provenance headers (model + version + generating tool) and never assert
+correctness — code actions scaffold, they do not discharge.
+
+### 8.2 The schema IR as shared domain language
+
+One schema declaration drives every consumer (§4.5):
+
+```text
+schema declaration (Jolt data)
+  ├── validator + boundary contract (§4.5 three modes)
+  ├── compiler inference/facts
+  ├── Hegel generator domain
+  ├── canonical trace encoding/redaction
+  ├── model action domain
+  ├── refinement contract
+  └── solver obligation input (§8.6, later stage)
+```
+
+The gradual lattice `Dynamic → partially known shape → precise structural
+schema → refinement` is the only typing story (§4.5); `Dynamic` is not proof
+of membership, and `Dynamic`→precise boundaries receive contracts per §4.5's
+three modes. Resource protocols are schema forms: `Atom<T>`, `Agent<T>`,
+`Chan<in T,out U>`, `Task<T>`, FFI ownership handles.
+
+### 8.3 Hegel consumption (generation and shrinking)
+
+- **Schema → generator domains:** generators derive from schema
+  declarations; the known gaps are hand-built in-project (D9):
+  keyword/symbol leaves via `fmap`, bounded-depth recursion via
+  `bind`/`one-of`, grammar-directed program generation for §6. These are
+  project code, not a new generator language.
+- **Every Hegel result is `sampled`** (§5), with producer-typed coordinates
+  `{seed, tool versions, minimized-source?}` (§5.4); the concrete minimized
+  source is always persisted (P4: stateful traces do not persist args).
+- **Stateful models:** a model declaration (§8.5) compiles to Hegel stateful
+  rules with shrink/replay records.
+- **Concurrency and time obligations route to jolt-sim, never Hegel** (D9,
+  scoped): cross-task transient escape, multi-thread atom linearizability,
+  deref timeouts. Their **sequential-model variants remain Hegel-`sampled`**
+  (P12 reconciliation) — Hegel is never the producer of bounded-complete or
+  concurrent-schedule evidence.
+
+### 8.4 jolt-sim consumption (traces, replay, monitors)
+
+- **Trace document:** canonical values only (rejects host objects and
+  unstable mutable positions — P2/jolt-sim `trace`). Lanes within one
+  document: deterministic choices, modeled transitions, observed lifecycle
+  events, effect-route evidence, cleanup/controlledness status. Structural
+  document validation is owned by `trace` (kernel-independent; F4
+  reconciliation), not by the kernel or any monitor.
+- **Origins and provenance ride as trace-schema metadata fields, never
+  inside canonical values** (§4.4, P11 B.7).
+- **Replay is producer-typed** (§5.4): jolt-sim action-path replay validates
+  enabled choices and canonical projections (`kernel.clj:667-698`); Hegel
+  replay is seed-based. One record schema, per-producer coordinates (P12
+  F1).
+- **Monitors:** pure folds over validated trace documents returning
+  `:pass` / `:violation` / `:inconclusive` (`monitor.clj:100-146`);
+  finite-trace safety only (§5.1 — never unbounded liveness). Observation
+  coverage is declared per mapping (`:required` / `:audit-only` /
+  `:best-effort`); unknown, malformed, lost, or ambiguously mapped events
+  are `inconclusive`/`failed` per policy, never silently ignored (P5 B.16).
+- Live-collection observations are terminal only at declared quiescence
+  points (§3.4 hazard rule).
+
+### 8.5 Model declarations (the defmodel path)
+
+A **model declaration** is Jolt data: state schema, bounds, operations
+`{name, args domain, pre, step}`, invariants, and literal examples. One
+declaration drives, at increasing evidence levels:
+
+```text
+literal example tests (sampled, literal cases)
+  → Hegel stateful rules (sampled)
+  → finite explorer input (bounded-complete iff finished uncapped, §5.1)
+  → offline monitor folds (monitored, per coverage)
+  → shrink/replay records (producer-typed coordinates)
+```
+
+The §7 mailbox is the reference instance of this pattern. Explorer terminals
+are `:completed` / `:failed` / `:deadlock` / `:step-limit`; a state-cap
+result is `inconclusive`, never a pass (§7.3).
+
+### 8.6 External solver consumption (later stage)
+
+Backend-neutral obligations are **derived** from CSIR + schemas — never
+hand-authored in solver syntax:
+
+| Obligation kind | Backend | Level rule |
+| --- | --- | --- |
+| Relational bounded witness | relational/solver backend | `sampled`/`bounded-complete` per declared relation |
+| Inductive invariant, resource lemma | SMT or proof-assistant backend | `proved` iff certificate checked, with stated TCB |
+| Protocol/distributed temporal model | TLA+/Quint/other temporal backend | only the exact independently verified bounded claim |
+
+Constraints carried forward (P11/Cedar, §9): fragment types map 1:1 to
+decidable theories; ground well-formedness over the finite footprint, never
+quantifiers; validator as precondition making the encoding total; errors
+encoded explicitly; restricted subtyping. Generated solver skeletons are
+**drafts requiring human review**, marked as generated, never certified
+translations. A "verified X" claim without a checked certificate is
+`assumed`, not `proved` (§5.6 — the Cedar §1-vs-§4.4 precedent is exactly
+what this rule exists for).
+
+### 8.7 REPL, debugger, and agent experience consumption
+
+For each source transition, shared CSIR/evidence infrastructure displays:
+source and macro provenance (§4); schema/contracts/inferred facts (§4.5);
+effects/capabilities/resource ownership (§3.3); proof status and assumptions
+(§5 records); runtime events and model projection (§8.4); replay controls
+and minimized witnesses; and opaque host crossings with their lane (§3.2
+widening-site records). **Agents may propose** declarations, proofs, model
+decompositions, adapters, and regressions; **only compiler/toolchain
+evidence upgrades a claim** (§5.6).
+
+### 8.8 Contract modes in practice
+
+- **Advisory** (development): inline schemas checked in REPL/dev mode;
+  throttled or sampled validation is `sampled` evidence, never a type or
+  proof claim.
+- **Enforced** (untrusted/sandbox/FFI/capability boundaries): boundary
+  contracts with explicit violation reports; the violation report names
+  which side failed — the `Dynamic` side is blamed; the precise side is
+  blameless (Checked C blame-theorem shape, P11 C).
+- **Discharged-elidable:** a contract may be elided only with recorded
+  justification (a checked proof discharging it); Checked C's erasure is
+  the reference mode. Throttled validation is never a discharge.
 
 ## 9. Staged exit criteria
 
