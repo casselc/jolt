@@ -55,6 +55,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `{:blocking true}`; omitted/false capture keeps the existing scalar
   result, and unsupported targets or malformed options fail closed.
 
+- **`jolt.host/target`, an exact fail-closed compiler-target descriptor.**
+  Reports `:os`, `:arch`, `:abi`, `:libc`, `:endian`, `:pointer-bits`,
+  `:file-separator`, `:path-separator`, and `:processors`. The compiler target's
+  OS, architecture, and ABI come from an exact allowlist checked against
+  `rt.ss`'s native-error convention selection; an unrecognized machine tuple
+  fails closed to `:unknown` instead of guessing, while independently measurable
+  runtime facts remain available. `System`'s
+  `os.name`, the new `os.arch`, `line.separator`, `file.separator`, and
+  `path.separator` (individually, via `System/lineSeparator`, and via
+  `System/getProperties`) now project from these same target facts, replacing
+  the previous fuzzy machine-name substring scan for `os.name` — one classifier
+  instead of two independent authorities. Optional native-symbol resolution now
+  also selects its Windows-safe path from the compiler target, including Windows
+  ARM64, so cross-images cannot bake POSIX relocations into Windows output.
+
 ## [0.5.17] - 2026-08-01
 
 Gaps and wrong answers on the `java.lang.String` surface, found by probing it after
