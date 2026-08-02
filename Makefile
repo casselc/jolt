@@ -60,7 +60,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release jolt-sim joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selectedchez selfhost shakelocal \
-  simcontroller simimagesmoke traceemit \
+  simcontroller simimagesmoke targetfacts traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
 
@@ -117,7 +117,7 @@ install: build
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffideclaredhook ffinativehook \
-  simcontroller \
+  simcontroller targetfacts \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
@@ -468,6 +468,13 @@ ffinativehook:
 # transient seed like ffideclaredhook.
 simcontroller:
 	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/sim-controller-bridge-test.ss
+
+# jolt.host/target: the exact fail-closed (os arch abi) classifier stays in
+# lockstep with rt.ss's native-error convention macro, and the current host's
+# System/Runtime surface (os.name/os.arch/separators/processors) projects
+# coherently from the same target facts.
+targetfacts:
+	@$(CHEZ) --script test/chez/target-descriptor-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
