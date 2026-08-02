@@ -112,6 +112,7 @@ No compiler/runtime implementation until charter + first proof target accepted.
 | `docs/research/reports/P8-FABLE-SLICE1-IDENTITY-SPINE.md` | primary orchestrator (this lane) | advisory review; F1–F7 approved and applied |
 | `docs/research/reports/P9-FABLE-SLICE2-PROOF-TARGET.md` | primary orchestrator (this lane) | advisory review; G1–G6 approved and applied |
 | `docs/research/reports/P10-V0517-REFRESH-REGISTER.md` | primary orchestrator (this lane) | unreviewed working artifact; **citation authority for charter** |
+| `docs/research/reports/P11-EXTERNAL-REFERENCE-AUDITS.md` | primary orchestrator (this lane) | unreviewed working artifact; incorporation dispositions pending |
 | `docs/research/APPLICATION-CORE-SEMANTIC-CHARTER.md` | primary orchestrator (this lane) | **drafting — section-by-section user review before each commit** |
 | everything else in worktree | untouched at base SHA | — |
 
@@ -137,6 +138,7 @@ External lanes (do not touch):
 | P4 Hegel/differential obligations | `property-testing` | `zai-coding-plan/glm-5.2`, high | jolt-hegel + 2 research docs, read-only | **completed** — session `ses_0400e9f45ffe91J6BPnLROGN95`; report in `reports/P4-EXECUTABLE-OBLIGATIONS-MATRIX.md` |
 | P3 first proof target design | `formal-methods` | `openai/gpt-5.6-terra`, high | docs + P1 register + jolt-sim kernel | **completed** — session `ses_03ffb4ccbffeEMPcSVPkOGLMRK`; report in `reports/P3-FIRST-PROOF-TARGET-DESIGN.md` |
 | P10 v0.5.17 facts refresh | `jolt-runtime-engineer` | `openai/gpt-5.6-sol`, high | v0517 reference tree + P1 register, read-only | **completed** — session `ses_03fabf181ffey963aAQ9f2A0wU`; report in `reports/P10-V0517-REFRESH-REGISTER.md`. Verdicts: 7 CONFIRMED (invoke order, interop opacity, macro phase, atoms, settlement, core.async, conveyance, compile spine), 3 CHANGED (IR `:def :meta` duplication; `jolt.host/mono-nanos`+`wall-nanos` new; telemetry primitives), 1 REMOVED (sim/controller overlay — no lifecycle seam at v0.5.17) |
+| P11 external reference audits (user-supplied refs) | 4× `jolt-research-auditor` (Deepseek profile, in-session) | profile default | local captures in `/home/chuck/ai-src/refs-cache/` | **completed** — Hydro `ses_03f56c807ffeopMEfiWfffZ6dn`, Cedar `ses_03f5696b8ffe77gNhKbPqjgFtd`, trio `ses_03f51390dffeTdB0JSM7AyK4RE`, provenance `ses_03f5106fdffe2VxJGkwltbBD7H`; report `reports/P11-EXTERNAL-REFERENCE-AUDITS.md`. Note: Deepseek cannot read PDFs natively (refused to fabricate — correct); PDFs extracted via uv+pymupdf to markdown. Auditor corrections: Rubydust is dynamic *type inference* (not origin tracking); ICSE'13 is EXPOSITOR time-travel debugging (not provenance); Dafny paper is the Cutler/Torlak/Hicks stability extended abstract |
 | Phase 1.5 model trial | `jolt-structure-auditor` via dispatcher `-m fireworks-ai/accounts/fireworks/models/deepseek-v4-flash-0731` | default | 4 research docs, read-only | **superseded** — first run timed out at 300s pre-restart (`ses_0400e39acffek30lUV0PJ2w4EZ`); retried via new profile below |
 | Phase 1.5 retry: claim-discipline checklist | `jolt-research-auditor` via dispatcher (new profile, no `-m`) | Deepseek V4 Flash 0731, profile default, 600s | 4 research docs, read-only | **completed** — session `ses_03ffb0eb6ffe7VL4SDqvMkyErG`; report in `reports/P5-RESEARCH-DOC-CLAIM-CHECKLIST.md`; trial verdict: model suitable for bounded extraction audits |
 | Phase 3a design challenge (vendor-independent) | external Claude CLI | `sonnet` (latest alias, Claude Code 2.1.220), high effort, plan mode, Read/Glob/Grep only, $10 budget (user-authorized), no Fable | decision memo + reports + live v0.5.13 + jolt-sim | **completed** — report in `reports/P6-CLAUDE-DESIGN-CHALLENGE.md`; nonpersistent, no session ID |
@@ -400,7 +402,8 @@ User authorized creating bounded profiles for the new models and extending
 | 15 | `1b3840c5`+`688aaa45` | PR policy update + draft PR #12 recorded/pushed | yes (user directed PR) |
 | 16 | `315f0c0d` | H3 sub-decisions S1–S3 confirmed | yes |
 | 17 | `152dd732` | charter §1 revisions: Clojure.next neutrality + §1.5 staging + H4 eager-first | yes (directions given in §1 review) |
-| 18 | (pending) | H5 canonical-hash decision + charter §2 full draft (evaluation order + observable semantics) | pending |
+| 18 | `a7889565` | H5 canonical-hash decision + charter §2 full draft (evaluation order + observable semantics) | §2 under user review |
+| 19 | (pending) | P11 external reference audits + handoff state | pending |
 
 ## §1 review outcome (2026-08-01)
 
