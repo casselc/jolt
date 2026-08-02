@@ -26,6 +26,22 @@
   subtraction-safe bounds, and nonzero-length null pointers before any native
   access or mutation.
 
+  with-byte-array-pointer is a scoped, synchronous in-out bridge, not a
+  zero-copy view: (with-byte-array-pointer arr f) loans the whole signed byte
+  array and (with-byte-array-pointer arr off len f) loans one validated range.
+  Each calls f with [pointer validated-length]. It validates the byte-array
+  kind and subtraction-safe range before any allocation or callback, copies the
+  selected signed bytes into a temporary native-octet bytevector, locks it for a
+  stable address only for f's dynamic extent, then copies its octets back as
+  signed bytes on normal return, jolt/host exception, and nonlocal exit. Native
+  code must not retain the pointer; the loaned range is owned by copy-back while
+  f runs. A nested loan of the same array on one thread is rejected, while
+  distinct-array nesting is allowed. Callers must prevent overlapping loan
+  lifetimes or other access to the same array across threads, even for disjoint
+  ranges; joining a child before an outer callback returns does not make two
+  independent snapshot copy-backs safe. A captured continuation cannot re-enter
+  a retired loan. It performs no native call itself, so it captures no errno.
+
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers
   a compile-time-typed signature to a real Chez foreign-procedure. Its optional
