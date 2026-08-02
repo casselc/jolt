@@ -244,6 +244,7 @@ cts: testbin
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
