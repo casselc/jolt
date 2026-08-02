@@ -46,6 +46,8 @@ No compiler/runtime implementation until charter + first proof target accepted.
 | `docs/research/reports/P4-EXECUTABLE-OBLIGATIONS-MATRIX.md` | primary orchestrator (this lane) | unreviewed working artifact |
 | `docs/research/reports/P3-FIRST-PROOF-TARGET-DESIGN.md` | primary orchestrator (this lane) | unreviewed working artifact |
 | `docs/research/reports/P5-RESEARCH-DOC-CLAIM-CHECKLIST.md` | primary orchestrator (this lane) | unreviewed working artifact |
+| `docs/research/reports/P6-CLAUDE-DESIGN-CHALLENGE.md` | primary orchestrator (this lane) | advisory review, reconciled |
+| `docs/research/reports/P7-DEEP-REVIEW-CHALLENGE.md` | primary orchestrator (this lane) | advisory review, reconciled |
 | everything else in worktree | untouched at base SHA | — |
 
 Out-of-worktree session infrastructure (not lane artifacts, not in a git repo):
@@ -71,9 +73,9 @@ External lanes (do not touch):
 | P3 first proof target design | `formal-methods` | `openai/gpt-5.6-terra`, high | docs + P1 register + jolt-sim kernel | **completed** — session `ses_03ffb4ccbffeEMPcSVPkOGLMRK`; report in `reports/P3-FIRST-PROOF-TARGET-DESIGN.md` |
 | Phase 1.5 model trial | `jolt-structure-auditor` via dispatcher `-m fireworks-ai/accounts/fireworks/models/deepseek-v4-flash-0731` | default | 4 research docs, read-only | **superseded** — first run timed out at 300s pre-restart (`ses_0400e39acffek30lUV0PJ2w4EZ`); retried via new profile below |
 | Phase 1.5 retry: claim-discipline checklist | `jolt-research-auditor` via dispatcher (new profile, no `-m`) | Deepseek V4 Flash 0731, profile default, 600s | 4 research docs, read-only | **completed** — session `ses_03ffb0eb6ffe7VL4SDqvMkyErG`; report in `reports/P5-RESEARCH-DOC-CLAIM-CHECKLIST.md`; trial verdict: model suitable for bounded extraction audits |
-| Phase 3a design challenge (vendor-independent) | external Claude CLI | `sonnet` (latest alias, Claude Code 2.1.220), high effort, plan mode, Read/Glob/Grep only, $10 budget (user-authorized), no Fable | decision memo + reports + live v0.5.13 + jolt-sim | **in progress** |
-| Phase 3b design challenge (fresh-context internal) | `jolt-deep-reviewer` | Kimi K3 (Fireworks), profile default, read-only | same material | **in progress** |
-| Phase 3 scope rule | both reviewers may flag AT MOST 3 sections each for a later bounded Fable review; no Fable run without explicit user direction | — | — | accepted user constraint |
+| Phase 3a design challenge (vendor-independent) | external Claude CLI | `sonnet` (latest alias, Claude Code 2.1.220), high effort, plan mode, Read/Glob/Grep only, $10 budget (user-authorized), no Fable | decision memo + reports + live v0.5.13 + jolt-sim | **completed** — report in `reports/P6-CLAUDE-DESIGN-CHALLENGE.md`; nonpersistent, no session ID |
+| Phase 3b design challenge (fresh-context internal) | `jolt-deep-reviewer` | Kimi K3 (Fireworks), profile default, read-only | same material | **completed** — session `ses_03fedc27dffe5yQx7iH7RXij1y`; report in `reports/P7-DEEP-REVIEW-CHALLENGE.md` |
+| Phase 3 scope rule | both reviewers flagged ≤3 sections each for later bounded Fable review; no Fable run without explicit user direction | — | — | satisfied; candidates recorded below |
 | Phase 5 final review | `jolt-reviewer` | `zai-coding-plan/glm-5.2`, high | charter vs sources, read-only | pending |
 
 Selectable model IDs verified via `opencode models` (2026-08-01):
@@ -134,7 +136,58 @@ alternatives, and rejected options in `DECISION-MEMO-2026-08-01.md`:
 
 ## Rejected alternatives
 
-None yet.
+See `DECISION-MEMO-2026-08-01.md` §Rejected alternatives (A1, B1, B3, C1, C3,
+D1, D3, D5-alternative). Phase 3 (P6/P7) did not overturn any rejection.
+
+## Phase 3 design-challenge reconciliation (2026-08-01)
+
+Two independent challenges (P6 Claude Sonnet, vendor-independent; P7 Kimi K3,
+fresh-context internal) reviewed the decision memo + P1–P5. **All four
+load-bearing citations verified with exact line numbers by both reviewers**;
+P7 additionally verified the explore-states fixture counts, hermetic
+fail-closed routing, replay validation, and monitor fold. No evidence-lattice
+violation found. Convergent findings and primary dispositions:
+
+Accepted wording/precision amendments (non-substantive):
+- A1: P3 §4 evidence table gains the "after execution" qualifier (P6 MINOR).
+- A2: "carries only optional :pos" → "only :pos carries source metadata; none
+  of the 13 optional annotation keys carries provenance/site/resource/
+  assumptions" (P7 m4).
+- A3: "finish BFS with no state cap" → "must terminate `:completed`, never
+  `:state-limit`" (P7 m3; explorer requires positive `:max-states`).
+- A4: D9 "never Hegel" scoped: concurrent/timed variants route to jolt-sim;
+  sequential-model variants remain Hegel-`sampled` (P6 MINOR).
+- A5: registered-callback sentence completed: "…contract is declared, it may
+  be narrowed to a named capability lane" (P7 m5).
+- A6: P3 `:steps :steps` typo (P7 m8). A7: max-steps-7 derivation line added
+  (≤6 task transitions; 7 gives one slack) (P7 q1).
+
+Decision clarifications requiring user approval (presented in chat 2026-08-01):
+- C1 (D1): record A3-over-A2 as architect judgment pending a concrete
+  consumer; add CSIR v1 staging (field set, version pin, owner, exit test).
+- C2 (D5): quote F4 verbatim; resolve by lane priority; declare milestone
+  claim "TCB-validation-only, empty refinement relation"; record the
+  0.5.13-substrate dependency.
+- C3 (D7): rescope to conformance-lane test authority only; formal v1 fragment
+  makes no numeric-`=` claim; drop "(executable-derived)".
+- C4 (new): D4 descriptor `site-id` IS the D1 CSIR site ID (one ID space).
+- C5 (new): owners — CSIR schema/versioning = future Jolt core lane; charter
+  evidence-record acceptance = this lane until Codex handoff.
+
+Deferred to charter content: staged exit criteria detail (charter §9),
+enumeration of "selected throw/try/catch/finally" (charter §2),
+Hegel/differential ordering (CSIR v1 + reference evaluator first, generated
+cases second; hegel API additions remain deferred).
+
+Fable candidates flagged (union of both reviewers; NOT scheduled; Fable only
+on explicit user direction):
+1. D1 identity spine: A3-vs-A2 justification + site-ID/macro-digest-chain/
+   declared-anchor rule (P6+P7).
+2. D5/F4 full reconciliation read (P6) + P3 mailbox transition relation and
+   controls adequacy incl. max-steps derivation (P7).
+3. Site-ID ↔ descriptor unification cross-check once charter §4/§6 exist (P6).
+4. D3/C2 lattice soundness + one-record-schema sufficiency across Hegel
+   seed-only replay vs jolt-sim action-path replay (P7).
 
 ## Open questions
 
@@ -231,4 +284,5 @@ User authorized creating bounded profiles for the new models and extending
 | 1 | `62352c15` | handoff skeleton | yes (plan approved) |
 | 2 | `9df9ec38` | P1/P2/P4 reports + handoff state + infra record | yes (restart authorized) |
 | 3 | `f1825664` | P3 proof-target design + P5 claim checklist + handoff state | yes (all D1–D10 recs approved) |
-| 4 | (pending) | decision memo (D1–D10 accepted) + handoff state | pending |
+| 4 | `0328c988` | decision memo (D1–D10 accepted) + handoff state | yes (design challenge authorized) |
+| 5 | (pending) | P6/P7 challenge reports + reconciliation + handoff state | pending |
