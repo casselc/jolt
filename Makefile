@@ -57,7 +57,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
-  gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
+  gateboot gatebootsmoke hasheqconcurrency httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret remint sci selectedchez selfhost \
   shakelocal shakesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
@@ -124,6 +124,18 @@ unit:
 # The fresh compilation pass must retain the exact caller-selected Chez.
 selectedchez:
 	@CHEZ="$(CHEZ)" sh test/chez/selected-chez-test.sh
+
+# Concurrent weak hash-cache regression: four coordinated Chez threads hammer
+# the production string/symbol hasheq caches (host/chez/hasheq.ss) with shared
+# hot keys + fresh weak keys under bounded allocation/collection pressure,
+# checking every result against the pure compute-string-hasheq /
+# compute-symbol-hasheq functions. Process-isolated per attempt with a portable
+# bounded timeout. A failing run preserves every attempt, including earlier
+# successful controls; JOLT_HASHEQ_CONCURRENCY_KEEP=1 keeps all-green runs too.
+# Keep this focused until old-control reliability and fixed cross-platform
+# stability justify registering it in the full CI aggregate.
+hasheqconcurrency:
+	@sh test/chez/hasheq-concurrency-test.sh "$(CHEZ)"
 
 # Real-CLI smoke over bin/jolt.
 # The CLI and build gates spawn a jolt process per case; a prebuilt binary boots
