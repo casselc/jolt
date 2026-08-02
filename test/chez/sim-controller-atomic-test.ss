@@ -347,6 +347,119 @@
     (= 0 (jolt-mono-nanos)))
 (jolt-sim-restore-controller! domain-fresh-token)
 
+;; The active-owner check precedes the domain mutex: same-thread controlled
+;; clock reentry fails immediately rather than self-deadlocking.
+(define clock-reentry-rejected? #f)
+(define clock-reentry-token
+  (install native-ffi
+           (lambda (_ __)
+             (set! clock-reentry-rejected? (raises? jolt-mono-nanos))
+             7)))
+(ok "same-thread controlled clock reentry fails before domain locking"
+    (and (= 7 (jolt-mono-nanos)) clock-reentry-rejected?))
+(jolt-sim-restore-controller! clock-reentry-token)
+
+;; Domain-mutex linearization discriminator. jolt-sim-mono-nanos used to call
+;; the clock source outside the domain mutex, so B could publish a later sample
+;; while A held an earlier one and A would then fail as "backward". The mutex
+;; now spans both operations, making their order explicit.
+;;
+;; A obtains sample 1 and parks on a condition. B then attempts sample 2. The
+;; old runtime lets B publish first; the corrected runtime blocks B until A is
+;; released. Every wait is bounded and no scheduler sleep is involved.
+(define clock-race-seq (box 0))
+(define clock-race-seq-mu (make-mutex))
+(define (clock-race-next-seq!)
+  (with-mutex clock-race-seq-mu
+    (let ((n (+ 1 (unbox clock-race-seq)))) (set-box! clock-race-seq n) n)))
+(define clock-race-mu (make-mutex))
+(define clock-race-cv (make-condition))
+(define clock-race-a-parked? #f)
+(define clock-race-release? #f)
+(define clock-race-a-done? #f)
+(define clock-race-b-done? #f)
+(define clock-race-a-error #f)
+(define clock-race-b-error #f)
+(define clock-race-a-value #f)
+(define clock-race-b-value #f)
+(define (clock-race-controller descriptor proceed)
+  (let ((n (clock-race-next-seq!)))
+    (when (= n 1)
+      (with-mutex clock-race-mu
+        (set! clock-race-a-parked? #t)
+        (condition-broadcast clock-race-cv)
+        (let ((deadline (ms->deadline 5000)))
+          (let wait ()
+            (unless clock-race-release?
+              (unless (condition-wait clock-race-cv clock-race-mu deadline)
+                (error 'clock-race-test "thread A release deadline"))
+              (wait))))))
+    n))
+(define clock-race-token (install native-ffi clock-race-controller))
+(fork-thread
+ (lambda ()
+   (guard (e (#t (set! clock-race-a-error e)))
+     (set! clock-race-a-value (jolt-mono-nanos)))
+   (with-mutex clock-race-mu
+     (set! clock-race-a-done? #t) (condition-broadcast clock-race-cv))))
+(define clock-race-a-parked-timeout? #f)
+(with-mutex clock-race-mu
+  (let ((deadline (ms->deadline 5000)))
+    (let wait ()
+      (unless clock-race-a-parked?
+        (if (condition-wait clock-race-cv clock-race-mu deadline)
+            (wait)
+            (set! clock-race-a-parked-timeout? #t))))))
+(fork-thread
+ (lambda ()
+   (guard (e (#t (set! clock-race-b-error e)))
+     (set! clock-race-b-value (jolt-mono-nanos)))
+   (with-mutex clock-race-mu
+     (set! clock-race-b-done? #t) (condition-broadcast clock-race-cv))))
+;; Bounded hold: give thread B every opportunity to race ahead of the
+;; still-parked thread A before A is released. Thread B's whole fetch+validate
+;; is a handful of calls; this fixed, generous hold is a safety bound on the
+;; test's own coordination, not a guess at scheduler timing — the fix's
+;; correctness does not depend on how long this hold lasts, only how reliably
+;; this test reproduces the old bug on unfixed code does.
+(with-mutex clock-race-mu
+  (let ((deadline (ms->deadline 300)))
+    (let wait ()
+      (unless clock-race-b-done?
+        (when (condition-wait clock-race-cv clock-race-mu deadline)
+          (wait))))))
+(define clock-race-b-raced-ahead? clock-race-b-done?)
+(with-mutex clock-race-mu
+  (set! clock-race-release? #t) (condition-broadcast clock-race-cv))
+(define clock-race-a-finish-timeout? #f)
+(with-mutex clock-race-mu
+  (let ((deadline (ms->deadline 5000)))
+    (let wait ()
+      (unless clock-race-a-done?
+        (if (condition-wait clock-race-cv clock-race-mu deadline)
+            (wait)
+            (set! clock-race-a-finish-timeout? #t))))))
+(define clock-race-b-finish-timeout? #f)
+(with-mutex clock-race-mu
+  (let ((deadline (ms->deadline 5000)))
+    (let wait ()
+      (unless clock-race-b-done?
+        (if (condition-wait clock-race-cv clock-race-mu deadline)
+            (wait)
+            (set! clock-race-b-finish-timeout? #t))))))
+(ok "clock-domain race rendezvous completed within deadline"
+    (not (or clock-race-a-parked-timeout? clock-race-a-finish-timeout?
+             clock-race-b-finish-timeout?)))
+(ok "thread B cannot publish while thread A's earlier sample is still parked"
+    (not clock-race-b-raced-ahead?))
+(ok "thread A's genuinely-earlier sample is never rejected as backward"
+    (not clock-race-a-error))
+(ok "thread B's genuinely-later sample is never rejected as backward"
+    (not clock-race-b-error))
+(ok "both concurrent samples were accepted in obtain order"
+    (and (equal? 1 clock-race-a-value) (equal? 2 clock-race-b-value)))
+(jolt-sim-restore-controller! clock-race-token)
+
 ;; Pin read-array!'s argument order and both current write-array arities without
 ;; allowing fake pointers to reach Chez.
 (define seen '())
