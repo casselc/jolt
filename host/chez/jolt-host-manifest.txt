@@ -110,6 +110,8 @@ maximum-memory-bytes
 monitor-enter
 monitor-exit
 mono-nanos
+monotonic-nanos
+monotonic-source
 park-until-interrupt
 protocol-methods
 rational-type?

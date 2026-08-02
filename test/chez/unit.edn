@@ -698,6 +698,8 @@
   ;; finer than millisecond granularity: 200 back-to-back reads can't all land on a
   ;; 1e6 boundary unless the clock is really a millisecond counter scaled by 1e6.
   {:suite "telemetry" :expr "(some (fn [_] (pos? (rem (jolt.host/mono-nanos) 1000000))) (range 200))" :expected "true"}
+  {:suite "telemetry" :expr "(let [a (jolt.host/monotonic-nanos) b (jolt.host/monotonic-nanos)] (>= b a))" :expected "true"}
+  {:suite "telemetry" :expr "(= :monotonic (jolt.host/monotonic-source))" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/cpu-nanos) 0)" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/real-nanos) 0)" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/gc-count) 0)" :expected "true"}
