@@ -115,6 +115,7 @@ No compiler/runtime implementation until charter + first proof target accepted.
 | `docs/research/reports/P11-EXTERNAL-REFERENCE-AUDITS.md` | primary orchestrator (this lane) | incorporations approved and applied |
 | `docs/research/reports/P12-EVIDENCE-LATTICE-REVIEW.md` | primary orchestrator (this lane) | advisory review; all 8 findings accepted and applied |
 | `docs/research/reports/P13-SITE-ID-UNIFICATION-REVIEW.md` | primary orchestrator (this lane) | advisory review; all findings accepted and applied |
+| `docs/research/reports/P14-FINAL-CHARTER-REVIEW.md` | primary orchestrator (this lane) | advisory review; accept-with-amendments, all applied |
 | `docs/research/APPLICATION-CORE-SEMANTIC-CHARTER.md` | primary orchestrator (this lane) | **drafting — section-by-section user review before each commit** |
 | everything else in worktree | untouched at base SHA | — |
 
@@ -414,7 +415,7 @@ User authorized creating bounded profiles for the new models and extending
 | 25 | `5991de22`+`9a974b6a` | charter §7 draft (first proof target) + handoff checkpoint | **§7 accepted** |
 | 26 | `a3b6f12c` | charter §8 draft (one-model consumption) | **§8 accepted** |
 | 27 | `484f8914` | charter §9 draft (staged exit criteria) — completes the charter | **§9 accepted; charter complete** |
-| 28 | (pending) | Phase 5: jolt-reviewer final independent review + reconciliation | pending |
+| 28 | (pending) | Phase 5: P14 final review + all amendments applied | pending |
 
 ## §1 review outcome (2026-08-01)
 
@@ -433,10 +434,13 @@ rule; failed-disposition rule; levels-vs-tags-vs-statuses terminology; plus
 `ses_03f0299eeffezA6kA7HMb3KkbS`, report `reports/P13-SITE-ID-UNIFICATION-REVIEW.md`)
 found 1 blocker + 3 majors + 1 minor + 1 question-finding — **all accepted
 and applied before commit**. **§1–§9 + Appendix A ALL ACCEPTED 2026-08-01 — the charter is complete and
-accepted.** Phase 5 (final independent review, `jolt-reviewer`) dispatched
-2026-08-01. Remaining after reconciliation: Codex-requested companion
-artifact (whole-system flow model + requested runtime seams register), then
-final handoff checkpoint to Codex.
+accepted.** Phase 5 complete: `jolt-reviewer` final review (session
+`ses_03ce2a213fferS1t1XO94rUVzT`, report `reports/P14-FINAL-CHARTER-REVIEW.md`)
+returned **accept-with-amendments** — 2 majors (§1.2 citation cluster; NaN
+canonical-comparison tension) + 4 minors + 1 question, **all accepted and
+applied**. 25+ load-bearing citations re-verified against v0.5.17 + jolt-sim.
+Remaining: Codex-requested companion artifact (whole-system flow model +
+requested runtime seams register), then final handoff checkpoint to Codex.
 
 User approved §1 with two directions:
 1. **Implementation-neutrality (Clojure.next core):** the charter's semantics

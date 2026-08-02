@@ -73,6 +73,12 @@ recorded in the versioned profile matrix (§1.4):
 | `target-dependent` | Behavior legitimately differs by target; each target's semantics is named separately |
 | `opaque` | No portable semantics; claims may not cross this boundary (§3) |
 
+**Evidence discipline for realization notes (P14 MINOR-6):** realization
+notes throughout this charter come from source-reading audits (P1/P10) and
+carry no executed evidence level — they are documentation, never the
+definition of core semantics. Formal evidence for the fragment routes
+through §6 (`sampled`).
+
 ### 1.2 The v1 formal-core profile
 
 Values (portable semantics; realizations cited as notes; details in §2):
@@ -81,16 +87,18 @@ Values (portable semantics; realizations cited as notes; details in §2):
 - **Exact integers:** unbounded exact semantics — arithmetic is always exact
   (bignum semantics); implementations may use a small-integer fast path
   *(realization: Jolt-on-Chez uses Chez 61-bit fixnums with exact bignum
-  promotion, `V17` P10 #2)*. Fixed-width interop casts are explicit checked
-  operations whose width set is `target-dependent`; they are not part of core
-  arithmetic.
+  promotion — P1 §2 [v0513]; not re-verified at v0.5.17, no changelog entries
+  for this area in 0.5.14–0.5.17 per P10 (c))*. Fixed-width interop casts
+  are explicit checked operations whose width set is `target-dependent`;
+  they are not part of core arithmetic.
 - **Exact ratios** (non-integer rationals); **IEEE-754 binary64 doubles**
   (no single-float in the core).
 - **Strings:** immutable sequences of **Unicode scalar values**. `count` and
   indexing are by scalar value; a scalar value cannot be split by `subs`.
   *(Realization: JVM hosts index UTF-16 code units and CAN split surrogate
   pairs — a platform accident, `target-dependent`, not core semantics.
-  Jolt-on-Chez indexes scalar values directly, `V17` P10 #2.)*
+  Jolt-on-Chez indexes scalar values directly — P1 §2 [v0513]; not
+  re-verified at v0.5.17, no changelog entries for this area per P10 (c).)*
 - **Symbols** (namespace/name, not interned, may carry metadata); **keywords**
   (namespace/name, interned — identity-stable).
 - **Collections:** persistent lists, vectors, maps, sets. Equality and
@@ -98,8 +106,9 @@ Values (portable semantics; realizations cited as notes; details in §2):
   hash-based maps/sets is unspecified** (realization-dependent; only sorted
   collections guarantee order). *(Realizations: Jolt-on-Chez vectors are
   32-way tries with tails; maps use insertion-ordered small maps promoting to
-  HAMT past thresholds; sets are hash-ordered HAMTs — `V17` P10 #2. JVM
-  realizations differ in kind, not in this portable contract.)*
+  HAMT past thresholds; sets are hash-ordered HAMTs — P1 §2 [v0513]; not
+  re-verified at v0.5.17, no changelog entries for this area per P10 (c).
+  JVM realizations differ in kind, not in this portable contract.)*
 - **Equality, hashing, comparison:** as **test authority**, the conformance
   register governs test expectations where it conflicts with README prose
   (C3). The formal v1 fragment makes **no numeric-`=` claim** (D6/C3);
@@ -236,12 +245,12 @@ most are staged as follows (exit criteria in §9):
   defined realization, exception, cancellation, and resource semantics,
   specified separately from the eager core.
 - **Coordination and async (atoms, promises/delays/futures, agents,
-  channels/core.async-equivalent, timers, Flow):** stage after the
-  coordination-kernels stage (§9), and gated on the v0.5.17 runtime lane
-  delivering lifecycle observation/control seams (non-goal 13: requested,
-  never assumed). The §7 mailbox proof target is the seed of this work —
-  capacity/blocked/close/drain semantics on the cooperative model before any
-  runtime channel semantics is claimed.
+  channels/core.async-equivalent, timers, Flow):** a **coordination-kernels
+  stage beyond §9's current enumeration** (P14 MINOR-5), gated on the
+  v0.5.17 runtime lane delivering lifecycle observation/control seams
+  (non-goal 13: requested, never assumed). The §7 mailbox proof target is
+  the seed of this work — capacity/blocked/close/drain semantics on the
+  cooperative model before any runtime channel semantics is claimed.
 - **Effect handlers and simulation worlds:** the H3 derivation hierarchy and
   tier model land with the runtime lane's controller; this charter specifies
   the contracts, not the ABI.
@@ -339,7 +348,9 @@ rule here is UNSPECIFIED and out of fragment, not implicitly host behavior.
   specialization.)*
 - **Determinism statement:** within the fragment, observable evaluation order
   is fully determined by these rules; no unspecified order remains. This is
-  what makes the §6 differential relation well-defined.
+  a **definitional** claim about the fragment's semantics (P14 Q-7);
+  whether Jolt conforms to it is exactly what §6 validates — the
+  realization notes above support the spec, not the conformance.
 
 ### 2.3 Values, equality, hashing, comparison
 
@@ -371,8 +382,10 @@ rule here is UNSPECIFIED and out of fragment, not implicitly host behavior.
 - **`compare`:** a total order over `nil` (least), numbers (by value),
   strings (scalar-value lexicographic), keywords, symbols, booleans,
   characters, and equal-length vectors (lexicographic); NaN sorts topmost
-  among doubles and compares equal to itself (so total order is preserved).
-  Comparing unsupported pairs is a `:class-cast` error (§2.4).
+  among doubles and compares equal to itself (so total order is preserved)
+  *(stated portable rule awaiting §6 corpus witness, same as the `=` NaN
+  rule — P14 MINOR-3)*. Comparing unsupported pairs is a `:class-cast`
+  error (§2.4).
   *(Realization: P1 §2 `converters.ss:180-223` [v0513], returning exact
   -1/0/1; 0.5.17 note: host String `.compareTo` now returns integers —
   `V17/CHANGELOG.md:27-34`.)*
@@ -462,9 +475,15 @@ The observable outcome of a fragment program is exactly one of:
    classified `:timeout`. A `:timeout` is never evidence of true divergence
    or of convergence; it is an inconclusive outcome (§5).
 
-Two outcomes are equal iff: both canonical values are `=`-equal per §2.3, or
-both error outcomes have equal kinds (and equal data for `:ex-info`).
-Divergence is equal only to itself and proves nothing.
+Two outcomes are equal iff: both canonical values are **equal as canonical
+forms**, or both error outcomes have equal kinds (and equal data for
+`:ex-info`). **The comparison is over canonical forms, not runtime `=`**
+(P14 MAJOR-2): canonicalization (§2.3/A.2) is what makes the relation
+coherent — two NaN outcomes agree by their single `##NaN` canonical marker
+even though `(= NaN NaN)` is false at runtime, and `-0.0`/`0.0` share one
+canonical form. Where this section says "`=`-equal per §2.3", read
+canonical-form equality after §2.3/A.2 canonicalization. Divergence is equal
+only to itself and proves nothing.
 
 ## 3. Boundary taxonomy
 
@@ -476,12 +495,12 @@ anything it cannot determine widens.
 
 ### 3.1 The four lanes
 
-| Lane | Meaning | Claim levels reachable |
+| Lane | Meaning | Claim/evidence reach |
 | --- | --- | --- |
 | `ordinary-core` | Resolved, expanded semantics over canonical values and declared core operations — the §2 fragment and later specified kernels | up to `bounded-complete`; `proved` only with a checked certificate + stated TCB |
 | `Dynamic-opaque` | `eval`/`load-string`, dynamic resolution, unknown macro expansion, unresolved call paths, runtime-generated code | `opaque` / `assumed` only; no static coverage or proof claim crosses |
-| `host-capability` | Declared capability crossings: raw host objects, FFI, process, callbacks, clocks, entropy, I/O — including telemetry primitives as observation inputs | `monitored` / `probed` / `runtime` evidence with named postconditions; never purity by assertion |
-| `simulation-handler` | Optional scenario interpretation of a registered effect descriptor (§3.3); never a production dependency | `simulated` — deterministic model behavior, not host behavior |
+| `host-capability` | Declared capability crossings: raw host objects, FFI, process, callbacks, clocks, entropy, I/O — including telemetry primitives as observation inputs | `monitored` plus `probed`/`runtime` evidence-kind tags (§5.3 terminology — tags, not levels) with named postconditions; never purity by assertion |
+| `simulation-handler` | Optional scenario interpretation of a registered effect descriptor (§3.3); never a production dependency | `simulated` (an evidence-kind tag, §5.3) — deterministic model behavior, not host behavior |
 
 ### 3.2 Mechanical widening rules
 
