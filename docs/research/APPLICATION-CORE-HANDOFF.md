@@ -43,14 +43,12 @@
   worktree). The charter's semantic contracts are source-level and expected to
   survive; line-level citations and the mono-nanos/telemetry/timed-wait deltas
   are what P10 refreshes.
-- **Amendment queue:** H1 (proposed, pending Chuck confirmation): D4/D2
-  effect vocabulary becomes OPEN and application/library-extensible (per
-  Codex guidance) — closed per-descriptor schema validation, hermetic
-  fail-closed on unregistered families, and F6/F7 identity rules are
-  unaffected. H2 (applied by this record; coordination-mandated): D10
-  charter baseline = v0.5.17; no compatibility obligations for
-  v0.5.12/v0.5.13/earlier fork behavior; branch/worktree "v0513" names are
-  historical.
+- **Amendment queue:** H1 (D4/D2 effect vocabulary OPEN and extensible):
+  **user-confirmed 2026-08-01** ("effects should be extensible"); applied to
+  memo. Governance model for user-defined families (E-options analysis:
+  universally-open vs core-reserved vs policy-tiered vs refinement-only)
+  presented in chat; decision pending. H2 (charter baseline = v0.5.17):
+  applied; coordination-mandated.
 - **PR flag:** Codex says "keep the public draft PR current"; Chuck's standing
   rule for this lane is never push/open a PR. Holding Chuck's rule pending
   explicit reversal.
@@ -368,4 +366,5 @@ User authorized creating bounded profiles for the new models and extending
 | 9 | `01ecf4c5` | Fable slice-2 report (P9) + reconciliation + handoff state | yes (G1–G6 approved) |
 | 10 | `248d4256` | memo G-amendments + Phase 4 charter drafting start | yes (pivot forwarded) |
 | 11 | `b48bb60a` | v0.5.17 coordination pivot record; Fable 3–4 cancelled | recorded |
-| 12 | (pending) | P10 refresh register + charter baseline revision (front matter + §1) | pending |
+| 12 | `e79ef669` | P10 refresh register + charter baseline revision (front matter + §1) | yes (H1 confirmed) |
+| 13 | (pending) | H1/H2 memo amendments + handoff state | pending |

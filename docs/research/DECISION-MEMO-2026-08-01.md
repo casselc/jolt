@@ -377,3 +377,34 @@ row, now explicit); fixture-to-test wiring remains trusted and is acknowledged.
   ancestor of `eb7bce4` (verified 2026-08-01); C2's pin is the newer main.
 - Name-collision fix: "the Flow plan" = the Maelstrom/Flow implementation plan
   document; "F4" denotes only amendment F4.
+
+## H-amendments 2026-08-01 (v0.5.17 coordination pivot)
+
+### H1 (amends D4/D2): effect vocabulary is open and extensible — user-confirmed 2026-08-01
+
+The effect-operation vocabulary is **open and application/library-extensible**:
+families register with the runtime; the compiler never closes the enumeration.
+Unchanged from D4/D2: per-descriptor **schema validation** against each
+family's registered schema; handler discipline (dynamically scoped,
+innermost-first, strict-LIFO, substitution-or-abort; no continuations at this
+layer); hermetic simulation fails closed on unregistered/unhandled families;
+F6/F7 identity rules (CSIR site-ID or reserved `host-origin` ID; `operation-id`
+per-instance unique). Per the coordination handoff: the clock effect is
+abstract with distinct monotonic and wall-clock semantics (v0.5.17 maps
+monotonic to `jolt.host/mono-nanos` and wall to `jolt.host/wall-nanos`, and
+the descriptor records which primitive supplied each value); native/FFI effects
+support pass-through, modeled, record/replay, and hybrid policies; simulation
+never prohibits deliberately calling the real OS; simulator handlers control
+existing application/library boundaries and never reimplement libraries. The
+extensibility **governance model** (how open user-defined families are:
+E-options) is decided separately and staged — registration machinery first,
+governance rules as the mechanism matures.
+
+### H2 (amends D10): charter baseline = v0.5.17
+
+This charter targets upstream Jolt v0.5.17 (tag commit
+`da59e49dbe8c810e05aa2ce900a95c5a1ef0c9fe`). No compatibility obligations for
+v0.5.12/v0.5.13 or earlier fork behavior; branch/worktree names containing
+"v0513" are historical. This lane's git base remains `021b0b72` (no rebase,
+no rename). Source citations follow `reports/P10-V0517-REFRESH-REGISTER.md`
+where it differs from P1.
