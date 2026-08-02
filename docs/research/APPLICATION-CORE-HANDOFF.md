@@ -1,8 +1,68 @@
 # Jolt Application Core Charter — Lane Handoff
 
-**Status:** active research lane; Phase 1 grounding complete except P3; preparing
-for an OpenCode restart to load new bounded agent profiles.
+**Status:** active research lane; Phase 4 charter drafting in progress;
+**target baseline pivoted to upstream v0.5.17 (2026-08-01)** — see pivot section.
 **Durable source of truth:** this file. Chat/session summaries are secondary.
+
+## Coordination pivot to v0.5.17 (2026-08-01, Codex handoff via user)
+
+- **New target baseline:** upstream Jolt v0.5.17, tag commit
+  `da59e49dbe8c810e05aa2ce900a95c5a1ef0c9fe` ("Merge PR #516
+  fix/string-surface-gaps"). Verified locally: tag `v0.5.17` contains it.
+  Read-only reference worktree: `/home/chuck/ai-src/worktrees/jolt-v0517-reference`
+  (DETACHED at the tag).
+- **Codex-reported baseline evidence:** clean upstream v0.5.17 unit suite
+  1195/1195 — reported, NOT independently re-run by this lane.
+- **Upstream now owns:** monotonic clock as `jolt.host/mono-nanos`; telemetry;
+  TimeUnit; timed-wait and Thread.join fixes; nREPL/editor improvements;
+  CLI/dependency tooling; String APIs. Codex preserves upstream decisions and
+  remints only still-needed fork functionality (their items 1–10: arraycopy,
+  executor admission, exact-width FFI, atomic native-error, ranged transfers,
+  scoped loans, sim image, future lifecycle hooks, unified sim controller on
+  v0.5.17 + mono-nanos, Linux CI + x64 Windows validation).
+- **This lane's git base REMAINS `021b0b72`** (historical; per coordination
+  boundaries: continue in this worktree, no rebase/rename of the
+  `v0513`-named branch). Charter *target* becomes v0.5.17 semantic contracts.
+  Do not design for compatibility with v0.5.12/v0.5.13 or earlier fork
+  behavior; "v0513" names are historical.
+- **Codex design guidance adopted (affects charter):** portable source-level
+  model, not coupled to v0.5.13 compiler internals, not waiting on the runtime
+  remint; clocks as abstract effect with distinct monotonic vs wall-clock
+  semantics (monotonic maps to `jolt.host/mono-nanos` on v0.5.17); **effects
+  extensible by applications/libraries, NOT a compiler-closed enumeration**;
+  native/FFI effects support pass-through / modeled / record-replay / hybrid
+  policies and simulation must not prohibit deliberately calling the real OS;
+  simulator handlers control existing application/library boundaries, never
+  reimplement libraries.
+- **Fable: slices 3 and 4 CANCELLED.** The handoff explicitly does not
+  authorize additional Fable usage; existing P8/P9 artifacts remain inputs.
+  Remaining review load shifts to `jolt-reviewer` (Phase 5) and
+  `jolt-deep-reviewer` (unaffected — not Fable).
+- **P10 dispatched:** targeted refresh of P1's load-bearing facts against
+  v0.5.17 (`jolt-runtime-engineer`, read-only, using the v0517 reference
+  worktree). The charter's semantic contracts are source-level and expected to
+  survive; line-level citations and the mono-nanos/telemetry/timed-wait deltas
+  are what P10 refreshes.
+- **Amendment queue:** H1 (proposed, pending Chuck confirmation): D4/D2
+  effect vocabulary becomes OPEN and application/library-extensible (per
+  Codex guidance) — closed per-descriptor schema validation, hermetic
+  fail-closed on unregistered families, and F6/F7 identity rules are
+  unaffected. H2 (applied by this record; coordination-mandated): D10
+  charter baseline = v0.5.17; no compatibility obligations for
+  v0.5.12/v0.5.13/earlier fork behavior; branch/worktree "v0513" names are
+  historical.
+- **PR flag:** Codex says "keep the public draft PR current"; Chuck's standing
+  rule for this lane is never push/open a PR. Holding Chuck's rule pending
+  explicit reversal.
+- **Codex deliverables mapping:** identities (entity/operation/request/
+  transaction/attempt), lifecycle state machines, linearization/commit/
+  publish/durability points, cancellation/retry/timeout/cleanup/ambiguous
+  outcomes, extensible effect/handler contract, minimal adapter points →
+  charter §3/§4/§5/§8 content + a new companion artifact (whole-system
+  HTTP→command→SQLite→outbox flow model + requested-runtime-seams register)
+  scheduled after §8; bounded proof models + witness→schedule/Hegel/shrink/
+  replay path → §7/§8 (already designed via D5/G); deterministic scenario
+  inputs + canonical trace/evidence schemas → §5/§8.
 
 ## Identity
 
