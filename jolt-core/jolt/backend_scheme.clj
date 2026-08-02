@@ -325,7 +325,7 @@
                   "define" "def-var!" "def-var-with-meta!"
                   "declare-var!" "intern-ns!"
                   ;; ffi lowering (emit-ffi-fn: a Chez foreign-procedure).
-                  "foreign-procedure"}]
+                  "foreign-procedure" "call-with-values"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is
@@ -573,8 +573,14 @@
 ;; compile-time literals from the analyzer, so this emits a real typed binding;
 ;; the resulting Scheme procedure is callable like any jolt fn. The library must
 ;; have loaded the shared object (jolt.ffi/load-library) before this def runs.
+;; Keep this compile-time table in lockstep with ffi-type->chez in
+;; host/chez/java/ffi.ss, which serves the runtime memory accessors.
 (def ^:private ffi-types
   {"int" "int" "uint" "unsigned-int" "long" "long" "ulong" "unsigned-long"
+   "int8" "integer-8" "i8" "integer-8"
+   "int16" "integer-16" "short" "integer-16"
+   "uint16" "unsigned-16" "ushort" "unsigned-16"
+   "int32" "integer-32" "uint32" "unsigned-32"
    "int64" "integer-64" "uint64" "unsigned-64" "size_t" "size_t" "ssize_t" "ssize_t"
    "iptr" "iptr" "uptr" "uptr" "double" "double" "float" "float"
    "pointer" "void*" "void*" "void*" "string" "string" "void" "void"
@@ -584,18 +590,43 @@
 (defn- emit-ffi-fn [node]
   (let [n (count (:argtypes node))
         params (mapv (fn [i] (str "a" i)) (range n))
-        fp (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
-                (chez-str-lit (:csym node))
-                " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
-                (ffi-type->chez (:rettype node)) ")")]
-    ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
-    ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
-    ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
-    ;; evaluate to a callable closure before the shared library is loaded —
-    ;; critical for :optional :jolt/native libs whose load-object runs in the
-    ;; scheme-start launcher, after the heap is already built.
-    (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
-         "((or p (begin (set! p " fp ") p)) " (str/join " " params) ")))")))
+        args (str/join " " (map ffi-type->chez (:argtypes node)))
+        ret (ffi-type->chez (:rettype node))
+        csym (chez-str-lit (:csym node))
+        capture (:capture-native-error node)
+        ;; The foreign-procedure builder. :capture-native-error swaps in Chez's
+        ;; __errno/__get_last_error convention (jolt-ffi-native-error-procedure,
+        ;; host/chez/rt.ss): the call returns the native result AND the thread's
+        ;; native error slot as two values, read in the foreign-call return path
+        ;; before collect-safe reactivation or any later Scheme/native work can
+        ;; overwrite them. (conv ...) is () for a plain call, (__collect_safe)
+        ;; for a :blocking one — the only difference from foreign-procedure, so
+        ;; a captured binding composes with :blocking and shares the lazy cell.
+        fp (if capture
+             (str "(jolt-ffi-native-error-procedure "
+                  (if (:blocking node) "(__collect_safe)" "()") " "
+                  csym " (" args ") " ret ")")
+             (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
+                  csym " (" args ") " ret ")"))
+        ;; Lazy resolution: the foreign-procedure form is deferred inside a
+        ;; closure. On first call, the cell `p` is set to the FP and then
+        ;; invoked; subsequent calls skip the set!. This lets a defcfn's
+        ;; defining form (top-level def) evaluate to a callable closure before
+        ;; the shared library is loaded — critical for :optional :jolt/native
+        ;; libs whose load-object runs in the scheme-start launcher, after the
+        ;; heap is already built. Captured and scalar bindings share this cell.
+        call (str "((or p (begin (set! p " fp ") p)) " (str/join " " params) ")")
+        ;; Materialize the captured result+error into ONE persistent Jolt vector
+        ;; [native-result error-code] (result first). call-with-values is the
+        ;; seam that hands the foreign call's two return values to the builder;
+        ;; constructing the vector cannot race with the capture, which already
+        ;; happened inside the foreign-call return path. A scalar binding keeps
+        ;; the bare call, byte-identical to before this option existed.
+        body (if capture
+               (str "(call-with-values (lambda () " call ")"
+                    " (lambda (r e) (jolt-vector r e)))")
+               call)]
+    (str "(let ((p #f)) (lambda (" (str/join " " params) ") " body "))")))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the

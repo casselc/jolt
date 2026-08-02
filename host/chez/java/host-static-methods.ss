@@ -260,11 +260,26 @@
   (let ((t (current-time 'time-utc)))
     (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
 
+;; System/nanoTime and the public Jolt deadline source use Chez's
+;; time-monotonic interface. Do not silently substitute wall time: a clock that
+;; can step backward is not a safe deadline clock. monotonic-source reports the
+;; Chez interface selected, not a claim about the OS implementation beneath it.
+(define (now-monotonic-nanos)
+  (let ((t (current-time 'time-monotonic)))
+    (+ (* 1000000000 (time-second t))
+       (time-nanosecond t))))
+
+(def-var! "jolt.host" "monotonic-nanos"
+  (lambda () (->num (now-monotonic-nanos))))
+(def-var! "jolt.host" "monotonic-source"
+  (lambda ()
+    (keyword #f "chez-time-monotonic")))
+
 ;; clojure.core/current-time-ms — epoch milliseconds; backs the `time` macro.
 (def-var! "clojure.core" "current-time-ms" (lambda () (->num (now-millis))))
 (register-class-statics! "System"
   (list (cons "currentTimeMillis" (lambda () (->num (now-millis))))
-        (cons "nanoTime" (lambda () (->num (* 1000000 (now-millis)))))
+        (cons "nanoTime" (lambda () (->num (now-monotonic-nanos))))
         (cons "exit" (lambda args (exit (if (null? args) 0 (jnum->exact (car args))))))
         ;; System/gc -> a full Chez collection (so weak references clear and their
         ;; guardians fire); Runtime.gc() routes here too.
@@ -791,4 +806,3 @@
 (for-each (lambda (nm)
             (register-class-ctor! nm (lambda _ (lambda (rdr . _) (lrsr-read-literal rdr)))))
           '("LispReader$StringReader" "clojure.lang.LispReader$StringReader"))
-

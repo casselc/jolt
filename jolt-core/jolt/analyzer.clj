@@ -656,21 +656,72 @@
 
 ;; jolt.ffi/__cfn: the low-level foreign-function form a jolt library
 ;; uses (via the jolt.ffi/foreign-fn macro) to bind native code. Shape:
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)            ; non-blocking
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)  ; may block
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)             ; non-blocking
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)   ; may block
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype {opts})      ; options map
 ;; The C symbol is a string literal and the types are literal keywords, read here
 ;; at compile time; the Chez back end lowers it to a real `foreign-procedure`
 ;; (typed marshaling, no runtime eval). A :blocking call is emitted __collect_safe
 ;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
 ;; must not pin the stop-the-world collector. A leaf IR node.
+;;
+;; The single trailing option foreign-fn/defcfn accept, normalized to a flat
+;; {:blocking Boolean :capture-native-error Boolean} map. This is the one choke
+;; point both the public macros (which thread the option through unchanged) and a
+;; direct jolt.ffi/__cfn form pass through, so every malformed option fails closed
+;; at compile time regardless of how it was written:
+;;   - absent                 -> scalar result, non-blocking (legacy default)
+;;   - the literal :blocking  -> scalar result, blocking (legacy shorthand)
+;;   - a literal options map  -> per-key Booleans; the only accepted keys are
+;;                               :blocking and :capture-native-error
+;; Unknown or namespaced keys, non-keyword keys, and non-literal-Boolean values
+;; each throw. Duplicate literal keys fail earlier at the reader boundary.
+;; capture-native-error composes with :blocking and is rejected for :void (no
+;; stable first element) in analyze-ffi-fn below.
+(defn- ffi-option
+  ([]
+   {:blocking false :capture-native-error false})
+  ([opt]
+   (cond
+     (and (form-keyword? opt)
+          (nil? (namespace opt))
+          (= "blocking" (name opt)))
+     {:blocking true :capture-native-error false}
+     (form-map? opt)
+     (reduce
+       (fn [res pr]
+         (let [k (nth pr 0) v (nth pr 1)]
+           (when-not (and (form-keyword? k) (nil? (namespace k)))
+             (throw (str "jolt.ffi: option key must be an unqualified keyword, got: " k)))
+           (let [kn (name k)]
+             (when-not (or (= kn "blocking") (= kn "capture-native-error"))
+               (throw (str "jolt.ffi: unknown option :" kn)))
+             (when-not (or (true? v) (false? v))
+               (throw (str "jolt.ffi: option :" kn " must be a literal Boolean, got: " v)))
+             (assoc res (if (= kn "blocking") :blocking :capture-native-error) v))))
+       {:blocking false :capture-native-error false}
+       (form-map-pairs opt))
+     :else
+     (throw (str "jolt.ffi: option must be :blocking or an options map, got: " opt)))))
+
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
-    (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking])")))
-  {:op :ffi-fn
-   :csym (nth items 1)
-   :argtypes (mapv name (form-vec-items (nth items 2)))
-   :rettype (name (nth items 3))
-   :blocking (and (= 5 (count items)) (= "blocking" (name (nth items 4))))})
+    (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking | {opts}])")))
+  (let [rettype (name (nth items 3))
+        opt (if (= 5 (count items))
+              (ffi-option (nth items 4))
+              (ffi-option))
+        blocking (:blocking opt)
+        capture (:capture-native-error opt)]
+    (when (and capture (= rettype "void"))
+      (throw (str "jolt.ffi: :capture-native-error is not supported for :void "
+                  "(no stable native result to pair with the error code)")))
+    {:op :ffi-fn
+     :csym (nth items 1)
+     :argtypes (mapv name (form-vec-items (nth items 2)))
+     :rettype rettype
+     :blocking blocking
+     :capture-native-error capture}))
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
 ;; macro) — the inverse of __cfn. It wraps a jolt fn as a C-callable function

@@ -98,6 +98,8 @@ locale-name
 make-interrupt
 make-thread-local
 map-entry
+monotonic-nanos
+monotonic-source
 monitor-enter
 monitor-exit
 park-until-interrupt

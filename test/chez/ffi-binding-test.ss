@@ -1,12 +1,13 @@
 ;; jolt.ffi regression: a compile-time-typed foreign binding lowers to a real
-;; Chez foreign-procedure and calls native code. Run:
-;;   chez --script test/chez/ffi-binding-test.ss
-;; Binds a few libc functions (process symbols, always present) through the
-;; jolt.ffi/__cfn special form + the host memory primitives — the same path a
-;; library uses to bind its native deps.
+;; Chez foreign-procedure and calls native code. Run `make ffi`; its wrapper
+;; builds the portable scalar helper first. The gate binds both helper and libc
+;; symbols through jolt.ffi/__cfn plus the host memory primitives — the same path
+;; a library uses to bind its native dependencies.
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
+(load "host/chez/loader.ss")
+(set-source-roots! ldr-install-roots)
 (load "host/chez/java/ffi.ss")
 
 (define total 0) (define fails 0)
@@ -14,6 +15,35 @@
 ;; eval one form (string) in `user`, like the loader does form-by-form, so a def
 ;; is visible to a later form.
 (define (ev s) (jolt-compile-eval s "user"))
+(define (has? s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i nsub) ns) #f)
+            ((string=? (substring s i (+ i nsub)) sub) #t)
+            (else (loop (+ i 1)))))))
+
+;; Helpers for the native-error-capture cases. Each returns a plain boolean, so a
+;; stale seed (whose analyzer predates the options map) reports FAIL cleanly — no
+;; mid-suite crash, and no false green from a sentinel value. The legacy cases
+;; above keep bare `ev`.
+;; ev-bool: #t iff `src` compiles+evals to a truthy jolt value; #f on any
+;; compile/eval error or a falsy result.
+(define (ev-bool src)
+  (guard (e (#t #f))
+    (jolt-truthy? (ev src))))
+;; ev=: #t iff `src` evals to the exact integer `expected`; #f on error/mismatch.
+(define (ev= src expected)
+  (guard (e (#t #f))
+    (= expected (jnum->exact (ev src)))))
+;; rejects?: #t iff compiling `src` throws — the shape a malformed option or a
+;; captured :void must take, at compile time, in jolt.analyzer/analyze-ffi-fn.
+(define (rejects? src)
+  (guard (e (#t #t)) (ev src) #f))
+
+(define scalar-helper (getenv "JOLT_FFI_SCALAR_HELPER"))
+(unless scalar-helper
+  (error #f "JOLT_FFI_SCALAR_HELPER must name the compiled scalar test library"))
+(load-shared-object scalar-helper)
 
 ;; load libc (process symbols) and bind typed foreign functions
 (ev "(jolt.ffi/load-library)")
@@ -32,6 +62,161 @@
                      (let [v (jolt.ffi/read p :int)] (jolt.ffi/free p) v))"))))
 (ok "sizeof :pointer is a word" (let ((n (jnum->exact (ev "(jolt.ffi/sizeof :pointer)")))) (or (= n 8) (= n 4))))
 
+;; Exact scalar widths used by native structures and protocols. In particular,
+;; pollfd and sockaddr fields cannot be modeled faithfully as :int: that gives
+;; them the wrong width, while byte-position workarounds depend on host order.
+(ok "signed 8-bit aliases have exact width 1"
+    (equal? '(1 1)
+            (map (lambda (t)
+                   (jnum->exact
+                     (ev (string-append "(jolt.ffi/sizeof " t ")"))))
+                 '(":int8" ":i8"))))
+(ok "16-bit aliases have exact width 2"
+    (equal? '(2 2 2 2)
+            (map (lambda (t)
+                   (jnum->exact
+                     (ev (string-append "(jolt.ffi/sizeof " t ")"))))
+                 '(":int16" ":short" ":uint16" ":ushort"))))
+(ok "32-bit types have exact width 4"
+    (equal? '(4 4)
+            (map (lambda (t)
+                   (jnum->exact
+                     (ev (string-append "(jolt.ffi/sizeof " t ")"))))
+                 '(":int32" ":uint32"))))
+
+(ev "(def p8 (jolt.ffi/alloc 1))")
+(ev "(jolt.ffi/write p8 :i8 0 -1)")
+(ok "signed 8-bit aliases preserve sign"
+    (= -1 (jnum->exact (ev "(jolt.ffi/read p8 :int8 0)"))))
+(ev "(jolt.ffi/free p8)")
+
+(ok "uint16 roundtrips its maximum value"
+    (= 65535
+       (jnum->exact
+         (ev "(let [p (jolt.ffi/alloc 2)]
+                (jolt.ffi/write p :uint16 0 65535)
+                (let [v (jolt.ffi/read p :uint16 0)]
+                  (jolt.ffi/free p)
+                  v))"))))
+(ev "(def p16 (jolt.ffi/alloc 2))")
+(ev "(jolt.ffi/write p16 :int16 0 -1)")
+(ok "the same 16 bits retain signed and unsigned interpretations"
+    (and (= -1 (jnum->exact (ev "(jolt.ffi/read p16 :int16 0)")))
+         (= 65535 (jnum->exact (ev "(jolt.ffi/read p16 :uint16 0)")))))
+(ev "(jolt.ffi/free p16)")
+(ok "int16 roundtrips its minimum value"
+    (= -32768
+       (jnum->exact
+         (ev "(let [p (jolt.ffi/alloc 2)]
+                (jolt.ffi/write p :short 0 -32768)
+                (let [v (jolt.ffi/read p :int16 0)]
+                  (jolt.ffi/free p)
+                  v))"))))
+
+(ok "uint32 roundtrips its maximum value"
+    (= 4294967295
+       (jnum->exact
+         (ev "(let [p (jolt.ffi/alloc 4)]
+                (jolt.ffi/write p :uint32 0 4294967295)
+                (let [v (jolt.ffi/read p :uint32 0)]
+                  (jolt.ffi/free p)
+                  v))"))))
+(ev "(def p32 (jolt.ffi/alloc 4))")
+(ev "(jolt.ffi/write p32 :int32 0 -1)")
+(ok "the same 32 bits retain signed and unsigned interpretations"
+    (and (= -1 (jnum->exact (ev "(jolt.ffi/read p32 :int32 0)")))
+         (= 4294967295 (jnum->exact (ev "(jolt.ffi/read p32 :uint32 0)")))))
+(ev "(jolt.ffi/free p32)")
+(ok "int32 roundtrips its minimum value"
+    (= -2147483648
+       (jnum->exact
+         (ev "(let [p (jolt.ffi/alloc 4)]
+                (jolt.ffi/write p :int32 0 -2147483648)
+                (let [v (jolt.ffi/read p :int32 0)]
+                  (jolt.ffi/free p)
+                  v))"))))
+
+;; Store-width check is byte-order-independent: the two bytes may be in either
+;; order, but the sentinel immediately after them must remain untouched.
+(ev "(def p-width (jolt.ffi/alloc 3))")
+(ev "(jolt.ffi/write p-width :uint8 2 171)")
+(ev "(jolt.ffi/write p-width :uint16 0 4660)")
+(ok "a uint16 store occupies exactly two bytes"
+    (let ((b0 (jnum->exact (ev "(jolt.ffi/read p-width :uint8 0)")))
+          (b1 (jnum->exact (ev "(jolt.ffi/read p-width :uint8 1)")))
+          (b2 (jnum->exact (ev "(jolt.ffi/read p-width :uint8 2)")))
+          (v (jnum->exact (ev "(jolt.ffi/read p-width :uint16 0)"))))
+      (and (equal? '(18 52) (sort < (list b0 b1)))
+           (= 171 b2)
+           (= 4660 v))))
+(ev "(jolt.ffi/free p-width)")
+
+;; Exercise compiler-side argument, result, and callback lowering against a
+;; portable C helper. High-bit boundary values discriminate signedness, while
+;; the memory checks above discriminate width independently of register ABI.
+(for-each
+  (lambda (form) (ev form))
+  '("(def c-widen-i8 (jolt.ffi/__cfn \"jolt_test_widen_i8\" [:i8] :int64))"
+    "(def c-widen-i16 (jolt.ffi/__cfn \"jolt_test_widen_i16\" [:short] :int64))"
+    "(def c-widen-u16 (jolt.ffi/__cfn \"jolt_test_widen_u16\" [:ushort] :uint64))"
+    "(def c-widen-i32 (jolt.ffi/__cfn \"jolt_test_widen_i32\" [:int32] :int64))"
+    "(def c-widen-u32 (jolt.ffi/__cfn \"jolt_test_widen_u32\" [:uint32] :uint64))"
+    "(def c-return-i8 (jolt.ffi/__cfn \"jolt_test_return_i8\" [] :int8))"
+    "(def c-return-i16 (jolt.ffi/__cfn \"jolt_test_return_i16\" [] :int16))"
+    "(def c-return-u16 (jolt.ffi/__cfn \"jolt_test_return_u16\" [] :uint16))"
+    "(def c-return-i32 (jolt.ffi/__cfn \"jolt_test_return_i32\" [] :int32))"
+    "(def c-return-u32 (jolt.ffi/__cfn \"jolt_test_return_u32\" [] :uint32))"))
+
+(ok "exact-width native arguments preserve boundary values"
+    (equal? '(-128 -32768 65535 -2147483648 4294967295)
+            (map (lambda (form) (jnum->exact (ev form)))
+                 '("(c-widen-i8 -128)"
+                   "(c-widen-i16 -32768)"
+                   "(c-widen-u16 65535)"
+                   "(c-widen-i32 -2147483648)"
+                   "(c-widen-u32 4294967295)"))))
+(ok "exact-width native results preserve boundary values"
+    (equal? '(-128 -32768 65535 -2147483648 4294967295)
+            (map (lambda (form) (jnum->exact (ev form)))
+                 '("(c-return-i8)"
+                   "(c-return-i16)"
+                   "(c-return-u16)"
+                   "(c-return-i32)"
+                   "(c-return-u32)"))))
+
+(for-each
+  (lambda (form) (ev form))
+  '("(def i8-id (jolt.ffi/__ccallable (fn [x] x) [:int8] :int8))"
+    "(def i16-id (jolt.ffi/__ccallable (fn [x] x) [:int16] :int16))"
+    "(def u16-id (jolt.ffi/__ccallable (fn [x] x) [:uint16] :uint16))"
+    "(def i32-id (jolt.ffi/__ccallable (fn [x] x) [:int32] :int32))"
+    "(def u32-id (jolt.ffi/__ccallable (fn [x] x) [:uint32] :uint32))"
+    "(def c-call-i8 (jolt.ffi/__cfn \"jolt_test_call_i8\" [:pointer] :int64))"
+    "(def c-call-i16 (jolt.ffi/__cfn \"jolt_test_call_i16\" [:pointer] :int64))"
+    "(def c-call-u16 (jolt.ffi/__cfn \"jolt_test_call_u16\" [:pointer] :uint64))"
+    "(def c-call-i32 (jolt.ffi/__cfn \"jolt_test_call_i32\" [:pointer] :int64))"
+    "(def c-call-u32 (jolt.ffi/__cfn \"jolt_test_call_u32\" [:pointer] :uint64))"))
+(ok "C-invoked exact-width callbacks preserve boundary values"
+    (equal? '(-128 -32768 65535 -2147483648 4294967295)
+            (map (lambda (form) (jnum->exact (ev form)))
+                 '("(c-call-i8 i8-id)"
+                   "(c-call-i16 i16-id)"
+                   "(c-call-u16 u16-id)"
+                   "(c-call-i32 i32-id)"
+                   "(c-call-u32 u32-id)"))))
+(for-each
+  (lambda (name) (ev (string-append "(jolt.ffi/free-callable " name ")")))
+  '("i8-id" "i16-id" "u16-id" "i32-id" "u32-id"))
+
+(ok "unknown runtime memory types fail closed"
+    (guard (e (#t #t))
+      (ev "(jolt.ffi/sizeof :int128)")
+      #f))
+(ok "unknown compile-time signature types fail closed"
+    (guard (e (#t #t))
+      (ev "(jolt.ffi/__cfn \"strlen\" [:int128] :int)")
+      #f))
+
 ;; byte-array buffer I/O: write a byte-array into foreign memory and read it back
 ;; byte-exact (high bytes preserved, no UTF-8 mangling). Elements are SIGNED bytes
 ;; like the JVM's byte[], so a high byte reads negative and 0xff-masks back.
@@ -46,13 +231,322 @@
                      (= [0 65 -56 -1 10] (vec back))
                      (= [0 65 200 255 10] (mapv #(bit-and % 0xff) back)))))")))
 
-;; a :blocking foreign call is collect-safe: a thread parked in it must not pin
-;; the stop-the-world collector. (collect) here would throw "cannot collect when
-;; multiple threads are active" if usleep weren't emitted __collect_safe.
-(ev "(def c-usleep (jolt.ffi/__cfn \"usleep\" [:uint] :int :blocking))")
-(let ((usleep (var-deref "user" "c-usleep")))
-  (fork-thread (lambda () (usleep 2000000)))           ; ~2s in a blocking call
-  (let loop ((i 0)) (when (fx<? i 30000000) (loop (fx+ i 1))))  ; spin so the thread enters usleep
+;; --- ranged byte-array transfers: read-array! and the 4-arg write-array. -----
+;; Both copy a sub-range, validate exact byte-array kind + complete range + null
+;; for zero length BEFORE any native access or mutation, fold native u8 -> signed
+;; (na-u8->byte) on read and mask signed -> #xff on write, and return the length.
+(ok "read-array! copies a destination sub-range and conserves prefix/suffix"
+    (jolt-truthy?
+      (ev "(let [p (jolt.ffi/alloc 5)]
+              (jolt.ffi/write p :uint8 0 10)
+              (jolt.ffi/write p :uint8 1 200)
+              (jolt.ffi/write p :uint8 2 255)
+              (jolt.ffi/write p :uint8 3 0)
+              (jolt.ffi/write p :uint8 4 127)
+              (let [dest (byte-array [-1 -1 -1 -1 -1 -1 -1 -1])
+                    n (jolt.ffi/read-array! p 3 dest 2)]
+                (jolt.ffi/free p)
+                (and (= n 3)
+                     (= -1 (nth dest 0)) (= -1 (nth dest 1))
+                     (= -1 (nth dest 5)) (= -1 (nth dest 6)) (= -1 (nth dest 7))
+                     (= 10 (bit-and (nth dest 2) 0xff))
+                     (= 200 (bit-and (nth dest 3) 0xff))
+                     (= 255 (bit-and (nth dest 4) 0xff))
+                     (= -56 (nth dest 3))
+                     (= -1 (nth dest 4)))))")))
+(ok "write-array ranged form copies a source sub-range and conserves native sentinels"
+    (jolt-truthy?
+      (ev "(let [src (byte-array [0 200 255 7 -1 0])
+                  p (jolt.ffi/alloc 8)]
+              (doseq [i (range 8)] (jolt.ffi/write p :uint8 i 170))
+              (let [n (jolt.ffi/write-array (+ p 2) src 1 4)
+                    out (mapv #(bit-and (jolt.ffi/read p :uint8 %) 0xff) (range 8))]
+                (jolt.ffi/free p)
+                (and (= n 4)
+                     (= out [170 170 200 255 7 255 170 170]))))")))
+(ok "ranged read-array! equals whole-array read-array over the same bytes"
+    (jolt-truthy?
+      (ev "(let [p (jolt.ffi/alloc 4)]
+              (jolt.ffi/write p :uint8 0 1)
+              (jolt.ffi/write p :uint8 1 2)
+              (jolt.ffi/write p :uint8 2 3)
+              (jolt.ffi/write p :uint8 3 4)
+              (let [whole (jolt.ffi/read-array p 4)
+                    into (byte-array 4)
+                    n (jolt.ffi/read-array! p 4 into 0)]
+                (jolt.ffi/free p)
+                (and (= n 4) (= (vec whole) (vec into)))))")))
+(ok "zero-length exact-tail transfer with a null pointer is a no-op"
+    (jolt-truthy?
+      (ev "(let [dest (byte-array [5 6 7])
+                  src (byte-array [5 6 7])]
+              (and (= 0 (jolt.ffi/read-array! jolt.ffi/null 0 dest 3))
+                   (= 0 (jolt.ffi/write-array jolt.ffi/null src 3 0))
+                   (= [5 6 7] (vec dest))))")))
+
+;; rejection BEFORE effects: each invalid call throws AND leaves the (byte) array
+;; or native buffer untouched. try/catch returns true only when dest/native is the
+;; original sentinel after the throw.
+(ok "read-array! rejects negative length before mutating dest"
+    (jolt-truthy?
+      (ev "(let [dest (byte-array [9 9 9 9])
+                  p (jolt.ffi/alloc 3)]
+              (try
+                (try (jolt.ffi/read-array! p -1 dest 0) false
+                     (catch IndexOutOfBoundsException _ (= [9 9 9 9] (vec dest))))
+                (finally (jolt.ffi/free p))))")))
+(ok "read-array! rejects negative offset before mutating dest"
+    (jolt-truthy?
+      (ev "(let [dest (byte-array [9 9 9 9])
+                  p (jolt.ffi/alloc 3)]
+              (try
+                (try (jolt.ffi/read-array! p 1 dest -1) false
+                     (catch IndexOutOfBoundsException _ (= [9 9 9 9] (vec dest))))
+                (finally (jolt.ffi/free p))))")))
+(ok "read-array! rejects offset-beyond-length before mutating dest"
+    (jolt-truthy?
+      (ev "(let [dest (byte-array [9 9 9 9])
+                  p (jolt.ffi/alloc 3)]
+              (try
+                (try (jolt.ffi/read-array! p 1 dest 4) false
+                     (catch IndexOutOfBoundsException _ (= [9 9 9 9] (vec dest))))
+                (finally (jolt.ffi/free p))))")))
+(ok "read-array! rejects an overflow-shaped length before mutating dest"
+    (jolt-truthy?
+      (ev "(let [dest (byte-array [9 9 9 9])]
+              (try
+                (jolt.ffi/read-array! jolt.ffi/null 9223372036854775807 dest 1)
+                false
+                (catch IndexOutOfBoundsException _ (= [9 9 9 9] (vec dest)))))")))
+(ok "read-array! rejects a wrong-kind destination"
+    (jolt-truthy?
+      (ev "(try (jolt.ffi/read-array! jolt.ffi/null 1 [0 1 2] 0) false
+                (catch IllegalArgumentException _ true))")))
+(ok "read-array! rejects a non-byte-array (char-array) destination"
+    (jolt-truthy?
+      (ev "(try (jolt.ffi/read-array! jolt.ffi/null 1 (char-array [\\a \\b]) 0) false
+                (catch IllegalArgumentException _ true))")))
+(ok "read-array! rejects a null pointer with non-zero length"
+    (jolt-truthy?
+      (ev "(try (jolt.ffi/read-array! jolt.ffi/null 1 (byte-array 2) 0) false
+                (catch NullPointerException _ true))")))
+(ok "write-array ranged rejects negative offset before touching native memory"
+    (jolt-truthy?
+      (ev "(let [src (byte-array [1 2 3 4 5])
+                  p (jolt.ffi/alloc 5)]
+              (doseq [i (range 5)] (jolt.ffi/write p :uint8 i 204))
+              (try
+                (try (jolt.ffi/write-array p src -1 2) false
+                     (catch IndexOutOfBoundsException _
+                       (= [204 204 204 204 204]
+                          (mapv #(bit-and (jolt.ffi/read p :uint8 %) 0xff) (range 5)))))
+                (finally (jolt.ffi/free p))))")))
+(ok "write-array ranged rejects length-exceeds-src before touching native memory"
+    (jolt-truthy?
+      (ev "(let [src (byte-array [1 2 3 4 5])
+                  p (jolt.ffi/alloc 5)]
+              (doseq [i (range 5)] (jolt.ffi/write p :uint8 i 204))
+              (try
+                (try (jolt.ffi/write-array p src 0 99) false
+                     (catch IndexOutOfBoundsException _
+                       (= [204 204 204 204 204]
+                          (mapv #(bit-and (jolt.ffi/read p :uint8 %) 0xff) (range 5)))))
+                (finally (jolt.ffi/free p))))")))
+(ok "write-array ranged rejects an overflow-shaped length before native access"
+    (jolt-truthy?
+      (ev "(let [src (byte-array [1 2 3 4 5])]
+              (try
+                (jolt.ffi/write-array jolt.ffi/null src 1 9223372036854775807)
+                false
+                (catch IndexOutOfBoundsException _ (= [1 2 3 4 5] (vec src)))))")))
+(ok "write-array ranged rejects a wrong-kind source"
+    (jolt-truthy?
+      (ev "(try (jolt.ffi/write-array jolt.ffi/null [0 1 2] 0 1) false
+                (catch IllegalArgumentException _ true))")))
+(ok "write-array ranged rejects a null pointer with non-zero length"
+    (jolt-truthy?
+      (ev "(try (jolt.ffi/write-array jolt.ffi/null (byte-array [1 2]) 0 1) false
+                (catch NullPointerException _ true))")))
+
+;; whole-array (2-arg) write-array compatibility + a moderately large payload
+;; exercising the fold/mask seam across both directions over many bytes.
+(ok "whole-array write-array still roundtrips (backward-compatible form)"
+    (jolt-truthy?
+      (ev "(let [src (byte-array [7 200 255 0 -1])
+                  p (jolt.ffi/alloc 5)
+                  w (jolt.ffi/write-array p src)
+                  back (jolt.ffi/read-array p 5)]
+              (jolt.ffi/free p)
+              (and (= w 5) (= (vec src) (vec back))))")))
+(ok "read-array! / write-array handle a moderately large payload"
+    (jolt-truthy?
+      (ev "(let [n 4096
+                  src (byte-array (mapv #(bit-and % 0xff) (range n)))
+                  p (jolt.ffi/alloc n)
+                  w (jolt.ffi/write-array p src)
+                  dest (byte-array n)
+                  r (jolt.ffi/read-array! p n dest 0)]
+              (jolt.ffi/free p)
+              (and (= w n) (= r n) (= (vec src) (vec dest))))")))
+
+;; --- scoped in-out byte-array pointers ---------------------------------------
+;; The public pointer is an address into a private locked bytevector, never the
+;; signed vector backing the Jolt byte-array.  The portable helper performs a
+;; real C write through that pointer; the Jolt array changes only when the scope
+;; copies the native octets back at exit.
+(ev "(def c-fill-pointer
+       (jolt.ffi/__cfn \"jolt_test_fill_bytes\"
+                         [:pointer :uint8 :size_t] :pointer))")
+(ok "ranged pointer loan copies native octets back as signed bytes"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3 4])
+                  result (jolt.ffi/with-byte-array-pointer
+                           a 1 2
+                           (fn [p n]
+                             (c-fill-pointer p 200 n)
+                             [:returned n]))]
+              (and (= [:returned 2] result)
+                   (= [1 -56 -56 4] (vec a))))")))
+(ok "whole-array pointer loan supplies its validated length"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3])]
+              (and (= 3 (jolt.ffi/with-byte-array-pointer
+                          a (fn [p n] (c-fill-pointer p 255 n) n)))
+                   (= [-1 -1 -1] (vec a))))")))
+(ok "pointer loan exposes signed input bytes as exact native octets"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [-128 -1 0 127])]
+              (and
+                (jolt.ffi/with-byte-array-pointer
+                  a
+                  (fn [p n]
+                    (= [128 255 0 127]
+                       (mapv #(jolt.ffi/read p :uint8 %) (range n)))))
+                (= [-128 -1 0 127] (vec a))))")))
+(ok "exact-tail empty pointer loan is valid"
+    (jolt-truthy?
+      (ev "(jolt.ffi/with-byte-array-pointer
+             (byte-array [1 2]) 2 0
+             (fn [p n] (and (integer? p) (zero? n))))")))
+(ok "whole empty pointer loan is valid"
+    (jolt-truthy?
+      (ev "(jolt.ffi/with-byte-array-pointer
+             (byte-array 0)
+             (fn [p n] (and (integer? p) (zero? n))))")))
+(ok "pointer loan rejects invalid kind and range before callback"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2]) calls (atom 0) f (fn [_ _] (swap! calls inc))]
+              (and
+                (try (jolt.ffi/with-byte-array-pointer (int-array [1]) f)
+                     false (catch IllegalArgumentException _ true))
+                (try (jolt.ffi/with-byte-array-pointer a 1 2 f)
+                     false (catch IndexOutOfBoundsException _ true))
+                (try (jolt.ffi/with-byte-array-pointer a 1 4611686018427387904 f)
+                     false (catch IndexOutOfBoundsException _ true))
+                (zero? @calls)))")))
+;; Exercise the private scope directly for host exception/nonlocal control and
+;; pointer stability. Its receive callback gets the temporary bytevector address.
+(let* ((a (ev "(byte-array [1 2 3 4])"))
+       (v (jolt-array-vec a)))
+  (ok "temporary pointer stays stable through allocation and collection"
+      (and (= 2 (ffi-with-scoped-byte-array-pointer "test"
+                 a 1 2
+                 (lambda (p n)
+                   (make-bytevector 1048576 0)
+                   (collect)
+                   (foreign-set! 'unsigned-8 p 0 200)
+                   n)))
+           (equal? '#(1 -56 3 4) v)))
+  (ok "host exception copies back and preserves its primary exception"
+      (and
+       (guard (e (#t (and (string=? (condition-message e) "host loan boom") #t)))
+         (ffi-with-scoped-byte-array-pointer "test"
+          a 1 2
+          (lambda (p n)
+            (foreign-set! 'unsigned-8 p 0 201)
+            (error 'loan "host loan boom")))
+         #f)
+       (= -55 (vector-ref v 1))))
+  (ok "nonlocal exit copies back"
+      (and
+       (eq? 'escaped
+            (call/cc
+             (lambda (escape)
+               (ffi-with-scoped-byte-array-pointer "test"
+                a 2 1
+                (lambda (p n)
+                  (foreign-set! 'unsigned-8 p 0 202)
+                  (escape 'escaped))))))
+       (= -54 (vector-ref v 2)))))
+(ok "Jolt exception copies native changes back before propagating"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2])]
+              (and
+                (try
+                  (jolt.ffi/with-byte-array-pointer
+                    a (fn [p n]
+                        (c-fill-pointer p 203 n)
+                        (throw (Exception. \"jolt loan boom\"))))
+                  false
+                  (catch Exception e (= \"jolt loan boom\" (.getMessage e))))
+                (= [-53 -53] (vec a))))")))
+(ok "same-array nesting is rejected and cross-array nesting copies both back"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2]) b (byte-array [3 4])]
+              (and
+                (jolt.ffi/with-byte-array-pointer a
+                  (fn [_ _]
+                    (try (jolt.ffi/with-byte-array-pointer a (fn [_ _] false))
+                         false (catch IllegalStateException _ true))))
+                (jolt.ffi/with-byte-array-pointer a
+                  (fn [pa na]
+                    (jolt.ffi/with-byte-array-pointer b
+                      (fn [pb nb]
+                        (c-fill-pointer pa 204 na)
+                        (c-fill-pointer pb 205 nb)
+                        true))))
+                (= [-52 -52] (vec a)) (= [-51 -51] (vec b))))")))
+(ok "an inherited active-loan cell is ignored for a different owner thread id"
+    (let ((a (ev "(byte-array [1])")))
+      (parameterize ((ffi-byte-array-loan-cell
+                      (cons (+ (get-thread-id) 1) (list a))))
+        (null? (ffi-current-byte-array-loans)))))
+
+;; Capturing a continuation in the callback is legal once.  Calling it after the
+;; first exit must fail from the scope's before thunk, before callback code runs.
+(let* ((a (ev "(byte-array [1])")) (v (jolt-array-vec a))
+       (saved #f) (visits 0) (phase 0)
+       (outcome
+        (guard (e (#t (list 'raised (condition-message e) visits)))
+          (let ((value
+                 (ffi-with-scoped-byte-array-pointer "test"
+                  a 0 1
+                  (lambda (p n)
+                    (call/cc (lambda (k) (unless saved (set! saved k)) 'first))
+                    (set! visits (+ visits 1))
+                    n))))
+            (if (= phase 0)
+                (begin
+                  (set! phase 1)
+                  ;; A second after-thunk/copy-back would overwrite this value.
+                  (vector-set! v 0 77)
+                  (saved 'again))
+                (list 'returned value visits))))))
+  (ok "retired loan rejects continuation re-entry before callback resumes"
+      (and (eq? 'raised (car outcome))
+           (has? (cadr outcome) "cannot be re-entered")
+           (= 1 (caddr outcome))
+           (= 77 (vector-ref v 0)))))
+
+;; A :blocking foreign call is collect-safe: a thread parked in it must not pin
+;; the stop-the-world collector. Resolve the helper once before spawning so a
+;; missing symbol cannot make the worker fail open.
+(ev "(def c-test-sleep
+       (jolt.ffi/__cfn \"jolt_test_sleep_millis\" [:uint32] :void :blocking))")
+(let ((sleep-fn (var-deref "user" "c-test-sleep")))
+  (sleep-fn 0) ; force lazy native-symbol resolution on the asserting thread
+  (fork-thread (lambda () (sleep-fn 2000))) ; ~2s
+  (let loop ((i 0)) (when (fx<? i 30000000) (loop (fx+ i 1)))) ; let the worker enter native sleep
   (ok "blocking ffi call is collect-safe" (guard (e (#t #f)) (collect) #t)))
 
 ;; callbacks: receive a call FROM C. A foreign-callable wraps a jolt fn as a
@@ -78,6 +572,104 @@
 ;; free-callable unlocks + drops the code object, returning nil.
 (ok "free-callable releases the callback"
     (jolt-nil? (ev "(jolt.ffi/free-callable cmp)")))
+
+;; --- atomic native-error capture -----------------------------------------
+;; jolt.ffi/__cfn, foreign-fn, and defcfn accept a literal options map with
+;; :blocking and :capture-native-error (literal Booleans only). capture returns
+;; [native-result error-code] (result first), composing with :blocking and the
+;; lazy native-symbol cell. ENOENT==2 (POSIX) and ERROR_FILE_NOT_FOUND==2
+;; (Windows) are the same integer, so the gate is platform-neutral: it never
+;; binds Winsock/WinAPI directly. Malformed options and capture on :void fail
+;; closed at compile time, in jolt.analyzer/analyze-ffi-fn.
+;; Each assertion uses ev-bool/ev=/rejects? so a stale seed (whose analyzer
+;; predates the options map) reports FAIL rather than crashing the suite; against
+;; a reminted image they must hold exactly as written.
+(ev "(require '[jolt.ffi :as ffi])")
+
+;; legacy scalar compatibility: omitted option, and explicit capture=false,
+;; keep the bare scalar result (no pair). The omitted-option case also passes
+;; against the current seed (no map involved), a live no-regression signal.
+(ev "(def c-set-err-scalar (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int))")
+(ok "omitted option keeps the scalar result"
+    (ev= "(c-set-err-scalar)" -1))
+(ev-bool "(def c-set-err-scalar-off (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int {:capture-native-error false}))")
+(ok "explicit :capture-native-error false keeps the scalar result"
+    (ev= "(c-set-err-scalar-off)" -1))
+(ev-bool "(def c-legacy-blocking (ffi/foreign-fn \"jolt_test_set_error_fail\" [] :int :blocking))")
+(ok "public legacy :blocking keeps the scalar result"
+    (ev= "(c-legacy-blocking)" -1))
+(ev-bool "(def c-map-blocking (ffi/foreign-fn \"jolt_test_set_error_fail\" [] :int {:blocking true}))")
+(ok "public {:blocking true} keeps the scalar result"
+    (ev= "(c-map-blocking)" -1))
+(ev-bool "(def c-empty-options (ffi/foreign-fn \"jolt_test_set_error_fail\" [] :int {}))")
+(ok "public empty options map keeps the scalar result"
+    (ev= "(c-empty-options)" -1))
+
+;; direct __cfn options map: capture returns exactly [native-result error-code].
+(ev-bool "(def c-capture (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int {:capture-native-error true}))")
+(ok "captured __cfn returns [native-result error-code], result first"
+    (ev-bool "(let [[r e] (c-capture)] (and (= r -1) (= e 2)))"))
+
+;; public foreign-fn and defcfn macros accept the same options map.
+(ev-bool "(def c-ffn (ffi/foreign-fn \"jolt_test_set_error_fail\" [] :int {:capture-native-error true}))")
+(ok "foreign-fn options map produces a captured binding"
+    (ev-bool "(let [[r e] (c-ffn)] (and (= r -1) (= e 2)))"))
+(ev-bool "(ffi/defcfn c-dfn \"jolt_test_set_error_fail\" [] :int {:capture-native-error true})")
+(ok "defcfn options map produces a captured binding"
+    (ev-bool "(let [[r e] (c-dfn)] (and (= r -1) (= e 2)))"))
+
+;; capture composes with :blocking (collect-safe), same public shape.
+(ev-bool "(def c-capture-block (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int {:blocking true :capture-native-error true}))")
+(ok "captured + :blocking returns the same [result error] shape"
+    (ev-bool "(let [[r e] (c-capture-block)] (and (= r -1) (= e 2)))"))
+(ok "captured lowering cannot be shadowed by a same-named local"
+    (ev-bool "(let [call-with-values (fn [& _] :shadowed)
+                    f (jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :int
+                        {:capture-native-error true})]
+                (= [-1 2] (f)))"))
+
+;; saved-pair immutability: a later failing call mutates the SAME error slot
+;; (EINVAL=22 / ERROR_INVALID_PARAMETER=87), but the pair already snapshotted in
+;; the capture's foreign-call return path stays [-1 2].
+(ev-bool "(def c-overwrite-err (jolt.ffi/__cfn \"jolt_test_overwrite_error\" [] :void))")
+(ok "saved [result error] survives a later mutation of the same slot"
+    (ev-bool "(let [pair (c-capture)] (c-overwrite-err) (and (= (nth pair 0) -1) (= (nth pair 1) 2)))"))
+
+;; malformed-option rejection: each fails closed at compile time.
+(ok "unknown option key rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {:bogus true})"))
+(ok "non-Boolean option value rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {:capture-native-error \"yes\"})"))
+(ok "nonliteral option value rejected"
+    (rejects? "(let [flag true]
+                 (jolt.ffi/__cfn \"strlen\" [] :int {:capture-native-error flag}))"))
+(ok "namespaced option key rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {:other/capture-native-error true})"))
+(ok "non-keyword option key rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {\"blocking\" true})"))
+(ok "extra trailing option rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int :blocking :extra)"))
+(ok "non-map/non-keyword trailing option rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int 42)"))
+(ok "explicit nil direct option rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int nil)"))
+(ok "namespaced legacy keyword rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int :other/blocking)"))
+(ok "non-:blocking keyword option rejected"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int :collect-safe)"))
+(ok "duplicate literal option key rejected by the reader"
+    (rejects? "(jolt.ffi/__cfn \"strlen\" [] :int {:blocking true :blocking false})"))
+(ok "macro extra trailing option rejected"
+    (rejects? "(ffi/foreign-fn \"strlen\" [] :int :blocking :extra)"))
+(ok "macro non-map trailing option rejected"
+    (rejects? "(ffi/foreign-fn \"strlen\" [] :int 42)"))
+(ok "macro explicit nil option rejected"
+    (rejects? "(ffi/foreign-fn \"strlen\" [] :int nil)"))
+
+;; capture on :void is rejected: Chez's unspecified void result is not a stable
+;; first vector element, so there is nothing sound to pair with the error code.
+(ok "captured :void rejected"
+    (rejects? "(jolt.ffi/__cfn \"jolt_test_set_error_fail\" [] :void {:capture-native-error true})"))
 
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
