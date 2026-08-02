@@ -116,6 +116,7 @@ No compiler/runtime implementation until charter + first proof target accepted.
 | `docs/research/reports/P12-EVIDENCE-LATTICE-REVIEW.md` | primary orchestrator (this lane) | advisory review; all 8 findings accepted and applied |
 | `docs/research/reports/P13-SITE-ID-UNIFICATION-REVIEW.md` | primary orchestrator (this lane) | advisory review; all findings accepted and applied |
 | `docs/research/reports/P14-FINAL-CHARTER-REVIEW.md` | primary orchestrator (this lane) | advisory review; accept-with-amendments, all applied |
+| `docs/research/APPLICATION-FLOW-RUNTIME-SEAMS-2026-08-01.md` | primary orchestrator (this lane) | **companion artifact v1** (Codex-requested): Part 1 flow model (`ecosystem-extension-engineer` `ses_03cdc122dffeCRs1Ju1AUk96HM`), Part 2 seams register (`jolt-sim-engineer` `ses_03cdbd674ffeeOhnUsV1j0GibH`), Part 3 integration (primary) |
 | `docs/research/APPLICATION-CORE-SEMANTIC-CHARTER.md` | primary orchestrator (this lane) | **drafting — section-by-section user review before each commit** |
 | everything else in worktree | untouched at base SHA | — |
 
@@ -415,7 +416,8 @@ User authorized creating bounded profiles for the new models and extending
 | 25 | `5991de22`+`9a974b6a` | charter §7 draft (first proof target) + handoff checkpoint | **§7 accepted** |
 | 26 | `a3b6f12c` | charter §8 draft (one-model consumption) | **§8 accepted** |
 | 27 | `484f8914` | charter §9 draft (staged exit criteria) — completes the charter | **§9 accepted; charter complete** |
-| 28 | (pending) | Phase 5: P14 final review + all amendments applied | pending |
+| 28 | `8be0a565` | Phase 5: P14 final review + all amendments applied | yes (companion artifact next) |
+| 29 | (pending) | companion artifact v1 (flow model + seams register + integration) | pending |
 
 ## §1 review outcome (2026-08-01)
 
