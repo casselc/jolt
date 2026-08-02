@@ -353,6 +353,10 @@ User authorized creating bounded profiles for the new models and extending
   `Chuck Cassel <619504+casselc@users.noreply.github.com>`
 - To resume: read this file, then `git status`/`git log` in the worktree.
 
+**Draft PR:** https://github.com/casselc/jolt/pull/12 (base
+`codex/upstream-rebase-v0.5.13-candidate`, head
+`opencode/v0513-application-core-charter`, created 2026-08-01).
+
 ## Pull-request policy (updated 2026-08-01, user-authorized)
 
 - The standing "never push, never open a PR" rule is **lifted for this lane
