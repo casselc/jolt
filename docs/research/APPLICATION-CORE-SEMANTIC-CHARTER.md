@@ -904,9 +904,130 @@ verification-instability treated as evidence-relevant metadata.
 
 ## Appendix A. Normalization algorithm (normative)
 
-DRAFT PENDING — per F3: gensym canonicalization, sibling/child indexing,
-re-expansion chain order, treatment of position-propagated metadata; input to
-the site-ID digest (F2). Drafted with §4.
+This appendix defines `normalize`, the total, deterministic function from a
+fully macro-expanded form to its **normal form** (NF), and the **role path**
+addressing scheme. The site-ID digest (§4.2, F2) is computed over the NF.
+Two independent implementations of this appendix must produce identical NFs
+for identical input; the CSIR v1 exit test's cross-run/cross-implementation
+determinism vectors (§9) check exactly that.
+
+### A.1 Inputs, output, and totality
+
+- **Input:** one fully macro-expanded form (post-expansion, pre-analysis),
+  produced by the reader + expansion pipeline (§2.4: expansion precedes
+  dispatch, recursively re-analyzed).
+- **Output:** an NF tree per A.2, plus the role path of every node per A.5.
+- `normalize` is total and deterministic: it depends only on the input form,
+  never on expansion order, compilation environment, host, or run. Any
+  construct it cannot classify is an implementation error in the normalizer,
+  not an unspecified case — fail closed.
+
+### A.2 Normal form
+
+An NF node is exactly one of:
+
+```text
+[:atom kind value]      kind ∈ {nil boolean integer ratio double decimal
+                                string character keyword symbol}
+[:coll type children]   type ∈ {list vector map set}
+                        children = NF nodes in source order
+                        (maps: flattened key/value pairs in pair order)
+[:quote-data form]      form = NF of the quoted datum (metadata retained per A.4)
+```
+
+Atom canonicalization follows §2.3: integers/ratios by exact value; doubles
+by IEEE-754 bits **canonicalized** (`-0.0` → `0.0`; all NaN payloads → one
+canonical `##NaN` marker); strings by scalar-value sequence; characters by
+codepoint; keywords/symbols by `{ns, name}` — except gensym symbols, per A.3.
+
+### A.3 Gensym canonicalization
+
+- **Detection (portable rule):** a symbol is a gensym iff it is **not
+  readable** — it cannot round-trip through the reader to an identical
+  symbol. Readable symbols keep `{ns, name}`.
+- **Canonicalization:** each distinct gensym **object** is renamed
+  `G{index}` in first-occurrence order under a depth-first pre-order
+  traversal of the form. Two occurrences of the same gensym object share an
+  index; two distinct gensym objects never do — including gensyms with
+  identical printed names from different scopes.
+- *Realization detail:* the object-identity test is host-specific (Jolt
+  realization: symbol identity in the expanded form tree, `V17`
+  `host-contract.ss` expansion path — P10 #4). The portable rule above is
+  the contract; the identity test is an implementation obligation checked by
+  the A.8 vectors.
+
+### A.4 Metadata treatment
+
+Metadata is stripped everywhere **except** two cases:
+
+1. **`:dynamic` on a Var definition** — retained as a boolean semantic flag
+   (it changes §2.2 binding rules).
+2. **Metadata attached to quoted data** — retained, canonicalized as §2.3
+   data (it is observable via `meta`; `[:quote-data]` preserves it).
+
+Stripped (never part of identity): `:pos`/line/column/file; the `:def :meta`
+location duplication present at v0.5.17 (`V17/jolt-core/jolt/analyzer.clj:
+417-432`); `:tag`/type hints (they affect only opaque-lane host dispatch);
+docstrings and `:arglists`; user metadata on non-quoted forms. Rationale:
+the digest identifies *evaluation semantics* of the expanded form; everything
+stripped either has no semantic effect or affects only an opaque lane.
+
+### A.5 Role paths
+
+Every NF node carries a **role path**: a vector of role tokens from the
+enclosing top-level definition's root. Role tokens are assigned by the
+node's position under the following schema (exhaustive for the §2.4 fragment;
+any unlisted head in evaluation position is an invocation):
+
+| Head | Roles |
+| --- | --- |
+| invocation | `:invoke/fn`, `:invoke/arg[i]` (0-based) |
+| `if` | `:if/test`, `:if/then`, `:if/else` |
+| `do` | `:do/[i]` |
+| `let*` | `:let*/bindings[i].init`, `:let*/body[j]` |
+| `loop*` | `:loop*/bindings[i].init`, `:loop*/body[j]`; `recur` args as `:recur/arg[i]` |
+| `fn*` | `:fn*/arity[i].params`, `:fn*/arity[i].body[j]` |
+| `def` | `:def/init` (the Var symbol and metadata are not nodes) |
+| `var` | `:var/sym` (leaf) |
+| `quote` | `:quote/data` |
+| `set!` | `:set!/target` (leaf symbol), `:set!/value` |
+| `throw` | `:throw/value` |
+| `try` | `:try/body[i]`, `:try/catch[i].class`, `:try/catch[i].body[j]`, `:try/finally[j]` |
+| collection literals | `:list/[i]`, `:vector/[i]`, `:map/key[i]`, `:map/val[i]`, `:set/[i]` (in evaluation position) |
+
+The site-ID's "semantic-role path" (§4.2) is the role path from the
+enclosing top-level definition root to the node.
+
+### A.6 Expansion parent (single-step)
+
+Each NF node produced by macro expansion records the **immediate** expansion
+step that introduced it: the role path of the macro call site in the
+pre-expansion form, or `nil` for source-written nodes. The chain order of
+nested expansions is outermost-first per the realization (P10 #4:
+`V17/jolt-core/jolt/analyzer.clj:961-973`;
+`V17/host/chez/host-contract.ss:236-253`), but the NF never depends on
+expansion order — only on the final form plus these single-step links. The
+full expansion-parent *chain* (A3) is reconstructible by following links and
+is **not** part of v1 (F1).
+
+### A.7 Digest computation
+
+The NF is serialized in a canonical EDN subset (atoms per A.2, children
+ordered per A.2/A.5, role paths embedded) and digested with **SHA-256**. The
+digest algorithm is named in the CSIR-schema version (§4.1), so a future
+algorithm change is a schema remint (F4), never a silent drift. (H5's 32-bit
+value hash is deliberately not reused: identity digests need collision
+resistance beyond value-hash purposes.)
+
+### A.8 Determinism vector suite (exit-test content)
+
+The CSIR v1 exit test (§9) must include vectors covering: literal forms of
+every atom kind; nested macros with gensyms (incl. same-printed-name
+distinct-scope gensyms); structure-preserving movement (whitespace, comments,
+reordering of map-literal pairs is **not** structure-preserving — pair order
+is semantic per §2.2); `def` with and without `:dynamic`; quote with and
+without metadata; a form compiled twice with identical IDs; and the same
+form normalized by two independent implementations with identical NFs.
 
 ## Appendix B. Grounding references
 

@@ -407,7 +407,8 @@ User authorized creating bounded profiles for the new models and extending
 | 19 | `4ef7053d` | P11 external reference audits + handoff state | yes (incorporation list approved) |
 | 20 | `ad0e1d89` | P11 incorporations into §1.4/§3–§9 notes + charter §3 full draft (boundary taxonomy) | **§3 accepted** |
 | 21 | `782b361f` | charter §4 full draft (provenance spine, site IDs, schemas/effects, assumptions) | **§4 accepted** |
-| 22 | (pending) | charter §5 draft (evidence taxonomy) + P12 lattice review + amendments | pending |
+| 22 | `f08cb55b` | charter §5 draft (evidence taxonomy) + P12 lattice review + amendments | **§5 accepted** |
+| 23 | (pending) | charter Appendix A (normative normalization algorithm) | pending |
 
 ## §1 review outcome (2026-08-01)
 
@@ -421,7 +422,8 @@ lattice-soundness pass (Fable-slice-4 replacement, session
 found 1 blocker + 3 majors + 4 minors — **all 8 accepted and applied to §5
 before commit** (producer-typed replay coordinates; bundle-never-promotes
 rule; failed-disposition rule; levels-vs-tags-vs-statuses terminology; plus
-4 minors). §5 presented for user review.
+4 minors). **§5 ACCEPTED 2026-08-01.** Appendix A (normative normalization)
+drafted and presented next; then §6 with slice-3-replacement cross-check.
 
 User approved §1 with two directions:
 1. **Implementation-neutrality (Clojure.next core):** the charter's semantics
