@@ -290,6 +290,7 @@
 (jch-register-supers! "java.nio.charset.IllegalCharsetNameException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.lang.Error" '("java.lang.Throwable"))
 (jch-register-supers! "java.lang.AssertionError" '("java.lang.Error"))
+(jch-register-supers! "java.lang.ArrayStoreException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.lang.ArrayIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
 (jch-register-supers! "java.lang.StringIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
 (jch-register-supers! "java.lang.ReflectiveOperationException" '("java.lang.Exception"))
