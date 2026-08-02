@@ -901,9 +901,40 @@
 (define (executor-enqueue! self job)
   (let ((st (jhost-state self)))
     (with-mutex (vector-ref st 2)
+      ;; Admission and shutdown linearize under the queue mutex: once shutdown
+      ;; wins this critical section, execute/submit must reject synchronously
+      ;; rather than appending work after a worker may already have exited.
+      (if (vector-ref st 0)
+          (jolt-throw
+           (jolt-host-throwable
+            "java.util.concurrent.RejectedExecutionException"
+            "Executor has been shut down"))
+          (begin
+            (let ((q (unbox (vector-ref st 1))))
+              (set-cdr! q (cons job (cdr q))))
+            (condition-broadcast (vector-ref st 3)))))))
+;; shutdown/shutdownNow/close all fall through to this: they set the flag and
+;; wake every worker parked in condition-wait so a fully-drained pool notices
+;; the shutdown and exits instead of idling forever. Idempotent — a second
+;; call just re-sets the flag and re-broadcasts, both harmless.
+(define (executor-shutdown! self)
+  (let ((st (jhost-state self)))
+    (with-mutex (vector-ref st 2)
+      (vector-set! st 0 #t)
+      (condition-broadcast (vector-ref st 3))))
+  jolt-nil)
+(define (executor-shutdown? self)
+  (let ((st (jhost-state self)))
+    (with-mutex (vector-ref st 2)
+      (vector-ref st 0))))
+(define (executor-terminated? self)
+  (let ((st (jhost-state self)))
+    (with-mutex (vector-ref st 2)
       (let ((q (unbox (vector-ref st 1))))
-        (set-cdr! q (cons job (cdr q))))
-      (condition-broadcast (vector-ref st 3)))))
+        (and (vector-ref st 0)
+             (null? (car q))
+             (null? (cdr q))
+             (fx=? 0 (vector-ref st 4)))))))
 (let ((single (lambda _ (make-executor 1)))
       (fixed  (lambda (n . _) (make-executor (max 1 (jnum->exact n)))))
       ;; per-task / cached / virtual: enough workers to not serialize; a generous
@@ -929,15 +960,18 @@
                               (jolt-report-throwable e (current-error-port)))))
                 (jolt-invoke thunk)))))
           jolt-nil))
-        (cons "shutdown" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (with-mutex (vector-ref st 2) (condition-broadcast (vector-ref st 3)))) jolt-nil))
-        (cons "shutdownNow" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (with-mutex (vector-ref st 2) (condition-broadcast (vector-ref st 3)))) (jolt-vector)))
-        (cons "close" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (with-mutex (vector-ref st 2) (condition-broadcast (vector-ref st 3)))) jolt-nil))
-        (cons "isShutdown" (lambda (self) (vector-ref (jhost-state self) 0)))
-        (cons "isTerminated" (lambda (self) (let* ((st (jhost-state self)) (q (unbox (vector-ref st 1))))
-          (and (vector-ref st 0) (null? (car q)) (null? (cdr q)) (fx=? 0 (vector-ref st 4))))))
+        ;; Route through executor-shutdown!/-shutdown?/-terminated? (defined above
+        ;; with make-executor) rather than touching st 0 here directly: those set
+        ;; and read the flag INSIDE the queue mutex, the same lock executor-enqueue!
+        ;; checks it under. Setting the flag before acquiring the mutex (as this used
+        ;; to do) raced a concurrent execute/submit past the admission check, and
+        ;; isShutdown/isTerminated reading st 0 with no lock at all could observe a
+        ;; torn view of shutdown?/queue/worker-count relative to a worker's exit.
+        (cons "shutdown" (lambda (self) (executor-shutdown! self)))
+        (cons "shutdownNow" (lambda (self) (executor-shutdown! self) (jolt-vector)))
+        (cons "close" (lambda (self) (executor-shutdown! self)))
+        (cons "isShutdown" (lambda (self) (executor-shutdown? self)))
+        (cons "isTerminated" (lambda (self) (executor-terminated? self)))
         ;; (timeout, unit) on the JVM. The unit used to be dropped and the amount read
         ;; as milliseconds outright, so (.awaitTermination ex 5 TimeUnit/SECONDS)
         ;; waited five MILLISECONDS and reported the pool still running.
