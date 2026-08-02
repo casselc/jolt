@@ -162,32 +162,37 @@ Accepted wording/precision amendments (non-substantive):
 - A6: P3 `:steps :steps` typo (P7 m8). A7: max-steps-7 derivation line added
   (≤6 task transitions; 7 gives one slack) (P7 q1).
 
-Decision clarifications requiring user approval (presented in chat 2026-08-01):
-- C1 (D1): record A3-over-A2 as architect judgment pending a concrete
-  consumer; add CSIR v1 staging (field set, version pin, owner, exit test).
-- C2 (D5): quote F4 verbatim; resolve by lane priority; declare milestone
-  claim "TCB-validation-only, empty refinement relation"; record the
-  0.5.13-substrate dependency.
-- C3 (D7): rescope to conformance-lane test authority only; formal v1 fragment
-  makes no numeric-`=` claim; drop "(executable-derived)".
-- C4 (new): D4 descriptor `site-id` IS the D1 CSIR site ID (one ID space).
-- C5 (new): owners — CSIR schema/versioning = future Jolt core lane; charter
-  evidence-record acceptance = this lane until Codex handoff.
+Decision clarifications C1–C5: **APPROVED by user 2026-08-01** and applied to
+`DECISION-MEMO-2026-08-01.md` §Amendments 2026-08-01:
+- C1 (D1): A3-over-A2 recorded as architect judgment; CSIR v1 staging fixed
+  (field set, version pin to `021b0b72`, future-core-lane validator owner,
+  exit test = one fixed corpus case through both paths, labeled `sampled`).
+- C2 (D5): F4 quoted verbatim; resolution by lane priority; milestone claim
+  "TCB-validation-only, empty refinement relation"; 0.5.13-substrate
+  dependency recorded.
+- C3 (D7): rescoped to conformance-lane test authority only; formal v1
+  fragment makes no numeric-`=` claim; "(executable-derived)" dropped.
+- C4 (new): one site-ID space; descriptor `site-id` = CSIR site ID;
+  Dynamic-opaque code carries the widening site's ID only.
+- C5 (new): CSIR schema/versioning = future Jolt core lane; charter
+  evidence-record acceptance = this lane until Codex handoff, then Codex.
+
+Full dispositions: `REVIEW-RECONCILIATION-2026-08-01.md`.
 
 Deferred to charter content: staged exit criteria detail (charter §9),
 enumeration of "selected throw/try/catch/finally" (charter §2),
 Hegel/differential ordering (CSIR v1 + reference evaluator first, generated
 cases second; hegel API additions remain deferred).
 
-Fable candidates flagged (union of both reviewers; NOT scheduled; Fable only
-on explicit user direction):
-1. D1 identity spine: A3-vs-A2 justification + site-ID/macro-digest-chain/
-   declared-anchor rule (P6+P7).
-2. D5/F4 full reconciliation read (P6) + P3 mailbox transition relation and
-   controls adequacy incl. max-steps derivation (P7).
-3. Site-ID ↔ descriptor unification cross-check once charter §4/§6 exist (P6).
-4. D3/C2 lattice soundness + one-record-schema sufficiency across Hegel
-   seed-only replay vs jolt-sim action-path replay (P7).
+Fable review: **user-directed 2026-08-01 for all four slices.** Sequential,
+one Claude task at a time, per-slice budget cap $10, read-only, bounded to its
+slice:
+1. D1 identity spine (A3-vs-A2 honesty, site-ID/macro-digest/declared-anchor,
+   C4 unification incl. eval'd-code site-IDs) — **dispatched**
+2. D5/F4 reconciliation + P3 mailbox controls adequacy — pending
+3. Site-ID ↔ descriptor unification cross-check — after charter §4/§6 drafted
+4. D3/C2 lattice soundness + record-schema sufficiency — before charter §5
+   finalized
 
 ## Open questions
 
@@ -285,4 +290,5 @@ User authorized creating bounded profiles for the new models and extending
 | 2 | `9df9ec38` | P1/P2/P4 reports + handoff state + infra record | yes (restart authorized) |
 | 3 | `f1825664` | P3 proof-target design + P5 claim checklist + handoff state | yes (all D1–D10 recs approved) |
 | 4 | `0328c988` | decision memo (D1–D10 accepted) + handoff state | yes (design challenge authorized) |
-| 5 | (pending) | P6/P7 challenge reports + reconciliation + handoff state | pending |
+| 5 | `6cc3966f` | P6/P7 challenge reports + reconciliation + handoff state | yes (C1–C5 approved) |
+| 6 | (pending) | memo amendments C1–C5 + reconciliation file + Fable sequencing | pending |

@@ -134,6 +134,100 @@ remint; no compatibility claims across the 0.5.12/0.5.13 gap from this lane.
 
 - Claude CLI (Sonnet, high effort, plan mode, read-only, budget $10 authorized
   by user) — vendor-independent challenge: citation spot-verification, weakest
-  claims, overclaims, charter blockers. Result: pending.
+  claims, overclaims, charter blockers. Result: completed, `reports/P6-CLAUDE-DESIGN-CHALLENGE.md`.
 - `jolt-deep-reviewer` (Kimi K3, read-only, in-session) — fresh-context internal
-  challenge on the same material. Result: pending.
+  challenge on the same material. Result: completed, `reports/P7-DEEP-REVIEW-CHALLENGE.md`.
+- All four load-bearing citations verified with exact line numbers by both
+  reviewers. No evidence-lattice violations. No decision overturned.
+
+## Amendments 2026-08-01 (post-challenge, user-approved C1–C5)
+
+These amendments supersede or extend the referenced decisions above.
+
+### C1 (amends D1): A3 is architect judgment; CSIR v1 staging fixed
+
+The choice of A3 over A2 is recorded as **architect judgment**, asserted in P2
+without comparative evidence; no accepted consumer yet requires A3's declared
+anchors / expansion-parent chain. The **A2-minimal milestone is the only
+committed build**; promotion to A3 requires a named consumer and a fresh review.
+CSIR v1 staging: field set = `{site-id (D1 structural rule), source span,
+expansion parent (single-step in v1), resolved binding, operation tag, lane
+(D2), declared assumptions}`; schema version pinned to base SHA `021b0b72`;
+validator owned by the future Jolt core lane; exit test = one fixed corpus case
+evaluated through the reference evaluator AND the compiled path with matching
+terminal observable, labeled `sampled`.
+
+### C2 (amends D5): F4 quoted verbatim; resolution by lane priority; claim scope declared
+
+F4's objection, verbatim: "The suggested standalone capacity-one mailbox BFS is
+not the immediate proof target… it does not displace the higher-priority
+unchanged-code HTTP/TCP/DB/Maelstrom integration."
+Resolution by lane priority: F4 governs the **jolt-sim runtime lane's** landing
+order; this charter lane specifies a pure-model proof target for the
+cooperative-model track, which F3 roadmap item 3 explicitly recommends. F4's
+sentence is about what jolt-sim executes next, not about what the charter
+specifies as its first target design. The milestone's claim is declared
+**"TCB-validation-only, empty refinement relation"**: the mailbox model has no
+abstraction/coverage relation to any Jolt implementation artifact (native
+channel semantics UNKNOWN per P1), so its evidence validates the
+explorer/kernel/monitor TCB — it is not evidence about Jolt channels.
+Dependency recorded: execution substrate = jolt-sim kernel on a
+0.5.13-compatible pin; jolt-sim's 0.5.13 pivot is unconfirmed (D10); the design
+targets kernel semantics verified at `eb7bce4`.
+
+### C3 (replaces D7): numeric-`=` authority rescoped to conformance-lane tests only
+
+Where conformance tests conflict with README prose on numeric `=`
+(category-blind `1` vs `1N`), the conformance register (`SPEC.md` +
+`known-divergences.edn`) governs **test expectations** only. The formal v1
+fragment makes **no numeric-`=` claim** (D6 already excludes equality corners).
+Category-blind equality is NOT canonized as formal semantics. The README
+correction remains upstream hygiene. (Original D7's "(executable-derived)"
+provenance tag is dropped as unevidenced.)
+
+### C4 (new): one site-ID space
+
+D4's effect-descriptor `site-id` field **is** the D1 CSIR site ID — one ID
+space. An operation descriptor references the CSIR node at which the operation
+is performed. Code that widens to `Dynamic-opaque` (eval, dynamic resolution)
+carries the site-ID of the **widening site** (the eval/resolve call site) when
+one exists, and no finer-grained IDs; evidence records must note the widening
+site.
+
+### C5 (new): ownership assignments
+
+CSIR schema/versioning work is owned by the **future Jolt core implementation
+lane** (not this charter lane). Acceptance of jolt-sim-produced evidence into
+charter D3 evidence records is owned by **this charter lane** until Codex
+handoff, then by Codex.
+
+### Accepted wording corrections (recorded; applied at charter drafting, not by rewriting subagent reports)
+
+- P3 §4 evidence table: all levels are "after execution" (nothing executed).
+- D1 fact wording: only `:pos` carries source metadata; none of the 13 optional
+  IR annotation keys carries provenance/site/resource/assumptions.
+- D5 wording: the corrected control must terminate `:completed`, never
+  `:state-limit` (the explorer requires a positive `:max-states`).
+- D9 scoped: sequential-model variants of concurrency laws remain
+  Hegel-`sampled`; only concurrent/timed variants route to jolt-sim.
+- D5 max-steps-7 derivation: 2 tasks × 3 operations ⇒ longest quiescence path
+  ≤6 task transitions; `max-steps 7` provides one slack.
+- Registered-callback rule completed: "…unless its
+  thread/lifetime/ownership/serialization contract is declared, in which case
+  it may be narrowed to a named capability lane."
+- P3 `:steps :steps` projection-list typo noted (kernel: `:steps` once).
+
+### Fable review sequencing (user-directed 2026-08-01, all four slices approved)
+
+Sequential, one Claude task at a time, per-slice budget cap $10, read-only,
+bounded to its slice (never the whole memo):
+1. **Slice 1 (now):** D1 identity spine — A3-vs-A2 judgment honesty, site-ID /
+   macro-digest-chain / declared-anchor rule, C4 unification consequences
+   (incl. site-IDs for eval'd/dynamically resolved code).
+2. **Slice 2 (next):** D5/F4 reconciliation + P3 mailbox transition relation,
+   invariant, and controls adequacy (incl. max-steps derivation).
+3. **Slice 3 (after charter §4/§6 exist):** site-ID ↔ descriptor unification
+   cross-section check.
+4. **Slice 4 (before charter §5 final):** D3/C2 lattice soundness + one
+   record-schema sufficiency across Hegel seed-only replay vs jolt-sim
+   action-path replay.
