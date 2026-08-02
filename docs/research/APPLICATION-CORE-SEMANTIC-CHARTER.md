@@ -578,15 +578,132 @@ depends on this).
 
 ## 4. Provenance, site IDs, schemas/effects, assumptions
 
-DRAFT PENDING — A3-target/A2-minimal staging with closed v1 schema (F1);
-site-ID from normalized-expanded-form digest (F2) + normative normalization
-appendix (F3, Appendix A); remint orphaning + migration records (F4); anchors
-A3-conditional with no evidence transfer (F5); effect descriptors D2 with one
-ID space + host-origin class + per-instance `operation-id` (C4/F6/F7);
-declared assumptions representation; origins/provenance as trace-schema
-metadata, never inside canonical values (P11 B.7); dynamic origin tracking
-("which CSIR site produced this runtime value") deferred to a later opt-in
-stage with lazy materialization (P11 D).
+This section defines the identity spine every evidence record, trace,
+monitor, replay coordinate, and solver obligation depends on. It is the most
+heavily amended area of the charter (D1 with C1, F1–F7, C4, P11 B.7).
+
+### 4.1 The provenance spine: A3 target, A2-minimal committed milestone
+
+- **Target design (A3):** a compiler-owned, immutable **semantic provenance
+  graph** over expanded forms — each semantic node carries an origin anchor,
+  expansion-parent chain, resolved binding, and semantic-role path; CSIR is
+  its normalized, versioned projection. Recorded as **architect judgment**
+  (C1): no accepted consumer yet requires A3's declared anchors /
+  expansion-parent chain over A2, and promotion to A3 requires a named
+  consumer and a fresh review. The dangerous drift direction is A3-creep;
+  the closed v1 schema (below) is the gate mechanism.
+- **Committed build (A2-minimal, CSIR v1):** after macro expansion and
+  semantic resolution, the compiler emits an **immutable CSIR v1 document
+  beside the optimization IR**, plus a source/provenance map. CSIR v1 is a
+  **closed schema (F1):** unknown fields and anchor records are validation
+  failures. **There are no anchors in v1.** Any A3 feature (anchors,
+  expansion chain beyond single-step) requires a schema remint, which
+  requires a memo amendment naming the consumer plus core-lane review (C5).
+- **CSIR v1 field set (C1):** `{site-id, source span, expansion parent
+  (single-step), resolved binding, operation tag, lane (§3), declared
+  assumptions}`. Schema version pinned to the baseline (`v0.5.17` tag
+  `da59e49d`, H2). The schema validator is owned by the future Jolt core
+  lane (C5).
+- **Anchors (A3-conditional, F5):** if A3 is ever promoted, a declared anchor
+  preserves identity across an intentional refactor — but evidence levels
+  **never transfer across an anchor** (post-anchor claims restart at
+  `assumed`). An anchor grants attribution/history continuity only. Anchor
+  record: old/new CSIR digests, normalized-expansion diff, differential-run
+  evidence ID (the operation's corpus must pass identically on both
+  digests), reviewer identity, stated equivalence argument. General semantic
+  preservation is undecidable; reviewer judgment backed by the mandatory
+  differential-corpus check is the only control.
+
+### 4.2 Site identity (F2/F3)
+
+- **Site-ID = digest of the normalized expanded form at the site** plus the
+  structural components `{CSIR-schema version, namespace/logical definition,
+  resolved binding path, operation tag}` (F2). **Never a line/column hash:**
+  formatting, comments, and structure-preserving movement retain the ID;
+  changing binding resolution, expanded form, operation schema,
+  namespace/definition identity, or CSIR schema breaks it.
+- **The macro-definition digest chain is provenance metadata outside the ID**
+  (F2): a macro edit that changes nothing at the use site must not break the
+  site's identity, and a definition digest may be uncomputable for prebuilt
+  libraries (expanders are opaque compiled closures —
+  `V17/host/chez/host-contract.ss:285-295`). Keeping the chain even as
+  metadata requires explicitly staged definition-time source capture.
+- **Normalization is normative (F3):** Appendix A defines the canonical
+  normalization algorithm — gensym canonicalization, sibling/child indexing,
+  re-expansion chain order, and treatment of position-propagated metadata,
+  including the `:def :meta` location duplication present at v0.5.17
+  (`V17/jolt-core/jolt/analyzer.clj:417-432`), which normalization must
+  strip. Determinism is a hard requirement: the same source compiled twice
+  must yield identical site-IDs; the CSIR v1 exit test includes
+  cross-run/cross-implementation determinism vectors (F3/C1).
+
+### 4.3 Remint and migration policy (F4)
+
+- A prerelease CSIR schema remint **orphans all prior evidence records** —
+  detectable via §5 record metadata, never silently reinterpreted or
+  promoted. One current baseline; no compatibility readers for superseded
+  prerelease schemas.
+- Post-v1 remints must emit an **old-ID→new-ID migration record** for
+  surviving sites. Unversioned identity surviving a remint silently would be
+  worse than orphaning.
+
+### 4.4 Effect descriptors and identity (C4/F6/F7; §3.3)
+
+- **One ID space:** a descriptor's `site-id` IS the CSIR site ID of the node
+  where the operation is performed (C4).
+- **`host-origin` reserved ID class (F6):** operations issued from
+  handwritten host-layer code that never traverses the analyzer (including
+  callbacks fired from native threads) carry a reserved enumerated
+  `host-origin` ID (registration site + entry-kind tag). An absent `site-id`
+  is a validation failure.
+- **`Dynamic-opaque` regions:** attribution is descriptor-level (F7) —
+  operations share the widening site's ID; discrimination comes from the
+  descriptor's fields. `operation-id` is per-instance unique; `operation` is
+  the per-kind tag.
+- **Origins and provenance ride as trace-schema metadata fields, never
+  inside canonical values** (P11 B.7): H5 hash-consistency depends on this.
+  Dynamic per-value origin tracking is a later opt-in stage with lazy
+  materialization (P11 D).
+
+### 4.5 Schemas and assumptions
+
+- **One canonical schema IR** (§8): Malli/spec-like Jolt syntax — data, not
+  a separate language — driving validators/boundary contracts, compiler
+  facts, Hegel generator domains, canonical trace codecs, model domains,
+  refinement contracts, and solver obligation inputs.
+- **Gradual lattice:** `Dynamic` → partially known shape → precise
+  structural schema → refinement. `Dynamic` is not proof of membership; a
+  `Dynamic`→precise boundary receives a contract unless a
+  compiler-recognized guard or a checked proof discharges it. Three contract
+  modes (P11 C): **advisory** (development/sampled), **enforced**
+  (untrusted/FFI/capability boundaries, explicit violation reports),
+  **discharged-elidable** (only with recorded justification; Checked C's
+  erasure is the reference mode).
+- **Required schema forms:** scalar/literal values, unions, closed/open map
+  shapes, required/optional entries, recursive schemas, tagged unions,
+  function signatures, effect/capability descriptors (§3.3), and resource
+  protocols (`Atom<T>`, `Agent<T>`, `Chan<in T,out U>`, `Task<T>`, FFI
+  ownership handles). Arbitrary predicate functions are runtime-only opaque
+  refinements unless separately translated into a checked fragment.
+- **Validator vacuity rule (P11 B.6):** the schema validator must warn on
+  always-true or always-false contract branches (singleton-type-style
+  vacuity detection). **Optional-entry rule:** accessing an optional map
+  entry inside a contract requires a prior presence check enforced by the
+  validator (capability-style), so validators, generators, and traces agree
+  on which optional fields are guaranteed present.
+- **Declared assumptions:** named, per-site or per-claim, carried in CSIR
+  and in every §5 evidence record. An assumption is never validation:
+  `opaque → assumed` requires an explicit named assumption and upgrades
+  nothing further by itself.
+
+### 4.6 What this section explicitly does not provide
+
+- No provenance in the current compiler: v0.5.17 IR carries `:pos` (and
+  `:def :meta` location duplication) but no lineage, site, or assumption
+  fields (`V17/jolt-core/jolt/ir.clj:100-108,149-168`). CSIR is new work
+  owned by the future core lane (C5), gated by §9's exit criteria.
+- No descriptor schema inheritance across effect families (S2).
+- No anchor mechanism in v1 (F1).
 
 ## 5. Evidence taxonomy
 

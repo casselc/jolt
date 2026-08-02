@@ -404,15 +404,16 @@ User authorized creating bounded profiles for the new models and extending
 | 17 | `152dd732` | charter §1 revisions: Clojure.next neutrality + §1.5 staging + H4 eager-first | yes (directions given in §1 review) |
 | 18 | `a7889565` | H5 canonical-hash decision + charter §2 full draft (evaluation order + observable semantics) | **§2 accepted** |
 | 19 | `4ef7053d` | P11 external reference audits + handoff state | yes (incorporation list approved) |
-| 20 | (pending) | P11 incorporations into §1.4/§3–§9 notes + charter §3 full draft (boundary taxonomy) | pending |
+| 20 | `ad0e1d89` | P11 incorporations into §1.4/§3–§9 notes + charter §3 full draft (boundary taxonomy) | **§3 accepted** |
+| 21 | (pending) | charter §4 full draft (provenance spine, site IDs, schemas/effects, assumptions) | pending |
 
 ## §1 review outcome (2026-08-01)
 
 **§1 ACCEPTED** after application of all user directions (neutrality
 reframing, §1.5 staging, H4 processing model). **§2 ACCEPTED 2026-08-01**
 along with the full P11 incorporation list; incorporations applied to §1.4
-(support-level matrix) and the §3–§9 pending notes. §3 drafted and presented
-2026-08-01; review pending.
+(support-level matrix) and the §3–§9 pending notes. **§3 ACCEPTED 2026-08-01.**
+§4 drafted and presented 2026-08-01; review pending.
 
 User approved §1 with two directions:
 1. **Implementation-neutrality (Clojure.next core):** the charter's semantics
