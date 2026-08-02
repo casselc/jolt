@@ -453,7 +453,7 @@ refinement.
    Pass-through in hybrid/observed worlds is always an explicit per-family
    policy choice, never ambient.
 
-Sub-decision defaults (proposed; confirm or adjust):
+Sub-decision defaults (**user-confirmed 2026-08-01**):
 - **S1:** single-parent derivation in v1 (a tree, not a DAG) — no
   `prefer-method` conflict machinery; multiple parents later if a concrete
   need appears.

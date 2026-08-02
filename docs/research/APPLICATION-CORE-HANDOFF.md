@@ -50,8 +50,8 @@
   policy tiers) with multimethod-style derivation as the mechanism (user's
   proposal); derivation optional-but-rewarded, standalone families default to
   tier (b) pass-through-only.** Sub-decisions S1–S3 (single-parent tree v1,
-  no schema inheritance v1, tier-(a) registration validation) proposed as
-  defaults, pending user confirmation.
+  no schema inheritance v1, tier-(a) registration validation) **user-confirmed
+  2026-08-01**.
 - **PR flag:** Codex says "keep the public draft PR current"; Chuck's standing
   rule for this lane is never push/open a PR. Holding Chuck's rule pending
   explicit reversal.
@@ -389,4 +389,5 @@ User authorized creating bounded profiles for the new models and extending
 | 11 | `b48bb60a` | v0.5.17 coordination pivot record; Fable 3–4 cancelled | recorded |
 | 12 | `e79ef669` | P10 refresh register + charter baseline revision (front matter + §1) | yes (H1 confirmed) |
 | 13 | `cc1059de` | H1/H2 memo amendments + handoff state | yes (E2+E3 + hierarchy directed) |
-| 14 | (pending) | H3 derivation-hierarchy amendment + handoff state | pending |
+| 14 | `def4bcd9` | H3 derivation-hierarchy amendment + handoff state | yes (S1–S3 confirmed) |
+| 15 | `1b3840c5`+`688aaa45` | PR policy update + draft PR #12 recorded/pushed | yes (user directed PR) |
