@@ -48,6 +48,7 @@ No compiler/runtime implementation until charter + first proof target accepted.
 | `docs/research/reports/P5-RESEARCH-DOC-CLAIM-CHECKLIST.md` | primary orchestrator (this lane) | unreviewed working artifact |
 | `docs/research/reports/P6-CLAUDE-DESIGN-CHALLENGE.md` | primary orchestrator (this lane) | advisory review, reconciled |
 | `docs/research/reports/P7-DEEP-REVIEW-CHALLENGE.md` | primary orchestrator (this lane) | advisory review, reconciled |
+| `docs/research/reports/P8-FABLE-SLICE1-IDENTITY-SPINE.md` | primary orchestrator (this lane) | advisory review; F1–F7 pending user approval |
 | everything else in worktree | untouched at base SHA | — |
 
 Out-of-worktree session infrastructure (not lane artifacts, not in a git repo):
@@ -188,8 +189,12 @@ Fable review: **user-directed 2026-08-01 for all four slices.** Sequential,
 one Claude task at a time, per-slice budget cap $10, read-only, bounded to its
 slice:
 1. D1 identity spine (A3-vs-A2 honesty, site-ID/macro-digest/declared-anchor,
-   C4 unification incl. eval'd-code site-IDs) — **dispatched**
-2. D5/F4 reconciliation + P3 mailbox controls adequacy — pending
+   C4 unification incl. eval'd-code site-IDs) — **completed**; report
+   `reports/P8-FABLE-SLICE1-IDENTITY-SPINE.md`; 1 BLOCKER (macro-digest chain
+   causes global ID churn) + 4 majors; amendments F1–F7 proposed,
+   **pending user approval**; dispositions in chat
+2. D5/F4 reconciliation + P3 mailbox controls adequacy — pending (after F1–F7
+   decision)
 3. Site-ID ↔ descriptor unification cross-check — after charter §4/§6 drafted
 4. D3/C2 lattice soundness + record-schema sufficiency — before charter §5
    finalized
@@ -291,4 +296,5 @@ User authorized creating bounded profiles for the new models and extending
 | 3 | `f1825664` | P3 proof-target design + P5 claim checklist + handoff state | yes (all D1–D10 recs approved) |
 | 4 | `0328c988` | decision memo (D1–D10 accepted) + handoff state | yes (design challenge authorized) |
 | 5 | `6cc3966f` | P6/P7 challenge reports + reconciliation + handoff state | yes (C1–C5 approved) |
-| 6 | (pending) | memo amendments C1–C5 + reconciliation file + Fable sequencing | pending |
+| 6 | `28f12307` | memo amendments C1–C5 + reconciliation file + Fable sequencing | yes (Fable 4 slices directed) |
+| 7 | (pending) | Fable slice-1 report (P8) + handoff state | pending |
