@@ -306,6 +306,8 @@
 (ok "one install controls System/nanoTime" (= 444 (jolt-mono-nanos)))
 (ok "one install controls jolt.host monotonic source"
     (= 444 ((var-deref "jolt.host" "mono-nanos"))))
+(ok "one install controls jolt.host/monotonic-nanos alias"
+    (= 444 ((var-deref "jolt.host" "monotonic-nanos"))))
 (ok "supervisor monotonic bypass remains native"
     (not (= 444 (jnum->exact (jolt-sim-supervisor-mono-nanos)))))
 (jolt-sim-restore-controller! combined)

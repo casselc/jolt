@@ -496,6 +496,12 @@
 (define (jolt-mono-nanos) (time->nanos (current-time 'time-monotonic)))
 (def-var! "jolt.host" "wall-nanos" jolt-wall-nanos)
 (def-var! "jolt.host" "mono-nanos" jolt-mono-nanos)
+;; Consumer-facing deadline spelling. Keep this as a wrapper instead of storing
+;; jolt-mono-nanos by value: the simulation profile redirects that top-level
+;; binding, so both names and System/nanoTime observe the same controlled clock.
+(def-var! "jolt.host" "monotonic-nanos" (lambda () (jolt-mono-nanos)))
+(def-var! "jolt.host" "monotonic-source"
+  (lambda () (keyword #f "monotonic")))
 
 ;; Collector + memory counters. `statistics` allocates a fresh sstats record per
 ;; call, so these are polling-cadence primitives (a metrics reader every N seconds),

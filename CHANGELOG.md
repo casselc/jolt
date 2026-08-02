@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Consumer-facing monotonic deadline clock.** `jolt.host/monotonic-nanos`
+  aliases the existing `mono-nanos` clock used by `System/nanoTime`, and
+  `jolt.host/monotonic-source` reports `:monotonic`. The alias follows the
+  simulation profile's controlled clock instead of capturing the native source.
+
 - **Variadic foreign bindings declare their fixed-argument boundary.**
   `jolt.ffi/foreign-fn` and `defcfn` accept
   `{:varargs-after n}`, where `n` is the positive number of declared fixed C
