@@ -413,7 +413,8 @@ User authorized creating bounded profiles for the new models and extending
 | 24 | `a3217d53` | charter §6 draft (differential loop) + P13 cross-check + amendments | **§6 accepted** |
 | 25 | `5991de22`+`9a974b6a` | charter §7 draft (first proof target) + handoff checkpoint | **§7 accepted** |
 | 26 | `a3b6f12c` | charter §8 draft (one-model consumption) | **§8 accepted** |
-| 27 | (pending) | charter §9 draft (staged exit criteria) — completes the charter | pending |
+| 27 | `484f8914` | charter §9 draft (staged exit criteria) — completes the charter | **§9 accepted; charter complete** |
+| 28 | (pending) | Phase 5: jolt-reviewer final independent review + reconciliation | pending |
 
 ## §1 review outcome (2026-08-01)
 
@@ -431,12 +432,11 @@ rule; failed-disposition rule; levels-vs-tags-vs-statuses terminology; plus
 2026-08-01; slice-3-replacement cross-check (session
 `ses_03f0299eeffezA6kA7HMb3KkbS`, report `reports/P13-SITE-ID-UNIFICATION-REVIEW.md`)
 found 1 blocker + 3 majors + 1 minor + 1 question-finding — **all accepted
-and applied before commit**. **§6 ACCEPTED 2026-08-01.** **§7 ACCEPTED 2026-08-01.** **§8 ACCEPTED
-2026-08-01.** §9 (staged exit criteria) drafted and presented 2026-08-01 —
-**the charter is now complete in draft** (§1–§9 + Appendix A + Appendix B).
-Remaining: Phase 5 final independent review (`jolt-reviewer`), then the
-Codex-requested companion artifact (whole-system flow model + requested
-runtime seams register), then final handoff checkpoint.
+and applied before commit**. **§1–§9 + Appendix A ALL ACCEPTED 2026-08-01 — the charter is complete and
+accepted.** Phase 5 (final independent review, `jolt-reviewer`) dispatched
+2026-08-01. Remaining after reconciliation: Codex-requested companion
+artifact (whole-system flow model + requested runtime seams register), then
+final handoff checkpoint to Codex.
 
 User approved §1 with two directions:
 1. **Implementation-neutrality (Clojure.next core):** the charter's semantics
