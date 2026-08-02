@@ -351,8 +351,22 @@ User authorized creating bounded profiles for the new models and extending
 
 - Checkpoint commits only after user review, author:
   `Chuck Cassel <619504+casselc@users.noreply.github.com>`
-- Never push, never open a PR.
 - To resume: read this file, then `git status`/`git log` in the worktree.
+
+## Pull-request policy (updated 2026-08-01, user-authorized)
+
+- The standing "never push, never open a PR" rule is **lifted for this lane
+  only**, per user direction 2026-08-01 adopting Codex coordination guidance:
+  keep one public **draft** PR current with bounded, clean research slices.
+- PR location: fork `casselc/jolt` only. Base:
+  `codex/upstream-rebase-v0.5.13-candidate` (contains this lane's git base
+  `021b0b72`, so the PR diff shows only research-lane commits). Head:
+  `opencode/v0513-application-core-charter`.
+- **Never push or open anything against `jolt-lang/jolt` (origin).**
+- Push at each checkpoint commit; no force-push, no history rewrites, no
+  branch renames. The PR body points here as the durable source of truth.
+- All other ownership boundaries unchanged: no edits to compiler/rebase
+  worktrees; no pushes to any other branch.
 
 ## Checkpoint log
 
