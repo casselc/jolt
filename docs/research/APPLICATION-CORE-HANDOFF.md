@@ -411,7 +411,7 @@ User authorized creating bounded profiles for the new models and extending
 | 22 | `f08cb55b` | charter §5 draft (evidence taxonomy) + P12 lattice review + amendments | **§5 accepted** |
 | 23 | `e956fa45` | charter Appendix A (normative normalization algorithm) | **Appendix A accepted** |
 | 24 | `a3217d53` | charter §6 draft (differential loop) + P13 cross-check + amendments | **§6 accepted** |
-| 25 | (pending) | charter §7 draft (first proof target) | pending |
+| 25 | `5991de22` | charter §7 draft (first proof target) | pending user review |
 
 ## §1 review outcome (2026-08-01)
 
@@ -430,7 +430,7 @@ rule; failed-disposition rule; levels-vs-tags-vs-statuses terminology; plus
 `ses_03f0299eeffezA6kA7HMb3KkbS`, report `reports/P13-SITE-ID-UNIFICATION-REVIEW.md`)
 found 1 blocker + 3 majors + 1 minor + 1 question-finding — **all accepted
 and applied before commit**. **§6 ACCEPTED 2026-08-01.** §7 (first proof
-target) drafted and presented next; then §8, §9.
+target) drafted and presented 2026-08-01; review pending. Then §8, §9.
 
 User approved §1 with two directions:
 1. **Implementation-neutrality (Clojure.next core):** the charter's semantics
