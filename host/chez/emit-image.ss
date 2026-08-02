@@ -135,7 +135,17 @@
 ;; a build creates one unit per build and publishes it immediately, so the mode flags
 ;; a build then sets (set-direct-link!/set-var-cache!) land on THIS unit — the same one
 ;; the per-form emit reads its emit-session state from.
-(define (ei-fresh-unit!) (set! ei-unit-box (jolt-ei-new-unit)) (ei-publish-unit!) ei-unit-box)
+(define (ei-fresh-unit!)
+  (set! ei-unit-box (jolt-ei-new-unit))
+  (ei-publish-unit!)
+  ;; The marker exists only in the isolated sim runtime overlay.  Reapply the
+  ;; compile-time flavor after every fresh build unit; ordinary images never
+  ;; enter this arm and their emitted FFI bodies contain no simulator reference.
+  (when (and (top-level-bound? 'jolt-sim-runtime-image?)
+             (eq? #t (top-level-value 'jolt-sim-runtime-image?)))
+    (let ((set-sim! (var-deref "jolt.backend-scheme" "set-sim-instrument!")))
+      (when (procedure? set-sim!) (set-sim! #t))))
+  ei-unit-box)
 ;; publish the current unit to the backend so the emit reads its emit-session state
 ;; (flags, gensym, cache-cells, ctor-shapes) and the contagion clone reaches it.
 ;; Guarded for the first re-mint off an older seed (no set-emit-unit! yet).

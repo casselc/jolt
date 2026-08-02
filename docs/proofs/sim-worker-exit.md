@@ -7,9 +7,12 @@ policy that waits for its successful `:exit` acknowledgement cannot permit
 restoration while that worker may still execute its application body.
 
 This is a sufficiency claim for the external `jolt-sim` restoration guard that
-will consume the private lifecycle seam. The runtime emits the evidence; this
-slice deliberately exposes no public controller ABI and does not itself decide
-when an external controlled scope may restore its controller.
+consumes the sim-image-only prerelease ABI 6 lifecycle seam. The runtime emits
+the evidence and exposes only the unified
+`install-controller! {:future f :ffi ffi :clock clock}` / `restore-controller!`
+pair. One opaque strict-LIFO token owns all three effective controllers; there
+are no public per-subcontroller install or restore operations. The runtime still
+does not decide when an external controlled scope has drained enough to restore.
 
 The model covers snapshots formed from these facts:
 
@@ -198,9 +201,10 @@ Run serially with a pinned threaded Chez:
 make -j1 ordinaryfuturenosim futuresimhook simimagesmoke
 ```
 
-Current Linux and x64 Windows Chez 10.4.1 results are each 26/26 ordinary-image
-assertions and 61/61 future lifecycle assertions. The Linux host also passes
-the isolated release/sim image and runtime-cache smoke.
+Current executed Linux x86_64 / Chez 10.4.1 results are 52/52 ordinary-image
+assertions and 60/60 future lifecycle assertions. The same Linux host passes
+the isolated release/sim image and runtime-cache smoke. ABI 6 Windows evidence
+is pending; no current Windows count is claimed by this record.
 
 ## Remaining gaps
 
@@ -211,3 +215,9 @@ callback begins; the wrapper removes the physical Chez thread from the live
 thread registry only when the callback returns. A failing `:exit` callback must
 poison external restoration rather than count as an acknowledgement. A
 controller that blocks forever in any callback can still prevent drainage.
+
+The focused nested-FFI-during-proceed gate is a synthetic synchronous native
+thunk witness: it proves that controller-phase reentry remains rejected while a
+proceeded native phase can synchronously enter a nested controlled FFI call with
+strict-LIFO proceed tokens. A bounded real `qsort`/SQLite-UDF callback fixture is
+still pending and is not claimed by this Linux evidence.

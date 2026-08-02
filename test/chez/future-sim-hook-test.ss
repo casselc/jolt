@@ -14,6 +14,7 @@
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
+(load "host/chez/java/ffi.ss")
 (load "host/chez/sim/runtime.ss")
 
 (define total 0)
@@ -29,14 +30,10 @@
   (ok (string-append name " => " expected)
       (string=? (render s) expected)))
 
-;; This is still a private runtime seam. Do not expose a partial controller ABI
-;; before future, clock, and FFI operations can be installed atomically.
-(ok "future hook slice registers no public controller vars"
-    (not (var-cell-lookup "jolt.internal.sim" "capabilities")))
-(ok "future hook slice cannot resolve a partial public controller ABI"
-    (guard (e (#t #t))
-      (ev "(jolt.internal.sim/capabilities)")
-      #f))
+;; The future seam now ships only as part of the complete atomic ABI 6 overlay.
+(ok "future hook is exposed through complete controller ABI"
+    (and (var-cell-lookup "jolt.internal.sim" "capabilities")
+         (= 6 (jolt-get (jolt-sim-capabilities) (keyword #f "abi-version")))))
 
 ;; The disabled path is ordinary Jolt and does not allocate simulation IDs.
 (is "future works with hook disabled"

@@ -56,7 +56,16 @@
 (unless (or jb-release? (string=? jb-profile "debug"))
   (error 'build-jolt
          "profile must be \"release\", \"debug\", or \"sim\""
-         jb-profile))
+  jb-profile))
+
+;; Spliced only into the isolated sim launcher's scheme-start.  This arms the
+;; current compiler unit before `run`, `-e`, or `build` can compile user code;
+;; emit-image.ss reapplies it to each fresh AOT unit.  The ordinary launcher has
+;; no corresponding runtime branch or controller symbol reference.
+(define jb-sim-init-form
+  (if jb-sim?
+      "    ((var-deref \"jolt.backend-scheme\" \"set-sim-instrument!\") #t)\n"
+      ""))
 
 ;; Cross-compilation: an optional 3rd arg is the target Chez machine, and the
 ;; target pack comes from $JOLT_TARGET_PACK — cross-builds jolt itself for
@@ -179,7 +188,7 @@
 (scheme-start
   (lambda args
     (set-source-roots! " (ldr-install-roots-str) ")
-    ;; JOLT_TRACE at RUNTIME (the env is unset at heap-build), before any app ns
+" jb-sim-init-form "    ;; JOLT_TRACE at RUNTIME (the env is unset at heap-build), before any app ns
     ;; compiles, so a `-M:run` traces the app's own code.
     (jolt-trace-init-from-env!)
     ;; shared dispatch (cli-core.ss, inlined via the runtime manifest): the -e

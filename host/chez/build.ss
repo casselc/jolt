@@ -1041,9 +1041,16 @@
           ;; defines no vars of its own (only a defmethod) so ns-has-vars? can't
           ;; vouch for it and its own (ns) form hasn't run yet.
           (put-string out "\n;; === app namespace pre-registration ===\n")
-          (for-each (lambda (p) (put-string out (string-append "(intern-ns! " (ei-str-lit (car p)) ")\n")))
-                    ordered)
-          (put-string out "\n;; === app ===\n")
+           (for-each (lambda (p) (put-string out (string-append "(intern-ns! " (ei-str-lit (car p)) ")\n")))
+                     ordered)
+           ;; A sim-built app with its compiler retained can eval/load source at
+           ;; application top level, before scheme-start. Arm that embedded
+           ;; compiler here, after the runtime/compiler definitions and before
+           ;; the first app form. Compiler-dropped outputs omit the call entirely.
+           (when (and (bld-sim-runtime-image?) (not drop-compiler?))
+             (put-string out "\n;; === sim retained-compiler flavor ===\n")
+             (put-string out "(jolt-sim-arm-compiler!)\n"))
+           (put-string out "\n;; === app ===\n")
           (for-each (lambda (s) (put-string out s) (put-string out "\n")) app-strs)
           ;; The launcher runs as Chez's scheme-start (so argv reaches -main —
           ;; top-level boot forms run during heap build, before args are set), and
