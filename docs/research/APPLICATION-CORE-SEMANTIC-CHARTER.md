@@ -707,11 +707,141 @@ heavily amended area of the charter (D1 with C1, F1–F7, C4, P11 B.7).
 
 ## 5. Evidence taxonomy
 
-DRAFT PENDING — the 7 levels; C2 claim-relative partial order; never-promote
-list; mandatory record metadata; pre-remint record rule (records remain valid
-under their recorded versions, never silently promoted); Fable slice-4
-(lattice soundness + record-schema sufficiency) fires before this section is
-finalized.
+Every claim in the ecosystem carries exactly one evidence level, a claim
+identity, a scope, and the mandatory record metadata of §5.4. Levels are
+never merged; a claim displays its level, bounds, assumptions, and replay
+coordinates wherever it appears.
+
+### 5.1 The seven levels
+
+| Level | Meaning | Requirements |
+| --- | --- | --- |
+| `proved` | A checked theorem/certificate establishes the proposition under stated assumptions | Names the exact proposition, the artifacts it is relative to, the checker and its version, and every TCB component; a paper proof or an unchecked encoding is **not** `proved` (P11/Cedar §4.4 precedent) |
+| `bounded-complete` | A **finished, uncapped** exploration of a declared finite transition relation found no violation | Finite relation declared; canonical state identity; all enabled actions explored; exploration terminated; **no state cap was hit** — a cutoff is not bounded-complete |
+| `sampled` | Generated or example cases over a declared sampling domain passed | Declared domain; reproducible cases; replay coordinates (seed); Hegel results and differential corpus results are always `sampled`, never more |
+| `monitored` | A validated canonical trace satisfies a finite-trace property under declared required-observation coverage | Validated trace document; coverage declaration; loss, malformed mapping, or an escape yields `inconclusive`/`failed`, never pass; finite-trace properties only — never unbounded liveness |
+| `assumed` | An explicit, named assumption is recorded | Not validation; `opaque → assumed` requires naming the assumption; upgrades nothing further by itself |
+| `opaque` | Nothing is claimed | The honest default at any boundary not yet specified |
+| `failed` | Evidence for the **negation**: a counterexample, witness, violated monitor, or a differential counterexample (mismatched terminal outcomes per §2.6) was found | Incomparable with all positive levels; blocks any promotion of the claim until the failure is resolved and re-evidenced (re-evidencing is a new evidence chain for the same claim ID; the historical `failed` record remains attached with its disposition) |
+
+### 5.2 The claim-relative partial order (C2)
+
+Evidence levels relate **only for the same proposition, transition relation,
+abstraction, and scope**:
+
+```text
+                 proved
+                   │  (requires checked certificate of same/stronger
+                   │   proposition under listed assumptions + TCB)
+          bounded-complete
+          │                │  (only when a finished, uncapped exploration
+          │                │   covers that same finite relation)
+      sampled          monitored
+          │                │
+          └── assumed ─────┘
+                   │
+                opaque
+
+failed ⊥ (incomparable with every positive level; blocks promotion)
+```
+
+`sampled` and `monitored` are **incomparable**: neither outranks the other;
+they answer different questions about the same claim. Evidence **bundles**
+combine only when claim ID and **scope** match exactly, where scope is the
+full record identity: transition relation/abstraction digest (including the
+canonical state-identity/projection), bounds, fairness, host assumptions,
+**schema/IR version, and target tuple**. **A bundle's level is the strongest
+single member's; combination never promotes.** No set of `sampled` and/or
+`monitored` records is `bounded-complete` — that level requires a finished,
+uncapped exploration of the declared finite relation by a single exploration
+claim. (The diagram depicts level order, not bundle semantics.)
+
+### 5.3 The never-promote list
+
+The following promotions are **never** valid, for any tool, any claim:
+
+1. Hegel/sample pass → `proved`.
+2. Finite monitor pass → unbounded liveness (monitors decide finite-trace
+   properties only).
+3. Timeout → deadlock (a timeout is `inconclusive`, always).
+4. State-cap cutoff → `bounded-complete`.
+5. Model result → implementation conformance without a declared abstraction
+   and coverage relation (D3; D5's mailbox milestone explicitly carries an
+   empty refinement relation).
+6. `table` / `probed` native facts → runtime support claims (runtime claims
+   need real target execution).
+7. Anchor crossing → any evidence transfer (post-anchor claims restart at
+   `assumed`, F5).
+8. Pre-remint record → post-remint promotion (records are orphaned and
+   detectable only, F4).
+9. Sampled/lossy production telemetry → a required-coverage monitor pass
+   (sampled-away telemetry ⇒ `inconclusive`, P5 B.18).
+10. Simulation (`simulated`) → host behavior claims of any kind.
+
+**Failed-disposition rule (P11 reviewer F3):** §4.1 anchor records and §4.3
+remint records must enumerate **unresolved `failed` records** on the old
+digest, each with a per-record disposition (`resolved` / `re-evidenced` /
+`waived` with reviewer identity). An undispositioned failure blocks the new
+claim at `failed` — failure is never laundered across an anchor or remint,
+even though positive evidence never transfers.
+
+**Terminology (levels vs tags vs statuses):** the seven levels above are the
+only evidence **levels**. `probed`, `runtime`, and `simulated` (as used in
+§3.1's lane table) are evidence-**kind tags** marking the producing lane, not
+levels. `inconclusive` is a **result status**, not a level: it marks an
+outcome that establishes neither the proposition nor its negation (timeouts,
+state caps without a violation witness, lost required observations). A
+state-cap result is `inconclusive` unless a violation witness exists — in
+which case the claim is `failed` on the witness's own evidence.
+
+### 5.4 Mandatory evidence record metadata
+
+Every evidence record carries: **claim ID and proposition; level;
+source/model/CSIR digest; schema/IR version; tool and checker versions;
+transition-system/abstraction digest; bounds and state-cap status; fairness;
+host/FFI and controlledness assumptions; result; replay coordinates;
+timestamp; and target tuple.** **Replay coordinates are producer-typed**
+(P11 reviewer F1 — the quadruple seed/choices/trace-digest/witness is
+unfulfillable by the charter's own first producers): Hegel = `{seed, tool
+versions, minimized-source?}` (public cross-process replay is seed-only,
+P4); jolt-sim exploration = `{sim-config digest, transition-relation digest,
+bounds, witness-path? on violation}`; monitor = `{trace digest, coverage
+declaration}`. The D5 mailbox execution (§7) is the conformance fixture for
+this per-producer schema. Records from before a schema/IR remint **remain
+readable as historical records under their recorded versions** and are
+orphaned for all current-claim display and promotion (F4).
+Verification-instability is evidence-relevant metadata: tool/checker versions
+are pinned, and known instability of the checker is recorded (P11
+Dafny-stability precedent).
+
+### 5.5 Claim classes and their producers (routing)
+
+| Claim class | Producer | Level ceiling |
+| --- | --- | --- |
+| Examples, local regressions | ordinary Jolt tests | `sampled` (literal-case examples) |
+| Generated/shrunk cases | jolt-hegel | `sampled` |
+| Finite pure reachability | jolt-sim explicit-state explorer | `bounded-complete` iff finished uncapped, else `failed`/`inconclusive` |
+| Relational bounded witness | relational/solver backend | `sampled`/`bounded-complete` per declared relation |
+| Inductive invariant, resource lemma | SMT or proof-assistant backend | `proved` iff certificate checked, with TCB |
+| Protocol/distributed temporal model | TLA+/Quint/other temporal backend | only the exact independently verified bounded claim |
+| Native ABI/layout fact | header/layout probe + target runtime gate | `probed`; `runtime` only after real target execution |
+| Implementation↔model relation | trace refinement adapter with declared abstraction + coverage | `monitored`/`bounded-complete` per coverage |
+| Finite safety over observed traces | runtime monitors over canonical traces | `monitored` |
+| Liveness/temporal properties | later stage only: explicit fairness + infinite-trace interpretation | never from a finite monitor |
+
+### 5.6 Display and honesty rules
+
+- A green run is never displayed as a proof; a state-cap result is displayed
+  as `inconclusive`/`failed`, never as success; unknown/malformed/lost
+  required observations are reported, not hidden.
+- External precedents this lattice exists to prevent (P11): an
+  "exhaustive… all possible executions" claim with no declared finite
+  relation (Hydro docs), and a "verified" headline for a component whose
+  machine-checked proofs are still underway (Cedar §1 vs §4.4). Under this
+  lattice the first is not `bounded-complete` and the second is `assumed`,
+  not `proved`.
+- Agents and tools may propose claims; only compiler/toolchain-produced
+  evidence records upgrade them.
 
 ## 6. First executable differential-validation loop
 

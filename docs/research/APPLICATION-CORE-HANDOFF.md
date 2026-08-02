@@ -112,7 +112,8 @@ No compiler/runtime implementation until charter + first proof target accepted.
 | `docs/research/reports/P8-FABLE-SLICE1-IDENTITY-SPINE.md` | primary orchestrator (this lane) | advisory review; F1–F7 approved and applied |
 | `docs/research/reports/P9-FABLE-SLICE2-PROOF-TARGET.md` | primary orchestrator (this lane) | advisory review; G1–G6 approved and applied |
 | `docs/research/reports/P10-V0517-REFRESH-REGISTER.md` | primary orchestrator (this lane) | unreviewed working artifact; **citation authority for charter** |
-| `docs/research/reports/P11-EXTERNAL-REFERENCE-AUDITS.md` | primary orchestrator (this lane) | unreviewed working artifact; incorporation dispositions pending |
+| `docs/research/reports/P11-EXTERNAL-REFERENCE-AUDITS.md` | primary orchestrator (this lane) | incorporations approved and applied |
+| `docs/research/reports/P12-EVIDENCE-LATTICE-REVIEW.md` | primary orchestrator (this lane) | advisory review; all 8 findings accepted and applied |
 | `docs/research/APPLICATION-CORE-SEMANTIC-CHARTER.md` | primary orchestrator (this lane) | **drafting — section-by-section user review before each commit** |
 | everything else in worktree | untouched at base SHA | — |
 
@@ -405,7 +406,8 @@ User authorized creating bounded profiles for the new models and extending
 | 18 | `a7889565` | H5 canonical-hash decision + charter §2 full draft (evaluation order + observable semantics) | **§2 accepted** |
 | 19 | `4ef7053d` | P11 external reference audits + handoff state | yes (incorporation list approved) |
 | 20 | `ad0e1d89` | P11 incorporations into §1.4/§3–§9 notes + charter §3 full draft (boundary taxonomy) | **§3 accepted** |
-| 21 | (pending) | charter §4 full draft (provenance spine, site IDs, schemas/effects, assumptions) | pending |
+| 21 | `782b361f` | charter §4 full draft (provenance spine, site IDs, schemas/effects, assumptions) | **§4 accepted** |
+| 22 | (pending) | charter §5 draft (evidence taxonomy) + P12 lattice review + amendments | pending |
 
 ## §1 review outcome (2026-08-01)
 
@@ -413,7 +415,13 @@ User authorized creating bounded profiles for the new models and extending
 reframing, §1.5 staging, H4 processing model). **§2 ACCEPTED 2026-08-01**
 along with the full P11 incorporation list; incorporations applied to §1.4
 (support-level matrix) and the §3–§9 pending notes. **§3 ACCEPTED 2026-08-01.**
-§4 drafted and presented 2026-08-01; review pending.
+**§4 ACCEPTED 2026-08-01.** §5 drafted 2026-08-01; jolt-deep-reviewer
+lattice-soundness pass (Fable-slice-4 replacement, session
+`ses_03f20f3fbffeAvYaaszgzb3rCE`, report `reports/P12-EVIDENCE-LATTICE-REVIEW.md`)
+found 1 blocker + 3 majors + 4 minors — **all 8 accepted and applied to §5
+before commit** (producer-typed replay coordinates; bundle-never-promotes
+rule; failed-disposition rule; levels-vs-tags-vs-statuses terminology; plus
+4 minors). §5 presented for user review.
 
 User approved §1 with two directions:
 1. **Implementation-neutrality (Clojure.next core):** the charter's semantics
