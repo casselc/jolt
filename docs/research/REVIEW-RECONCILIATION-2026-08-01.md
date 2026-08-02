@@ -90,7 +90,7 @@ read-only, bounded to its slice:
 | Slice | Scope | Timing | Status |
 | --- | --- | --- | --- |
 | 1 | D1 identity spine: A3-vs-A2 judgment honesty, site-ID / macro-digest-chain / declared-anchor rule, C4 unification consequences (incl. site-IDs for eval'd/dynamically resolved code) | completed 2026-08-01 | report `reports/P8-FABLE-SLICE1-IDENTITY-SPINE.md`; F1–F7 user-approved and applied to memo |
-| 2 | D5/F4 reconciliation + P3 mailbox transition relation, invariant, controls adequacy (incl. max-steps derivation) | completed 2026-08-01 ($3.47 of $10 cap) | report `reports/P9-FABLE-SLICE2-PROOF-TARGET.md`; 2 blockers + 4 majors; amendments G1–G6 proposed, **pending user approval** |
+| 2 | D5/F4 reconciliation + P3 mailbox transition relation, invariant, controls adequacy (incl. max-steps derivation) | completed 2026-08-01 ($3.47 of $10 cap) | report `reports/P9-FABLE-SLICE2-PROOF-TARGET.md`; 2 blockers + 4 majors; amendments G1–G6 **user-approved and applied to memo** |
 | 3 | site-ID ↔ descriptor unification cross-section check | after charter §4/§6 drafted | pending |
 | 4 | D3/C2 lattice soundness + one record-schema sufficiency (Hegel seed-only replay vs jolt-sim action-path replay) | before charter §5 finalized | pending |
 
@@ -115,7 +115,7 @@ non-deterministic normalization spec; host-origin site-ID dangling case), 3
 minors, 2 questions. D1's core direction (structural key, never line/column)
 survived adversarial review and was verified against live source.
 
-## Fable slice-2 dispositions (primary recommendation; pending user approval)
+## Fable slice-2 dispositions (user-approved 2026-08-01; applied as G-amendments)
 
 Report: `reports/P9-FABLE-SLICE2-PROOF-TARGET.md`. Cost $3.47 (cap $10).
 All source analysis hand-simulated by Fable against live jolt-sim source;

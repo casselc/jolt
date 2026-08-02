@@ -303,3 +303,77 @@ widening site's ID; discrimination comes from the descriptor). D4's
 `operation-id` is **per-instance unique** (one per operation invocation),
 aligning with jolt-sim's stable operation-ID practice; the `operation` field
 remains the per-kind tag.
+
+## G-amendments 2026-08-01 (Fable slice 2, user-approved)
+
+These amendments correct the D5 first proof target design. Report:
+`reports/P9-FABLE-SLICE2-PROOF-TARGET.md`. Note: throughout this memo, "the
+Flow plan" refers to `JOLT-SIM-MAELSTROM-FLOW-IMPLEMENTATION-PLAN.md`;
+"F4" unambiguously denotes amendment F4 above (name-collision fix, G6).
+
+### G1 (amends D5): step bound re-derived counting block transitions
+
+Encoding declared: guard failure ⇒ `step-block`, a budget-consuming transition;
+wakes are conditional on world-tracked waiting flags. The longest quiescence
+path is **10 task transitions** (9 if the consumer starts blocked);
+`max-steps` is set to **11** (one slack). `:step-limit` remains in the
+violation disjunction as the bound's checked control. This supersedes the
+earlier "≤6 + one slack = 7" derivation, which counted only productive
+operations and would have made the corrected control return `:violation` via
+its own `:step-limit` clause.
+
+### G2 (amends D5/P3 model): world gains waiting flags; wakes conditional; relation restated
+
+The kernel has no world-state guards: `machine-actions` enumerates runnable
+tasks only (`kernel.clj:545-560`), and a task blocks by executing `step-block`
+(one transition, increments `:steps`). Waking a non-blocked task throws outside
+the step-fn catch (`kernel.clj:187-190,357-363`), crashing the explorer.
+Therefore: the world schema gains producer/consumer **waiting flags**; every
+wake is conditional on them; the transition relation is restated as a
+model-level abstraction over the kernel graph containing block transitions;
+and "send enabled" is defined over the projection. Spurious wakeups cannot
+occur (wakes are exact and explicit) and close-while-sender-blocked is
+unreachable in this configuration; both are named in the omissions list.
+
+### G3 (amends D5 invariant): `:failed` added to the violation disjunction
+
+`classify` puts `:failed` first (`kernel.clj:322-327,530-535`); without this
+clause a step-fn defect becomes a silently-counted terminal while the corrected
+control returns `:completed`.
+
+### G4 (amends D5 controls): clause 3 made non-vacuous by a second fault-injected control
+
+A second fault-injected control uses the producer program `send-a, close,
+send-b`, expecting the no-send-after-close clause (clause 3) to fire. (The
+original configuration can never reach a pending send after close, so clause 3
+was untestable as configured; a documented-vacuous downgrade was considered
+and rejected in favor of the cheap strengthening control.)
+
+### G5 (amends D5 TCB): two rows added
+
+- **Invariant function:** per-clause known-SAT probe fixtures. The buggy
+  close-drop preserves prefix-ness, so clause 2 (prefix) is never exercised by
+  the named buggy control; clauses 1, 2, 3, and the `:deadlock` clause each
+  require their own probe.
+- **Persisted-trace EDN reader:** malformed/truncated/forged-document rejection
+  fixtures, including the documented end-of-input-sentinel regression.
+
+Also named: the canonical value/restore round-trip underpins both state
+identity and evidence canonicalization (covered by the canonical-projection
+row, now explicit); fixture-to-test wiring remains trusted and is acknowledged.
+
+### G6 (minors, recorded)
+
+- Non-vacuity verification mechanism named: literal scripted-path fixtures with
+  `restore-projection` asserts (the existing idiom at
+  `explore_states_test.clj:379-385`) or per-class probe invariants expecting
+  `:violation`.
+- `:max-states` (explorer state cap, `explore_states.clj:54-59`) is named
+  beside `:max-steps` (kernel transition budget); the two are never conflated.
+- Execution scheduling: D5 evidence remains `[assumed]` until the jolt-sim
+  landing order explicitly schedules it (requires a jolt-sim landing-order
+  amendment); recorded as a dependency, not a claim.
+- Pin recency resolved by the primary via `git merge-base`: `588677b` is an
+  ancestor of `eb7bce4` (verified 2026-08-01); C2's pin is the newer main.
+- Name-collision fix: "the Flow plan" = the Maelstrom/Flow implementation plan
+  document; "F4" denotes only amendment F4.

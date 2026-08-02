@@ -49,7 +49,8 @@ No compiler/runtime implementation until charter + first proof target accepted.
 | `docs/research/reports/P6-CLAUDE-DESIGN-CHALLENGE.md` | primary orchestrator (this lane) | advisory review, reconciled |
 | `docs/research/reports/P7-DEEP-REVIEW-CHALLENGE.md` | primary orchestrator (this lane) | advisory review, reconciled |
 | `docs/research/reports/P8-FABLE-SLICE1-IDENTITY-SPINE.md` | primary orchestrator (this lane) | advisory review; F1–F7 approved and applied |
-| `docs/research/reports/P9-FABLE-SLICE2-PROOF-TARGET.md` | primary orchestrator (this lane) | advisory review; G1–G6 pending user approval |
+| `docs/research/reports/P9-FABLE-SLICE2-PROOF-TARGET.md` | primary orchestrator (this lane) | advisory review; G1–G6 approved and applied |
+| `docs/research/APPLICATION-CORE-SEMANTIC-CHARTER.md` | primary orchestrator (this lane) | **drafting — section-by-section user review before each commit** |
 | everything else in worktree | untouched at base SHA | — |
 
 Out-of-worktree session infrastructure (not lane artifacts, not in a git repo):
@@ -197,7 +198,7 @@ slice:
 2. D5/F4 reconciliation + P3 mailbox controls adequacy — **completed**
    ($3.47 of $10 cap); report `reports/P9-FABLE-SLICE2-PROOF-TARGET.md`;
    2 blockers (kernel encoding; max-steps bound) + 4 majors; amendments
-   G1–G6 proposed, **pending user approval**
+   G1–G6 **user-approved and applied to memo**
 3. Site-ID ↔ descriptor unification cross-check — after charter §4/§6 drafted
 4. D3/C2 lattice soundness + record-schema sufficiency — before charter §5
    finalized
@@ -302,4 +303,5 @@ User authorized creating bounded profiles for the new models and extending
 | 6 | `28f12307` | memo amendments C1–C5 + reconciliation file + Fable sequencing | yes (Fable 4 slices directed) |
 | 7 | `b5f6c819` | Fable slice-1 report (P8) + handoff state | yes (F1–F7 approved) |
 | 8 | `489b9a49` | memo F-amendments + reconciliation dispositions + slice-2 dispatch | yes (F1–F7 approved) |
-| 9 | (pending) | Fable slice-2 report (P9) + reconciliation + handoff state | pending |
+| 9 | `01ecf4c5` | Fable slice-2 report (P9) + reconciliation + handoff state | yes (G1–G6 approved) |
+| 10 | (pending) | memo G-amendments + Phase 4 charter drafting start | pending |
