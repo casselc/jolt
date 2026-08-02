@@ -44,11 +44,14 @@
   survive; line-level citations and the mono-nanos/telemetry/timed-wait deltas
   are what P10 refreshes.
 - **Amendment queue:** H1 (D4/D2 effect vocabulary OPEN and extensible):
-  **user-confirmed 2026-08-01** ("effects should be extensible"); applied to
-  memo. Governance model for user-defined families (E-options analysis:
-  universally-open vs core-reserved vs policy-tiered vs refinement-only)
-  presented in chat; decision pending. H2 (charter baseline = v0.5.17):
-  applied; coordination-mandated.
+  **user-confirmed 2026-08-01**; applied to memo. H2 (charter baseline =
+  v0.5.17): applied; coordination-mandated. **H3 (extensibility governance):
+  user-decided 2026-08-01 — E2+E3 (core-reserved `:jolt.effect/*` set +
+  policy tiers) with multimethod-style derivation as the mechanism (user's
+  proposal); derivation optional-but-rewarded, standalone families default to
+  tier (b) pass-through-only.** Sub-decisions S1–S3 (single-parent tree v1,
+  no schema inheritance v1, tier-(a) registration validation) proposed as
+  defaults, pending user confirmation.
 - **PR flag:** Codex says "keep the public draft PR current"; Chuck's standing
   rule for this lane is never push/open a PR. Holding Chuck's rule pending
   explicit reversal.
@@ -367,4 +370,5 @@ User authorized creating bounded profiles for the new models and extending
 | 10 | `248d4256` | memo G-amendments + Phase 4 charter drafting start | yes (pivot forwarded) |
 | 11 | `b48bb60a` | v0.5.17 coordination pivot record; Fable 3–4 cancelled | recorded |
 | 12 | `e79ef669` | P10 refresh register + charter baseline revision (front matter + §1) | yes (H1 confirmed) |
-| 13 | (pending) | H1/H2 memo amendments + handoff state | pending |
+| 13 | `cc1059de` | H1/H2 memo amendments + handoff state | yes (E2+E3 + hierarchy directed) |
+| 14 | (pending) | H3 derivation-hierarchy amendment + handoff state | pending |

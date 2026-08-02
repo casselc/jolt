@@ -408,3 +408,57 @@ v0.5.12/v0.5.13 or earlier fork behavior; branch/worktree names containing
 "v0513" are historical. This lane's git base remains `021b0b72` (no rebase,
 no rename). Source citations follow `reports/P10-V0517-REFRESH-REGISTER.md`
 where it differs from P1.
+
+### H3 (implements H1): effect-family derivation hierarchy — E2+E3 governance via multimethod-style derivation
+
+User-decided 2026-08-01: E2+E3 governance; mechanism "something like
+multimethod hierarchies" (user's phrasing). Derivation is **optional but
+rewarded** — this resolves the E4 rigidity problem without E4's mandatory
+refinement.
+
+1. Every effect family is a namespaced keyword. Families form a derivation
+   hierarchy as in Clojure multimethods: a family MAY `derive` from a parent
+   family; `isa?`/ancestors queries govern handler applicability and tier
+   inheritance.
+2. **Core reserved set (E2):** the `:jolt.effect/*` namespace prefix is
+   reserved for Jolt-core-owned families (clock, entropy, scheduling/task,
+   io/fs, net, process, ffi) with fixed semantics, schemas, and target
+   mappings (e.g., monotonic clock → `jolt.host/mono-nanos` on v0.5.17, the
+   descriptor recording the supplying primitive). Core families may not be
+   redefined or shadowed; extension happens by deriving **from** them.
+3. **Open extension:** library/application families register under their own
+   namespaces. A derived family inherits handler coverage and policy tier
+   from its ancestors. A standalone family (no declared parents) defaults to
+   **tier (b) pass-through-only** — honest by default.
+4. **Handler applicability:** a handler installed for family F covers F and
+   all its descendants. Dynamic scope remains innermost-first (D4): between
+   two applicable installed handlers, the dynamically nearest wins; between
+   handlers at the same dynamic level, the most-specific family wins; two
+   equally-specific applicable handlers at the same level is an installation
+   error and fails closed.
+5. **Policy tiers (E3):** a family inherits its tier from the nearest
+   ancestor with a declared tier unless it declares its own. A family may
+   upgrade to tier (a) `modeled` only with a registered model/handler as
+   evidence — registration validates the named model exists and rejects
+   invalid claims at registration time (fail closed, no warn-and-admit). A
+   family may downgrade (declare (b)/(c) below an ancestor's tier) when its
+   operations escape the ancestor's model; a hermetic world rejects
+   installation of (b)/(c) families regardless of ancestor tier.
+6. **Schemas (v1):** per-family and independent; derivation governs handler,
+   tier, and semantics inheritance only — NOT descriptor schema inheritance.
+   Schema composition is a possible later feature, not v1.
+7. **Fail-closed rule (updated from D4):** a hermetic world fails closed on a
+   performed family when no installed handler covers it directly or via
+   ancestors, or when the family is registered at a tier the world rejects.
+   Pass-through in hybrid/observed worlds is always an explicit per-family
+   policy choice, never ambient.
+
+Sub-decision defaults (proposed; confirm or adjust):
+- **S1:** single-parent derivation in v1 (a tree, not a DAG) — no
+  `prefer-method` conflict machinery; multiple parents later if a concrete
+  need appears.
+- **S2:** no descriptor schema inheritance in v1 (per §6).
+- **S3:** any explicit tier change requires a declaration at registration;
+  silent inheritance is the default; tier-(a) claims without a registered
+  model are rejected at registration validation, not admitted with a
+  warning.
