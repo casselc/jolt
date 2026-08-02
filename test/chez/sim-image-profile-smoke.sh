@@ -113,6 +113,9 @@ sim_got="$("$work/sim-app")"
 
 definition='(define jolt-sim-runtime-image? #t)'
 hook_definition='(define (jolt-sim-future-call thunk)'
+controller_definition='(define (jolt-sim-capabilities)'
+ffi_hook_definition='(define jolt-ffi-sim-hook #f)'
+clock_definition='(define (jolt-sim-now-monotonic-nanos)'
 
 if grep -Fq "$definition" "$work/normal-runtime.ss"; then
   echo "sim image smoke: ordinary app runtime contains the sim marker" >&2
@@ -123,10 +126,13 @@ if grep -Fq "$definition" "$normal_compiler_build/flat.ss"; then
   exit 1
 fi
 for file in "$work/normal-runtime.ss" "$normal_compiler_build/flat.ss"; do
-  if grep -Fq "$hook_definition" "$file"; then
-    echo "sim image smoke: ordinary image contains the future hook: $file" >&2
-    exit 1
-  fi
+  for forbidden in "$hook_definition" "$controller_definition" \
+                   "$ffi_hook_definition" "$clock_definition"; do
+    if grep -Fq "$forbidden" "$file"; then
+      echo "sim image smoke: ordinary image contains simulation controller machinery: $file" >&2
+      exit 1
+    fi
+  done
 done
 
 count="$(line_count "$definition" "$work/sim-runtime.ss")"
@@ -158,6 +164,13 @@ for file in "$work/sim-runtime.ss" "$sim_compiler_build/flat.ss"; do
     echo "sim image smoke: expected one executable future hook in $file, found $count" >&2
     exit 1
   }
+  for required in "$controller_definition" "$ffi_hook_definition" "$clock_definition"; do
+    count="$(line_count "$required" "$file")"
+    [ "$count" -eq 1 ] || {
+      echo "sim image smoke: expected one executable controller definition in $file, found $count" >&2
+      exit 1
+    }
+  done
 done
 
 # runtime.ss has a generated kernel prologue and trailing fingerprint. Remove

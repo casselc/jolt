@@ -50,10 +50,32 @@
    fhk-exit
    fhk-abort))
 
-;; No public controller ABI exists in this slice. The complete future, clock,
-;; and FFI controller surface will be exposed atomically in a later slice.
+;; The complete controller ABI is sim-image-only.
 (ok "ordinary image has registered no vars under jolt.internal.sim"
     (not (var-cell-lookup "jolt.internal.sim" "capabilities")))
+
+(for-each
+ (lambda (name)
+   (ok (string-append "ordinary image has no jolt.internal.sim/" name)
+       (not (var-cell-lookup "jolt.internal.sim" name))))
+ '("install-controller!" "restore-controller!" "controller-errors"
+   "clear-controller-errors!" "install-ffi-controller!"
+   "install-ffi-routing-controller!" "restore-ffi-controller!"
+   "install-clock-controller!" "install-clock-routing-controller!"
+   "restore-clock-controller!" "supervisor-monotonic-nanos"))
+
+(for-each
+ (lambda (sym)
+   (ok (string-append "ordinary image has no " (symbol->string sym) " binding")
+       (not (top-level-bound? sym))))
+ '(jolt-ffi-sim-hook jolt-ffi-install-sim-hook!
+    jolt-ffi-install-routing-hook! jolt-ffi-invoke-sim-hook
+    jolt-sim-clock-top jolt-sim-now-monotonic-nanos
+    jolt-sim-supervisor-now-monotonic-nanos jolt-sim-proceed-stack-cell
+    jolt-sim-controller-top jolt-sim-controller-installation?
+    jolt-sim-install-controller! jolt-sim-restore-controller!
+    jolt-sim-current-future-controller jolt-sim-current-ffi-hook
+    jolt-sim-current-clock-installation))
 
 ;; --- fully-qualified resolution from ordinary Jolt source fails closed too ---
 (ok "ordinary Jolt source cannot resolve jolt.internal.sim/capabilities"

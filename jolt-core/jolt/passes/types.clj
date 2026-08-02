@@ -95,6 +95,10 @@
    :var-cache? (atom false)
    :trace-frames? (atom false)
    :source-reg? (atom false)
+   ;; Compile-time-only flavor bit.  Ordinary units leave it false and emit no
+   ;; simulator references; the isolated sim compiler reapplies it to every
+   ;; fresh build unit before emitting application code.
+   :sim-instrument? (atom false)
    :direct-link-defined (atom #{})
    :direct-link-fns (atom #{})
    ;; the back-end gensym label counter and the per-def cache-cell collector — emit

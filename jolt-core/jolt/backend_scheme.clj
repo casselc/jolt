@@ -161,6 +161,14 @@
 (defn set-source-reg! [on] (reset! (:source-reg? (cur)) (boolean on)))
 (defn- source-reg? [] @(:source-reg? (cur)))
 
+;; Compile-time selection for the isolated simulation image.  This is unit
+;; state, not a process-global mode: ordinary emission is byte-identical and
+;; contains no controller reference.  The sim launcher and its build driver set
+;; it before compiling user namespaces.
+(defn set-sim-instrument! [on]
+  (reset! (:sim-instrument? (cur)) (boolean on)))
+(defn- sim-instrument? [] @(:sim-instrument? (cur)))
+
 ;; A direct-link Scheme binding name for a var. The fqn maps to a unique identifier
 ;; jv$<ns>$<name>; chars that break a Scheme identifier or the `$` separator are
 ;; escaped so distinct vars never collide.
@@ -622,10 +630,24 @@
         ;; constructing the vector cannot race with the capture, which already
         ;; happened inside the foreign-call return path. A scalar binding keeps
         ;; the bare call, byte-identical to before this option existed.
-        body (if capture
-               (str "(call-with-values (lambda () " call ")"
-                    " (lambda (r e) (jolt-vector r e)))")
-               call)]
+        native-body (if capture
+                      (str "(call-with-values (lambda () " call ")"
+                           " (lambda (r e) (jolt-vector r e)))")
+                      call)
+        ;; Only a sim compilation unit emits this branch.  The native thunk is
+        ;; the exact ordinary call, including atomic result+native-error capture;
+        ;; leaving it unforced prevents symbol resolution and all OS access.
+        body (if (sim-instrument?)
+               (str "(let ((h (jolt-sim-current-ffi-hook))) (if h "
+                    "(jolt-ffi-invoke-sim-hook h "
+                    "(jolt-ffi-make-sim-descriptor " csym " "
+                    "(list " (str/join " " (map chez-str-lit (:argtypes node))) ") "
+                    (chez-str-lit (:rettype node)) " "
+                    (if (:blocking node) "#t" "#f") " "
+                    (if capture "#t" "#f") " "
+                    "(list " (str/join " " params) ")) "
+                    "(lambda () " native-body ")) " native-body "))")
+               native-body)]
     (str "(let ((p #f)) (lambda (" (str/join " " params) ") " body "))")))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
