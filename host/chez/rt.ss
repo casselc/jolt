@@ -48,7 +48,13 @@
   (lambda (x)
     (syntax-case x (quote)
       ((_ name (quote args) (quote res))
-       (if (memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
+       ;; Select from the compiler target, as the native-error convention below
+       ;; does.  A cross-image build still runs on the build host, so
+       ;; machine-type would otherwise compile a POSIX foreign relocation into
+       ;; a Windows image.  Include Chez's Windows ARM64 target names as well as
+       ;; x86/x86-64 so optional POSIX symbols remain load-time safe there.
+       (if (memq (eval '(#%$target-machine))
+                 '(a6nt ta6nt i3nt ti3nt arm64nt tarm64nt))
            #'(guard (e (#t #f))
                (load-shared-object #f)
                (and (foreign-entry? name)
