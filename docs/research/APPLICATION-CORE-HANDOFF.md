@@ -410,7 +410,8 @@ User authorized creating bounded profiles for the new models and extending
 | 21 | `782b361f` | charter §4 full draft (provenance spine, site IDs, schemas/effects, assumptions) | **§4 accepted** |
 | 22 | `f08cb55b` | charter §5 draft (evidence taxonomy) + P12 lattice review + amendments | **§5 accepted** |
 | 23 | `e956fa45` | charter Appendix A (normative normalization algorithm) | **Appendix A accepted** |
-| 24 | (pending) | charter §6 draft (differential loop) + P13 cross-check + amendments | pending |
+| 24 | `a3217d53` | charter §6 draft (differential loop) + P13 cross-check + amendments | **§6 accepted** |
+| 25 | (pending) | charter §7 draft (first proof target) | pending |
 
 ## §1 review outcome (2026-08-01)
 
@@ -428,11 +429,8 @@ rule; failed-disposition rule; levels-vs-tags-vs-statuses terminology; plus
 2026-08-01; slice-3-replacement cross-check (session
 `ses_03f0299eeffezA6kA7HMb3KkbS`, report `reports/P13-SITE-ID-UNIFICATION-REVIEW.md`)
 found 1 blocker + 3 majors + 1 minor + 1 question-finding — **all accepted
-and applied before commit** (subtree-re-evaluation divergence localization;
-provenance map defined as versioned side artifact; role path restored to
-§4.2 components + duplicate-subform vector; both-sides lane-exclusion rule;
-F6/F7 uncovered-by-design note; logical-definition and host-origin
-clarifications). §6 presented for user review.
+and applied before commit**. **§6 ACCEPTED 2026-08-01.** §7 (first proof
+target) drafted and presented next; then §8, §9.
 
 User approved §1 with two directions:
 1. **Implementation-neutrality (Clojure.next core):** the charter's semantics

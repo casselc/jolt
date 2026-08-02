@@ -991,17 +991,186 @@ reference evaluator carries its own controls:
 
 ## 7. First proof target
 
-DRAFT PENDING — capacity-one mailbox per D5 with G1–G6 corrections: world
-with waiting flags; conditional wakes; model-level relation over kernel block
-transitions; `max-steps 11` (longest quiescence path 10 + slack) with
-`:max-states` named; invariant disjunction incl. `:failed`; second
-fault-injected control (send-a, close, send-b) for clause 3; per-clause
-known-SAT probes; persisted-trace reader fixtures; TCB table; claim scope
-"TCB-validation-only, empty refinement relation"; execution dependency
-(jolt-sim landing-order amendment or evidence stays `[assumed]`).
-P11 incorporations: FuzzChick rule-table factorization pattern for isolating
-the transition relation for systematic fault injection; coverage
-instrumentation targets the claim, never the harness.
+The first proof target is a **pure, bounded cooperative-model exploration**:
+it validates the explorer/kernel/monitor trusted computing base, not any Jolt
+implementation artifact. Design source: P3 with Fable slice-2 corrections
+(G1–G6, P9).
+
+### 7.1 Target and claim scope
+
+- **Target:** a capacity-one mailbox with `send`, `receive`, and `close` —
+  **no timeout** (D5). Two tasks (one producer, one consumer), fixed messages
+  `[:a :b]`, capacity one, unreduced BFS on the existing jolt-sim cooperative
+  kernel + `explore-states` (verified: `kernel.clj:494-621`,
+  `explore_states.clj:1-26`).
+- **Claim scope (C2): "TCB-validation-only, empty refinement relation."**
+  The model has no abstraction/coverage relation to any Jolt implementation
+  artifact (native channel semantics UNKNOWN per P1 §8); its evidence
+  validates the explorer/kernel/monitor TCB. It is not evidence about Jolt
+  channels, `core.async`, or arbitrary Jolt code.
+- **Priority reconciliation (C2):** the Flow plan's objection, verbatim: "The
+  suggested standalone capacity-one mailbox BFS is not the immediate proof
+  target… it does not displace the higher-priority unchanged-code
+  HTTP/TCP/DB/Maelstrom integration." That sentence governs the **jolt-sim
+  runtime lane's landing order**; this charter lane specifies the
+  cooperative-model track's first target, which the same plan's roadmap item
+  3 recommends. Neither contradicts the other; Fable slice 2 judged the
+  resolution genuine (P9 §1).
+
+### 7.2 The model (G2)
+
+**State variables:**
+
+```clojure
+{:tasks {0 producer-control 1 consumer-control}
+ :world {:open? boolean
+         :slot nil|:a|:b
+         :accepted [prefix of [:a :b]]
+         :delivered [prefix of [:a :b]]
+         :waiting {:producer boolean :consumer boolean}}   ; G2: required
+ :now 0
+ :steps 0..11
+ :max-steps 11}                                           ; G1
+```
+
+Task 0 executes `send :a`, `send :b`, then `close`. Task 1 receives `:a`,
+receives `:b`, then observes closed-and-empty.
+
+**Transition relation (model-level abstraction over kernel block
+transitions):** the kernel has no world-state guards — `machine-actions`
+enumerates runnable tasks only (`kernel.clj:545-560`), and a task blocks by
+executing `step-block` (one transition, increments `:steps`). Model rules:
+
+- `send m`: proceeds iff `open?` and `slot = nil`; installs `m`, appends to
+  `accepted`. Otherwise the task executes a budget-consuming `step-block`.
+- `receive`: proceeds iff the slot is nonempty; removes it, appends to
+  `delivered`. Otherwise `step-block`.
+- `close`: flips `open?` to false; **preserves** a buffered item.
+- `receive` on closed-and-empty completes the consumer.
+- **Every wake is conditional on the world's waiting flags** (G2): waking a
+  non-blocked task throws outside the step-fn catch
+  (`kernel.clj:187-190,357-363`) and would crash the explorer.
+- "Send enabled" is defined over the projection (model enabledness), never
+  confused with kernel runnable-task enumeration.
+- Spurious wakeups cannot occur (wakes are exact and explicit);
+  close-while-sender-blocked is unreachable in this configuration. Both are
+  named in the omissions (§7.5).
+
+**State identity:** the kernel's canonical machine projection
+`{:tasks :world :now :steps :max-steps}`, excluding trace and step function
+(`kernel.clj:513-528`).
+
+### 7.3 The invariant (G3)
+
+The exploration invariant returns canonical evidence iff any of:
+
+1. `slot ∉ {nil, :a, :b}` or holds more than one message;
+2. `delivered` is not a prefix of `accepted`;
+3. the mailbox is closed and a `send` transition is enabled (model-level,
+   over the projection);
+4. `status = :completed` and (`accepted ≠ [:a :b]` or `delivered ≠ [:a :b]`
+   or `slot ≠ nil` or `open? ≠ false`);
+5. `status = :step-limit`;
+6. `status = :deadlock`;
+7. `status = :failed` (G3 — a step-fn defect must not pass silently).
+
+A state-cap outcome is not a violation witness and is never a pass.
+
+### 7.4 Controls
+
+- **Buggy known-SAT control:** `close` drops a full slot (`close-buggy`).
+  Expected witness (5 actions): `send-a, receive-a, send-b, close-buggy,
+  receive` — the consumer observes closed-and-empty with `delivered = [:a]`;
+  clause 4 fires at the final state. Hand-simulated as the shortest witness,
+  enabled step-by-step (P9 §3a; inference, pre-execution). The same
+  invariant schema is used — no special test.
+- **Corrected control:** `close` preserves the slot. Required result:
+  exploration terminates `:completed` with no witness — and **never
+  `:state-limit`** (`:state-limit` violates clause 5 by design: it is the
+  bound's checked control).
+- **Second fault-injected control (G4):** producer program `send-a, close,
+  send-b` — expects clause 3 to fire. This makes clause 3 non-vacuous (the
+  main configuration can never reach a pending send after close).
+- **Non-vacuity (G6):** literal scripted-path fixtures with
+  `restore-projection` asserts (existing idiom,
+  `explore_states_test.clj:379-385`) or per-class probe invariants,
+  requiring: a reachable blocked-consumer state; a reachable
+  blocked-producer/full-slot state; a close-before-drain path; a
+  drain-before-close path; a completed terminal with both messages
+  delivered; and a separate all-blocked/no-timer fixture classified
+  `:deadlock`. Record exact `:visited`, terminal counts, and **edge/action
+  count** — the explorer does not currently report edge count; it must be
+  added before the non-vacuity metric is claimed (P9 §3d).
+- **Per-clause known-SAT probes (G5):** each invariant clause gets its own
+  probe. The buggy close-drop preserves prefix-ness, so clause 2 is never
+  exercised by the main buggy control; clauses 1, 2, 3, and the `:deadlock`
+  clause each require dedicated probes.
+- **Replay and monitor regression:** for each named valid path and the buggy
+  witness: scripted kernel run; persist canonical trace, model version,
+  bounds, and action path; `kernel/replay` reproduces the exact event trace
+  (validates enabled choices and projections, `kernel.clj:667-698`); the
+  monitor grammar check over the trace document returns `:pass`
+  (`monitor.clj:100-146`). The buggy path becomes a literal permanent
+  regression: corrected model delivers `[:a :b]`; faulty close produces the
+  named loss evidence.
+- **Fault-injection design (P11/FuzzChick):** the transition relation is
+  factored for systematic mutation (rule-table isolation); coverage
+  instrumentation targets the claim, never the harness.
+
+### 7.5 Bounds, assumptions, and omissions
+
+- **Quantification:** all BFS-reachable canonical states under messages
+  `[:a :b]`, two tasks, capacity one, and `max-steps 11`. Derivation (G1):
+  blocking consumes steps; the longest quiescence path is **10** task
+  transitions (9 if the consumer starts blocked); 11 provides one slack.
+  `:max-states` (explorer state cap) is named separately and is never
+  conflated with `:max-steps` (kernel transition budget).
+- **No reduction:** no partial-order or symmetry reduction in v1.
+- **No fairness assumption:** BFS enumerates all enabled finite actions.
+  **No liveness or unbounded progress claim.** `:completed` is model
+  quiescence; `:deadlock` is a distinct terminal classification.
+- **Omissions (explicit):** timeout/timer ties, cancellation, dynamic
+  values, multiple producers/consumers, unbounded queues, host scheduling,
+  `core.async`, FFI, runtime refinement, spurious wakeups (impossible by
+  construction), close-while-sender-blocked (unreachable in this
+  configuration).
+
+### 7.6 TCB
+
+| Trusted component | Required independent control |
+| --- | --- |
+| Mailbox model encoding and abstraction | Buggy SAT control, corrected control, literal path tests |
+| Kernel transition/classification | machine/kernel agreement fixtures; blocked/deadlock/completed cases |
+| BFS explorer | shortest-witness, state-limit, complete-graph fixtures (exist); **edge count added before the non-vacuity metric is claimed** |
+| Canonical projection | canonical round-trip and projection-includes-budget tests |
+| Trace validator/replay | exact-trace replay and malformed-trace rejection |
+| Monitor implementation | grammar golden traces and malformed-order rejection |
+| **Invariant function (G5)** | per-clause known-SAT probes |
+| **Persisted-trace EDN reader (G5)** | malformed/truncated/forged-document rejection, incl. the end-of-input-sentinel regression |
+| Canonical value/restore round-trip | named: underpins state identity and evidence canonicalization |
+| Fixture-to-test wiring | trusted; acknowledged |
+
+No component above is `proved`; all are in the TCB.
+
+### 7.7 Evidence labels and execution dependency
+
+- Model source/design: `assumed`.
+- Buggy control (pre-execution): `failed` — expected.
+- Corrected control, completed uncapped BFS: `bounded-complete` (only for
+  this finite relation and stated assumptions).
+- Replay/monitor pass over a validated trace: `monitored`.
+- Nothing here is `proved`.
+- **Execution dependency:** all evidence remains `assumed` until the
+  jolt-sim landing order explicitly schedules execution (a jolt-sim
+  landing-order amendment). The design targets kernel semantics verified at
+  `eb7bce4` (primary-verified via merge-base: newer than `588677b`, G6).
+  The execution substrate additionally requires the jolt-sim kernel on a
+  v0.5.17-compatible pin, supplied by the runtime lane's items 7–9 (sim
+  image, lifecycle hooks, unified controller) — requested, never assumed
+  (non-goal 13).
+- **Pre-execution blocker checklist:** (a) explorer edge count added;
+  (b) per-clause probes written; (c) trace-reader rejection fixtures
+  written; (d) world waiting-flags encoding implemented in the fixture.
 
 ## 8. One semantic/evidence model consumption
 
