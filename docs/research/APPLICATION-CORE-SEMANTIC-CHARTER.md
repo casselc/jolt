@@ -1312,19 +1312,114 @@ evidence upgrades a claim** (§5.6).
 
 ## 9. Staged exit criteria
 
-DRAFT PENDING — exact exit criteria for: charter acceptance; reference
-evaluator; schema prototype; first verified kernel. Includes the CSIR v1 exit
-test (one fixed corpus case through both paths, labeled `sampled`, plus
-cross-run site-ID determinism vectors per F3) and the proof-target execution
-gate (jolt-sim landing-order amendment). P11/Cedar design-for-decidability
-constraints for the verified-kernel stage: fragment types map 1:1 to
-decidable theories; ground well-formedness over the finite footprint, never
-quantifiers; validator as precondition making the encoding total; errors
-encoded explicitly; restricted subtyping. Checked C migration ergonomics:
-best-effort non-blocking adoption; monotonic progress (verified parts stay
-verified); artifact buildable/testable at every stage. Dafny-stability
-discipline: TCB components specified + opaque; tool/checker versions pinned;
-verification-instability treated as evidence-relevant metadata.
+Each stage has an exact, checkable exit. A stage's evidence records carry
+§5.4 metadata; promotion follows §5's lattice only; a schema/IR remint
+orphans affected records (F4) and the affected evidence restarts. No stage
+may claim more than its exit states.
+
+### 9.1 Stage 0 — Baseline and semantic-delta control
+
+- Pin: upstream v0.5.17 tag `da59e49dbe8c810e05aa2ce900a95c5a1ef0c9fe`;
+  read-only reference worktree; P10 refresh register as citation authority.
+- Codex-reported v0.5.17 suite state (1195/1195) recorded **as reported**,
+  never re-claimed by this lane.
+- **Exit:** one reviewed baseline record; no ambiguity between checkout,
+  seed, simulation image, and conformance corpus (seed/image/corpus
+  reconciliation belongs to the runtime lane; this lane's share is the P10
+  register + this handoff record).
+- **Status: satisfied for this lane** (P10, 2026-08-01).
+
+### 9.2 Stage 1 — Charter acceptance + CSIR v1 schema
+
+- This charter accepted in full (§1–§9 + appendices).
+- CSIR v1 **closed schema** published: field set per §4.1 (C1), version pin,
+  validator owner named (future core lane, C5).
+- Appendix A normalization implemented with the **determinism vector suite**
+  passing (A.8): compile-twice-identical, two-implementations-identical,
+  duplicate-subform, REPL-redefinition, gensym canonicalization, metadata
+  cases.
+- The CSIR provenance map (§4.1) emitted as a versioned side artifact with
+  its digest in §5.4 metadata.
+- **Exit test:** one fixed corpus case evaluated through the reference
+  evaluator AND the compiled path with matching terminal observable (§2.6),
+  labeled `sampled` with full §5.4 metadata.
+- **Gate:** independent review of the schema + vectors (`jolt-reviewer` or
+  successor).
+
+### 9.3 Stage 2 — Reference evaluator
+
+- Small-step evaluator over CSIR v1 for the §2 fragment (or the agreed
+  subfragment per §6.7).
+- **Exit:** (a) evaluator self-tests pass with results derived from §2's
+  rules directly (not from compiled Jolt); (b) the **buggy-evaluator
+  control** (§6.5) produces detectable mismatches on the probe corpus —
+  the loop's own non-vacuity control; (c) the conformance selection runs
+  both paths with zero unexplained differential failures; (d) all loop
+  evidence recorded `sampled` with producer-typed coordinates; (e) the
+  known-divergence register has zero uncited entries.
+- **Gate:** differential gate green + independent spot-check of the register
+  and harness.
+
+### 9.4 Stage 3 — Schema prototype
+
+- Canonical schema IR implemented for the §4.5 required forms:
+  scalar/literal, unions, closed/open map shapes, required/optional entries,
+  recursive schemas, tagged unions, function signatures, effect descriptors
+  (§3.3), resource protocols.
+- Validator implements the **vacuity warnings** (always-true/always-false
+  contract branches) and the **optional-entry presence-check rule** (§4.5);
+  three contract modes (§8.8) operate; normalization is deterministic.
+- Hegel domain derivation works for the generator-mappable subset, with
+  hand-built gap combinators documented (D9).
+- **Exit:** (a) deterministic schema normalization (same schema → same
+  normalized form, two implementations); (b) one enforced boundary contract
+  demonstrates blame direction (Dynamic side blamed, §8.8); (c)
+  Guardrails-like REPL diagnostics on a real namespace; (d) Hegel
+  round-trips on derived domains, `sampled`; (e) **no unqualified type or
+  proof claim appears anywhere** in the prototype's output or docs.
+
+### 9.5 Stage 4 — First verified kernel
+
+- A small pure kernel (selected pure core-library functions per §1.5, or
+  the §2-fragment evaluator's own core) with a checkable terminating subset
+  and backend-neutral obligation emission (§8.6).
+- **Exit:** ONE independently checked theorem/certificate with an explicit
+  TCB statement, plus: a deliberately faulty control (found by the checker
+  or the differential loop), a corrected claim, a non-vacuity control, an
+  executable regression, and §6 differential validation preserved between
+  the kernel's reference semantics and compiled code. Evidence: `proved`
+  for the exact theorem under stated assumptions/TCB — **and nothing more**
+  (no "verified kernel" halo claims).
+- **Design constraints (P11/Cedar):** fragment types map 1:1 to decidable
+  theories; ground well-formedness over the finite footprint, never
+  quantifiers; validator as precondition making the encoding total; errors
+  encoded explicitly; restricted subtyping. **TCB discipline
+  (P11/Dafny-stability):** each TCB component specified and opaque;
+  tool/checker versions pinned; verification instability recorded as
+  evidence-relevant metadata. **Migration ergonomics (P11/Checked C):**
+  best-effort non-blocking adoption; monotonic progress (verified parts
+  stay verified); the artifact stays buildable and testable at every stage.
+- **Gate:** theorem + certificate + executable cross-check + faulty control
+  + TCB statement + independent review.
+
+### 9.6 Proof-target execution gate (§7)
+
+The §7 mailbox executes when ALL of: (a) explorer edge count lands;
+(b) per-clause probes written; (c) trace-reader rejection fixtures written;
+(d) waiting-flags encoding implemented; **and** the jolt-sim landing order
+schedules it on a v0.5.17-compatible kernel pin (runtime lane items 7–9 —
+requested, never assumed). Evidence levels per §7.7: nothing is claimed
+before that gate, and what is claimed after it is exactly
+`bounded-complete`/`monitored` for the declared relation — TCB-validation
+only, empty refinement relation.
+
+### 9.7 Explicit non-exits (what no stage ever certifies)
+
+- No stage certifies arbitrary Jolt code or proves the compiler correct.
+- No stage claims unbounded liveness from finite evidence, complete corpus
+  coverage, or host behavior from simulation.
+- Platform lanes not actually executed are named, never claimed.
+- Evidence before its stage's gate is `assumed` (or lower), by construction.
 
 ## Appendix A. Normalization algorithm (normative)
 
