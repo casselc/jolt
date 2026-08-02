@@ -402,13 +402,16 @@ User authorized creating bounded profiles for the new models and extending
 | 15 | `1b3840c5`+`688aaa45` | PR policy update + draft PR #12 recorded/pushed | yes (user directed PR) |
 | 16 | `315f0c0d` | H3 sub-decisions S1–S3 confirmed | yes |
 | 17 | `152dd732` | charter §1 revisions: Clojure.next neutrality + §1.5 staging + H4 eager-first | yes (directions given in §1 review) |
-| 18 | `a7889565` | H5 canonical-hash decision + charter §2 full draft (evaluation order + observable semantics) | §2 under user review |
-| 19 | (pending) | P11 external reference audits + handoff state | pending |
+| 18 | `a7889565` | H5 canonical-hash decision + charter §2 full draft (evaluation order + observable semantics) | **§2 accepted** |
+| 19 | `4ef7053d` | P11 external reference audits + handoff state | yes (incorporation list approved) |
+| 20 | (pending) | P11 incorporations into §1.4/§3–§9 notes + charter §3 full draft (boundary taxonomy) | pending |
 
 ## §1 review outcome (2026-08-01)
 
 **§1 ACCEPTED** after application of all user directions (neutrality
-reframing, §1.5 staging, H4 processing model). §2 drafted and presented
+reframing, §1.5 staging, H4 processing model). **§2 ACCEPTED 2026-08-01**
+along with the full P11 incorporation list; incorporations applied to §1.4
+(support-level matrix) and the §3–§9 pending notes. §3 drafted and presented
 2026-08-01; review pending.
 
 User approved §1 with two directions:

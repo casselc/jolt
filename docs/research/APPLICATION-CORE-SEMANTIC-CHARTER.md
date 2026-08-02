@@ -215,6 +215,12 @@ may not be referenced as `formal-core` unless its matrix row cites a §2
 semantics subsection and its §6 differential coverage state. The matrix is
 reminted with the charter, not patched for prerelease compatibility.
 
+Each row also carries a **support level** (`Full` / `Partial` / `Limited` /
+`Excluded`) with a Notes column naming the exact unsupported variants (the
+Hydro feature-support-matrix honesty pattern, P11 A.5): coverage granularity
+is pre-committed per feature, and any "same code" claim is immediately
+qualified by its named exceptions.
+
 ### 1.5 Coverage staging (what comes after this charter's core)
 
 This charter specifies the semantic foundation. The two surfaces asked about
@@ -462,9 +468,113 @@ Divergence is equal only to itself and proves nothing.
 
 ## 3. Boundary taxonomy
 
-DRAFT PENDING — B2 lanes with mechanical widening rules; registered-callback
-narrowing; fail-closed hermetic simulation; controller composition note;
-widening-site ID rule (C4/F6/F7).
+Every behavior in a program is classified into exactly one **lane**. The lane
+determines which claims may be made and which evidence levels are reachable
+(§5). Classification is computed conservatively over CSIR regions (§4): the
+analyzer assigns the narrowest lane the region's operations provably satisfy;
+anything it cannot determine widens.
+
+### 3.1 The four lanes
+
+| Lane | Meaning | Claim levels reachable |
+| --- | --- | --- |
+| `ordinary-core` | Resolved, expanded semantics over canonical values and declared core operations — the §2 fragment and later specified kernels | up to `bounded-complete`; `proved` only with a checked certificate + stated TCB |
+| `Dynamic-opaque` | `eval`/`load-string`, dynamic resolution, unknown macro expansion, unresolved call paths, runtime-generated code | `opaque` / `assumed` only; no static coverage or proof claim crosses |
+| `host-capability` | Declared capability crossings: raw host objects, FFI, process, callbacks, clocks, entropy, I/O — including telemetry primitives as observation inputs | `monitored` / `probed` / `runtime` evidence with named postconditions; never purity by assertion |
+| `simulation-handler` | Optional scenario interpretation of a registered effect descriptor (§3.3); never a production dependency | `simulated` — deterministic model behavior, not host behavior |
+
+### 3.2 Mechanical widening rules
+
+A region widens to `Dynamic-opaque` when it contains any of: `eval` /
+`load-string`; dynamic resolution or an unresolved Var; an unknown macro; a
+raw host object crossing; an unregistered callback; or any construct the
+analyzer cannot determine. Widening is contagious upward to the enclosing
+claim. Host interop operand order (`host-new`/`host-call`) is `opaque`
+(§1.2); qualified static-method invocation remains an ordered ordinary
+invocation (§2.2).
+
+A **registered callback** is `host-capability` unless its
+thread/lifetime/ownership/serialization contract is declared, in which case
+it may be narrowed to a named capability lane.
+
+**Widening-site record (P11 B.3, `nondet!` precedent):** every widening site
+records `{site-id, trigger, human-authored explanation}` and is
+review-flagged. Detection stays mechanical (unsound-omission-free); the
+explanation forces human attention per site — strictly stronger than either
+alone. Widening sites are first-class review artifacts in §5 evidence
+records.
+
+### 3.3 Effect families and the derivation hierarchy (H3)
+
+An **effect descriptor** is `{family, operation, canonical-args,
+operation-id, resource-id, site-id, assumptions}`: `operation-id` is
+per-instance unique (F7); `site-id` is the CSIR site ID or a reserved
+`host-origin` ID (F6/C4); origins and provenance ride as trace-schema
+metadata fields, never inside canonical values (P11 B.7 — H5 hash-consistency
+depends on this).
+
+- **Core reserved set (E2):** the `:jolt.effect/*` prefix is reserved for
+  Jolt-core-owned families — clock, entropy, scheduling/task, io/fs, net,
+  process, ffi — with fixed semantics, schemas, and target mappings.
+  Extension happens by deriving **from** them; they may not be redefined or
+  shadowed.
+- **Clock effect (worked example, H1):** an abstract family with distinct
+  **monotonic** and **wall-clock** operations. On v0.5.17 the real handler
+  maps monotonic to `jolt.host/mono-nanos` and wall to
+  `jolt.host/wall-nanos`, and the descriptor records which primitive supplied
+  each value (`V17/host/chez/rt.ss:441-458`). Simulation supplies
+  virtual-time handlers under the same family.
+- **Open extension:** library/application families register under their own
+  namespaces and MAY `derive` from a parent family (single-parent tree, S1).
+  Derivation is optional but rewarded: derived families inherit handler
+  coverage and policy tier; standalone families default to tier (b).
+- **Policy tiers (E3):** `(a) modeled` — requires a registered model/handler
+  as evidence; registration validates the named model exists and rejects
+  invalid claims (S3); `(b) pass-through-only` — real OS/host always,
+  recorded but never modeled; `(c) opaque`. Tiers inherit from the nearest
+  declared ancestor; upgrades require evidence, downgrades must be declared.
+  A hermetic world rejects (b)/(c) families at install.
+- **Handler applicability:** a handler installed for family F covers F and
+  all its descendants. Handlers are dynamically scoped, innermost-first,
+  strict-LIFO; a handler substitutes a validated result or aborts. **No
+  continuations exist at this layer.** Between applicable handlers, the
+  dynamically nearest wins; at the same dynamic level, the most-specific
+  family wins; equal specificity is an installation error and fails closed.
+- **Fail-closed rule:** a hermetic world fails closed on a performed family
+  with no covering handler (directly or via ancestors), or on any family
+  registered at a tier the world rejects. Pass-through in hybrid/observed
+  worlds is always an explicit per-family policy choice, never ambient.
+  Native/FFI families support pass-through, modeled, record/replay, and
+  hybrid routing policies; **simulation never prohibits deliberately calling
+  the real OS**; simulator handlers control existing application/library
+  boundaries and never reimplement libraries (H1).
+
+### 3.4 Observation and hazard classes
+
+- Observable events are emitted only at declared operation boundaries
+  (descriptors) or at runtime lifecycle seams — which do not exist at the
+  v0.5.17 baseline and are **requested from the runtime lane, never assumed**
+  (non-goal 13; P10 (b) REMOVED).
+- **Live-collection-as-final hazard (P11 B.2):** an observation of a
+  collection may be treated as a terminal value only at a declared
+  **quiescence point**. A monitor or differential comparison that observes a
+  collection before quiescence must classify the observation `inconclusive`,
+  never pass/fail on it (mirrors Hydro's bounded/unbounded typing, P11 A.4).
+- Host telemetry scalars (clocks, counters, thread-id) are observation inputs
+  only — never evidence identities (non-goal 14).
+
+### 3.5 Boundary evidence rules
+
+- Lane membership caps evidence levels per §3.1's table; §5's lattice governs
+  promotion within a lane.
+- Unknown, malformed, or lost **required** observations are
+  `inconclusive`/`failed` according to the declared coverage policy — never
+  silently ignored (P5 B.16).
+- The jolt-sim runtime adapter is an **optional** host-capability /
+  simulation-handler seam, not a language-wide effect runtime; its controller
+  semantics at `eb7bce4` are documented in P2; at v0.5.17 no controller seam
+  exists upstream (P10 (b)) — the charter specifies the contracts, not the
+  ABI.
 
 ## 4. Provenance, site IDs, schemas/effects, assumptions
 
@@ -473,7 +583,10 @@ site-ID from normalized-expanded-form digest (F2) + normative normalization
 appendix (F3, Appendix A); remint orphaning + migration records (F4); anchors
 A3-conditional with no evidence transfer (F5); effect descriptors D2 with one
 ID space + host-origin class + per-instance `operation-id` (C4/F6/F7);
-declared assumptions representation.
+declared assumptions representation; origins/provenance as trace-schema
+metadata, never inside canonical values (P11 B.7); dynamic origin tracking
+("which CSIR site produced this runtime value") deferred to a later opt-in
+stage with lazy materialization (P11 D).
 
 ## 5. Evidence taxonomy
 
@@ -487,11 +600,15 @@ finalized.
 
 DRAFT PENDING — source → CSIR → reference evaluator → compiled Jolt; corpus
 (conformance selection + generated programs); comparison relation (terminal
-observable: canonical value or exception class); known-divergence register;
-minimized-case persistence (concrete source + Hegel seed + versions);
-first honest milestone (one fixed corpus case, labeled `sampled`); Hegel API
-additions remain deferred (D9); ordering: CSIR v1 + reference evaluator first,
-generated cases second.
+observable per §2.6); known-divergence register; minimized-case persistence
+(concrete source + Hegel seed + versions); first honest milestone (one fixed
+corpus case, labeled `sampled`); Hegel API additions remain deferred (D9);
+ordering: CSIR v1 + reference evaluator first, generated cases second.
+P11/Cedar incorporations: generators for ALL input classes; CI-enforced
+spec/impl sync (reference evaluator and compiled path gated together);
+direct property tests on the implementation as well as cross-implementation
+comparison; reference evaluator is TCB and gets its own controls (the Cedar
+oracle itself was buggy).
 
 ## 7. First proof target
 
@@ -503,6 +620,9 @@ fault-injected control (send-a, close, send-b) for clause 3; per-clause
 known-SAT probes; persisted-trace reader fixtures; TCB table; claim scope
 "TCB-validation-only, empty refinement relation"; execution dependency
 (jolt-sim landing-order amendment or evidence stays `[assumed]`).
+P11 incorporations: FuzzChick rule-table factorization pattern for isolating
+the transition relation for systematic fault injection; coverage
+instrumentation targets the claim, never the harness.
 
 ## 8. One semantic/evidence model consumption
 
@@ -512,7 +632,12 @@ inputs; sampled vs bounded-complete vs monitored routing per §5; Hegel gaps
 hand-built in-project (D9); concurrency/time obligations to jolt-sim;
 sequential-model variants remain Hegel-`sampled`; no separate user-facing
 languages; generated artifacts carry provenance headers and never assert
-correctness.
+correctness. P11 incorporations: singleton-type-style vacuity warnings
+(always-true/always-false contract branches flagged by the validator);
+capability rule — optional-entry access in contracts requires a prior
+presence check; contract modes (advisory / enforced / discharged-elidable)
+with Checked C erasure as the discharged-mode reference; one property
+artifact drives testing and proof (FuzzChick).
 
 ## 9. Staged exit criteria
 
@@ -520,7 +645,15 @@ DRAFT PENDING — exact exit criteria for: charter acceptance; reference
 evaluator; schema prototype; first verified kernel. Includes the CSIR v1 exit
 test (one fixed corpus case through both paths, labeled `sampled`, plus
 cross-run site-ID determinism vectors per F3) and the proof-target execution
-gate (jolt-sim landing-order amendment).
+gate (jolt-sim landing-order amendment). P11/Cedar design-for-decidability
+constraints for the verified-kernel stage: fragment types map 1:1 to
+decidable theories; ground well-formedness over the finite footprint, never
+quantifiers; validator as precondition making the encoding total; errors
+encoded explicitly; restricted subtyping. Checked C migration ergonomics:
+best-effort non-blocking adoption; monotonic progress (verified parts stay
+verified); artifact buildable/testable at every stage. Dafny-stability
+discipline: TCB components specified + opaque; tool/checker versions pinned;
+verification-instability treated as evidence-relevant metadata.
 
 ## Appendix A. Normalization algorithm (normative)
 
