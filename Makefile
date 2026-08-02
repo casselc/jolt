@@ -60,7 +60,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
-  shakesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
+  shakesmoke smoke staticnativesmoke targetfacts test testbin transient unit unitcontext \
   values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
@@ -102,7 +102,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit grenadine mvnhttp depssmoke depsunit smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
+ci: submodules values corpus unit grenadine mvnhttp depssmoke depsunit smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi targetfacts transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -248,6 +248,13 @@ ffi:
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
+
+# jolt.host/target: the exact fail-closed (os arch abi) classifier stays in
+# lockstep with rt.ss's native-error convention macro, and the current host's
+# System/Runtime surface (os.name/os.arch/separators/processors) projects
+# coherently from the same target facts.
+targetfacts:
+	@$(CHEZ) --script test/chez/target-descriptor-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:

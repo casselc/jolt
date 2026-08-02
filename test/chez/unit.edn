@@ -321,6 +321,16 @@
   {:suite "javastatic" :expr "(string? (System/getenv \"HOME\"))" :expected "true"}
   {:suite "javastatic" :expr "(fn? System/exit)" :expected "true"}
   {:suite "javastatic" :expr "(string? (get (System/getProperties) \"os.name\"))" :expected "true"}
+  ;; jolt.host/target is the exact fail-closed compiler-target descriptor (see
+  ;; target-descriptor-test.ss); these check the public Clojure-level surface
+  ;; agrees with the System/Runtime properties derived from the same facts.
+  {:suite "target" :expr "(= #{:os :arch :abi :libc :endian :pointer-bits :file-separator :path-separator :processors} (set (keys (jolt.host/target))))" :expected "true"}
+  {:suite "target" :expr "(let [{:keys [os arch abi libc endian pointer-bits file-separator path-separator processors]} (jolt.host/target)] (and (keyword? os) (keyword? arch) (keyword? abi) (keyword? libc) (keyword? endian) (number? pointer-bits) (pos? pointer-bits) (string? file-separator) (string? path-separator) (number? processors) (pos? processors)))" :expected "true"}
+  {:suite "target" :expr "(= (jolt.host/available-processors) (.availableProcessors (java.lang.Runtime/getRuntime)) (:processors (jolt.host/target)))" :expected "true"}
+  {:suite "target" :expr "(let [p (System/getProperties)] (and (= (System/getProperty \"os.name\") (get p \"os.name\")) (= (System/getProperty \"os.arch\") (get p \"os.arch\"))))" :expected "true"}
+  {:suite "target" :expr "(let [t (jolt.host/target) p (System/getProperties)] (and (= (:file-separator t) (System/getProperty \"file.separator\") (get p \"file.separator\")) (= (:path-separator t) (System/getProperty \"path.separator\") (get p \"path.separator\"))))" :expected "true"}
+  {:suite "target" :expr "(let [p (System/getProperties)] (= (System/lineSeparator) (System/getProperty \"line.separator\") (get p \"line.separator\")))" :expected "true"}
+  {:suite "target" :expr "(let [p (System/getProperties)] (and (= (System/getProperty \"java.class.path\") (get p \"java.class.path\")) (= (System/getProperty \"jolt.version\") (get p \"jolt.version\")) (= (System/getProperty \"user.dir\") (get p \"user.dir\"))))" :expected "true"}
   {:suite "javastatic" :expr "(pos? (count (seq (System/getenv))))" :expected "true"}
   {:suite "javastatic" :expr "(let [es (map (fn [[k v]] [k v]) (System/getenv))] (and (pos? (count es)) (every? vector? es)))" :expected "true"}
   {:suite "javastatic" :expr "(.toString (StringBuilder. \"x\"))" :expected "\"x\""}
