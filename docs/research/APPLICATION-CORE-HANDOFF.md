@@ -114,6 +114,7 @@ No compiler/runtime implementation until charter + first proof target accepted.
 | `docs/research/reports/P10-V0517-REFRESH-REGISTER.md` | primary orchestrator (this lane) | unreviewed working artifact; **citation authority for charter** |
 | `docs/research/reports/P11-EXTERNAL-REFERENCE-AUDITS.md` | primary orchestrator (this lane) | incorporations approved and applied |
 | `docs/research/reports/P12-EVIDENCE-LATTICE-REVIEW.md` | primary orchestrator (this lane) | advisory review; all 8 findings accepted and applied |
+| `docs/research/reports/P13-SITE-ID-UNIFICATION-REVIEW.md` | primary orchestrator (this lane) | advisory review; all findings accepted and applied |
 | `docs/research/APPLICATION-CORE-SEMANTIC-CHARTER.md` | primary orchestrator (this lane) | **drafting — section-by-section user review before each commit** |
 | everything else in worktree | untouched at base SHA | — |
 
@@ -408,7 +409,8 @@ User authorized creating bounded profiles for the new models and extending
 | 20 | `ad0e1d89` | P11 incorporations into §1.4/§3–§9 notes + charter §3 full draft (boundary taxonomy) | **§3 accepted** |
 | 21 | `782b361f` | charter §4 full draft (provenance spine, site IDs, schemas/effects, assumptions) | **§4 accepted** |
 | 22 | `f08cb55b` | charter §5 draft (evidence taxonomy) + P12 lattice review + amendments | **§5 accepted** |
-| 23 | (pending) | charter Appendix A (normative normalization algorithm) | pending |
+| 23 | `e956fa45` | charter Appendix A (normative normalization algorithm) | **Appendix A accepted** |
+| 24 | (pending) | charter §6 draft (differential loop) + P13 cross-check + amendments | pending |
 
 ## §1 review outcome (2026-08-01)
 
@@ -422,8 +424,15 @@ lattice-soundness pass (Fable-slice-4 replacement, session
 found 1 blocker + 3 majors + 4 minors — **all 8 accepted and applied to §5
 before commit** (producer-typed replay coordinates; bundle-never-promotes
 rule; failed-disposition rule; levels-vs-tags-vs-statuses terminology; plus
-4 minors). **§5 ACCEPTED 2026-08-01.** Appendix A (normative normalization)
-drafted and presented next; then §6 with slice-3-replacement cross-check.
+4 minors). **§5 ACCEPTED 2026-08-01.** **Appendix A ACCEPTED 2026-08-01.** §6 drafted
+2026-08-01; slice-3-replacement cross-check (session
+`ses_03f0299eeffezA6kA7HMb3KkbS`, report `reports/P13-SITE-ID-UNIFICATION-REVIEW.md`)
+found 1 blocker + 3 majors + 1 minor + 1 question-finding — **all accepted
+and applied before commit** (subtree-re-evaluation divergence localization;
+provenance map defined as versioned side artifact; role path restored to
+§4.2 components + duplicate-subform vector; both-sides lane-exclusion rule;
+F6/F7 uncovered-by-design note; logical-definition and host-origin
+clarifications). §6 presented for user review.
 
 User approved §1 with two directions:
 1. **Implementation-neutrality (Clojure.next core):** the charter's semantics

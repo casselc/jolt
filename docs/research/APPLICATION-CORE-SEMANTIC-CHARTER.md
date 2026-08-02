@@ -594,11 +594,17 @@ heavily amended area of the charter (D1 with C1, F1–F7, C4, P11 B.7).
   the closed v1 schema (below) is the gate mechanism.
 - **Committed build (A2-minimal, CSIR v1):** after macro expansion and
   semantic resolution, the compiler emits an **immutable CSIR v1 document
-  beside the optimization IR**, plus a source/provenance map. CSIR v1 is a
-  **closed schema (F1):** unknown fields and anchor records are validation
-  failures. **There are no anchors in v1.** Any A3 feature (anchors,
-  expansion chain beyond single-step) requires a schema remint, which
-  requires a memo amendment naming the consumer plus core-lane review (C5).
+  beside the optimization IR**. CSIR v1 is a **closed schema (F1):** unknown
+  fields and anchor records are validation failures. **There are no anchors
+  in v1.** Any A3 feature (anchors, expansion chain beyond single-step)
+  requires a schema remint, which requires a memo amendment naming the
+  consumer plus core-lane review (C5).
+- **Provenance map (side artifact, P13-B):** the compiler also emits a
+  versioned **CSIR provenance map**, `site-id → {source span,
+  optimization-IR node path}`, as a side artifact **outside** the closed
+  CSIR v1 schema (F1). Its digest is recorded in §5.4 evidence metadata.
+  The map is versioned, but a map-only change does not alter site-IDs and
+  does not orphan evidence (F4) — it is evidence-metadata-only.
 - **CSIR v1 field set (C1):** `{site-id, source span, expansion parent
   (single-step), resolved binding, operation tag, lane (§3), declared
   assumptions}`. Schema version pinned to the baseline (`v0.5.17` tag
@@ -618,10 +624,13 @@ heavily amended area of the charter (D1 with C1, F1–F7, C4, P11 B.7).
 
 - **Site-ID = digest of the normalized expanded form at the site** plus the
   structural components `{CSIR-schema version, namespace/logical definition,
-  resolved binding path, operation tag}` (F2). **Never a line/column hash:**
-  formatting, comments, and structure-preserving movement retain the ID;
-  changing binding resolution, expanded form, operation schema,
-  namespace/definition identity, or CSIR schema breaks it.
+  resolved binding path, semantic-role path (Appendix A.5), operation tag}`
+  (F2, completed per P13-C: the role path is what distinguishes duplicate
+  sibling subforms). **Never a line/column hash:** formatting, comments, and
+  structure-preserving movement retain the ID; changing binding resolution,
+  expanded form, operation schema, namespace/definition identity, or CSIR
+  schema breaks it. "Logical definition" is the enclosing top-level Var's
+  `{ns, name}`.
 - **The macro-definition digest chain is provenance metadata outside the ID**
   (F2): a macro edit that changes nothing at the use site must not break the
   site's identity, and a definition digest may be uncomputable for prebuilt
@@ -653,9 +662,10 @@ heavily amended area of the charter (D1 with C1, F1–F7, C4, P11 B.7).
   where the operation is performed (C4).
 - **`host-origin` reserved ID class (F6):** operations issued from
   handwritten host-layer code that never traverses the analyzer (including
-  callbacks fired from native threads) carry a reserved enumerated
-  `host-origin` ID (registration site + entry-kind tag). An absent `site-id`
-  is a validation failure.
+  callbacks fired from native threads) carry a reserved `host-origin` ID.
+  `host-origin` IDs are **enumerated per entry-kind**, with the registration
+  site recorded as a field (P13-F). An absent `site-id` is a validation
+  failure.
 - **`Dynamic-opaque` regions:** attribution is descriptor-level (F7) —
   operations share the widening site's ID; discrimination comes from the
   descriptor's fields. `operation-id` is per-instance unique; `operation` is
@@ -845,17 +855,139 @@ Dafny-stability precedent).
 
 ## 6. First executable differential-validation loop
 
-DRAFT PENDING — source → CSIR → reference evaluator → compiled Jolt; corpus
-(conformance selection + generated programs); comparison relation (terminal
-observable per §2.6); known-divergence register; minimized-case persistence
-(concrete source + Hegel seed + versions); first honest milestone (one fixed
-corpus case, labeled `sampled`); Hegel API additions remain deferred (D9);
-ordering: CSIR v1 + reference evaluator first, generated cases second.
-P11/Cedar incorporations: generators for ALL input classes; CI-enforced
-spec/impl sync (reference evaluator and compiled path gated together);
-direct property tests on the implementation as well as cross-implementation
-comparison; reference evaluator is TCB and gets its own controls (the Cedar
-oracle itself was buggy).
+The loop's purpose is narrow and honest: establish that **compiled Jolt and
+the executable reference evaluator agree** on the §2 fragment, on a declared
+corpus, at the §2.6 terminal observable. It does not establish that the
+semantics is "right" — the evaluator is TCB (§6.5). All evidence the loop
+produces is `sampled` (§5): sampling is its construction.
+
+```text
+ordinary Jolt source
+  -> expand + normalize (Appendix A) -> CSIR v1 (§4.1)
+  -> executable reference evaluator (§6.2)
+  -> compiled Jolt (existing v0.5.17 compiler)
+  -> compare terminal observable (§2.6)
+```
+
+### 6.1 Components and their current states
+
+| Component | State | Owner / notes |
+| --- | --- | --- |
+| CSIR v1 | **does not exist** | new compiler work; future core lane (C5); closed schema (F1); field set per §4.1; normalization per Appendix A |
+| Reference evaluator | **does not exist** | small-step evaluator over CSIR v1 for the §2 fragment, written for obvious correctness over performance; TCB with its own controls (§6.5) |
+| Compiled Jolt | exists | the v0.5.17 compiler/backend (P10 (a): spine unchanged) |
+| Comparison harness | does not exist | drives both paths on one corpus, applies §2.6 equivalence (including the compiled-side terminal canonicalization), records §5.4 producer-typed coordinates |
+
+### 6.2 Corpus
+
+- **Conformance selection:** pure-fragment cases selected from
+  `test/conformance/`, each carrying an expected result or a
+  known-divergence classification (§6.4). Cases outside the §2 fragment are
+  excluded by the §3 lane rules, not silently adapted.
+- **Generated corpus:** grammar-directed generation over the §2.4 form set,
+  size-bounded, biased toward order-sensitivity and error paths (P4 row 2).
+  Hegel seeds, shrinks, and minimizes (always `sampled`). Generators are
+  **hand-built in-project** (D9): keyword/symbol leaves via `fmap` over
+  string generators, bounded-depth recursion via `bind`/`one-of`; no
+  jolt-hegel API additions until this loop exists.
+- **All input classes get generators** (P11/Cedar B.4): programs, and — once
+  the fragment grows — environments/inputs, not programs alone.
+
+### 6.3 Comparison relation
+
+- The §2.6 terminal observable: canonical value, error outcome
+  `{kind, data?}`, or bounded divergence (`:timeout` = `inconclusive`,
+  never evidence of convergence or divergence).
+- Equivalence per §2.6: metadata excluded; values containing functions or
+  host objects are not canonical-comparable and classify the program's lane
+  per §3 instead of producing a fragment outcome. **Lane exclusion requires
+  both sides' terminals to be non-canonical** (or a static non-fragment
+  classification): an exactly-one-side non-canonical terminal is a
+  differential failure per §6.4, attributed per §6.6 — exclusion never masks
+  a one-sided divergence (P13-D).
+- **Known-divergence register:** approved, version-pinned differences with
+  source rationale — a filter/reporting artifact, never an implicit
+  ignore-list. Every registered divergence must cite a §2 rule or be
+  classified `target-dependent` with per-target records. A difference
+  matching no register entry is a **differential failure**, never silently
+  absorbed.
+
+### 6.4 Failure handling and persistence
+
+A differential failure (mismatched terminal outcomes per §2.6):
+
+1. Retain: minimized source, expanded CSIR, reference result, compiled
+   result, Jolt SHA, CSIR-schema version, and divergence status.
+2. Persist per §5.4 producer-typed coordinates: Hegel = `{seed, tool
+   versions, minimized-source?}` — the **concrete minimized source is
+   always retained** because Hegel stateful traces do not persist argument
+   values (P4).
+3. Promote the minimized program to a **named ordinary regression corpus
+   entry** — permanent, versioned, replayed on every gate run.
+4. Record the evidence record at level `failed` for the affected claim
+   (§5.1); the claim is blocked until resolved and re-evidenced (§5.3
+   failed-disposition rule).
+
+### 6.5 The evaluator is TCB — loop self-controls
+
+The Cedar oracle was itself buggy (P11 B/Q7.2: proofs and differential
+testing "revealed several bugs" in the reference model). Therefore the
+reference evaluator carries its own controls:
+
+- **Evaluator self-tests:** unit tests over the §2.4 form set with expected
+  results derived from §2's rules directly (not from compiled Jolt).
+- **Buggy-evaluator control:** a variant evaluator with one deliberately
+  wrong rule (e.g., right-to-left arguments) MUST produce detectable
+  mismatches on a fixed probe corpus — the loop's own non-vacuity control,
+  proving the comparison harness discriminates.
+- **CI-enforced spec/impl sync (P11 B.4):** the corpus gate runs both paths
+  together; a change to either side that alters any outcome must produce
+  either agreement or a registered divergence — never an unexplained delta.
+- **Direct property tests on the implementation** (P11 B.4): compiled-path
+  invariants (e.g., read/print round-trips of canonical values) tested
+  directly, not only via cross-implementation comparison.
+
+### 6.6 Site-ID ↔ descriptor unification in the loop (C4/F6/F7)
+
+- Every corpus program's CSIR nodes carry site-IDs (§4.2). A divergence
+  report cites the **site-ID of the smallest reference-side subcomputation
+  whose §2.6 terminal outcomes differ between sides**, localized by
+  re-evaluation over CSIR v1 nodes (which carry `site-id`, §4.1) — the pure
+  fragment has no per-step observable (§2.6), so localization works by
+  subtree re-evaluation, not step inspection (P13-A). The compiled-side
+  position is reported via the §4.1 provenance map, whose digest is in the
+  record's §5.4 metadata (P13-B).
+- When the fragment later extends to host-capability operations, the
+  descriptor at each such call site carries `site-id` = the CSIR site ID of
+  that node (C4/F6): differential evidence and §3 effect evidence attach to
+  the same identity without translation. `Dynamic-opaque` corpus cases are
+  excluded by lane (§3), not attributed.
+
+### 6.7 First honest milestone and staging
+
+1. Define the versioned minimal CSIR v1 schema and the reference evaluator
+   for **one agreed pure subfragment** (a strict subset of §2: literals,
+   `if`/`do`, `let*`, ordered invocation of first-order fns).
+2. Run **one fixed corpus case** through both paths; record it as `sampled`
+   with full §5.4 metadata. This is the milestone — explicitly **not** a
+   conformance claim.
+3. Add the conformance selection; then generated Hegel cases; then broaden
+   the fragment rule by rule (each broadening re-runs the whole gate).
+4. Exit criteria per §9 stage 2 (reference evaluator) and the CSIR v1 exit
+   test (§9 stage 1): one fixed corpus case through both paths labeled
+   `sampled`, plus Appendix A determinism vectors.
+
+### 6.8 Scope limits
+
+- Pure §2 fragment only: no concurrency, FFI, host interop (opaque order),
+  `eval`/dynamic resolution (Dynamic-opaque), reader-eval, transients,
+  channels, or equality corners (D7/C3). **No descriptors exist in the v1
+  loop;** F6's `host-origin` class and F7's per-instance `operation-id` are
+  specified (§4.4) but **uncovered-by-design** until the host-capability
+  extension (P13-E).
+- All loop evidence is `sampled`; corpus coverage is **reported**, never
+  implied complete. The loop validates reference↔compiled agreement under
+  §2's semantics; it never validates §2 itself.
 
 ## 7. First proof target
 
@@ -1012,12 +1144,14 @@ is **not** part of v1 (F1).
 
 ### A.7 Digest computation
 
-The NF is serialized in a canonical EDN subset (atoms per A.2, children
-ordered per A.2/A.5, role paths embedded) and digested with **SHA-256**. The
-digest algorithm is named in the CSIR-schema version (§4.1), so a future
-algorithm change is a schema remint (F4), never a silent drift. (H5's 32-bit
-value hash is deliberately not reused: identity digests need collision
-resistance beyond value-hash purposes.)
+Each node's digest is over the canonical serialization of **that node's NF
+subtree with its role path embedded** (atoms per A.2, children ordered per
+A.2/A.5), digested with **SHA-256**. The role path is what distinguishes
+duplicate sibling subforms (P13-C). The digest algorithm is named in the
+CSIR-schema version (§4.1), so a future algorithm change is a schema remint
+(F4), never a silent drift. (H5's 32-bit value hash is deliberately not
+reused: identity digests need collision resistance beyond value-hash
+purposes.)
 
 ### A.8 Determinism vector suite (exit-test content)
 
@@ -1026,7 +1160,10 @@ every atom kind; nested macros with gensyms (incl. same-printed-name
 distinct-scope gensyms); structure-preserving movement (whitespace, comments,
 reordering of map-literal pairs is **not** structure-preserving — pair order
 is semantic per §2.2); `def` with and without `:dynamic`; quote with and
-without metadata; a form compiled twice with identical IDs; and the same
+without metadata; **duplicate sibling subforms** (identical subforms in one
+body must yield distinct site-IDs by role path, P13-C); **re-evaluation of
+the same top-level form** (REPL redefinition of the same Var yields
+identical site-IDs); a form compiled twice with identical IDs; and the same
 form normalized by two independent implementations with identical NFs.
 
 ## Appendix B. Grounding references
