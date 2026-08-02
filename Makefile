@@ -247,6 +247,7 @@ ffi:
 	@$(CHEZ) --script test/chez/ffi-ranged-transfer-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
