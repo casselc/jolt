@@ -12,7 +12,12 @@
         (ffi/free pp))
 
   Types (keywords): :int :uint :long :ulong :int64 :uint64 :size_t :ssize_t
-  :iptr :uptr :double :float :pointer :string :void :uint8 :char.
+  :iptr :uptr :double :float :pointer :string :void :uint8 :char, plus exact
+  scalar widths :int8/:i8, :int16/:short, :uint16/:ushort, :int32, :uint32.
+  Each exact width is a fixed-width native-byte-order memory type and signature
+  type; the signed and unsigned widths at each size expose the same stored bits
+  (a :uint16 read of a :int16 -1 write is 65535). Wire byte order stays an
+  explicit conversion (htons/ntohs or a codec).
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers
