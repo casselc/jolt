@@ -44,6 +44,8 @@ No compiler/runtime implementation until charter + first proof target accepted.
 | `docs/research/reports/P1-SEMANTIC-FACTS-REGISTER.md` | primary orchestrator (this lane) | unreviewed working artifact |
 | `docs/research/reports/P2-DECISION-ALTERNATIVES-MEMO.md` | primary orchestrator (this lane) | unreviewed working artifact |
 | `docs/research/reports/P4-EXECUTABLE-OBLIGATIONS-MATRIX.md` | primary orchestrator (this lane) | unreviewed working artifact |
+| `docs/research/reports/P3-FIRST-PROOF-TARGET-DESIGN.md` | primary orchestrator (this lane) | unreviewed working artifact |
+| `docs/research/reports/P5-RESEARCH-DOC-CLAIM-CHECKLIST.md` | primary orchestrator (this lane) | unreviewed working artifact |
 | everything else in worktree | untouched at base SHA | — |
 
 Out-of-worktree session infrastructure (not lane artifacts, not in a git repo):
@@ -66,8 +68,9 @@ External lanes (do not touch):
 | P1 runtime semantic grounding | `jolt-runtime-engineer` | `openai/gpt-5.6-sol`, high | v0.5.13 candidate source, read-only | **completed** — session `ses_0400ee974ffeD2n1HmvHthHXhz`; report in `reports/P1-SEMANTIC-FACTS-REGISTER.md` |
 | P2 semantic boundary alternatives | `simulation-formalism-architect` | `openai/gpt-5.6-terra`, high | 4 research docs + jolt-sim, read-only | **completed** — session `ses_0400ea2c9ffeIuhezqZdOrofZX`; report in `reports/P2-DECISION-ALTERNATIVES-MEMO.md` |
 | P4 Hegel/differential obligations | `property-testing` | `zai-coding-plan/glm-5.2`, high | jolt-hegel + 2 research docs, read-only | **completed** — session `ses_0400e9f45ffe91J6BPnLROGN95`; report in `reports/P4-EXECUTABLE-OBLIGATIONS-MATRIX.md` |
-| P3 first proof target design | `formal-methods` | `openai/gpt-5.6-terra`, high | docs + P1 register | **pending — dispatch after restart** (prompt essence below) |
-| Phase 1.5 model trial | `jolt-structure-auditor` via dispatcher `-m fireworks-ai/accounts/fireworks/models/deepseek-v4-flash-0731` | default | 4 research docs, read-only | **timed out at 300s, session aborted** (`ses_0400e39acffek30lUV0PJ2w4EZ`); superseded by the new `jolt-research-auditor` profile — retry after restart with 600s budget |
+| P3 first proof target design | `formal-methods` | `openai/gpt-5.6-terra`, high | docs + P1 register + jolt-sim kernel | **completed** — session `ses_03ffb4ccbffeEMPcSVPkOGLMRK`; report in `reports/P3-FIRST-PROOF-TARGET-DESIGN.md` |
+| Phase 1.5 model trial | `jolt-structure-auditor` via dispatcher `-m fireworks-ai/accounts/fireworks/models/deepseek-v4-flash-0731` | default | 4 research docs, read-only | **superseded** — first run timed out at 300s pre-restart (`ses_0400e39acffek30lUV0PJ2w4EZ`); retried via new profile below |
+| Phase 1.5 retry: claim-discipline checklist | `jolt-research-auditor` via dispatcher (new profile, no `-m`) | Deepseek V4 Flash 0731, profile default, 600s | 4 research docs, read-only | **completed** — session `ses_03ffb0eb6ffe7VL4SDqvMkyErG`; report in `reports/P5-RESEARCH-DOC-CLAIM-CHECKLIST.md`; trial verdict: model suitable for bounded extraction audits |
 | Phase 3 design challenge | external Claude CLI | `sonnet`, high, plan mode, read-only | decision memo + live source | pending (after Phase 2) |
 | Phase 5 final review | `jolt-reviewer` | `zai-coding-plan/glm-5.2`, high | charter vs sources, read-only | pending |
 
@@ -198,4 +201,5 @@ User authorized creating bounded profiles for the new models and extending
 | # | Commit | Contents | Reviewed by user |
 | --- | --- | --- | --- |
 | 1 | `62352c15` | handoff skeleton | yes (plan approved) |
-| 2 | (pending) | P1/P2/P4 reports + handoff state + infra record | pending |
+| 2 | `9df9ec38` | P1/P2/P4 reports + handoff state + infra record | yes (restart authorized) |
+| 3 | (pending) | P3 proof-target design + P5 claim checklist + handoff state | pending |
