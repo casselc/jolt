@@ -1,7 +1,15 @@
-# Jolt Application Core Semantic Charter
+# Application Core Semantic Charter (Clojure.next core; first realization: Jolt)
 
 **Status:** DRAFT — section-by-section review in progress. Sections marked
 "DRAFT PENDING" are not yet accepted.
+**Scope:** a **Clojure.next Application Core** — implementation-neutral,
+portable semantics with named realization targets. The semantics in this
+charter are written to be implementable in Jolt-on-Chez, jank, JVM/CLR hosts,
+or native Clojure implementations (Go/Zig/Rust/…). **Jolt-on-Chez at upstream
+v0.5.17 is the first/reference realization** and the source of all executable
+evidence in this lane; it is not the owner of the semantics. Host behavior
+appears only as cited *realization notes*, never as the definition of core
+semantics, and no host's accidents are canonized.
 **Target baseline:** upstream Jolt **v0.5.17**, tag commit
 `da59e49dbe8c810e05aa2ce900a95c5a1ef0c9fe` (coordination pivot 2026-08-01;
 read-only reference worktree `jolt-v0517-reference`). This lane's git base and
@@ -67,24 +75,49 @@ recorded in the versioned profile matrix (§1.4):
 
 ### 1.2 The v1 formal-core profile
 
-Values (representations per P1 register; semantics in §2):
+Values (portable semantics; realizations cited as notes; details in §2):
 
-- `nil`, booleans; exact integers (61-bit fixnum path with bignum promotion on
-  the generic path; checked casts truncate toward zero with JVM-sized ranges,
-  per the conformance register); exact ratios; doubles (flonum, no
-  single-float representation); strings (Chez strings, Unicode codepoint
-  indexing — an astral character counts one and cannot be split by `subs`);
-  symbols (not interned, may carry metadata); keywords (interned).
-- Persistent lists, vectors (32-way trie with tail), maps (array-map insertion
-  order promoting to HAMT order past thresholds), sets (hash-ordered).
-  Equality and hashing are order-independent for maps/sets.
-- Equality, hashing, and comparison: as **test authority**, the conformance
-  register (`test/conformance/SPEC.md` + `known-divergences.edn`) governs test
-  expectations where it conflicts with README prose (C3). The formal v1
-  fragment makes **no numeric-`=` claim** (D6/C3); hash-consistency and
-  compare laws are §6/§8 `sampled` obligations, not formal claims.
-- Metadata: supported on symbols and collection values and Vars (P1); the
+- `nil`, booleans.
+- **Exact integers:** unbounded exact semantics — arithmetic is always exact
+  (bignum semantics); implementations may use a small-integer fast path
+  *(realization: Jolt-on-Chez uses Chez 61-bit fixnums with exact bignum
+  promotion, `V17` P10 #2)*. Fixed-width interop casts are explicit checked
+  operations whose width set is `target-dependent`; they are not part of core
+  arithmetic.
+- **Exact ratios** (non-integer rationals); **IEEE-754 binary64 doubles**
+  (no single-float in the core).
+- **Strings:** immutable sequences of **Unicode scalar values**. `count` and
+  indexing are by scalar value; a scalar value cannot be split by `subs`.
+  *(Realization: JVM hosts index UTF-16 code units and CAN split surrogate
+  pairs — a platform accident, `target-dependent`, not core semantics.
+  Jolt-on-Chez indexes scalar values directly, `V17` P10 #2.)*
+- **Symbols** (namespace/name, not interned, may carry metadata); **keywords**
+  (namespace/name, interned — identity-stable).
+- **Collections:** persistent lists, vectors, maps, sets. Equality and
+  hashing are order-independent for maps/sets. **Iteration order of
+  hash-based maps/sets is unspecified** (realization-dependent; only sorted
+  collections guarantee order). *(Realizations: Jolt-on-Chez vectors are
+  32-way tries with tails; maps use insertion-ordered small maps promoting to
+  HAMT past thresholds; sets are hash-ordered HAMTs — `V17` P10 #2. JVM
+  realizations differ in kind, not in this portable contract.)*
+- **Equality, hashing, comparison:** as **test authority**, the conformance
+  register governs test expectations where it conflicts with README prose
+  (C3). The formal v1 fragment makes **no numeric-`=` claim** (D6/C3);
+  hash-consistency and compare laws are §6/§8 `sampled` obligations. The
+  canonical string/collection hash algorithm is defined by this charter so
+  all realizations agree *(JVM-compatible hashing is a `target-dependent`
+  interop concern — open question I1)*.
+- **Metadata:** supported on symbols and collection values and Vars; the
   exhaustive eligibility matrix is `specified-profile`, not formal-core v1.
+
+**Sequence processing model (H4):** the core is **eager/transducer-first at
+the bottom**. Default sequence operations are eager and strict; transducers
+are the composable, collection-agnostic transformation primitive; eager
+drivers (`into`/`transduce`-style) are the canonical consumers. **Laziness
+is opt-in** via explicit lazy stream/generator constructors with defined
+realization, exception, cancellation, and resource semantics (§2). *(JVM
+pervasive/chunked laziness is a host behavior; chunk size is a realization
+detail, not core semantics.)*
 
 Forms (evaluation order and observable semantics in §2):
 
@@ -128,8 +161,11 @@ Excluded from v1 formal-core (each with its lane; details in §3):
 
 ### 1.3 Explicit non-goals
 
-1. **No JVM accident preservation.** Category-blind `1`=`1N` is conformance
-   test authority only (C3); it is not canonized as formal semantics.
+1. **No host-accident canonization.** The core does not preserve any host's
+   implementation accidents — JVM UTF-16 surrogate splitting, JVM primitive
+   overflow behavior, Chez-specific integer widths, or category-blind
+   `1`=`1N` (conformance test authority only, C3 — not formal semantics).
+   Portable semantics first; realizations are cited, never canonized.
 2. **No arbitrary JVM class interop, unrestricted reflection, or implicit
    host mutation** in any classified lane.
 3. **No single portable semantics pretense.** Platform-specific behavior is
@@ -178,6 +214,31 @@ referenced proof/conformance record) → evidence obligations (§5/§8). A featu
 may not be referenced as `formal-core` unless its matrix row cites a §2
 semantics subsection and its §6 differential coverage state. The matrix is
 reminted with the charter, not patched for prerelease compatibility.
+
+### 1.5 Coverage staging (what comes after this charter's core)
+
+This charter specifies the semantic foundation. The two surfaces asked about
+most are staged as follows (exit criteria in §9):
+
+- **The core library (clojure.core-equivalent: seq/reduce/map/filter/concat,
+  transducers, predicates):** mostly pure functions over immutable values —
+  the cheapest formalization target after the fragment evaluator exists.
+  Stage: with the reference evaluator and schema prototype (§9 stages 2–3), a
+  selected pure kernel of core functions gets equational semantics and
+  becomes the first `verified-kernel` candidate (§9 stage 4). The processing
+  model is eager/transducer-first (§1.2); **lazy streams are opt-in** with
+  defined realization, exception, cancellation, and resource semantics,
+  specified separately from the eager core.
+- **Coordination and async (atoms, promises/delays/futures, agents,
+  channels/core.async-equivalent, timers, Flow):** stage after the
+  coordination-kernels stage (§9), and gated on the v0.5.17 runtime lane
+  delivering lifecycle observation/control seams (non-goal 13: requested,
+  never assumed). The §7 mailbox proof target is the seed of this work —
+  capacity/blocked/close/drain semantics on the cooperative model before any
+  runtime channel semantics is claimed.
+- **Effect handlers and simulation worlds:** the H3 derivation hierarchy and
+  tier model land with the runtime lane's controller; this charter specifies
+  the contracts, not the ABI.
 
 ---
 

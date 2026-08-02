@@ -268,9 +268,18 @@ slice:
 
 ## Open questions
 
+- **I1 (new, from §1 review):** canonical hash algorithm strategy for the
+  Clojure.next core. Option (a): charter defines its own canonical
+  string/collection hash (all next-impls agree; JVM-compatible hashing
+  becomes a `target-dependent` interop profile). Option (b): mandate
+  JVM-compatible hashing everywhere (preserves cross-impl persisted-hash
+  behavior; drags JVM's UTF-16-unit semantics into every host). Primary
+  recommendation: (a). Pending user decision before §2's equality/hash text.
+
 From P1 (source-grounded):
 1. Which source is authoritative for numeric `=`: README category-aware claim or
-   conformance register's category-blind behavior?
+   conformance register's category-blind behavior? (resolved by C3 for tests;
+   formal claim deferred)
 2. Does the live reader accept `#=` as inert syntax, or reject it?
 3. Should charter "function-call evaluation order" include host interop forms?
    (P1 found ordinary `:invoke` is observably left-to-right but host
@@ -391,3 +400,27 @@ User authorized creating bounded profiles for the new models and extending
 | 13 | `cc1059de` | H1/H2 memo amendments + handoff state | yes (E2+E3 + hierarchy directed) |
 | 14 | `def4bcd9` | H3 derivation-hierarchy amendment + handoff state | yes (S1–S3 confirmed) |
 | 15 | `1b3840c5`+`688aaa45` | PR policy update + draft PR #12 recorded/pushed | yes (user directed PR) |
+| 16 | `315f0c0d` | H3 sub-decisions S1–S3 confirmed | yes |
+| 17 | (pending) | charter §1 revisions: Clojure.next implementation-neutrality reframing + §1.5 coverage staging | pending |
+
+## §1 review outcome (2026-08-01)
+
+User approved §1 with two directions:
+1. **Implementation-neutrality (Clojure.next core):** the charter's semantics
+   must be portable — implementable in jank, JVM/CLR, or native Clojure impls
+   (Go/Zig/Rust) — not tied to Jolt/Chez. Applied: retitled charter scope;
+   values rewritten portable-first with realization notes (e.g., strings =
+   immutable sequences of Unicode scalar values; JVM UTF-16 splitting named a
+   platform accident, `target-dependent`; Jolt-on-Chez = first realization,
+   V17-cited); non-goal 1 generalized to "no host-accident canonization";
+   canonical hash strategy opened as question I1.
+2. **Coverage staging (core library, async):** answered in new §1.5 —
+   clojure.core-equivalent pure kernel = next stage after reference evaluator
+   (first verified-kernel candidate, equational semantics); coordination/
+   async kernels staged after, gated on v0.5.17 runtime lifecycle seams;
+   §7 mailbox is the seed.
+3. **Processing model (H4, user-directed):** eager/transducer-first at the
+   bottom with opt-in laziness — applied to memo (H4), §1.2 (processing-model
+   block), and §1.5 (lazy streams opt-in with defined realization/exception/
+   cancellation/resource semantics). JVM pervasive/chunked laziness named a
+   host behavior, not core semantics.

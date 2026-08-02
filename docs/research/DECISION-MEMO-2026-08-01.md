@@ -462,3 +462,22 @@ Sub-decision defaults (**user-confirmed 2026-08-01**):
   silent inheritance is the default; tier-(a) claims without a registered
   model are rejected at registration validation, not admitted with a
   warning.
+
+### H4 (new): sequence processing model — eager/transducer-first, opt-in laziness
+
+User-directed 2026-08-01 (§1 review): the core is **transducer/eager-first at
+the bottom, with opt-in laziness**.
+
+- Default sequence-processing operations are **eager and strict**.
+  Transducers are the composable, collection-agnostic transformation
+  primitive; eager drivers (`into`/`transduce`-style) are the canonical
+  consumers.
+- **Laziness is opt-in** through explicit lazy stream/generator constructors
+  with defined realization, exception, cancellation, and resource semantics
+  (realization granularity, exception-during-realization,
+  abandonment/cancellation, head-retention rules — specified in §2).
+- JVM pervasive/chunked laziness is a host behavior, not core semantics;
+  chunk size is a realization detail.
+- Consistent with the research plan's original guidance (strict collections
+  and transducer-oriented processing by default; explicit lazy streams remain
+  useful with defined semantics).
