@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Variadic foreign bindings declare their fixed-argument boundary.**
+  `jolt.ffi/foreign-fn` and `defcfn` accept
+  `{:varargs-after n}`, where `n` is the positive number of declared fixed C
+  parameters before `...`. The boundary composes with collect-safe calls and
+  atomic native-error capture and lowers to Chez's `__varargs_after`
+  convention, which is required on targets whose variadic and fixed calling
+  conventions differ. Callers declare already-promoted C ABI types for
+  arguments after the boundary.
+
 - **Scoped in-out byte-array pointer loans for `jolt.ffi`.**
   `with-byte-array-pointer` lends a stable pointer to a temporary native-octet
   copy of a whole signed byte array or one validated range, then copies native

@@ -1213,6 +1213,14 @@
   ;; / declare-var! / intern-ns! / define (top-level + forward-decl + ns-splice),
   ;; foreign-procedure (ffi lowering). A local shadowing these only clashes when
   ;; the def/ffi/var-cache form is emitted inside that local's scope.
+  ;; ffi variadic boundary — jolt.ffi/__cfn {:varargs-after n} is validated at
+  ;; analyze time (fail closed): n must be a positive literal integer no greater
+  ;; than the declared argtype count. These :throws rows exercise the analyzer
+  ;; guard directly; __cfn is a special form, so no require is needed.
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after 3.0})" :expected :throws}
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after 0})" :expected :throws}
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after -1})" :expected :throws}
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t] :int {:varargs-after 3})" :expected :throws}
   ;; munge-injective (compiler-review R2 stage 2). munge-name maps ' -> $P, # -> $H,
   ;; and $ -> $$ (escape-first) so distinct Clojure locals get distinct Scheme ids.
   ;; Pre-remint a' and a_PRIME_ both emit a_PRIME_ (old ' -> _PRIME_ substitution),
