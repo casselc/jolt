@@ -19,6 +19,13 @@
   (a :uint16 read of a :int16 -1 write is 65535). Wire byte order stays an
   explicit conversion (htons/ntohs or a codec).
 
+  The host byte-array buffer helpers are exposed here as vars from the runtime:
+  read-array allocates a fresh byte-array, read-array! copies into an existing
+  byte-array at an offset, and write-array has a whole-array form and a ranged
+  (ptr src src-off len) form. Both ranged forms validate the byte-array kind,
+  subtraction-safe bounds, and nonzero-length null pointers before any native
+  access or mutation.
+
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers
   a compile-time-typed signature to a real Chez foreign-procedure. Its optional
