@@ -90,7 +90,7 @@ read-only, bounded to its slice:
 | Slice | Scope | Timing | Status |
 | --- | --- | --- | --- |
 | 1 | D1 identity spine: A3-vs-A2 judgment honesty, site-ID / macro-digest-chain / declared-anchor rule, C4 unification consequences (incl. site-IDs for eval'd/dynamically resolved code) | completed 2026-08-01 | report `reports/P8-FABLE-SLICE1-IDENTITY-SPINE.md`; F1–F7 user-approved and applied to memo |
-| 2 | D5/F4 reconciliation + P3 mailbox transition relation, invariant, controls adequacy (incl. max-steps derivation) | after slice 1 | dispatched |
+| 2 | D5/F4 reconciliation + P3 mailbox transition relation, invariant, controls adequacy (incl. max-steps derivation) | completed 2026-08-01 ($3.47 of $10 cap) | report `reports/P9-FABLE-SLICE2-PROOF-TARGET.md`; 2 blockers + 4 majors; amendments G1–G6 proposed, **pending user approval** |
 | 3 | site-ID ↔ descriptor unification cross-section check | after charter §4/§6 drafted | pending |
 | 4 | D3/C2 lattice soundness + one record-schema sufficiency (Hegel seed-only replay vs jolt-sim action-path replay) | before charter §5 finalized | pending |
 
@@ -114,3 +114,29 @@ Fable slice-1 verdict context preserved in P8: 1 blocker (macro-digest churn),
 non-deterministic normalization spec; host-origin site-ID dangling case), 3
 minors, 2 questions. D1's core direction (structural key, never line/column)
 survived adversarial review and was verified against live source.
+
+## Fable slice-2 dispositions (primary recommendation; pending user approval)
+
+Report: `reports/P9-FABLE-SLICE2-PROOF-TARGET.md`. Cost $3.47 (cap $10).
+All source analysis hand-simulated by Fable against live jolt-sim source;
+nothing executed (read-only fence). Two blockers, four majors; D5/C2 direction
+survives ("mailbox remains the right first target after the encoding and bound
+amendments").
+
+| Amendment | Content | Primary disposition |
+| --- | --- | --- |
+| G1 (blocker) | Re-derive step bound counting block transitions: guard failure ⇒ `step-block` consumes a step; longest quiescence path = 10 (9 if consumer initially blocked); `max-steps` 11 (one slack); keep `:step-limit` in the violation disjunction as the checked bound control | **recommend accept** — without this, the corrected control returns `:violation` via its own `:step-limit` clause (P3:117-123) |
+| G2 (blocker) | World schema gains producer/consumer waiting flags; every wake conditional on them (unconditional wake throws outside the step-fn catch, kernel.clj:187-190,357-363); transition relation restated as model-level abstraction over kernel block transitions; "send enabled" defined over the projection | **recommend accept** — the guard-style "enabled iff" relation does not exist in the kernel (`machine-actions` enumerates runnable tasks only) |
+| G3 (major) | Add `status = :failed` to the invariant disjunction (kernel.clj:322-327,530-535) | **recommend accept** — otherwise a step-fn defect passes silently |
+| G4 (major) | Clause 3 (no-send-after-close) made non-vacuous by a second fault-injected control: producer program `send-a, close, send-b`, expecting the clause-3 probe to fire | **recommend accept** — preferred over documented-vacuous downgrade; cheap and strengthens the suite |
+| G5 (major) | Two TCB rows: invariant function (per-clause known-SAT probes — the buggy drop preserves prefix-ness, so clause 2 needs its own probe) and persisted-trace EDN reader (malformed/truncated/forged rejection incl. the end-of-input-sentinel regression) | **recommend accept** |
+| G6 (minors) | Name non-vacuity mechanism (scripted-path fixtures with `restore-projection` asserts / per-class probe invariants); name `:max-states` beside `:max-steps`; execution scheduling recorded as "needs jolt-sim landing-order amendment or stays `[assumed]`"; pin recency resolved by primary (`588677b` is ancestor of `eb7bce4`, git merge-base verified 2026-08-01 — C2's pin is the newer main); "F4" name collision fixed (memo refers to "the Flow plan"; "F4" denotes only the amendment) | **recommend accept** |
+
+Verified-sound elements (no amendment needed): the buggy 5-action witness
+(hand-simulated as the shortest witness firing only at its final state); the
+edge-count staging (explorer verifiably has no edge counter); C2's lane-priority
+resolution (F4 assigns the mailbox a role — "useful later control for state
+identity and reduction soundness" — and F4:14-15 explicitly permits bounded
+claims on the cooperative-model track; residual gap is only unscheduled
+execution); the non-vacuity state-class set (mechanism naming via G6);
+`:step-limit`-as-violation design (kept as the bound's checked control).
