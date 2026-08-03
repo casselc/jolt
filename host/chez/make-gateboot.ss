@@ -37,8 +37,14 @@
 (set-source-roots! ldr-install-roots)
 (load "host/chez/build.ss")
 
-(define gb-build "target/dev")
-(bld-system (string-append "mkdir -p '" gb-build "'"))
+(bld-check-chez-version)
+
+;; Tests can isolate this artifact from a concurrent target/dev build while
+;; still exercising the real fresh-compiler path.
+(define gb-build
+  (let ((p (getenv "JOLT_GATEBOOT_BUILD_DIR")))
+    (if (and p (> (string-length p) 0)) p "target/dev")))
+(bld-system (string-append "mkdir -p " (bld-sh-quote gb-build)))
 
 (define gb-gate-ss (string-append gb-build "/gate.ss"))
 (define gb-gate-so (string-append gb-build "/gate.so"))
@@ -108,7 +114,8 @@
         "(fasl-compressed #t)\n"
         "(compile-file " (ei-str-lit gb-gate-ss) " " (ei-str-lit gb-gate-so-tmp) ")\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'")))
+  (bld-system (string-append
+                (bld-sh-quote bld-chez) " --script " (bld-sh-quote cs))))
 (when (file-exists? gb-gate-so) (delete-file gb-gate-so))
 (rename-file gb-gate-so-tmp gb-gate-so)
 

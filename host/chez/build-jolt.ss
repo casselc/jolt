@@ -376,7 +376,8 @@
         (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
         (ei-str-lit jb-flat-so) ")\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'")))
+  (bld-system (string-append
+                (bld-sh-quote bld-chez) " --script " (bld-sh-quote cs))))
 
 ;; --- 3. embed boots/stub as C arrays + cc-link ------------------------------
 ;; xxd a file into header H and rename its symbol to NAME / NAME_len.

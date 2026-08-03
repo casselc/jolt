@@ -4,9 +4,31 @@
 # clojure.core overlay (jolt-core/clojure/core/*.clj). Iterates bootstrap.ss from the
 # current seed to a byte-fixpoint and overwrites host/chez/seed/.
 set -e
+
+# Resolve the selected compiler before changing directories. Make exports
+# JOLT_CHEZ even when its CHEZ variable is not present in recipe environments;
+# ignoring it can silently remint with a different `scheme` found on PATH.
+requested_chez="${JOLT_CHEZ:-${CHEZ:-}}"
+if [ -n "$requested_chez" ]; then
+  CHEZ="$(command -v "$requested_chez" 2>/dev/null || true)"
+else
+  CHEZ="$(command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null ||
+    command -v scheme 2>/dev/null || true)"
+fi
+if [ -z "$CHEZ" ] || [ ! -x "$CHEZ" ]; then
+  echo "re-mint: selected Chez is not executable: ${requested_chez:-<none>}" >&2
+  exit 1
+fi
+case "$CHEZ" in
+  /*|[A-Za-z]:[\\/]*|\\\\*) ;;
+  *)
+    chez_dir="$(CDPATH= cd -- "$(dirname -- "$CHEZ")" && pwd -P)"
+    CHEZ="$chez_dir/$(basename -- "$CHEZ")"
+    ;;
+esac
+
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
-CHEZ="${CHEZ:-$(command -v chez || command -v chezscheme || command -v scheme)}"
 tmp="$(mktemp -d)"
 cleanup() {
   status=$?

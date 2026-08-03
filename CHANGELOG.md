@@ -75,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target-aware contract; complete Windows `java.nio.file.Path` value algebra
   remains a separate compatibility slice.
 
+- **Builds retain the explicitly selected Chez toolchain.** The launcher
+  exports the resolved compiler as `JOLT_CHEZ`; isolated compile passes, seed
+  remints, self-host checks, and smoke gates reuse it instead of rediscovering
+  another `chez` from `PATH`.
+  Relative selections remain stable across the launcher's directory change,
+  and shell metacharacters in executable paths stay literal. A child whose
+  version or host machine differs from the running Chez—or whose identity
+  cannot be probed successfully—now fails before any output is linked,
+  preventing mixed boot, FASL, and kernel files.
+
 ## [0.5.20] - 2026-08-02
 
 A backtrace could show frames from calls that had already finished, and in the
