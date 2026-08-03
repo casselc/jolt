@@ -1,10 +1,12 @@
 ;; natives-array.ss — Java-style mutable arrays for the Chez host.
 ;;
-;; A jolt-array wraps a Chez mutable vector + a `kind` tag (for bytes?). The array
-;; CONSTRUCTORS are native (they build the backing); the overlay's aget/aset/alength
-;; are pure over count / nth / jolt.host/ref-put!, so we extend those dispatchers
-;; to see a jolt-array (backed by a Chez vector). Loaded after host-table.ss (ref-put!),
-;; transients.ss, seq.ss (the dispatchers it chains).
+;; A jolt-array wraps a mutable Chez BACKING + a `kind` tag (for bytes?). The backing
+;; is a bytevector for byte arrays, an flvector for double/float arrays, and a boxed
+;; vector for every other kind — see THE BACKING SEAM below, which is the only place
+;; that distinction is visible. The array CONSTRUCTORS are native (they build the
+;; backing); the overlay's aget/aset/alength are pure over count / nth /
+;; jolt.host/ref-put!, so we extend those dispatchers to see a jolt-array. Loaded
+;; after host-table.ss (ref-put!), transients.ss, seq.ss (the dispatchers it chains).
 
 (define-record-type jolt-array (fields (mutable vec) kind) (nongenerative jolt-array-v1))
 
@@ -18,11 +20,20 @@
 
 (define (na-idx i) (if (and (number? i) (not (exact? i))) (exact (floor i)) i))
 
+;; numeric tower: array element defaults / masked bytes / count are
+;; EXACT integers (= JVM byte/short/int), matching exact integer literals.
+;; Defined ahead of the seam because ja-set!'s byte arm narrows through it.
+(define (na-byte-of v) (bitwise-and (exact (floor v)) #xff))
+
 ;; --- THE BACKING SEAM -------------------------------------------------------
-;; A double/float jolt-array is backed by a Chez FLVECTOR (unboxed flonums); every
-;; other kind keeps a boxed Chez vector. These helpers let the collection
-;; dispatchers (count/seq/nth/ref-put!/aset/aclone) and java.util.Arrays work over
-;; either backing. Chez has flvector? / make-flvector / flvector-ref / -set! / -length.
+;; THREE backings, keyed off the element kind:
+;;   byte          -> a Chez BYTEVECTOR   (1 byte/element, unboxed octets)
+;;   double/float  -> a Chez FLVECTOR     (8 bytes/element, unboxed flonums)
+;;   everything else -> a boxed Chez VECTOR
+;; These helpers let the collection dispatchers (count/seq/nth/ref-put!/aset/aclone)
+;; and java.util.Arrays work over any of them. Chez has bytevector? /
+;; make-bytevector / bytevector-u8-ref / -set! / bytevector-length, and
+;; flvector? / make-flvector / flvector-ref / -set! / -length.
 ;;
 ;; CONVENTION: every ja-* helper takes the BACKING (the result of jolt-array-vec),
 ;; NOT the jolt-array. Call sites read the backing out once — (let ((v (jolt-array-vec
@@ -33,41 +44,94 @@
 ;; each helper below (plus na-make-backing / na-list->backing for construction), and
 ;; nothing outside natives-array.ss has to change.
 ;;
+;; BYTE SLOTS HOLD UNSIGNED OCTETS (0..255), which is what the vector backing
+;; already stored and what every byte-array constructor already produced —
+;; (aget (byte-array [-1]) 0) is 255 here and was 255 before. The JVM exposes
+;; byte[] slots as SIGNED bytes; jolt.core's `unchecked-byte` / jolt-bytes'
+;; `signed-byte-at` do that conversion on read. So the bytevector's u8 domain is
+;; exactly the domain the byte backing already had — the representation narrowed,
+;; the value domain did not move.
+;;
 ;; Keep these small, non-recursive and closure-free — ja-ref/ja-set! are per-element
-;; on array traversal, so cp0 must be able to inline them at every call site.
+;; on array traversal, so cp0 must be able to inline them at every call site. The
+;; bytevector arm is tested FIRST: byte scanning is the workload this backing exists
+;; for, and the flonum arrays have their own unboxed bypass (jolt-flaget/jolt-flaset)
+;; for their hot path.
 (define (na-fl-kind? k) (or (eq? k 'double) (eq? k 'float)))
-(define (ja-len v)     (if (flvector? v) (flvector-length v) (vector-length v)))
-(define (ja-ref v i)   (if (flvector? v) (flvector-ref v i) (vector-ref v i)))
+(define (ja-len v)
+  (cond ((bytevector? v) (bytevector-length v))
+        ((flvector? v)   (flvector-length v))
+        (else            (vector-length v))))
+(define (ja-ref v i)
+  (cond ((bytevector? v) (bytevector-u8-ref v i))
+        ((flvector? v)   (flvector-ref v i))
+        (else            (vector-ref v i))))
+;; ja-set! on a byte backing NARROWS to an octet rather than throwing.
+;; bytevector-u8-set! errors outside 0..255 where vector-set! silently accepted
+;; anything, so the byte arm has to choose. It masks, for two reasons: (a) it makes
+;; the generic aset / jolt.host/ref-put! path agree with na-aset-byte (aset-byte),
+;; which has always masked through na-byte-of, and (b) masking is what the JVM does
+;; — `b[i] = (byte) v` narrows. This is the one deliberate BEHAVIOUR change of the
+;; bytevector switch: (aset (byte-array 3) 0 -1) used to leave a raw -1 in the slot
+;; (a value no JVM byte[] can hold, and one that `seq`/`Arrays/toString` then leaked
+;; back out); it now leaves 255, the same octet aset-byte would have written.
 (define (ja-set! v i x)
-  (if (flvector? v)
-      (flvector-set! v i (if (flonum? x) x (exact->inexact x)))
-      (vector-set! v i x)))
+  (cond ((bytevector? v)
+         (bytevector-u8-set! v i (if (and (fixnum? x) (fx>=? x 0) (fx<=? x 255)) x (na-byte-of x))))
+        ((flvector? v) (flvector-set! v i (if (flonum? x) x (exact->inexact x))))
+        (else (vector-set! v i x))))
 (define (ja->list v)
-  (if (flvector? v)
-      (let loop ((i (- (flvector-length v) 1)) (acc '()))
-        (if (< i 0) acc (loop (- i 1) (cons (flvector-ref v i) acc))))
-      (vector->list v)))
+  (cond ((bytevector? v) (bytevector->u8-list v))
+        ((flvector? v)
+         (let loop ((i (- (flvector-length v) 1)) (acc '()))
+           (if (< i 0) acc (loop (- i 1) (cons (flvector-ref v i) acc)))))
+        (else (vector->list v))))
 (define (ja-copy v)
-  (if (flvector? v)
-      (let* ((n (flvector-length v)) (r (make-flvector n 0.0)))
-        (do ((i 0 (+ i 1))) ((= i n) r) (flvector-set! r i (flvector-ref v i))))
-      (vector-copy v)))
-;; Element-wise equality of two backings (java.util.Arrays/equals). `equal?` already
-;; walks vectors, flvectors and bytevectors element-wise, so this is one call today —
-;; it exists so the comparison has a single home if backings ever stop being
-;; equal?-comparable across kinds (e.g. a byte-array on a bytevector would no longer
-;; compare equal? to an int-array on a vector holding the same numbers).
-(define (ja-equal? a b) (equal? a b))
+  (cond ((bytevector? v) (bytevector-copy v))
+        ((flvector? v)
+         (let* ((n (flvector-length v)) (r (make-flvector n 0.0)))
+           (do ((i 0 (+ i 1))) ((= i n) r) (flvector-set! r i (flvector-ref v i)))))
+        (else (vector-copy v))))
+;; Element-wise equality of two backings (java.util.Arrays/equals).
+;;
+;; CROSS-KIND EQUALITY IS PRESERVED. `equal?` alone would now answer #f for
+;; (Arrays/equals (byte-array [1 2]) (int-array [1 2])) — a bytevector is never
+;; equal? to a vector — where it answered #t before the byte backing moved. That
+;; comparison is a compile error on the JVM (there is no Arrays.equals(byte[],int[])
+;; overload), so neither answer is "the JVM's"; #t is simply what jolt has always
+;; said, and the representation change is not a reason to change it. So: same
+;; backing shape -> one `equal?` (the fast path, and the only path byte/byte,
+;; int/int and double/double take); different shapes -> walk elements. Element
+;; comparison stays `equal?`, which keeps exact-vs-inexact distinct — a byte-array
+;; and a double-array of the same numbers are still NOT equal, as before.
+(define (ja-same-shape? a b)
+  (or (and (bytevector? a) (bytevector? b))
+      (and (flvector? a) (flvector? b))
+      (and (vector? a) (vector? b))))
+(define (ja-equal? a b)
+  (if (ja-same-shape? a b)
+      (equal? a b)
+      (let ((n (ja-len a)))
+        (and (= n (ja-len b))
+             (let loop ((i 0))
+               (or (= i n)
+                   (and (equal? (ja-ref a i) (ja-ref b i)) (loop (+ i 1)))))))))
 (define (na-make-backing n kind init)
-  (if (na-fl-kind? kind)
-      (make-flvector (exact n) (if (flonum? init) init (exact->inexact init)))
-      (make-vector (exact n) init)))
+  (cond ((eq? kind 'byte) (make-bytevector (exact n) (na-byte-of init)))
+        ((na-fl-kind? kind)
+         (make-flvector (exact n) (if (flonum? init) init (exact->inexact init))))
+        (else (make-vector (exact n) init))))
 (define (na-list->backing lst kind)
-  (if (na-fl-kind? kind)
-      (let* ((n (length lst)) (fv (make-flvector n 0.0)))
-        (let loop ((i 0) (l lst))
-          (if (null? l) fv (begin (flvector-set! fv i (exact->inexact (car l))) (loop (+ i 1) (cdr l))))))
-      (list->vector lst)))
+  (cond ((eq? kind 'byte)
+         (let* ((n (length lst)) (bv (make-bytevector n)))
+           (let loop ((i 0) (l lst))
+             (if (null? l) bv
+                 (begin (bytevector-u8-set! bv i (na-byte-of (car l))) (loop (+ i 1) (cdr l)))))))
+        ((na-fl-kind? kind)
+         (let* ((n (length lst)) (fv (make-flvector n 0.0)))
+           (let loop ((i 0) (l lst))
+             (if (null? l) fv (begin (flvector-set! fv i (exact->inexact (car l))) (loop (+ i 1) (cdr l)))))))
+        (else (list->vector lst))))
 
 (define (na-from-seq x kind) (make-jolt-array (na-list->backing (seq->list (jolt-seq x)) kind) kind))
 ;; (T-array size) | (T-array size init) | (T-array seq)
@@ -75,10 +139,6 @@
   (if (number? a)
       (make-jolt-array (na-make-backing (na-idx a) kind (if (pair? rest) (car rest) init)) kind)
       (na-from-seq a kind)))
-
-;; numeric tower: array element defaults / masked bytes / count are
-;; EXACT integers (= JVM byte/short/int), matching exact integer literals.
-(define (na-byte-of v) (bitwise-and (exact (floor v)) #xff))
 
 ;; --- constructors -----------------------------------------------------------
 (define (na-object-array a . rest)  (na-num-array a rest jolt-nil 'object))
@@ -99,19 +159,30 @@
            (list->vector (map (lambda (c) (if (char? c) c (integer->char (exact (truncate c)))))
                               (seq->list (jolt-seq a)))) 'char))))
 ;; (byte-array n [init]) | (byte-array coll). Also coerces the host's OTHER byte
-;; carrier — a Chez bytevector (what String/.getBytes produce) — and a string's
+;; carrier — a Chez bytevector (what a raw host read hands back) — and a string's
 ;; UTF-8 bytes, so bytevector and byte-array interconvert across interop seams.
+;; The backing IS a bytevector now, so the bytevector/string/byte-array arms are
+;; straight copies (string->utf8 already yields the exact backing we want) instead
+;; of the u8-list round trips they needed when the backing was a boxed vector.
 (define (na-byte-array a . rest)
   (cond
-    ((number? a) (make-jolt-array (make-vector (exact (na-idx a)) (na-byte-of (if (pair? rest) (car rest) 0))) 'byte))
-    ((bytevector? a) (make-jolt-array (list->vector (bytevector->u8-list a)) 'byte))
-    ((string? a) (make-jolt-array (list->vector (bytevector->u8-list (string->utf8 a))) 'byte))
-    (else (make-jolt-array (list->vector (map na-byte-of (seq->list (jolt-seq a)))) 'byte))))
-;; jolt byte-array -> Chez bytevector (for String decode / utf8->string).
+    ((number? a) (make-jolt-array (make-bytevector (exact (na-idx a)) (na-byte-of (if (pair? rest) (car rest) 0))) 'byte))
+    ((bytevector? a) (make-jolt-array (bytevector-copy a) 'byte))
+    ((string? a) (make-jolt-array (string->utf8 a) 'byte))
+    ;; another byte-array: its backing is already a bytevector of octets, so the
+    ;; per-element na-byte-of masking the seq path would do is a no-op. Copy it.
+    ((and (jolt-array? a) (eq? (jolt-array-kind a) 'byte))
+     (make-jolt-array (bytevector-copy (jolt-array-vec a)) 'byte))
+    (else (make-jolt-array (na-list->backing (seq->list (jolt-seq a)) 'byte) 'byte))))
+;; jolt byte-array -> Chez bytevector (for String decode / utf8->string). A fresh
+;; copy: callers hand the result to decoders/ports that must not alias live storage.
 (define (na-bytearray->bv arr)
-  (let* ((v (jolt-array-vec arr)) (n (ja-len v)) (bv (make-bytevector n)))
-    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bitwise-and (exact (ja-ref v i)) #xff)))
-    bv))
+  (let ((v (jolt-array-vec arr)))
+    (if (bytevector? v)
+        (bytevector-copy v)
+        (let* ((n (ja-len v)) (bv (make-bytevector n)))
+          (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bitwise-and (exact (ja-ref v i)) #xff)))
+          bv))))
 (define (na-make-array a . rest)    ; (make-array len) | (make-array type len ...)
   (make-jolt-array (make-vector (exact (na-idx (if (number? a) a (car rest)))) jolt-nil) 'object))
 (define (na-into-array a . rest)    (na-from-seq (if (pair? rest) (car rest) a) 'object))

@@ -49,7 +49,12 @@
    ["generic-add"        10000 #(+ 1000000 2000000)]
    ["str-concat"          1000 #(str "a" "b" "c")]
    ["map-filter-reduce"    200 #(reduce + (filter even? (map inc (range 50))))]
-   ["assoc-small-map"     1000 #(assoc {:a 1 :b 2} :c 3)]])
+   ["assoc-small-map"     1000 #(assoc {:a 1 :b 2} :c 3)]
+   ;; Pins the byte-array BACKING at one byte per element. A byte-array is backed
+   ;; by a Chez bytevector; if it ever regresses to a boxed vector of fixnums this
+   ;; jumps ~8x (100 * 1000 elements: ~120KB on a bytevector, ~820KB on a vector),
+   ;; which is far outside the tolerance. Divide by 100 * 1000 for bytes/element.
+   ["byte-array-1000"      100 #(byte-array 1000)]])
 
 (defn- run-all []
   (reduce (fn [acc [name n f]] (assoc acc name (measure n f))) {} cases))
