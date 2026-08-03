@@ -758,14 +758,58 @@
 (define (find-protocol-method type-tag proto method)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti (let ((pi (hashtable-ref ti proto #f))) (and pi (hashtable-ref pi method #f))))))
-(define (find-method-any-protocol type-tag method)
+;; Flattened method lookup, memoized per type.
+;;
+;; find-method-any-protocol / -arity are the fallback path core collection fns
+;; take for a deftype that implements an interface inline (Indexed/Counted/…).
+;; Resolving through the nested per-protocol tables on EVERY call allocated a
+;; fresh key vector (hashtable-keys) and cost up to 2N hashtable-refs for a type
+;; implementing N protocols — paid once per element for an indexed byte reader,
+;; which made (nth window i) ~16x a persistent-vector nth.
+;;
+;; The flat table maps method name -> the list of impls found across the type's
+;; protocols, in the same hashtable-keys order the old scan used, so precedence
+;; is unchanged: the "any protocol" answer is the head, and the arity-selecting
+;; answer is the first element accepting the call's arg count with the head as
+;; fallback — exactly the old (or fallback f) rule.
+;;
+;; Validity: keyed by the per-type table's IDENTITY in a weak eq hashtable and
+;; stamped with jolt-proto-epoch, the same guard the emitted PIC uses.
+;; register-protocol-method bumps the epoch, so a new or replaced impl misses.
+;; A type pruned from type-registry and re-registered gets a fresh per-type
+;; table, so it misses on identity even within one epoch. Weak keys let a pruned
+;; table's cache entry be collected (the unit/corpus harnesses prune per unit).
+(define flat-method-cache (make-weak-eq-hashtable))
+(define (build-flat-methods ti)
+  (let ((flat (make-hashtable string-hash string=?))
+        (ks (hashtable-keys ti)))
+    (let loop ((i 0))
+      (when (fx< i (vector-length ks))
+        (let ((pi (hashtable-ref ti (vector-ref ks i) #f)))
+          (when pi
+            (let ((mks (hashtable-keys pi)))
+              (let mloop ((j 0))
+                (when (fx< j (vector-length mks))
+                  (let* ((m (vector-ref mks j))
+                         (f (hashtable-ref pi m #f)))
+                    (when f
+                      (hashtable-set! flat m (append (hashtable-ref flat m '()) (list f)))))
+                  (mloop (fx+ j 1)))))))
+        (loop (fx+ i 1))))
+    flat))
+(define (flat-methods ti)
+  (let ((hit (hashtable-ref flat-method-cache ti #f)))
+    (if (and hit (fx=? (car hit) jolt-proto-epoch))
+        (cdr hit)
+        (let ((flat (build-flat-methods ti)))
+          (hashtable-set! flat-method-cache ti (cons jolt-proto-epoch flat))
+          flat))))
+(define (find-method-impls type-tag method)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
-    (and ti
-         (let* ((ks (hashtable-keys ti)) (n (vector-length ks)))
-           (let loop ((i 0))
-             (and (fx< i n)
-                  (let ((f (hashtable-ref (hashtable-ref ti (vector-ref ks i) #f) method #f)))
-                    (or f (loop (fx+ i 1))))))))))
+    (and ti (hashtable-ref (flat-methods ti) method '()))))
+(define (find-method-any-protocol type-tag method)
+  (let ((l (find-method-impls type-tag method)))
+    (and l (pair? l) (car l))))
 ;; A deftype can implement a method NAME at two arities from two interfaces (e.g.
 ;; data.priority-map's seq: Seqable.seq[this] and Sorted.seq[this ascending]),
 ;; registered under different protocols. Pick the impl whose procedure accepts
@@ -773,15 +817,14 @@
 (define (proc-accepts? f n)
   (and (procedure? f) (bitwise-bit-set? (procedure-arity-mask f) n)))
 (define (find-method-any-protocol-arity type-tag method nargs)
-  (let ((ti (hashtable-ref type-registry type-tag #f)))
-    (and ti
-         (let* ((ks (hashtable-keys ti)) (n (vector-length ks)))
-           (let loop ((i 0) (fallback #f))
-             (if (fx>= i n)
-                 fallback
-                 (let ((f (hashtable-ref (hashtable-ref ti (vector-ref ks i) #f) method #f)))
-                   (cond ((and f (proc-accepts? f nargs)) f)
-                         (else (loop (fx+ i 1) (or fallback f)))))))))))
+  (let ((l (find-method-impls type-tag method)))
+    (and l (pair? l)
+         ;; first impl accepting this arg count, else the first impl found —
+         ;; the old scan's (or fallback f), which kept the earliest non-#f.
+         (let loop ((rest l))
+           (cond ((null? rest) (car l))
+                 ((proc-accepts? (car rest) nargs) (car rest))
+                 (else (loop (cdr rest))))))))
 (define (type-satisfies? type-tag proto)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti (hashtable-ref ti proto #f) #t)))
