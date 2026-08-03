@@ -872,13 +872,30 @@ mkdir -p "$bare/app/src/app"
 printf '{:paths ["src"]}\n' > "$bare/app/deps.edn"
 printf '(ns app.core)\n(defn -main [& _] (println "bare:" (+ 40 2)))\n' > "$bare/app/src/app/core.clj"
 abs_jolt="$(cd "$(dirname "$JOLT_BIN")" && pwd)/$(basename "$JOLT_BIN")"
-if ( cd "$bare/app" && "$abs_jolt" build -m app.core -o app >/dev/null 2>&1 )    && [ "$("$bare/app/app" 2>/dev/null | tail -1)" = "bare: 42" ]; then
+bare_build_log="$bare/build.log"
+bare_run_log="$bare/run.log"
+bare_build_rc=0
+( cd "$bare/app" && "$abs_jolt" build -m app.core -o app ) >"$bare_build_log" 2>&1 || bare_build_rc=$?
+bare_run_rc=not-run
+bare_got=
+if [ "$bare_build_rc" -eq 0 ]; then
+  bare_run_rc=0
+  "$bare/app/app" >"$bare_run_log" 2>&1 || bare_run_rc=$?
+  bare_got="$(tail -1 "$bare_run_log")"
+fi
+if [ "$bare_build_rc" -eq 0 ] && [ "$bare_run_rc" -eq 0 ] && [ "$bare_got" = "bare: 42" ]; then
   pass=$((pass + 1))
+  rm -rf "$bare"
 else
   echo "  FAIL: bare-directory standalone build (embedded runtime sources)"
+  echo "    build rc=$bare_build_rc, run rc=$bare_run_rc, got=\`$bare_got\`"
+  sed -n '1,240p' "$bare_build_log" | sed 's/^/    build | /'
+  if [ -f "$bare_run_log" ]; then
+    sed -n '1,240p' "$bare_run_log" | sed 's/^/    run   | /'
+  fi
+  echo "    preserved artifacts at $bare"
   fails=$((fails + 1))
 fi
-rm -rf "$bare"
 
 # A stale PWD does not decide where relative paths resolve. PWD is a shell
 # convention, not the process's working directory: a child started elsewhere (a

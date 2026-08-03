@@ -75,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also selects its Windows-safe path from the compiler target, including Windows
   ARM64, so cross-images cannot bake POSIX relocations into Windows output.
 
+### Fixed
+
+- **Windows project, dependency, temporary, and build-output paths no longer
+  acquire a duplicate project prefix.** Drive-absolute and UNC paths pass
+  through unchanged, root-relative paths inherit the project drive, and
+  drive-relative paths fail closed instead of resolving against the wrong
+  drive. `java.io.File`, dependency roots, and CLI build outputs share the same
+  target-aware contract; complete Windows `java.nio.file.Path` value algebra
+  remains a separate compatibility slice.
+
 ## [0.5.17] - 2026-08-01
 
 Gaps and wrong answers on the `java.lang.String` surface, found by probing it after

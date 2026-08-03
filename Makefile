@@ -59,7 +59,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr futuresimhook grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release jolt-sim joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity ordinaryfuturenosim pic protoret remint sci selectedchez selfhost \
+  narrow numeric numwp oparity ordinaryfuturenosim pathfacts pic protoret remint sci selectedchez selfhost \
   shakelocal shakesmoke simcontrolleratomic simcontrollerimage simffiemit simimagesmoke \
   smoke staticnativesmoke targetfacts test testbin transient unit unitcontext \
   values wp ci
@@ -103,7 +103,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit selectedchez grenadine mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi targetfacts ordinaryfuturenosim futuresimhook simcontrolleratomic simffiemit simcontrollerimage transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke simimagesmoke certify
+ci: submodules values corpus unit selectedchez grenadine mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi targetfacts pathfacts ordinaryfuturenosim futuresimhook simcontrolleratomic simffiemit simcontrollerimage transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke simimagesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -267,6 +267,10 @@ ffi:
 # coherently from the same target facts.
 targetfacts:
 	@$(CHEZ) --script test/chez/target-descriptor-test.ss
+
+# Pure POSIX/Windows absolute, rooted, and project-resolution contracts.
+pathfacts:
+	@$(CHEZ) --script test/chez/path-contract-test.ss
 
 # The ordinary runtime carries no simulator hook state or branch.
 ordinaryfuturenosim:
