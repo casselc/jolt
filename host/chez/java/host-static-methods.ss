@@ -469,7 +469,7 @@
   (list (cons "valueOf" (lambda (x . _)
                           (cond ((jolt-nil? x) "null")
                                 ((and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
-                                 (list->string (vector->list (jolt-array-vec x))))
+                                 (list->string (ja->list (jolt-array-vec x))))
                                 (else (jolt-str-render-one x)))))
         ;; String.join(delim, elems) — elems as a collection or spread as varargs,
         ;; the two shapes the JVM overloads on.

@@ -18,10 +18,23 @@
 
 (define (na-idx i) (if (and (number? i) (not (exact? i))) (exact (floor i)) (jolt-need-num i)))
 
+;; --- THE BACKING SEAM -------------------------------------------------------
 ;; A double/float jolt-array is backed by a Chez FLVECTOR (unboxed flonums); every
 ;; other kind keeps a boxed Chez vector. These helpers let the collection
 ;; dispatchers (count/seq/nth/ref-put!/aset/aclone) and java.util.Arrays work over
 ;; either backing. Chez has flvector? / make-flvector / flvector-ref / -set! / -length.
+;;
+;; CONVENTION: every ja-* helper takes the BACKING (the result of jolt-array-vec),
+;; NOT the jolt-array. Call sites read the backing out once — (let ((v (jolt-array-vec
+;; a))) …) — and then go through ja-len / ja-ref / ja-set! / ja->list / ja-copy /
+;; ja-equal? only. They must NOT call vector-length / vector-ref / vector-set! /
+;; vector->list / vector? on it. That rule is what makes the backing representation
+;; swappable in THIS FILE alone: adding a new backing kind means adding an arm to
+;; each helper below (plus na-make-backing / na-list->backing for construction), and
+;; nothing outside natives-array.ss has to change.
+;;
+;; Keep these small, non-recursive and closure-free — ja-ref/ja-set! are per-element
+;; on array traversal, so cp0 must be able to inline them at every call site.
 (define (na-fl-kind? k) (or (eq? k 'double) (eq? k 'float)))
 (define (ja-len v)     (if (flvector? v) (flvector-length v) (vector-length v)))
 ;; An out-of-range index on the generic aget/aset path throws the typed JVM
@@ -54,6 +67,12 @@
       (let* ((n (flvector-length v)) (r (make-flvector n 0.0)))
         (do ((i 0 (+ i 1))) ((= i n) r) (flvector-set! r i (flvector-ref v i))))
       (vector-copy v)))
+;; Element-wise equality of two backings (java.util.Arrays/equals). `equal?` already
+;; walks vectors, flvectors and bytevectors element-wise, so this is one call today —
+;; it exists so the comparison has a single home if backings ever stop being
+;; equal?-comparable across kinds (e.g. a byte-array on a bytevector would no longer
+;; compare equal? to an int-array on a vector holding the same numbers).
+(define (ja-equal? a b) (equal? a b))
 (define (na-make-backing n kind init)
   (if (na-fl-kind? kind)
       (make-flvector (exact n) (if (flonum? init) init (exact->inexact init)))
@@ -111,8 +130,8 @@
 ;; inbound half of the raw-bytes seam: every producer of a byte-array from raw bytes
 ;; — .getBytes, stream reads, Files/readAllBytes, Base64, FFI — funnels through here.
 (define (na-bv->bytearray bv)
-  (let* ((n (bytevector-length bv)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (bytevector-u8-ref bv i))))
+  (let* ((n (bytevector-length bv)) (v (na-make-backing n 'byte 0)))
+    (do ((i 0 (+ i 1))) ((= i n)) (ja-set! v i (na-u8->byte (bytevector-u8-ref bv i))))
     (make-jolt-array v 'byte)))
 ;; (byte-array n [init]) | (byte-array coll). Also coerces the host's OTHER byte
 ;; carrier — a Chez bytevector (what the charset encoders produce) — and a string's
@@ -126,8 +145,8 @@
 ;; jolt byte-array -> Chez bytevector (for String decode / utf8->string). The
 ;; outbound half: the #xff mask folds a signed element back to its raw byte.
 (define (na-bytearray->bv arr)
-  (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (bv (make-bytevector n)))
-    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bitwise-and (exact (vector-ref v i)) #xff)))
+  (let* ((v (jolt-array-vec arr)) (n (ja-len v)) (bv (make-bytevector n)))
+    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bitwise-and (exact (ja-ref v i)) #xff)))
     bv))
 (define (na-make-array a . rest)    ; (make-array len) | (make-array type len ...)
   (make-jolt-array (make-vector (exact (na-idx (if (number? a) a (car rest)))) jolt-nil) 'object))
@@ -208,9 +227,13 @@
 (define (na-aset-char arr i v)    (na-aset! arr i v))
 (define (na-aset-boolean arr i v) (na-aset! arr i v))
 (define (na-aset-byte arr i v)
-  (let ((bv (jolt-array-vec arr)) (j (exact (na-idx i))) (b (na-byte-of v)))
-    (ja-check bv j)
-    (vector-set! bv j b) b))
+  ;; Through the ja-* seam rather than a raw vector-set! on the backing, so a
+  ;; change of byte-array representation is contained to the seam. ja-set! does
+  ;; the ja-check itself. Returns the NARROWED byte, not the argument, so aset's
+  ;; result agrees with a following aget.
+  (let ((b (na-byte-of v)))
+    (ja-set! (jolt-array-vec arr) (exact (na-idx i)) b)
+    b))
 
 ;; --- coercions (identity on arrays; byte/short are masked scalar casts) ------
 (define (na-bytes x) (if (and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) x (na-byte-array x)))
@@ -284,6 +307,14 @@
 ;; dominant per-access cost in the hot loop. Non-fixnum indices (flonum/bignum/
 ;; ratio) keep the coercing path unchanged; out-of-range still raises via
 ;; flvector-ref's range check (the array bounds contract).
+;;
+;; REPRESENTATION DEPENDENCY (deliberate): jolt-flaget/jolt-flaset are the only
+;; expressions left in the tree that apply a vector primitive to a
+;; (jolt-array-vec ...) result. They bypass the ja-* seam on purpose — the whole
+;; point is to skip the flvector? test the seam would re-do. They are sound only
+;; because the numeric pass proved the ^doubles/^floats kind, so they are pinned
+;; to the FLVECTOR backing specifically and are unaffected by any change to the
+;; byte/object backing. If the flvector backing ever moves, fix these too.
 (define (jolt-flaget a i)
   (flvector-ref (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i)))))
 ;; unboxed write target for (aset ^doubles a i v): direct flvector-set!, returning
@@ -372,7 +403,7 @@
 ;; their layout. Lives here (not io.ss) because io.ss loads before byte-array.
 (define (jolt-io-copy src dst . _opts)
   (define (write-all! bytes)
-    (record-method-dispatch dst "write" (list->cseq (list bytes 0 (vector-length (jolt-array-vec bytes))))))
+    (record-method-dispatch dst "write" (list->cseq (list bytes 0 (ja-len (jolt-array-vec bytes))))))
   (cond
     ((or (bytevector? src) (string? src)
          (and (jolt-array? src) (eq? (jolt-array-kind src) 'byte)))

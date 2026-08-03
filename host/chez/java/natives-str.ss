@@ -363,7 +363,7 @@
            (dv (jolt-array-vec (arg 2))) (dst-begin (jolt->idx (arg 3))))
        (let loop ((i src-begin) (j dst-begin))
          (when (fx<? i src-end)
-           (vector-set! dv j (string-ref s i))
+           (ja-set! dv j (string-ref s i))
            (loop (fx+ i 1) (fx+ j 1)))))
      jolt-nil)
     ((string=? method "subSequence")

@@ -114,7 +114,9 @@
       (throw-jvm (quote IllegalArgumentException)
                  (string-append "jolt.ffi/" who ": expected byte-array"))))
 (define (ffi-check-array-range who v off len)
-  (let ((n (vector-length v)))
+  ;; v is the BACKING (ffi-byte-array-vector returns jolt-array-vec), so its
+  ;; length comes from the ja-* seam, not vector-length.
+  (let ((n (ja-len v)))
     ;; Keep the final check in subtraction form. Besides admitting the exact
     ;; empty tail, it never constructs the potentially huge sum off+len.
     (when (or (< off 0) (< len 0) (> off n) (> len (- n off)))
@@ -127,8 +129,9 @@
     (throw-jvm (quote NullPointerException)
                (string-append "jolt.ffi/" who ": null pointer"))))
 (define (ffi-read-array ptr n)
-  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (foreign-ref 'unsigned-8 p i))))
+  ;; the backing is built by natives-array.ss's constructor, not hand-rolled here.
+  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (na-make-backing n 'byte 0)))
+    (do ((i 0 (+ i 1))) ((= i n)) (ja-set! v i (na-u8->byte (foreign-ref 'unsigned-8 p i))))
     (make-jolt-array v 'byte)))
 (define (ffi-read-array! ptr len dest dest-off)
   (let* ((v (ffi-byte-array-vector "read-array!" dest))
@@ -138,14 +141,14 @@
     (let ((p (jnum->exact ptr)))
       (ffi-check-transfer-pointer "read-array!" p n)
       (do ((i 0 (+ i 1))) ((= i n))
-        (vector-set! v (+ off i) (na-u8->byte (foreign-ref 'unsigned-8 p i))))
+        (ja-set! v (+ off i) (na-u8->byte (foreign-ref 'unsigned-8 p i))))
       n)))
 (define ffi-write-array
   (case-lambda
     ((ptr arr)                          ; whole-array form (unchanged)
-     (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
+     (let* ((v (jolt-array-vec arr)) (n (ja-len v)) (p (jnum->exact ptr)))
        (do ((i 0 (+ i 1))) ((= i n))
-         (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
+         (foreign-set! 'unsigned-8 p i (bitwise-and (exact (ja-ref v i)) #xff)))
        n))
     ((ptr src src-off len)              ; source sub-range form
      (let* ((v (ffi-byte-array-vector "write-array" src))
@@ -155,7 +158,7 @@
        (let ((p (jnum->exact ptr)))
          (ffi-check-transfer-pointer "write-array" p n)
          (do ((i 0 (+ i 1))) ((= i n))
-           (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v (+ off i))) #xff)))
+           (foreign-set! 'unsigned-8 p i (bitwise-and (exact (ja-ref v (+ off i))) #xff)))
          n)))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-array!" ffi-read-array!)
@@ -201,13 +204,16 @@
 (define (ffi-current-byte-array-loans)
   (let ((cell (ffi-byte-array-loan-cell)) (id (get-thread-id)))
     (if (and (pair? cell) (eqv? (car cell) id)) (cdr cell) '())))
-(define (ffi-copy-vector-to-bytevector! src start tmp cnt)
+;; src / dest are byte-array BACKINGS, so both halves of the loan copy go through
+;; the ja-* seam. Named -backing- rather than -vector- for that reason: what is on
+;; the other side of the bytevector is natives-array.ss's business.
+(define (ffi-copy-backing-to-bytevector! src start tmp cnt)
   (do ((i 0 (+ i 1))) ((= i cnt))
     (bytevector-u8-set! tmp i
-                        (bitwise-and (exact (vector-ref src (+ start i))) #xff))))
-(define (ffi-copy-bytevector-to-vector! tmp dest start cnt)
+                        (bitwise-and (exact (ja-ref src (+ start i))) #xff))))
+(define (ffi-copy-bytevector-to-backing! tmp dest start cnt)
   (do ((i 0 (+ i 1))) ((= i cnt))
-    (vector-set! dest (+ start i) (na-u8->byte (bytevector-u8-ref tmp i)))))
+    (ja-set! dest (+ start i) (na-u8->byte (bytevector-u8-ref tmp i)))))
 ;; who names the public entry for error messages; `proc` is a Scheme callback
 ;; receiving (pointer validated-length) — distinct from the jolt fn the public
 ;; form wraps via jolt-invoke2. Exposed so the gate can exercise host exceptions
@@ -225,7 +231,7 @@
                                 ": nested loan of the same byte-array")))
     ;; All validation precedes the temporary allocation and lock.
     (let ((tmp (make-bytevector cnt 0)) (retired? #f))
-      (ffi-copy-vector-to-bytevector! v start tmp cnt)
+      (ffi-copy-backing-to-bytevector! v start tmp cnt)
       (lock-object tmp)
       (dynamic-wind
         (lambda ()
@@ -244,7 +250,7 @@
           (set! retired? #t)
           (dynamic-wind
             void
-            (lambda () (ffi-copy-bytevector-to-vector! tmp v start cnt))
+            (lambda () (ffi-copy-bytevector-to-backing! tmp v start cnt))
             (lambda () (unlock-object tmp))))))))
 (define (ffi-with-byte-array-pointer-range arr off len f)
   (ffi-with-scoped-byte-array-pointer
@@ -254,7 +260,7 @@
   (case-lambda
     ((arr f)
      (let ((v (ffi-byte-array-vector "with-byte-array-pointer" arr)))
-       (ffi-with-byte-array-pointer-range arr 0 (vector-length v) f)))
+       (ffi-with-byte-array-pointer-range arr 0 (ja-len v) f)))
     ((arr off len f)
      (ffi-with-byte-array-pointer-range arr off len f))))
 (def-var! "jolt.ffi" "with-byte-array-pointer" ffi-with-byte-array-pointer)

@@ -11,24 +11,27 @@
 (define (bb-limit b) (vector-ref (jhost-state b) 2))
 (define (bb-pos! b n) (vector-set! (jhost-state b) 1 n))
 (define (bb-limit! b n) (vector-set! (jhost-state b) 2 n))
-(define (bb-capacity b) (vector-length (jolt-array-vec (bb-backing b))))
+;; The backing byte-array is reached ONLY through natives-array.ss's ja-* seam
+;; (ja-len / ja-ref / ja-set!) and built ONLY through na-make-backing, so this file
+;; does not depend on how a byte-array stores its bytes.
+(define (bb-capacity b) (ja-len (jolt-array-vec (bb-backing b))))
 
 ;; (ByteBuffer/wrap ba) | (ByteBuffer/wrap ba off len) | (ByteBuffer/allocate n)
 (register-class-statics! "ByteBuffer"
   (list
     (cons "wrap" (lambda (ba . rest)
-                   (let ((cap (vector-length (jolt-array-vec ba))))
+                   (let ((cap (ja-len (jolt-array-vec ba))))
                      (if (pair? rest)
                          (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
                            (make-byte-buffer ba off (+ off len)))
                          (make-byte-buffer ba 0 cap)))))
     (cons "allocate" (lambda (n)
                        (let ((cap (jnum->exact n)))
-                         (make-byte-buffer (make-jolt-array (make-vector cap 0) 'byte) 0 cap))))
+                         (make-byte-buffer (make-jolt-array (na-make-backing cap 'byte 0) 'byte) 0 cap))))
     ;; jolt has one heap; a direct buffer is just a buffer here.
     (cons "allocateDirect" (lambda (n)
                              (let ((cap (jnum->exact n)))
-                               (make-byte-buffer (make-jolt-array (make-vector cap 0) 'byte) 0 cap))))))
+                               (make-byte-buffer (make-jolt-array (na-make-backing cap 'byte 0) 'byte) 0 cap))))))
 
 (register-host-methods! "byte-buffer"
   (list
@@ -49,8 +52,8 @@
     ;; (read paths — hexdumps, decoders — are unaffected).
     (cons "slice" (lambda (self)
                     (let* ((src (jolt-array-vec (bb-backing self))) (p (bb-pos self))
-                           (n (- (bb-limit self) p)) (nv (make-vector n 0)))
-                      (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! nv i (vector-ref src (+ p i))))
+                           (n (- (bb-limit self) p)) (nv (na-make-backing n 'byte 0)))
+                      (do ((i 0 (fx+ i 1))) ((fx=? i n)) (ja-set! nv i (ja-ref src (+ p i))))
                       (make-byte-buffer (make-jolt-array nv 'byte) 0 n))))
     (cons "rewind" (lambda (self) (bb-pos! self 0) self))
     (cons "flip" (lambda (self) (bb-limit! self (bb-pos self)) (bb-pos! self 0) self))
@@ -66,16 +69,16 @@
                        (let* ((sv (jolt-array-vec (bb-backing src))) (sp (bb-pos src))
                               (n (- (bb-limit src) sp)))
                          (do ((i 0 (fx+ i 1))) ((fx=? i n))
-                           (vector-set! dv (+ dp i) (vector-ref sv (+ sp i))))
+                           (ja-set! dv (+ dp i) (ja-ref sv (+ sp i))))
                          (bb-pos! src (bb-limit src)) (bb-pos! self (+ dp n))))
                       ((jolt-array? src)
-                       (let* ((sv (jolt-array-vec src)) (n (vector-length sv)))
+                       (let* ((sv (jolt-array-vec src)) (n (ja-len sv)))
                          (do ((i 0 (fx+ i 1))) ((fx=? i n))
-                           (vector-set! dv (+ dp i) (vector-ref sv i)))
+                           (ja-set! dv (+ dp i) (ja-ref sv i)))
                          (bb-pos! self (+ dp n))))
                       ;; a lone byte: narrowed like any byte-array store, so the
                       ;; backing stays in -128..127 whichever form the caller used.
-                      (else (vector-set! dv dp (na-byte-of src)) (bb-pos! self (+ dp 1))))
+                      (else (ja-set! dv dp (na-byte-of src)) (bb-pos! self (+ dp 1))))
                     self)))
     ;; get(): relative single byte at position, advancing it.
     ;; get(int i): absolute single byte at index i (position unchanged).
@@ -84,16 +87,16 @@
                   (let ((src (jolt-array-vec (bb-backing self))))
                     (cond
                       ((null? args)
-                       (let ((p (bb-pos self))) (bb-pos! self (+ p 1)) (->num (vector-ref src p))))
+                       (let ((p (bb-pos self))) (bb-pos! self (+ p 1)) (->num (ja-ref src p))))
                       ((number? (car args))
-                       (->num (vector-ref src (jnum->exact (car args)))))
+                       (->num (ja-ref src (jnum->exact (car args)))))
                       (else
                        (let* ((dst (car args)) (rest (cdr args)) (dv (jolt-array-vec dst))
                               (off (if (pair? rest) (jnum->exact (car rest)) 0))
-                              (len (if (and (pair? rest) (pair? (cdr rest))) (jnum->exact (cadr rest)) (vector-length dv)))
+                              (len (if (and (pair? rest) (pair? (cdr rest))) (jnum->exact (cadr rest)) (ja-len dv)))
                               (p (bb-pos self)))
                          (do ((i 0 (+ i 1))) ((= i len))
-                           (vector-set! dv (+ off i) (vector-ref src (+ p i))))
+                           (ja-set! dv (+ off i) (ja-ref src (+ p i))))
                          (bb-pos! self (+ p len))
                          self))))))))
 
