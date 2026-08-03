@@ -140,3 +140,37 @@
 (def-var! "jolt.perf" "gc-cpu-ms" perf-gc-cpu-ms)
 (def-var! "jolt.perf" "cpu-ms" perf-cpu-ms)
 (def-var! "jolt.perf" "collect!" perf-collect!)
+
+;; --- jolt.perf: compiler introspection ---------------------------------------
+;;
+;; Whether a jolt expression became a machine primitive or stayed a generic
+;; dispatch is a static fact, readable off the compiler output — it does not
+;; need benchmarking. Chez's cp0 output distinguishes them plainly:
+;;
+;;   (bitwise-and x 255) -> (if (fixnum? x) (fxand 255 x) (bitwise-and 255 x))
+;;   (fxand x 255)       -> (fxand 255 x)
+;;
+;; The first carries a type test on every call; the second is one instruction.
+;; Reading that is how a claim like "this path is generic" gets settled before
+;; anyone writes a benchmark.
+;;
+;; emitted-scheme returns what the jolt backend produced for a form;
+;; optimized-scheme returns it after Chez's cp0, which is where inlining and
+;; primitive selection have happened. print-gensym is disabled so bindings read
+;; as `x` rather than `#{x a6asprai2hcqbmswpvb4wleny-0}`.
+;;
+;; NOTE: both ANALYZE the form, which has the ordinary analysis side effects —
+;; a def interns its var, an ns form switches namespace. Pass an expression, not
+;; a program, unless those effects are wanted.
+(define (perf-ns-arg ns) (if (string? ns) ns (chez-current-ns)))
+(define (perf-emitted-scheme form ns)
+  (jolt-analyze-emit-form form (perf-ns-arg ns)))
+(define (perf-optimized-scheme form ns)
+  (let* ((scm (jolt-analyze-emit-form form (perf-ns-arg ns)))
+         (datum (read (open-input-string scm))))
+    (parameterize ((print-gensym #f))
+      (let ((op (open-output-string)))
+        (write (expand/optimize datum) op)
+        (get-output-string op)))))
+(def-var! "jolt.perf" "emitted-scheme" perf-emitted-scheme)
+(def-var! "jolt.perf" "optimized-scheme" perf-optimized-scheme)
