@@ -656,21 +656,85 @@
 
 ;; jolt.ffi/__cfn: the low-level foreign-function form a jolt library
 ;; uses (via the jolt.ffi/foreign-fn macro) to bind native code. Shape:
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)            ; non-blocking
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)  ; may block
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)             ; non-blocking
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)   ; may block
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype {opts})      ; options map
 ;; The C symbol is a string literal and the types are literal keywords, read here
 ;; at compile time; the Chez back end lowers it to a real `foreign-procedure`
 ;; (typed marshaling, no runtime eval). A :blocking call is emitted __collect_safe
 ;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
 ;; must not pin the stop-the-world collector. A leaf IR node.
+;;
+;; Normalize the optional form to the flags understood by the back end. Direct
+;; __cfn calls and the public macros share this fail-closed validation: keys
+;; must be unqualified keywords, :blocking/:capture-native-error take literal
+;; Booleans, :varargs-after takes a positive literal integer, and unknown keys
+;; are rejected rather than ignored.
+(defn- ffi-option
+  ([]
+   {:blocking false :capture-native-error false :varargs-after nil})
+  ([opt]
+   (cond
+     (and (form-keyword? opt)
+          (nil? (namespace opt))
+          (= "blocking" (name opt)))
+     {:blocking true :capture-native-error false :varargs-after nil}
+
+     (form-map? opt)
+     (reduce
+       (fn [res pr]
+         (let [k (nth pr 0) v (nth pr 1)]
+           (when-not (and (form-keyword? k) (nil? (namespace k)))
+             (throw (str "jolt.ffi: option key must be an unqualified keyword, got: " k)))
+           (let [kn (name k)]
+             (cond
+               (= kn "varargs-after")
+               (do (when-not (and (integer? v) (pos? v))
+                     (throw (str "jolt.ffi: option :varargs-after must be a positive literal integer, got: " v)))
+                   (assoc res :varargs-after v))
+               (or (= kn "blocking") (= kn "capture-native-error"))
+               (do (when-not (or (true? v) (false? v))
+                     (throw (str "jolt.ffi: option :" kn " must be a literal Boolean, got: " v)))
+                   (assoc res
+                          (if (= kn "blocking") :blocking :capture-native-error)
+                          v))
+               :else
+               (throw (str "jolt.ffi: unknown option :" kn))))))
+       {:blocking false :capture-native-error false :varargs-after nil}
+       (form-map-pairs opt))
+
+     :else
+     (throw (str "jolt.ffi: option must be :blocking or an options map, got: " opt)))))
+
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
-    (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking])")))
-  {:op :ffi-fn
-   :csym (nth items 1)
-   :argtypes (mapv name (form-vec-items (nth items 2)))
-   :rettype (name (nth items 3))
-   :blocking (and (= 5 (count items)) (= "blocking" (name (nth items 4))))})
+    (throw (str "jolt.ffi/foreign-fn expects "
+                "(foreign-fn \"sym\" [argtypes] rettype [:blocking | {opts}])")))
+  (let [rettype (name (nth items 3))
+        opt (if (= 5 (count items))
+              (ffi-option (nth items 4))
+              (ffi-option))
+        argtypes (mapv name (form-vec-items (nth items 2)))
+        blocking (:blocking opt)
+        capture (:capture-native-error opt)
+        varargs-after (:varargs-after opt)]
+    (when (and capture (= rettype "void"))
+      (throw (str "jolt.ffi: :capture-native-error is not supported for :void "
+                  "(no stable native result to pair with the error code)")))
+    ;; :varargs-after n is the number of declared fixed C params before "...", so
+    ;; it cannot exceed the declared argtype count. Validated here at analyze
+    ;; time, before any native symbol is resolved (fail closed).
+    (when (and varargs-after (> varargs-after (count argtypes)))
+      (throw (str "jolt.ffi: :varargs-after " varargs-after
+                  " must not exceed the declared argument count "
+                  (count argtypes))))
+    {:op :ffi-fn
+     :csym (nth items 1)
+     :argtypes argtypes
+     :rettype rettype
+     :blocking blocking
+     :capture-native-error capture
+     :varargs-after varargs-after}))
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
 ;; macro) — the inverse of __cfn. It wraps a jolt fn as a C-callable function

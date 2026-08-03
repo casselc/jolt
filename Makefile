@@ -56,11 +56,12 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
+  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr futuresimhook grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
-  jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
-  shakesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
+  jolt jolt-debug jolt-release jolt-sim joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
+  narrow numeric numwp oparity ordinaryfuturenosim pathfacts pic protoret printperf remint sci selectedchez selfhost \
+  shakelocal shakesmoke simcontrolleratomic simcontrollerimage simffiemit simimagesmoke smoke \
+  staticnativesmoke targetfacts test testbin transient unit unitcontext \
   values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
@@ -102,7 +103,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit grenadine mvnhttp depssmoke depsunit smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
+ci: submodules values corpus unit selectedchez grenadine mvnhttp depssmoke depsunit smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi targetfacts pathfacts ordinaryfuturenosim futuresimhook simcontrolleratomic simffiemit simcontrollerimage transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke simimagesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -121,6 +122,10 @@ corpus:
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
 
+# Launcher/compiler selection, exact child identity, and fresh-compile witness.
+selectedchez:
+	@CHEZ="$(CHEZ)" sh test/chez/selected-chez-test.sh
+
 # Real-CLI smoke over bin/jolt.
 # The CLI and build gates spawn a jolt process per case; a prebuilt binary boots
 # ~10x faster than script mode (0.14s vs 1.5s) and builds an app ~5x faster, so
@@ -136,7 +141,7 @@ TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src ve
 testbin:
 	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
 	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
-	  $(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt; \
+	  "$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt; \
 	else \
 	  echo "testbin: target/release/jolt up to date"; \
 	fi
@@ -219,9 +224,22 @@ grenadine:
 # JOLT_CROSS_TARGET (optional) cross-compiles jolt for another Chez machine — it is
 # passed as build-jolt.ss's 3rd arg and needs $JOLT_TARGET_PACK (empty = native).
 jolt-release:
-	@$(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
+	@"$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
 jolt-debug:
-	@$(CHEZ) --script host/chez/build-jolt.ss debug target/debug/jolt
+	@"$(CHEZ)" --script host/chez/build-jolt.ss debug target/debug/jolt
+# A release-optimized compiler/runtime image with a private simulation overlay.
+# The overlay is absent from release/debug. It carries the complete prerelease
+# ABI 6 future/clock/FFI controller and compile-time FFI instrumentation flavor.
+jolt-sim:
+	@"$(CHEZ)" --script host/chez/build-jolt.ss sim target/sim/jolt $(JOLT_CROSS_TARGET)
+
+# Build one unchanged app through release and sim compilers. The runtime overlay
+# must be the only pre-fingerprint source difference, and the shared runtime
+# cache must retain distinct content-addressed entries for the two flavors.
+simimagesmoke: testbin jolt-sim
+	@JOLT_NORMAL=target/release/jolt JOLT_SIM=target/sim/jolt \
+	  sh test/chez/sim-image-profile-smoke.sh
+
 # Re-mint the seed first so the embedded compiler image is current, then both builds.
 jolt: selfhost jolt-release jolt-debug
 	@echo "OK: target/release/jolt and target/debug/jolt built"
@@ -244,6 +262,48 @@ cts: testbin
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+	@$(CHEZ) --script test/chez/ffi-ranged-transfer-test.ss
+	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
+
+# jolt.host/target: the exact fail-closed (os arch abi) classifier stays in
+# lockstep with rt.ss's native-error convention macro, and the current host's
+# System/Runtime surface (os.name/os.arch/separators/processors) projects
+# coherently from the same target facts.
+targetfacts:
+	@$(CHEZ) --script test/chez/target-descriptor-test.ss
+
+# Pure POSIX/Windows absolute, rooted, and project-resolution contracts.
+pathfacts:
+	@$(CHEZ) --script test/chez/path-contract-test.ss
+
+# The ordinary runtime carries no simulator hook state or branch.
+ordinaryfuturenosim:
+	@$(CHEZ) --script test/chez/ordinary-future-no-sim-hook-test.ss
+
+# Complete prerelease ABI 6 controller loaded from source: one atomic composite
+# future/clock/FFI install/restore stack, exact descriptor registry, fail-closed
+# projection, scoped proceed, and staged signed-byte loan cleanup.
+simcontrolleratomic:
+	@$(CHEZ) --script test/chez/sim-controller-atomic-test.ss
+
+# End-to-end sim compiler/image witness: typed scalar descriptor interception,
+# missing-symbol fail-closed modeling, atomic native-error proceed, and central
+# System/nanoTime control from ordinary Jolt source.
+simcontrollerimage: jolt-sim
+	@target/sim/jolt run test/chez/sim-controller-image-test.clj
+	@JOLT_SIM=target/sim/jolt sh test/chez/sim-runtime-eval-built-test.sh
+
+# Compiler-source gate: only a sim compilation unit emits the exact typed-call
+# hook branch; ordinary output contains no simulation symbol reference.
+simffiemit:
+	@$(CHEZ) --script test/chez/sim-ffi-emit-test.ss
+
+# Load the private sim overlay over the source runtime, then exercise unchanged
+# ordinary future code through its start/settlement/worker-ownership boundaries.
+futuresimhook:
+	@$(CHEZ) --script test/chez/future-sim-hook-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
@@ -421,7 +481,7 @@ remint:
 # Precompile the runtime to target/dev/flat.so so dev bin/jolt boots ~10x faster
 # (loads the .so instead of compiling ~50 .ss files from source every invocation).
 devboot: submodules
-	@$(CHEZ) --script host/chez/make-devboot.ss
+	@"$(CHEZ)" --script host/chez/make-devboot.ss
 
 # Precompile the gate boot preamble to target/dev/gate.so so a pass gate boots in
 # ~0.2s instead of ~1.5s (it spends nearly all of that loading the same six
@@ -430,7 +490,7 @@ devboot: submodules
 # otherwise, so nothing depends on this target and CI is unaffected. Worth it
 # when iterating on one pass gate; `make ci` runs them in parallel anyway.
 gateboot: submodules
-	@$(CHEZ) --script host/chez/make-gateboot.ss
+	@"$(CHEZ)" --script host/chez/make-gateboot.ss
 
 # Smoke test: the gate boot image's staleness predicate. Drives
 # gate-boot-image-fresh? over synthetic input lists, so it boots no runtime,

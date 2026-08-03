@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An opt-in simulation compiler/runtime profile.** `make jolt-sim` builds a
+  separate image whose private `jolt.internal.sim` ABI atomically installs
+  future-lifecycle, scalar FFI, and monotonic-clock controllers. Sim-compiled
+  calls can be modeled, observed, or selectively proceeded to the real native
+  branch with scoped, single-use authority; ordinary release/debug images and
+  ordinary compilation units retain their existing paths. This prerelease
+  surface is intended for deterministic schedulers and adversarial library
+  tests, not as a compatibility-stable public runtime API yet.
+
+- **Variadic foreign bindings declare their fixed-argument boundary.**
+  `jolt.ffi/foreign-fn` and `defcfn` accept
+  `{:varargs-after n}`, where `n` is the positive number of declared fixed C
+  parameters before `...`. The boundary composes with collect-safe calls and
+  atomic native-error capture and lowers to Chez's `__varargs_after`
+  convention, which is required on targets whose variadic and fixed calling
+  conventions differ. Callers declare already-promoted C ABI types for
+  arguments after the boundary.
+
+- **Scoped in-out byte-array pointer loans for `jolt.ffi`.**
+  `with-byte-array-pointer` lends a stable pointer to a temporary native-octet
+  copy of a whole signed byte array or one validated range, then copies native
+  changes back on normal, exceptional, and nonlocal exit. The pointer is valid
+  only during the synchronous callback and is always unlocked when that scope
+  retires. Same-array nesting on one owner thread is rejected; callers must also
+  prevent overlapping loans or access to the same array across threads, even
+  for disjoint ranges, because independent snapshot copy-back can lose updates.
+  Captured continuations cannot re-enter a retired loan, and the helper itself
+  captures no native error.
+
+- **Ranged byte-array transfers for `jolt.ffi`.** `read-array!` copies an exact
+  native byte range into an existing signed byte array, while the four-argument
+  `write-array` form copies an exact source window without staging another
+  array. Both validate the byte-array kind, subtraction-safe bounds, and null
+  pointer rules before native access or destination mutation; zero-length
+  transfers at an array's exact tail remain valid and return zero. Existing
+  whole-array transfers and signed-byte/raw-octet conversion remain unchanged.
+
+- **Atomic native-error capture for `jolt.ffi`.** `foreign-fn` and `defcfn`
+  accept `{:capture-native-error true}` and return `[native-result error-code]`,
+  capturing POSIX `errno` or Windows `GetLastError` in the foreign-call return
+  path before cleanup or collector reactivation can overwrite it. It composes
+  with `{:blocking true}`; omitted/false capture keeps the existing scalar
+  result, and unsupported targets or malformed options fail closed.
+
+- **`jolt.host/target`, an exact fail-closed compiler-target descriptor.**
+  Reports `:os`, `:arch`, `:abi`, `:libc`, `:endian`, `:pointer-bits`,
+  `:file-separator`, `:path-separator`, and `:processors`. The compiler target's
+  OS, architecture, and ABI come from an exact allowlist checked against
+  `rt.ss`'s native-error convention selection; an unrecognized machine tuple
+  fails closed to `:unknown` instead of guessing, while independently measurable
+  runtime facts remain available. `System`'s `os.name`, `os.arch`, separators,
+  and properties project from the same target facts. Optional native-symbol
+  resolution also selects its Windows-safe path from the compiler target,
+  including Windows ARM64, so cross-images cannot bake POSIX relocations into
+  Windows output.
+
+### Fixed
+
+- **Windows project, dependency, temporary, and build-output paths no longer
+  acquire a duplicate project prefix.** Drive-absolute and UNC paths pass
+  through unchanged, root-relative paths inherit the project drive, and
+  drive-relative paths fail closed instead of resolving against the wrong
+  drive. `java.io.File`, dependency roots, and CLI build outputs share the same
+  target-aware contract; complete Windows `java.nio.file.Path` value algebra
+  remains a separate compatibility slice.
+
+- **Builds retain the explicitly selected Chez toolchain.** The launcher
+  exports the resolved compiler as `JOLT_CHEZ`; isolated compile passes, seed
+  remints, self-host checks, and smoke gates reuse it instead of rediscovering
+  another `chez` from `PATH`.
+  Relative selections remain stable across the launcher's directory change,
+  and shell metacharacters in executable paths stay literal. A child whose
+  version or host machine differs from the running Chez—or whose identity
+  cannot be probed successfully—now fails before any output is linked,
+  preventing mixed boot, FASL, and kernel files.
+
 ## [0.5.20] - 2026-08-02
 
 A backtrace could show frames from calls that had already finished, and in the
@@ -231,7 +309,6 @@ colliding UUIDs, and the UUIDs were guessable even once they were unique.
   exception class the way the JVM inherits them from `Throwable`, which also filled
   in `.getLocalizedMessage`, `.getSuppressed` and `.fillInStackTrace` — each of
   which existed on one kind of throwable and not the other.
-
 ## [0.5.17] - 2026-08-01
 
 Gaps and wrong answers on the `java.lang.String` surface, found by probing it after

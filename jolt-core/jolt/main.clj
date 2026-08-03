@@ -463,6 +463,25 @@
                                      cands (if (string? c) [c] (vec c))]
                                  (into [(if (:optional spec) "opt" "req")] cands))))))))
 
+(defn- build-output-path
+  "Resolve an optional build output against the project without touching disk."
+  [pdir mode project-name output]
+  (if (nil? output)
+    (str pdir "/target/" (if (= mode "dev") "debug" "release") "/" project-name)
+    (jolt.host/resolve-project-path pdir output)))
+
+(defn- project-basename
+  "The final non-root path segment under the running target's path grammar."
+  [pdir entry]
+  (let [windows? (= :windows (:os (jolt.host/target)))
+        native-path (if windows? (str/replace pdir "\\" "/") pdir)
+        segments (remove str/blank? (str/split native-path #"/"))
+        segment (last segments)
+        drive-only? (and windows? (= 2 (count segment)) (= \: (nth segment 1)))]
+    (if (or (str/blank? segment) (= "." segment) drive-only?)
+      (first (str/split entry #"\."))
+      segment)))
+
 (defn- cmd-build [more]
   (let [{:keys [project-paths embed-dirs build] :as resolved}
         (resolve-current)]
@@ -496,13 +515,8 @@
       ;; the driver creates sits next to it, so it lands under the same target dir.
       ;; An explicit -o is honored: absolute as-is, relative against the project.
       (let [pdir (project-dir)
-            proj (let [seg (last (str/split pdir #"/"))]
-                   (if (or (str/blank? seg) (= "." seg)) (first (str/split entry #"\.")) seg))
-            out (let [o (:out opts)]
-                  (cond
-                    (nil? o) (str pdir "/target/" (if (= mode "dev") "debug" "release") "/" proj)
-                    (str/starts-with? o "/") o
-                    :else (str pdir "/" o)))
+            proj (project-basename pdir entry)
+            out (build-output-path pdir mode proj (:out opts))
             ;; :jolt/native libs with a :static archive are cc-linked into the
             ;; binary by default; --dynamic (or deps.edn :jolt/build {:dynamic-natives
             ;; true}) keeps the old behavior — load a shared object at runtime.

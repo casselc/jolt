@@ -10,8 +10,12 @@ cd "$root"
 # scheme.h) and a C compiler, same as build-smoke.sh. A distro chezscheme package
 # ships neither, so skip there (CI included).
 csv="$JOLT_CHEZ_CSV"
+if [ -n "${JOLT_CHEZ:-}" ]; then
+  chez_bin="$(command -v "$JOLT_CHEZ" 2>/dev/null || true)"
+else
+  chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || true)"
+fi
 if [ -z "$csv" ]; then
-  chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)"
   if [ -n "$chez_bin" ]; then
     base="$(cd "$(dirname "$chez_bin")/.." 2>/dev/null && pwd)"
     for d in "$base"/lib/csv*/*/; do
@@ -19,11 +23,13 @@ if [ -z "$csv" ]; then
     done
   fi
 fi
-if ! command -v cc >/dev/null 2>&1 || [ -z "$csv" ] || [ ! -f "$csv/scheme.h" ] || [ ! -f "$csv/libkernel.a" ]; then
+if [ -z "$chez_bin" ] || ! command -v cc >/dev/null 2>&1 ||
+   [ -z "$csv" ] || [ ! -f "$csv/scheme.h" ] || [ ! -f "$csv/libkernel.a" ]; then
   echo "jolt self-build smoke: skipped (Chez kernel dev files or C compiler not available)"
   exit 0
 fi
 export JOLT_CHEZ_CSV="$csv"
+export JOLT_CHEZ="$chez_bin"
 
 # 1. Build jolt (debug profile — faster; the self-contained app-build mechanism
 # is identical to release, only Chez compile settings differ).

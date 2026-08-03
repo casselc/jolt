@@ -47,9 +47,19 @@
 (define jb-profile (if (pair? jb-args) (car jb-args) "release"))
 (define jb-out (if (and (pair? jb-args) (pair? (cdr jb-args))) (cadr jb-args)
                    (string-append "target/" jb-profile "/jolt")))
-(define jb-release? (string=? jb-profile "release"))
+(define jb-sim? (string=? jb-profile "sim"))
+(define jb-release? (or (string=? jb-profile "release") jb-sim?))
 (unless (or jb-release? (string=? jb-profile "debug"))
-  (error 'build-jolt "profile must be \"release\" or \"debug\"" jb-profile))
+  (error 'build-jolt "profile must be \"release\", \"debug\", or \"sim\"" jb-profile))
+
+;; Spliced only into the isolated sim launcher's scheme-start. This arms the
+;; current compiler unit before `run`, `-e`, or `build` can compile user code;
+;; emit-image.ss reapplies it to each fresh AOT unit. The ordinary launcher has
+;; no corresponding runtime branch or controller symbol reference.
+(define jb-sim-init-form
+  (if jb-sim?
+      "    ((var-deref \"jolt.backend-scheme\" \"set-sim-instrument!\") #t)\n"
+      ""))
 
 ;; Cross-compilation: an optional 3rd arg is the target Chez machine, and the
 ;; target pack comes from $JOLT_TARGET_PACK — cross-builds jolt itself for
@@ -131,6 +141,10 @@
     (for-each (lambda (entry) (when (string? entry) (walk (bld-load-path entry))))
               bld-runtime-manifest)
     (for-each (lambda (kv) (walk (bld-load-path (cdr kv)))) bld-tagged-loads)
+    ;; The sim overlay stays outside the ordinary manifest, but a distributed
+    ;; sim compiler must embed it so its own `jolt build` can inline the same
+    ;; overlay without repository source on disk.
+    (when jb-sim? (walk "host/chez/sim/runtime.ss"))
     (reverse order)))
 
 (define (jb-emit-runtime-embeds out)
@@ -177,7 +191,7 @@
 (scheme-start
   (lambda args
     (set-source-roots! " (ldr-install-roots-str) ")
-    ;; JOLT_TRACE at RUNTIME (the env is unset at heap-build), before any app ns
+" jb-sim-init-form "    ;; JOLT_TRACE at RUNTIME (the env is unset at heap-build), before any app ns
     ;; compiles, so a `-M:run` traces the app's own code.
     (jolt-trace-init-from-env!)
     ;; shared dispatch (cli-core.ss, inlined via the runtime manifest): the -e
@@ -257,6 +271,12 @@
                                  (ei-str-lit jb-version) ")\n"))
   ;; full runtime + compiler image: keep the compiler (jolt evals at runtime).
   (bld-emit-runtime out #f #f)
+  ;; Only the sim compiler carries this overlay. Keep it outside the ordinary
+  ;; runtime manifest so release/debug images and source-mode Jolt cannot load
+  ;; simulation state accidentally.
+  (when jb-sim?
+    (put-string out "\n;; === simulation-only runtime overlay ===\n")
+    (bld-inline-line "(load \"host/chez/sim/runtime.ss\")" out 0))
   ;; The build subsystem (build.ss + emit-image.ss + dce.ss, fully inlined) and the
   ;; runtime .ss source embeds it reads are needed ONLY by `jolt build`. As eager
   ;; top-level forms they cost ~45ms at EVERY startup (build.ss defines ~18ms, the
@@ -356,7 +376,8 @@
         (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
         (ei-str-lit jb-flat-so) ")\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'")))
+  (bld-system (string-append
+                (bld-sh-quote bld-chez) " --script " (bld-sh-quote cs))))
 
 ;; --- 3. embed boots/stub as C arrays + cc-link ------------------------------
 ;; xxd a file into header H and rename its symbol to NAME / NAME_len.

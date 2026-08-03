@@ -15,34 +15,51 @@
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 export JOLT_PWD="${JOLT_PWD:-$PWD}"
 
-# Identify the Chez Scheme executable. $JOLT_CHEZ is authoritative and is how the
-# Makefile hands down the one it selected — the same interpreter that mints the
-# seed and compiles target/dev/flat.so. Without it the gate can straddle two Chez
-# installs, because make provisions its own when the one on PATH is the wrong
-# version: source mode then dies on whichever primitive the older one lacks
-# ("variable flvector? is not bound"), and after `make devboot` it dies on
-# "incompatible fasl-object version" instead, since a fasl only loads in the Chez
-# that wrote it.
-if [ -z "${JOLT_CHEZ:-}" ]; then
-  while read -r JOLT_CHEZ
-  do
-      if [ `which ${JOLT_CHEZ}` ]
-      then
-  	break;
-      fi
-  done <<EOF
-chez
-chezscheme
-EOF
-
-  # If we failed to find one, whinge and exit.
-  if [ ! `which ${JOLT_CHEZ}` ]
-  then
-      echo "No valid Chez Scheme executable found: please install Chez Scheme."
-      exit 1
-  fi
+# Identify the Chez executable. Official/source installs commonly expose
+# `scheme`, while some distributions and CI shims use `chez` or `chezscheme`.
+# An explicit $JOLT_CHEZ remains authoritative so source execution, fresh
+# compile passes, boot files, and the linked kernel cannot straddle installs.
+CHEZ=
+if [ -n "${JOLT_CHEZ:-}" ]
+then
+    CHEZ="$(command -v "$JOLT_CHEZ" 2>/dev/null || true)"
+    if [ -z "$CHEZ" ]
+    then
+        echo "JOLT_CHEZ does not name an executable: $JOLT_CHEZ"
+        exit 1
+    fi
+else
+    for candidate in chez chezscheme scheme
+    do
+        if command -v "$candidate" >/dev/null 2>&1
+        then
+            CHEZ="$(command -v "$candidate")"
+            break
+        fi
+    done
 fi
-CHEZ="$JOLT_CHEZ"
+
+if [ -z "$CHEZ" ]
+then
+    echo "No valid Chez Scheme executable found: please install Chez Scheme."
+    exit 1
+fi
+
+# `command -v ./scheme` is allowed to return the same relative spelling.  The
+# launcher changes to the jolt checkout below, so make that path stable first.
+# Preserve native Windows drive/UNC spellings: Git-for-Windows sh can execute
+# them directly, and treating `C:\...` as a POSIX relative path corrupts it.
+case "$CHEZ" in
+    /*|[A-Za-z]:[\\/]*|\\\\*) ;;
+    *)
+        CHEZ_DIR="$(CDPATH= cd -- "$(dirname -- "$CHEZ")" 2>/dev/null && pwd -P)" || {
+            echo "Cannot resolve selected Chez executable: $CHEZ"
+            exit 1
+        }
+        CHEZ="$CHEZ_DIR/$(basename -- "$CHEZ")"
+        ;;
+esac
+export JOLT_CHEZ="$CHEZ"
 
 # Version for --version / banners: git describe of this checkout, else "dev".
 export JOLT_VERSION="${JOLT_VERSION:-$(git -C "$root" describe --tags --always --dirty 2>/dev/null || echo dev)}"
@@ -90,11 +107,11 @@ fi
 # The devcache entry is a checked-in script sharing cli.ss's tail (cli-tail.ss)
 # — an inline heredoc here once drifted from cli.ss and broke project commands.
 if [ "$use_cache" = 1 ]; then
-  exec ${CHEZ} --script host/chez/cli-devcache.ss "$@"
+  exec "$CHEZ" --script host/chez/cli-devcache.ss "$@"
 fi
 
 # Fallback: source mode. Hint for devs (only when interactive).
 if [ -t 1 ] && [ -z "${JOLT_QUIET:-}" ]; then
   echo "jolt: source mode; run 'make devboot' to precompile" >&2
 fi
-exec ${CHEZ} --script host/chez/cli.ss "$@"
+exec "$CHEZ" --script host/chez/cli.ss "$@"

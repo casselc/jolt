@@ -19,7 +19,11 @@ case "$jolt" in /*) joltabs="$jolt" ;; *) joltabs="$root/$jolt" ;; esac
 # csv dir we validate so the build uses exactly it.
 csv="$JOLT_CHEZ_CSV"
 if [ -z "$csv" ]; then
-  chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)"
+  if [ -n "${JOLT_CHEZ:-}" ]; then
+    chez_bin="$(command -v "$JOLT_CHEZ" 2>/dev/null || true)"
+  else
+    chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)"
+  fi
   if [ -n "$chez_bin" ]; then
     base="$(cd "$(dirname "$chez_bin")/.." 2>/dev/null && pwd)"
     for d in "$base"/lib/csv*/*/; do
@@ -34,8 +38,42 @@ fi
 export JOLT_CHEZ_CSV="$csv"
 
 app="$root/test/chez/build-app"
-out="$(mktemp -d)/app-bin"
-trap 'rm -rf "$(dirname "$out")"' EXIT
+scratch="$(mktemp -d)"
+out="$scratch/app-bin"
+cleanup() {
+  status=$?
+  if [ "$status" -eq 0 ] && [ "${JOLT_PRESERVE_TEST_ARTIFACTS:-}" != "1" ]; then
+    rm -rf "$scratch"
+  else
+    echo "build smoke: preserved artifacts at $scratch" >&2
+  fi
+}
+trap cleanup EXIT
+
+# Exercise cmd-build's output policy through the real CLI before the larger
+# build matrix. Work on a copy so the default target/ directory never dirties
+# the checked-in fixture.
+path_app="$scratch/path-project"
+cp -R "$app" "$path_app"
+default_path_out="$path_app/target/release/path-project"
+default_path_log="$scratch/default-output.log"
+echo "build smoke: default output -> $default_path_out"
+if ! JOLT_PWD="$path_app" "$jolt" build -m app.core >"$default_path_log" 2>&1; then
+  echo "  FAIL: default-output jolt build exited non-zero"
+  sed -n '1,240p' "$default_path_log"
+  exit 1
+fi
+[ -x "$default_path_out" ] || { echo "  FAIL: default output missing"; exit 1; }
+
+relative_path_out="$path_app/dist/path-app"
+relative_path_log="$scratch/relative-output.log"
+echo "build smoke: relative output -> $relative_path_out"
+if ! JOLT_PWD="$path_app" "$jolt" build -m app.core -o "dist/path-app" >"$relative_path_log" 2>&1; then
+  echo "  FAIL: relative-output jolt build exited non-zero"
+  sed -n '1,240p' "$relative_path_log"
+  exit 1
+fi
+[ -x "$relative_path_out" ] || { echo "  FAIL: relative output missing"; exit 1; }
 
 echo "build smoke: compiling app.core -> $out"
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" >/dev/null 2>&1; then
@@ -699,4 +737,4 @@ if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nospli
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache)"
+echo "build smoke: passed (default+relative-output + release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache)"
