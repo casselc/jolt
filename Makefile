@@ -54,7 +54,7 @@ export LIBRARY_PATH := $(subst $(space),:,$(strip $(CHEZSCHEME-LIB-DIRS)))$(if $
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
+  allocgate aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
@@ -102,7 +102,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit selectedchez grenadine mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
+ci: submodules values corpus unit allocgate selectedchez grenadine mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -120,6 +120,13 @@ corpus:
 # Host-specific unit cases.
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
+
+# Allocation regression gate. Chez's allocation counter does not vary run to
+# run, unlike wall clock on a shared host, so this asserts on bytes rather than
+# time and needs no repeated sampling. ALLOC_GATE_RECORD=1 rewrites the
+# baseline.
+allocgate:
+	@bin/joltc test/chez/alloc-gate.clj
 
 # The fresh compilation pass must retain the exact caller-selected Chez.
 selectedchez:
