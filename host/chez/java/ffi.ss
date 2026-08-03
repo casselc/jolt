@@ -87,12 +87,12 @@
 ;; fresh byte-array of n bytes; write-array copies a byte-array's bytes into ptr
 ;; and returns the count.
 (define (ffi-read-array ptr n)
-  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (foreign-ref 'unsigned-8 p i)))
+  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (na-make-backing n 'byte 0)))
+    (do ((i 0 (+ i 1))) ((= i n)) (ja-set! v i (foreign-ref 'unsigned-8 p i)))
     (make-jolt-array v 'byte)))
 (define (ffi-write-array ptr arr)
-  (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
-    (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
+  (let* ((v (jolt-array-vec arr)) (n (ja-len v)) (p (jnum->exact ptr)))
+    (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bitwise-and (exact (ja-ref v i)) #xff)))
     n))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)

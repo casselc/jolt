@@ -18,10 +18,23 @@
 
 (define (na-idx i) (if (and (number? i) (not (exact? i))) (exact (floor i)) i))
 
+;; --- THE BACKING SEAM -------------------------------------------------------
 ;; A double/float jolt-array is backed by a Chez FLVECTOR (unboxed flonums); every
 ;; other kind keeps a boxed Chez vector. These helpers let the collection
 ;; dispatchers (count/seq/nth/ref-put!/aset/aclone) and java.util.Arrays work over
 ;; either backing. Chez has flvector? / make-flvector / flvector-ref / -set! / -length.
+;;
+;; CONVENTION: every ja-* helper takes the BACKING (the result of jolt-array-vec),
+;; NOT the jolt-array. Call sites read the backing out once — (let ((v (jolt-array-vec
+;; a))) …) — and then go through ja-len / ja-ref / ja-set! / ja->list / ja-copy /
+;; ja-equal? only. They must NOT call vector-length / vector-ref / vector-set! /
+;; vector->list / vector? on it. That rule is what makes the backing representation
+;; swappable in THIS FILE alone: adding a new backing kind means adding an arm to
+;; each helper below (plus na-make-backing / na-list->backing for construction), and
+;; nothing outside natives-array.ss has to change.
+;;
+;; Keep these small, non-recursive and closure-free — ja-ref/ja-set! are per-element
+;; on array traversal, so cp0 must be able to inline them at every call site.
 (define (na-fl-kind? k) (or (eq? k 'double) (eq? k 'float)))
 (define (ja-len v)     (if (flvector? v) (flvector-length v) (vector-length v)))
 (define (ja-ref v i)   (if (flvector? v) (flvector-ref v i) (vector-ref v i)))
@@ -39,6 +52,12 @@
       (let* ((n (flvector-length v)) (r (make-flvector n 0.0)))
         (do ((i 0 (+ i 1))) ((= i n) r) (flvector-set! r i (flvector-ref v i))))
       (vector-copy v)))
+;; Element-wise equality of two backings (java.util.Arrays/equals). `equal?` already
+;; walks vectors, flvectors and bytevectors element-wise, so this is one call today —
+;; it exists so the comparison has a single home if backings ever stop being
+;; equal?-comparable across kinds (e.g. a byte-array on a bytevector would no longer
+;; compare equal? to an int-array on a vector holding the same numbers).
+(define (ja-equal? a b) (equal? a b))
 (define (na-make-backing n kind init)
   (if (na-fl-kind? kind)
       (make-flvector (exact n) (if (flonum? init) init (exact->inexact init)))
@@ -90,8 +109,8 @@
     (else (make-jolt-array (list->vector (map na-byte-of (seq->list (jolt-seq a)))) 'byte))))
 ;; jolt byte-array -> Chez bytevector (for String decode / utf8->string).
 (define (na-bytearray->bv arr)
-  (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (bv (make-bytevector n)))
-    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bitwise-and (exact (vector-ref v i)) #xff)))
+  (let* ((v (jolt-array-vec arr)) (n (ja-len v)) (bv (make-bytevector n)))
+    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bitwise-and (exact (ja-ref v i)) #xff)))
     bv))
 (define (na-make-array a . rest)    ; (make-array len) | (make-array type len ...)
   (make-jolt-array (make-vector (exact (na-idx (if (number? a) a (car rest)))) jolt-nil) 'object))
@@ -112,7 +131,7 @@
 (define (na-aset-char arr i v)    (na-aset! arr i v))
 (define (na-aset-boolean arr i v) (na-aset! arr i v))
 (define (na-aset-byte arr i v)
-  (vector-set! (jolt-array-vec arr) (exact (na-idx i)) (na-byte-of v)) v)
+  (ja-set! (jolt-array-vec arr) (exact (na-idx i)) (na-byte-of v)) v)
 
 ;; --- coercions (identity on arrays; byte/short are masked scalar casts) ------
 (define (na-bytes x) (if (and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) x (na-byte-array x)))
@@ -174,6 +193,11 @@
 ;; unboxed read target for (aget ^doubles a i): direct flvector-ref on the backing,
 ;; skipping jolt-nth's case-lambda + jolt-array?/flvector? dispatch. Emitted only
 ;; when jolt.passes.numeric proved the array is a ^doubles/^floats (flvector) param.
+;; REPRESENTATION DEPENDENCY (deliberate): these two bypass the ja-* seam on purpose
+;; — the whole point is to skip the flvector? test the seam would re-do. They are
+;; sound only because the numeric pass proved the ^doubles/^floats kind, so they are
+;; pinned to the FLVECTOR backing specifically and are unaffected by any change to
+;; the byte/object backing. If the flvector backing ever moves, fix these too.
 (define (jolt-flaget a i) (flvector-ref (jolt-array-vec a) (exact (na-idx i))))
 ;; unboxed write target for (aset ^doubles a i v): direct flvector-set!, returning
 ;; the stored flonum (JVM aset returns the val).
@@ -240,7 +264,7 @@
 ;; their layout. Lives here (not io.ss) because io.ss loads before byte-array.
 (define (jolt-io-copy src dst . _opts)
   (define (write-all! bytes)
-    (record-method-dispatch dst "write" (list->cseq (list bytes 0 (vector-length (jolt-array-vec bytes))))))
+    (record-method-dispatch dst "write" (list->cseq (list bytes 0 (ja-len (jolt-array-vec bytes))))))
   (cond
     ((or (bytevector? src) (string? src)
          (and (jolt-array? src) (eq? (jolt-array-kind src) 'byte)))
