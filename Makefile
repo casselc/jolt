@@ -6,7 +6,7 @@
 
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
 
-.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint joltc joltc-release joltc-debug joltcsmoke devboot devbootsmoke aotcachesmoke aotcacheperf submodules httpsfetch mvnhttp
+.PHONY: allocgate test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint joltc joltc-release joltc-debug joltcsmoke devboot devbootsmoke aotcachesmoke aotcacheperf submodules httpsfetch mvnhttp
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -22,7 +22,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit mvnhttp smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke aotcachesmoke certify
+ci: submodules values corpus unit allocgate mvnhttp smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke aotcachesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -38,6 +38,13 @@ corpus:
 	@$(CHEZ) --script host/chez/run-corpus.ss
 
 # Host-specific unit cases.
+# Allocation regression gate. Chez's allocation counter does not vary run to
+# run, unlike wall clock on a shared host, so this asserts on bytes rather than
+# time and needs no repeated sampling. ALLOC_GATE_RECORD=1 rewrites the
+# baseline.
+allocgate:
+	@bin/joltc test/chez/alloc-gate.clj
+
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
 

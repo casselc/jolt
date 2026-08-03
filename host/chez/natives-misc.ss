@@ -111,3 +111,32 @@
 (def-var! "clojure.core" "hash-ordered-coll" nm-hash-ordered-coll)
 (def-var! "clojure.core" "mix-collection-hash" nm-mix-collection-hash)
 (def-var! "clojure.core" "hash-unordered-coll" nm-hash-unordered-coll)
+
+;; --- jolt.perf: deterministic performance counters ---------------------------
+;;
+;; Wall-clock measurement on a shared host has a run-to-run spread (~10% was
+;; measured for a bencode decode), which makes a single-sample comparison below
+;; the noise floor and forces repeated sampling and medians. Chez's allocation
+;; and collection counters do NOT vary run to run: a change either allocates
+;; more or it does not. These expose them so a regression gate can assert on a
+;; count instead of a time.
+;;
+;; bytes-allocated is cumulative for the process; take a difference around the
+;; work under test. collect! forces a collection first so the difference is not
+;; polluted by whatever the caller had already made unreachable.
+(define (perf-bytes-allocated) (bytes-allocated))
+(define (perf-gc-count) (sstats-gc-count (statistics)))
+(define (perf-gc-cpu-ms)
+  (let ((t (sstats-gc-cpu (statistics))))
+    (+ (* (time-second t) 1000) (quotient (time-nanosecond t) 1000000))))
+(define (perf-cpu-ms)
+  (let ((t (cpu-time)))
+    (if (time? t)
+        (+ (* (time-second t) 1000) (quotient (time-nanosecond t) 1000000))
+        t)))
+(define (perf-collect!) (collect (collect-maximum-generation)) #t)
+(def-var! "jolt.perf" "bytes-allocated" perf-bytes-allocated)
+(def-var! "jolt.perf" "gc-count" perf-gc-count)
+(def-var! "jolt.perf" "gc-cpu-ms" perf-gc-cpu-ms)
+(def-var! "jolt.perf" "cpu-ms" perf-cpu-ms)
+(def-var! "jolt.perf" "collect!" perf-collect!)
