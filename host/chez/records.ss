@@ -843,6 +843,31 @@
         (let ((flat (build-flat-methods ti)))
           (hashtable-set! flat-method-cache ti (cons jolt-proto-epoch flat))
           flat))))
+;; Descriptor-keyed entry point for the hot collection fallback. An instance
+;; reaches its descriptor by two immutable field reads (jrec-desc, then the
+;; cached table), so this skips the type-registry lookup — which hashes the
+;; type TAG string on every element access. The tag is still needed to build
+;; the flat table, but only on a miss. Same epoch guard; weak keys so a
+;; pruned type's entry is collectable.
+;; Cached in the descriptor's OWN ptable under a reserved eq key, rather than a
+;; side table: no weak-hashtable overhead on the hot path, nothing to leak (the
+;; entry dies with the desc), and invalidation is already wired — a type re-def
+;; sets ptable to #f, and a new registration bumps the epoch this entry carries.
+;; The key is a gensym, so it cannot collide with an intern-pm-key identity.
+(define flat-coll-methods-key (gensym "flat-coll-methods"))
+(define (flat-methods-for-desc desc)
+  (let ((pt (jrdesc-ptable desc)))
+    (if (not pt)
+        ;; no ptable yet (no inline protocol registered) — nothing to cache in
+        (let ((ti (hashtable-ref type-registry (jrdesc-tag desc) #f)))
+          (if ti (flat-methods ti) (make-hashtable string-hash string=?)))
+        (let ((hit (hashtable-ref pt flat-coll-methods-key #f)))
+          (if (and hit (fx=? (car hit) jolt-proto-epoch))
+              (cdr hit)
+              (let* ((ti (hashtable-ref type-registry (jrdesc-tag desc) #f))
+                     (flat (if ti (build-flat-methods ti) (make-hashtable string-hash string=?))))
+                (hashtable-set! pt flat-coll-methods-key (cons jolt-proto-epoch flat))
+                flat))))))
 (define (find-method-impls type-tag method)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti (hashtable-ref (flat-methods ti) method '()))))
