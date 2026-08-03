@@ -249,7 +249,34 @@
         ;; decide whether to emit ANSI, and a nil means "not a tty".
         (cons "console" (lambda _ jolt-nil))
         (cons "lineSeparator" (lambda _ "\n"))
-        (cons "identityHashCode" (lambda (x) (->num (equal-hash x))))))
+        (cons "identityHashCode" (lambda (x) (->num (equal-hash x))))
+        ;; System/arraycopy src srcPos dst dstPos len — copy a run of elements
+        ;; between two arrays. Goes through natives-array.ss's ja-* seam, so it
+        ;; works for every backing (bytevector / flvector / boxed vector) and for
+        ;; any src/dst kind pair, and it does not care how a byte-array stores
+        ;; its bytes.
+        ;;
+        ;; OVERLAP: the JVM specifies the copy as if the source range were first
+        ;; copied to a temporary and then written out, so a self-copy with
+        ;; overlapping ranges must not clobber source elements it has yet to
+        ;; read. Copying backwards when the ranges overlap forwards (same backing,
+        ;; srcPos < dstPos) gives that without allocating the temporary.
+        ;;
+        ;; Bounds are checked up front and raise IndexOutOfBoundsException like
+        ;; the JVM, rather than surfacing a raw Chez range error.
+        (cons "arraycopy"
+              (lambda (src src-pos dst dst-pos len)
+                (let ((sv (jolt-array-vec src)) (dv (jolt-array-vec dst))
+                      (sp (jnum->exact src-pos)) (dp (jnum->exact dst-pos))
+                      (n (jnum->exact len)))
+                  (when (or (< n 0) (< sp 0) (< dp 0)
+                            (> (+ sp n) (ja-len sv)) (> (+ dp n) (ja-len dv)))
+                    (throw-jvm (quote IndexOutOfBoundsException)
+                               "arraycopy: last source/destination index out of bounds"))
+                  (if (and (eq? sv dv) (< sp dp))
+                      (do ((i (- n 1) (- i 1))) ((< i 0)) (ja-set! dv (+ dp i) (ja-ref sv (+ sp i))))
+                      (do ((i 0 (+ i 1))) ((= i n)) (ja-set! dv (+ dp i) (ja-ref sv (+ sp i)))))
+                  jolt-nil)))))
 
 ;; java.lang.Long.bitCount: the population count of the value's 64-bit two's-
 ;; complement (mask to 64 bits so a negative long counts like the JVM, e.g.
