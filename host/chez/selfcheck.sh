@@ -7,7 +7,15 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 CHEZ="${CHEZ:-$(command -v chez || command -v chezscheme || command -v scheme)}"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+cleanup() {
+  status=$?
+  if [ "$status" -eq 0 ] && [ "${JOLT_PRESERVE_TEST_ARTIFACTS:-}" != "1" ]; then
+    rm -rf "$tmp"
+  else
+    echo "self-host: preserved artifacts at $tmp" >&2
+  fi
+}
+trap cleanup EXIT
 "$CHEZ" --script host/chez/bootstrap.ss \
   host/chez/seed/prelude.ss host/chez/seed/image.ss "$tmp/p.ss" "$tmp/i.ss" >/dev/null
 if diff -q host/chez/seed/prelude.ss "$tmp/p.ss" >/dev/null \
