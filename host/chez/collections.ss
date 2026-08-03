@@ -511,7 +511,11 @@
 ;; as an inline impl; the core collection fns fall back to it. find-method-any-
 ;; protocol / jolt-invoke load later — resolved at call time.
 (define (rec-coll-method coll name)
-  (and (jrec? coll) (find-method-any-protocol (jrec-tag coll) name)))
+  (and (jrec? coll)
+       ;; descriptor-keyed: two field reads + one eq ref, instead of hashing the
+       ;; type tag string on every call (records.ss flat-methods-for-desc).
+       (let ((l (hashtable-ref (flat-methods-for-desc (jrec-desc coll)) name '())))
+         (and (pair? l) (car l)))))
 
 (define (jolt-nth-nil-idx! i)
   (when (jolt-nil? i)
