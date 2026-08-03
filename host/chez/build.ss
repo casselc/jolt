@@ -296,6 +296,13 @@
         (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
         (begin (put-string out line) (put-string out "\n")))))
 
+;; True only inside the special sim compiler/runtime image. The marker is
+;; deliberately absent from ordinary images; probe it dynamically so the shared
+;; build subsystem remains valid in both flavors without a second manifest.
+(define (bld-sim-runtime-image?)
+  (and (top-level-bound? 'jolt-sim-runtime-image?)
+       (eq? #t (top-level-value 'jolt-sim-runtime-image?))))
+
 ;; Inline the runtime manifest, dispatching on the manifest tags. core-strs (the
 ;; shaken clojure.core defs, or #f) replaces the 'prelude blob; drop-compiler? (a
 ;; closed AOT app that never compiles from source) omits 'image + 'compile-eval —
@@ -311,7 +318,14 @@
         ((memq entry '(image compile-eval))
          (unless drop-compiler? (bld-inline-line (cdr (assq entry bld-tagged-loads)) out 0)))
         (else (bld-inline-line entry out 0))))
-    bld-runtime-manifest))
+    bld-runtime-manifest)
+  ;; A sim compiler propagates its private overlay into every output flavor,
+  ;; including split, unsplit, tree-shaken, cross, and library builds. Because
+  ;; this runs before runtime.ss is content-hashed, upstream's existing cache
+  ;; automatically keys ordinary and sim runtime halves separately.
+  (when (bld-sim-runtime-image?)
+    (put-string out "\n;; === simulation-only runtime overlay ===\n")
+    (bld-inline-line "(load \"host/chez/sim/runtime.ss\")" out 0)))
 
 ;; --- app emission -----------------------------------------------------------
 ;; Re-emit one app namespace to a list of Scheme strings: run-passes (const-fold +
@@ -1029,6 +1043,13 @@
           (put-string out "\n;; === app namespace pre-registration ===\n")
           (for-each (lambda (p) (put-string out (string-append "(intern-ns! " (ei-str-lit (car p)) ")\n")))
                     ordered)
+          ;; A sim-built app with its compiler retained can eval/load source at
+          ;; application top level, before scheme-start. Arm that embedded
+          ;; compiler here, after the runtime/compiler definitions and before
+          ;; the first app form. Compiler-dropped outputs omit the call entirely.
+          (when (and (bld-sim-runtime-image?) (not drop-compiler?))
+            (put-string out "\n;; === sim retained-compiler flavor ===\n")
+            (put-string out "(jolt-sim-arm-compiler!)\n"))
           (put-string out "\n;; === app ===\n")
           (for-each (lambda (s) (put-string out s) (put-string out "\n")) app-strs)
           ;; The launcher runs as Chez's scheme-start (so argv reaches -main —
