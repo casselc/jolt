@@ -59,7 +59,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
+  narrow numeric numwp oparity pathfacts pic protoret printperf remint sci selfhost shakelocal \
   shakesmoke smoke staticnativesmoke targetfacts test testbin transient unit unitcontext \
   values wp ci
 
@@ -102,7 +102,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit grenadine mvnhttp depssmoke depsunit smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi targetfacts transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
+ci: submodules values corpus unit grenadine mvnhttp depssmoke depsunit smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi targetfacts pathfacts transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -255,6 +255,10 @@ ffi:
 # coherently from the same target facts.
 targetfacts:
 	@$(CHEZ) --script test/chez/target-descriptor-test.ss
+
+# Pure POSIX/Windows absolute, rooted, and project-resolution contracts.
+pathfacts:
+	@$(CHEZ) --script test/chez/path-contract-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
