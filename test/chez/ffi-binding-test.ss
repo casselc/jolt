@@ -7,13 +7,37 @@
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
+(load "host/chez/loader.ss")
+(set-source-roots! ldr-install-roots)
 (load "host/chez/java/ffi.ss")
 
-(define total 0) (define fails 0)
+(define total 0) (define fails 0) (define skipped 0)
 (define (ok name pred) (set! total (+ total 1)) (unless pred (set! fails (+ fails 1)) (printf "FAIL: ~a\n" name)))
+(define (skip name)
+  (set! skipped (+ skipped 1))
+  (printf "SKIP: ~a\n" name))
+(define (raises? thunk) (guard (e (#t #t)) (thunk) #f))
 ;; eval one form (string) in `user`, like the loader does form-by-form, so a def
 ;; is visible to a later form.
 (define (ev s) (jolt-compile-eval s "user"))
+;; Lower one form without evaluating it so convention order can be asserted
+;; independently of whether this host ABI happens to expose the bug.
+(define (emitf s)
+  (let-values (((f j) (rdr-read-form s 0 (string-length s))))
+    (let ((ctx (make-analyze-ctx "user")))
+      (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
+(define (has? s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i nsub) ns) #f)
+            ((string=? (substring s i (+ i nsub)) sub) #t)
+            (else (loop (+ i 1)))))))
+(define windows-host?
+  (and (memq (machine-type) '(i3nt ti3nt a6nt ta6nt arm64nt tarm64nt)) #t))
+
+;; gate-boot stops before the loader, so explicitly load the public namespace
+;; before exercising its foreign-fn/defcfn macros below.
+(ev "(require '[jolt.ffi :as ffi])")
 
 ;; load libc (process symbols) and bind typed foreign functions
 (ev "(jolt.ffi/load-library)")
@@ -79,5 +103,88 @@
 (ok "free-callable releases the callback"
     (jolt-nil? (ev "(jolt.ffi/free-callable cmp)")))
 
-(printf "~a/~a passed~n" (- total fails) total)
+;; variadic foreign functions: {:varargs-after n} declares the fixed-argument
+;; boundary before the C "...", lowering to Chez's __varargs_after convention
+;; (required on targets whose variadic and fixed calling conventions differ).
+;; snprintf is a clean variadic libc witness: 3 fixed params (buf, size, fmt)
+;; then "...". The declared argtypes list the fixed params followed by the
+;; already-promoted variadic ones (:double), and the boundary (3) may not exceed
+;; the argtype count. A floating variadic value is deliberately discriminating:
+;; Apple arm64 moves arguments after `...` to the stack, while other ABIs still
+;; need their variadic floating-point metadata/convention emitted correctly.
+(ok "blocking precedes the variadic boundary in plain lowering"
+    (has? (emitf "(jolt.ffi/__cfn \"snprintf\"
+                    [:pointer :size_t :pointer :double] :int
+                    {:blocking true :varargs-after 3})")
+          "(foreign-procedure __collect_safe (__varargs_after 3) \"snprintf\""))
+(ok "capture groups blocking and the variadic boundary in order"
+    (has? (emitf "(jolt.ffi/__cfn \"snprintf\"
+                    [:pointer :size_t :pointer :double] :int
+                    {:blocking true :capture-native-error true
+                     :varargs-after 3})")
+          "(jolt-ffi-native-error-procedure (__collect_safe (__varargs_after 3)) \"snprintf\""))
+(unless windows-host?
+  (ev "(ffi/defcfn c-snprintf \"snprintf\"
+                      [:pointer :size_t :string :double] :int {:varargs-after 3})"))
+(if windows-host?
+    (skip "POSIX snprintf variadic byte witness")
+    (ok "variadic {:varargs-after 3} lowers snprintf and writes the right bytes"
+        (jolt-truthy?
+          (ev "(let [buf (jolt.ffi/alloc 16)
+                     n (c-snprintf buf 16 \"%.1f\" 1.5)]
+                 (let [ok (and (= n 3)
+                               (= 49 (bit-and (jolt.ffi/read buf :uint8 0) 0xff))
+                               (= 46 (bit-and (jolt.ffi/read buf :uint8 1) 0xff))
+                               (= 53 (bit-and (jolt.ffi/read buf :uint8 2) 0xff)))]
+                   (jolt.ffi/free buf) ok))"))))
+;; the boundary may equal the argtype count (a trailing "..." that matches zero
+;; extra args); it just may not exceed it.
+(ok "varargs-after equal to arg count is accepted (1 fixed, 0 variadic)"
+    (= 9 (jnum->exact
+           (ev "(let [f (jolt.ffi/__cfn \"abs\" [:int] :int {:varargs-after 1})] (f -9))"))))
+
+;; --- analyzer fail-closed: malformed {:varargs-after ...} ---------------------
+;; Validated at compile time in jolt.analyzer/analyze-ffi-fn, before any native
+;; symbol is resolved. Each must raise rather than silently ignore the bad option.
+(ok "non-integer :varargs-after rejected"
+    (raises? (lambda () (ev "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after 3.0})"))))
+(ok "zero :varargs-after rejected"
+    (raises? (lambda () (ev "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after 0})"))))
+(ok "negative :varargs-after rejected"
+    (raises? (lambda () (ev "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after -1})"))))
+(ok ":varargs-after exceeding arg count rejected"
+    (raises? (lambda () (ev "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t] :int {:varargs-after 3})"))))
+(ok "public foreign-fn forwards {:varargs-after}"
+    (has? (emitf "(ffi/foreign-fn \"snprintf\"
+                    [:pointer :size_t :string :double] :int
+                    {:varargs-after 3})")
+          "(foreign-procedure (__varargs_after 3) \"snprintf\""))
+(if windows-host?
+    (skip "POSIX public foreign-fn snprintf execution")
+    (ok "public foreign-fn variadic binding calls snprintf"
+        (jolt-truthy?
+          (ev "(let [buf (jolt.ffi/alloc 16)
+                     f (ffi/foreign-fn \"snprintf\"
+                         [:pointer :size_t :string :double] :int
+                         {:varargs-after 3})
+                     n (f buf 16 \"%.1f\" 2.5)]
+                 (jolt.ffi/free buf)
+                 (= 3 n))"))))
+(unless windows-host?
+  (ev "(ffi/defcfn c-snprintf-captured \"snprintf\"
+         [:pointer :size_t :pointer :double] :int
+         {:blocking true :capture-native-error true :varargs-after 3})"))
+(if windows-host?
+    (skip "POSIX blocking capture with snprintf varargs")
+    (ok "blocking capture and variadic lowering execute together"
+        (jolt-truthy?
+          (ev "(let [buf (jolt.ffi/alloc 16)
+                     fmt (jolt.ffi/string->ptr \"%.1f\")
+                     pair (c-snprintf-captured buf 16 fmt 7.5)]
+                 (jolt.ffi/free fmt)
+                 (jolt.ffi/free buf)
+                 (and (vector? pair) (= 2 (count pair))
+                      (= 3 (nth pair 0)) (integer? (nth pair 1))))"))))
+
+(printf "~a/~a passed; ~a skipped~n" (- total fails) total skipped)
 (exit (if (zero? fails) 0 1))

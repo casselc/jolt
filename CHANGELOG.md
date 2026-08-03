@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Consumer-facing monotonic deadline clock.** `jolt.host/monotonic-nanos`
+  aliases the existing `mono-nanos` clock used by `System/nanoTime`, and
+  `jolt.host/monotonic-source` reports `:monotonic`. The alias follows the
+  simulation profile's controlled clock instead of capturing the native source.
+
+- **Variadic foreign bindings declare their fixed-argument boundary.**
+  `jolt.ffi/foreign-fn` and `defcfn` accept
+  `{:varargs-after n}`, where `n` is the positive number of declared fixed C
+  parameters before `...`. The boundary composes with collect-safe calls and
+  atomic native-error capture and lowers to Chez's `__varargs_after`
+  convention, which is required on targets whose variadic and fixed calling
+  conventions differ. Callers declare already-promoted C ABI types for
+  arguments after the boundary. Sim-profile FFI descriptor version 6 carries
+  the same optional boundary so controllers and traces retain the exact call
+  declaration.
+
+- **An opt-in simulation compiler/runtime profile.** `make jolt-sim` builds a
+  separate image whose private `jolt.internal.sim` ABI atomically installs
+  future-lifecycle, scalar FFI, and monotonic-clock controllers. Sim-compiled
+  calls can be modeled, observed, or selectively proceeded to the real native
+  branch with scoped, single-use authority; ordinary release/debug images and
+  ordinary compilation units retain their existing paths. This prerelease
+  surface is intended for deterministic schedulers and adversarial library
+  tests, not as a compatibility-stable public runtime API yet.
+
 - **Scoped in-out byte-array pointer loans for `jolt.ffi`.**
   `with-byte-array-pointer` lends a stable pointer to a temporary native-octet
   copy of a whole signed byte array or one validated range, then copies native
@@ -34,6 +59,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path before cleanup or collector reactivation can overwrite it. It composes
   with `{:blocking true}`; omitted/false capture keeps the existing scalar
   result, and unsupported targets or malformed options fail closed.
+
+- **`jolt.host/target`, an exact fail-closed compiler-target descriptor.**
+  Reports `:os`, `:arch`, `:abi`, `:libc`, `:endian`, `:pointer-bits`,
+  `:file-separator`, `:path-separator`, and `:processors`. The compiler target's
+  OS, architecture, and ABI come from an exact allowlist checked against
+  `rt.ss`'s native-error convention selection; an unrecognized machine tuple
+  fails closed to `:unknown` instead of guessing, while independently measurable
+  runtime facts remain available. `System`'s
+  `os.name`, the new `os.arch`, `line.separator`, `file.separator`, and
+  `path.separator` (individually, via `System/lineSeparator`, and via
+  `System/getProperties`) now project from these same target facts, replacing
+  the previous fuzzy machine-name substring scan for `os.name` — one classifier
+  instead of two independent authorities. Optional native-symbol resolution now
+  also selects its Windows-safe path from the compiler target, including Windows
+  ARM64, so cross-images cannot bake POSIX relocations into Windows output.
+
+### Fixed
+
+- **Windows project, dependency, temporary, and build-output paths no longer
+  acquire a duplicate project prefix.** Drive-absolute and UNC paths pass
+  through unchanged, root-relative paths inherit the project drive, and
+  drive-relative paths fail closed instead of resolving against the wrong
+  drive. `java.io.File`, dependency roots, and CLI build outputs share the same
+  target-aware contract; complete Windows `java.nio.file.Path` value algebra
+  remains a separate compatibility slice.
 
 ## [0.5.17] - 2026-08-01
 

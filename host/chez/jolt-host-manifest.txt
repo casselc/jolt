@@ -7,6 +7,7 @@
 # in jolt-core, so any drift fails CI. Regenerate after an intended change:
 #   grep -rhoE --include='*.ss' 'def-var! "jolt.host" "[^"]+"' host/ \
 #     | sed -E 's/.*"jolt.host" "([^"]+)".*/\1/' | LC_ALL=C sort -u
+absolute-path?
 add-shutdown-hook
 allow-unresolved-vars?
 array-value?
@@ -110,6 +111,8 @@ maximum-memory-bytes
 monitor-enter
 monitor-exit
 mono-nanos
+monotonic-nanos
+monotonic-source
 park-until-interrupt
 protocol-methods
 rational-type?
@@ -128,6 +131,8 @@ register-source!
 resolvable-names
 resolve-class-hint
 resolve-global
+resolve-project-path
+rooted-path?
 run-expr-string
 run-interruptible
 run-main-pump
@@ -144,6 +149,7 @@ stash-inline!
 stop-main-pump
 table?
 tagged-table
+target
 thread-id
 throwable
 type-satisfies?

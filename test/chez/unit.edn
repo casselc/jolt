@@ -243,10 +243,10 @@
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.read (io/reader (StringReader. \"k\"))))" :expected "107"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (slurp (io/reader (char-array \"xyz\"))))" :expected "\"xyz\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (string? (slurp (io/reader \"README.md\"))))" :expected "true"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toString (.toURL (io/file \"/tmp/x\"))))" :expected "\"file:/tmp/x\""}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toURI (io/file \"/tmp/x\")))" :expected "#object[java.net.URI \"file:/tmp/x\"]"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (str (.toURI (io/file \"/tmp/x\"))))" :expected "\"file:/tmp/x\""}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/x\"))))" :expected "\"#object[java.net.URI \\\"file:/tmp/x\\\"]\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [dir (System/getProperty \"user.dir\") path (if (= :windows (:os (jolt.host/target))) (str (subs dir 0 2) \"/tmp/x\") \"/tmp/x\")] (= (str \"file:\" path) (.toString (.toURL (io/file \"/tmp/x\"))))))" :expected "true"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [dir (System/getProperty \"user.dir\") path (if (= :windows (:os (jolt.host/target))) (str (subs dir 0 2) \"/tmp/x\") \"/tmp/x\") uri (.toURI (io/file \"/tmp/x\"))] (and (instance? java.net.URI uri) (= (str \"file:\" path) (str uri)))))" :expected "true"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [dir (System/getProperty \"user.dir\") path (if (= :windows (:os (jolt.host/target))) (str (subs dir 0 2) \"/tmp/x\") \"/tmp/x\")] (= (str \"file:\" path) (str (.toURI (io/file \"/tmp/x\"))))))" :expected "true"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [dir (System/getProperty \"user.dir\") path (if (= :windows (:os (jolt.host/target))) (str (subs dir 0 2) \"/tmp/x\") \"/tmp/x\")] (= (str \"#object[java.net.URI \\\"file:\" path \"\\\"]\") (pr-str (.toURI (io/file \"/tmp/x\"))))))" :expected "true"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (io/file \"/tmp/x\")))" :expected "\"#object[java.io.File \\\"/tmp/x\\\"]\""}
   {:suite "ioreader" :expr "(pr-str (atom 1))" :expected "\"#object[clojure.lang.Atom]\""}
  ;; io/resource has two branches — a source root (a jfile) and an embedded resource
@@ -270,8 +270,8 @@
   ;; strips the scheme. All five must hold before io/resource can return a URL.
   ;; Built against a temp file so nothing here depends on a machine path.
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [f (java.io.File/createTempFile \"joltres\" \".txt\")] (spit f \"hello\") (let [u (java.net.URL. (str \"file:\" (.getAbsolutePath f))) r (and (= \"hello\" (slurp u)) (= \"hello\" (slurp (.openStream u))) (= \"hello\" (slurp (io/reader u))) (= \"hello\" (slurp (io/input-stream u))) (= (.getAbsolutePath f) (str (io/file u))))] (.delete f) r)))" :expected "true"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "\"/tmp/x\""}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "\"/a/b\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [dir (System/getProperty \"user.dir\") path (if (= :windows (:os (jolt.host/target))) (str (subs dir 0 2) \"/tmp/x\") \"/tmp/x\")] (= path (.getPath (.toURL (io/file \"/tmp/x\"))))))" :expected "true"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [dir (System/getProperty \"user.dir\") path (if (= :windows (:os (jolt.host/target))) (str (subs dir 0 2) \"/a/b\") \"/a/b\")] (= path (.getAbsolutePath (io/file \"/a/b\")))))" :expected "true"}
   {:suite "ioreader" :expr "(slurp (StringReader. \"a=1\"))" :expected "\"a=1\""}
   {:suite "ioreader" :expr "(slurp (StringReader. \"b\") :encoding \"UTF-8\")" :expected "\"b\""}
   {:suite "ioreader" :expr "(with-open [r (StringReader. \"a\")] (.read r))" :expected "97"}
@@ -303,6 +303,28 @@
   {:suite "javastatic" :expr "(string? (System/getenv \"HOME\"))" :expected "true"}
   {:suite "javastatic" :expr "(fn? System/exit)" :expected "true"}
   {:suite "javastatic" :expr "(string? (get (System/getProperties) \"os.name\"))" :expected "true"}
+  ;; jolt.host/target is the exact fail-closed compiler-target descriptor (see
+  ;; target-descriptor-test.ss); these check the public Clojure-level surface
+  ;; agrees with the System/Runtime properties derived from the same facts.
+  {:suite "target" :expr "(= #{:os :arch :abi :libc :endian :pointer-bits :file-separator :path-separator :processors} (set (keys (jolt.host/target))))" :expected "true"}
+  {:suite "target" :expr "(let [{:keys [os arch abi libc endian pointer-bits file-separator path-separator processors]} (jolt.host/target)] (and (keyword? os) (keyword? arch) (keyword? abi) (keyword? libc) (keyword? endian) (number? pointer-bits) (pos? pointer-bits) (string? file-separator) (string? path-separator) (number? processors) (pos? processors)))" :expected "true"}
+  {:suite "target" :expr "(= (jolt.host/available-processors) (.availableProcessors (java.lang.Runtime/getRuntime)) (:processors (jolt.host/target)))" :expected "true"}
+  {:suite "target" :expr "(let [p (System/getProperties)] (and (= (System/getProperty \"os.name\") (get p \"os.name\")) (= (System/getProperty \"os.arch\") (get p \"os.arch\"))))" :expected "true"}
+  {:suite "target" :expr "(let [t (jolt.host/target) p (System/getProperties)] (and (= (:file-separator t) (System/getProperty \"file.separator\") (get p \"file.separator\")) (= (:path-separator t) (System/getProperty \"path.separator\") (get p \"path.separator\"))))" :expected "true"}
+  {:suite "target" :expr "(let [p (System/getProperties)] (= (System/lineSeparator) (System/getProperty \"line.separator\") (get p \"line.separator\")))" :expected "true"}
+  {:suite "target" :expr "(let [p (System/getProperties)] (and (= (System/getProperty \"java.class.path\") (get p \"java.class.path\")) (= (System/getProperty \"jolt.version\") (get p \"jolt.version\")) (= (System/getProperty \"user.dir\") (get p \"user.dir\"))))" :expected "true"}
+  ;; Native File/project/deps/build path consumers share one target-aware
+  ;; classifier. Cross-target string algebra lives in path-contract-test.ss;
+  ;; these rows exercise the public surface on the running target.
+  {:suite "path-contract" :label "Java absolute paths distinguish POSIX roots from Windows roots" :expected "true" :expr "(let [windows? (= :windows (:os (jolt.host/target)))] (= [(not windows?) windows? windows? false false] (mapv jolt.host/absolute-path? [\"/tmp/x\" \"C:/tmp/x\" \"\\\\\\\\server\\\\share\\\\x\" \"\\\\rooted\" \"C:tmp/x\"])))"}
+  {:suite "path-contract" :label "project rooted paths add drive-less Windows roots" :expected "true" :expr "(let [windows? (= :windows (:os (jolt.host/target)))] (= [true windows? windows? windows? false] (mapv jolt.host/rooted-path? [\"/tmp/x\" \"\\\\rooted\" \"C:/tmp/x\" \"\\\\\\\\server\\\\share\\\\x\" \"C:tmp/x\"])))"}
+  {:suite "path-contract" :label "drive-relative paths remain Java-relative" :expected "false" :expr "(jolt.host/absolute-path? \"C:tmp/x\")"}
+  {:suite "path-contract" :label "File uses the target-aware absolute classifier" :expected "true" :expr "(every? true? (for [p [\"/tmp/x\" \"C:/tmp/x\" \"D:\\\\tmp\\\\x\" \"\\\\rooted\" \"\\\\\\\\server\\\\share\\\\x\" \"C:tmp/x\"] :let [expected (jolt.host/absolute-path? p)]] (= expected (.isAbsolute (java.io.File. p)))))"}
+  {:suite "path-contract" :label "File static separators project from the target descriptor" :expected "true" :expr "(let [{:keys [file-separator path-separator]} (jolt.host/target)] (and (= file-separator java.io.File/separator) (= path-separator java.io.File/pathSeparator) (= (first file-separator) java.io.File/separatorChar) (= (first path-separator) java.io.File/pathSeparatorChar)))"}
+  {:suite "path-contract" :label "File roots and their listed children stay absolute" :expected "true" :expr "(let [roots (seq (java.io.File/listRoots))] (and (seq roots) (every? #(.isAbsolute %) roots) (every? (fn [root] (every? #(.isAbsolute %) (or (seq (.listFiles root)) []))) roots)))"}
+  {:suite "path-contract" :label "File name and parent split only on native separators" :expected "true" :expr "(let [windows? (= :windows (:os (jolt.host/target))) path (if windows? \"D:\\\\project\\\\leaf\" \"/project/leaf\") file (java.io.File. path)] (and (= \"leaf\" (.getName file)) (= (if windows? \"D:\\\\project\" \"/project\") (.getParent file)) (= (if windows? \"D:\\\\project\" \"/project\") (str (.getParentFile file))) (if windows? true (= \"acme\\\\tools\" (.getName (java.io.File. \"acme\\\\tools\"))))))"}
+  {:suite "path-contract" :label "native project resolution handles absolute, root-relative, and ordinary relative paths" :expected "true" :expr "(let [windows? (= :windows (:os (jolt.host/target))) base (if windows? \"D:\\\\project\" \"/project\")] (and (= (if windows? \"C:\\\\out\" \"/out\") (jolt.host/resolve-project-path base (if windows? \"C:\\\\out\" \"/out\"))) (= (if windows? \"D:\\\\rooted\" \"/rooted\") (jolt.host/resolve-project-path base (if windows? \"\\\\rooted\" \"/rooted\"))) (= (str base \"/relative\") (jolt.host/resolve-project-path base \"relative\"))))"}
+  {:suite "path-contract" :label "drive-relative project paths fail closed only on Windows" :expected "true" :expr "(if (= :windows (:os (jolt.host/target))) (try (jolt.host/resolve-project-path \"D:\\\\project\" \"C:relative\") false (catch IllegalArgumentException _ true)) (= \"/project/C:relative\" (jolt.host/resolve-project-path \"/project\" \"C:relative\")))"}
   {:suite "javastatic" :expr "(pos? (count (seq (System/getenv))))" :expected "true"}
   {:suite "javastatic" :expr "(let [es (map (fn [[k v]] [k v]) (System/getenv))] (and (pos? (count es)) (every? vector? es)))" :expected "true"}
   {:suite "javastatic" :expr "(.toString (StringBuilder. \"x\"))" :expected "\"x\""}
@@ -688,6 +710,8 @@
   ;; finer than millisecond granularity: 200 back-to-back reads can't all land on a
   ;; 1e6 boundary unless the clock is really a millisecond counter scaled by 1e6.
   {:suite "telemetry" :expr "(some (fn [_] (pos? (rem (jolt.host/mono-nanos) 1000000))) (range 200))" :expected "true"}
+  {:suite "telemetry" :expr "(let [a (jolt.host/monotonic-nanos) b (jolt.host/monotonic-nanos)] (>= b a))" :expected "true"}
+  {:suite "telemetry" :expr "(= :monotonic (jolt.host/monotonic-source))" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/cpu-nanos) 0)" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/real-nanos) 0)" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/gc-count) 0)" :expected "true"}
@@ -1195,6 +1219,14 @@
   ;; / declare-var! / intern-ns! / define (top-level + forward-decl + ns-splice),
   ;; foreign-procedure (ffi lowering). A local shadowing these only clashes when
   ;; the def/ffi/var-cache form is emitted inside that local's scope.
+  ;; ffi variadic boundary — jolt.ffi/__cfn {:varargs-after n} is validated at
+  ;; analyze time (fail closed): n must be a positive literal integer no greater
+  ;; than the declared argtype count. These :throws rows exercise the analyzer
+  ;; guard directly; __cfn is a special form, so no require is needed.
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after 3.0})" :expected :throws}
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after 0})" :expected :throws}
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after -1})" :expected :throws}
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t] :int {:varargs-after 3})" :expected :throws}
   ;; munge-injective (compiler-review R2 stage 2). munge-name maps ' -> $P, # -> $H,
   ;; and $ -> $$ (escape-first) so distinct Clojure locals get distinct Scheme ids.
   ;; Pre-remint a' and a_PRIME_ both emit a_PRIME_ (old ' -> _PRIME_ substitution),
@@ -1582,4 +1614,10 @@
   ;; A PARTIAL provider value merges over ROOT: only :months is stated, and MMMM
   ;; still answers.
   {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"de-test\" {:months [\"Januar\" \"Februar\" \"März\" \"April\" \"Mai\" \"Juni\" \"Juli\" \"August\" \"September\" \"Oktober\" \"November\" \"Dezember\"]}) (.format (java.text.SimpleDateFormat. \"MMMM\" 'de-test) (java.util.Date. 1393632000000)))" :expected "\"März\""}
+
+  ;; Loading jolt.main pulls the complete CLI/dependency namespace graph into
+  ;; this source gate. Keep these private-helper checks last: run-unit's reset
+  ;; deliberately prunes vars and loader marks, but source-root additions made
+  ;; by existing add-deps cases are process-global and are not rolled back.
+  {:suite "path-contract" :label "deps and build helpers share the native project-path contract" :expected "true" :expr "(do (require 'jolt.main) (let [abspath @#'jolt.deps/abspath output @#'jolt.main/build-output-path basename @#'jolt.main/project-basename windows? (= :windows (:os (jolt.host/target))) project (if windows? \"D:\\\\p\" \"/p\") absolute (if windows? \"C:\\\\already\\\\out\" \"/already/out\") relative \"dist/app\"] (and (= absolute (abspath project absolute)) (= (str project \"/\" relative) (abspath project relative)) (= (str project \"/target/debug/demo\") (output project \"dev\" \"demo\" nil)) (= absolute (output project \"release\" \"demo\" absolute)) (= (str project \"/\" relative) (output project \"release\" \"demo\" relative)) (= [\"demo\" (if windows? \"demo\" \"D:\\\\workspace\\\\demo\\\\\") \"app\" (if windows? \"tools\" \"acme\\\\tools\") (if windows? \"app\" \"C:\") (if windows? \"app\" \"D:\\\\\")] [(basename \"/workspace/demo/\" \"app.core\") (basename \"D:\\\\workspace\\\\demo\\\\\" \"app.core\") (basename \"/\" \"app.core\") (basename \"/tmp/acme\\\\tools\" \"app.core\") (basename \"/tmp/C:\" \"app.core\") (basename \"D:\\\\\" \"app.core\")]))))"}
 ]

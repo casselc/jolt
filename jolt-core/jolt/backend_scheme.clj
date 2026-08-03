@@ -161,6 +161,14 @@
 (defn set-source-reg! [on] (reset! (:source-reg? (cur)) (boolean on)))
 (defn- source-reg? [] @(:source-reg? (cur)))
 
+;; Compile-time selection for the isolated simulation image: when armed, every
+;; `jolt.ffi/defcfn` call site emits a branch that lets an installed FFI
+;; controller intercept the call before it reaches native code. Ordinary
+;; release/debug units never set this, so their emitted output contains no
+;; simulator reference. Unit state, not a process-global mode.
+(defn set-sim-instrument! [on] (reset! (:sim-instrument? (cur)) (boolean on)))
+(defn- sim-instrument? [] @(:sim-instrument? (cur)))
+
 ;; A direct-link Scheme binding name for a var. The fqn maps to a unique identifier
 ;; jv$<ns>$<name>; chars that break a Scheme identifier or the `$` separator are
 ;; escaped so distinct vars never collide.
@@ -593,19 +601,52 @@
         ret (ffi-type->chez (:rettype node))
         csym (chez-str-lit (:csym node))
         capture (:capture-native-error node)
+        block? (:blocking node)
+        va (:varargs-after node)
+        va-token (when va (str "(__varargs_after " va ")"))
+        ;; Chez foreign conventions. (__varargs_after n) declares the fixed-
+        ;; argument boundary of a variadic C function, which is required on
+        ;; targets whose variadic and fixed calling conventions differ; it
+        ;; composes with __collect_safe (a :blocking call) and follows it, the
+        ;; order the native-error capture macro splices into its conventions.
+        fp-convs (str (when block? "__collect_safe ")
+                      (when va (str va-token " ")))
+        ne-convs (cond
+                   (and block? va) (str "(__collect_safe " va-token ")")
+                   block?          "(__collect_safe)"
+                   va              (str "(" va-token ")")
+                   :else           "()")
         fp (if capture
-             (str "(jolt-ffi-native-error-procedure "
-                  (if (:blocking node) "(__collect_safe)" "()") " "
+             (str "(jolt-ffi-native-error-procedure " ne-convs " "
                   csym " (" args ") " ret ")")
-             (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
+             (str "(foreign-procedure " fp-convs
                   csym " (" args ") " ret ")"))
         call (str "((or p (begin (set! p " fp ") p)) "
                   (str/join " " params) ")")
-        body (if capture
-               (str "(call-with-values (lambda () " call ")"
-                    " (lambda (result native-error)"
-                    " (jolt-vector result native-error)))")
-               call)]
+        native-body (if capture
+                      (str "(call-with-values (lambda () " call ")"
+                           " (lambda (result native-error)"
+                           " (jolt-vector result native-error)))")
+                      call)
+        ;; Isolated sim image only: snapshot the effective FFI controller once
+        ;; per call and let it intercept before native code runs. The hook
+        ;; receives a descriptor built fresh from this call site's own emitted
+        ;; type/arity/flags/variadic boundary, plus a thunk that runs the
+        ;; untouched native body
+        ;; on request — ordinary release/debug units never set sim-instrument?
+        ;; and emit exactly native-body, with no simulator reference at all.
+        body (if (sim-instrument?)
+               (str "(let ((h (jolt-sim-current-ffi-hook))) (if h "
+                    "(jolt-ffi-invoke-sim-hook h "
+                    "(jolt-ffi-make-sim-descriptor " csym " "
+                    "(list " (str/join " " (map chez-str-lit (:argtypes node))) ") "
+                    (chez-str-lit (:rettype node)) " "
+                    (if (:blocking node) "#t" "#f") " "
+                    (if capture "#t" "#f") " "
+                    (if va (str va) "#f") " "
+                    "(list " (str/join " " params) ")) "
+                    "(lambda () " native-body ")) " native-body "))")
+               native-body)]
     ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
     ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
     ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
