@@ -291,11 +291,11 @@
 
 ;; Wrapping (unchecked) coercions: truncate to the width and sign-fold like the
 ;; JVM primitive conversions ((unchecked-byte 200) is -56); unchecked-char wraps
-;; into char range. unchecked-long/int are host natives (converters.ss).
-(defn unchecked-byte [x]
-  (let [b (bit-and (unchecked-long x) 0xff)] (if (< b 128) b (- b 256))))
-(defn unchecked-short [x]
-  (let [s (bit-and (unchecked-long x) 0xffff)] (if (< s 32768) s (- s 65536))))
+;; into char range. unchecked-long/int/byte/short are host natives
+;; (converters.ss) — byte and short moved there because every element read
+;; through a byte view pays one, and the Clojure form cost a var deref plus
+;; generic bit-and/</- per conversion. unchecked-char stays here: it returns a
+;; char rather than an exact integer and is not on that path.
 (defn unchecked-char [x] (char (bit-and (unchecked-long x) 0xffff)))
 (defn unchecked-float [x] (double x))
 (defn unchecked-double [x] (double x))

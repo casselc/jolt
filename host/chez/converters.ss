@@ -271,8 +271,23 @@
                               -2147483648 2147483647))
       (let ((i (bitwise-and (jolt-unchecked-long x) #xffffffff)))
         (if (>= i #x80000000) (- i #x100000000) i))))
+;; unchecked-byte/short: mask to the width and sign-fold, exactly as
+;; unchecked-int does at 32 bits. These were the only wrapping coercions still
+;; defined in the clojure.core overlay (22-coll.clj) rather than here, which put
+;; a var deref, a call to unchecked-long, and generic bit-and/</- on every
+;; conversion. jolt.bytes/Window reads one byte per element through
+;; unchecked-byte, so that cost is paid per byte of every decoded frame:
+;; measured at ~209 ns/byte against ~27 for the aget it wraps.
+(define (jolt-unchecked-byte x)
+  (let ((b (bitwise-and (jolt-unchecked-long x) #xff)))
+    (if (>= b #x80) (- b #x100) b)))
+(define (jolt-unchecked-short x)
+  (let ((s (bitwise-and (jolt-unchecked-long x) #xffff)))
+    (if (>= s #x8000) (- s #x10000) s)))
 (def-var! "clojure.core" "unchecked-long" jolt-unchecked-long)
 (def-var! "clojure.core" "unchecked-int" jolt-unchecked-int)
+(def-var! "clojure.core" "unchecked-byte" jolt-unchecked-byte)
+(def-var! "clojure.core" "unchecked-short" jolt-unchecked-short)
 (def-var! "clojure.core" "double" jolt-double)
 ;; float: Chez has no single-float type, so the value stays a flonum — but the
 ;; cast range-checks against Float/MAX_VALUE like RT.floatCast (an infinity is
