@@ -1275,6 +1275,9 @@
 (def-var! "jolt.host" "source-roots" (lambda () (list->cseq source-roots)))
 (def-var! "jolt.host" "load-namespace" (lambda (n) (load-namespace n) jolt-nil))
 (def-var! "jolt.host" "file-exists?" (lambda (p) (if (file-exists? p) #t #f)))
+(def-var! "jolt.host" "absolute-path?" jolt-path-absolute?)
+(def-var! "jolt.host" "rooted-path?" jolt-path-rooted?)
+(def-var! "jolt.host" "resolve-project-path" jolt-resolve-project-path)
 ;; …and whether it is a DIRECTORY, which file-exists? also answers #t for. A bare
 ;; argv token is dispatched as a file to run before a :tasks lookup (main.clj's
 ;; run-file-arg?), so `jolt test` in any project with a test/ dir — which is every
