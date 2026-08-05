@@ -8,7 +8,7 @@
 ;; installs its bridge through that file's declared-call seam).
 ;;
 ;; This is the complete prerelease controller overlay: composite ABI 6 with FFI
-;; descriptor version 7 (unreleased; no compatibility with any earlier FFI
+;; descriptor version 8 (unreleased; no compatibility with any earlier FFI
 ;; descriptor shape). It owns
 ;; future-lifecycle, monotonic-clock, typed foreign-call, and raw
 ;; native-operation interception, unified behind ONE atomic install/restore
@@ -312,7 +312,7 @@
 (def-var! "clojure.core" "future-call" jolt-sim-future-call)
 (def-var! "clojure.core" "future-cancel" jolt-sim-future-cancel)
 
-;; === exact descriptor-v7 projection ==========================================
+;; === exact descriptor-v8 projection ==========================================
 ;; The canonical seam hands the bridge one of two raw host alists per
 ;; intercepted call:
 ;;   foreign:  ((kind . foreign-call) (csym . string) (argtypes . (string …))
@@ -332,7 +332,10 @@
   ;; host/chez/java/ffi.ss, including null? and excluding borrow/release —
   ;; with-byte-array-pointer's scoped loan lifecycle is runtime-owned, so no
   ;; loan descriptor ever reaches a controller (its enclosed FFI is
-  ;; intercepted normally by the canonical seam).
+  ;; intercepted normally by the canonical seam). The scoped byte-array view
+  ;; vars at the bottom of this file are likewise NOT operations here: they
+  ;; copy between a controller and the runtime-owned locked temporary behind
+  ;; an active loan directly and carry no descriptor at all.
   '("load-library" "loaded?" "alloc" "free" "read" "write" "sizeof" "null?"
     "read-bytes" "write-bytes" "read-array" "read-array!" "write-array"
     "ptr->string" "string->ptr"))
@@ -532,7 +535,7 @@
 (define (jolt-sim-supervisor-mono-nanos)
   (->num (jolt-sim-supervisor-mono-nanos-source)))
 
-;; === public prerelease controller ABI (composite 6, FFI descriptor 7) ========
+;; === public prerelease controller ABI (composite 6, FFI descriptor 8) ========
 (define jolt-sim-kw-abi-version (keyword #f "abi-version"))
 (define jolt-sim-kw-future-lifecycle (keyword #f "future-lifecycle"))
 (define jolt-sim-kw-controller-errors (keyword #f "controller-errors"))
@@ -552,6 +555,13 @@
 (define jolt-sim-kw-owner-thread (keyword #f "owner-thread"))
 (define jolt-sim-kw-lifo (keyword #f "lifo"))
 (define jolt-sim-kw-scoped-byte-array-release (keyword #f "scoped-byte-array-release"))
+(define jolt-sim-kw-scoped-byte-array-view (keyword #f "scoped-byte-array-view"))
+(define jolt-sim-kw-read-active-byte-array-view
+  (keyword #f "read-active-byte-array-view"))
+(define jolt-sim-kw-write-active-byte-array-view!
+  (keyword #f "write-active-byte-array-view!"))
+(define jolt-sim-kw-read-arity (keyword #f "read-arity"))
+(define jolt-sim-kw-write-arity (keyword #f "write-arity"))
 (define jolt-sim-kw-runtime-owned (keyword #f "runtime-owned"))
 (define jolt-sim-kw-operations (keyword #f "operations"))
 (define jolt-sim-kw-result (keyword #f "result"))
@@ -600,7 +610,7 @@
     jolt-sim-kw-clock-controller-arity 2)
    jolt-sim-kw-ffi-interception
    (jolt-hash-map
-    jolt-sim-kw-descriptor-version 7
+    jolt-sim-kw-descriptor-version 8
     jolt-sim-kw-kinds (jolt-vector jolt-sim-kw-foreign-function
                                    jolt-sim-kw-native-operation)
     jolt-sim-kw-arguments jolt-sim-kw-live
@@ -610,7 +620,25 @@
                             jolt-sim-native-operation-names))
     jolt-sim-kw-proceed-routing
     (jolt-assoc jolt-sim-proceed-capabilities
-                jolt-sim-kw-scoped-byte-array-release jolt-sim-kw-runtime-owned))
+                jolt-sim-kw-scoped-byte-array-release jolt-sim-kw-runtime-owned)
+    ;; The OPTIONAL scoped byte-array view: a controller's only window into
+    ;; the runtime-owned temporary behind an ACTIVE with-byte-array-pointer
+    ;; loan of its own thread. Both operations return nil for an unmatched
+    ;; address (stale/post-extent, cross-thread, never-loaned) and fail closed
+    ;; with IndexOutOfBoundsException for a matched address with an
+    ;; out-of-range span. No acquire/release or borrow/release operation or
+    ;; descriptor exists: the loan's dynamic extent owns the temporary, and
+    ;; copy-back on exit remains the only publisher of temporary writes.
+    jolt-sim-kw-scoped-byte-array-view
+    (jolt-hash-map
+     jolt-sim-kw-operations
+     (jolt-vector jolt-sim-kw-read-active-byte-array-view
+                  jolt-sim-kw-write-active-byte-array-view!)
+     jolt-sim-kw-read-arity 2
+     jolt-sim-kw-write-arity 2
+     jolt-sim-kw-owner-thread #t
+     jolt-sim-kw-dynamic-extent #t
+     jolt-sim-kw-runtime-owned #t))
    jolt-sim-kw-clock-interception
    (jolt-hash-map
     jolt-sim-kw-descriptor-version 1
@@ -725,3 +753,17 @@
 (def-var! "jolt.internal.sim" "clear-controller-errors!" jolt-future-hook-errors-clear!)
 (def-var! "jolt.internal.sim" "supervisor-mono-nanos"
           jolt-sim-supervisor-mono-nanos)
+;; The OPTIONAL scoped byte-array view vars (advertised under
+;; :ffi-interception/:scoped-byte-array-view). They are the safe controller
+;; window into the runtime-owned locked temporary behind an ACTIVE
+;; with-byte-array-pointer loan of the calling thread: unmatched addresses
+;; (stale/post-extent, cross-thread, never-loaned) answer nil, a matched
+;; address with an out-of-range span fails closed with
+;; IndexOutOfBoundsException, and neither var exposes loan acquire/release —
+;; the loan's dynamic extent and copy-back own the temporary's lifetime. Both
+;; are the exact host entries from host/chez/java/ffi.ss, unwrapped: they are
+;; not intercepted and carry no descriptor.
+(def-var! "jolt.internal.sim" "read-active-byte-array-view"
+          ffi-read-active-byte-array-view)
+(def-var! "jolt.internal.sim" "write-active-byte-array-view!"
+          ffi-write-active-byte-array-view!)
