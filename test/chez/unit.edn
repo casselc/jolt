@@ -1589,4 +1589,12 @@
   ;; Wider than the JVM's 16-bit char by design, hence a unit row not a corpus
   ;; one. Surrogates are not scalar values and stay rejected.
   {:suite "char / code points" :expr "[(int (char 65)) (int (char 128515)) (int (first (str (char 128515)))) (try (char 55296) (catch Exception e (ex-message e))) (try (char 1114112) (catch Exception e (ex-message e)))]" :expected "[65 128515 128515 \"Value out of range for char: 55296\" \"Value out of range for char: 1114112\"]"}
+  ;; ffi fail-closed: a foreign-fn signature type the compiler's ffi-types table
+  ;; does not name is rejected at compile time — never silently marshaled at a
+  ;; guessed width. Truthful before and after any table change (the exact
+  ;; scalar widths ARE named by the table and positively witnessed, memory and
+  ;; signature/callback, by test/chez/ffi-widths-test.ss). __cfn is a special
+  ;; form, so no require is needed and the jolt.ffi runtime vars are
+  ;; irrelevant here — this row exercises the compiler alone.
+  {:suite "ffi" :expr "(jolt.ffi/__cfn \"strlen\" [:bogus] :size_t)" :expected :throws}
 ]
