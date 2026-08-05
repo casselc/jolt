@@ -105,11 +105,25 @@ sim_line="$(grep -n '^(define jolt-sim-runtime-image?' "$sim.build/flat.ss" | he
   fail "overlay (flat.ss line $sim_line) does not follow java/ffi.ss (line $ffi_line)"
 ok
 
-# --- 4b. no overlay leaks into any ordinary image flat source present -----------
+# --- 4b. no active overlay leaks into an ordinary image present -----------------
+# Ordinary compiler images embed build.ss as source so they can build apps. That
+# generic source necessarily names the optional sim marker, but it must not
+# contain a top-level overlay definition or install the public sim vars at run
+# time. Count actual definitions (the same structural check as the sim image),
+# then ask each executable image directly.
 for f in target/release/jolt.build/flat.ss target/debug/jolt.build/flat.ss; do
   if [ -f "$f" ]; then
-    n="$(grep -c 'jolt-sim-runtime-image?' "$f" || true)"
-    [ "$n" = "0" ] || fail "ordinary image flat source $f mentions the sim overlay $n time(s)"
+    ordinary="${f%.build/flat.ss}"
+    n="$(overlay_count "$ordinary")"
+    [ "$n" = "0" ] || fail "ordinary image $ordinary has $n active sim overlay definition(s)"
+    if [ -x "$ordinary" ]; then
+      profile="$(basename "$(dirname "$ordinary")")"
+      state="$("$ordinary" -e '(if (find-var (quote jolt.internal.sim/capabilities)) :present :absent)' \
+        2>"$tmp/ordinary-$profile-e.err")" \
+        || fail "$ordinary -e exited non-zero (see $tmp/ordinary-$profile-e.err)"
+      [ "$state" = ":absent" ] || \
+        fail "$ordinary has jolt.internal.sim/capabilities ('$state'), want :absent"
+    fi
     ok
   fi
 done
