@@ -197,12 +197,35 @@
                 ((> (string-length cwd) 0) cwd)
                 (else "."))))))
 
+;; Classify an absolute native path without touching the filesystem. POSIX
+;; absolute paths begin with '/'. Windows absolute paths are either
+;; drive-qualified (C:/x or C:\x) or UNC (\\server\share, accepting '/' too).
+;; A bare drive designator such as C:x remains relative. This must use the Jolt
+;; target, not the build host: cross-images execute this source for the target.
+(define (jolt-ascii-alpha? c)
+  (or (and (char>=? c #\a) (char<=? c #\z))
+      (and (char>=? c #\A) (char<=? c #\Z))))
+(define (jolt-native-path-separator? c)
+  (or (char=? c #\/) (char=? c #\\)))
+(define (jolt-native-path-absolute-for? windows? p)
+  (if windows?
+      (or (and (>= (string-length p) 3)
+               (jolt-ascii-alpha? (string-ref p 0))
+               (char=? (string-ref p 1) #\:)
+               (jolt-native-path-separator? (string-ref p 2)))
+          (and (>= (string-length p) 2)
+               (jolt-native-path-separator? (string-ref p 0))
+               (jolt-native-path-separator? (string-ref p 1))))
+      (and (> (string-length p) 0) (char=? (string-ref p 0) #\/))))
+(define (jolt-native-path-absolute? p)
+  (jolt-native-path-absolute-for? (eq? target-os (keyword #f "windows")) p))
+
 ;; A user-facing relative path resolves against user.dir — the user's cwd before
 ;; the launcher cd'd to the jolt repo root — matching the JVM, where io/file is
 ;; cwd-relative. (io/resource builds jfiles from the source roots directly, so it
 ;; isn't routed through here.)
 (define (project-relative p)
-  (if (or (= (string-length p) 0) (char=? (string-ref p 0) #\/))
+  (if (or (= (string-length p) 0) (jolt-native-path-absolute? p))
       p
       (let ((base (jolt-user-dir)))
         ;; "." adds nothing the OS won't do itself when it resolves a relative
@@ -256,7 +279,7 @@
 ;; are user.dir-relative.
 (define (jfile-abs p)
   (cond ((= (string-length p) 0) (jolt-user-dir))
-        ((char=? (string-ref p 0) #\/) p)
+        ((jolt-native-path-absolute? p) p)
         (else (project-relative p))))
 
 ;; --- file metadata over Chez filesystem ops ---------------------------------
@@ -490,7 +513,7 @@
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
-      ((string=? name "isAbsolute")     (list (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/)) #t #f)))
+      ((string=? name "isAbsolute")     (list (jolt-native-path-absolute? p)))
       ;; listFiles builds each child from the path AS GIVEN (new File(this, name)
       ;; on the JVM), so a File made from a relative path lists relative children.
       ((string=? name "listFiles")      (list (list->cseq (map make-jfile (jolt-list-dir p)))))
