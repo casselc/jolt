@@ -61,7 +61,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
-  traceemit \
+  simcontroller traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
 
@@ -118,6 +118,7 @@ install: build
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffideclaredhook ffinativehook stdlibfasl \
+  simcontroller \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -515,6 +516,13 @@ ffideclaredhook:
 # so verify it against the same fresh transient seed.
 ffinativehook:
 	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/ffi-native-sim-hook-test.ss
+
+# The sim controller bridge (host/chez/sim/runtime.ss) is a source-loaded
+# overlay on the declared-call seam; its gate drives declared calls and raw
+# native ops through the one persistent bridge, so verify it against a fresh
+# transient seed like ffideclaredhook.
+simcontroller:
+	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/sim-controller-bridge-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
