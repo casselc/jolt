@@ -1,5 +1,5 @@
 ;; Sim controller bridge gate (host/chez/sim/runtime.ss, composite ABI 6 with
-;; FFI descriptor version 7).
+;; FFI descriptor version 8).
 ;; The overlay installs one persistent bridge through the canonical
 ;; declared-call seam and this gate drives declared calls AND raw native ops
 ;; through that bridge, so run it against a fresh transient seed through
@@ -72,8 +72,8 @@
 
 (define caps (jolt-sim-capabilities))
 (ok "controller ABI is exactly prerelease 6" (= 6 (mget caps "abi-version")))
-(ok "FFI descriptor is exactly 7"
-    (= 7 (mget (mget caps "ffi-interception") "descriptor-version")))
+(ok "FFI descriptor is exactly 8"
+    (= 8 (mget (mget caps "ffi-interception") "descriptor-version")))
 (ok "clock descriptor is exactly 1"
     (= 1 (mget (mget caps "clock-interception") "descriptor-version")))
 (ok "public installation descriptor names one exact complete config"
@@ -98,7 +98,7 @@
                        :future-controller-arity 3
                        :ffi-controller-arity 2
                        :clock-controller-arity 2}
-        :ffi-interception {:descriptor-version 7
+        :ffi-interception {:descriptor-version 8
                            :kinds [:foreign-function :native-operation]
                            :arguments :live
                            :task-identity :future-lifecycle
@@ -110,7 +110,13 @@
                            :proceed-routing {:controller-arity 2 :proceed-arity 0
                                              :single-use true :dynamic-extent true
                                              :owner-thread true :lifo true
-                                             :scoped-byte-array-release :runtime-owned}}
+                                             :scoped-byte-array-release :runtime-owned}
+                           :scoped-byte-array-view
+                           {:operations [:read-active-byte-array-view
+                                         :write-active-byte-array-view!]
+                            :read-arity 2 :write-arity 2
+                            :owner-thread true :dynamic-extent true
+                            :runtime-owned true}}
         :clock-interception {:descriptor-version 1
                              :operations [:mono-nanos]
                              :result :exact-integer-nanoseconds
@@ -119,7 +125,7 @@
                              :proceed-routing {:controller-arity 2 :proceed-arity 0
                                                :single-use true :dynamic-extent true
                                                :owner-thread true :lifo true}}}"))
-(ok "capability map matches the one exact ABI 6 / descriptor 7 contract"
+(ok "capability map matches the one exact ABI 6 / descriptor 8 contract"
     (jolt=2 caps expected-capabilities))
 (ok "sim public ABI exports no independent subcontroller installers"
     (for-all
@@ -1421,6 +1427,88 @@
             (list fhk-spawn fhk-start fhk-cancel fhk-exit)))
 (jolt-sim-restore-controller! cx-inner-token)
 (jolt-sim-restore-controller! cx-outer-token)
+
+;; --- L. scoped byte-array view vars: the controller window into a loan -------
+;; The two OPTIONAL vars advertised under :ffi-interception/:scoped-byte-array-view
+;; are a controller's only byte-copying window into the runtime-owned temporary
+;; behind an ACTIVE with-byte-array-pointer loan: inside a controller
+;; invocation the canonical activation rejects a nested raw FFI operation on
+;; the loaned pointer (section G), while the view vars read/write the tracked
+;; locked temporary directly, carrying no descriptor of any kind.
+(define view-read-var (var-deref "jolt.internal.sim" "read-active-byte-array-view"))
+(define view-write-var (var-deref "jolt.internal.sim" "write-active-byte-array-view!"))
+(ok "sim public ABI exposes the exact scoped byte-array view vars"
+    (and (var-cell-lookup "jolt.internal.sim" "read-active-byte-array-view")
+         (var-cell-lookup "jolt.internal.sim" "write-active-byte-array-view!")))
+(ok "scoped byte-array view vars take exactly the advertised arities"
+    (and (= 4 (procedure-arity-mask view-read-var))
+         (= 4 (procedure-arity-mask view-write-var))))
+(ok "view vars answer nil with no active loan"
+    (and (jolt-nil? (view-read-var 424242 1))
+         (jolt-nil? (view-write-var 424242 sweep-ba))))
+
+;; A controller observing an intercepted write-array on a loaned pointer:
+;; snapshot the temporary with the read view, proceed (the exact original
+;; write-array mutates the same temporary), patch an interior span with the
+;; write view, and let the loan's ordinary copy-back publish both effects.
+(define view-snapshots '())
+(define view-write-result #f)
+(define view-captured-p #f)
+(define view-nested-ffi-rejected? #f)
+(define view-ba-patch (na-byte-array (jolt-vector 5 6)))
+(define view-token
+  (install
+   (lambda (d proceed)
+     (if (and (eq? (mget d "kind") (kw "native-operation"))
+              (eq? (mget d "operation") (kw "write-array")))
+         (let ((p (pvec-nth-d (mget d "arguments") 0 jolt-nil)))
+           (set! view-captured-p p)
+           ;; The canonical activation still rejects a nested raw FFI read on
+           ;; the loaned pointer; the view is the supported window.
+           (set! view-nested-ffi-rejected?
+                 (raises? (lambda () (ffi-read p (kw "uint8")))))
+           (set! view-snapshots (cons (view-read-var p 4) view-snapshots))
+           (let ((r (jolt-invoke proceed)))
+             (set! view-write-result (view-write-var (+ p 2) view-ba-patch))
+             r))
+         (jolt-invoke proceed)))
+   native-clock))
+(define view-roundtrip
+  (jolt-truthy?
+   (ev "(let [a (byte-array [1 2 3 4])]
+          (jolt.ffi/with-byte-array-pointer a
+            (fn [p n] (jolt.ffi/write-array p (byte-array [9 8 7 6]))))
+          (= [9 8 5 6] (vec a)))")))
+(jolt-sim-restore-controller! view-token)
+(ok "controller-phase nested raw FFI on the loaned pointer still fails"
+    view-nested-ffi-rejected?)
+(ok "controller read view snapshots the temporary before the proceeded write"
+    (and (= 1 (length view-snapshots))
+         (equal? '(1 2 3 4)
+                 (vector->list (jolt-array-vec (car view-snapshots))))))
+(ok "controller write view patched the temporary and reported its exact count"
+    (= 2 view-write-result))
+(ok "proceeded write and view patch both copy back at loan exit"
+    view-roundtrip)
+(ok "the captured loan pointer is stale after the dynamic extent"
+    (jolt-nil? (view-read-var view-captured-p 1)))
+
+;; The public Clojure surface: nil outside a loan, a whole-span read, an
+;; interior write re-read inside the extent, and copy-back at exit — all
+;; through the exact jolt.internal.sim vars with no controller installed.
+(ok "jolt code drives the view vars through the public var surface"
+    (jolt-truthy?
+     (ev "(let [a (byte-array [10 20 30 40])
+                rv (deref (find-var 'jolt.internal.sim/read-active-byte-array-view))
+                wv (deref (find-var 'jolt.internal.sim/write-active-byte-array-view!))]
+            (and (nil? (rv 16 1))
+                 (nil? (wv 16 (byte-array [0])))
+                 (jolt.ffi/with-byte-array-pointer a
+                   (fn [p n]
+                     (and (= [10 20 30 40] (vec (rv p n)))
+                          (= 2 (wv (inc p) (byte-array [1 2])))
+                          (= [10 1 2 40] (vec (rv p n))))))
+                 (= [10 1 2 40] (vec a))))")))
 
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

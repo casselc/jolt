@@ -12,6 +12,16 @@
 ;; that overlapping same-array cross-thread loans are supported; and reject a
 ;; captured continuation's re-entry after first exit before the callback resumes.
 ;;
+;; It also covers the scoped byte-array VIEW operations the simulation overlay
+;; publishes as the optional jolt.internal.sim/read-active-byte-array-view and
+;; jolt.internal.sim/write-active-byte-array-view! vars: fresh-array reads of
+;; the whole or an interior span of the runtime-owned temporary behind an
+;; ACTIVE loan of the current thread, exact-count writes that copy back at
+;; exit, fail-closed IndexOutOfBoundsException spans at a matched address, nil
+;; for unmatched, stale/post-extent, and inherited cross-thread addresses, and
+;; both loans reachable while distinct-array loans nest — all without any
+;; acquire/release descriptor or lifecycle exposure.
+;;
 ;; The public pointer is an address into the private locked bytevector, NEVER the
 ;; signed vector backing the jolt byte-array. The portable C helper performs a
 ;; real write through that pointer; the jolt array changes only when the scope
@@ -39,6 +49,13 @@
       (cond ((> (+ i nsub) ns) #f)
             ((string=? (substring s i (+ i nsub)) sub) #t)
             (else (loop (+ i 1)))))))
+;; the exact JVM class name of a synchronously thrown jolt throwable, #f when
+;; the thunk returns normally or raises a non-jolt (raw host) condition.
+(define (thrown-class thunk)
+  (guard (e (#t (let ((x (jolt-unwrap-throw e)))
+                  (and (jolt-ex-info-record? x)
+                       (jolt-ex-info-record-class-name x)))))
+    (thunk) #f))
 
 (define helper-so (getenv "JOLT_FFI_BYTE_ARRAY_POINTER_HELPER"))
 (unless helper-so
@@ -268,6 +285,175 @@
            (bytevector? tmp)
            (not (locked-object? tmp))
            (= 77 (vector-ref v 0)))))
+
+;; --- scoped byte-array view over the ACTIVE loan (Scheme level) --------------
+;; The two operations the simulation overlay publishes under jolt.internal.sim
+;; are host entries in host/chez/java/ffi.ss, exercised here directly. All
+;; source byte-arrays are built BEFORE any callback runs, so no compile-eval
+;; happens inside a loan extent.
+(define view-src0 (ev "(byte-array 0)"))
+(define view-src1 (ev "(byte-array [9])"))
+(define view-src2 (ev "(byte-array [7 8])"))
+(define view-src3 (ev "(byte-array 3)"))
+
+;; Read the whole span and an interior span; a write through the view copies
+;; back at exit exactly like a native write through the pointer.
+(let* ((a (ev "(byte-array [1 2 3 4])")) (v (jolt-array-vec a))
+       (inside
+        (ffi-with-scoped-byte-array-pointer "test"
+         a 1 2
+         (lambda (p n)
+           (list (vector->list (jolt-array-vec
+                                (ffi-read-active-byte-array-view p n)))
+                 (vector->list (jolt-array-vec
+                                (ffi-read-active-byte-array-view (+ p 1) 1)))
+                 (ffi-write-active-byte-array-view! (+ p 1) view-src1))))))
+  (ok "active view reads the loan span and an interior span, and writes copy back"
+      (and (equal? '(2 3) (car inside))
+           (equal? '(3) (cadr inside))
+           (= 1 (caddr inside))
+           (equal? '#(1 2 9 4) v))))
+
+;; A native write through the loaned pointer is observable through the view
+;; before exit, then copies back.
+(let* ((a (ev "(byte-array [5 6])")) (v (jolt-array-vec a))
+       (seen
+        (ffi-with-scoped-byte-array-pointer "test"
+         a 0 2
+         (lambda (p n)
+           (foreign-set! 'unsigned-8 p 0 200)
+           (foreign-set! 'unsigned-8 p 1 201)
+           (vector->list
+            (jolt-array-vec (ffi-read-active-byte-array-view p n)))))))
+  (ok "active view observes native writes through the loan pointer"
+      (and (equal? '(-56 -55) seen) (equal? '#(-56 -55) v))))
+
+;; A matched address with an out-of-range span fails CLOSED before any
+;; temporary access or mutation; the exact byte-array kind is validated only
+;; after the address matches, so an unmatched address is nil for any source.
+(let* ((a (ev "(byte-array [1 2])")) (v (jolt-array-vec a))
+       (results
+        (ffi-with-scoped-byte-array-pointer "test"
+         a 0 2
+         (lambda (p n)
+           (list (thrown-class (lambda () (ffi-read-active-byte-array-view p 3)))
+                 (thrown-class (lambda () (ffi-read-active-byte-array-view p -1)))
+                 (thrown-class (lambda ()
+                                 (ffi-read-active-byte-array-view (+ p 2) 1)))
+                 (thrown-class (lambda ()
+                                 (ffi-write-active-byte-array-view! p view-src3)))
+                 (thrown-class (lambda ()
+                                 (ffi-write-active-byte-array-view! p 7)))
+                 (ffi-write-active-byte-array-view! (- p 1) 7)
+                 (ffi-read-active-byte-array-view "not-a-pointer" 1))))))
+  (ok "matched address with an out-of-range span fails closed without mutation"
+      (and (equal? '("java.lang.IndexOutOfBoundsException"
+                     "java.lang.IndexOutOfBoundsException"
+                     "java.lang.IndexOutOfBoundsException"
+                     "java.lang.IndexOutOfBoundsException"
+                     "java.lang.IllegalArgumentException")
+                   (list (car results) (cadr results) (caddr results)
+                         (cadddr results) (car (cddddr results))))
+           (jolt-nil? (cadr (cddddr results)))
+           (jolt-nil? (caddr (cddddr results)))
+           (equal? '#(1 2) v))))
+
+;; The exact tail starts an EMPTY in-range view, mirroring the exact-tail
+;; empty loan: a zero-length read there returns a fresh empty byte-array, not
+;; nil, and a zero-length write copies nothing and reports 0.
+(let* ((a (ev "(byte-array [1 2])"))
+       (tail
+        (ffi-with-scoped-byte-array-pointer "test"
+         a 0 2
+         (lambda (p n)
+           (list (ffi-read-active-byte-array-view (+ p 2) 0)
+                 (ffi-write-active-byte-array-view! (+ p 2) view-src0))))))
+  (ok "exact-tail empty view is in range"
+      (and (jolt-array? (car tail))
+           (equal? '#() (jolt-array-vec (car tail)))
+           (= 0 (cadr tail)))))
+
+;; Addresses outside every active owner-thread loan answer nil: below the
+;; base, beyond the tail, and a never-loaned address, during the extent.
+(let* ((a (ev "(byte-array [1 2])"))
+       (misses
+        (ffi-with-scoped-byte-array-pointer "test"
+         a 0 2
+         (lambda (p n)
+           (list (ffi-read-active-byte-array-view (- p 1) 1)
+                 (ffi-read-active-byte-array-view (+ p 3) 1)
+                 (ffi-read-active-byte-array-view 0 1)
+                 (ffi-write-active-byte-array-view! (+ p 3) view-src1))))))
+  (ok "unmatched addresses answer nil during the extent"
+      (for-all jolt-nil? misses)))
+
+;; After the dynamic extent the loan is retired and its address is stale:
+;; both operations answer nil on the exact pointer that was live inside.
+(let* ((a (ev "(byte-array [1 2])"))
+       (live-p (ffi-with-scoped-byte-array-pointer "test" a 0 2
+                 (lambda (p n) p))))
+  (ok "stale post-extent addresses answer nil"
+      (and (integer? live-p)
+           (jolt-nil? (ffi-read-active-byte-array-view live-p 1))
+           (jolt-nil? (ffi-write-active-byte-array-view! live-p view-src1)))))
+
+;; A forked child inherits the cell (now carrying the tracked loan entry) but
+;; reads it as empty under owner tagging: its view operations on the parent's
+;; live pointer are denied with nil, never an error and never a peek.
+(let* ((a (ev "(byte-array [1 2])")) (v (jolt-array-vec a))
+       (mu (make-mutex)) (cv (make-condition))
+       (done? #f) (child-result #f)
+       (deadline (ms->deadline 5000))
+       (parent-id (get-thread-id)))
+  (ffi-with-scoped-byte-array-pointer "test"
+   a 0 2
+   (lambda (p n)
+     (fork-thread
+      (lambda ()
+        (let ((result
+               (guard (e (#t e))
+                 (and (not (= parent-id (get-thread-id)))
+                      (null? (ffi-current-byte-array-loans))
+                      (jolt-nil? (ffi-read-active-byte-array-view p 1))
+                      (jolt-nil? (ffi-write-active-byte-array-view!
+                                  p view-src1))))))
+          (with-mutex mu
+            (set! child-result result)
+            (set! done? #t)
+            (condition-signal cv)))))
+     (with-mutex mu
+       (let wait ()
+         (cond (done? #t)
+               ((condition-wait cv mu deadline) (wait))
+               (else done?))))))
+  ;; A lost child or signal is a bounded test failure, never a hung gate.
+  (ok "a forked child is denied the parent's active loan view"
+      (and done? (eq? child-result #t) (equal? '#(1 2) v))))
+
+;; Distinct-array nesting keeps BOTH loans reachable through the view while
+;; the inner extent runs; each writes only its own temporary.
+(let* ((a (ev "(byte-array [1 2])")) (av (jolt-array-vec a))
+       (b (ev "(byte-array [3 4])")) (bv (jolt-array-vec b))
+       (inner
+        (ffi-with-scoped-byte-array-pointer "test"
+         a 0 2
+         (lambda (pa na)
+           (ffi-with-scoped-byte-array-pointer "test"
+            b 0 2
+            (lambda (pb nb)
+              (list (vector->list (jolt-array-vec
+                                   (ffi-read-active-byte-array-view pa na)))
+                    (vector->list (jolt-array-vec
+                                   (ffi-read-active-byte-array-view pb nb)))
+                    (ffi-write-active-byte-array-view! (+ pa 1) view-src1)
+                    (ffi-write-active-byte-array-view! pb view-src2))))))))
+  (ok "distinct nested loans each expose their own active view"
+      (and (equal? '(1 2) (car inner))
+           (equal? '(3 4) (cadr inner))
+           (= 1 (caddr inner))
+           (= 2 (cadddr inner))
+           (equal? '#(1 9) av)
+           (equal? '#(7 8) bv))))
 
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
