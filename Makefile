@@ -486,12 +486,19 @@ cts: testbin
 
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
-# The widths gate covers the exact scalar vocabulary across both halves of the
-# API: runtime memory access and compiler-emitted procedures/callables.
+# ffi-widths: the exact scalar widths across both halves of jolt.ffi — runtime
+# memory accessors (sizeof/read/write, signed/unsigned bit equivalence) and the
+# compile-time signature path (native args/results/callbacks through a C helper
+# the wrapper builds). The signature half requires a seed minted from the
+# backend source that declares the widths (`make remint`).
+# ffi-ranged-transfer: read-array! and the ranged write-array copy exact
+# offset/count windows between a byte-array and native memory, validating kind,
+# bounds, and null-for-zero-length before any native access or mutation.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@$(CHEZ) --script test/chez/ffi-ranged-transfer-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
