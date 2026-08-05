@@ -126,23 +126,60 @@
             (map (lambda (form) (jnum->exact (ev form)))
                  '("(r-i8)" "(r-i16)" "(r-u16)" "(r-i32)" "(r-u32)"))))
 
-;; Legal boundary values alone do not distinguish a narrow signature from an
-;; accidentally widened register type on common ABIs: the C callee can truncate
-;; the same value. Each canonical name and alias therefore gets a just-outside-
-;; domain argument that the exact Chez foreign type must reject before C runs.
+;; C calls alone cannot prove the declaration width: a mistakenly widened
+;; foreign signature can still appear correct when the C callee's fixed-width
+;; parameter performs the narrowing. Pin the exact compiler declarations that
+;; both emit-ffi-fn and emit-ffi-callable consume from the re-minted seed.
+(define compiler-ffi-type->chez
+  (var-deref "jolt.backend-scheme" "ffi-type->chez"))
+(ok "compiler maps every exact-width canonical name and alias exactly"
+    (for-all
+     (lambda (entry)
+       (equal? (cdr entry)
+               (jolt-invoke1 compiler-ffi-type->chez (car entry))))
+     '(("int8" . "integer-8")
+       ("i8" . "integer-8")
+       ("int16" . "integer-16")
+       ("short" . "integer-16")
+       ("uint16" . "unsigned-16")
+       ("ushort" . "unsigned-16")
+       ("int32" . "integer-32")
+       ("uint32" . "unsigned-32"))))
+
+;; Chez's exact integer foreign types narrow opposite-signed values that still
+;; fit the same bit-pattern width (rather than rejecting both sides of each
+;; source domain). Assert the observable two's-complement reinterpretation for
+;; every canonical name and alias.
+(ok "i8 narrows 128 to -128"
+    (= -128 (jnum->exact (ev "(w-i8 128)"))))
+(ok "int8 narrows 128 to -128"
+    (= -128 (jnum->exact (ev "(w-int8 128)"))))
+(ok "short narrows 32768 to -32768"
+    (= -32768 (jnum->exact (ev "(w-i16 32768)"))))
+(ok "int16 narrows 32768 to -32768"
+    (= -32768 (jnum->exact (ev "(w-int16 32768)"))))
+(ok "ushort narrows -1 to 65535"
+    (= 65535 (jnum->exact (ev "(w-u16 -1)"))))
+(ok "uint16 narrows -1 to 65535"
+    (= 65535 (jnum->exact (ev "(w-uint16 -1)"))))
+(ok "int32 narrows 2147483648 to -2147483648"
+    (= -2147483648 (jnum->exact (ev "(w-i32 2147483648)"))))
+(ok "uint32 narrows -1 to 4294967295"
+    (= 4294967295 (jnum->exact (ev "(w-u32 -1)"))))
+
+;; Values beyond the accepted bit-pattern envelope still fail closed. Exercise
+;; both spellings at every aliased width so none can silently widen.
 (for-each
  (lambda (named-form)
    (ok (car named-form)
        (raises? (lambda () (ev (cdr named-form))))))
  '(("i8 rejects -129" . "(w-i8 -129)")
-   ("int8 rejects 128" . "(w-int8 128)")
+   ("int8 rejects -129" . "(w-int8 -129)")
    ("short rejects -32769" . "(w-i16 -32769)")
-   ("int16 rejects 32768" . "(w-int16 32768)")
-   ("ushort rejects -1" . "(w-u16 -1)")
+   ("int16 rejects -32769" . "(w-int16 -32769)")
+   ("ushort rejects 65536" . "(w-u16 65536)")
    ("uint16 rejects 65536" . "(w-uint16 65536)")
    ("int32 rejects -2147483649" . "(w-i32 -2147483649)")
-   ("int32 rejects 2147483648" . "(w-i32 2147483648)")
-   ("uint32 rejects -1" . "(w-u32 -1)")
    ("uint32 rejects 4294967296" . "(w-u32 4294967296)")))
 
 ;; --- callback path: C invokes exact-width jolt foreign-callables -------------
