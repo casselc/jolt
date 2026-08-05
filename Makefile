@@ -56,16 +56,16 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
+  devbootsmoke devirt directlink ffi ffideclaredhook ffinativehook fieldjoin fieldnum fieldread flarr grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
-  jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
-  traceemit \
-  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
+  jolt jolt-debug jolt-release jolt-sim joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
+  narrow numeric numwp oparity pic protoret printperf remint sci selectedchez selfhost shakelocal \
+  simcontroller simimagesmoke stateimage traceemit \
+  shakesmoke smoke staticnativesmoke targetfacts test testbin transient unit unitcontext \
   values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci gate-run-test gate-run-ci gate-status
+.PHONY: build install test ci gate-run-test gate-run-ci gate-status selectedchez
 
 default:: build
 
@@ -112,7 +112,8 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
+  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffideclaredhook ffinativehook \
+  simcontroller targetfacts \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   traceemit traceeval \
@@ -221,6 +222,12 @@ corpus:
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
 
+# Launcher/compiler selection, exact child identity, and fresh-compile witness.
+# Focused gate: not part of `make test`/ci — it drives real build-jolt compiles
+# and needs a complete Chez install (bin + csv<ver>/<machine>).
+selectedchez:
+	@CHEZ="$(CHEZ)" sh test/chez/selected-chez-test.sh
+
 # Real-CLI smoke over bin/jolt.
 # The CLI and build gates spawn a jolt process per case; a prebuilt binary boots
 # ~10x faster than script mode (0.14s vs 1.5s) and builds an app ~5x faster, so
@@ -236,7 +243,7 @@ TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src ve
 testbin:
 	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
 	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
-	  $(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt; \
+	  "$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt; \
 	else \
 	  echo "testbin: target/release/jolt up to date"; \
 	fi
@@ -319,12 +326,29 @@ grenadine:
 # JOLT_CROSS_TARGET (optional) cross-compiles jolt for another Chez machine — it is
 # passed as build-jolt.ss's 3rd arg and needs $JOLT_TARGET_PACK (empty = native).
 jolt-release:
-	@$(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
+	@"$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
 jolt-debug:
-	@$(CHEZ) --script host/chez/build-jolt.ss debug target/debug/jolt
+	@"$(CHEZ)" --script host/chez/build-jolt.ss debug target/debug/jolt
 # Re-mint the seed first so the embedded compiler image is current, then both builds.
 jolt: selfhost jolt-release jolt-debug
 	@echo "OK: target/release/jolt and target/debug/jolt built"
+
+# Sim-image compiler: debug-settings jolt binary PLUS the simulation runtime
+# overlay (host/chez/sim/runtime.ss, jolt.internal.sim composite ABI 6) spliced
+# into its own flat image and propagated to every app it builds. Opt-in on
+# purpose: `make jolt` above does NOT build it, and ordinary release/debug
+# images carry no simulation source or state.
+jolt-sim:
+	@"$(CHEZ)" --script host/chez/build-jolt.ss sim target/sim/jolt
+
+# Sim image smoke: builds the sim compiler (the jolt-sim prerequisite), proves
+# its jolt.internal.sim/capabilities ABI is 6 and the overlay is spliced exactly
+# once after java/ffi.ss, proves ordinary source jolt lacks the var, then builds
+# one vanilla app with each compiler: the sim-built app must report ABI 6, the
+# ordinary-built one must not have the overlay at all. Serial by construction;
+# opt-in like joltsmoke (a full compiler build), deliberately not in the gates.
+simimagesmoke: jolt-sim
+	@CHEZ="$(CHEZ)" sh test/chez/sim-image-smoke.sh
 
 # Self-build smoke: the distributed jolt compiles an app with Chez + cc removed.
 joltsmoke:
@@ -342,8 +366,51 @@ cts: testbin
 
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
+# ffi-widths: the exact scalar widths across both halves of jolt.ffi — runtime
+# memory accessors (sizeof/read/write, signed/unsigned bit equivalence) and the
+# compile-time signature path (native args/results/callbacks through a C helper
+# the wrapper builds). The signature half requires a seed minted from the
+# backend source that declares the widths (`make remint`).
+# ffi-ranged-transfer: read-array! and the ranged write-array copy exact
+# offset/count windows between a byte-array and native memory, validating kind,
+# bounds, and null-for-zero-length before any native access or mutation.
+# ffi-byte-array-pointer: with-byte-array-pointer loans a stable pointer into a
+# private native-octet snapshot of a whole byte-array or one validated range to
+# a synchronous callback, copying native mutation back on normal, exceptional,
+# and nonlocal exit; same-array nesting and retired-continuation re-entry are
+# rejected.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@$(CHEZ) --script test/chez/ffi-ranged-transfer-test.ss
+	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
+
+# Internal declared-call interception is compiler-source behavior, so verify it
+# against a fresh transient seed rather than the checked-in image.
+ffideclaredhook:
+	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/ffi-sim-hook-test.ss
+
+# Raw native-op interception lives in host runtime source, but its gate also
+# drives declared calls through the same hook — and the checked-in image
+# predates that compiler emission — so verify it against a fresh transient seed
+# like ffideclaredhook.
+ffinativehook:
+	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/ffi-native-sim-hook-test.ss
+
+# The sim controller bridge (host/chez/sim/runtime.ss) is a source-loaded
+# overlay on the declared-call seam; its gate drives declared calls and raw
+# native ops through the one persistent bridge, so verify it against a fresh
+# transient seed like ffideclaredhook.
+simcontroller:
+	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/sim-controller-bridge-test.ss
+
+# jolt.host/target: the exact fail-closed (os arch abi) classifier stays in
+# lockstep with rt.ss's native-error convention macro, and the current host's
+# System/Runtime surface (os.name/os.arch/separators/processors) projects
+# coherently from the same target facts.
+targetfacts:
+	@$(CHEZ) --script test/chez/target-descriptor-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:

@@ -1,7 +1,14 @@
 ;; build-jolt.ss — build jolt itself as a self-contained native binary (jolt-eaj).
 ;;
 ;;   chez --script host/chez/build-jolt.ss <profile> <out-path>
-;;   profile: "release" | "debug"   out-path: e.g. target/release/jolt
+;;   profile: "release" | "debug" | "sim"   out-path: e.g. target/release/jolt
+;;
+;; "sim" uses the debug Chez compile settings and additionally carries the
+;; simulation runtime overlay (host/chez/sim/runtime.ss) in the compiler image
+;; itself, so the resulting binary — and every app it builds — has the
+;; jolt.internal.sim controller seam. Ordinary release/debug images remain free
+;; of simulation source and state: the overlay is NOT in bld-runtime-manifest,
+;; and its embed below is registered for this profile only.
 ;;
 ;; Runs on a dev/CI machine that HAS Chez + cc. Produces a binary that needs
 ;; NEITHER: it bakes the full runtime + compiler image + all jolt-core/stdlib
@@ -48,8 +55,16 @@
 (define jb-out (if (and (pair? jb-args) (pair? (cdr jb-args))) (cadr jb-args)
                    (string-append "target/" jb-profile "/jolt")))
 (define jb-release? (string=? jb-profile "release"))
-(unless (or jb-release? (string=? jb-profile "debug"))
-  (error 'build-jolt "profile must be \"release\" or \"debug\"" jb-profile))
+;; "sim" rides the debug branch of every Chez setting below (they all key off
+;; jb-release?): optimize-level 0, inspector/source info on, uncompressed fasl.
+(define jb-sim? (string=? jb-profile "sim"))
+(unless (or jb-release? (string=? jb-profile "debug") jb-sim?)
+  (error 'build-jolt "profile must be \"release\", \"debug\", or \"sim\"" jb-profile))
+
+;; The one overlay load line shared by the flat-image splice and the resource
+;; embed walk. A string-literal load: bld-load-path / bld-inline-line key off
+;; exactly this shape.
+(define jb-sim-overlay-load "(load \"host/chez/sim/runtime.ss\")")
 
 ;; Cross-compilation: an optional 3rd arg is the target Chez machine, and the
 ;; target pack comes from $JOLT_TARGET_PACK — cross-builds jolt itself for
@@ -131,6 +146,10 @@
     (for-each (lambda (entry) (when (string? entry) (walk (bld-load-path entry))))
               bld-runtime-manifest)
     (for-each (lambda (kv) (walk (bld-load-path (cdr kv)))) bld-tagged-loads)
+    ;; sim profile only: embed the overlay source so the sim compiler's `build`
+    ;; reads it from the binary (bld-source-string) with no checkout on disk.
+    ;; Ordinary profiles skip it — no sim source leaks into their resources.
+    (when jb-sim? (walk (bld-load-path jb-sim-overlay-load)))
     (reverse order)))
 
 (define (jb-emit-runtime-embeds out)
@@ -257,6 +276,15 @@
                                  (ei-str-lit jb-version) ")\n"))
   ;; full runtime + compiler image: keep the compiler (jolt evals at runtime).
   (bld-emit-runtime out #f #f)
+  ;; sim profile: splice the simulation overlay into the compiler's own flat
+  ;; runtime — inlined, exactly once, after the manifest (so after
+  ;; host/chez/java/ffi.ss, whose declared-call seam the overlay bridges
+  ;; through). This is the sim compiler's ONLY copy: build.ss's bld-emit-runtime
+  ;; re-splices the overlay only when the RUNNING compiler already carries the
+  ;; overlay's jolt-sim-runtime-image? marker, and this host process never loads
+  ;; it, so the call above added nothing. Deliberately not in
+  ;; bld-runtime-manifest: that would put it in ordinary images too.
+  (when jb-sim? (bld-inline-line jb-sim-overlay-load out 0))
   ;; The build subsystem (build.ss + emit-image.ss + dce.ss, fully inlined) and the
   ;; runtime .ss source embeds it reads are needed ONLY by `jolt build`. As eager
   ;; top-level forms they cost ~45ms at EVERY startup (build.ss defines ~18ms, the
@@ -356,7 +384,8 @@
         (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
         (ei-str-lit jb-flat-so) ")\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'")))
+  (bld-system (string-append
+                (bld-sh-quote bld-chez) " --script " (bld-sh-quote cs))))
 
 ;; --- 3. embed boots/stub as C arrays + cc-link ------------------------------
 ;; xxd a file into header H and rename its symbol to NAME / NAME_len.

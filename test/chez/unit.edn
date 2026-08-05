@@ -320,6 +320,16 @@
   {:suite "javastatic" :expr "(string? (System/getenv \"HOME\"))" :expected "true"}
   {:suite "javastatic" :expr "(fn? System/exit)" :expected "true"}
   {:suite "javastatic" :expr "(string? (get (System/getProperties) \"os.name\"))" :expected "true"}
+  ;; jolt.host/target is the exact fail-closed compiler-target descriptor (see
+  ;; target-descriptor-test.ss); these check the public Clojure-level surface
+  ;; agrees with the System/Runtime properties derived from the same facts.
+  {:suite "target" :expr "(= #{:os :arch :abi :libc :endian :pointer-bits :file-separator :path-separator :processors} (set (keys (jolt.host/target))))" :expected "true"}
+  {:suite "target" :expr "(let [{:keys [os arch abi libc endian pointer-bits file-separator path-separator processors]} (jolt.host/target)] (and (keyword? os) (keyword? arch) (keyword? abi) (keyword? libc) (keyword? endian) (number? pointer-bits) (pos? pointer-bits) (string? file-separator) (string? path-separator) (number? processors) (pos? processors)))" :expected "true"}
+  {:suite "target" :expr "(= (jolt.host/available-processors) (.availableProcessors (java.lang.Runtime/getRuntime)) (:processors (jolt.host/target)))" :expected "true"}
+  {:suite "target" :expr "(let [p (System/getProperties)] (and (= (System/getProperty \"os.name\") (get p \"os.name\")) (= (System/getProperty \"os.arch\") (get p \"os.arch\"))))" :expected "true"}
+  {:suite "target" :expr "(let [t (jolt.host/target) p (System/getProperties)] (and (= (:file-separator t) (System/getProperty \"file.separator\") (get p \"file.separator\")) (= (:path-separator t) (System/getProperty \"path.separator\") (get p \"path.separator\"))))" :expected "true"}
+  {:suite "target" :expr "(let [p (System/getProperties)] (= (System/lineSeparator) (System/getProperty \"line.separator\") (get p \"line.separator\")))" :expected "true"}
+  {:suite "target" :expr "(let [p (System/getProperties)] (and (= (System/getProperty \"java.class.path\") (get p \"java.class.path\")) (= (System/getProperty \"jolt.version\") (get p \"jolt.version\")) (= (System/getProperty \"user.dir\") (get p \"user.dir\"))))" :expected "true"}
   {:suite "javastatic" :expr "(pos? (count (seq (System/getenv))))" :expected "true"}
   {:suite "javastatic" :expr "(let [es (map (fn [[k v]] [k v]) (System/getenv))] (and (pos? (count es)) (every? vector? es)))" :expected "true"}
   {:suite "javastatic" :expr "(.toString (StringBuilder. \"x\"))" :expected "\"x\""}
@@ -1170,6 +1180,11 @@
   ;; / declare-var! / intern-ns! / define (top-level + forward-decl + ns-splice),
   ;; foreign-procedure (ffi lowering). A local shadowing these only clashes when
   ;; the def/ffi/var-cache form is emitted inside that local's scope.
+  ;; Variadic FFI boundaries fail closed during analysis.
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after 3.0})" :expected :throws}
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after 0})" :expected :throws}
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :int] :int {:varargs-after -1})" :expected :throws}
+  {:suite "ffi-varargs" :expr "(jolt.ffi/__cfn \"snprintf\" [:pointer :size_t] :int {:varargs-after 3})" :expected :throws}
   ;; munge-injective (compiler-review R2 stage 2). munge-name maps ' -> $P, # -> $H,
   ;; and $ -> $$ (escape-first) so distinct Clojure locals get distinct Scheme ids.
   ;; Pre-remint a' and a_PRIME_ both emit a_PRIME_ (old ' -> _PRIME_ substitution),
@@ -1589,4 +1604,12 @@
   ;; Wider than the JVM's 16-bit char by design, hence a unit row not a corpus
   ;; one. Surrogates are not scalar values and stay rejected.
   {:suite "char / code points" :expr "[(int (char 65)) (int (char 128515)) (int (first (str (char 128515)))) (try (char 55296) (catch Exception e (ex-message e))) (try (char 1114112) (catch Exception e (ex-message e)))]" :expected "[65 128515 128515 \"Value out of range for char: 55296\" \"Value out of range for char: 1114112\"]"}
+  ;; ffi fail-closed: a foreign-fn signature type the compiler's ffi-types table
+  ;; does not name is rejected at compile time — never silently marshaled at a
+  ;; guessed width. Truthful before and after any table change (the exact
+  ;; scalar widths ARE named by the table and positively witnessed, memory and
+  ;; signature/callback, by test/chez/ffi-widths-test.ss). __cfn is a special
+  ;; form, so no require is needed and the jolt.ffi runtime vars are
+  ;; irrelevant here — this row exercises the compiler alone.
+  {:suite "ffi" :expr "(jolt.ffi/__cfn \"strlen\" [:bogus] :size_t)" :expected :throws}
 ]

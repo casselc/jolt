@@ -48,7 +48,13 @@
   (lambda (x)
     (syntax-case x (quote)
       ((_ name (quote args) (quote res))
-       (if (memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
+       ;; Select from the compiler target, as the native-error convention below
+       ;; does.  A cross-image build still runs on the build host, so
+       ;; machine-type would otherwise compile a POSIX foreign relocation into
+       ;; a Windows image.  Include Chez's Windows ARM64 target names as well as
+       ;; x86/x86-64 so optional POSIX symbols remain load-time safe there.
+       (if (memq (eval '(#%$target-machine))
+                 '(a6nt ta6nt i3nt ti3nt arm64nt tarm64nt))
            #'(guard (e (#t #f))
                (load-shared-object #f)
                (and (foreign-entry? name)
@@ -57,6 +63,40 @@
                (load-shared-object #f)
                (and (foreign-entry? name)
                     (foreign-procedure name args res))))))))
+
+;; Build a foreign procedure whose invocation returns both the native result
+;; and the calling thread's native error slot as Scheme values. Chez captures
+;; the slot in the foreign-call return path, before collect-safe reactivation or
+;; later Scheme/native work can overwrite it.
+;;
+;; Select from the compiler target, not this process's machine-type: cross-image
+;; builds rebind #%$target-machine while the build host remains unchanged. An
+;; unrecognized target fails during expansion rather than guessing a nearby ABI.
+(define-syntax jolt-ffi-native-error-convention-case
+  (lambda (x)
+    (syntax-case x ()
+      ((_ get-last-error-form errno-form)
+       (case (eval '(#%$target-machine))
+         ((i3nt ti3nt a6nt ta6nt arm64nt tarm64nt)
+          #'get-last-error-form)
+         ((i3le ti3le a6le ta6le
+           ppc32le tppc32le arm32le tarm32le
+           arm64le tarm64le rv64le trv64le la64le tla64le
+           i3osx ti3osx a6osx ta6osx
+           ppc32osx tppc32osx arm64osx tarm64osx)
+          #'errno-form)
+         (else
+          (error 'jolt-ffi-native-error-convention-case
+                 "unsupported target machine"
+                 (eval '(#%$target-machine)))))))))
+
+(define-syntax jolt-ffi-native-error-procedure
+  (lambda (x)
+    (syntax-case x ()
+      ((_ (conv ...) name args res)
+       #'(jolt-ffi-native-error-convention-case
+           (foreign-procedure __get_last_error conv ... name args res)
+           (foreign-procedure __errno conv ... name args res))))))
 
 ;; --- how many processors can this process use ---------------------------------
 ;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
