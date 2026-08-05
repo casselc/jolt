@@ -463,7 +463,20 @@
         ((memq entry '(image compile-eval))
          (unless drop-compiler? (bld-inline-line (cdr (assq entry bld-tagged-loads)) out 0)))
         (else (bld-inline-line entry out 0))))
-    bld-runtime-manifest))
+    bld-runtime-manifest)
+  ;; A compiler built with build-jolt.ss's "sim" profile carries the simulation
+  ;; overlay in its own image and propagates it to every app it builds: splice
+  ;; host/chez/sim/runtime.ss — inlined, exactly once (it has no (load) forms),
+  ;; after the manifest, i.e. after host/chez/java/ffi.ss, whose declared-call
+  ;; seam the overlay bridges through. The overlay's own marker gates the
+  ;; splice, so an ordinary release/debug/source compiler — which never loads
+  ;; the overlay nor embeds its source — emits nothing, and its apps stay free
+  ;; of simulation source and state. The sim compiler's OWN image is spliced by
+  ;; build-jolt.ss instead (its host process has no marker), so a compiler
+  ;; image never gets two copies.
+  (when (and (top-level-bound? 'jolt-sim-runtime-image?)
+             (top-level-value 'jolt-sim-runtime-image?))
+    (bld-inline-line "(load \"host/chez/sim/runtime.ss\")" out 0)))
 
 ;; --- app emission -----------------------------------------------------------
 ;; Re-emit one app namespace to a list of Scheme strings: run-passes (const-fold +
