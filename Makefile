@@ -347,10 +347,14 @@ cts: testbin
 # compile-time signature path (native args/results/callbacks through a C helper
 # the wrapper builds). The signature half requires a seed minted from the
 # backend source that declares the widths (`make remint`).
+# ffi-ranged-transfer: read-array! and the ranged write-array copy exact
+# offset/count windows between a byte-array and native memory, validating kind,
+# bounds, and null-for-zero-length before any native access or mutation.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@$(CHEZ) --script test/chez/ffi-ranged-transfer-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
