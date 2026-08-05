@@ -59,7 +59,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi ffideclaredhook ffinativehook fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
+  narrow numeric numwp oparity pic protoret printperf remint sci selectedchez selfhost shakelocal \
   simcontroller traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
@@ -68,7 +68,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck grenadinecheck \
-        fibersbench dynbench \
+        selectedchez fibersbench dynbench \
         fibersresidue
 
 default:: build
@@ -288,6 +288,12 @@ corpus:
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
 
+# Launcher/compiler selection, exact child identity, and fresh-compile witness.
+# Focused gate: not part of `make test`/ci — it drives real build-jolt compiles
+# and needs a complete Chez install (bin + csv<ver>/<machine>).
+selectedchez:
+	@CHEZ="$(CHEZ)" sh test/chez/selected-chez-test.sh
+
 # Real-CLI smoke over bin/jolt.
 # The CLI and build gates spawn a jolt process per case; a prebuilt binary boots
 # ~10x faster than script mode (0.14s vs 1.5s) and builds an app ~5x faster, so
@@ -303,7 +309,7 @@ TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src ve
 testbin:
 	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
 	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
-	  $(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt; \
+	  "$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt; \
 	else \
 	  echo "testbin: target/release/jolt up to date"; \
 	fi
@@ -386,9 +392,9 @@ grenadine:
 # JOLT_CROSS_TARGET (optional) cross-compiles jolt for another Chez machine — it is
 # passed as build-jolt.ss's 3rd arg and needs $JOLT_TARGET_PACK (empty = native).
 jolt-release:
-	@$(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
+	@"$(CHEZ)" --script host/chez/build-jolt.ss release target/release/jolt $(JOLT_CROSS_TARGET)
 jolt-debug:
-	@$(CHEZ) --script host/chez/build-jolt.ss debug target/debug/jolt
+	@"$(CHEZ)" --script host/chez/build-jolt.ss debug target/debug/jolt
 # Re-mint the seed first so the embedded compiler image is current, then both builds.
 jolt: selfhost jolt-release jolt-debug
 	@echo "OK: target/release/jolt and target/debug/jolt built"
