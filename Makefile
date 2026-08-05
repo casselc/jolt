@@ -57,7 +57,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
-  devbootsmoke devirt directlink ffi ffideclaredhook fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
+  devbootsmoke devirt directlink ffi ffideclaredhook ffinativehook fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
@@ -117,7 +117,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
+  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffideclaredhook ffinativehook stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -510,6 +510,11 @@ ffi:
 # against a fresh transient seed rather than the checked-in image.
 ffideclaredhook:
 	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/ffi-sim-hook-test.ss
+
+# Raw native-op interception also drives declared calls through the compiler,
+# so verify it against the same fresh transient seed.
+ffinativehook:
+	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/ffi-native-sim-hook-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:

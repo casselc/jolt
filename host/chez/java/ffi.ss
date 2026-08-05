@@ -27,7 +27,7 @@
 ;; any reload. A NAMED library goes through the scoped loader below — RTLD_LOCAL
 ;; + a registered handle — so its symbols are reachable by its own defcfns and
 ;; invisible to everyone else's.
-(define (ffi-load-library . args)
+(define (ffi-load-library-real args)
   (cond
     ((or (null? args) (jolt-nil? (car args)))
      jolt-nil)                                   ; boot's global handle suffices
@@ -49,12 +49,37 @@
        jolt-nil))
     (else (jolt-ffi-load-native (jolt-str-render-one (car args))) jolt-nil)))
 
+;; Every operation exposed under jolt.ffi below reads the internal interception
+;; hook once per call (see the "declared foreign-call interception" section at
+;; the bottom — the same seam covers these raw operations).  #f runs the
+;; original body directly: one variable read and one branch, with no descriptor
+;; or proceed allocation.  Each original body appears twice, once as the
+;; proceed thunk and once as the disabled branch, mirroring the compiler's
+;; emitted shape for declared calls, so proceed executes exactly the original
+;; operation — same results, same validation, same exceptions.
+(define (ffi-load-library . args)
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         ;; The descriptor list spine is a per-call snapshot of the lexical
+         ;; rest list: a hook mutating descriptor args must not redirect the
+         ;; real operation, which always applies the untouched lexical args.
+         h "load-library" (list-copy args)
+         (lambda () (ffi-load-library-real args)))
+        (ffi-load-library-real args))))
+
 ;; Loadable without mutating resolution state: probe with a LOCAL dlopen through
 ;; the scoped loader (registering the handle — a probe that succeeds will be
 ;; followed by use). The old form side-effected the GLOBAL namespace to answer
 ;; a yes/no question.
 (define (ffi-loaded? name)
-  (if (jolt-ffi-load-native (jolt-str-render-one name)) #t #f))
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "loaded?" (list name)
+         (lambda ()
+           (if (jolt-ffi-load-native (jolt-str-render-one name)) #t #f)))
+        (if (jolt-ffi-load-native (jolt-str-render-one name)) #t #f))))
 
 ;; --- scoped native libraries: dlopen RTLD_LOCAL + per-handle dlsym ----------
 ;; A :jolt/native library's symbols must NEVER depend on the process-global
@@ -134,10 +159,14 @@
 ;; The keyword type names jolt.ffi accepts (in foreign-fn signatures and the
 ;; memory accessors) map to Chez foreign types. Kept in one place so the backend
 ;; (compile-time, for foreign-procedure) and these accessors (runtime, for
-;; foreign-ref/set!) agree — see ffi-types in jolt-core/jolt/backend_scheme.clj.
-;; Exact scalar widths use native byte order. Signed and unsigned names at one
-;; width expose the same stored bits; wire byte order remains an explicit codec
-;; or htons/ntohs concern.
+;; foreign-ref/set!) agree — see ffi-types in jolt-core/jolt/backend_scheme.clj
+;; (baked into the checked-in seed, so a newly added signature type rides the
+;; next seed remint).
+;; The exact scalar widths (int8/16/32, uint8/16/32) are fixed-width, native
+;; byte order: the signed and unsigned widths at each size expose the SAME
+;; stored bits (a :uint16 read of a :int16 -1 write is 65535), so a memory
+;; access and a typed foreign call agree on layout. Wire byte order stays an
+;; explicit conversion (htons/ntohs or a codec).
 (define (ffi-type->chez kw)
   (let ((n (if (keyword-t? kw) (keyword-t-name kw) (jolt-str-render-one kw))))
     (cond
@@ -168,14 +197,54 @@
 ;; --- foreign memory ----------------------------------------------------------
 ;; alloc returns a pointer (integer address). The caller frees it. read/write take
 ;; a type keyword and an optional byte offset.
-(define (ffi-alloc nbytes) (sa-foreign-alloc (jnum->exact nbytes)))
-(define (ffi-free ptr) (sa-foreign-free (jnum->exact ptr)) jolt-nil)
+(define (ffi-alloc nbytes)
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "alloc" (list nbytes)
+         (lambda () (sa-foreign-alloc (jnum->exact nbytes))))
+        (sa-foreign-alloc (jnum->exact nbytes)))))
+(define (ffi-free ptr)
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "free" (list ptr)
+         (lambda () (sa-foreign-free (jnum->exact ptr)) jolt-nil))
+        (begin (sa-foreign-free (jnum->exact ptr)) jolt-nil))))
 (define (ffi-read ptr ty . off)
-  (sa-foreign-ref (ffi-type->chez ty) (jnum->exact ptr) (if (pair? off) (jnum->exact (car off)) 0)))
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         ;; As with load-library, the descriptor tail spine-copies the lexical
+         ;; offset list, so hook mutation of descriptor args cannot move the
+         ;; real read's pointer offset.
+         h "read" (cons ptr (cons ty (list-copy off)))
+         (lambda ()
+           (sa-foreign-ref (ffi-type->chez ty) (jnum->exact ptr)
+                        (if (pair? off) (jnum->exact (car off)) 0))))
+        (sa-foreign-ref (ffi-type->chez ty) (jnum->exact ptr)
+                     (if (pair? off) (jnum->exact (car off)) 0)))))
 (define (ffi-write ptr ty off val)
-  (sa-foreign-set! (ffi-type->chez ty) (jnum->exact ptr) (jnum->exact off) val) jolt-nil)
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "write" (list ptr ty off val)
+         (lambda ()
+           (sa-foreign-set! (ffi-type->chez ty) (jnum->exact ptr)
+                         (jnum->exact off) val)
+           jolt-nil))
+        (begin
+          (sa-foreign-set! (ffi-type->chez ty) (jnum->exact ptr)
+                        (jnum->exact off) val)
+          jolt-nil))))
 ;; sizeof a foreign type (for laying out structs / arrays).
-(define (ffi-sizeof ty) (sa-foreign-sizeof (ffi-type->chez ty)))
+(define (ffi-sizeof ty)
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "sizeof" (list ty)
+         (lambda () (sa-foreign-sizeof (ffi-type->chez ty))))
+        (sa-foreign-sizeof (ffi-type->chez ty)))))
 (define (ffi-null? ptr) (and (number? ptr) (= (jnum->exact ptr) 0)))
 (define ffi-null 0)
 
@@ -183,14 +252,41 @@
 ;; read n bytes at ptr as a string (UTF-8, falling back to latin1 for invalid
 ;; sequences) — for a socket recv buffer and similar fixed-length reads.
 (define (ffi-read-bytes ptr n)
-  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n)))
-    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (sa-foreign-ref 'unsigned-8 p i)))
-    (guard (e (#t (list->string (map integer->char (bytevector->u8-list bv))))) (utf8->string bv))))
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "read-bytes" (list ptr n)
+         (lambda ()
+           (let* ((n (jnum->exact n)) (p (jnum->exact ptr))
+                  (bv (make-bytevector n)))
+             (do ((i 0 (+ i 1))) ((= i n))
+               (bytevector-u8-set! bv i (sa-foreign-ref 'unsigned-8 p i)))
+             (guard
+               (e (#t (list->string (map integer->char (bytevector->u8-list bv)))))
+               (utf8->string bv)))))
+        (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n)))
+          (do ((i 0 (+ i 1))) ((= i n))
+            (bytevector-u8-set! bv i (sa-foreign-ref 'unsigned-8 p i)))
+          (guard
+            (e (#t (list->string (map integer->char (bytevector->u8-list bv)))))
+            (utf8->string bv))))))
 ;; write a string's UTF-8 bytes into ptr (no NUL terminator); return the count.
 (define (ffi-write-bytes ptr s)
-  (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv)) (p (jnum->exact ptr)))
-    (do ((i 0 (+ i 1))) ((= i n)) (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
-    n))
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "write-bytes" (list ptr s)
+         (lambda ()
+           (let* ((bv (string->utf8 (jolt-str-render-one s)))
+                  (n (bytevector-length bv)) (p (jnum->exact ptr)))
+             (do ((i 0 (+ i 1))) ((= i n))
+               (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+             n)))
+        (let* ((bv (string->utf8 (jolt-str-render-one s)))
+               (n (bytevector-length bv)) (p (jnum->exact ptr)))
+          (do ((i 0 (+ i 1))) ((= i n))
+            (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+          n))))
 (def-var! "jolt.ffi" "read-bytes" ffi-read-bytes)
 (def-var! "jolt.ffi" "write-bytes" ffi-write-bytes)
 
@@ -233,36 +329,97 @@
     (throw-jvm (quote NullPointerException)
                (string-append "jolt.ffi/" who ": null pointer"))))
 (define (ffi-read-array ptr n)
-  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (sa-foreign-ref 'unsigned-8 p i))))
-    (make-jolt-array v 'byte)))
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "read-array" (list ptr n)
+         (lambda ()
+           (let* ((n (jnum->exact n)) (p (jnum->exact ptr))
+                  (v (make-vector n 0)))
+             (do ((i 0 (+ i 1))) ((= i n))
+               (vector-set! v i (na-u8->byte (sa-foreign-ref 'unsigned-8 p i))))
+             (make-jolt-array v 'byte))))
+        (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
+          (do ((i 0 (+ i 1))) ((= i n))
+            (vector-set! v i (na-u8->byte (sa-foreign-ref 'unsigned-8 p i))))
+          (make-jolt-array v 'byte)))))
 (define (ffi-read-array! ptr len dest dest-off)
-  (let* ((v (ffi-byte-array-vector "read-array!" dest))
-         (n (jnum->exact len))
-         (off (jnum->exact dest-off)))
-    (ffi-check-array-range "read-array!" v off n)
-    (let ((p (jnum->exact ptr)))
-      (ffi-check-transfer-pointer "read-array!" p n)
-      (do ((i 0 (+ i 1))) ((= i n))
-        (vector-set! v (+ off i) (na-u8->byte (sa-foreign-ref 'unsigned-8 p i))))
-      n)))
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "read-array!" (list ptr len dest dest-off)
+         (lambda ()
+           (let* ((v (ffi-byte-array-vector "read-array!" dest))
+                  (n (jnum->exact len))
+                  (off (jnum->exact dest-off)))
+             (ffi-check-array-range "read-array!" v off n)
+             (let ((p (jnum->exact ptr)))
+               (ffi-check-transfer-pointer "read-array!" p n)
+               (do ((i 0 (+ i 1))) ((= i n))
+                 (vector-set! v (+ off i)
+                              (na-u8->byte (sa-foreign-ref 'unsigned-8 p i))))
+               n))))
+        (let* ((v (ffi-byte-array-vector "read-array!" dest))
+               (n (jnum->exact len))
+               (off (jnum->exact dest-off)))
+          (ffi-check-array-range "read-array!" v off n)
+          (let ((p (jnum->exact ptr)))
+            (ffi-check-transfer-pointer "read-array!" p n)
+            (do ((i 0 (+ i 1))) ((= i n))
+              (vector-set! v (+ off i)
+                           (na-u8->byte (sa-foreign-ref 'unsigned-8 p i))))
+            n)))))
+;; Each write-array arity intercepts independently, so the descriptor's
+;; argument count — two for the whole-array form, four for the ranged form —
+;; tells a controller which shape was called.
 (define ffi-write-array
   (case-lambda
     ((ptr arr)                          ; whole-array form (unchanged)
-     (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
-       (do ((i 0 (+ i 1))) ((= i n))
-         (sa-foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
-       n))
+     (let ((h jolt-ffi-declared-call-hook))
+       (if h
+           (jolt-ffi-invoke-native-op-hook
+            h "write-array" (list ptr arr)
+            (lambda ()
+              (let* ((v (jolt-array-vec arr)) (n (vector-length v))
+                     (p (jnum->exact ptr)))
+                (do ((i 0 (+ i 1))) ((= i n))
+                  (sa-foreign-set! 'unsigned-8 p i
+                                (bitwise-and (exact (vector-ref v i)) #xff)))
+                n)))
+           (let* ((v (jolt-array-vec arr)) (n (vector-length v))
+                  (p (jnum->exact ptr)))
+             (do ((i 0 (+ i 1))) ((= i n))
+               (sa-foreign-set! 'unsigned-8 p i
+                             (bitwise-and (exact (vector-ref v i)) #xff)))
+             n))))
     ((ptr src src-off len)              ; source sub-range form
-     (let* ((v (ffi-byte-array-vector "write-array" src))
-            (off (jnum->exact src-off))
-            (n (jnum->exact len)))
-       (ffi-check-array-range "write-array" v off n)
-       (let ((p (jnum->exact ptr)))
-         (ffi-check-transfer-pointer "write-array" p n)
-         (do ((i 0 (+ i 1))) ((= i n))
-           (sa-foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v (+ off i))) #xff)))
-         n)))))
+     (let ((h jolt-ffi-declared-call-hook))
+       (if h
+           (jolt-ffi-invoke-native-op-hook
+            h "write-array" (list ptr src src-off len)
+            (lambda ()
+              (let* ((v (ffi-byte-array-vector "write-array" src))
+                     (off (jnum->exact src-off))
+                     (n (jnum->exact len)))
+                (ffi-check-array-range "write-array" v off n)
+                (let ((p (jnum->exact ptr)))
+                  (ffi-check-transfer-pointer "write-array" p n)
+                  (do ((i 0 (+ i 1))) ((= i n))
+                    (sa-foreign-set! 'unsigned-8 p i
+                                  (bitwise-and (exact (vector-ref v (+ off i)))
+                                               #xff)))
+                  n))))
+           (let* ((v (ffi-byte-array-vector "write-array" src))
+                  (off (jnum->exact src-off))
+                  (n (jnum->exact len)))
+             (ffi-check-array-range "write-array" v off n)
+             (let ((p (jnum->exact ptr)))
+               (ffi-check-transfer-pointer "write-array" p n)
+               (do ((i 0 (+ i 1))) ((= i n))
+                 (sa-foreign-set! 'unsigned-8 p i
+                               (bitwise-and (exact (vector-ref v (+ off i)))
+                                            #xff)))
+               n)))))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-array!" ffi-read-array!)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
@@ -333,7 +490,7 @@
     ;; All validation precedes the temporary allocation and lock.
     (let ((tmp (make-bytevector cnt 0)) (retired? #f))
       (ffi-copy-vector-to-bytevector! v start tmp cnt)
-      (lock-object tmp)
+      (sa-lock-object tmp)
       (dynamic-wind
         (lambda ()
           (when retired?
@@ -352,7 +509,7 @@
           (dynamic-wind
             void
             (lambda () (ffi-copy-bytevector-to-vector! tmp v start cnt))
-            (lambda () (unlock-object tmp))))))))
+            (lambda () (sa-unlock-object tmp))))))))
 (define (ffi-with-byte-array-pointer-range arr off len f)
   (ffi-with-scoped-byte-array-pointer
    "with-byte-array-pointer" arr off len
@@ -370,22 +527,51 @@
 ;; A C string result already comes back as a jolt string (the `string` foreign
 ;; type). For a `void*` that points at a NUL-terminated C string, read it here.
 (define (ffi-ptr->string ptr)
-  (if (ffi-null? ptr) jolt-nil
-      (let ((p (jnum->exact ptr)))
-        (let loop ((i 0) (acc '()))
-          (let ((b (sa-foreign-ref 'unsigned-8 p i)))
-            (if (= b 0) (utf8->string (u8-list->bytevector (reverse acc)))
-                (loop (+ i 1) (cons b acc))))))))
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "ptr->string" (list ptr)
+         (lambda ()
+           (if (ffi-null? ptr) jolt-nil
+               (let ((p (jnum->exact ptr)))
+                 (let loop ((i 0) (acc '()))
+                   (let ((b (sa-foreign-ref 'unsigned-8 p i)))
+                     (if (= b 0)
+                         (utf8->string (u8-list->bytevector (reverse acc)))
+                         (loop (+ i 1) (cons b acc)))))))))
+        (if (ffi-null? ptr) jolt-nil
+            (let ((p (jnum->exact ptr)))
+              (let loop ((i 0) (acc '()))
+                (let ((b (sa-foreign-ref 'unsigned-8 p i)))
+                  (if (= b 0)
+                      (utf8->string (u8-list->bytevector (reverse acc)))
+                      (loop (+ i 1) (cons b acc))))))))))
 ;; Copy a jolt string's UTF-8 bytes into a freshly alloc'd NUL-terminated buffer;
 ;; the caller frees it. Returns the pointer.
 (define (ffi-string->ptr s)
-  (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv))
-         (p (sa-foreign-alloc (+ n 1))))
-    ;; free on a mid-copy throw — the caller only ever sees a whole buffer
-    (guard (e (#t (guard (_ (#t #f)) (sa-foreign-free p)) (raise e)))
-      (do ((i 0 (+ i 1))) ((= i n)) (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
-      (sa-foreign-set! 'unsigned-8 p n 0)
-      p)))
+  (let ((h jolt-ffi-declared-call-hook))
+    (if h
+        (jolt-ffi-invoke-native-op-hook
+         h "string->ptr" (list s)
+         (lambda ()
+           (let* ((bv (string->utf8 (jolt-str-render-one s)))
+                  (n (bytevector-length bv))
+                  (p (sa-foreign-alloc (+ n 1))))
+             ;; free on a mid-copy throw — the caller only ever sees a whole buffer
+             (guard (e (#t (guard (_ (#t #f)) (sa-foreign-free p)) (raise e)))
+               (do ((i 0 (+ i 1))) ((= i n))
+                 (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+               (sa-foreign-set! 'unsigned-8 p n 0)
+               p))))
+        (let* ((bv (string->utf8 (jolt-str-render-one s)))
+               (n (bytevector-length bv))
+               (p (sa-foreign-alloc (+ n 1))))
+          ;; free on a mid-copy throw — the caller only ever sees a whole buffer
+          (guard (e (#t (guard (_ (#t #f)) (sa-foreign-free p)) (raise e)))
+            (do ((i 0 (+ i 1))) ((= i n))
+              (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+            (sa-foreign-set! 'unsigned-8 p n 0)
+            p)))))
 
 ;; --- callbacks: receive calls FROM C ----------------------------------------
 ;; jolt.ffi/foreign-callable lowers to (jolt-ffi-register-callable! (foreign-callable …)).
@@ -467,8 +653,11 @@
 ;; --- declared foreign-call interception (internal simulation seam) ----------
 ;; The compiler reads jolt-ffi-declared-call-hook once at the start of every
 ;; generated defcfn invocation.  #f keeps the ordinary lazily cached native
-;; call; a hook receives (descriptor proceed), before symbol resolution.  This
-;; is intentionally host-internal for now: no jolt.ffi var exposes it.
+;; call; a hook receives (descriptor proceed), before symbol resolution.  The
+;; raw jolt.ffi operations above read the same cell once per call and ride the
+;; same machinery with native-op descriptors — see the native-operation
+;; subsection below.  This is intentionally host-internal for now: no jolt.ffi
+;; var exposes it.
 ;;
 ;; Installations are process-global and form a strict token-cleared stack.  An
 ;; out-of-order or repeated clear fails closed instead of disabling a newer
@@ -584,11 +773,61 @@
           (jolt-invoke2 hook descriptor proceed)))
       (lambda () (set! hook-retired? #t)))))
 
+;; --- raw native-operation interception (the same seam) -----------------------
+;; The one hook also covers the raw operations this file exposes under
+;; jolt.ffi: load-library, loaded?, alloc, free, read, write, sizeof, null?,
+;; read-bytes, write-bytes, read-array, read-array!, both write-array arities,
+;; ptr->string, and string->ptr.  Each operation reads
+;; jolt-ffi-declared-call-hook once per call; #f runs the original body
+;; directly — one variable read and one branch, with no descriptor or proceed
+;; allocation.  An installed hook receives a native-op descriptor plus the same
+;; scoped, same-thread, at-most-once proceed as a declared call, so both kinds
+;; share the token-cleared installation stack, the owner-tagged activation
+;; cell, and every lifetime rejection above.  Substitution returns the hook's
+;; value unwrapped; proceed runs the exact original body, so its results,
+;; jolt-nil returns, validation errors (byte-array kind, subtraction-safe
+;; range, null-for-nonzero-length pointer), and exceptions are the operation's
+;; own, and a synchronous callback reached through it starts a fresh
+;; interception.
+;;
+;; The descriptor is the same plain-alist shape with kind `native-op`, a copied
+;; `op` name string, and `args` — the exact
+;; live call arguments in call order: the optional read offset when supplied,
+;; the destination byte-array for read-array! (a controller may model writes
+;; through it), both or all four write-array arguments (the count tells the
+;; arities apart), and zero or one load-library arguments.  Argument VALUES are
+;; the exact live objects, but the descriptor list spine is a per-call snapshot
+;; (lexical rest and offset lists are spine-copied), so a controller mutating
+;; descriptor structure cannot redirect the operation its proceed runs — that
+;; proceed always applies its untouched lexical arguments.
+;;
+;; Deliberate exclusions:
+;;  * jolt.ffi/null is a constant value var (0), not an operation — there is no
+;;    call to intercept.  Models use and answer 0 for null pointers; null? IS
+;;    intercepted, so a controller owns the predicate's answers.
+;;  * with-byte-array-pointer keeps its scoped loan lifecycle un-reimplemented:
+;;    it performs no foreign-memory operation of its own (its temporary is a
+;;    locked Scheme bytevector, not foreign-alloc'd memory), and the jolt.ffi
+;;    operations its callback makes on the loaned pointer are intercepted
+;;    normally.
+;;  * free-callable / register-export (and the internal callable/export
+;;    tables) are jolt-side registries, not raw native operations.
+;; Declared foreign calls remain kind `foreign-call`; a controller installs
+;; exactly one hook and dispatches on descriptor kind.
+(define (jolt-ffi-make-native-op-descriptor op args)
+  (list (cons 'kind 'native-op)
+        (cons 'op (string-copy op))
+        (cons 'args args)))
+
+(define (jolt-ffi-invoke-native-op-hook hook op args real-op)
+  (jolt-ffi-invoke-declared-call-hook
+   hook (jolt-ffi-make-native-op-descriptor op args) real-op))
+
 ;; --- expose under jolt.ffi ---------------------------------------------------
 (def-var! "jolt.ffi" "free-callable" ffi-free-callable)
 (def-var! "jolt.ffi" "register-export" jolt-ffi-register-export!)
 (def-var! "jolt.ffi" "load-library" ffi-load-library)
-(def-var! "jolt.ffi" "loaded?" (lambda (n) (if (ffi-loaded? n) #t #f)))
+(def-var! "jolt.ffi" "loaded?" (lambda (n) (if (jolt-truthy? (ffi-loaded? n)) #t #f)))
 (def-var! "jolt.ffi" "load-native" jolt-ffi-load-native)
 (def-var! "jolt.ffi" "dlsym-native" jolt-ffi-dlsym-native)
 (def-var! "jolt.ffi" "alloc" ffi-alloc)
@@ -596,7 +835,15 @@
 (def-var! "jolt.ffi" "read" ffi-read)
 (def-var! "jolt.ffi" "write" ffi-write)
 (def-var! "jolt.ffi" "sizeof" ffi-sizeof)
-(def-var! "jolt.ffi" "null?" (lambda (p) (if (ffi-null? p) #t #f)))
+;; null? intercepts at the var rather than inside ffi-null?, so ptr->string's
+;; internal null check above never surfaces to a controller as a separate op.
+(def-var! "jolt.ffi" "null?"
+  (lambda (p)
+    (let ((h jolt-ffi-declared-call-hook))
+      (if h
+          (jolt-ffi-invoke-native-op-hook
+           h "null?" (list p) (lambda () (if (ffi-null? p) #t #f)))
+          (if (ffi-null? p) #t #f)))))
 (def-var! "jolt.ffi" "null" ffi-null)
 (def-var! "jolt.ffi" "ptr->string" ffi-ptr->string)
 (def-var! "jolt.ffi" "string->ptr" ffi-string->ptr)
