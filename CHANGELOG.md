@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Internal interception for raw `jolt.ffi` native operations.** The declared
+  foreign-call interception seam now also covers the raw operations `jolt.ffi`
+  exposes: `load-library`, `loaded?`, `alloc`, `free`, `read`, `write`,
+  `sizeof`, `null?`, `read-bytes`, `write-bytes`, `read-array`, `read-array!`,
+  both `write-array` arities, `ptr->string`, and `string->ptr`. Each operation
+  reads the same process-global hook once per call — disabled remains one
+  variable read and one branch with no descriptor or proceed allocation — and
+  an installed hook receives a stable `native-op` descriptor carrying the
+  operation name and the exact live call arguments (including the `read-array!`
+  destination array a model can write through; the two `write-array` arities
+  are told apart by argument count) plus the same scoped, same-thread,
+  at-most-once `proceed` as a declared call. Proceed runs the exact original
+  operation, preserving results, nil returns, byte-array kind/range/null
+  pointer validation, and exception behavior, while substitution returns the
+  hook's value unwrapped — except `loaded?`, which keeps its Boolean public
+  contract by normalizing any substituted value (nil and false become false,
+  anything else true). Both descriptor kinds share the one token-cleared
+  installation stack and reentrancy contract, so a controller installs exactly
+  one hook. `null` stays a plain value var (there is no operation to
+  intercept), `with-byte-array-pointer` keeps its scoped loan lifecycle
+  un-reimplemented (its callback's own `jolt.ffi` operations are intercepted
+  normally), and the callable/export registries are not intercepted. Still a
+  test/runtime seam, not yet public API.
+
 - **Internal interception for declared `jolt.ffi` calls.** A disabled-by-default
   runtime hook can substitute or explicitly proceed with each generated
   `foreign-fn`/`defcfn` call before native symbol resolution. Controllers receive
