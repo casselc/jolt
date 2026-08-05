@@ -944,6 +944,7 @@
     (let [types (if vi (vec (concat (subvec at 0 vi) (subvec at (inc vi)))) at)
           n (count types)
           params (mapv (fn [i] (str "a" i)) (range n))
+          call-args (str/join " " params)
           conv (if vi (str " (__varargs_after " vi ")") "")
           args (str/join " " (map ffi-type->chez types))
           ret (ffi-type->chez (:rettype node))
@@ -959,21 +960,37 @@
                            "sa-foreign-procedure-blocking "
                            "sa-foreign-procedure ")
                     conv " " csym " (" args ") " ret ")"))
-          call (str "((or p (begin (set! p " fp ") p)) "
-                    (str/join " " params) ")")
-          body (if capture
-                 (str "(call-with-values (lambda () " call ")"
+          native-call (str "((or p (begin (set! p " fp ") p)) " call-args ")")
+          native-body (if capture
+                 (str "(call-with-values (lambda () " native-call ")"
                       " (lambda (result native-error)"
                       " (jolt-vector result native-error)))")
-                 call)]
+                 native-call)
+          argtypes-lit (str "(list "
+                            (str/join " " (map chez-str-lit at))
+                            ")")
+          descriptor (str "(jolt-ffi-make-declared-call-descriptor "
+                          csym " " argtypes-lit " "
+                          (chez-str-lit (:rettype node)) " "
+                          (if (:blocking node) "#t" "#f") " "
+                          (if capture "#t" "#f")
+                          " (list " call-args "))")
+          hooked-body (str "(jolt-ffi-invoke-declared-call-hook h " descriptor
+                           " (lambda () " native-body "))")]
       ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
       ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
       ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
       ;; evaluate to a callable closure before the shared library is loaded —
       ;; critical for :optional :jolt/native libs whose load-object runs in the
-      ;; scheme-start launcher, after the heap is already built.
-      (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
-           body ")))"))))
+      ;; scheme-start launcher, after the heap is already built. The internal
+      ;; declared-call hook is snapshotted once before symbol resolution on each
+      ;; invocation. Its disabled path adds only that read/branch; descriptor and
+      ;; proceed allocation occur only in the hooked branch. A substitution is
+      ;; returned as-is, while proceed preserves the exact scalar or captured
+      ;; [result native-error] shape.
+      (str "(let ((p #f)) (lambda (" call-args ") "
+           "(let ((h jolt-ffi-declared-call-hook)) "
+           "(if h " hooked-body " " native-body ")))))"))))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the

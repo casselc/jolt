@@ -56,7 +56,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
+  devbootsmoke devirt directlink ffi ffideclaredhook fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
@@ -427,6 +427,11 @@ ffi:
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@$(CHEZ) --script test/chez/ffi-ranged-transfer-test.ss
 	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
+
+# Internal declared-call interception is compiler-source behavior, so verify it
+# against a fresh transient seed rather than the checked-in image.
+ffideclaredhook:
+	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/ffi-sim-hook-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
