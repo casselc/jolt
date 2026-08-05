@@ -58,9 +58,9 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi ffideclaredhook ffinativehook fieldjoin fieldnum fieldread flarr grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
-  jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
+  jolt jolt-debug jolt-release jolt-sim joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selectedchez selfhost shakelocal \
-  simcontroller traceemit \
+  simcontroller simimagesmoke traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   values wp ci
 
@@ -332,6 +332,23 @@ jolt-debug:
 # Re-mint the seed first so the embedded compiler image is current, then both builds.
 jolt: selfhost jolt-release jolt-debug
 	@echo "OK: target/release/jolt and target/debug/jolt built"
+
+# Sim-image compiler: debug-settings jolt binary PLUS the simulation runtime
+# overlay (host/chez/sim/runtime.ss, jolt.internal.sim composite ABI 6) spliced
+# into its own flat image and propagated to every app it builds. Opt-in on
+# purpose: `make jolt` above does NOT build it, and ordinary release/debug
+# images carry no simulation source or state.
+jolt-sim:
+	@"$(CHEZ)" --script host/chez/build-jolt.ss sim target/sim/jolt
+
+# Sim image smoke: builds the sim compiler (the jolt-sim prerequisite), proves
+# its jolt.internal.sim/capabilities ABI is 6 and the overlay is spliced exactly
+# once after java/ffi.ss, proves ordinary source jolt lacks the var, then builds
+# one vanilla app with each compiler: the sim-built app must report ABI 6, the
+# ordinary-built one must not have the overlay at all. Serial by construction;
+# opt-in like joltsmoke (a full compiler build), deliberately not in the gates.
+simimagesmoke: jolt-sim
+	@CHEZ="$(CHEZ)" sh test/chez/sim-image-smoke.sh
 
 # Self-build smoke: the distributed jolt compiles an app with Chez + cc removed.
 joltsmoke:
