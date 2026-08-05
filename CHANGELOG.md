@@ -1969,6 +1969,18 @@ is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
 
 ### Added
 
+- **Scoped in-out byte-array pointer loans for `jolt.ffi`.**
+  `with-byte-array-pointer` lends a stable pointer to a temporary native-octet
+  copy of a whole signed byte array or one validated range, then copies native
+  changes back on normal, exceptional, and nonlocal exit. The pointer is valid
+  only during the synchronous callback and is always unlocked when that scope
+  retires. Same-array nesting on one owner thread is rejected; callers must also
+  prevent overlapping loans or access to the same array across threads. Snapshot
+  copy-back can lose updates for overlapping ranges, and the API does not
+  synchronize or enforce ownership even when callers choose disjoint ranges.
+  Captured continuations cannot re-enter a retired loan, and the helper itself
+  captures no native error.
+
 - **Ranged byte-array transfers for `jolt.ffi`.** `read-array!` copies an exact
   native byte range into an existing signed byte array, while the four-argument
   `write-array` form copies an exact source window without staging another
