@@ -739,7 +739,8 @@
                   ;; ffi lowering (emit-ffi-fn/emit-ffi-callable: the sa-* adapter
                   ;; syntaxes a Chez foreign-procedure/callable expands to).
                   "sa-foreign-procedure" "sa-foreign-procedure-blocking"
-                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"}]
+                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"
+                  "jolt-ffi-native-error-procedure" "call-with-values"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is
@@ -1119,11 +1120,45 @@
           n (count types)
           params (mapv (fn [i] (str "a" i)) (range n))
           conv (if vi (str " (__varargs_after " vi ")") "")
-          fp (str "(" (if (:blocking node) "sa-foreign-procedure-blocking " "sa-foreign-procedure ")
-                  conv " "
-                  (chez-str-lit (:csym node))
-                  " (" (str/join " " (map ffi-type->chez types)) ") "
-                  (ffi-type->chez (:rettype node)) ")")]
+          args (str/join " " (map ffi-type->chez types))
+          ret (ffi-type->chez (:rettype node))
+          csym (chez-str-lit (:csym node))
+          capture (:capture-native-error node)
+          fp (if capture
+               (str "(jolt-ffi-native-error-procedure ("
+                    (cond (:blocking node) "__collect_safe"
+                          vi (str "__varargs_after " vi)
+                          :else "")
+                    ") " csym " (" args ") " ret ")")
+               (str "(" (if (:blocking node)
+                           "sa-foreign-procedure-blocking "
+                           "sa-foreign-procedure ")
+                    conv " " csym " (" args ") " ret ")"))
+          ;; Prefer a symbol resolved from the declaring native library's
+          ;; RTLD_LOCAL handle.  The capture wrapper accepts the resolved
+          ;; address in the same entry position as Chez foreign-procedure, so
+          ;; scoped lookup and atomic errno/GetLastError capture compose.
+          ;; Variadic bindings retain global symbol lookup until address +
+          ;; (__varargs_after n) has a dedicated cross-platform gate.
+          scoped (if vi "#f"
+                   (str "(let ((a (jolt-ffi-dlsym-native " csym "))) "
+                        "(and a "
+                        (if capture
+                          (str "(jolt-ffi-native-error-procedure ("
+                               (when (:blocking node) "__collect_safe")
+                               ") a (" args ") " ret ")")
+                          (str "(foreign-procedure "
+                               (when (:blocking node) "__collect_safe ")
+                               "a (" args ") " ret ")"))
+                        "))"))
+          resolve-fp (str "(or " scoped " " fp ")")
+          call (str "((or p (begin (set! p " resolve-fp ") p)) "
+                    (str/join " " params) ")")
+          body (if capture
+                 (str "(call-with-values (lambda () " call ")"
+                      " (lambda (result native-error)"
+                      " (jolt-vector result native-error)))")
+                 call)]
       ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
       ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
       ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
@@ -1138,13 +1173,8 @@
       ;; the symbol. Skipped for :varargs bindings — those are libc functions
       ;; (fcntl/ioctl) that resolve globally as process symbols, and address +
       ;; (__varargs_after n) is untested. defcfn's surface syntax is unchanged.
-      (let [scoped (if vi "#f"
-                     (str "(let ((a (jolt-ffi-dlsym-native " (chez-str-lit (:csym node)) "))) "
-                          "(and a (foreign-procedure " (when (:blocking node) "__collect_safe ")
-                          "a (" (str/join " " (map ffi-type->chez types)) ") "
-                          (ffi-type->chez (:rettype node)) ")))"))]
-        (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
-             "((or p (begin (set! p (or " scoped " " fp ")) p)) " (str/join " " params) ")))")))))
+      (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
+           body ")))"))))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the
@@ -1444,9 +1474,9 @@
         ;; a chained comparison (<= a b c) means (and (<= a b) (<= b c)); the fast
         ;; binary op is 2-ary, so expand rather than pass 3+ args to it. order-args
         ;; binds each operand to a temp once, so reusing a temp across pairs is safe.
-        (order-args (fn [as]
+        (order-args (fn [as])
           (str "(and " (str/join " " (map (fn [pair] (str "(" op " " (first pair) " " (second pair) ")"))
-                                          (partition 2 1 as))) ")")))
+                                          (partition 2 1 as))) ")"))
         ;; Every fast-path op is BINARY — jolt-l+ and friends are 2-arg macros (3
         ;; operands is a syntax error at expansion, not a runtime one) and the
         ;; unchecked ops are 2-arg procs — while +/-/*/min/max are variadic. Lower N
@@ -1456,8 +1486,8 @@
         ;; appears exactly once and in source order, so this is safe whether or not
         ;; order-args bound them to temps.
         (> (count args) 2)
-        (order-args (fn [as]
-          (reduce (fn [acc a] (str "(" op " " acc " " a ")")) (first as) (rest as))))
+        (order-args (fn [as])
+          (reduce (fn [acc a] (str "(" op " " acc " " a ")")) (first as) (rest as)))
         ;; The other end: ONE operand. (+ x)/(* x)/(min x)/(max x) ARE x, and a
         ;; binary op has no 1-operand form to splice it into. A specialized operand
         ;; is already coerced (^long -> fixnum, ^double -> flonum), so unlike the
@@ -1525,7 +1555,7 @@
 (defn- emit-invoke [node]
   (let [tail? *tail?*]           ; capture: children below emit non-tail
    (binding [*tail?* false]
-    (let [fnode (:fn node)
+    (let [fnode (:fn node)]
         arg-nodes (:args node)
         args (mapv emit arg-nodes)
         tl (or (node-line node) 0)
@@ -1548,7 +1578,7 @@
                                 (str "jolt-invoke" (count args))
                                 "jolt-invoke")]
                    (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
-                                 (fn [operands] (emit-call tail? callee operands tl)))))]
+                                 (fn [operands] (emit-call tail? callee operands tl))))))
     (cond
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
@@ -1561,7 +1591,7 @@
       ;; The receiver is bound once — it feeds both the resolve and the application.
       (:devirt-type node)
       (order-args (fn [as]
-                     (let [r (fresh-label "_r$")
+                     (let [r (fresh-label "_r$")]
                           ;; a site whose impl has a contagion clone resolves the clone
                           ;; (fl* + exact->inexact on the :num operand) instead of the
                           ;; shared impl; otherwise the ordinary devirt-resolve. The
@@ -1585,7 +1615,7 @@
                                         (str "(if (and (pair? " c ") (fx= (car " c ") jolt-proto-epoch))"
                                              " (cdr " c ")"
                                              " (let ((_f " dv ")) (set! " c " (cons jolt-proto-epoch _f)) _f))"))
-                                      dv)]
+                                      dv)
                       (str "(let* ((" r " " (first as) ")) ("
                            resolver " " (str/join " " (cons r (rest as))) "))"))))
       ;; polymorphic inline cache: a protocol call the inference recognized (:proto)
@@ -1736,7 +1766,7 @@
       ;; below (which still uses the direct binding as the invoke target).
       (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
            (direct-link-fn? (:ns fnode) (:name fnode)))
-      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl)))
+      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
@@ -1764,7 +1794,7 @@
                          (if (<= n 8)
                            (str "(make-jrec" n " " cached-desc " jolt-nil"
                                 (when (pos? n) (str " " (str/join " " as))) ")")
-                           (str "(let ((v (vector " (str/join " " as) "))) (make-jrec " cached-desc " v jolt-nil))"))))))
+                           (str "(let ((v (vector " (str/join " " as) "))) (make-jrec " cached-desc " v jolt-nil))")))))))
       ;; a late-bound :var call head can hold a procedure OR a non-applicable
       ;; value the RT dispatches (multimethod, keyword/coll IFn) — route via
       ;; jolt-invoke (transparent for a procedure).
@@ -1772,7 +1802,7 @@
       (invoke)
       ;; a computed callee can yield ANY IFn — route through jolt-invoke.
       :else
-      (invoke))))))
+      (invoke)))))
 
 ;; try/catch/finally. throw raises a Chez condition wrapping the jolt value
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
