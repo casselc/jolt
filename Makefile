@@ -342,8 +342,14 @@ cts: testbin
 
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
+# ffi-widths: the exact scalar widths across both halves of jolt.ffi — runtime
+# memory accessors (sizeof/read/write, signed/unsigned bit equivalence) and the
+# compile-time signature path (native args/results/callbacks through a C helper
+# the wrapper builds). The signature half requires a seed minted from the
+# backend source that declares the widths (`make remint`).
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
