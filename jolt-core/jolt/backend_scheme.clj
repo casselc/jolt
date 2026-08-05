@@ -567,7 +567,8 @@
                   ;; ffi lowering (emit-ffi-fn/emit-ffi-callable: the sa-* adapter
                   ;; syntaxes a Chez foreign-procedure/callable expands to).
                   "sa-foreign-procedure" "sa-foreign-procedure-blocking"
-                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"}]
+                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"
+                  "jolt-ffi-native-error-procedure" "call-with-values"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is
@@ -944,11 +945,27 @@
           n (count types)
           params (mapv (fn [i] (str "a" i)) (range n))
           conv (if vi (str " (__varargs_after " vi ")") "")
-          fp (str "(" (if (:blocking node) "sa-foreign-procedure-blocking " "sa-foreign-procedure ")
-                  conv " "
-                  (chez-str-lit (:csym node))
-                  " (" (str/join " " (map ffi-type->chez types)) ") "
-                  (ffi-type->chez (:rettype node)) ")")]
+          args (str/join " " (map ffi-type->chez types))
+          ret (ffi-type->chez (:rettype node))
+          csym (chez-str-lit (:csym node))
+          capture (:capture-native-error node)
+          fp (if capture
+               (str "(jolt-ffi-native-error-procedure ("
+                    (cond (:blocking node) "__collect_safe"
+                          vi (str "__varargs_after " vi)
+                          :else "")
+                    ") " csym " (" args ") " ret ")")
+               (str "(" (if (:blocking node)
+                           "sa-foreign-procedure-blocking "
+                           "sa-foreign-procedure ")
+                    conv " " csym " (" args ") " ret ")"))
+          call (str "((or p (begin (set! p " fp ") p)) "
+                    (str/join " " params) ")")
+          body (if capture
+                 (str "(call-with-values (lambda () " call ")"
+                      " (lambda (result native-error)"
+                      " (jolt-vector result native-error)))")
+                 call)]
       ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
       ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
       ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
@@ -956,7 +973,7 @@
       ;; critical for :optional :jolt/native libs whose load-object runs in the
       ;; scheme-start launcher, after the heap is already built.
       (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
-           "((or p (begin (set! p " fp ") p)) " (str/join " " params) ")))"))))
+           body ")))"))))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the
