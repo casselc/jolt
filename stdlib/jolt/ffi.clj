@@ -50,9 +50,11 @@
   a compile-time-typed signature to a real Chez foreign-procedure. Its optional
   trailing map accepts :blocking and :capture-native-error literal Booleans;
   capture returns [native-result error-code] atomically and requires a non-void
-  result. foreign-callable is the inverse — it wraps a jolt fn as a C-callable
-  function pointer so C can call back into jolt (e.g. GTK signal handlers);
-  free-callable releases it.")
+  result. It also accepts {:varargs-after n}, where n is the positive number of
+  declared fixed C parameters before the "...": argument types after that
+  boundary must already reflect C's default promotions. foreign-callable is the
+  inverse — it wraps a jolt fn as a C-callable function pointer so C can call
+  back into jolt (e.g. GTK signal handlers); free-callable releases it.")
 
 ;; foreign-fn binds C symbol `csym` to a typed callable. Expands to the __cfn
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
@@ -61,8 +63,10 @@
 ;; so it's emitted collect-safe and won't pin the garbage collector.
 ;; An options map may instead combine :blocking with
 ;; :capture-native-error. Capture returns [native-result error-code] (result
-;; first), with the error slot read in the foreign-call return path. The analyzer
-;; validates the literal map and rejects capture on :void.
+;; first), with the error slot read in the foreign-call return path. The map may
+;; also carry {:varargs-after n} to declare the fixed-argument boundary before
+;; C's "...". The analyzer validates the literal map and rejects capture on
+;; :void.
 (defn- cfn-form [csym argtypes rettype args who]
   (let [n (count args)]
     (cond

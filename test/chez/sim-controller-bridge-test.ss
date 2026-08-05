@@ -59,6 +59,9 @@
 (ev "(ffi/defcfn c-bridge-cap-abs \"abs\" [:int] :int {:capture-native-error true})")
 (ev "(ffi/defcfn c-bridge-ghost \"definitely_not_a_real_c_symbol_bridge_zzz9\" [:int :int] :int {:blocking true})")
 (ev "(ffi/defcfn c-bridge-ghost-cap \"definitely_not_a_real_c_symbol_bridge_cap_zzz9\" [] :int {:capture-native-error true})")
+(ev "(ffi/defcfn c-bridge-ghost-varargs
+       \"definitely_not_a_real_c_symbol_bridge_varargs_zzz9\"
+       [:int :double] :double {:varargs-after 1})")
 
 ;; --- A. persistent bridge + exact advertised ABI ------------------------------
 (ok "overlay installs the bridge as the current canonical hook"
@@ -167,6 +170,17 @@
          (cons 'rettype rettype)
          (cons 'blocking blocking)
          (cons 'capture-native-error capture)
+         (cons 'varargs-after #f)
+         (cons 'args args))))
+(define (project-variadic csym argtypes rettype boundary args)
+  (jolt-sim-project-ffi-descriptor
+   (list (cons 'kind 'foreign-call)
+         (cons 'csym csym)
+         (cons 'argtypes argtypes)
+         (cons 'rettype rettype)
+         (cons 'blocking #f)
+         (cons 'capture-native-error #f)
+         (cons 'varargs-after boundary)
          (cons 'args args))))
 (define (project-native op args)
   (jolt-sim-project-ffi-descriptor
@@ -175,6 +189,18 @@
 (define fixed-foreign (project-foreign "fixed" '("int") "int" #f #f (list 7)))
 (ok "fixed foreign projection carries exact nil variadic boundary"
     (jolt-nil? (mget fixed-foreign "varargs-after")))
+(define variadic-foreign
+  (project-variadic "variadic" '("int" "double") "double" 1
+                    (list 1 2.5)))
+(ok "variadic foreign projection carries exact positive boundary"
+    (= 1 (jnum->exact (mget variadic-foreign "varargs-after"))))
+(ok "invalid variadic boundaries fail closed"
+    (and (raises? (lambda ()
+                    (project-variadic "bad" '("int") "int" 0 (list 1))))
+         (raises? (lambda ()
+                    (project-variadic "bad" '("int") "int" 2 (list 1))))
+         (raises? (lambda ()
+                    (project-variadic "bad" '("int") "int" 1.0 (list 1))))))
 (ok "foreign projection kind and renamed fields"
     (and (eq? (mget fixed-foreign "kind") (kw "foreign-function"))
          (string=? "fixed" (mget fixed-foreign "symbol"))
@@ -252,6 +278,7 @@
                 (list (cons 'csym "x") (cons 'kind 'foreign-call)
                       (cons 'argtypes '()) (cons 'rettype "int")
                       (cons 'blocking #f) (cons 'capture-native-error #f)
+                      (cons 'varargs-after #f)
                       (cons 'args '()))))))
 (ok "foreign kind mismatch fails closed"
     (raises? (lambda ()
@@ -259,6 +286,7 @@
                 (list (cons 'kind 'native-op) (cons 'csym "x")
                       (cons 'argtypes '()) (cons 'rettype "int")
                       (cons 'blocking #f) (cons 'capture-native-error #f)
+                      (cons 'varargs-after #f)
                       (cons 'args '()))))))
 (ok "non-string csym fails closed"
     (raises? (lambda () (project-foreign 1 '("int") "int" #f #f (list 1)))))
@@ -305,6 +333,7 @@
                 (list (cons 'kind 'foreign-call) (cons 'csym "x")
                       (cons 'argtypes '("int")) (cons 'rettype "int")
                       (cons 'blocking #f) (cons 'capture-native-error #f)
+                      (cons 'varargs-after #f)
                       (cons 'args (list 1 2)))
                 (lambda () (set! malformed-proceed-used? #t) 9)))))
 (ok "malformed input never reached the controller" (= 0 malformed-seen))
@@ -993,6 +1022,13 @@
            (= 8 (jnum->exact (pvec-nth-d (mget d "arguments") 1 jolt-nil))))))
 (ok "capture-declared substitution is returned unwrapped"
     (= 999 (jnum->exact (ev "(c-bridge-ghost-cap)"))))
+(ok "compiled variadic call projects its exact boundary"
+    (begin
+      (set! seen '())
+      (= 999 (jnum->exact (ev "(c-bridge-ghost-varargs 1 2.5)")))))
+(let ((d (car seen)))
+  (ok "compiled variadic descriptor retains boundary 1"
+      (= 1 (jnum->exact (mget d "varargs-after")))))
 (jolt-sim-restore-controller! sweep-token)
 
 ;; loaded? always publishes a Jolt Boolean, including when a modeled controller

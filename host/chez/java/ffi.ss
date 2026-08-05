@@ -703,13 +703,14 @@
 ;; literals or a later descriptor.  Arguments remain the exact live Jolt values:
 ;; a substitute may need to model writes through an array or pointer.
 (define (jolt-ffi-make-declared-call-descriptor
-         csym argtypes rettype blocking capture-native-error args)
+         csym argtypes rettype blocking capture-native-error varargs-after args)
   (list (cons 'kind 'foreign-call)
         (cons 'csym (string-copy csym))
         (cons 'argtypes (map string-copy argtypes))
         (cons 'rettype (string-copy rettype))
         (cons 'blocking blocking)
         (cons 'capture-native-error capture-native-error)
+        (cons 'varargs-after varargs-after)
         (cons 'args args)))
 
 ;; Invoke one hook under a continuation-safe lifetime.  `proceed` is the only

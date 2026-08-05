@@ -665,19 +665,20 @@
 ;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
 ;; must not pin the stop-the-world collector. A leaf IR node.
 ;;
-;; Normalize the optional form to the two literal Boolean flags understood by
-;; the back end. Direct __cfn calls and the public macros share this fail-closed
-;; validation: keys must be unqualified keywords, values literal Booleans, and
-;; unknown keys are rejected rather than ignored.
+;; Normalize the optional form to the flags understood by the back end. Direct
+;; __cfn calls and the public macros share this fail-closed validation: keys
+;; must be unqualified keywords, :blocking/:capture-native-error take literal
+;; Booleans, :varargs-after takes a positive literal integer, and unknown keys
+;; are rejected rather than ignored.
 (defn- ffi-option
   ([]
-   {:blocking false :capture-native-error false})
+   {:blocking false :capture-native-error false :varargs-after nil})
   ([opt]
    (cond
      (and (form-keyword? opt)
           (nil? (namespace opt))
           (= "blocking" (name opt)))
-     {:blocking true :capture-native-error false}
+     {:blocking true :capture-native-error false :varargs-after nil}
 
      (form-map? opt)
      (reduce
@@ -686,15 +687,25 @@
            (when-not (and (form-keyword? k) (nil? (namespace k)))
              (throw (str "jolt.ffi: option key must be an unqualified keyword, got: " k)))
            (let [kn (name k)]
-             (when-not (or (= kn "blocking") (= kn "capture-native-error"))
-               (throw (str "jolt.ffi: unknown option :" kn)))
-             (when-not (or (true? v) (false? v))
-               (throw (str "jolt.ffi: option :" kn
-                           " must be a literal Boolean, got: " v)))
-             (assoc res
-                    (if (= kn "blocking") :blocking :capture-native-error)
-                    v))))
-       {:blocking false :capture-native-error false}
+             (cond
+               (= kn "varargs-after")
+               (do
+                 (when-not (and (integer? v) (pos? v))
+                   (throw (str "jolt.ffi: option :varargs-after must be a positive literal integer, got: " v)))
+                 (assoc res :varargs-after v))
+
+               (or (= kn "blocking") (= kn "capture-native-error"))
+               (do
+                 (when-not (or (true? v) (false? v))
+                   (throw (str "jolt.ffi: option :" kn
+                               " must be a literal Boolean, got: " v)))
+                 (assoc res
+                        (if (= kn "blocking") :blocking :capture-native-error)
+                        v))
+
+               :else
+               (throw (str "jolt.ffi: unknown option :" kn))))))
+       {:blocking false :capture-native-error false :varargs-after nil}
        (form-map-pairs opt))
 
      :else
@@ -708,17 +719,24 @@
         opt (if (= 5 (count items))
               (ffi-option (nth items 4))
               (ffi-option))
+        argtypes (mapv name (form-vec-items (nth items 2)))
         blocking (:blocking opt)
-        capture (:capture-native-error opt)]
+        capture (:capture-native-error opt)
+        varargs-after (:varargs-after opt)]
     (when (and capture (= rettype "void"))
       (throw (str "jolt.ffi: :capture-native-error is not supported for :void "
                   "(no stable native result to pair with the error code)")))
+    (when (and varargs-after (> varargs-after (count argtypes)))
+      (throw (str "jolt.ffi: :varargs-after " varargs-after
+                  " must not exceed the declared argument count "
+                  (count argtypes))))
     {:op :ffi-fn
      :csym (nth items 1)
-     :argtypes (mapv name (form-vec-items (nth items 2)))
+     :argtypes argtypes
      :rettype rettype
      :blocking blocking
-     :capture-native-error capture}))
+     :capture-native-error capture
+     :varargs-after varargs-after}))
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
 ;; macro) — the inverse of __cfn. It wraps a jolt fn as a C-callable function

@@ -1,4 +1,4 @@
-;; ffi-widths-test.ss — exact scalar-width FFI types gate.
+;; ffi-widths-test.ss — exact scalar-width and variadic FFI types gate.
 ;;
 ;; Exercises the exact scalar widths (:int8/:i8, :int16/:short, :uint16/:ushort,
 ;; :int32, :uint32) across BOTH halves of jolt.ffi so a typed foreign call and a
@@ -125,6 +125,15 @@
     (equal? '(-128 -32768 65535 -2147483648 4294967295)
             (map (lambda (form) (jnum->exact (ev form)))
                  '("(r-i8)" "(r-i16)" "(r-u16)" "(r-i32)" "(r-u32)"))))
+
+;; One fixed integer precedes three already-promoted doubles. This is an
+;; executable witness on every supported platform, including ABIs where fixed
+;; and variadic floating-point arguments use different locations.
+(ev "(def sum-variadic
+       (jolt.ffi/__cfn \"jolt_w_sum_variadic\"
+         [:int :double :double :double] :double {:varargs-after 1}))")
+(ok "variadic boundary preserves promoted doubles"
+    (= 6.875 (ev "(sum-variadic 3 1.5 2.25 3.125)")))
 
 ;; C calls alone cannot prove the declaration width: a mistakenly widened
 ;; foreign signature can still appear correct when the C callee's fixed-width

@@ -1,5 +1,6 @@
-/* Exact-width native argument, result, and callback witnesses for jolt.ffi. */
+/* Exact-width and variadic native ABI witnesses for jolt.ffi. */
 #include <stdint.h>
+#include <stdarg.h>
 
 #ifdef _WIN32
 #define JOLT_WIDTHS_EXPORT __declspec(dllexport)
@@ -43,4 +44,17 @@ JOLT_WIDTHS_EXPORT int64_t jolt_w_call_i32(jolt_w_i32_callback callback) {
 
 JOLT_WIDTHS_EXPORT uint64_t jolt_w_call_u32(jolt_w_u32_callback callback) {
   return callback(UINT32_MAX);
+}
+
+JOLT_WIDTHS_EXPORT double jolt_w_sum_variadic(int count, ...) {
+  va_list args;
+  double sum = 0.0;
+  int i;
+
+  va_start(args, count);
+  for (i = 0; i < count; i++) {
+    sum += va_arg(args, double);
+  }
+  va_end(args);
+  return sum;
 }

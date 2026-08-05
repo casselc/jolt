@@ -36,6 +36,29 @@
 (define (dget descriptor key) (cdr (assq key descriptor)))
 (define (throws? thunk)
   (guard (e (#t #t)) (thunk) #f))
+(define (emitf source)
+  (let-values (((form next) (rdr-read-form source 0 (string-length source))))
+    (let ((ctx (make-analyze-ctx "user")))
+      (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx form) ctx)))))
+(define (contains? s part)
+  (let ((n (string-length s)) (m (string-length part)))
+    (let loop ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring s i (+ i m)) part) #t)
+            (else (loop (+ i 1)))))))
+
+(ok "blocking convention precedes variadic boundary"
+    (contains?
+     (emitf "(jolt.ffi/__cfn \"snprintf\"
+               [:pointer :size_t :pointer :double] :int
+               {:blocking true :varargs-after 3})")
+     "(foreign-procedure __collect_safe (__varargs_after 3) \"snprintf\""))
+(ok "native-error capture groups both conventions in order"
+    (contains?
+     (emitf "(jolt.ffi/__cfn \"snprintf\"
+               [:pointer :size_t :pointer :double] :int
+               {:blocking true :capture-native-error true :varargs-after 3})")
+     "(jolt-ffi-native-error-procedure (__collect_safe (__varargs_after 3)) \"snprintf\""))
 
 ;; Three real bindings plus two deliberately unresolvable bindings.  Merely
 ;; defining a binding must remain lazy; an installed hook must substitute the
@@ -81,6 +104,8 @@
   (ok "descriptor blocking flag is exact" (eq? #t (dget d 'blocking)))
   (ok "descriptor capture flag is exact"
       (eq? #f (dget d 'capture-native-error)))
+  (ok "fixed descriptor carries absent variadic boundary"
+      (eq? #f (dget d 'varargs-after)))
   (ok "descriptor arguments are exact" (equal? '(42 7) (dget d 'args))))
 (let ((d (list-ref descriptors 2)))
   (ok "capture descriptor flag is exact"

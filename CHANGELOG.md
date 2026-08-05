@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Variadic foreign bindings declare their fixed-argument boundary.**
+  `jolt.ffi/foreign-fn` and `defcfn` accept `{:varargs-after n}`, where `n` is
+  the positive number of fixed C parameters before `...`. The boundary lowers
+  to Chez's `__varargs_after` convention, composes with blocking calls and
+  native-error capture, and is retained exactly by simulation FFI descriptor
+  version 8. Callers declare already-promoted C ABI types after the boundary.
+
 - **Source-loaded simulation controller bridge (`host/chez/sim/runtime.ss`,
   composite ABI 6 with exact FFI descriptor version 8).** The prerelease
   simulation overlay unifies
@@ -37,7 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no raw FFI wrappers or second hook stack. Every public controller sees only
   the projected descriptor map: foreign calls become
   `{:kind :foreign-function, :task id, :symbol …, :argument-types […],
-  :return-type …, :blocking? …, :capture-native-error? …, :varargs-after nil,
+  :return-type …, :blocking? …, :capture-native-error? …,
+  :varargs-after nil-or-positive-integer,
   :arguments […]}` and raw operations `{:kind :native-operation, :task id,
   :operation …, :arguments […]}`, validated for exact key order and types,
   fixed argument count, the current 15-operation set (including `null?`,

@@ -317,14 +317,15 @@
 ;; intercepted call:
 ;;   foreign:  ((kind . foreign-call) (csym . string) (argtypes . (string …))
 ;;              (rettype . string) (blocking . bool)
-;;              (capture-native-error . bool) (args . (…)))
+;;              (capture-native-error . bool) (varargs-after . #f|positive-int)
+;;              (args . (…)))
 ;;   native:   ((kind . native-op) (op . string) (args . (…)))
 ;; Every public :ffi controller sees the EXACT jolt-sim map projection below,
 ;; and only that: key order, kind, operation membership, fixed argument count
 ;; against argtypes, and per-operation arity are all validated first, so a
 ;; malformed descriptor fails before the controller or any proceed can run.
-;; The raw compiler/host metadata stays behind; :varargs-after is always nil
-;; because the current compiler emission carries no variadic boundary.
+;; The raw compiler/host metadata stays behind; the exact optional variadic
+;; boundary is retained in descriptor 8 for handler matching and trace fidelity.
 ;; Arguments remain the exact live Jolt values: a substitute may need to model
 ;; writes through an array or pointer.
 (define jolt-sim-native-operation-names
@@ -368,7 +369,7 @@
   (let ((ks (jolt-sim-raw-keys desc)))
     (cond
       ((and (equal? ks '(kind csym argtypes rettype blocking
-                              capture-native-error args))
+                              capture-native-error varargs-after args))
             (eq? (cdr (assq 'kind desc)) 'foreign-call)
             (string? (cdr (assq 'csym desc)))
             (list? (cdr (assq 'argtypes desc)))
@@ -376,6 +377,12 @@
             (string? (cdr (assq 'rettype desc)))
             (boolean? (cdr (assq 'blocking desc)))
             (boolean? (cdr (assq 'capture-native-error desc)))
+            (let ((varargs-after (cdr (assq 'varargs-after desc))))
+              (or (not varargs-after)
+                  (and (number? varargs-after) (exact? varargs-after)
+                       (integer? varargs-after) (> varargs-after 0)
+                       (<= varargs-after
+                           (length (cdr (assq 'argtypes desc)))))))
             (list? (cdr (assq 'args desc)))
             (= (length (cdr (assq 'argtypes desc)))
                (length (cdr (assq 'args desc)))))
@@ -389,7 +396,9 @@
         jolt-sim-kw-return-type (keyword #f (cdr (assq 'rettype desc)))
         jolt-sim-kw-blocking? (cdr (assq 'blocking desc))
         jolt-sim-kw-capture-native-error? (cdr (assq 'capture-native-error desc))
-        jolt-sim-kw-varargs-after jolt-nil
+        jolt-sim-kw-varargs-after
+        (let ((varargs-after (cdr (assq 'varargs-after desc))))
+          (if varargs-after (->num varargs-after) jolt-nil))
         jolt-sim-kw-arguments (apply jolt-vector (cdr (assq 'args desc)))))
       ((and (equal? ks '(kind op args))
             (eq? (cdr (assq 'kind desc)) 'native-op)

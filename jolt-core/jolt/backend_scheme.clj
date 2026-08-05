@@ -699,11 +699,20 @@
         ret (ffi-type->chez (:rettype node))
         csym (chez-str-lit (:csym node))
         capture (:capture-native-error node)
+        block? (:blocking node)
+        va (:varargs-after node)
+        va-token (when va (str "(__varargs_after " va ")"))
+        fp-convs (str (when block? "__collect_safe ")
+                      (when va (str va-token " ")))
+        ne-convs (cond
+                   (and block? va) (str "(__collect_safe " va-token ")")
+                   block?          "(__collect_safe)"
+                   va              (str "(" va-token ")")
+                   :else           "()")
         fp (if capture
-             (str "(jolt-ffi-native-error-procedure "
-                  (if (:blocking node) "(__collect_safe)" "()") " "
+             (str "(jolt-ffi-native-error-procedure " ne-convs " "
                   csym " (" args ") " ret ")")
-             (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
+             (str "(foreign-procedure " fp-convs
                   csym " (" args ") " ret ")"))
         native-call (str "((or p (begin (set! p " fp ") p)) " call-args ")")
         native-body (if capture
@@ -718,7 +727,8 @@
                         csym " " argtypes-lit " "
                         (chez-str-lit (:rettype node)) " "
                         (if (:blocking node) "#t" "#f") " "
-                        (if capture "#t" "#f")
+                        (if capture "#t" "#f") " "
+                        (if va (str va) "#f")
                         " (list " call-args "))")
         hooked-body (str "(jolt-ffi-invoke-declared-call-hook h " descriptor
                          " (lambda () " native-body "))")]
