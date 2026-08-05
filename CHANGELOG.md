@@ -671,6 +671,47 @@ is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
 
 ### Added
 
+- **Source-loaded simulation controller bridge (`host/chez/sim/runtime.ss`,
+  composite ABI 6 with exact FFI descriptor version 7).** The prerelease
+  simulation overlay unifies
+  future-lifecycle, monotonic-clock, typed foreign-call, and raw
+  native-operation control behind one strict-LIFO atomic
+  `jolt.internal.sim` controller with exactly `:future`, `:ffi`, and `:clock`
+  callbacks, backed by a single composite installation pointer. A controlled
+  future captures the effective composite at spawn, and its worker's nested
+  futures, FFI bridge calls, and controlled clock calls stay affine to that
+  capture even while an inner token is current globally; raw/uncontrolled work
+  the host cannot enumerate observes only the global pointer and reports
+  task/parent 0, and its quiescence across install/restore remains the
+  external adapter's precondition. At load the
+  overlay installs exactly one persistent bridge through the declared-call
+  hook seam; the bridge snapshots the composite pointer and either routes a
+  projected descriptor to the installed `:ffi` controller with the canonical
+  proceed untouched, or — with no controller — invokes that exact proceed
+  itself, so install/restore changes only the one pointer and the overlay adds
+  no raw FFI wrappers or second hook stack. Every public controller sees only
+  the projected descriptor map: foreign calls become
+  `{:kind :foreign-function, :task id, :symbol …, :argument-types […],
+  :return-type …, :blocking? …, :capture-native-error? …, :varargs-after nil,
+  :arguments […]}` and raw operations `{:kind :native-operation, :task id,
+  :operation …, :arguments […]}`, validated for exact key order and types,
+  fixed argument count, the current 15-operation set (including `null?`,
+  excluding `borrow-byte-array`/`release-byte-array` — the scoped loan
+  lifecycle stays runtime-owned and only its enclosed FFI is intercepted), and
+  per-operation arity, with malformed descriptors failing before any handler
+  or proceed. The future controller observes
+  `:spawn/:start/:finish/:cancel/:exit/:abort` with stable unique task ids and
+  parentage, may gate task start, captures a start failure as the future's
+  own, and latches terminal-hook failures into a structured
+  `controller-errors` channel without replacing published results. The clock
+  controller samples+validates+publishes under one domain mutex shared by
+  nested installations (concurrent samples can no longer be falsely rejected
+  as backward), validates exact-integer nondecreasing nanoseconds, and keeps
+  an unhooked `supervisor-mono-nanos` for watchdog use. Unreleased: the
+  install/future/clock composite shape is unchanged ABI 6; only the FFI
+  descriptor advances to exact version 7, with no compatibility code for any
+  earlier descriptor shape. Still not public API.
+
 - **Internal interception for raw `jolt.ffi` native operations.** The declared
   foreign-call interception seam now also covers the raw operations `jolt.ffi`
   exposes: `load-library`, `loaded?`, `alloc`, `free`, `read`, `write`,
