@@ -3084,6 +3084,15 @@ is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
   131 assertions, matching JVM Clojure exactly — and joins the
   libconformance fleet. (#540)
 
+### Added
+
+- **Atomic native-error capture for `jolt.ffi`.** `foreign-fn` and `defcfn`
+  accept `{:capture-native-error true}` and return `[native-result error-code]`,
+  capturing POSIX `errno` or Windows `GetLastError` in the foreign-call return
+  path before cleanup or collector reactivation can overwrite it. It composes
+  with `{:blocking true}`; omitted/false capture keeps the existing scalar
+  result, and unsupported targets or malformed options fail closed.
+
 ## [0.6.4] - 2026-08-05
 
 ### Changed
