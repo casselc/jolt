@@ -350,11 +350,17 @@ cts: testbin
 # ffi-ranged-transfer: read-array! and the ranged write-array copy exact
 # offset/count windows between a byte-array and native memory, validating kind,
 # bounds, and null-for-zero-length before any native access or mutation.
+# ffi-byte-array-pointer: with-byte-array-pointer loans a stable pointer into a
+# private native-octet snapshot of a whole byte-array or one validated range to
+# a synchronous callback, copying native mutation back on normal, exceptional,
+# and nonlocal exit; same-array nesting and retired-continuation re-entry are
+# rejected.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@$(CHEZ) --script test/chez/ffi-ranged-transfer-test.ss
+	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
