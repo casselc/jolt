@@ -357,7 +357,18 @@
 ;; Overlapping private snapshots can copy back in an order that loses updates;
 ;; even disjoint ranges remain outside the supported contract because this API
 ;; neither synchronizes access nor enforces array ownership across threads.
-(define ffi-byte-array-loan-cell (make-thread-parameter #f))   ; (owner-id . arrays)
+;;
+;; Each active loan entry tracks the loaned byte-array, the LOCKED temporary
+;; bytevector behind the public pointer, the temporary's base address (stable
+;; exactly while locked, i.e. for the callback's dynamic extent), and the
+;; validated length. Entries are internal to this file: beyond the nesting
+;; check their only readers are the scoped byte-array view operations below,
+;; so a simulation controller can copy bytes to and from the active temporary
+;; WITHOUT any acquire/release or borrow/release lifecycle descriptor.
+(define-record-type jolt-ffi-byte-array-loan
+  (fields arr tmp base length)
+  (nongenerative jolt-ffi-byte-array-loan-v1))
+(define ffi-byte-array-loan-cell (make-thread-parameter #f))   ; (owner-id . loans)
 (define (ffi-current-byte-array-loans)
   (let ((cell (ffi-byte-array-loan-cell)) (id (get-thread-id)))
     (if (and (pair? cell) (eqv? (car cell) id)) (cdr cell) '())))
@@ -379,12 +390,13 @@
          (owner-id (get-thread-id))
          (active-loans (ffi-current-byte-array-loans)))
     (ffi-check-array-range who v start cnt)
-    (when (memq arr active-loans)
+    (when (exists (lambda (loan) (eq? arr (jolt-ffi-byte-array-loan-arr loan)))
+                  active-loans)
       (throw-jvm (quote IllegalStateException)
                  (string-append "jolt.ffi/" who
                                 ": nested loan of the same byte-array")))
     ;; All validation precedes the temporary allocation and lock.
-    (let ((tmp (make-bytevector cnt 0)) (retired? #f))
+    (let ((tmp (make-bytevector cnt 0)) (retired? #f) (loan #f))
       (ffi-copy-vector-to-bytevector! v start tmp cnt)
       (lock-object tmp)
       (dynamic-wind
@@ -393,9 +405,15 @@
             (error 'jolt.ffi
                    "scoped byte-array pointer continuation cannot be re-entered")))
         (lambda ()
+          ;; Capture the address and construct the record only after cleanup is
+          ;; installed. If either operation raises, the after thunk still
+          ;; retires, copies back, and unlocks the temporary exactly once.
+          (set! loan
+                (make-jolt-ffi-byte-array-loan
+                 arr tmp (object->reference-address tmp) cnt))
           (parameterize ((ffi-byte-array-loan-cell
-                          (cons owner-id (cons arr active-loans))))
-            (proc (object->reference-address tmp) cnt)))
+                          (cons owner-id (cons loan active-loans))))
+            (proc (jolt-ffi-byte-array-loan-base loan) cnt)))
         (lambda ()
           ;; Retire before cleanup so a continuation can never resume with the
           ;; old address. The nested wind still unlocks tmp if copy-back exposes
@@ -418,6 +436,96 @@
     ((arr off len f)
      (ffi-with-byte-array-pointer-range arr off len f))))
 (def-var! "jolt.ffi" "with-byte-array-pointer" ffi-with-byte-array-pointer)
+
+;; --- scoped byte-array views over the ACTIVE loan (simulation seam) ----------
+;; A controller's safe window into the runtime-owned temporary behind an
+;; ACTIVE with-byte-array-pointer loan. The simulation overlay
+;; (host/chez/sim/runtime.ss) publishes these as the OPTIONAL
+;; jolt.internal.sim/read-active-byte-array-view and
+;; jolt.internal.sim/write-active-byte-array-view! vars; ordinary images keep
+;; them as unexposed Scheme entries. They are deliberately NOT intercepted
+;; native operations: both copy through the tracked locked bytevector, never
+;; through a raw foreign address, so they carry no descriptor of any kind —
+;; and no acquire/release or borrow/release lifecycle operation exists for
+;; them. The loan contract above (validation, same-owner-thread nesting
+;; rejection, dynamic-extent locking, continuation retirement, and copy-back)
+;; is unchanged and owns the temporary's whole lifetime: a view never extends
+;; it, and copy-back on exit remains the only publisher of temporary writes.
+;;
+;; Matching is owner-thread exact. The lookup walks only the current thread's
+;; OWN active loan cell (ffi-current-byte-array-loans collapses an inherited
+;; cell to empty), so a stale or post-extent address, another thread's loan,
+;; and a never-loaned address all miss and return jolt-nil — for any length
+;; and any source. A matched address with an out-of-range span instead fails
+;; CLOSED with IndexOutOfBoundsException, in the same subtraction form as
+;; ffi-check-array-range, BEFORE any temporary access. The span covers the
+;; loan's whole [base, base+length] range including the exact tail, so an
+;; empty view at base+length is in-range (mirroring the exact-tail empty
+;; loan), while a non-empty span there is out of bounds.
+;; read-active-byte-array-view(ptr len) returns a FRESH jolt byte-array of the
+;; in-range span, folding native octets to signed bytes (na-u8->byte);
+;; write-active-byte-array-view!(ptr src) validates the exact byte-array kind
+;; only after the address matches, masks signed bytes to native octets, and
+;; returns the exact count copied.
+(define (ffi-active-byte-array-loan-for p)
+  (let loop ((loans (ffi-current-byte-array-loans)))
+    (cond
+      ((null? loans) #f)
+      ((let ((loan (car loans)))
+         (and (>= p (jolt-ffi-byte-array-loan-base loan))
+              (<= (- p (jolt-ffi-byte-array-loan-base loan))
+                  (jolt-ffi-byte-array-loan-length loan))))
+       (car loans))
+      (else (loop (cdr loans))))))
+(define (ffi-read-active-byte-array-view ptr len)
+  (if (not (number? ptr))
+      jolt-nil
+      (let* ((p (jnum->exact ptr))
+             (loan (ffi-active-byte-array-loan-for p)))
+        (if (not loan)
+            jolt-nil
+            (let* ((base (jolt-ffi-byte-array-loan-base loan))
+                   (remaining
+                    (- (jolt-ffi-byte-array-loan-length loan) (- p base)))
+                   (n (and (number? len) (jnum->exact len))))
+              ;; A matched address fails closed on ANY out-of-range span —
+              ;; a non-numeric or negative length included — before access.
+              (when (or (not n) (< n 0) (> n remaining))
+                (throw-jvm (quote IndexOutOfBoundsException)
+                           (string-append
+                            "jolt.internal.sim/read-active-byte-array-view"
+                            ": view span out of bounds")))
+              (let ((tmp (jolt-ffi-byte-array-loan-tmp loan))
+                    (off (- p base))
+                    (v (make-vector n 0)))
+                (do ((i 0 (+ i 1))) ((= i n))
+                  (vector-set! v i (na-u8->byte (bytevector-u8-ref tmp (+ off i)))))
+                (make-jolt-array v 'byte)))))))
+(define (ffi-write-active-byte-array-view! ptr src)
+  (if (not (number? ptr))
+      jolt-nil
+      (let* ((p (jnum->exact ptr))
+             (loan (ffi-active-byte-array-loan-for p)))
+        (if (not loan)
+            jolt-nil
+            ;; The exact byte-array kind is validated only after the address
+            ;; matches, so an unmatched pointer is exactly nil for any source.
+            (let* ((v (ffi-byte-array-vector "write-active-byte-array-view!" src))
+                   (n (vector-length v))
+                   (base (jolt-ffi-byte-array-loan-base loan))
+                   (remaining
+                    (- (jolt-ffi-byte-array-loan-length loan) (- p base))))
+              (when (> n remaining)
+                (throw-jvm (quote IndexOutOfBoundsException)
+                           (string-append
+                            "jolt.internal.sim/write-active-byte-array-view!"
+                            ": view span out of bounds")))
+              (let ((tmp (jolt-ffi-byte-array-loan-tmp loan))
+                    (off (- p base)))
+                (do ((i 0 (+ i 1))) ((= i n))
+                  (bytevector-u8-set! tmp (+ off i)
+                                      (bitwise-and (exact (vector-ref v i)) #xff)))
+                n))))))
 
 ;; --- string / bytevector marshaling ------------------------------------------
 ;; A C string result already comes back as a jolt string (the `string` foreign
@@ -688,7 +796,10 @@
 ;;    it performs no foreign-memory operation of its own (its temporary is a
 ;;    locked Scheme bytevector, not foreign-alloc'd memory), and the jolt.ffi
 ;;    operations its callback makes on the loaned pointer are intercepted
-;;    normally.
+;;    normally.  The scoped byte-array view helpers share that exclusion: they
+;;    copy between a controller and the tracked locked temporary directly, so
+;;    they carry no descriptor and the simulation overlay publishes them only
+;;    as optional jolt.internal.sim vars, never as native operations.
 ;;  * free-callable / register-export (and the internal callable/export
 ;;    tables) are jolt-side registries, not raw native operations.
 ;; Declared foreign calls remain kind `foreign-call`; a controller installs
