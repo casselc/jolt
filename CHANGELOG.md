@@ -1969,6 +1969,18 @@ is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
 
 ### Added
 
+- **Internal interception for declared `jolt.ffi` calls.** A disabled-by-default
+  runtime hook can substitute or explicitly proceed with each generated
+  `foreign-fn`/`defcfn` call before native symbol resolution. Controllers receive
+  stable call metadata plus a synchronous, at-most-once continuation for the
+  exact original scalar or native-error-capturing call. Hook installation is a
+  strict token-cleared stack; direct nested calls and retained or re-entered
+  hook/proceed continuations fail closed. A synchronous native callback reached
+  through `proceed` begins a fresh intercepted call. Clearing selects the future
+  hook but is not an in-flight-callback barrier, so controllers must establish
+  quiescence before restoring their token. This is a test/runtime seam, not yet
+  public API.
+
 - **Scoped in-out byte-array pointer loans for `jolt.ffi`.**
   `with-byte-array-pointer` lends a stable pointer to a temporary native-octet
   copy of a whole signed byte array or one validated range, then copies native
