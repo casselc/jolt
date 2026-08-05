@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **External compile passes retain the selected Chez toolchain.** Build entry
+  points now reuse `JOLT_CHEZ` instead of rediscovering a different compiler
+  from `PATH`, quote the selected executable safely, and fail before compiling
+  when its version or host machine cannot be proved to match the running Chez.
+
 ### Added
 
 - **Source-loaded simulation controller bridge (`host/chez/sim/runtime.ss`,
