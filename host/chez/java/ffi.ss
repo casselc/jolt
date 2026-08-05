@@ -96,18 +96,73 @@
 ;; Move raw bytes between a jolt byte-array (jolt-array kind 'byte) and foreign
 ;; memory, byte-exact (no UTF-8 / latin1 decode) — for socket recv/send and the
 ;; zlib / OpenSSL buffers an HTTP client passes through. read-array returns a
-;; fresh byte-array of n bytes; write-array copies a byte-array's bytes into ptr
-;; and returns the count. Foreign memory is unsigned octets and a byte-array element
-;; is a signed byte, so the two directions fold and mask across that seam.
+;; fresh byte-array of n bytes; read-array! copies n native octets INTO an
+;; existing byte-array at an offset (mutating only that range); write-array
+;; copies a byte-array's bytes into ptr. The ranged write-array form
+;; (write-array ptr src src-off len) copies a source sub-range; the original
+;; whole-array (write-array ptr src) form is unchanged. Foreign memory is
+;; unsigned octets and a byte-array element is a signed byte, so the two
+;; directions fold (na-u8->byte) and mask (#xff) across that seam.
+;;
+;; read-array! and the ranged write-array VALIDATE the exact byte-array kind,
+;; the complete range (subtraction-form bounds len <= length - offset, which an
+;; offset-beyond-length or too-large len fails without an offset+len overflow),
+;; and that a null pointer appears only for a zero-length transfer — all BEFORE
+;; any native access or destination/source mutation, so a rejected call is a
+;; no-op. One side of a transfer is always foreign memory and the other a
+;; Scheme-held vector, so source and destination can never alias. Both return
+;; the copied length.
+(define (ffi-byte-array-vector who arr)
+  (if (and (jolt-array? arr) (eq? (jolt-array-kind arr) 'byte))
+      (jolt-array-vec arr)
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append "jolt.ffi/" who ": expected byte-array"))))
+(define (ffi-check-array-range who v off len)
+  (let ((n (vector-length v)))
+    ;; Keep the final check in subtraction form. Besides admitting the exact
+    ;; empty tail, it never constructs the potentially huge sum off+len.
+    (when (or (< off 0) (< len 0) (> off n) (> len (- n off)))
+      (throw-jvm (quote IndexOutOfBoundsException)
+                 (string-append "jolt.ffi/" who ": byte-array range out of bounds")))))
+(define (ffi-check-transfer-pointer who ptr len)
+  ;; No native address is dereferenced for an empty transfer, so zero is valid
+  ;; exactly in that case. Reject every non-empty null before foreign-ref/set!.
+  (when (and (> len 0) (= ptr 0))
+    (throw-jvm (quote NullPointerException)
+               (string-append "jolt.ffi/" who ": null pointer"))))
 (define (ffi-read-array ptr n)
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
     (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (foreign-ref 'unsigned-8 p i))))
     (make-jolt-array v 'byte)))
-(define (ffi-write-array ptr arr)
-  (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
-    (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
-    n))
+(define (ffi-read-array! ptr len dest dest-off)
+  (let* ((v (ffi-byte-array-vector "read-array!" dest))
+         (n (jnum->exact len))
+         (off (jnum->exact dest-off)))
+    (ffi-check-array-range "read-array!" v off n)
+    (let ((p (jnum->exact ptr)))
+      (ffi-check-transfer-pointer "read-array!" p n)
+      (do ((i 0 (+ i 1))) ((= i n))
+        (vector-set! v (+ off i) (na-u8->byte (foreign-ref 'unsigned-8 p i))))
+      n)))
+(define ffi-write-array
+  (case-lambda
+    ((ptr arr)                          ; whole-array form (unchanged)
+     (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
+       (do ((i 0 (+ i 1))) ((= i n))
+         (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
+       n))
+    ((ptr src src-off len)              ; source sub-range form
+     (let* ((v (ffi-byte-array-vector "write-array" src))
+            (off (jnum->exact src-off))
+            (n (jnum->exact len)))
+       (ffi-check-array-range "write-array" v off n)
+       (let ((p (jnum->exact ptr)))
+         (ffi-check-transfer-pointer "write-array" p n)
+         (do ((i 0 (+ i 1))) ((= i n))
+           (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v (+ off i))) #xff)))
+         n)))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
+(def-var! "jolt.ffi" "read-array!" ffi-read-array!)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
 
 ;; --- string / bytevector marshaling ------------------------------------------
