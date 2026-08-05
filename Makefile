@@ -350,6 +350,7 @@ cts: testbin
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:

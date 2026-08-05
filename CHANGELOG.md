@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Atomic native-error capture for `jolt.ffi`.** `foreign-fn` and `defcfn`
+  accept `{:capture-native-error true}` and return `[native-result error-code]`,
+  capturing POSIX `errno` or Windows `GetLastError` in the foreign-call return
+  path before cleanup or collector reactivation can overwrite it. It composes
+  with `{:blocking true}`; omitted/false capture keeps the existing scalar
+  result, and unsupported targets or malformed options fail closed.
+
 ## [0.6.4] - 2026-08-05
 
 ### Changed
