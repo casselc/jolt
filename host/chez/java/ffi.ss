@@ -345,6 +345,126 @@
           ((guard (e (#t #f)) (load-shared-object (car cs)) #t) #t)
           (else (loop (cdr cs)))))))
 
+;; --- declared foreign-call interception (internal simulation seam) ----------
+;; The compiler reads jolt-ffi-declared-call-hook once at the start of every
+;; generated defcfn invocation.  #f keeps the ordinary lazily cached native
+;; call; a hook receives (descriptor proceed), before symbol resolution.  This
+;; is intentionally host-internal for now: no jolt.ffi var exposes it.
+;;
+;; Installations are process-global and form a strict token-cleared stack.  An
+;; out-of-order or repeated clear fails closed instead of disabling a newer
+;; controller.  Install/clear linearize future hook selection under the mutex,
+;; but clear is deliberately not a quiescence barrier: a call that snapshotted
+;; the prior hook may begin invoking it after clear returns.  A controller must
+;; prevent new calls and drain its in-flight invocations before restoring its
+;; token.  Invocation ownership is separate and thread-tagged because Chez thread
+;; parameters are inherited: a child must not inherit its parent's "inside hook"
+;; state, while nested FFI on the same owner thread must fail.
+(define-record-type jolt-ffi-declared-call-hook-installation
+  (fields hook previous)
+  (nongenerative jolt-ffi-declared-call-hook-installation-v1))
+(define-record-type jolt-ffi-declared-call-activation
+  (fields owner-id)
+  (nongenerative jolt-ffi-declared-call-activation-v1))
+(define jolt-ffi-declared-call-hook #f) ; separate hot-path cell
+(define jolt-ffi-declared-call-hook-top #f)
+(define jolt-ffi-declared-call-hook-mu (make-mutex))
+(define jolt-ffi-declared-call-activation-cell (make-thread-parameter #f))
+
+(define (jolt-ffi-install-declared-call-hook! hook)
+  (unless hook
+    (error 'jolt-ffi-install-declared-call-hook! "hook must be non-false"))
+  (with-mutex jolt-ffi-declared-call-hook-mu
+    (let ((installation
+           (make-jolt-ffi-declared-call-hook-installation
+            hook jolt-ffi-declared-call-hook-top)))
+      (set! jolt-ffi-declared-call-hook-top installation)
+      (set! jolt-ffi-declared-call-hook hook)
+      installation)))
+
+(define (jolt-ffi-clear-declared-call-hook! installation)
+  (with-mutex jolt-ffi-declared-call-hook-mu
+    (unless (eq? installation jolt-ffi-declared-call-hook-top)
+      (error 'jolt-ffi-clear-declared-call-hook!
+             "declared-call hooks must be cleared by their current token"))
+    (let ((previous
+           (jolt-ffi-declared-call-hook-installation-previous installation)))
+      (set! jolt-ffi-declared-call-hook-top previous)
+      (set! jolt-ffi-declared-call-hook
+            (and previous
+                 (jolt-ffi-declared-call-hook-installation-hook previous)))))
+  jolt-nil)
+
+(define (jolt-ffi-current-declared-call-activation)
+  (let ((activation (jolt-ffi-declared-call-activation-cell))
+        (owner-id (get-thread-id)))
+    (and activation
+         (eqv? owner-id
+               (jolt-ffi-declared-call-activation-owner-id activation))
+         activation)))
+
+;; The descriptor is an ordinary, inspectable alist.  Its metadata is copied on
+;; every intercepted call, so mutation by one controller cannot corrupt compiler
+;; literals or a later descriptor.  Arguments remain the exact live Jolt values:
+;; a substitute may need to model writes through an array or pointer.
+(define (jolt-ffi-make-declared-call-descriptor
+         csym argtypes rettype blocking capture-native-error args)
+  (list (cons 'kind 'foreign-call)
+        (cons 'csym (string-copy csym))
+        (cons 'argtypes (map string-copy argtypes))
+        (cons 'rettype (string-copy rettype))
+        (cons 'blocking blocking)
+        (cons 'capture-native-error capture-native-error)
+        (cons 'args args)))
+
+;; Invoke one hook under a continuation-safe lifetime.  `proceed` is the only
+;; bypass: it calls the exact generated native path, including lazy caching and
+;; native-error capture, but only synchronously, on this owner thread, and at
+;; most once.  Both the hook extent and proceed use dynamic-wind retirement so a
+;; captured continuation fails before either body can resume after first exit.
+(define (jolt-ffi-invoke-declared-call-hook hook descriptor real-call)
+  (when (jolt-ffi-current-declared-call-activation)
+    (error 'jolt-ffi-invoke-declared-call-hook
+           "nested FFI from a declared-call hook requires its exact proceed"))
+  (let* ((owner-id (get-thread-id))
+         (activation (make-jolt-ffi-declared-call-activation owner-id))
+         (hook-retired? #f)
+         (proceed-used? #f)
+         (proceed-retired? #f))
+    (define (proceed)
+      (unless (and (not hook-retired?)
+                   (eq? activation
+                        (jolt-ffi-current-declared-call-activation)))
+        (error 'jolt-ffi-declared-call-proceed
+               "proceed is valid only during its declared-call hook invocation"))
+      (when proceed-used?
+        (error 'jolt-ffi-declared-call-proceed
+               "proceed may be called at most once"))
+      (set! proceed-used? #t)
+      (dynamic-wind
+        (lambda ()
+          (when proceed-retired?
+            (error 'jolt-ffi-declared-call-proceed
+                   "proceed continuation cannot be re-entered")))
+        ;; `proceed` authorizes this exact real call, not a blanket bypass.  A
+        ;; synchronous native callback into Jolt therefore starts with no active
+        ;; hook invocation and may make its own freshly intercepted declared
+        ;; FFI call.  On return (or any nonlocal exit), parameterize restores the
+        ;; outer activation before the proceed extent retires.
+        (lambda ()
+          (parameterize ((jolt-ffi-declared-call-activation-cell #f))
+            (real-call)))
+        (lambda () (set! proceed-retired? #t))))
+    (dynamic-wind
+      (lambda ()
+        (when hook-retired?
+          (error 'jolt-ffi-invoke-declared-call-hook
+                 "hook continuation cannot be re-entered")))
+      (lambda ()
+        (parameterize ((jolt-ffi-declared-call-activation-cell activation))
+          (jolt-invoke2 hook descriptor proceed)))
+      (lambda () (set! hook-retired? #t)))))
+
 ;; --- expose under jolt.ffi ---------------------------------------------------
 (def-var! "jolt.ffi" "free-callable" ffi-free-callable)
 (def-var! "jolt.ffi" "register-export" jolt-ffi-register-export!)
