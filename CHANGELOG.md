@@ -810,7 +810,7 @@ is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
 ### Added
 
 - **Source-loaded simulation controller bridge (`host/chez/sim/runtime.ss`,
-  composite ABI 6 with exact FFI descriptor version 7).** The prerelease
+  composite ABI 6 with exact FFI descriptor version 8).** The prerelease
   simulation overlay unifies
   future-lifecycle, monotonic-clock, typed foreign-call, and raw
   native-operation control behind one strict-LIFO atomic
@@ -847,8 +847,17 @@ is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
   as backward), validates exact-integer nondecreasing nanoseconds, and keeps
   an unhooked `supervisor-mono-nanos` for watchdog use. Unreleased: the
   install/future/clock composite shape is unchanged ABI 6; only the FFI
-  descriptor advances to exact version 7, with no compatibility code for any
+  descriptor advances to exact version 8, with no compatibility code for any
   earlier descriptor shape. Still not public API.
+
+- **Runtime-owned views of active scoped byte-array loans.** The simulation
+  overlay exposes exact `jolt.internal.sim/read-active-byte-array-view` and
+  `write-active-byte-array-view!` operations for copying through the locked
+  temporary behind a currently active `with-byte-array-pointer` loan. Views
+  remain owner-thread and dynamic-extent confined, return nil for unmatched or
+  stale addresses, and fail closed for matched out-of-range spans. They do not
+  expose or duplicate loan acquisition, release, locking, retirement, or
+  copy-back; those lifetimes remain wholly owned by `jolt.ffi`.
 
 - **Sim-image compiler flavor (`make jolt-sim`, `make simimagesmoke`).**
   `build-jolt.ss` accepts a `sim` profile producing `target/sim/jolt` with the
