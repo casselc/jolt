@@ -2017,6 +2017,16 @@ is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
   descriptor advances to exact version 7, with no compatibility code for any
   earlier descriptor shape. Still not public API.
 
+- **Sim-image compiler flavor (`make jolt-sim`, `make simimagesmoke`).**
+  `build-jolt.ss` accepts a `sim` profile producing `target/sim/jolt` with the
+  debug Chez compile settings: the simulation overlay above is spliced into
+  that compiler's own flat image exactly once after `host/chez/java/ffi.ss`
+  and propagated to every app that image builds (gated on the overlay's
+  `jolt-sim-runtime-image?` marker, so the compiler image itself never gets
+  two copies). Ordinary release/debug/source images carry no simulation
+  source or state, and `make jolt` does not build the sim image. Still not
+  public API.
+
 - **Internal interception for raw `jolt.ffi` native operations.** The declared
   foreign-call interception seam now also covers the raw operations `jolt.ffi`
   exposes: `load-library`, `loaded?`, `alloc`, `free`, `read`, `write`,
