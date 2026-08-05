@@ -144,6 +144,25 @@
 (ok "jolt.host/target :processors matches jolt-available-processors"
     (= (jnum->exact (tget "processors")) (jolt-available-processors)))
 
+;; Native path classification is target-dependent. Exercise both policies here
+;; so Linux CI still proves the Windows form that source-runtime jobs consume.
+(ok "POSIX absolute paths accept only a leading slash"
+    (and (jolt-native-path-absolute-for? #f "/tmp/project")
+         (not (jolt-native-path-absolute-for? #f "C:/project"))
+         (not (jolt-native-path-absolute-for? #f "relative/project"))))
+(ok "Windows absolute paths accept drive and UNC forms but not drive-relative"
+    (and (jolt-native-path-absolute-for? #t "C:/project")
+         (jolt-native-path-absolute-for? #t "C:\\project")
+         (jolt-native-path-absolute-for? #t "\\\\server\\share")
+         (jolt-native-path-absolute-for? #t "//server/share")
+         (not (jolt-native-path-absolute-for? #t "C:project"))
+         (not (jolt-native-path-absolute-for? #t "relative/project"))))
+(ok "project-relative preserves a native absolute JOLT_PWD-derived path"
+    (let ((p (if (eq? target-os (kw "windows"))
+                 "C:\\project/deps.edn"
+                 "/project/deps.edn")))
+      (string=? p (project-relative p))))
+
 (ok "System/getProperty os.name is the exact target-derived string"
     (string=? target-os-name (sys-get-property "os.name")))
 (ok "System/getProperty os.arch is the exact target-derived string"

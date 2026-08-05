@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows project roots remain absolute during dependency resolution.**
+  Drive-qualified and UNC paths are classified using the compiled Jolt target,
+  so `JOLT_PWD=C:\\project` resolves `deps.edn` once instead of producing the
+  invalid `C:\\project/C:\\project/deps.edn` path seen by native Windows jobs.
+
 - **External compile passes retain the selected Chez toolchain.** Build entry
   points now reuse `JOLT_CHEZ` instead of rediscovering a different compiler
   from `PATH`, quote the selected executable safely, and fail before compiling
