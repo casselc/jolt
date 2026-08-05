@@ -56,7 +56,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
+  devbootsmoke devirt directlink ffi ffideclaredhook fieldjoin fieldnum fieldread flarr grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
@@ -112,7 +112,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
+  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffideclaredhook \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   traceemit traceeval \
@@ -361,6 +361,11 @@ ffi:
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@$(CHEZ) --script test/chez/ffi-ranged-transfer-test.ss
 	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
+
+# Internal declared-call interception is compiler-source behavior, so verify it
+# against a fresh transient seed rather than the checked-in image.
+ffideclaredhook:
+	@CHEZ="$(CHEZ)" sh host/chez/transient-seed-gate.sh test/chez/ffi-sim-hook-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
