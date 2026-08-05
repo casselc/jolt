@@ -204,6 +204,14 @@
     ((_ name args res) (sa-ffi-raise 'sa-foreign-procedure-blocking))
     ((_ conv name args res) (sa-ffi-raise 'sa-foreign-procedure-blocking))))
 
+;; (sa-foreign-procedure-native-error (conv ...) name args res) -> procedure
+;; SYNTAX: return the native result and error slot as two values. Degradation:
+;; Gambit's jolt target has no ffi tier, so raise like every other FFI binding.
+(define-syntax sa-foreign-procedure-native-error
+  (syntax-rules ()
+    ((_ (conv ...) name args res)
+     (sa-ffi-raise 'sa-foreign-procedure-native-error))))
+
 ;; (sa-foreign-callable proc args res) -> foreign callable
 ;; SYNTAX: compile-time-typed foreign-callable creation, mirroring
 ;; sa-foreign-procedure. Contract: build a foreign callable around a Scheme

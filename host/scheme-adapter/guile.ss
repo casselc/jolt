@@ -106,6 +106,9 @@
 ;;   sa-foreign-procedure-blocking UNIMPLEMENTED  ?? must verify collect-safety; may
 ;;                                        collapse to plain sa-foreign-procedure only if the
 ;;                                        collector never stops other threads.
+;;   sa-foreign-procedure-native-error UNIMPLEMENTED  ?? must atomically return
+;;                                        the result plus errno-equivalent from
+;;                                        the foreign-call return path.
 ;;   sa-foreign-alloc       UNIMPLEMENTED  ?? (system foreign) make-c-struct / bytevector
 ;;                                        candidates.
 ;;   sa-foreign-free        UNIMPLEMENTED  ?? same.
