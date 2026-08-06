@@ -379,8 +379,21 @@
 
 ;; Symbol hasheq = Util.hashCombine(Murmur3.hashUnencodedChars(name), Util.hash(ns)).
 ;; JVM caches in _hasheq field. Jolt symbols aren't interned (meta varies),
-;; so we cache in a weak-eq hashtable keyed by the symbol object.
-(define symbol-hasheq-cache (make-weak-eq-hashtable))
+;; so we cache in a weak-eq hashtable keyed by the symbol object. Chez mutable
+;; hashtables cannot be accessed concurrently, including a ref racing with a
+;; set!, so each application thread owns its cache. The owner id is required
+;; because Chez thread parameters are inherited by a forked thread. Keep the
+;; two cells separate so a thread pays only for the cache it actually uses.
+(define symbol-hasheq-cache-cell (make-thread-parameter #f))
+(define string-hasheq-cache-cell (make-thread-parameter #f))
+(define (current-hasheq-cache cache-cell)
+  (let ((cell (cache-cell))
+        (id (get-thread-id)))
+    (if (and (pair? cell) (eqv? (car cell) id))
+        (cdr cell)
+        (let ((fresh (make-weak-eq-hashtable)))
+          (cache-cell (cons id fresh))
+          fresh))))
 
 (define (compute-symbol-hasheq ns name)
   (let ((ns-hash (if (or (jolt-nil? ns) (not ns) (eq? ns '()))
@@ -389,24 +402,26 @@
     (hash-combine (murmur3-hash-unencoded-chars name) ns-hash)))
 
 (define (symbol-hasheq sym)
-  (or (hashtable-ref symbol-hasheq-cache sym #f)
-      (let ((h (compute-symbol-hasheq (symbol-t-ns sym) (symbol-t-name sym))))
-        (hashtable-set! symbol-hasheq-cache sym h)
-        h)))
+  (let ((cache (current-hasheq-cache symbol-hasheq-cache-cell)))
+    (or (hashtable-ref cache sym #f)
+        (let ((h (compute-symbol-hasheq (symbol-t-ns sym)
+                                        (symbol-t-name sym))))
+          (hashtable-set! cache sym h)
+          h))))
 
 ;; String hasheq cache — same pattern as symbol cache.
 ;; JVM caches String.hashCode per object; Jolt strings aren't interned
-;; (they're regular Chez strings), so we cache in a weak-eq hashtable.
-(define string-hasheq-cache (make-weak-eq-hashtable))
+;; (they're regular Chez strings), so we cache in the other per-thread table.
 
 (define (compute-string-hasheq s)
   (murmur3-hash-int (java-string-hashcode s)))
 
 (define (string-hasheq s)
-  (or (hashtable-ref string-hasheq-cache s #f)
-      (let ((h (compute-string-hasheq s)))
-        (hashtable-set! string-hasheq-cache s h)
-        h)))
+  (let ((cache (current-hasheq-cache string-hasheq-cache-cell)))
+    (or (hashtable-ref cache s #f)
+        (let ((h (compute-string-hasheq s)))
+          (hashtable-set! cache s h)
+          h))))
 
 ;; ============================================================================
 ;; jolt-hasheq — the top-level dispatch (mirrors Util.hasheq)
@@ -489,4 +504,3 @@
 
 ;; ============================================================================
 ;; Quick sanity: export a helper for the natives to rebind clojure.core/hash
-

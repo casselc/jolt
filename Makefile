@@ -57,7 +57,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi ffideclaredhook ffinativehook fieldjoin fieldnum fieldread flarr grenadine \
-  gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
+  gateboot gatebootsmoke hasheqconcurrency httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release jolt-sim joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selectedchez selfhost shakelocal \
   simcontroller simimagesmoke stateimage traceemit \
@@ -111,7 +111,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
+CI-GATES := submodules values hasheqconcurrency corpus unit grenadine mvnhttp depssmoke depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi ffideclaredhook ffinativehook \
   simcontroller targetfacts \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
@@ -213,6 +213,12 @@ selfhost:
 # Value-model unit tests (nil/truthiness/collections on Chez).
 values:
 	@$(CHEZ) --script test/chez/values-test.ss
+
+# The weak-eq hasheq caches must remain owned by one application thread so Chez
+# never observes a corrupted bucket chain during its post-GC rehash. This gate
+# exercises concurrent mutation, inherited parameter replacement, and cleanup.
+hasheqconcurrency:
+	@$(CHEZ) --script test/chez/hasheq-concurrency-test.ss
 
 # Corpus conformance vs JVM-sourced expecteds (allowlist + floor).
 corpus:
