@@ -173,9 +173,10 @@
 ;; for *ns* / str-of-ns to track the switch.
 (define (jolt-in-ns desig)
   (let* ((nm (ns-desig->name desig)) (n (intern-ns! nm)))
-    ;; set the THREAD-LOCAL current ns; *ns* reads derive from it (dyn-binding.ss),
-    ;; so this is per-thread — concurrent nREPL sessions don't clobber each other.
-    (set-chez-ns! nm)
+    ;; set the THREAD-LOCAL current ns and, after dyn-binding.ss has loaded, the
+    ;; nearest dynamic *ns* binding. Loader restoration uses the same explicit
+    ;; operation, while bootstrap/compiler-only setters remain parameter-only.
+    (set-chez-ns-and-binding! nm)
     n))
 
 ;; ns-name: a namespace's name as a (no-ns) symbol. Overrides the overlay (which

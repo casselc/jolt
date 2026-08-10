@@ -1033,10 +1033,10 @@
                               (string-append "Could not locate " (ns-name->rel name)
                                              ".jolt (or .clj/.cljc) on the source roots"))))
          (saved (chez-current-ns))
-         (base (guard (e (else (set-chez-ns! saved) (raise e)))
+         (base (guard (e (else (set-chez-ns-and-binding! saved) (raise e)))
                  (cpath-with-compile-files
                    (lambda () (cpath-compile-load name file dir))))))
-    (set-chez-ns! saved)
+    (set-chez-ns-and-binding! saved)
     (unless (or (ns-has-vars? name) (hashtable-ref ns-registry name #f))
       (throw-jvm 'java.lang.Exception
                  (string-append "namespace '" name "' not found after loading '" file "'")))
@@ -1078,7 +1078,7 @@
            (ldr-mark-loaded! name)            ; mark before load so a cycle terminates
            (let ((saved (chez-current-ns)))
              (guard (e (else
-                         (set-chez-ns! saved)          ; restore ns, then roll the mark back
+                         (set-chez-ns-and-binding! saved) ; restore ns, then roll the mark back
                          (unless was-loaded? (ldr-unmark-loaded! name))
                          (raise e)))
                 (cond
@@ -1089,7 +1089,7 @@
                   ((cpath-compiling-dir file)
                    => (lambda (dir) (cpath-compile-load name file dir)))
                   (else (aot-load-or-compile name file force?))))
-              (set-chez-ns! saved)             ; restore the current ns (thread-local)
+              (set-chez-ns-and-binding! saved) ; restore current ns and any dynamic binding
               ;; the hook feeds `jolt build`, which needs the SOURCE path; an
               ;; artifact-only namespace has none to give.
               (ns-loaded-hook name (or file art))))

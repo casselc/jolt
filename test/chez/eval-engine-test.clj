@@ -11,6 +11,38 @@
   (when-not (= expected actual)
     (swap! failures conj [label expected actual])))
 
+;; A minimal persistent adapter: it owns the dynamic namespace/history values,
+;; delegates one exact form to jolt.eval, then commits the evaluator's explicit
+;; post-form namespace coordinate and the updated history for its next call.
+;; This is deliberately test scaffolding, not another public REPL API.
+(defn start-session []
+  (atom {:namespace (the-ns 'jolt.eval-engine-test)
+         :one :session-old-1
+         :two :session-old-2
+         :three :session-old-3
+         :error nil}))
+
+(defn session-evaluate! [session code]
+  (let [{:keys [namespace one two three error]} @session]
+    (binding [*ns* namespace
+              *1 one
+              *2 two
+              *3 three
+              *e error]
+      (let [result (jolt.eval/evaluate
+                    {:code code
+                     :ns (str (ns-name *ns*))
+                     :allow-unresolved-vars? false
+                     :capture-out? true
+                     :capture-err? true})]
+        (jolt.eval/record-history! :thread result)
+        (reset! session {:namespace (the-ns (symbol (:ns result)))
+                         :one *1
+                         :two *2
+                         :three *3
+                         :error *e})
+        result))))
+
 (binding [*1 :old-1 *2 :old-2 *3 :old-3 *e nil]
   (let [form "(do (print \"stdout\") (binding [*out* *err*] (print \"stderr\")) {:answer 42})"
         result (jolt.eval/evaluate
@@ -78,6 +110,60 @@
   (jolt.eval-engine-test/check
    :selected-namespace "jolt.eval-engine-target" (:ns result))
   (jolt.eval-engine-test/check :selected-value 42 (:value result)))
+(in-ns 'jolt.eval-engine-test)
+
+;; Namespace-changing forms execute inside a real session-owned *ns* binding.
+;; The evaluator must report the namespace before its private capture bindings
+;; unwind; the adapter persists that explicit coordinate across calls.
+(let [session (start-session)
+      ns-result (session-evaluate! session "(ns jolt.eval-engine-session-target)")
+      def-result (session-evaluate! session "(def answer 42)")
+      value-result (session-evaluate! session "answer")
+      error-result (session-evaluate!
+                    session
+                    "(throw (ex-info \"session-boom\" {:session true}))")
+      history-before-recovery (select-keys @session [:one :two :three :error])
+      recovery-result (session-evaluate! session "[answer *1 (ex-data *e)]")]
+  (check :session-ns-status :ok (:status ns-result))
+  (check :session-ns-coordinate
+         "jolt.eval-engine-session-target" (:ns ns-result))
+  (check :session-ns-persisted
+         "jolt.eval-engine-session-target"
+         (str (ns-name (:namespace @session))))
+  (check :session-def-status :ok (:status def-result))
+  (check :session-def-resolves 42 (:value value-result))
+  (check :session-error-status :error (:status error-result))
+  (check :session-error-namespace
+         "jolt.eval-engine-session-target" (:ns error-result))
+  (check :session-error-keeps-success-history
+         [42 'answer "jolt.eval-engine-session-target"
+          "jolt.eval-engine-session-target"]
+         [(:one history-before-recovery)
+          (:name (meta (:two history-before-recovery)))
+          (str (ns-name (:ns (meta (:two history-before-recovery)))))
+          (str (ns-name (:three history-before-recovery)))])
+  (check :session-error-history
+         {:session true}
+         (ex-data (:error history-before-recovery)))
+  (check :session-recovery-status :ok (:status recovery-result))
+  (check :session-recovery-value
+         [42 42 {:session true}] (:value recovery-result))
+  (check :session-recovery-namespace
+         "jolt.eval-engine-session-target" (:ns recovery-result)))
+(in-ns 'jolt.eval-engine-test)
+
+;; in-ns has the same continuation semantics as ns. Exercise it independently
+;; so a later macro-only workaround cannot accidentally satisfy this gate.
+(let [session (start-session)
+      result (session-evaluate!
+              session "(in-ns 'jolt.eval-engine-in-ns-target)")
+      def-result (session-evaluate! session "(def in-ns-answer 43)")
+      value-result (session-evaluate! session "in-ns-answer")]
+  (check :session-in-ns-status :ok (:status result))
+  (check :session-in-ns-coordinate
+         "jolt.eval-engine-in-ns-target" (:ns result))
+  (check :session-in-ns-def-status :ok (:status def-result))
+  (check :session-in-ns-resolves 43 (:value value-result)))
 (in-ns 'jolt.eval-engine-test)
 
 ;; Root history is the existing nREPL contract. Restore it so this focused file
