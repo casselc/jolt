@@ -96,7 +96,12 @@
       (bump! suite-total suite)
       (guard (e (#t (if throws?
                         (begin (set! pass (+ pass 1)) (bump! suite-pass suite))
-                        (set! fails (cons (list suite expr "raised") fails)))))
+                        (set! fails
+                          (cons (list suite expr
+                                      (if (condition? e)
+                                          (string-append "raised: " (condition->message-string e))
+                                          "raised: non-message condition"))
+                                fails)))))
         (let ((got (jolt-repl-str
                      (parameterize ((current-output-port sink))
                        (jolt-compile-eval (string-append "(do " expr ")") "user")))))
