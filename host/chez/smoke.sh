@@ -1046,5 +1046,114 @@ check '(.nextLong (java.util.Random. 12345))' '6674089274190705457'
 check_no '(dotimes [_ 100] (random-uuid))' 'no OS entropy'
 check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a \b} (nth u 19))])' '[36 \4 true]'
 
+# --- stdin waits do not suppress concurrent stdout --------------------------
+# Chez presents stdin and stdout as one thread-safe port guarded by one mutex.
+# A blocking get-line used to hold that mutex until a complete line arrived, so
+# a future could run (the marker proves it) but its println remained blocked.
+# Hold stdin at a partial line and require the worker's complete line to become
+# visible BEFORE supplying the newline that releases the reader.
+stdin_work="$(mktemp -d)"
+mkfifo "$stdin_work/in"
+abs_jolt3="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+stdin_failed=0
+stdin_pid=""
+stdin_interrupt() {
+  [ -n "$stdin_pid" ] && kill "$stdin_pid" 2>/dev/null || true
+  exec 9>&-
+  stdin_kill_wait=0
+  while [ -n "$stdin_pid" ] && kill -0 "$stdin_pid" 2>/dev/null && \
+        [ "$stdin_kill_wait" -lt 100 ]; do
+    sleep 0.01
+    stdin_kill_wait=$((stdin_kill_wait + 1))
+  done
+  [ -n "$stdin_pid" ] && kill -KILL "$stdin_pid" 2>/dev/null || true
+  [ -n "$stdin_pid" ] && wait "$stdin_pid" 2>/dev/null || true
+  echo "  interrupted: retained stdin smoke evidence at $stdin_work" >&2
+  exit 130
+}
+trap stdin_interrupt HUP INT TERM
+(
+  cd "$stdin_work" || exit 1
+  if [ -n "$jolt_timeout" ]; then
+    exec $jolt_timeout "$abs_jolt3" -e \
+      '(let [[ready release ran] *command-line-args* f (future (do (while (not (.exists (java.io.File. release))) (Thread/sleep 10)) (spit ran "ran") (println "worker-tick") (flush) :done)) _ (do (println "reader-ready") (flush) (spit ready "ready")) line (read-line)] [line @f])' \
+      -- "$stdin_work/reader-ready" "$stdin_work/release-worker" "$stdin_work/worker-ran"
+  else
+    exec "$abs_jolt3" -e \
+      '(let [[ready release ran] *command-line-args* f (future (do (while (not (.exists (java.io.File. release))) (Thread/sleep 10)) (spit ran "ran") (println "worker-tick") (flush) :done)) _ (do (println "reader-ready") (flush) (spit ready "ready")) line (read-line)] [line @f])' \
+      -- "$stdin_work/reader-ready" "$stdin_work/release-worker" "$stdin_work/worker-ran"
+  fi
+) < "$stdin_work/in" > "$stdin_work/out" 2> "$stdin_work/err" &
+stdin_pid=$!
+exec 9> "$stdin_work/in"
+printf 'abc' >&9
+
+# The worker cannot print until the parent releases it. Wait until the main
+# thread has announced the immediately-following read-line, then give it ample
+# time to enter the partial-line wait before allowing the future to run.
+stdin_reader_wait=0
+while [ "$stdin_reader_wait" -lt 300 ] && \
+      { [ ! -f "$stdin_work/reader-ready" ] || ! grep -q '^reader-ready$' "$stdin_work/out"; }; do
+  sleep 0.01
+  stdin_reader_wait=$((stdin_reader_wait + 1))
+done
+if [ ! -f "$stdin_work/reader-ready" ] || ! grep -q '^reader-ready$' "$stdin_work/out"; then
+  echo "  FAIL: stdin reader did not reach the partial-line wait"
+  printf '%s\n' "$(cat "$stdin_work/err")" | sed 's/^/    | /'
+  fails=$((fails + 1))
+  stdin_failed=1
+fi
+sleep 0.1
+: > "$stdin_work/release-worker"
+
+stdin_wait=0
+while [ "$stdin_wait" -lt 300 ] && \
+      { [ ! -f "$stdin_work/worker-ran" ] || ! grep -q '^worker-tick$' "$stdin_work/out"; }; do
+  sleep 0.01
+  stdin_wait=$((stdin_wait + 1))
+done
+if [ -f "$stdin_work/worker-ran" ] && grep -q '^worker-tick$' "$stdin_work/out"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a partial stdin line suppressed a concurrent stdout write"
+  printf '%s\n' "$(cat "$stdin_work/err")" | sed 's/^/    | /'
+  fails=$((fails + 1))
+  stdin_failed=1
+fi
+
+printf '\n' >&9
+exec 9>&-
+if wait "$stdin_pid" && grep -q '^\["abc" :done\]$' "$stdin_work/out"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: cooperative stdin changed partial-line completion"
+  sed 's/^/    | /' "$stdin_work/out" "$stdin_work/err"
+  fails=$((fails + 1))
+  stdin_failed=1
+fi
+trap - HUP INT TERM
+if [ "$stdin_failed" -eq 0 ]; then
+  rm -rf "$stdin_work"
+else
+  echo "    retained stdin smoke evidence at $stdin_work"
+fi
+
+# Pin the EOF and empty-line edges of Chez get-line that the cooperative seam
+# reproduces character by character.
+stdin_eof="$(printf 'abc' | $jolt -e '(let [a (read-line) b (read-line)] [a b])' 2>/dev/null | tail -1)"
+if [ "$stdin_eof" = '["abc" nil]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: partial EOF line — got \`$stdin_eof\`, want \`[\"abc\" nil]\`"
+  fails=$((fails + 1))
+fi
+stdin_lines="$(printf 'one\n\ntwo\n' | $jolt -e '(vector (read-line) (read-line) (read-line) (read-line))' 2>/dev/null | tail -1)"
+if [ "$stdin_lines" = '["one" "" "two" nil]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: buffered stdin line/EOF order — got \`$stdin_lines\`"
+  fails=$((fails + 1))
+fi
+
 echo "cli smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]
