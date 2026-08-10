@@ -691,8 +691,63 @@
 ;; stdin line seam: the clojure.core *in* reader (50-io.clj) drives read-line /
 ;; read / read+string through __stdin-read-line. Return the next line (newline
 ;; stripped) or nil at EOF. Without this, (read-line) and the REPL call nil.
+;;
+;; Chez installs one thread-safe stdin/out port backed by one mutex. A blocking
+;; get-line holds that mutex while it waits for input, which prevents another
+;; Jolt thread from printing to stdout. Read one character only when the port is
+;; ready instead: each false readiness check releases the shared port mutex
+;; before this thread sleeps, so a future can publish while the main thread is
+;; waiting on stdin. Readiness is checked for every character, not just the
+;; first, because a pipe may supply a partial line and pause before its newline.
+;; If a port cannot report readiness (notably some console configurations),
+;; preserve the old blocking behavior for the unconsumed suffix.
+(define jolt-stdin-poll-duration (make-time 'time-duration 10000000 0))
+
+(define (jolt-stdin-ready-state port)
+  (guard (e
+          ((i/o-read-error? e) 'unsupported)
+          (else (raise e)))
+    (if (input-port-ready? port) 'ready 'wait)))
+
+(define (jolt-stdin-prefix->string reversed-chars)
+  (list->string (reverse reversed-chars)))
+
+(define (jolt-stdin-blocking-suffix port reversed-chars)
+  (let ((suffix (get-line port)))
+    (if (eof-object? suffix)
+        (if (null? reversed-chars)
+            suffix
+            (jolt-stdin-prefix->string reversed-chars))
+        (if (null? reversed-chars)
+            suffix
+            (string-append (jolt-stdin-prefix->string reversed-chars) suffix)))))
+
+(define (jolt-stdin-get-line port)
+  (let loop ((reversed-chars '()))
+    (case (jolt-stdin-ready-state port)
+      ((wait)
+       (sleep jolt-stdin-poll-duration)
+       (loop reversed-chars))
+      ((unsupported)
+       (jolt-stdin-blocking-suffix port reversed-chars))
+      (else
+       (let ((c (get-char port)))
+         (cond
+           ((eof-object? c)
+            (if (null? reversed-chars)
+                c
+                (begin
+                  (unget-char port c)
+                  (jolt-stdin-prefix->string reversed-chars))))
+           ((char=? c #\newline)
+            (jolt-stdin-prefix->string reversed-chars))
+           (else
+            (loop (cons c reversed-chars)))))))))
+
 (def-var! "clojure.core" "__stdin-read-line"
-  (lambda () (let ((l (get-line (current-input-port)))) (if (eof-object? l) jolt-nil l))))
+  (lambda ()
+    (let ((l (jolt-stdin-get-line (current-input-port))))
+      (if (eof-object? l) jolt-nil l))))
 
 ;; (type f) -> :jolt/file (the tagged-file :jolt/type). Registered through the
 ;; type-arm registry (natives-meta.ss) so the dispatcher picks it up.
