@@ -38,6 +38,11 @@
             (chez-current-ns-param)))
       (chez-current-ns-param)))
 (define (set-chez-ns! ns) (chez-current-ns-param ns))
+;; Runtime code may additionally need to update the nearest dynamic *ns*
+;; binding. dyn-binding.ss replaces this bootstrap-safe default once the *ns*
+;; var and binding stack exist. Keeping the operations distinct prevents
+;; compiler/reset callers of set-chez-ns! from mutating a user's binding.
+(define set-chez-ns-and-binding! set-chez-ns!)
 
 (define-record-type jolt-multifn
   (fields name dispatch-fn methods default hierarchy prefers

@@ -178,6 +178,17 @@
 ;; defined (ns.ss loaded earlier); chez-current-ns consults it too.
 (set! star-ns-cell (jolt-var "clojure.core" "*ns*"))
 
+;; User-facing namespace changes and loader restoration must keep the runtime
+;; parameter and the nearest dynamic *ns* binding coherent. This is deliberately
+;; separate from set-chez-ns!: bootstrap, compiler, and test-reset callers often
+;; intend to move only the host analyzer coordinate.
+(set! set-chez-ns-and-binding!
+  (lambda (nm)
+    (let ((result (set-chez-ns! nm))
+          (p (dyn-find-binding star-ns-cell)))
+      (when p (set-cdr! p (intern-ns! nm)))
+      result)))
+
 (set! var-deref
   (lambda (ns name)
     (let ((cell (jolt-var ns name)))
