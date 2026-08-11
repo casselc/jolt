@@ -197,6 +197,43 @@
           ((guard (e (#t #f)) (sa-load-shared-object (car cs)) #t) #t)
           (else (loop (cdr cs)))))))
 
+;; --- compatibility read of the current thread's native error slot -----------
+;; New bindings should prefer {:capture-native-error true}: that pairs the
+;; result and error inside Chez's foreign-call return path, so no intervening
+;; native work can clobber the slot. errno remains for existing scalar bindings
+;; and performs exactly one native accessor call followed by a direct memory
+;; read on POSIX, or one WSAGetLastError call on Windows. Call it immediately.
+(define ffi-errno-location
+  (jolt-foreign-proc-safe "__errno_location" '() 'void*))
+(define ffi-error-location
+  (jolt-foreign-proc-safe "__error" '() 'void*))
+(define ffi-wsa-get-last-error
+  (jolt-foreign-proc-safe "WSAGetLastError" '() 'int))
+
+(define (ffi-native-error)
+  (case (sa-os-family)
+    ((linux)
+     (if ffi-errno-location
+         (sa-foreign-ref 'int (ffi-errno-location) 0)
+         (error 'jolt.ffi/errno "__errno_location is unavailable")))
+    ((macos)
+     (if ffi-error-location
+         (sa-foreign-ref 'int (ffi-error-location) 0)
+         (error 'jolt.ffi/errno "__error is unavailable")))
+    ((windows)
+     (if ffi-wsa-get-last-error
+         (ffi-wsa-get-last-error)
+         (error 'jolt.ffi/errno "WSAGetLastError is unavailable")))
+    (else
+     (error 'jolt.ffi/errno "unsupported target OS" (sa-os-family)))))
+
+(define (ffi-native-error-source)
+  (case (sa-os-family)
+    ((linux) (keyword #f "errno-location"))
+    ((macos) (keyword #f "error"))
+    ((windows) (keyword #f "wsa-get-last-error"))
+    (else (keyword #f "unsupported"))))
+
 ;; --- expose under jolt.ffi ---------------------------------------------------
 (def-var! "jolt.ffi" "free-callable" ffi-free-callable)
 (def-var! "jolt.ffi" "register-export" jolt-ffi-register-export!)
@@ -211,3 +248,5 @@
 (def-var! "jolt.ffi" "null" ffi-null)
 (def-var! "jolt.ffi" "ptr->string" ffi-ptr->string)
 (def-var! "jolt.ffi" "string->ptr" ffi-string->ptr)
+(def-var! "jolt.ffi" "errno" ffi-native-error)
+(def-var! "jolt.ffi" "errno-source" ffi-native-error-source)

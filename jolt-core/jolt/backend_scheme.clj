@@ -567,6 +567,9 @@
                   ;; ffi lowering (emit-ffi-fn/emit-ffi-callable: the sa-* adapter
                   ;; syntaxes a Chez foreign-procedure/callable expands to).
                   "sa-foreign-procedure" "sa-foreign-procedure-blocking"
+                  "sa-foreign-procedure-native-error"
+                  "sa-foreign-procedure-blocking-native-error"
+                  "call-with-values"
                   "sa-foreign-callable" "sa-foreign-callable-collect-safe"}]
     (into from-registry helpers)))
 
@@ -944,11 +947,31 @@
           n (count types)
           params (mapv (fn [i] (str "a" i)) (range n))
           conv (if vi (str " (__varargs_after " vi ")") "")
-          fp (str "(" (if (:blocking node) "sa-foreign-procedure-blocking " "sa-foreign-procedure ")
+          capture (:capture-native-error node)
+          adapter (cond
+                    (and (:blocking node) capture)
+                    "sa-foreign-procedure-blocking-native-error "
+
+                    (:blocking node)
+                    "sa-foreign-procedure-blocking "
+
+                    capture
+                    "sa-foreign-procedure-native-error "
+
+                    :else
+                    "sa-foreign-procedure ")
+          fp (str "(" adapter
                   conv " "
                   (chez-str-lit (:csym node))
                   " (" (str/join " " (map ffi-type->chez types)) ") "
-                  (ffi-type->chez (:rettype node)) ")")]
+                  (ffi-type->chez (:rettype node)) ")")
+          call (str "((or p (begin (set! p " fp ") p)) "
+                    (str/join " " params) ")")
+          body (if capture
+                 (str "(call-with-values (lambda () " call ")"
+                      " (lambda (result native-error)"
+                      " (jolt-vector result native-error)))")
+                 call)]
       ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
       ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
       ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
@@ -956,7 +979,7 @@
       ;; critical for :optional :jolt/native libs whose load-object runs in the
       ;; scheme-start launcher, after the heap is already built.
       (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
-           "((or p (begin (set! p " fp ") p)) " (str/join " " params) ")))"))))
+           body "))"))))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the

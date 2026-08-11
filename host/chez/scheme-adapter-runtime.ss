@@ -254,6 +254,51 @@
   (syntax-rules ()
     ((_ name args res) (foreign-procedure __collect_safe name args res))))
 
+;; Choose the native error convention from the COMPILER target. xpatch changes
+;; #%$target-machine while the compiling process's machine-type remains the host;
+;; consulting the latter would silently generate the wrong ABI in a cross-image.
+;; Unsupported targets fail during expansion rather than guessing an errno ABI.
+(define-syntax sa-native-error-convention-case
+  (lambda (x)
+    (syntax-case x ()
+      ((_ get-last-error-form errno-form)
+       (case (eval '(#%$target-machine))
+         ((i3nt ti3nt a6nt ta6nt arm64nt tarm64nt)
+          #'get-last-error-form)
+         ((i3le ti3le a6le ta6le
+           ppc32le tppc32le arm32le tarm32le
+           arm64le tarm64le rv64le trv64le la64le tla64le
+           i3osx ti3osx a6osx ta6osx
+           ppc32osx tppc32osx arm64osx tarm64osx)
+          #'errno-form)
+         (else
+          (error 'sa-native-error-convention-case
+                 "unsupported target machine"
+                 (eval '(#%$target-machine)))))))))
+
+;; Atomic native-error variants of the FFI adapters. Chez returns the native
+;; result and the calling thread's error slot as two Scheme values in the same
+;; foreign-call return path. The back end materializes those values immediately
+;; as the Jolt vector [result error-code]. The optional convention arm composes
+;; with (__varargs_after n); the blocking arm composes with __collect_safe.
+(define-syntax sa-foreign-procedure-native-error
+  (syntax-rules ()
+    ((_ name args res)
+     (sa-native-error-convention-case
+       (foreign-procedure __get_last_error name args res)
+       (foreign-procedure __errno name args res)))
+    ((_ conv name args res)
+     (sa-native-error-convention-case
+       (foreign-procedure __get_last_error conv name args res)
+       (foreign-procedure __errno conv name args res)))))
+
+(define-syntax sa-foreign-procedure-blocking-native-error
+  (syntax-rules ()
+    ((_ name args res)
+     (sa-native-error-convention-case
+       (foreign-procedure __get_last_error __collect_safe name args res)
+       (foreign-procedure __errno __collect_safe name args res)))))
+
 ;; (sa-foreign-callable proc args res) -> foreign callable
 ;; SYNTAX: compile-time-typed foreign-callable creation, mirroring
 ;; sa-foreign-procedure. (sa-foreign-callable f (int) int) lowers to

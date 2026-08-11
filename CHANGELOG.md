@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Foreign calls can capture the native result and error slot atomically.** A
+  `jolt.ffi/foreign-fn` or `defcfn` options map may set
+  `:capture-native-error true`; the call returns `[result error-code]` before
+  later Scheme or native work can overwrite POSIX `errno` or Windows last-error.
+  It composes with `:blocking` and the v0.7.1 `:varargs` marker. The existing
+  `jolt.ffi/errno` and diagnostic `errno-source` helpers remain available for
+  scalar bindings that cannot yet opt in.
+
 ## [0.7.1] - 2026-08-11
 
 Dependency resolution tells the truth about a Maven fetch that failed, retries a
