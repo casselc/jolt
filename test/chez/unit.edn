@@ -1643,4 +1643,8 @@
   {:suite "printing / str of a deftype" :expr "(do (defrecord Rc [a]) (deftype Dt [a]) [(str (->Rc 1)) (str (->Dt 1))])" :expected "[\"user.Rc{:a 1}\" \"user.Dt{:a 1}\"]"}
   ;; a declared toString still wins, collection shape or not
   {:suite "printing / str of a deftype" :expr "(do (deftype Sqt [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v))) Object (toString [_] \"MINE\")) (str (->Sqt [1 2])))" :expected "\"MINE\""}
+  ;; The compiler must reject an unregistered FFI type rather than guessing a
+  ;; width. Positive exact-width memory/signature/callback witnesses live in the
+  ;; dedicated C-backed ffi-widths gate.
+  {:suite "ffi" :expr "(jolt.ffi/__cfn \"strlen\" [:bogus] :size_t)" :expected :throws}
 ]
