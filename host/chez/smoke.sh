@@ -1024,6 +1024,30 @@ else
   fails=$((fails + 1))
 fi
 
+# Socket-free evaluation semantics are shared by the textual REPL and nREPL;
+# the self-checking file pins raw results, stream policy, history, namespace,
+# timing/backtrace metadata, and the existing public nREPL result shape.
+eval_engine_log="$(mktemp)"
+$jolt run test/chez/eval-engine-test.clj >"$eval_engine_log" 2>&1
+eval_engine_status=$?
+eval_engine_out="$(cat "$eval_engine_log")"
+if [ "$eval_engine_status" = 0 ] && printf '%s' "$eval_engine_out" | grep -q 'EVAL-ENGINE OK'; then
+  pass=$((pass + 1))
+  rm -f "$eval_engine_log"
+else
+  echo "  FAIL: shared evaluation engine"
+  if [ -n "$eval_engine_out" ]; then
+    printf '%s\n' "$eval_engine_out" | tail -12 | sed 's/^/    /'
+  else
+    echo "    (no output — evaluation test died before its verdict)"
+  fi
+  mkdir -p target/smoke-failures
+  eval_engine_failure="target/smoke-failures/eval-engine-$$.log"
+  mv "$eval_engine_log" "$eval_engine_failure"
+  echo "    full output retained at $eval_engine_failure"
+  fails=$((fails + 1))
+fi
+
 # REPL must exit on :repl/quit / :exit — a reliable exit that works in any
 # terminal, unlike ^D (which some terminals/editors don't deliver as EOF).
 # Pipe: an evaluable form, the quit keyword, then a sentinel that must NOT run.
@@ -1078,6 +1102,20 @@ else
   printf '%s\n' "$repl_err" | sed 's/^/    | /'
   fails=$((fails + 1))
 fi
+
+# Printing a successful value can itself fail (for example by realizing a lazy
+# sequence). That printer failure becomes *e and must not terminate the loop.
+repl_print_err="$(printf '(lazy-seq (throw (ex-info "print-boom" {:printer true})))\n(boolean *e)\n(+ 40 2)\n:exit\n' | $jolt repl 2>&1)"
+if printf '%s' "$repl_print_err" | grep -q 'print-boom' \
+   && printf '%s' "$repl_print_err" | grep -q 'true' \
+   && printf '%s' "$repl_print_err" | grep -q '42'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a REPL printer failure should update *e and continue"
+  printf '%s\n' "$repl_print_err" | sed 's/^/    | /'
+  fails=$((fails + 1))
+fi
+
 # JOLT_TRACE=0 opts out — no trace in the REPL.
 repl_off="$(printf '(defn ra [x] (+ x 1))\n(defn rb [x] (ra x))\n(rb :nan)\n:exit\n' | JOLT_TRACE=0 $jolt repl 2>&1)"
 if printf '%s' "$repl_off" | grep -q '  trace:'; then
