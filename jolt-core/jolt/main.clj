@@ -4,6 +4,7 @@
   which hands it the raw argv; the project directory is JOLT_PWD (the user's cwd
   before the launcher cd'd to the jolt repo)."
   (:require [jolt.deps :as deps]
+            [jolt.eval :as jeval]
             [clojure.string :as str]))
 
 (defn- project-dir [] (or (jolt.host/getenv "JOLT_PWD") "."))
@@ -416,18 +417,27 @@
         (if (#{:repl/quit :exit} (try (read-string form) (catch :default _ nil)))
           nil
           (do
-            (try (let [v (load-string form)]
-                   (var-set #'clojure.core/*3 *2)
-                   (var-set #'clojure.core/*2 *1)
-                   (var-set #'clojure.core/*1 v)
-                   (println (pr-str v)))
-                 (catch :default e
-                   (var-set #'clojure.core/*e e)
-                   (println "error:" (or (ex-message e)
-                                         (try ((resolve 'jolt.host/condition-message) e) (catch :default _ nil))
-                                         (pr-str e)))
-                   (when-let [bt (jolt.host/backtrace-string)]
-                     (print bt))))
+            (let [result (jeval/evaluate
+                          {:code form
+                           :allow-unresolved-vars? false
+                           :capture-out? false
+                           :capture-err? false})]
+              ;; Printing is part of a textual REPL evaluation: realizing a
+              ;; lazy value or invoking a custom printer can itself throw. Keep
+              ;; that failure inside the loop, update *e, and continue exactly
+              ;; as the pre-engine REPL did.
+              (try
+                (jeval/record-history! :thread result)
+                (let [{:keys [status value exception backtrace]} result]
+                  (if (= :ok status)
+                    (println (pr-str value))
+                    (do (println "error:" (jeval/err-msg exception))
+                        (when backtrace (print backtrace)))))
+                (catch :default e
+                  (var-set #'*e e)
+                  (println "error:" (jeval/err-msg e))
+                  (when-let [bt (jolt.host/backtrace-string)]
+                    (print bt)))))
             (recur)))))))
 
 ;; A deps.edn :tasks entry: a string is a shell command; a map is {:main-opts …}.
