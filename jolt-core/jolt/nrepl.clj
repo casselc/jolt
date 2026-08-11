@@ -19,6 +19,7 @@
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
+            [jolt.eval :as jeval]
             [jolt.analyzer :as ana]))
 
 ;; --- sockets (loopback server) ---------------------------------------------
@@ -174,10 +175,7 @@
 (defn err-msg
   "Best-effort message for any thrown value (ex-info, or a raw Chez condition —
   ex-message is nil for those, so fall back to the host condition text)."
-  [e]
-  (or (ex-message e)
-      (try ((resolve 'jolt.host/condition-message) e) (catch :default _ nil))
-      (pr-str e)))
+  [e] (jeval/err-msg e))
 
 (def ^:dynamic *capturing-thread*
   "The thread of an `evaluate` in flight, for as long as it is capturing *out* to
@@ -207,38 +205,29 @@
 (defn evaluate
   "Evaluate `code` (optionally in loaded ns `ns-str`), capturing *out*. Returns
   {:value .. :out .. :ns .. :err ..}. in-ns — not (binding [*ns* ..]) — sets the
-  ns load-string resolves against on jolt. Reusable by eval middleware."
+  ns load-string resolves against on jolt. Reusable by eval middleware.
+
+  Session middleware should persist the returned `:ns` and pass it back as
+  `ns-str`; it must not dynamically bind `*ns*` around this call."
   [code ns-str]
-  (let [result (atom nil) err (atom nil) exc (atom nil)
-        out (with-out-str
-              (binding [*capturing-thread* (Thread/currentThread)]
-                (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
-                       (in-ns (symbol ns-str)))
-                     (reset! result (binding [*allow-unresolved-vars* true]
-                                      (load-string code)))
-                     (catch :default e
-                       ;; the backtrace is read here, while it still describes
-                       ;; THIS failure
-                       (reset! exc e)
-                       (let [bt (jolt.host/backtrace-string)]
-                         (reset! last-backtrace bt)
-                         (reset! err (str (err-msg e) (when bt (str "\n" bt)))))))))]
-    ;; the REPL history vars, like clojure.main's REPL and every other nREPL
-    ;; server: an editor session can reach for *1 or (ex-data *e) after an error,
-    ;; and tooling (a stacktrace op) reads *e to find the last exception. These
-    ;; are process-wide roots — an nREPL server has no outer REPL loop whose
-    ;; thread bindings would shadow them.
-    ;; *e (and the backtrace beside it) survives a later successful eval, like
-    ;; every REPL's does
-    (if @exc
-      (alter-var-root #'*e (constantly @exc))
-      (do (alter-var-root #'*3 (constantly *2))
-          (alter-var-root #'*2 (constantly *1))
-          (alter-var-root #'*1 (constantly @result))))
-    {:value (when (nil? @err) (pr-str @result))
+  (let [result (binding [*capturing-thread* (Thread/currentThread)]
+                 (jeval/evaluate {:code code
+                                  :ns ns-str
+                                  :allow-unresolved-vars? true
+                                  :capture-out? true
+                                  :capture-err? false}))
+        {:keys [status value exception backtrace out ns]} result
+        ;; A watch reacting to the new *e root must see the backtrace belonging
+        ;; to that same exception, not the previous evaluation's trace.
+        _ (when (= :error status) (reset! last-backtrace backtrace))
+        _ (jeval/record-history! :root result)
+        error (when (= :error status)
+                (str (err-msg exception)
+                     (when backtrace (str "\n" backtrace))))]
+    {:value (when (= :ok status) (pr-str value))
      :out out
-     :ns (str (ns-name *ns*))
-     :err @err}))
+     :ns ns
+     :err error}))
 
 ;; ops middleware advertise via describe (built-ins + any a library registers).
 (def ^:private extra-ops (atom #{}))
