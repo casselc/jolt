@@ -396,11 +396,13 @@ cts: testbin
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 # The widths gate covers the exact scalar vocabulary across both halves of the
-# API: runtime memory access and compiler-emitted procedures/callables.
+# API: runtime memory access and compiler-emitted procedures/callables. The
+# byte-array pointer gate proves scoped native mutation and cleanup.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:

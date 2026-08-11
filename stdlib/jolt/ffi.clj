@@ -19,6 +19,14 @@
   unsigned names at one width expose the same stored bits; wire byte order stays
   an explicit codec or htons/ntohs concern.
 
+  with-byte-array-pointer is a scoped synchronous in-out bridge, not a zero-copy
+  view. Its whole-array and ranged forms call f with [pointer validated-length],
+  using a private foreign-memory snapshot and copying native changes back as
+  signed bytes on normal return, exception, or nonlocal exit. Native code must
+  not retain or free the pointer. Same-array nesting on one thread is rejected;
+  callers must prevent overlapping loans or access to the array across threads.
+  A captured continuation cannot re-enter a retired loan.
+
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers
   a compile-time-typed signature to a real Chez foreign-procedure. Its optional

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Scoped in-out byte-array pointer loans for `jolt.ffi`.**
+  `with-byte-array-pointer` lends a stable pointer to a private foreign-memory
+  snapshot of a whole signed byte array or one validated range. Native changes
+  are copied back on normal, exceptional, and nonlocal exit, and the allocation
+  is always freed. Native code must not retain the pointer. Same-array nesting
+  on one thread is rejected; callers remain responsible for cross-thread array
+  ownership.
+
 - **Foreign calls can capture the native result and error slot atomically.** A
   `jolt.ffi/foreign-fn` or `defcfn` options map may set
   `:capture-native-error true`; the call returns `[result error-code]` before
