@@ -1308,7 +1308,7 @@
    (controller-config rf-inner-future rf-inner-ffi rf-inner-clock)))
 (with-mutex rf-mu
   (set! rf-inner-installed? #t) (condition-broadcast rf-cv))
-(ok "outer controlled task completes after its raw fork" 
+(ok "outer controlled task completes after its raw fork"
     (equal? 5 (jolt-future-deref-timed rf-f 5000 life-timeout)))
 ;; Deref observes result publication, not the later :exit acknowledgement.
 ;; Await the outer exit explicitly before inspecting events or restoring either
