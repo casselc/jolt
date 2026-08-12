@@ -1885,21 +1885,63 @@
 (def-var! "clojure.core" "load" jolt-load)
 
 ;; --- shell primitive (jolt.host/sh, sh-out) ---------------------------------
-;; `sh` runs `sh -c CMD`, inheriting stdout/stderr (so git progress shows), and
-;; returns the exit code. `sh-out` captures stdout to a string (exit ignored) for
-;; commands whose output we parse (git rev-parse). Used by jolt.deps for git.
-(define (jolt-sh cmd) (system cmd))
+;; `sh` runs a shell command, inheriting stdout/stderr (so git progress shows),
+;; and returns the exit code. On POSIX, Chez's `system` already supplies the
+;; shell. On Windows it supplies cmd.exe, which cannot run the POSIX commands
+;; used by jolt.deps. JOLT_SH names an explicit POSIX shell there. Write the
+;; command to a temporary script so paths containing spaces and arbitrary shell
+;; syntax do not cross a second quoting language.
+(define (jolt-nonblank-env name)
+  (let ((value (getenv name)))
+    (and value (> (string-length value) 0) value)))
+(define (jolt-shell-script-path)
+  (let ((dir (or (jolt-nonblank-env "TEMP")
+                 (jolt-nonblank-env "TMP")
+                 ".")))
+    (string-append dir "/jolt-sh-"
+                   (number->string (get-process-id)) "-"
+                   (number->string (random 1000000000)) ".sh")))
+(define (jolt-windows-command-quote value)
+  ;; JOLT_SH and TEMP are trusted process coordinates. A literal quote cannot
+  ;; be represented safely in cmd.exe's executable/path positions.
+  (when (exists (lambda (c) (char=? c #\")) (string->list value))
+    (error 'jolt.host/sh "JOLT_SH or temporary path contains a quote" value))
+  (string-append "\"" value "\""))
+(define (jolt-with-shell-script cmd proc)
+  (let ((script (jolt-shell-script-path)))
+    (dynamic-wind
+      (lambda ()
+        (let ((out (open-output-file script 'replace)))
+          (put-string out cmd)
+          (newline out)
+          (close-output-port out)))
+      (lambda () (proc script))
+      (lambda () (guard (e (#t #f)) (delete-file script #f))))))
+(define (jolt-explicit-shell-command shell script)
+  (string-append (jolt-windows-command-quote shell) " "
+                 (jolt-windows-command-quote script)))
+(define (jolt-sh cmd)
+  (let ((shell (jolt-nonblank-env "JOLT_SH")))
+    (if shell
+        (jolt-with-shell-script
+          cmd (lambda (script) (system (jolt-explicit-shell-command shell script))))
+        (system cmd))))
 (def-var! "jolt.host" "sh" jolt-sh)
 
 (define (jolt-sh-out cmd)
-  (call-with-values
-    (lambda () (sa-run-process (string-append "exec sh -c " (sh-quote cmd))
-                               (native-transcoder)))
-    (lambda (stdin stdout stderr pid)
-      (close-port stdin)
-      (let ((out (get-string-all stdout)))
-        (close-port stdout) (close-port stderr)
-        (if (eof-object? out) "" out)))))
+  (define (capture command)
+    (call-with-values
+      (lambda () (sa-run-process command (native-transcoder)))
+      (lambda (stdin stdout stderr pid)
+        (close-port stdin)
+        (let ((out (get-string-all stdout)))
+          (close-port stdout) (close-port stderr)
+          (if (eof-object? out) "" out)))))
+  (let ((shell (jolt-nonblank-env "JOLT_SH")))
+    (if shell
+        (jolt-with-shell-script
+          cmd (lambda (script) (capture (jolt-explicit-shell-command shell script))))
+        (capture (string-append "exec sh -c " (sh-quote cmd))))))
 (define (sh-quote s)   ; single-quote for the outer sh -c
   (string-append "'"
     (apply string-append
