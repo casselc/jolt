@@ -57,6 +57,7 @@
 (ev "(ffi/load-library)")
 (ev "(ffi/defcfn c-bridge-abs \"abs\" [:int] :int)")
 (ev "(ffi/defcfn c-bridge-cap-abs \"abs\" [:int] :int {:capture-native-error true})")
+(ev "(ffi/defcfn c-bridge-fcntl-cap \"fcntl\" [:int :int :varargs :int] :int {:capture-native-error true})")
 (ev "(ffi/defcfn c-bridge-ghost \"definitely_not_a_real_c_symbol_bridge_zzz9\" [:int :int] :int {:blocking true})")
 (ev "(ffi/defcfn c-bridge-ghost-cap \"definitely_not_a_real_c_symbol_bridge_cap_zzz9\" [] :int {:capture-native-error true})")
 
@@ -175,6 +176,15 @@
 (define fixed-foreign (project-foreign "fixed" '("int") "int" #f #f (list 7)))
 (ok "fixed foreign projection carries exact nil variadic boundary"
     (jolt-nil? (mget fixed-foreign "varargs-after")))
+(define variadic-foreign
+  (project-foreign "fcntl" '("int" "int" "varargs" "int") "int" #f #t
+                   (list -1 3 0)))
+(ok "variadic projection removes the marker and publishes its boundary"
+    (and (equal? (vector->list (pvec-v (mget variadic-foreign "argument-types")))
+                 (list (kw "int") (kw "int") (kw "int")))
+         (= 2 (mget variadic-foreign "varargs-after"))
+         (= 3 (pvec-count (mget variadic-foreign "arguments")))
+         (eq? #t (mget variadic-foreign "capture-native-error?"))))
 (ok "foreign projection kind and renamed fields"
     (and (eq? (mget fixed-foreign "kind") (kw "foreign-function"))
          (string=? "fixed" (mget fixed-foreign "symbol"))
@@ -277,6 +287,11 @@
 (ok "argument count must equal argtype count"
     (and (raises? (lambda () (project-foreign "x" '("int") "int" #f #f (list 1 2))))
          (raises? (lambda () (project-foreign "x" '("int" "int") "int" #f #f (list 1))))))
+(ok "malformed variadic markers fail closed"
+    (and (raises? (lambda () (project-foreign "x" '("varargs" "int") "int" #f #f (list 1))))
+         (raises? (lambda () (project-foreign "x" '("int" "varargs") "int" #f #f (list 1))))
+         (raises? (lambda () (project-foreign "x" '("int" "varargs" "int" "varargs" "int")
+                                              "int" #f #f (list 1 2 3))))))
 (ok "superseded descriptor shape fails closed"
     (raises? (lambda ()
                (jolt-sim-project-ffi-descriptor
@@ -1032,6 +1047,12 @@
       (and (pvec? r)
            (= 2 (pvec-count r))
            (= 9 (jnum->exact (pvec-nth-d r 0 jolt-nil)))
+           (integer? (pvec-nth-d r 1 jolt-nil)))))
+(ok "proceeded captured variadic call preserves descriptor and result shape"
+    (let ((r (ev "(c-bridge-fcntl-cap -1 3 0)")))
+      (and (pvec? r)
+           (= 2 (pvec-count r))
+           (= -1 (jnum->exact (pvec-nth-d r 0 jolt-nil)))
            (integer? (pvec-nth-d r 1 jolt-nil)))))
 (ok "proceeded declared call is the exact native binding"
     (= 9 (jnum->exact (ev "(c-bridge-abs -9)"))))
