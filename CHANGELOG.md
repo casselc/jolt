@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A socket-free evaluator API with persistent namespace, result history, output,
+  error, and backtrace state for REPL and debugger clients.
+- A dedicated simulation image and controller overlay for futures, monotonic
+  time, declared foreign calls, and raw native operations. Ordinary Jolt images
+  do not contain this overlay.
+- Internal, disabled-by-default interception seams for declared FFI calls and
+  raw native operations. Interceptors receive one synchronous, at-most-once
+  continuation for the original operation.
+- Exact-width FFI scalar types, atomic native-error capture, ranged byte-array
+  transfers, and scoped in-out byte-array pointer loans. Pointer loans are
+  synchronous dynamic scopes; their callbacks must not park a fiber.
+- Runtime-owned inspection of active byte-array loans for the simulation image.
+- An exact, fail-closed compiler target descriptor in `jolt.host/target`.
+
+### Fixed
+
+- Native Windows project roots remain absolute during dependency resolution.
+- External compile passes retain and validate the selected Chez executable.
+
 ## [0.7.3] - 2026-08-11
 
 `core.async` names three carriers and jolt has all three now: `io-thread` runs
@@ -668,157 +691,6 @@ is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
 - mount (application state lifecycle) passes its full suite — 21 tests,
   131 assertions, matching JVM Clojure exactly — and joins the
   libconformance fleet. (#540)
-
-### Fixed
-
-- **Windows project roots remain absolute during dependency resolution.**
-  Drive-qualified and UNC paths are classified using the compiled Jolt target,
-  so `JOLT_PWD=C:\\project` resolves `deps.edn` once instead of producing the
-  invalid `C:\\project/C:\\project/deps.edn` path seen by native Windows jobs.
-
-- **External compile passes retain the selected Chez toolchain.** Build entry
-  points now reuse `JOLT_CHEZ` instead of rediscovering a different compiler
-  from `PATH`, quote the selected executable safely, and fail before compiling
-  when its version or host machine cannot be proved to match the running Chez.
-
-### Added
-
-- **Source-loaded simulation controller bridge (`host/chez/sim/runtime.ss`,
-  composite ABI 6 with exact FFI descriptor version 8).** The prerelease
-  simulation overlay unifies
-  future-lifecycle, monotonic-clock, typed foreign-call, and raw
-  native-operation control behind one strict-LIFO atomic
-  `jolt.internal.sim` controller with exactly `:future`, `:ffi`, and `:clock`
-  callbacks, backed by a single composite installation pointer. A controlled
-  future captures the effective composite at spawn, and its worker's nested
-  futures, FFI bridge calls, and controlled clock calls stay affine to that
-  capture even while an inner token is current globally; raw/uncontrolled work
-  the host cannot enumerate observes only the global pointer and reports
-  task/parent 0, and its quiescence across install/restore remains the
-  external adapter's precondition. At load the
-  overlay installs exactly one persistent bridge through the declared-call
-  hook seam; the bridge snapshots the composite pointer and either routes a
-  projected descriptor to the installed `:ffi` controller with the canonical
-  proceed untouched, or — with no controller — invokes that exact proceed
-  itself, so install/restore changes only the one pointer and the overlay adds
-  no raw FFI wrappers or second hook stack. Every public controller sees only
-  the projected descriptor map: foreign calls become
-  `{:kind :foreign-function, :task id, :symbol …, :argument-types […],
-  :return-type …, :blocking? …, :capture-native-error? …, :varargs-after nil,
-  :arguments […]}` and raw operations `{:kind :native-operation, :task id,
-  :operation …, :arguments […]}`, validated for exact key order and types,
-  fixed argument count, the current 15-operation set (including `null?`,
-  excluding `borrow-byte-array`/`release-byte-array` — the scoped loan
-  lifecycle stays runtime-owned and only its enclosed FFI is intercepted), and
-  per-operation arity, with malformed descriptors failing before any handler
-  or proceed. The future controller observes
-  `:spawn/:start/:finish/:cancel/:exit/:abort` with stable unique task ids and
-  parentage, may gate task start, captures a start failure as the future's
-  own, and latches terminal-hook failures into a structured
-  `controller-errors` channel without replacing published results. The clock
-  controller samples+validates+publishes under one domain mutex shared by
-  nested installations (concurrent samples can no longer be falsely rejected
-  as backward), validates exact-integer nondecreasing nanoseconds, and keeps
-  an unhooked `supervisor-mono-nanos` for watchdog use. Unreleased: the
-  install/future/clock composite shape is unchanged ABI 6; only the FFI
-  descriptor advances to exact version 8, with no compatibility code for any
-  earlier descriptor shape. Still not public API.
-
-- **Runtime-owned views of active scoped byte-array loans.** The simulation
-  overlay exposes exact `jolt.internal.sim/read-active-byte-array-view` and
-  `write-active-byte-array-view!` operations for copying through the locked
-  temporary behind a currently active `with-byte-array-pointer` loan. Views
-  remain owner-thread and dynamic-extent confined, return nil for unmatched or
-  stale addresses, and fail closed for matched out-of-range spans. They do not
-  expose or duplicate loan acquisition, release, locking, retirement, or
-  copy-back; those lifetimes remain wholly owned by `jolt.ffi`.
-
-- **Sim-image compiler flavor (`make jolt-sim`, `make simimagesmoke`).**
-  `build-jolt.ss` accepts a `sim` profile producing `target/sim/jolt` with the
-  debug Chez compile settings: the simulation overlay above is spliced into
-  that compiler's own flat image exactly once after `host/chez/java/ffi.ss`
-  and propagated to every app that image builds (gated on the overlay's
-  `jolt-sim-runtime-image?` marker, so the compiler image itself never gets
-  two copies). Ordinary release/debug/source images carry no simulation
-  source or state, and `make jolt` does not build the sim image. Still not
-  public API.
-
-- **Internal interception for raw `jolt.ffi` native operations.** The declared
-  foreign-call interception seam now also covers the raw operations `jolt.ffi`
-  exposes: `load-library`, `loaded?`, `alloc`, `free`, `read`, `write`,
-  `sizeof`, `null?`, `read-bytes`, `write-bytes`, `read-array`, `read-array!`,
-  both `write-array` arities, `ptr->string`, and `string->ptr`. Each operation
-  reads the same process-global hook once per call — disabled remains one
-  variable read and one branch with no descriptor or proceed allocation — and
-  an installed hook receives a stable `native-op` descriptor carrying the
-  operation name and the exact live call arguments (including the `read-array!`
-  destination array a model can write through; the two `write-array` arities
-  are told apart by argument count) plus the same scoped, same-thread,
-  at-most-once `proceed` as a declared call. Proceed runs the exact original
-  operation, preserving results, nil returns, byte-array kind/range/null
-  pointer validation, and exception behavior, while substitution returns the
-  hook's value unwrapped — except `loaded?`, which keeps its Boolean public
-  contract by normalizing any substituted value (nil and false become false,
-  anything else true). Both descriptor kinds share the one token-cleared
-  installation stack and reentrancy contract, so a controller installs exactly
-  one hook. `null` stays a plain value var (there is no operation to
-  intercept), `with-byte-array-pointer` keeps its scoped loan lifecycle
-  un-reimplemented (its callback's own `jolt.ffi` operations are intercepted
-  normally), and the callable/export registries are not intercepted. Still a
-  test/runtime seam, not yet public API.
-
-- **Internal interception for declared `jolt.ffi` calls.** A disabled-by-default
-  runtime hook can substitute or explicitly proceed with each generated
-  `foreign-fn`/`defcfn` call before native symbol resolution. Controllers receive
-  stable call metadata plus a synchronous, at-most-once continuation for the
-  exact original scalar or native-error-capturing call. Hook installation is a
-  strict token-cleared stack; direct nested calls and retained or re-entered
-  hook/proceed continuations fail closed. A synchronous native callback reached
-  through `proceed` begins a fresh intercepted call. Clearing selects the future
-  hook but is not an in-flight-callback barrier, so controllers must establish
-  quiescence before restoring their token. This is a test/runtime seam, not yet
-  public API.
-
-- **Scoped in-out byte-array pointer loans for `jolt.ffi`.**
-  `with-byte-array-pointer` lends a stable pointer to a temporary native-octet
-  copy of a whole signed byte array or one validated range, then copies native
-  changes back on normal, exceptional, and nonlocal exit. The pointer is valid
-  only during the synchronous callback and is always unlocked when that scope
-  retires. Same-array nesting on one owner thread is rejected; callers must also
-  prevent overlapping loans or access to the same array across threads. Snapshot
-  copy-back can lose updates for overlapping ranges, and the API does not
-  synchronize or enforce ownership even when callers choose disjoint ranges.
-  Captured continuations cannot re-enter a retired loan, and the helper itself
-  captures no native error.
-
-- **Ranged byte-array transfers for `jolt.ffi`.** `read-array!` copies an exact
-  native byte range into an existing signed byte array, while the four-argument
-  `write-array` form copies an exact source window without staging another
-  array — both move bytes directly between the array and native memory, never
-  routing through a string. Both validate the byte-array kind, subtraction-safe
-  bounds, and null pointer rules before native access or destination mutation;
-  zero-length transfers at an array's exact tail remain valid and return zero.
-  Existing whole-array transfers and signed-byte/raw-octet conversion remain
-  unchanged.
-
-- **Atomic native-error capture for `jolt.ffi`.** `foreign-fn` and `defcfn`
-  accept `{:capture-native-error true}` and return `[native-result error-code]`,
-  capturing POSIX `errno` or Windows `GetLastError` in the foreign-call return
-  path before cleanup or collector reactivation can overwrite it. It composes
-  with `{:blocking true}`; omitted/false capture keeps the existing scalar
-  result, and unsupported targets or malformed options fail closed.
-
-- **`jolt.host/target`, an exact fail-closed compiler-target descriptor.**
-  Reports `:os`, `:arch`, `:abi`, `:libc`, `:endian`, `:pointer-bits`,
-  `:file-separator`, `:path-separator`, and `:processors`. The compiler target's
-  OS, architecture, and ABI come from an exact allowlist checked against
-  `rt.ss`'s native-error convention selection; an unrecognized machine tuple
-  fails closed to `:unknown` instead of guessing, while independently measurable
-  runtime facts remain available. `System`'s `os.name`, `os.arch`, separators,
-  and properties project from the same target facts. Optional native-symbol
-  resolution also selects its Windows-safe path from the compiler target,
-  including Windows ARM64, so cross-images cannot bake POSIX relocations into
-  Windows output.
 
 ## [0.6.4] - 2026-08-05
 
