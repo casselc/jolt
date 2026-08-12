@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased fork additions]
+
+### Added
+
+- A socket-free evaluator API with persistent namespace, result history, output,
+  error, and backtrace state for REPL and debugger clients.
+- A dedicated simulation image and controller overlay for futures, monotonic
+  time, declared foreign calls, and raw native operations. Ordinary Jolt images
+  do not contain this overlay.
+- Internal, disabled-by-default interception seams for declared FFI calls and
+  raw native operations. Interceptors receive one synchronous, at-most-once
+  continuation for the original operation.
+- Exact-width FFI scalar types, atomic native-error capture, ranged byte-array
+  transfers, and scoped in-out byte-array pointer loans. Pointer loans are
+  synchronous dynamic scopes; their callbacks must not park a fiber.
+- Runtime-owned inspection of active byte-array loans for the simulation image.
+- An exact, fail-closed compiler target descriptor in `jolt.host/target`.
+
+### Fixed
+
+- Native Windows project roots remain absolute during dependency resolution.
+- External compile passes retain and validate the selected Chez executable.
+
 ## [0.7.16] - 2026-08-18
 
 A dependencies release. Most of it is one contribution (#645, thanks to
