@@ -87,9 +87,10 @@
                (eq? want-conv got-conv)))))
   target-machine-fact-names)
 
-;; jolt-foreign-proc-safe must choose the deferred eval form from the COMPILER
-;; target.  That prevents a Linux build host from baking a missing POSIX symbol
-;; relocation into a Windows cross-image, and covers Chez's Windows ARM64 names.
+;; jolt-foreign-proc-safe must retain both paths behind the v0.7.3 runtime OS
+;; adapter. A compile-file transformer cannot call the runtime adapter, so the
+;; compiled image carries a Windows-safe dynamic constructor and the ordinary
+;; statically typed POSIX constructor; the running target selects between them.
 (define (datum-contains-symbol? needle x)
   (cond ((symbol? x) (eq? needle x))
         ((pair? x) (or (datum-contains-symbol? needle (car x))
@@ -100,24 +101,17 @@
                 (or (datum-contains-symbol? needle (vector-ref x i))
                     (loop (+ i 1))))))
         (else #f)))
-(define (safe-foreign-proc-deferred-for-target? target)
-  (parameterize ((#%$target-machine target))
-    (datum-contains-symbol?
-      'eval
-      (syntax->datum
-        (expand '(jolt-foreign-proc-safe "jolt_optional_probe" '() 'int))))))
-(for-each
-  (lambda (target)
-    (ok (string-append (symbol->string target)
-                       ": optional FFI resolution is deferred")
-        (safe-foreign-proc-deferred-for-target? target)))
-  '(i3nt ti3nt a6nt ta6nt arm64nt tarm64nt))
-(for-each
-  (lambda (target)
-    (ok (string-append (symbol->string target)
-                       ": optional FFI resolution stays compiled")
-        (not (safe-foreign-proc-deferred-for-target? target))))
-  '(ta6le tarm64le ta6osx tarm64osx))
+(define safe-foreign-proc-expansion
+  (syntax->datum
+    (expand '(jolt-foreign-proc-safe "jolt_optional_probe" '() 'int))))
+(ok "optional FFI resolution selects from the runtime target adapter"
+    (datum-contains-symbol? 'sa-os-family safe-foreign-proc-expansion))
+(ok "optional FFI resolution retains the Windows dynamic constructor"
+    (datum-contains-symbol? 'sa-foreign-procedure-runtime
+                            safe-foreign-proc-expansion))
+(ok "optional FFI resolution retains the compiled non-Windows constructor"
+    ;; sa-foreign-procedure is a syntax adapter and is fully expanded here.
+    (datum-contains-symbol? '$foreign-procedure safe-foreign-proc-expansion))
 
 ;; --- current-host public descriptor coherence -----------------------------------
 ;; jolt.host/target, System's individual properties, System/getProperties, and
