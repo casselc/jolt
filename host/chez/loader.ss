@@ -1740,8 +1740,13 @@
       (lambda () (proc script))
       (lambda () (guard (e (#t #f)) (delete-file script #f))))))
 (define (jolt-explicit-shell-command shell script)
-  (string-append (jolt-windows-command-quote shell) " "
-                 (jolt-windows-command-quote script)))
+  (let ((command (string-append (jolt-windows-command-quote shell) " "
+                                (jolt-windows-command-quote script))))
+    ;; cmd.exe removes the first quote when an executable path is quoted. The
+    ;; conventional outer quote preserves the executable and argument quotes.
+    (if (eq? (sa-os-family) 'windows)
+        (string-append "\"" command "\"")
+        command)))
 (define (jolt-sh cmd)
   (let ((shell (jolt-nonblank-env "JOLT_SH")))
     (if shell
