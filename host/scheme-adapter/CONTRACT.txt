@@ -138,6 +138,7 @@ sa-gc-trip-bytes!
 # (a dynamic parameter — the degraded-backtrace gate flips it to prove throws
 # still carry type+message).
 sa-host-tag
+sa-compiler-host-probe-source
 sa-os-family
 sa-arch
 sa-endian
@@ -181,6 +182,7 @@ sa-foreign-callable-entry-point
 sa-foreign-procedure-runtime
 sa-foreign-procedure
 sa-foreign-procedure-blocking
+sa-foreign-procedure-native-error
 #
 # tier: eval
 # interaction-environment: R7RS (scheme repl), not Chez-only. The ONLY host

@@ -151,7 +151,7 @@
                   (if bld-nt? "\\" "/"))))
     (string-append dir sep "jolt-chez-probe-"
       (number->string (get-process-id)) "-"
-      (number->string (real-time)) "-"
+      (number->string (sa-real-time-ms)) "-"
       (number->string bld-probe-counter) "-" tag)))
 
 (define (bld-sh-capture/status cmd)
@@ -217,8 +217,7 @@
              (machine-result
                (begin
                  (let ((p (open-output-file machine-script 'replace)))
-                   (put-string p
-                     "(import (chezscheme))\n(display (machine-type))\n(newline)\n")
+                   (put-string p (sa-compiler-host-probe-source))
                    (close-port p))
                  (bld-sh-capture/status
                    (string-append (bld-sh-quote bld-chez)
@@ -479,8 +478,7 @@
   ;; of simulation source and state. The sim compiler's OWN image is spliced by
   ;; build-jolt.ss instead (its host process has no marker), so a compiler
   ;; image never gets two copies.
-  (when (and (top-level-bound? 'jolt-sim-runtime-image?)
-             (top-level-value 'jolt-sim-runtime-image?))
+  (when (sa-baked-global 'jolt-sim-runtime-image?)
     (bld-inline-line "(load \"host/chez/sim/runtime.ss\")" out 0)))
 
 ;; --- app emission -----------------------------------------------------------

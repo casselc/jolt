@@ -131,6 +131,13 @@
 (define (sa-host-tag)
   "gambit")
 
+;; Source program used to identify an external compiler selected by build.ss.
+;; The current Gambit target does not provide native compilation, so preserve
+;; that fail-closed boundary instead of inventing a child-compiler probe.
+(define (sa-compiler-host-probe-source)
+  (error 'sa-compiler-host-probe-source
+         "external compiler probing is unsupported on the gambit target"))
+
 ;; (sa-os-family) -> 'macos | 'windows | 'linux
 ;; The OS family every host OS branch derives. Contract: one of the three
 ;; symbols. Degradation: none — the sites have no safe assumed default; an
@@ -203,6 +210,11 @@
   (syntax-rules ()
     ((_ name args res) (sa-ffi-raise 'sa-foreign-procedure-blocking))
     ((_ conv name args res) (sa-ffi-raise 'sa-foreign-procedure-blocking))))
+
+(define-syntax sa-foreign-procedure-native-error
+  (syntax-rules ()
+    ((_ error-conv (conv ...) name args res)
+     (sa-ffi-raise 'sa-foreign-procedure-native-error))))
 
 ;; (sa-foreign-callable proc args res) -> foreign callable
 ;; SYNTAX: compile-time-typed foreign-callable creation, mirroring

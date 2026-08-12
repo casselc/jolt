@@ -798,7 +798,7 @@
                (keyword #f (symbol->string (cadddr row))))))
       (else (loop (cdr rows))))))
 
-(define target-machine-name (symbol->string (machine-type)))
+(define target-machine-name (sa-host-tag))
 (define target-facts (target-facts-for-machine-name target-machine-name))
 (define target-os (car target-facts))
 (define target-arch (cadr target-facts))
