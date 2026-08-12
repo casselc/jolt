@@ -144,6 +144,11 @@
     (evb "(let [[res err] (c-fail-ff 42)] (and (= res -1) (= err 42)))"))
 (ok "public defcfn captures the pair"
     (evb "(let [[res err] (c-fail-dc 42)] (and (= res -1) (= err 42)))"))
+(ev "(def c-vararg-err
+       (jolt.ffi/__cfn \"jolt_ne_vararg\" [:int :varargs :int] :int
+         {:capture-native-error true}))")
+(ok "variadic binding preserves its boundary while capturing native error"
+    (evb "(= [-7 82] (c-vararg-err 82 -7))"))
 (ok "capture lowering cannot be shadowed by a same-named local"
     (evb "(let [call-with-values (fn [& _] :shadowed)
                 f (jolt.ffi/__cfn \"jolt_ne_fail\" [:int] :int

@@ -36,7 +36,9 @@
   stable address only for f's dynamic extent, then copies its octets back as
   signed bytes on normal return, jolt/host exception, and nonlocal exit. Native
   code must not retain the pointer; the loaned range is owned by copy-back while
-  f runs. A nested loan of the same array on one thread is rejected, while
+  f runs. The callback must not park a fiber: parking unwinds its dynamic extent,
+  retires the loan, and makes continuation re-entry fail. A nested loan of the
+  same array on one thread is rejected, while
   distinct-array nesting is allowed. Callers must prevent overlapping loan
   lifetimes or other access to the same array across threads. Overlapping
   snapshots can lose updates during copy-back; even disjoint ranges are outside
