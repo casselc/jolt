@@ -321,10 +321,11 @@
 ;;   native:   ((kind . native-op) (op . string) (args . (…)))
 ;; Every public :ffi controller sees the EXACT jolt-sim map projection below,
 ;; and only that: key order, kind, operation membership, fixed argument count
-;; against argtypes, and per-operation arity are all validated first, so a
+;; against normalized argtypes, and per-operation arity are all validated first, so a
 ;; malformed descriptor fails before the controller or any proceed can run.
-;; The raw compiler/host metadata stays behind; :varargs-after is always nil
-;; because the current compiler emission carries no variadic boundary.
+;; The raw compiler marker stays behind: zero or one interior "varargs" marker
+;; is removed from :argument-types and its positive index is published as
+;; :varargs-after (nil for fixed-arity calls).
 ;; Arguments remain the exact live Jolt values: a substitute may need to model
 ;; writes through an array or pointer.
 (define jolt-sim-native-operation-names
@@ -364,20 +365,37 @@
       ((string=? op "write-array") (or (= n 2) (= n 4)))
       ((string=? op "read-array!") (= n 4))
       (else #f))))
+(define (jolt-sim-normalize-foreign-argtypes argtypes)
+  ;; Return (normalized-types . boundary-or-#f), or #f for a malformed marker.
+  ;; The compiler already enforces this shape; the bridge repeats the check
+  ;; because its raw descriptor seam is internal but independently callable.
+  (let loop ((remaining argtypes) (index 0) (types '()) (boundary #f))
+    (cond
+      ((null? remaining) (cons (reverse types) boundary))
+      ((string=? (car remaining) "varargs")
+       (if (or boundary (= index 0) (null? (cdr remaining)))
+           #f
+           (loop (cdr remaining) index types index)))
+      (else
+       (loop (cdr remaining) (+ index 1) (cons (car remaining) types) boundary)))))
 (define (jolt-sim-project-ffi-descriptor desc)
-  (let ((ks (jolt-sim-raw-keys desc)))
+  (let* ((ks (jolt-sim-raw-keys desc))
+         (raw-argtypes (and (list? desc) (assq 'argtypes desc)
+                            (cdr (assq 'argtypes desc))))
+         (normalized (and (list? raw-argtypes)
+                          (for-all string? raw-argtypes)
+                          (jolt-sim-normalize-foreign-argtypes raw-argtypes))))
     (cond
       ((and (equal? ks '(kind csym argtypes rettype blocking
                               capture-native-error args))
             (eq? (cdr (assq 'kind desc)) 'foreign-call)
             (string? (cdr (assq 'csym desc)))
-            (list? (cdr (assq 'argtypes desc)))
-            (for-all string? (cdr (assq 'argtypes desc)))
+            normalized
             (string? (cdr (assq 'rettype desc)))
             (boolean? (cdr (assq 'blocking desc)))
             (boolean? (cdr (assq 'capture-native-error desc)))
             (list? (cdr (assq 'args desc)))
-            (= (length (cdr (assq 'argtypes desc)))
+            (= (length (car normalized))
                (length (cdr (assq 'args desc)))))
        (jolt-hash-map
         jolt-sim-kw-kind jolt-sim-kw-foreign-function
@@ -385,11 +403,11 @@
         jolt-sim-kw-symbol (cdr (assq 'csym desc))
         jolt-sim-kw-argument-types
         (apply jolt-vector (map (lambda (s) (keyword #f s))
-                                (cdr (assq 'argtypes desc))))
+                                (car normalized)))
         jolt-sim-kw-return-type (keyword #f (cdr (assq 'rettype desc)))
         jolt-sim-kw-blocking? (cdr (assq 'blocking desc))
         jolt-sim-kw-capture-native-error? (cdr (assq 'capture-native-error desc))
-        jolt-sim-kw-varargs-after jolt-nil
+        jolt-sim-kw-varargs-after (if (cdr normalized) (cdr normalized) jolt-nil)
         jolt-sim-kw-arguments (apply jolt-vector (cdr (assq 'args desc)))))
       ((and (equal? ks '(kind op args))
             (eq? (cdr (assq 'kind desc)) 'native-op)
