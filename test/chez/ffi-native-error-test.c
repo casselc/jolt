@@ -23,6 +23,7 @@
 #endif
 
 #include <stdint.h>
+#include <stdarg.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -56,6 +57,19 @@ JOLT_NE_EXPORT int jolt_ne_ok(void) {
 JOLT_NE_EXPORT int jolt_ne_clobber(int code) {
   JOLT_NE_SET(code);
   return 0;
+}
+
+/* Variadic path: read one promoted int, write the requested error code, and
+ * return the variadic value. This composes the (__varargs_after 1) calling
+ * convention with atomic native-error capture in one binding. */
+JOLT_NE_EXPORT int jolt_ne_vararg(int code, ...) {
+  va_list args;
+  int value;
+  va_start(args, code);
+  value = va_arg(args, int);
+  va_end(args);
+  JOLT_NE_SET(code);
+  return value;
 }
 
 /* Stay in native code long enough for another Chez thread to force a
