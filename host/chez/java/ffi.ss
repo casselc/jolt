@@ -343,7 +343,9 @@
 ;; dynamic-wind runs copy-back on normal return, jolt/host exceptions, AND
 ;; nonlocal exits. Retiring before copy-back makes the address permanently dead
 ;; on that first exit; the before thunk then rejects a captured continuation
-;; before its callback can resume or a second copy-back can run.
+;; before its callback can resume or a second copy-back can run. A fiber park is
+;; such an exit: it retires and unlocks the loan, so resuming that fiber rejects
+;; before callback code continues. Loan callbacks therefore must not park.
 ;;
 ;; A thread parameter tracks same-owner-thread nested loans of the SAME array:
 ;; two independent snapshots would give an order-dependent, lossy copy-back, so

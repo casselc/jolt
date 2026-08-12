@@ -286,6 +286,34 @@
            (not (locked-object? tmp))
            (= 77 (vector-ref v 0)))))
 
+;; A v0.7.3 fiber park is a real nonlocal exit through host dynamic-winds. The
+;; loan must retire, copy back, and unlock on that exit; when the parked
+;; continuation is scheduled again, the before thunk must reject it before any
+;; callback code after the park can run.
+(jolt-fiber-carrier-count-set! 1)
+(let* ((a (ev "(byte-array [1])")) (v (jolt-array-vec a))
+       (tmp #f) (callback-resumed? #f)
+       (fiber
+        (sa-fiber-spawn
+         (lambda ()
+           (ffi-with-scoped-byte-array-pointer
+            "fiber-park-test" a 0 1
+            (lambda (p n)
+              (set! tmp (reference-address->object p))
+              (bytevector-u8-set! tmp 0 200)
+              (sa-fiber-yield)
+              (set! callback-resumed? #t)
+              n))))))
+  (sa-fiber-run-all)
+  (ok "fiber park retires and unlocks the loan before rejecting resume"
+      (and (eq? 'dead (jolt-fiber-state fiber))
+           (condition? (jolt-fiber-error fiber))
+           (has? (condition-message (jolt-fiber-error fiber)) "cannot be re-entered")
+           (not callback-resumed?)
+           (bytevector? tmp)
+           (not (locked-object? tmp))
+           (= -56 (vector-ref v 0)))))
+
 ;; --- scoped byte-array view over the ACTIVE loan (Scheme level) --------------
 ;; The two operations the simulation overlay publishes under jolt.internal.sim
 ;; are host entries in host/chez/java/ffi.ss, exercised here directly. All
