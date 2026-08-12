@@ -1128,7 +1128,7 @@
           fp (if capture
                (str "(jolt-ffi-native-error-procedure ("
                     (cond (:blocking node) "__collect_safe"
-                          vi (str "__varargs_after " vi)
+                          vi (str "(__varargs_after " vi ")")
                           :else "")
                     ") " csym " (" args ") " ret ")")
                (str "(" (if (:blocking node)
