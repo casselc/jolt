@@ -990,7 +990,7 @@
       ;; [result native-error] shape.
       (str "(let ((p #f)) (lambda (" call-args ") "
            "(let ((h jolt-ffi-declared-call-hook)) "
-           "(if h " hooked-body " " native-body ")))))"))))
+           "(if h " hooked-body " " native-body "))))"))))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the
