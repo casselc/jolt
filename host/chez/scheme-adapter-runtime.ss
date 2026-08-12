@@ -123,6 +123,14 @@
 (define (sa-host-tag)
   (symbol->string (machine-type)))
 
+;; (sa-compiler-host-probe-source) -> string
+;; A complete source program which prints the external Scheme compiler's host
+;; tag.  build.ss runs it in the selected child compiler and compares the result
+;; with sa-host-tag before compiling.  The program is target-owned because its
+;; imports and host-identification primitive necessarily are.
+(define (sa-compiler-host-probe-source)
+  "(import (chezscheme))\n(display (machine-type))\n(newline)\n")
+
 (define (sa-tag-contains? tag needle)
   (let ((n (string-length tag)) (m (string-length needle)))
     (let loop ((i 0))
@@ -253,6 +261,15 @@
 (define-syntax sa-foreign-procedure-blocking
   (syntax-rules ()
     ((_ name args res) (foreign-procedure __collect_safe name args res))))
+
+;; Native-error capture has a target-specific convention token before any
+;; ordinary calling convention. Keep that multi-token surface in the adapter;
+;; sa-foreign-procedure's optional convention slot is one datum and cannot
+;; express Chez's (__errno conv ...) grammar.
+(define-syntax sa-foreign-procedure-native-error
+  (syntax-rules ()
+    ((_ error-conv (conv ...) name args res)
+     (foreign-procedure error-conv conv ... name args res))))
 
 ;; (sa-foreign-callable proc args res) -> foreign callable
 ;; SYNTAX: compile-time-typed foreign-callable creation, mirroring

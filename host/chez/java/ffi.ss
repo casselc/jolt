@@ -64,7 +64,7 @@
          ;; The descriptor list spine is a per-call snapshot of the lexical
          ;; rest list: a hook mutating descriptor args must not redirect the
          ;; real operation, which always applies the untouched lexical args.
-         h "load-library" (list-copy args)
+         h "load-library" (append args '())
          (lambda () (ffi-load-library-real args)))
         (ffi-load-library-real args))))
 
@@ -218,7 +218,7 @@
          ;; As with load-library, the descriptor tail spine-copies the lexical
          ;; offset list, so hook mutation of descriptor args cannot move the
          ;; real read's pointer offset.
-         h "read" (cons ptr (cons ty (list-copy off)))
+         h "read" (cons ptr (cons ty (append off '())))
          (lambda ()
            (sa-foreign-ref (ffi-type->chez ty) (jnum->exact ptr)
                         (if (pair? off) (jnum->exact (car off)) 0))))
@@ -792,7 +792,7 @@
 (define (jolt-ffi-install-declared-call-hook! hook)
   (unless hook
     (error 'jolt-ffi-install-declared-call-hook! "hook must be non-false"))
-  (with-mutex jolt-ffi-declared-call-hook-mu
+  (jolt-with-mutex jolt-ffi-declared-call-hook-mu
     (let ((installation
            (make-jolt-ffi-declared-call-hook-installation
             hook jolt-ffi-declared-call-hook-top)))
@@ -801,7 +801,7 @@
       installation)))
 
 (define (jolt-ffi-clear-declared-call-hook! installation)
-  (with-mutex jolt-ffi-declared-call-hook-mu
+  (jolt-with-mutex jolt-ffi-declared-call-hook-mu
     (unless (eq? installation jolt-ffi-declared-call-hook-top)
       (error 'jolt-ffi-clear-declared-call-hook!
              "declared-call hooks must be cleared by their current token"))
