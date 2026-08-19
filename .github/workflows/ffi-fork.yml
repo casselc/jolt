@@ -122,7 +122,24 @@ jobs:
         run: |
           mkdir -p artifacts
           set +e
-          make -j1 CHEZ="$CHEZ" ffi > artifacts/ffi.log 2>&1
+          {
+            # The historical binding gate exercises POSIX-only symbols such as
+            # usleep and socket.  Keep it on Unix, then run every portable gate
+            # present in this point of the stack on all three target ABIs.
+            if [ "$RUNNER_OS" != Windows ]; then
+              "$CHEZ" --script test/chez/ffi-binding-test.ss
+            fi
+            sh test/chez/ffi-widths-test.sh "$CHEZ"
+            if [ -f test/chez/ffi-layout-test.sh ]; then
+              sh test/chez/ffi-layout-test.sh "$CHEZ"
+            fi
+            if [ -f test/chez/ffi-aggregate-test.sh ]; then
+              sh test/chez/ffi-aggregate-test.sh "$CHEZ"
+            fi
+            if [ -f test/chez/jolt-ffi-scoped-test.clj ]; then
+              bin/jolt run test/chez/jolt-ffi-scoped-test.clj
+            fi
+          } > artifacts/ffi.log 2>&1
           status=$?
           set -e
           cat artifacts/ffi.log
@@ -136,7 +153,13 @@ jobs:
 
       - name: Built-binary FFI consumers
         run: |
-          jolt_bin=$(find target/release -maxdepth 1 -type f -name 'jolt*' | head -1)
+          jolt_bin=
+          for candidate in target/release/jolt target/release/jolt.exe; do
+            if [ -f "$candidate" ]; then
+              jolt_bin=$candidate
+              break
+            fi
+          done
           test -n "$jolt_bin"
           if [ -f test/chez/jolt-ffi-layout-test.clj ]; then
             "$jolt_bin" run test/chez/jolt-ffi-layout-test.clj
