@@ -1,0 +1,149 @@
+name: fork FFI conformance
+
+on:
+  push:
+    branches:
+      - integration/v0.7.16-ffi
+      - codex/v0.7.16-ffi-*
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  ffi:
+    if: github.repository == 'casselc/jolt'
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86-64
+            os: ubuntu-latest
+            shell: bash
+          - name: windows-x86-64
+            os: windows-latest
+            shell: msys2 {0}
+          - name: macos-arm64
+            os: macos-14
+            shell: bash
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev
+
+      - name: macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install lz4
+
+      - name: Set up MSYS2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: inherit
+          install: >-
+            git make vim unzip
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-lz4
+            mingw-w64-x86_64-zlib
+
+      - name: Cache Chez 10.4.1
+        id: cache-chez
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.os == 'Windows' && 'chez-install' || '~/chez-10.4.1' }}
+          key: ffi-chez-${{ matrix.name }}-10.4.1-v1
+
+      - name: Build Chez 10.4.1 (Linux/macOS)
+        if: runner.os != 'Windows' && steps.cache-chez.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
+          cd /tmp/chez-src
+          ./configure --installprefix="$HOME/chez-10.4.1" --threads --disable-x11
+          make -j2
+          make install
+
+      - name: Build Chez 10.4.1 (Windows)
+        if: runner.os == 'Windows' && steps.cache-chez.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
+          cd /tmp/chez-src
+          ./configure --threads
+          make -j2
+          inst="$GITHUB_WORKSPACE/chez-install"
+          mkdir -p "$inst/bin" "$inst/csv"
+          cp ta6nt/bin/ta6nt/*.exe "$inst/bin/"
+          cp ta6nt/bin/ta6nt/*.dll "$inst/bin/" 2>/dev/null || true
+          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/bin/"
+          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/csv/"
+          cp ta6nt/boot/ta6nt/scheme.h ta6nt/boot/ta6nt/libkernel.a "$inst/csv/"
+
+      - name: Configure Chez
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            bindir="$GITHUB_WORKSPACE/chez-install/bin"
+            csv="$GITHUB_WORKSPACE/chez-install/csv"
+            { echo '#!/bin/sh'; echo "exec \"$bindir/scheme.exe\" \"\$@\""; } > "$bindir/chez"
+            { echo '#!/bin/sh'; echo 'exec gcc "$@"'; } > "$bindir/cc"
+            chmod +x "$bindir/chez" "$bindir/cc"
+          else
+            bindir="$HOME/chez-10.4.1/bin"
+            csv="$HOME/chez-10.4.1/lib/csv10.4.1/$(ls "$HOME/chez-10.4.1/lib/csv10.4.1" | head -1)"
+            if [ ! -x "$bindir/chez" ]; then
+              printf '#!/bin/sh\nexec "%s/scheme" "$@"\n' "$bindir" > "$bindir/chez"
+              chmod +x "$bindir/chez"
+            fi
+          fi
+          echo "$bindir" >> "$GITHUB_PATH"
+          echo "CHEZ=$bindir/chez" >> "$GITHUB_ENV"
+          echo "JOLT_CHEZ_CSV=$csv" >> "$GITHUB_ENV"
+          "$bindir/chez" --version | grep -Fx 10.4.1
+
+      - name: Focused FFI gate
+        run: |
+          mkdir -p artifacts
+          set +e
+          make -j1 CHEZ="$CHEZ" ffi > artifacts/ffi.log 2>&1
+          status=$?
+          set -e
+          cat artifacts/ffi.log
+          if [ "$status" -ne 0 ]; then
+            find /tmp -maxdepth 2 -type f -name 'jolt-ffi-*' -exec cp '{}' artifacts/ ';' 2>/dev/null || true
+            exit "$status"
+          fi
+
+      - name: Build Jolt binary
+        run: make -j1 CHEZ="$CHEZ" testbin
+
+      - name: Built-binary FFI consumers
+        run: |
+          jolt_bin=$(find target/release -maxdepth 1 -type f -name 'jolt*' | head -1)
+          test -n "$jolt_bin"
+          if [ -f test/chez/jolt-ffi-layout-test.clj ]; then
+            "$jolt_bin" run test/chez/jolt-ffi-layout-test.clj
+          fi
+          if [ -f test/chez/ffi-aggregate-test.sh ]; then
+            JOLT_FFI_BUILT_BIN="$jolt_bin" sh test/chez/ffi-aggregate-test.sh "$CHEZ"
+          fi
+          if [ -f test/chez/jolt-ffi-scoped-test.clj ]; then
+            "$jolt_bin" run test/chez/jolt-ffi-scoped-test.clj
+          fi
+
+      - name: Upload failed native evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffi-${{ matrix.name }}-${{ github.run_attempt }}
+          path: artifacts
+          if-no-files-found: warn
