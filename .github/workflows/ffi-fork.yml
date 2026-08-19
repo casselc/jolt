@@ -92,8 +92,9 @@ jobs:
       - name: Configure Chez
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
-            bindir="$GITHUB_WORKSPACE/chez-install/bin"
-            csv="$GITHUB_WORKSPACE/chez-install/csv"
+            workspace=$(cygpath -u "$GITHUB_WORKSPACE")
+            bindir="$workspace/chez-install/bin"
+            csv="$workspace/chez-install/csv"
             { echo '#!/bin/sh'; echo "exec \"$bindir/scheme.exe\" \"\$@\""; } > "$bindir/chez"
             { echo '#!/bin/sh'; echo 'exec gcc "$@"'; } > "$bindir/cc"
             chmod +x "$bindir/chez" "$bindir/cc"
