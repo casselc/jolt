@@ -417,6 +417,7 @@
        (if (or boundary (= index 0) (null? (cdr remaining)))
            #f
            (loop (cdr remaining) index types index)))
+      ((and boundary (jolt-sim-by-value-type? (car remaining))) #f)
       (else
        (loop (cdr remaining) (+ index 1) (cons (car remaining) types) boundary)))))
 (define (jolt-sim-project-ffi-descriptor desc)
@@ -435,6 +436,10 @@
             (jolt-sim-raw-signature-type? (cdr (assq 'rettype desc)))
             (boolean? (cdr (assq 'blocking desc)))
             (boolean? (cdr (assq 'capture-native-error desc)))
+            (not (and (cdr normalized)
+                      (jolt-sim-by-value-type? (cdr (assq 'rettype desc)))))
+            (not (and (cdr (assq 'capture-native-error desc))
+                      (jolt-sim-by-value-type? (cdr (assq 'rettype desc)))))
             (list? (cdr (assq 'args desc)))
             (= (+ (length (car normalized))
                   (if (jolt-sim-by-value-type? (cdr (assq 'rettype desc))) 1 0))

@@ -1274,7 +1274,7 @@
           call (str "(" proc
                     (when (seq call-args) (str " " (str/join " " call-args))) ")")
           native-body (if capture
-                        (str "(call-with-values (lambda () " call ")"
+                        (str "(jolt-ffi-call-with-values (lambda () " call ")"
                              " (lambda (result native-error)"
                              " (jolt-vector result native-error)))")
                         call)

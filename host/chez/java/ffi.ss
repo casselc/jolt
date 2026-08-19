@@ -11,6 +11,10 @@
 ;; representation `void*` arguments and results use, so pointers flow between
 ;; foreign-fn calls and these helpers transparently.
 
+;; Generated capture wrappers use this host-owned alias so an application local
+;; named call-with-values cannot shadow the Scheme primitive.
+(define jolt-ffi-call-with-values call-with-values)
+
 ;; --- loading shared objects --------------------------------------------------
 ;; (jolt.ffi/load-library name) loads a .so/.dylib by name (resolved by the OS
 ;; loader against the standard search paths). A library typically calls this once
