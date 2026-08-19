@@ -11,6 +11,10 @@
 ;; representation `void*` arguments and results use, so pointers flow between
 ;; foreign-fn calls and these helpers transparently.
 
+;; Generated capture wrappers use this host-owned alias so an application local
+;; named call-with-values cannot shadow the Scheme primitive.
+(define jolt-ffi-call-with-values call-with-values)
+
 ;; --- loading shared objects --------------------------------------------------
 ;; (jolt.ffi/load-library name) loads a .so/.dylib by name (resolved by the OS
 ;; loader against the standard search paths). A library typically calls this once
@@ -829,8 +833,11 @@
          csym argtypes rettype blocking capture-native-error args)
   (list (cons 'kind 'foreign-call)
         (cons 'csym (string-copy csym))
-        (cons 'argtypes (map string-copy argtypes))
-        (cons 'rettype (string-copy rettype))
+        (cons 'argtypes
+              (map (lambda (type)
+                     (if (string? type) (string-copy type) type))
+                   argtypes))
+        (cons 'rettype (if (string? rettype) (string-copy rettype) rettype))
         (cons 'blocking blocking)
         (cons 'capture-native-error capture-native-error)
         (cons 'args args)))

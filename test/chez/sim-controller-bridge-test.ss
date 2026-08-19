@@ -60,6 +60,8 @@
 (ev "(ffi/defcfn c-bridge-fcntl-cap \"fcntl\" [:int :int :varargs :int] :int {:capture-native-error true})")
 (ev "(ffi/defcfn c-bridge-ghost \"definitely_not_a_real_c_symbol_bridge_zzz9\" [:int :int] :int {:blocking true})")
 (ev "(ffi/defcfn c-bridge-ghost-cap \"definitely_not_a_real_c_symbol_bridge_cap_zzz9\" [] :int {:capture-native-error true})")
+(ev "(ffi/defcfn c-bridge-aggregate-arg \"definitely_not_a_real_c_aggregate_arg_zzz9\" [[:by-value [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]] :int)")
+(ev "(ffi/defcfn c-bridge-aggregate-return \"definitely_not_a_real_c_aggregate_return_zzz9\" [] [:by-value [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]])")
 
 ;; --- A. persistent bridge + exact advertised ABI ------------------------------
 (ok "overlay installs the bridge as the current canonical hook"
@@ -73,8 +75,8 @@
 
 (define caps (jolt-sim-capabilities))
 (ok "controller ABI is exactly prerelease 6" (= 6 (mget caps "abi-version")))
-(ok "FFI descriptor is exactly 8"
-    (= 8 (mget (mget caps "ffi-interception") "descriptor-version")))
+(ok "FFI descriptor is exactly 9"
+    (= 9 (mget (mget caps "ffi-interception") "descriptor-version")))
 (ok "clock descriptor is exactly 1"
     (= 1 (mget (mget caps "clock-interception") "descriptor-version")))
 (ok "public installation descriptor names one exact complete config"
@@ -99,7 +101,7 @@
                        :future-controller-arity 3
                        :ffi-controller-arity 2
                        :clock-controller-arity 2}
-        :ffi-interception {:descriptor-version 8
+        :ffi-interception {:descriptor-version 9
                            :kinds [:foreign-function :native-operation]
                            :arguments :live
                            :task-identity :future-lifecycle
@@ -126,7 +128,7 @@
                              :proceed-routing {:controller-arity 2 :proceed-arity 0
                                                :single-use true :dynamic-extent true
                                                :owner-thread true :lifo true}}}"))
-(ok "capability map matches the one exact ABI 6 / descriptor 8 contract"
+(ok "capability map matches the one exact ABI 6 / descriptor 9 contract"
     (jolt=2 caps expected-capabilities))
 (ok "sim public ABI exports no independent subcontroller installers"
     (for-all
@@ -185,6 +187,21 @@
          (= 2 (mget variadic-foreign "varargs-after"))
          (= 3 (pvec-count (mget variadic-foreign "arguments")))
          (eq? #t (mget variadic-foreign "capture-native-error?"))))
+(define date-layout
+  (ev "[:struct [[:year :int32] [:month :uint8] [:day :uint8]]]") )
+(define date-by-value (jolt-vector (kw "by-value") date-layout))
+(define aggregate-foreign
+  (project-foreign "consume_date" (list date-by-value) "int" #t #f (list 4096)))
+(ok "aggregate argument projection retains the literal generic descriptor"
+    (and (jolt=2 date-by-value
+                 (pvec-nth-d (mget aggregate-foreign "argument-types") 0 jolt-nil))
+         (= 4096 (pvec-nth-d (mget aggregate-foreign "arguments") 0 jolt-nil))))
+(define aggregate-return
+  (project-foreign "make_date" '() date-by-value #f #f (list 8192)))
+(ok "aggregate return projection retains its descriptor and destination argument"
+    (and (jolt=2 date-by-value (mget aggregate-return "return-type"))
+         (= 1 (pvec-count (mget aggregate-return "arguments")))
+         (= 8192 (pvec-nth-d (mget aggregate-return "arguments") 0 jolt-nil))))
 (ok "foreign projection kind and renamed fields"
     (and (eq? (mget fixed-foreign "kind") (kw "foreign-function"))
          (string=? "fixed" (mget fixed-foreign "symbol"))
@@ -287,6 +304,19 @@
 (ok "argument count must equal argtype count"
     (and (raises? (lambda () (project-foreign "x" '("int") "int" #f #f (list 1 2))))
          (raises? (lambda () (project-foreign "x" '("int" "int") "int" #f #f (list 1))))))
+(ok "aggregate return requires exactly one extra destination argument"
+    (and (raises? (lambda () (project-foreign "x" '() date-by-value #f #f '())))
+         (raises? (lambda () (project-foreign "x" '("int") date-by-value #f #f
+                                              (list 1 2 3))))))
+(ok "invalid and unsupported aggregate shapes fail closed"
+    (let ((empty (jolt-vector (kw "by-value")
+                              (jolt-vector (kw "struct") (jolt-vector))))
+          (variadic-types (list "int" "varargs" date-by-value)))
+      (and (raises? (lambda () (project-foreign "x" (list empty) "int" #f #f (list 1))))
+           (raises? (lambda () (project-foreign "x" variadic-types "int" #f #f (list 1 2))))
+           (raises? (lambda () (project-foreign "x" '("int" "varargs" "int")
+                                                date-by-value #f #f (list 1 2 3))))
+           (raises? (lambda () (project-foreign "x" '() date-by-value #f #t (list 1)))))))
 (ok "malformed variadic markers fail closed"
     (and (raises? (lambda () (project-foreign "x" '("varargs" "int") "int" #f #f (list 1))))
          (raises? (lambda () (project-foreign "x" '("int" "varargs") "int" #f #f (list 1))))
@@ -940,7 +970,10 @@
            ((string=? (keyword-t-name (mget d "operation")) "alloc") 424242)
            ((string=? (keyword-t-name (mget d "operation")) "sizeof") 64)
            (else 0))
-         999))
+         (if (string=? (mget d "symbol")
+                       "definitely_not_a_real_c_aggregate_return_zzz9")
+             (pvec-nth-d (mget d "arguments") 0 jolt-nil)
+             999)))
    native-clock))
 (ok "modeled alloc bypasses native" (= 424242 (ffi-alloc 8)))
 (ok "modeled sizeof bypasses native" (= 64 (ffi-sizeof (kw "int"))))
@@ -1008,6 +1041,19 @@
            (= 8 (jnum->exact (pvec-nth-d (mget d "arguments") 1 jolt-nil))))))
 (ok "capture-declared substitution is returned unwrapped"
     (= 999 (jnum->exact (ev "(c-bridge-ghost-cap)"))))
+(ok "aggregate argument reaches the same generic declared-call controller"
+    (= 999 (jnum->exact (ev "(c-bridge-aggregate-arg 4096)"))))
+(let ((d (car seen)))
+  (ok "aggregate argument descriptor and caller-owned pointer are preserved"
+      (and (jolt=2 date-by-value
+                   (pvec-nth-d (mget d "argument-types") 0 jolt-nil))
+           (= 4096 (pvec-nth-d (mget d "arguments") 0 jolt-nil)))))
+(ok "aggregate return substitution receives and returns the destination pointer"
+    (= 8192 (jnum->exact (ev "(c-bridge-aggregate-return 8192)"))))
+(let ((d (car seen)))
+  (ok "aggregate return descriptor preserves generic type and destination"
+      (and (jolt=2 date-by-value (mget d "return-type"))
+           (= 8192 (pvec-nth-d (mget d "arguments") 0 jolt-nil)))))
 (jolt-sim-restore-controller! sweep-token)
 
 ;; loaded? always publishes a Jolt Boolean, including when a modeled controller
