@@ -386,7 +386,8 @@
                      (ei-str-lit (cdr sp)) ")\n"))
                  pairs))))
       (close-port p))
-    (bld-system (string-append bld-chez " --script '" cs "'"))))
+    (bld-system (string-append
+                  (bld-sh-quote bld-chez) " --script " (bld-sh-quote cs)))))
 
 ;; Capture one ns's emitted Scheme to its .scm. aot-capture-load evaluates the
 ;; FILE through the normal load loop while teeing the per-form Scheme — the SAME
