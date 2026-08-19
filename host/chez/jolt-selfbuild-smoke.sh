@@ -10,8 +10,11 @@ cd "$root"
 # scheme.h) and a C compiler, same as build-smoke.sh. A distro chezscheme package
 # ships neither, so skip there (CI included).
 csv="$JOLT_CHEZ_CSV"
-if [ -z "$csv" ]; then
+chez_bin="${JOLT_CHEZ:-${CHEZ:-}}"
+if [ -z "$chez_bin" ]; then
   chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)"
+fi
+if [ -z "$csv" ]; then
   if [ -n "$chez_bin" ]; then
     base="$(cd "$(dirname "$chez_bin")/.." 2>/dev/null && pwd)"
     for d in "$base"/lib/csv*/*/; do
