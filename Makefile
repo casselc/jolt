@@ -530,6 +530,7 @@ ffi:
 	@$(CHEZ) --script test/chez/ffi-ranged-transfer-test.ss
 	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-layout-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
 
 # Internal declared-call interception is compiler-source behavior, so verify it
 # against a fresh transient seed rather than the checked-in image.

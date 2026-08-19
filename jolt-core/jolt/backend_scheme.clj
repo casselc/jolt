@@ -739,8 +739,7 @@
                   ;; ffi lowering (emit-ffi-fn/emit-ffi-callable: the sa-* adapter
                   ;; syntaxes a Chez foreign-procedure/callable expands to).
                   "sa-foreign-procedure" "sa-foreign-procedure-blocking"
-                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"
-                  "jolt-ffi-native-error-procedure" "call-with-values"}]
+                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is
@@ -1180,20 +1179,19 @@
          "(keyword \"jolt.ffi\" \"offsets\") " offsets " "
          "(keyword \"jolt.ffi\" \"types\") " types "))")))
 
+(defn- ffi-by-value? [type]
+  (and (map? type) (= :by-value (:ffi-kind type))))
+
+(defn- emit-ffi-signature-type-literal [type]
+  (if (ffi-by-value? type)
+    (str "(jolt-vector (keyword #f \"by-value\") "
+         (emit-layout-descriptor (:type type)) ")")
+    (chez-str-lit type)))
+
 (defn- emit-ffi-fn [node]
-  ;; A "varargs" marker in the argtype vector declares the binding variadic and
-  ;; marks the FIXED/VARIADIC boundary: types before it are the named
-  ;; parameters, types after it are the concrete variadic arguments this
-  ;; binding always passes. The call is emitted with Chez's (__varargs_after n)
-  ;; convention (n = the fixed-arg count = the marker's index), so the variadic
-  ;; arguments travel where the callee's va_list reads them — Apple arm64
-  ;; passes variadic args on the stack, and a fixed-arity binding silently
-  ;; corrupts them (fcntl, ioctl, open). C requires a named parameter before
-  ;; the ellipsis, and a trailing marker would declare nothing variadic, so
-  ;; both malformed shapes are rejected. Only supported on the non-blocking
-  ;; path: __collect_safe cannot combine with a varargs convention.
   (let [at (:argtypes node)
-        vi (first (keep-indexed (fn [i t] (when (= t "varargs") i)) at))]
+        vi (first (keep-indexed (fn [i type] (when (= type "varargs") i)) at))
+        ret-aggregate? (ffi-by-value? (:rettype node))]
     (when (and vi (zero? vi))
       (throw (ex-info "jolt.ffi: :varargs needs at least one fixed argtype before it"
                       {:argtypes at})))
@@ -1202,84 +1200,118 @@
                       {:argtypes at})))
     (when (and vi (:blocking node))
       (throw (ex-info "jolt.ffi: :varargs cannot combine with :blocking" {:argtypes at})))
+    (when (and vi ret-aggregate?)
+      (throw (ex-info "jolt.ffi: aggregate returns cannot combine with :varargs"
+                      {:argtypes at})))
+    (when (and vi (some ffi-by-value? (subvec at (inc vi))))
+      (throw (ex-info "jolt.ffi: aggregate variadic arguments are not supported"
+                      {:argtypes at})))
     (let [types (if vi (vec (concat (subvec at 0 vi) (subvec at (inc vi)))) at)
           n (count types)
           params (mapv (fn [i] (str "a" i)) (range n))
-          call-args (str/join " " params)
+          return-param (when ret-aggregate? "destination")
+          wrapper-params (if return-param (cons return-param params) params)
+          aggregates
+          (->> types
+               (map-indexed (fn [i type]
+                              (when (ffi-by-value? type)
+                                {:index i :name (fresh-label "jolt_ffi_arg")
+                                 :type (:type type)})))
+               (remove nil?)
+               vec)
+          aggregate-by-index (into {} (map (fn [entry] [(:index entry) entry]) aggregates))
+          return-name (when ret-aggregate? (fresh-label "jolt_ffi_return"))
+          emitted-types
+          (mapv (fn [i type]
+                  (if-let [entry (get aggregate-by-index i)]
+                    (str "(& " (:name entry) ")")
+                    (ffi-type->chez type)))
+                (range n) types)
+          emitted-return (if ret-aggregate?
+                           (str "(& " return-name ")")
+                           (ffi-type->chez (:rettype node)))
+          pointer-check
+          (fn [param type-name role]
+            (str "(let ((address (jnum->exact " param "))) "
+                 "(if (= address 0) "
+                 "(throw-jvm 'NullPointerException "
+                 (chez-str-lit (str "jolt.ffi: null by-value " role " pointer")) ") "
+                 "(make-ftype-pointer " type-name " address)))"))
+          native-args
+          (mapv (fn [i param]
+                  (if-let [entry (get aggregate-by-index i)]
+                    (pointer-check param (:name entry) "aggregate")
+                    param))
+                (range n) params)
+          native-destination (when ret-aggregate?
+                               (pointer-check return-param return-name "return destination"))
           conv (if vi (str " (__varargs_after " vi ")") "")
-          args (str/join " " (map ffi-type->chez types))
-          ret (ffi-type->chez (:rettype node))
-          csym (chez-str-lit (:csym node))
+          signature (str " (" (str/join " " emitted-types) ") " emitted-return)
           capture (:capture-native-error node)
           fp (if capture
                (str "(jolt-ffi-native-error-procedure ("
                     (cond (:blocking node) "__collect_safe"
                           vi (str "(__varargs_after " vi ")")
                           :else "")
-                    ") " csym " (" args ") " ret ")")
+                    ") " (chez-str-lit (:csym node)) signature ")")
                (str "(" (if (:blocking node)
                            "sa-foreign-procedure-blocking "
                            "sa-foreign-procedure ")
-                    conv " " csym " (" args ") " ret ")"))
-          ;; Prefer a symbol resolved from the declaring native library's
-          ;; RTLD_LOCAL handle.  The capture wrapper accepts the resolved
-          ;; address in the same entry position as Chez foreign-procedure, so
-          ;; scoped lookup and atomic errno/GetLastError capture compose.
-          ;; Variadic bindings retain global symbol lookup until address +
-          ;; (__varargs_after n) has a dedicated cross-platform gate.
+                    conv " " (chez-str-lit (:csym node)) signature ")"))
           scoped (if vi "#f"
-                   (str "(let ((a (jolt-ffi-dlsym-native " csym "))) "
+                   (str "(let ((a (jolt-ffi-dlsym-native " (chez-str-lit (:csym node)) "))) "
                         "(and a "
                         (if capture
                           (str "(jolt-ffi-native-error-procedure ("
                                (when (:blocking node) "__collect_safe")
-                               ") a (" args ") " ret ")")
+                               ") a" signature ")")
                           (str "(foreign-procedure "
                                (when (:blocking node) "__collect_safe ")
-                               "a (" args ") " ret ")"))
+                               "a" signature ")"))
                         "))"))
-          resolve-fp (str "(or " scoped " " fp ")")
-          native-call (str "((or p (begin (set! p " resolve-fp ") p)) " call-args ")")
+          proc (str "(or p (begin (set! p (or " scoped " " fp ")) p))")
+          call-args (if ret-aggregate? (into [native-destination] native-args) native-args)
+          call (str "(" proc
+                    (when (seq call-args) (str " " (str/join " " call-args))) ")")
           native-body (if capture
-                 (str "(call-with-values (lambda () " native-call ")"
-                      " (lambda (result native-error)"
-                      " (jolt-vector result native-error)))")
-                 native-call)
-          argtypes-lit (str "(list "
-                            (str/join " " (map chez-str-lit at))
-                            ")")
-          descriptor (str "(jolt-ffi-make-declared-call-descriptor "
-                          csym " " argtypes-lit " "
-                          (chez-str-lit (:rettype node)) " "
-                          (if (:blocking node) "#t" "#f") " "
-                          (if capture "#t" "#f")
-                          " (list " call-args "))")
+                        (str "(call-with-values (lambda () " call ")"
+                             " (lambda (result native-error)"
+                             " (jolt-vector result native-error)))")
+                        call)
+          body (if ret-aggregate?
+                 (str "(begin " native-body " " return-param ")")
+                 native-body)
+          descriptor-types
+          (str "(list "
+               (str/join " " (map emit-ffi-signature-type-literal at)) ")")
+          descriptor-return (emit-ffi-signature-type-literal (:rettype node))
+          descriptor-args (str/join " " wrapper-params)
+          descriptor
+          (str "(jolt-ffi-make-declared-call-descriptor "
+               (chez-str-lit (:csym node)) " " descriptor-types " "
+               descriptor-return " "
+               (if (:blocking node) "#t" "#f") " "
+               (if capture "#t" "#f")
+               " (list " descriptor-args "))")
           hooked-body (str "(jolt-ffi-invoke-declared-call-hook h " descriptor
-                           " (lambda () " native-body "))")]
-      ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
-      ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
-      ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
-      ;; evaluate to a callable closure before the shared library is loaded —
-      ;; critical for :optional :jolt/native libs whose load-object runs in the
-      ;; scheme-start launcher, after the heap is already built.
-      ;;
-      ;; Scoped resolution: dlsym the symbol against the RTLD_LOCAL handles a
-      ;; :jolt/native library registered, and build the foreign-procedure FROM THE
-      ;; ADDRESS on a hit (Chez accepts a runtime integer address in the entry
-      ;; position). Falls back to fp (global name resolution) when no handle has
-      ;; the symbol. Skipped for :varargs bindings — those are libc functions
-      ;; (fcntl/ioctl) that resolve globally as process symbols, and address +
-      ;; (__varargs_after n) is untested. defcfn's surface syntax is unchanged.
-      ;; Scoped lookup composes with capture and simulation interception through
-      ;; native-body. The internal declared-call hook is snapshotted once before
-      ;; symbol resolution on each
-      ;; invocation. Its disabled path adds only that read/branch; descriptor and
-      ;; proceed allocation occur only in the hooked branch. A substitution is
-      ;; returned as-is, while proceed preserves the exact scalar or captured
-      ;; [result native-error] shape.
-      (str "(let ((p #f)) (lambda (" call-args ") "
-           "(let ((h jolt-ffi-declared-call-hook)) "
-           "(if h " hooked-body " " native-body "))))"))))
+                           " (lambda () " body "))")
+          binding
+          (str "(let ((p #f)) (lambda (" (str/join " " wrapper-params) ") "
+               "(let ((h jolt-ffi-declared-call-hook)) "
+               "(if h " hooked-body " " body "))))")]
+      (if (or (seq aggregates) ret-aggregate?)
+        (str "(let () "
+             (str/join " "
+                       (concat
+                        (map (fn [entry]
+                               (str "(define-ftype " (:name entry) " "
+                                    (emit-ffi-layout-ftype (:type entry)) ")"))
+                             aggregates)
+                        (when ret-aggregate?
+                          [(str "(define-ftype " return-name " "
+                                (emit-ffi-layout-ftype (:type (:rettype node))) ")")])))
+             " " binding ")")
+        binding))))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the

@@ -829,8 +829,11 @@
          csym argtypes rettype blocking capture-native-error args)
   (list (cons 'kind 'foreign-call)
         (cons 'csym (string-copy csym))
-        (cons 'argtypes (map string-copy argtypes))
-        (cons 'rettype (string-copy rettype))
+        (cons 'argtypes
+              (map (lambda (type)
+                     (if (string? type) (string-copy type) type))
+                   argtypes))
+        (cons 'rettype (if (string? rettype) (string-copy rettype) rettype))
         (cons 'blocking blocking)
         (cons 'capture-native-error capture-native-error)
         (cons 'args args)))

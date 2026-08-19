@@ -312,11 +312,11 @@
 (def-var! "clojure.core" "future-call" jolt-sim-future-call)
 (def-var! "clojure.core" "future-cancel" jolt-sim-future-cancel)
 
-;; === exact descriptor-v8 projection ==========================================
+;; === exact descriptor-v9 projection ==========================================
 ;; The canonical seam hands the bridge one of two raw host alists per
 ;; intercepted call:
-;;   foreign:  ((kind . foreign-call) (csym . string) (argtypes . (string …))
-;;              (rettype . string) (blocking . bool)
+;;   foreign:  ((kind . foreign-call) (csym . string) (argtypes . (type …))
+;;              (rettype . type) (blocking . bool)
 ;;              (capture-native-error . bool) (args . (…)))
 ;;   native:   ((kind . native-op) (op . string) (args . (…)))
 ;; Every public :ffi controller sees the EXACT jolt-sim map projection below,
@@ -352,7 +352,47 @@
 (define jolt-sim-kw-varargs-after (keyword #f "varargs-after"))
 (define jolt-sim-kw-operation (keyword #f "operation"))
 (define jolt-sim-kw-arguments (keyword #f "arguments"))
+(define jolt-sim-kw-by-value (keyword #f "by-value"))
+(define jolt-sim-kw-struct (keyword #f "struct"))
 (define (jolt-sim-raw-keys d) (and (list? d) (for-all pair? d) (map car d)))
+(define jolt-sim-layout-scalar-names
+  '("int" "uint" "int8" "i8" "uint8" "u8" "byte" "char"
+    "int16" "short" "uint16" "ushort" "int32" "uint32"
+    "long" "ulong" "int64" "uint64" "size_t" "ssize_t" "iptr" "uptr"
+    "double" "float" "pointer" "void*"))
+(define (jolt-sim-unqualified-keyword? value)
+  (and (keyword? value) (not (keyword-t-ns value))))
+(define (jolt-sim-layout? value)
+  (and (jolt-vector? value)
+       (= 2 (jolt-count value))
+       (eq? (jolt-nth value 0) jolt-sim-kw-struct)
+       (let ((fields (jolt-nth value 1)))
+         (and (jolt-vector? fields)
+              (> (jolt-count fields) 0)
+              (let loop ((index 0) (names '()))
+                (if (= index (jolt-count fields))
+                    #t
+                    (let ((field (jolt-nth fields index)))
+                      (and (jolt-vector? field)
+                           (= 2 (jolt-count field))
+                           (let ((name (jolt-nth field 0))
+                                 (type (jolt-nth field 1)))
+                             (and (jolt-sim-unqualified-keyword? name)
+                                  (not (memq name names))
+                                  (or (and (jolt-sim-unqualified-keyword? type)
+                                           (member (keyword-t-name type)
+                                                   jolt-sim-layout-scalar-names))
+                                      (jolt-sim-layout? type))
+                                  (loop (+ index 1) (cons name names))))))))))))
+(define (jolt-sim-by-value-type? value)
+  (and (jolt-vector? value)
+       (= 2 (jolt-count value))
+       (eq? (jolt-nth value 0) jolt-sim-kw-by-value)
+       (jolt-sim-layout? (jolt-nth value 1))))
+(define (jolt-sim-raw-signature-type? value)
+  (or (string? value) (jolt-sim-by-value-type? value)))
+(define (jolt-sim-project-signature-type value)
+  (if (string? value) (keyword #f value) value))
 (define (jolt-sim-native-arity-valid? op args)
   (let ((n (length args)))
     (cond
@@ -372,7 +412,8 @@
   (let loop ((remaining argtypes) (index 0) (types '()) (boundary #f))
     (cond
       ((null? remaining) (cons (reverse types) boundary))
-      ((string=? (car remaining) "varargs")
+      ((and (string? (car remaining))
+            (string=? (car remaining) "varargs"))
        (if (or boundary (= index 0) (null? (cdr remaining)))
            #f
            (loop (cdr remaining) index types index)))
@@ -383,7 +424,7 @@
          (raw-argtypes (and (list? desc) (assq 'argtypes desc)
                             (cdr (assq 'argtypes desc))))
          (normalized (and (list? raw-argtypes)
-                          (for-all string? raw-argtypes)
+                          (for-all jolt-sim-raw-signature-type? raw-argtypes)
                           (jolt-sim-normalize-foreign-argtypes raw-argtypes))))
     (cond
       ((and (equal? ks '(kind csym argtypes rettype blocking
@@ -391,20 +432,22 @@
             (eq? (cdr (assq 'kind desc)) 'foreign-call)
             (string? (cdr (assq 'csym desc)))
             normalized
-            (string? (cdr (assq 'rettype desc)))
+            (jolt-sim-raw-signature-type? (cdr (assq 'rettype desc)))
             (boolean? (cdr (assq 'blocking desc)))
             (boolean? (cdr (assq 'capture-native-error desc)))
             (list? (cdr (assq 'args desc)))
-            (= (length (car normalized))
+            (= (+ (length (car normalized))
+                  (if (jolt-sim-by-value-type? (cdr (assq 'rettype desc))) 1 0))
                (length (cdr (assq 'args desc)))))
        (jolt-hash-map
         jolt-sim-kw-kind jolt-sim-kw-foreign-function
         jolt-sim-kw-task (jolt-future-current-task-id)
         jolt-sim-kw-symbol (cdr (assq 'csym desc))
         jolt-sim-kw-argument-types
-        (apply jolt-vector (map (lambda (s) (keyword #f s))
+        (apply jolt-vector (map jolt-sim-project-signature-type
                                 (car normalized)))
-        jolt-sim-kw-return-type (keyword #f (cdr (assq 'rettype desc)))
+        jolt-sim-kw-return-type
+        (jolt-sim-project-signature-type (cdr (assq 'rettype desc)))
         jolt-sim-kw-blocking? (cdr (assq 'blocking desc))
         jolt-sim-kw-capture-native-error? (cdr (assq 'capture-native-error desc))
         jolt-sim-kw-varargs-after (if (cdr normalized) (cdr normalized) jolt-nil)
@@ -628,7 +671,7 @@
     jolt-sim-kw-clock-controller-arity 2)
    jolt-sim-kw-ffi-interception
    (jolt-hash-map
-    jolt-sim-kw-descriptor-version 8
+    jolt-sim-kw-descriptor-version 9
     jolt-sim-kw-kinds (jolt-vector jolt-sim-kw-foreign-function
                                    jolt-sim-kw-native-operation)
     jolt-sim-kw-arguments jolt-sim-kw-live

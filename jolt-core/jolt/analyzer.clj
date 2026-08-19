@@ -927,70 +927,82 @@
     (throw "jolt.ffi/layout expects one literal struct descriptor"))
   {:op :ffi-layout :layout (analyze-ffi-layout-struct (nth items 1))})
 
-;; jolt.ffi/__cfn: the low-level foreign-function form a jolt library
-;; uses (via the jolt.ffi/foreign-fn macro) to bind native code. Shape:
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)             ; non-blocking
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)   ; may block
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype {opts})      ; options map
-;; The C symbol is a string literal and the types are literal keywords, read here
-;; at compile time; the Chez back end lowers it to a real `foreign-procedure`
-;; (typed marshaling, no runtime eval). A :blocking call is emitted __collect_safe
-;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
-;; must not pin the stop-the-world collector. A leaf IR node.
-;;
-;; Normalize the optional form to the two literal Boolean flags understood by
-;; the back end. Direct __cfn calls and the public macros share this fail-closed
-;; validation: keys must be unqualified keywords, values literal Booleans, and
-;; unknown keys are rejected rather than ignored.
+(defn- ffi-by-value-form? [form]
+  (when (form-vec? form)
+    (let [parts (vec (form-vec-items form))]
+      (and (= 2 (count parts))
+           (form-keyword? (nth parts 0))
+           (nil? (namespace (nth parts 0)))
+           (= "by-value" (name (nth parts 0)))))))
+
+(defn- analyze-ffi-signature-type [form position]
+  (cond
+    (form-keyword? form) (name form)
+    (ffi-by-value-form? form)
+      (let [parts (vec (form-vec-items form))]
+        {:ffi-kind :by-value
+         :type (analyze-ffi-layout-struct (nth parts 1))})
+    :else
+      (throw (str "jolt.ffi " position
+                  " type must be a keyword or [:by-value [:struct ...]], got "
+                  (pr-str form)))))
+
 (defn- ffi-option
-  ([]
-   {:blocking false :capture-native-error false})
+  ([] {:blocking false :capture-native-error false})
   ([opt]
    (cond
-     (and (form-keyword? opt)
-          (nil? (namespace opt))
+     (and (form-keyword? opt) (nil? (namespace opt))
           (= "blocking" (name opt)))
      {:blocking true :capture-native-error false}
 
      (form-map? opt)
      (reduce
-       (fn [res pr]
-         (let [k (nth pr 0) v (nth pr 1)]
-           (when-not (and (form-keyword? k) (nil? (namespace k)))
-             (throw (str "jolt.ffi: option key must be an unqualified keyword, got: " k)))
-           (let [kn (name k)]
-             (when-not (or (= kn "blocking") (= kn "capture-native-error"))
-               (throw (str "jolt.ffi: unknown option :" kn)))
-             (when-not (or (true? v) (false? v))
-               (throw (str "jolt.ffi: option :" kn
-                           " must be a literal Boolean, got: " v)))
-             (assoc res
-                    (if (= kn "blocking") :blocking :capture-native-error)
-                    v))))
-       {:blocking false :capture-native-error false}
-       (form-map-pairs opt))
+      (fn [res pr]
+        (let [k (nth pr 0) v (nth pr 1)]
+          (when-not (and (form-keyword? k) (nil? (namespace k)))
+            (throw (str "jolt.ffi: option key must be an unqualified keyword, got: " k)))
+          (let [kn (name k)]
+            (when-not (or (= kn "blocking") (= kn "capture-native-error"))
+              (throw (str "jolt.ffi: unknown option :" kn)))
+            (when-not (or (true? v) (false? v))
+              (throw (str "jolt.ffi: option :" kn
+                          " must be a literal Boolean, got: " v)))
+            (assoc res
+                   (if (= kn "blocking") :blocking :capture-native-error)
+                   v))))
+      {:blocking false :capture-native-error false}
+      (form-map-pairs opt))
 
      :else
      (throw (str "jolt.ffi: option must be :blocking or an options map, got: " opt)))))
 
+;; jolt.ffi/__cfn: the low-level foreign-function form a jolt library
+;; uses (via the jolt.ffi/foreign-fn macro) to bind native code. Shape:
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)            ; non-blocking
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)  ; may block
+;; The C symbol is a string literal and the types are literal keywords, read here
+;; at compile time; the Chez back end lowers it to a real `foreign-procedure`
+;; (typed marshaling, no runtime eval). A :blocking call is emitted __collect_safe
+;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
+;; must not pin the stop-the-world collector. A leaf IR node.
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
     (throw (str "jolt.ffi/foreign-fn expects "
                 "(foreign-fn \"sym\" [argtypes] rettype [:blocking | {opts}])")))
-  (let [rettype (name (nth items 3))
-        opt (if (= 5 (count items))
-              (ffi-option (nth items 4))
-              (ffi-option))
-        blocking (:blocking opt)
+  (let [rettype (analyze-ffi-signature-type (nth items 3) "return")
+        opt (if (= 5 (count items)) (ffi-option (nth items 4)) (ffi-option))
         capture (:capture-native-error opt)]
     (when (and capture (= rettype "void"))
       (throw (str "jolt.ffi: :capture-native-error is not supported for :void "
                   "(no stable native result to pair with the error code)")))
+    (when (and capture (ffi-by-value-form? (nth items 3)))
+      (throw "jolt.ffi: :capture-native-error is not supported for aggregate returns"))
     {:op :ffi-fn
      :csym (nth items 1)
-     :argtypes (mapv name (form-vec-items (nth items 2)))
+     :argtypes (mapv #(analyze-ffi-signature-type % "argument")
+                     (form-vec-items (nth items 2)))
      :rettype rettype
-     :blocking blocking
+     :blocking (:blocking opt)
      :capture-native-error capture}))
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable

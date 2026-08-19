@@ -19,42 +19,27 @@
   unsigned names at one width expose the same stored bits; wire byte order stays
   an explicit codec or htons/ntohs concern.
 
+  A struct passed or returned by value uses the same literal descriptor as
+  layout, wrapped in [:by-value descriptor]. An argument value is a non-null
+  caller-owned pointer to the struct bytes. An aggregate-returning callable takes
+  a non-null caller-owned destination pointer as its first Jolt argument, writes
+  the C return there, and returns that pointer. Aggregate callbacks and exports
+  are not supported. A fixed aggregate may precede :varargs, but aggregate
+  variadic arguments and aggregate-return-plus-varargs are rejected.
+
   The host byte-array buffer helpers are exposed here as vars from the runtime:
   read-array allocates a fresh byte-array, read-array! copies into an existing
-  byte-array at an offset, and write-array has a whole-array form and a ranged
-  (ptr src src-off len) form — all moving raw bytes directly, with no string
-  encode/decode in between. Both ranged forms validate the byte-array kind,
-  subtraction-safe bounds, and nonzero-length null pointers before any native
-  access or mutation.
-
-  with-byte-array-pointer is a scoped, synchronous in-out bridge, not a
-  zero-copy view: (with-byte-array-pointer arr f) loans the whole signed byte
-  array and (with-byte-array-pointer arr off len f) loans one validated range.
-  Each calls f with [pointer validated-length]. It validates the byte-array
-  kind and subtraction-safe range before any allocation or callback, copies the
-  selected signed bytes into a temporary native-octet bytevector, locks it for a
-  stable address only for f's dynamic extent, then copies its octets back as
-  signed bytes on normal return, jolt/host exception, and nonlocal exit. Native
-  code must not retain the pointer; the loaned range is owned by copy-back while
-  f runs. The callback must not park a fiber: parking unwinds its dynamic extent,
-  retires the loan, and makes continuation re-entry fail. A nested loan of the
-  same array on one thread is rejected, while
-  distinct-array nesting is allowed. Callers must prevent overlapping loan
-  lifetimes or other access to the same array across threads. Overlapping
-  snapshots can lose updates during copy-back; even disjoint ranges are outside
-  the supported contract because the helper neither synchronizes access nor
-  enforces cross-thread array ownership. A captured continuation cannot re-enter
-  a retired loan. It performs no native call itself, so it captures no native
-  error.
+  byte-array at an offset, and write-array accepts whole-array and ranged forms.
+  with-byte-array-pointer is a scoped synchronous in-out bridge. It loans a
+  temporary stable pointer only for the callback's dynamic extent and copies the
+  selected range back on every exit; native code must not retain that pointer or
+  park a fiber while the loan is active.
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers
-  a compile-time-typed signature to a real Chez foreign-procedure. Its optional
-  trailing map accepts :blocking and :capture-native-error literal Booleans;
-  capture returns [native-result error-code] atomically and requires a non-void
-  result. foreign-callable is the inverse — it wraps a jolt fn as a C-callable
-  function pointer so C can call back into jolt (e.g. GTK signal handlers);
-  free-callable releases it.")
+  a compile-time-typed signature to a real Chez foreign-procedure. foreign-callable
+  is the inverse — it wraps a jolt fn as a C-callable function pointer so C can
+  call back into jolt (e.g. GTK signal handlers); free-callable releases it.")
 
 (defmacro layout
   "Compile a literal [:struct [[field type] ...]] descriptor into immutable ABI
@@ -119,34 +104,16 @@
 ;;   (ffi/defcfn c-fcntl "fcntl" [:int :int :varargs :int] :int)
 ;; C's default argument promotions still apply after the marker: pass values
 ;; narrower than int as :int (and float as :double), not as an exact narrow type.
-;; An options map may instead combine :blocking with
-;; :capture-native-error. Capture returns [native-result error-code] (result
-;; first), with the error slot read in the foreign-call return path. The analyzer
-;; validates the literal map and rejects capture on :void.
-(defn- cfn-form [csym argtypes rettype args who]
-  (let [n (count args)]
-    (cond
-      (zero? n)
-      (list 'jolt.ffi/__cfn csym argtypes rettype)
+(defmacro foreign-fn [csym argtypes rettype & [opt]]
+  (if (= opt :blocking)
+    (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
+    (list 'jolt.ffi/__cfn csym argtypes rettype)))
 
-      (and (= n 1) (= (first args) :blocking))
-      (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
-
-      (and (= n 1) (map? (first args)))
-      (list 'jolt.ffi/__cfn csym argtypes rettype (first args))
-
-      :else
-      (throw (ex-info (str "jolt.ffi/" who ": trailing option must be "
-                           ":blocking or an options map; got " (vec args))
-                      {:jolt/ffi-option args})))))
-
-(defmacro foreign-fn [csym argtypes rettype & args]
-  (cfn-form csym argtypes rettype args "foreign-fn"))
-
-;; (defcfn name "c_symbol" [argtypes] rettype [:blocking | {opts}]) — def a
-;; foreign function. The trailing option matches foreign-fn.
-(defmacro defcfn [name csym argtypes rettype & args]
-  (list 'def name (cfn-form csym argtypes rettype args "defcfn")))
+;; (defcfn name "c_symbol" [argtypes] rettype [:blocking]) — def a foreign function.
+(defmacro defcfn [name csym argtypes rettype & [opt]]
+  (list 'def name (if (= opt :blocking)
+                    (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
+                    (list 'jolt.ffi/__cfn csym argtypes rettype))))
 
 ;; foreign-callable wraps a jolt fn `f` as a C-callable function pointer — the
 ;; inverse of foreign-fn, so C can call back INTO jolt (GTK signal handlers, a
