@@ -99,7 +99,14 @@ jobs:
             chmod +x "$bindir/chez" "$bindir/cc"
           else
             bindir="$HOME/chez-10.4.1/bin"
-            csv="$HOME/chez-10.4.1/lib/csv10.4.1/$(ls "$HOME/chez-10.4.1/lib/csv10.4.1" | head -1)"
+            csv=
+            for candidate in "$HOME/chez-10.4.1/lib/csv10.4.1/"*; do
+              if [ -f "$candidate/scheme.h" ]; then
+                csv="$candidate"
+                break
+              fi
+            done
+            test -n "$csv"
             if [ ! -x "$bindir/chez" ]; then
               printf '#!/bin/sh\nexec "%s/scheme" "$@"\n' "$bindir" > "$bindir/chez"
               chmod +x "$bindir/chez"
