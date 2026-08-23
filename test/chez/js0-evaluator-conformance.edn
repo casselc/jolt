@@ -1,0 +1,24 @@
+{:conformance/version 1
+ :conformance/scope :js0
+ :profiles [:agent/minimal :agent/project-read :agent/project-develop]
+ :cases
+ [{:case/id :profile/attenuation
+   :assertions [:minimal-denies-observation :read-denies-actuation
+                :develop-permits-actuation :over-profile-refused
+                :unrequested-not-reserved]}
+  {:case/id :context/isolation
+   :assertions [:definitions-local :authority-local]}
+  {:case/id :dispatch/recheck
+   :assertions [:projected-wrapper-without-effective-capability-denied
+                :revocation-reflected-in-coordinate]}
+  {:case/id :value/canonical
+   :assertions [:inert-domain-only :map-order-independent
+                :live-and-ambiguous-values-refused]}
+  {:case/id :replay/observation-and-actuation
+   :assertions [:historical-observation :no-second-actuation
+                :operation-mismatch :argument-mismatch :exhausted :unconsumed
+                :historical-operation-error]}
+  {:case/id :interrupt/health
+   :assertions [:nested-normal-restores-outer :nested-throw-restores-outer
+                :nested-interrupt-restores-outer :independent-worker-tokens
+                :tight-sci-loop-stops :post-interrupt-evaluation]}]}

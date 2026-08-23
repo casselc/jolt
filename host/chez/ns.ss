@@ -617,7 +617,12 @@
     (cons "min" min) (cons "max" max)
     (cons "mod" modulo) (cons "rem" remainder) (cons "quot" quotient)
     (cons "vector" jolt-vector) (cons "hash-map" jolt-hash-map) (cons "hash-set" jolt-hash-set)
-    (cons "conj" jolt-conj) (cons "get" jolt-get) (cons "nth" jolt-nth) (cons "count" jolt-count)
+    ;; Clojure's deftype expansion for IPersistentMap.cons refers to this private
+    ;; core Var.  SCI's host-side SciRecord uses that ordinary expansion, so it
+    ;; must be a resolvable Var even though the public `conj` call continues to
+    ;; inline.  Its semantics are precisely map/vector/set conj.
+    (cons "conj" jolt-conj) (cons "imap-cons" jolt-conj)
+    (cons "get" jolt-get) (cons "nth" jolt-nth) (cons "count" jolt-count)
     (cons "assoc" jolt-assoc) (cons "dissoc" jolt-dissoc) (cons "contains?" jolt-contains?)
     (cons "empty?" jolt-empty?) (cons "peek" jolt-peek) (cons "pop" jolt-pop)
     (cons "first" jolt-first) (cons "rest" jolt-rest) (cons "next" jolt-next) (cons "seq" jolt-seq)
@@ -633,6 +638,10 @@
 
 ;; --- bindings + *ns* --------------------------------------------------------
 (def-var! "clojure.core" "find-ns" jolt-find-ns)
+;; Private Clojure core value used by SCI's host printer.  Expose the platform
+;; line separator as a normal Var so `#'clojure.core/system-newline` compiles;
+;; Jolt's portable textual runtime uses LF on every supported target.
+(def-var! "clojure.core" "system-newline" "\n")
 (def-var! "clojure.core" "the-ns" jolt-the-ns)
 (def-var! "clojure.core" "create-ns" jolt-create-ns)
 (def-var! "clojure.core" "in-ns" jolt-in-ns)
