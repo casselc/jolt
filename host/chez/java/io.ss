@@ -1028,6 +1028,12 @@
 (register-host-methods! "thread"
   (list (cons "getContextClassLoader" (lambda (self) the-classloader))
         (cons "getName" (lambda (self) "main"))
+        ;; SCI records the host main thread id in every Context so its
+        ;; interrupt/cooperative evaluation path can identify the evaluator.
+        ;; Chez already supplies a stable numeric id for the running thread;
+        ;; returning it here gives Thread/currentThread().getId() the JVM
+        ;; contract without exposing any additional authority.
+        (cons "getId" (lambda (self) (get-thread-id)))
         ;; no reified call stack (jolt does TCO, so caller frames are erased) — an
         ;; empty StackTraceElement[]. clojure.spec.test.alpha's instrument reads it
         ;; to name the caller var; it degrades to no ::caller, the conform error

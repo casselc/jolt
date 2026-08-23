@@ -635,6 +635,13 @@
     (vector? form) (str "(jolt-vector " (str/join " " (map emit-quoted form)) ")")
     (set? form) (str "(jolt-hash-set " (str/join " " (sort (map emit-quoted form))) ")")
     (seq? form) (str "(jolt-list " (str/join " " (map emit-quoted form)) ")")
+    ;; a Class object embedded in quoted data — e.g. a macro quoting a var's
+    ;; resolved :tag (the JVM stores the Class itself in var meta, and a quoted
+    ;; Class literal evaluates to the Class). Rebuild it through the runtime
+    ;; interner — the same emit as the analyzer's :class leaf — so class
+    ;; identity and = hold across the quote.
+    (= (class form) java.lang.Class)
+    (str "(jolt-class-for " (chez-str-lit (.getName form)) ")")
     :else (throw (ex-info (str "emit-quoted: unsupported quoted form " (pr-str form)) {}))))
 
 ;; A def's :meta is a jolt map value. Non-empty? (a plain def carries {}).
