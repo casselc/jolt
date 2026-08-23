@@ -145,5 +145,11 @@ jobs:
       - name: Show Chez version
         run: chez --version
 
-      - name: Gate native dependency paths
-        run: make CHEZ=./chez-install/bin/chez depsunit
+      - name: Gate native dependency paths and Maven resolver
+        run: make CHEZ=./chez-install/bin/chez depsunit mvnhttp
+
+      - name: Fetch dependencies with forward-slash absolute paths
+        run: TMPDIR="$(cygpath -m "$RUNNER_TEMP")" make CHEZ=./chez-install/bin/chez httpsfetch
+
+      - name: Fetch dependencies with backslash absolute paths
+        run: TMPDIR="$(cygpath -w "$RUNNER_TEMP")" make CHEZ=./chez-install/bin/chez httpsfetch
