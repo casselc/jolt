@@ -4,6 +4,13 @@
 (def failures (atom []))
 (defn ok [label value] (when-not value (swap! failures conj label)))
 (defn denied? [f] (try (f) false (catch :default _ true)))
+(defn interrupted? [e]
+  ;; SCI decorates host errors with location data, so retain the causal walk
+  ;; rather than mistaking any prompt evaluation failure for cancellation.
+  (loop [e e n 0]
+    (and e (< n 8)
+         (or (:jolt/interrupted (ex-data e))
+             (recur (ex-cause e) (inc n))))))
 
 (let [world (atom {"a" "old"}) writes (atom 0) failures-at-host (atom 0)
       ops [{:id :math/inc :name 'inc* :effect :pure :fn inc}
@@ -64,6 +71,7 @@
     (Thread/sleep 20) (jolt.host/interrupt! token)
     (let [r (deref f 2000 ::timeout)]
       (ok "runaway evaluation stops" (not= ::timeout r))
+      (ok "runaway evaluation reports interruption" (interrupted? r))
       (ok "context healthy after interrupt" (= 3 (sandbox/evaluate! a "(+ 1 2)"))))))
 
 (if (empty? @failures)

@@ -704,23 +704,46 @@
 (define (jolt-make-interrupt) (box #f))
 (define (jolt-interrupt! token) (when (box? token) (set-box! token #t)) jolt-nil)
 (define (jolt-interrupted? token) (and (box? token) (unbox token) #t))
+
+;; Active poll handlers form a dynamic stack per application thread. Chez child
+;; threads inherit thread-parameter values, so owner-tag the stack: an inherited
+;; parent's stack is empty in the child rather than a claim that the child has an
+;; outer timer to rearm.
+(define interrupt-poll-stack (make-thread-parameter (cons #f '())))
+(define (current-interrupt-poll-stack)
+  (let ((state (interrupt-poll-stack)) (owner (get-thread-id)))
+    (if (and (pair? state) (eqv? (car state) owner)) (cdr state) '())))
+
 (define (jolt-run-interruptible token thunk)
-  (let ((prev-handler (timer-interrupt-handler)))
-    (let ((r (call/cc
-               (lambda (k)
-                 (timer-interrupt-handler
-                   (lambda ()
-                     (if (and (box? token) (unbox token))
-                         (k interrupt-sentinel)
-                         (begin (set-timer interrupt-check-ticks) (void)))))
-                 (set-timer interrupt-check-ticks)
-                 ;; guard ensures timer+handler are disarmed on EVERY exit from
-                 ;; the thunk — normal return, exception raise, and escape-continuation
-                 ;; jump (the outer set-timer/handler handles the interrupt case).
-                 (guard (e (#t (set-timer 0) (timer-interrupt-handler prev-handler) (raise e)))
-                   (let ((v (thunk))) (set-timer 0) v))))))
-      (set-timer 0)
-      (timer-interrupt-handler prev-handler)
+  (let ((prev-handler (timer-interrupt-handler))
+        (outer-stack (current-interrupt-poll-stack))
+        (owner (get-thread-id)))
+    (let ((r
+           (call/cc
+            (lambda (k)
+              (let ((handler
+                     (lambda ()
+                       (if (and (box? token) (unbox token))
+                           (k interrupt-sentinel)
+                           (begin (set-timer interrupt-check-ticks) (void))))))
+                ;; dynamic-wind is the ownership boundary for this timer frame.
+                ;; Its after thunk is the single cleanup point for normal return,
+                ;; throws, and the handler's escape continuation. Restore the
+                ;; outer handler first, then rearm it when an outer Jolt frame is
+                ;; active; merely restoring the handler leaves its timer stopped.
+                (dynamic-wind
+                  (lambda ()
+                    (interrupt-poll-stack
+                     (cons owner (cons handler outer-stack)))
+                    (timer-interrupt-handler handler)
+                    (set-timer interrupt-check-ticks))
+                  thunk
+                  (lambda ()
+                    (set-timer 0)
+                    (interrupt-poll-stack (cons owner outer-stack))
+                    (timer-interrupt-handler prev-handler)
+                    (when (pair? outer-stack)
+                      (set-timer interrupt-check-ticks)))))))))
       (if (eq? r interrupt-sentinel)
           (jolt-throw (jolt-ex-info "Evaluation interrupted" (jolt-hash-map jolt-kw-interrupted #t)))
           r))))

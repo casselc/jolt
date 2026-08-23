@@ -2,21 +2,19 @@
 
 ## Decision
 
-**Verdict: REVISE.**  The central feasibility question is answered positively
-for pure, interpreter-resident agent evaluation: Jolt now runs a real persistent
-`sci.core` Context, projects narrow host wrappers, keeps two contexts separate,
-records/replays semantic operation leaves, and truly interrupts a tight runaway
-SCI loop.  The milestone must not be called PASS yet because the Context uses
-SCI's broad standard-core default plus a deny list rather than a reviewed,
-explicitly allowlisted capability catalog, and nested Jolt interruption has an
-identified timer-restoration defect.  Neither limitation is hidden by this
-evidence.
+**Verdict: PASS.** Jolt can host a persistent, explicitly capability-bounded,
+cooperatively interruptible SCI evaluator for the JS0 contract. The context
+starts from a positive pure-language allowlist; effective authority is data,
+not projection accident; semantic dispatch independently rechecks it; and
+nested interrupt regions restore their outer polling state. This is a JS0
+evaluator result only, not Samizdat integration authorization.
 
 ## Coordinates and baseline
 
 | item | coordinate/result |
 | --- | --- |
-| Jolt | `615e52517042d62d0f92fb55f78a24e89bfe7af8` (local `main`, `origin/main`) |
+| Jolt base | `615e52517042d62d0f92fb55f78a24e89bfe7af8` (`main`, `origin/main`) |
+| JS0 branch | `js0-functional-sci` (this evidence) |
 | upstream/base | same commit; this checkout has no separate upstream remote |
 | vendored SCI | `32d62a5136ad3dc148588752f5bcc4cc30b14752` |
 | Chez evidence lane | Linux, Chez Scheme `10.4.1` (`/usr/local/bin/scheme`) |
@@ -65,11 +63,20 @@ special-cases.
   A helper containing read and write is replayed at its operation leaves.
   Changed args, wrong/exhausted calls, unconsumed receipts, unreconstructable
   values, and recorded host errors fail closed.
+* ContextSpec profiles `:agent/minimal`, `:agent/project-read`, and
+  `:agent/project-develop` enforce
+  `requested ⊆ authorized ⊆ profile maximum`. The effective description and
+  exact canonical coordinate use only inert data. A wrapper that remains
+  projected after host-side capability revocation is refused by dispatch.
+* The pure language is an explicit SCI `:allow` subset derived from bb4t's
+  reviewed vocabulary. `letfn`, namespace discovery, `doc`, and
+  `clojure.string` are deliberate JS0 exclusions; `loop`/`loop*` are included
+  so the interruption test executes a real runaway computation.
 * The representative denial slice covers bare and qualified `eval`,
   `load-string`, and `require`; Jolt FFI/process/fs names; `System/getenv`; and
   direct trusted-namespace references.  This establishes only the listed
   probes, not bb4t's 96-case corpus or a full static security proof.
-* A worker evaluating `(loop [] (recur))` inside
+* A worker evaluating a permitted `(loop [] (recur))` inside
   `jolt.host/run-interruptible` is interrupted, returns rather than merely
   timing out, and the same SCI Context subsequently evaluates `(+ 1 2)`.
 
@@ -96,22 +103,28 @@ Nothing in this single warm sample is surprising for an interactive REPL.
 make remint CHEZ=/usr/local/bin/scheme
 make selfhost CHEZ=/usr/local/bin/scheme
 /usr/local/bin/scheme --script host/chez/run-sci.ss
+/usr/local/bin/scheme --script host/chez/run-unit.ss
+/usr/local/bin/scheme --script test/chez/js0-interrupt-nesting-test.ss
 JOLT_CHEZ=/usr/local/bin/scheme JOLT_QUIET=1 ./bin/jolt run test/chez/js0-quote-class-literal-test.clj
 JOLT_CHEZ=/usr/local/bin/scheme JOLT_QUIET=1 ./bin/jolt -Sdeps '<SCI paths/deps>' run test/chez/js0-sandbox-test.clj
+JOLT_CHEZ=/usr/local/bin/scheme JOLT_QUIET=1 ./bin/jolt -Sdeps '<SCI paths/deps>' run test/chez/js0_authority_conformance_test.clj
 ```
 
 Results: seed remint converged; self-host fixpoint held; SCI gate was 417/424;
-both JS0 tests printed `OK`.
+the Chez unit gate was 1236/1236; nested interruption was 8/8; quote,
+functional sandbox, and authority conformance gates printed `OK`.
 
 ## Remaining gaps and nonclaims
 
-* `run-interruptible` is cooperative at Chez Scheme call back-edges.  It cannot
-  force-stop a thread resident in a blocking/native foreign call.  It also has
-  an identified nested-use defect: an inner invocation disarms the outer timer.
-  JS0 proves the tight pure-loop case only.
-* The current sandbox is deliberately experimental and uses SCI's standard
-  language environment plus a deny list.  JS1 must replace this with a
-  data-only, reviewed ContextSpec allowlist and canonical authority coordinate.
+* Interruption is cooperative at Chez Scheme call back-edges. It cannot
+  force-stop a thread resident in a blocking/native foreign call. JS0 proves a
+  tight pure SCI loop and nested timer restoration only.
+* A child thread spawned *inside* an already-active interruptible extent is not
+  a supported or executed JS0 pattern; JS0's concurrent-token evidence uses
+  independently entered worker extents.
+* The ContextSpec/catalog is deliberately small. It is not full bb4t corpus
+  parity, durable policy storage, or an API stability promise. The shared
+  contract description is `test/chez/js0-evaluator-conformance.edn`.
 * There is no durable journal, session resume, filesystem capability, Samizdat,
   Mycelium, bbagent migration, or full bb4t catalog here.
 * The bb4t authority artifact was produced against a newer SCI revision.  Its
@@ -121,8 +134,8 @@ both JS0 tests printed `OK`.
 
 ## Recommendation and stop gate
 
-Do not begin Samizdat integration.  The smallest next experiment after the two
-REVISE items are addressed is JS1: replace only Samizdat's model-facing
+Do not begin Samizdat integration automatically. The recommended next reviewed
+experiment is JS1: replace only Samizdat's model-facing
 live-image eval with one persistent Jolt/SCI Context, retaining its trusted
 developer REPL.
 
