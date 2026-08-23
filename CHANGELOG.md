@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Maven dependencies resolve into absolute Windows cache paths.** Filesystem
+  shims now preserve drive, root-relative, UNC, and device paths instead of
+  prefixing them with Jolt's launch directory, and accept both `/` and `\` as
+  Windows separators. The native HTTPS transport also discovers the OpenSSL 3
+  DLLs bundled with standard Git for Windows installs while keeping
+  `JOLT_OPENSSL_LIBDIR` as the explicit override. Fresh Windows installs can
+  therefore download Maven and Clojars dependencies without relocating the
+  cache or manually extending `PATH`.
+
 - **Dependency roots preserve absolute Windows paths.** `:local/root` and cache
   paths with drive, UNC, device, or root-relative spellings are no longer
   prefixed with Jolt's launch directory, and both `/` and `\` are accepted as
