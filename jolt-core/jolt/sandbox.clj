@@ -234,6 +234,53 @@
          (pr-str (coordinate-form (inert authority-desc))))))
 
 ;; ═══════════════════════════════════════════════════════════════════════════
+;; Reviewed language surface — trusted inert description and versioned
+;; coordinate
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(def language-surface-version
+  "Version of the language-surface description schema and its coordinate
+   scheme.  Consumers (e.g. Samizdat safe doc/complete) pin or gate on this
+   version.  Bump it when the description schema changes or the reviewed
+   vocabulary is deliberately re-generated; a vocabulary change also changes
+   the coordinate payload at any version."
+  1)
+
+(defn language-surface
+  "Trusted, inert, data-only description of the reviewed pure SCI language
+   surface (the base allow vocabulary).
+
+   Derived solely from the reviewed static data in this namespace.  It never
+   touches a live SCI Context, performs no SCI or host introspection, and
+   contains no vars, functions, namespaces, or other host handles — every
+   value is in the receipt domain (see `inert`).  Per-context projected
+   operation names are host handles and are deliberately absent; they are
+   attested per context by `effective-authority` instead.
+
+   The description is fully canonical: symbols are strings sorted by `str`.
+   Suitable for serialization, comparison, and as a completion corpus for
+   Samizdat safe doc/complete.  Doc text is not included; consumers key
+   their own documentation database by symbol name."
+  []
+  (inert
+    {:jolt.sandbox.surface/lang "js0-pure-sci"
+     :jolt.sandbox.surface/version language-surface-version
+     :jolt.sandbox.surface/count (count base-allow-vocabulary)
+     :jolt.sandbox.surface/symbols (vec (sort (map str base-allow-vocabulary)))}))
+
+(defn language-coordinate
+  "Deterministic versioned coordinate for the reviewed pure SCI language
+   surface: the scheme prefix js0-lang/v<version>: followed by the complete
+   canonical form of `language-surface`.  Same surface and version yield the
+   same string on any host, independent of print bindings or map iteration
+   order.  The js0-lang scheme is disjoint from the per-context authority
+   coordinate scheme (js0:)."
+  []
+  (str "js0-lang/v" language-surface-version ":"
+       (binding [*print-length* nil *print-level* nil]
+         (pr-str (coordinate-form (language-surface))))))
+
+;; ═══════════════════════════════════════════════════════════════════════════
 ;; Operation validation
 ;; ═══════════════════════════════════════════════════════════════════════════
 
