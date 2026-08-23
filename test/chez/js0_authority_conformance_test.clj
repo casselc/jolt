@@ -32,20 +32,41 @@
 (def ^:private pure-inc-op
   {:id :math/inc :name 'inc* :effect :pure :fn inc})
 
-(def ^:private observe-op
-  {:id :world/read :name 'read :effect :observation
+(def ^:private read-op
+  {:id :project/read :name 'read :effect :observation
    :fn #(get @world %)})
 
-(def ^:private actuate-op
-  {:id :world/write :name 'write :effect :actuation
+(def ^:private list-op
+  {:id :project/list :name 'list* :effect :observation
+   :fn #(vec (sort (keys @world)))})
+
+(def ^:private search-op
+  {:id :project/search :name 'search :effect :observation
+   :fn (fn [value]
+         (vec (filter #(= value (get @world %)) (sort (keys @world)))))})
+
+(def ^:private stat-op
+  {:id :project/stat :name 'stat :effect :observation
+   :fn (fn [k]
+         (if (= "fail" k)
+           (do (swap! fail-count inc)
+               (throw (ex-info "fixture failure" {})))
+           {:exists (contains? @world k)}))})
+
+(def ^:private edit-op
+  {:id :project/edit :name 'edit :effect :actuation
    :fn (fn [k v] (swap! write-count inc) (swap! world assoc k v) v)})
 
-(def ^:private fail-op
-  {:id :world/fail :name 'fail :effect :observation
-   :fn (fn [] (swap! fail-count inc) (throw (ex-info "fixture failure" {})))})
+(def ^:private network-get-op
+  {:id :network/get :name 'network-get :effect :observation
+   :fn (fn [_] "network")})
 
-(def ^:private all-ops [pure-inc-op observe-op actuate-op fail-op])
-(def ^:private read-ops [pure-inc-op observe-op fail-op])
+(def ^:private project-read-capabilities
+  #{:project/read :project/list :project/search :project/stat})
+(def ^:private project-develop-capabilities
+  (conj project-read-capabilities :project/edit))
+(def ^:private all-ops
+  [pure-inc-op read-op list-op search-op stat-op edit-op network-get-op])
 (def ^:private pure-ops [pure-inc-op])
 
 ;; ═════════════════════════════════════════════════════════════════════════
@@ -72,59 +93,75 @@
 ;; 2. Profiles
 ;; ═════════════════════════════════════════════════════════════════════════
 
-;; :agent/minimal — only :pure effects allowed
+;; Maxima are explicit capability IDs, independent of operation effects.
+(ok "profile maxima: minimal is exact"
+    (= #{} (get-in sandbox/profiles
+                   [:agent/minimal :profile/max-capabilities])))
+(ok "profile maxima: project-read is exact"
+    (= project-read-capabilities
+       (get-in sandbox/profiles
+               [:agent/project-read :profile/max-capabilities])))
+(ok "profile maxima: project-develop is exact"
+    (= project-develop-capabilities
+       (get-in sandbox/profiles
+               [:agent/project-develop :profile/max-capabilities])))
+
 (let [ctx (sandbox/create-context
            {:operations all-ops
             :profile :agent/minimal
-            :authorized-capabilities #{:math/inc}})]
-  (ok "profile minimal: pure op works"
-      (= 2 (sandbox/evaluate! ctx "(project/inc* 1)")))
+            :authorized-capabilities #{}})]
+  (ok "profile minimal: pure language works without a capability"
+      (= 2 (sandbox/evaluate! ctx "(+ 1 1)")))
+  (ok "profile minimal: projected pure operation is not authority"
+      (denied? #(sandbox/evaluate! ctx "(project/inc* 1)")))
   (ok "profile minimal: observation denied by recheck"
       (denied? #(sandbox/evaluate! ctx "(project/read \"a\")")))
   (ok "profile minimal: actuation denied by recheck"
-      (denied? #(sandbox/evaluate! ctx "(project/write \"b\" \"new\")"))))
+      (denied? #(sandbox/evaluate! ctx "(project/edit \"b\" \"new\")"))))
 
-;; :agent/project-read — :pure + :observation allowed
+;; :agent/project-read — exactly the four project read capabilities.
 (let [ctx (sandbox/create-context
            {:operations all-ops
             :profile :agent/project-read
-            :authorized-capabilities #{:math/inc :world/read}})]
-  (ok "profile read: pure works"
-      (= 2 (sandbox/evaluate! ctx "(project/inc* 1)")))
-  (ok "profile read: observation works"
+            :authorized-capabilities project-read-capabilities})]
+  (ok "profile read: read works"
       (= "old" (sandbox/evaluate! ctx "(project/read \"a\")")))
+  (ok "profile read: list works"
+      (= ["a"] (sandbox/evaluate! ctx "(project/list*)")))
+  (ok "profile read: search works"
+      (= ["a"] (sandbox/evaluate! ctx "(project/search \"old\")")))
+  (ok "profile read: stat works"
+      (= {:exists true} (sandbox/evaluate! ctx "(project/stat \"a\")")))
   (ok "profile read: actuation denied by recheck"
-      (denied? #(sandbox/evaluate! ctx "(project/write \"b\" \"new\")"))))
+      (denied? #(sandbox/evaluate! ctx "(project/edit \"b\" \"new\")")))
+  (ok "profile read: future observation capability denied by recheck"
+      (denied? #(sandbox/evaluate! ctx "(project/network-get \"https://example.test\")"))))
 
-;; :agent/project-develop — :pure + :observation + :actuation allowed
+;; :agent/project-develop — project-read plus edit.
 (let [ctx (sandbox/create-context
            {:operations all-ops
             :profile :agent/project-develop
-            :authorized-capabilities #{:math/inc :world/read :world/write}})]
-  (ok "profile develop: pure works"
-      (= 2 (sandbox/evaluate! ctx "(project/inc* 1)")))
+            :authorized-capabilities project-develop-capabilities})]
   (ok "profile develop: observation works"
       (= "old" (sandbox/evaluate! ctx "(project/read \"a\")")))
   (ok "profile develop: actuation works"
-      (do (sandbox/evaluate! ctx "(project/write \"b\" \"new\")")
+      (do (sandbox/evaluate! ctx "(project/edit \"b\" \"new\")")
           (= "new" (get @world "b")))))
 
 ;; ═════════════════════════════════════════════════════════════════════════
 ;; 3. Attenuation: authorized narrower than profile max
 ;; ═════════════════════════════════════════════════════════════════════════
 
-;; Profile allows actuation but we only authorize pure + observation.
+;; Profile allows edit but we only authorize read.
 ;; Requested defaults to authorized when only authorized is specified.
 (let [ctx (sandbox/create-context
            {:operations all-ops
             :profile :agent/project-develop
-            :authorized-capabilities #{:math/inc :world/read}})]
-  (ok "attenuation: pure works"
-      (= 2 (sandbox/evaluate! ctx "(project/inc* 1)")))
+            :authorized-capabilities #{:project/read}})]
   (ok "attenuation: observation works"
       (= "old" (sandbox/evaluate! ctx "(project/read \"a\")")))
   (ok "attenuation: actuation denied (attenuated out)"
-      (denied? #(sandbox/evaluate! ctx "(project/write \"b\" \"new\")"))))
+      (denied? #(sandbox/evaluate! ctx "(project/edit \"b\" \"new\")"))))
 
 ;; ═════════════════════════════════════════════════════════════════════════
 ;; 4. Rejected over-request: authorized exceeds profile max
@@ -132,38 +169,47 @@
 
 (ok "over-request: minimal rejects observation"
     (throws-with?
-      #(some-> % ex-data :jolt.sandbox/error)
+      #(= :profile-exceeded (some-> % ex-data :jolt.sandbox/error))
       #(sandbox/create-context
          {:operations all-ops
           :profile :agent/minimal
-          :authorized-capabilities #{:math/inc :world/read}})))
+          :authorized-capabilities #{:project/read}})))
 
 (ok "over-request: read rejects actuation"
     (throws-with?
-      #(some-> % ex-data :jolt.sandbox/error)
+      #(= :profile-exceeded (some-> % ex-data :jolt.sandbox/error))
       #(sandbox/create-context
          {:operations all-ops
           :profile :agent/project-read
-          :authorized-capabilities #{:math/inc :world/read :world/write}})))
+          :authorized-capabilities (conj project-read-capabilities
+                                         :project/edit)})))
+
+(ok "over-request: read rejects future observation outside explicit maximum"
+    (throws-with?
+      #(= :profile-exceeded (some-> % ex-data :jolt.sandbox/error))
+      #(sandbox/create-context
+         {:operations all-ops
+          :profile :agent/project-read
+          :authorized-capabilities #{:network/get}})))
 
 ;; ═════════════════════════════════════════════════════════════════════════
 ;; 5. Absent unrequested authorization
 ;; ═════════════════════════════════════════════════════════════════════════
 
-;; Profile allows observation+actuation but only pure is requested/authorized.
-;; Observation and actuation operations are present in the fixture but NOT
+;; Profile allows all project operations but only read is requested/authorized.
+;; Other operations are present in the fixture but NOT
 ;; callable because they are absent from the authorized set.
 (let [ctx (sandbox/create-context
            {:operations all-ops
             :profile :agent/project-develop
-            :requested-capabilities #{:math/inc}
-            :authorized-capabilities #{:math/inc}})]
-  (ok "unrequested: pure works"
-      (= 2 (sandbox/evaluate! ctx "(project/inc* 1)")))
-  (ok "unrequested: observation present but denied by recheck"
-      (denied? #(sandbox/evaluate! ctx "(project/read \"a\")")))
+            :requested-capabilities #{:project/read}
+            :authorized-capabilities #{:project/read}})]
+  (ok "unrequested: requested read works"
+      (= "old" (sandbox/evaluate! ctx "(project/read \"a\")")))
+  (ok "unrequested: list present but denied by recheck"
+      (denied? #(sandbox/evaluate! ctx "(project/list*)")))
   (ok "unrequested: actuation present but denied by recheck"
-      (denied? #(sandbox/evaluate! ctx "(project/write \"b\" \"new\")"))))
+      (denied? #(sandbox/evaluate! ctx "(project/edit \"b\" \"new\")"))))
 
 ;; ═════════════════════════════════════════════════════════════════════════
 ;; 6. Context isolation
@@ -174,18 +220,18 @@
   (let [a (sandbox/create-context
             {:operations all-ops
              :profile :agent/project-develop
-             :authorized-capabilities #{:math/inc :world/read :world/write}})
+             :authorized-capabilities #{:project/read :project/edit}})
         b (sandbox/create-context
             {:operations pure-ops
              :profile :agent/minimal
-             :authorized-capabilities #{:math/inc}})]
+             :authorized-capabilities #{}})]
     (sandbox/evaluate! a "(def isolated-val 99)")
     (ok "isolation: def in a not visible in b"
         (denied? #(sandbox/evaluate! b "isolated-val")))
     (ok "isolation: operation in a not in b"
         (denied? #(sandbox/evaluate! b "(project/read \"a\")")))
     (ok "isolation: b can still compute"
-        (= 2 (sandbox/evaluate! b "(project/inc* 1)")))))
+        (= 2 (sandbox/evaluate! b "(+ 1 1)")))))
 
 ;; ═════════════════════════════════════════════════════════════════════════
 ;; 7. Deny corpus — Jolt namespaces, eval, load, require, ffi, process,
@@ -196,7 +242,7 @@
 (let [ctx (sandbox/create-context
            {:operations all-ops
             :profile :agent/project-develop
-            :authorized-capabilities #{:math/inc :world/read :world/write :world/fail}})]
+            :authorized-capabilities project-develop-capabilities})]
   ;; Clojure core escape hatches
   (doseq [src ["(eval '(+ 1 2))" "(clojure.core/eval '(+ 1 2))"]]
     (ok (str "deny corpus: " src) (denied? #(sandbox/evaluate! ctx src))))
@@ -230,18 +276,18 @@
   (let [ctx (sandbox/create-context
             {:operations all-ops
              :profile :agent/project-develop
-             :authorized-capabilities #{:math/inc :world/read :world/write}})]
+             :authorized-capabilities #{:project/read :project/edit}})]
     ;; Both operations work initially
-    (ok "recheck: write works before revocation"
-        (do (sandbox/evaluate! ctx "(project/write \"b\" \"revoked\")") true))
-    ;; Revoke write capability while its SCI wrapper remains projected.
-    (sandbox/revoke! ctx :world/write)
-    (ok "recheck: write denied after revocation"
-        (denied? #(sandbox/evaluate! ctx "(project/write \"c\" \"nope\")")))
-    (ok "recheck: read still works after write revocation"
+    (ok "recheck: edit works before revocation"
+        (do (sandbox/evaluate! ctx "(project/edit \"b\" \"revoked\")") true))
+    ;; Revoke edit capability while its SCI wrapper remains projected.
+    (sandbox/revoke! ctx :project/edit)
+    (ok "recheck: edit denied after revocation"
+        (denied? #(sandbox/evaluate! ctx "(project/edit \"c\" \"nope\")")))
+    (ok "recheck: read still works after edit revocation"
         (= "old" (sandbox/evaluate! ctx "(project/read \"a\")")))
     (ok "recheck: coordinate reflects revocation"
-        (not (some #{":world/write"}
+        (not (some #{":project/edit"}
                    (:jolt.sandbox/authorized (sandbox/effective-authority ctx)))))))
 
 ;; ═════════════════════════════════════════════════════════════════════════
@@ -289,12 +335,21 @@
   (let [ctx (sandbox/create-context
             {:operations all-ops
              :profile :agent/project-read
-             :authorized-capabilities #{:math/inc :world/read}})
-        auth (sandbox/effective-authority ctx)]
+             :authorized-capabilities #{:project/read :project/stat}})
+        deref-count (atom 0)
+        original-deref deref
+        auth (with-redefs [deref (fn [x]
+                                   (when (identical? x ctx)
+                                     (swap! deref-count inc))
+                                   (original-deref x))]
+               (sandbox/effective-authority ctx))]
+    (ok "authority: state atom read once"
+        (= 1 @deref-count))
     (ok "authority: profile in description"
         (= ":agent/project-read" (:jolt.sandbox/profile auth)))
     (ok "authority: authorized in description"
-        (= #{":math/inc" ":world/read"} (set (:jolt.sandbox/authorized auth))))
+        (= #{":project/read" ":project/stat"}
+           (set (:jolt.sandbox/authorized auth))))
     (ok "authority: operations match authorized"
         (= 2 (count (:jolt.sandbox/operations auth))))
     (ok "authority: is inert data"
@@ -313,20 +368,20 @@
 ;; ═════════════════════════════════════════════════════════════════════════
 
 (let [coord-1 (let [c (sandbox/create-context
-                      {:operations (shuffle all-ops)
-                       :profile :agent/project-read
-                       :authorized-capabilities #{:math/inc :world/read}})]
-                (sandbox/canonical-coordinate (sandbox/effective-authority c)))
+                       {:operations (shuffle all-ops)
+                        :profile :agent/project-read
+                        :authorized-capabilities #{:project/read :project/stat}})]
+                 (sandbox/canonical-coordinate (sandbox/effective-authority c)))
       coord-2 (let [c (sandbox/create-context
-                      {:operations (reverse all-ops)
-                       :profile :agent/project-read
-                       :authorized-capabilities #{:math/inc :world/read}})]
-                (sandbox/canonical-coordinate (sandbox/effective-authority c)))
+                       {:operations (reverse all-ops)
+                        :profile :agent/project-read
+                        :authorized-capabilities #{:project/read :project/stat}})]
+                 (sandbox/canonical-coordinate (sandbox/effective-authority c)))
       coord-diff (let [c (sandbox/create-context
-                          {:operations all-ops
-                           :profile :agent/project-develop
-                           :authorized-capabilities #{:world/write}})]
-                   (sandbox/canonical-coordinate (sandbox/effective-authority c)))]
+                           {:operations all-ops
+                            :profile :agent/project-develop
+                            :authorized-capabilities #{:project/edit}})]
+                    (sandbox/canonical-coordinate (sandbox/effective-authority c)))]
    (ok "coordinate: order invariant" (= coord-1 coord-2))
    (ok "coordinate: independent of print bindings"
        (= coord-1
@@ -335,7 +390,7 @@
              (sandbox/effective-authority
               (sandbox/create-context
                {:operations all-ops :profile :agent/project-read
-                :authorized-capabilities #{:math/inc :world/read}}))))))
+                 :authorized-capabilities #{:project/read :project/stat}}))))))
    (ok "coordinate: diverges with different capabilities"
       (not= coord-1 coord-diff)))
 
@@ -347,13 +402,13 @@
   (reset! world {"a" "old"})
   (reset! write-count 0)
   (let [ctx (sandbox/create-context
-            {:operations all-ops
-             :profile :agent/project-develop
-             :authorized-capabilities #{:math/inc :world/read :world/write :world/fail}})]
+             {:operations all-ops
+              :profile :agent/project-develop
+              :authorized-capabilities #{:project/read :project/stat :project/edit}})]
     ;; Record an observation and actuation
     (sandbox/set-mode! ctx :record)
     (sandbox/evaluate! ctx
-      "(defn f [] (let [v (project/read \"a\")] (project/write \"a\" \"recorded\") [v \"recorded\"])) (f)")
+      "(defn f [] (let [v (project/read \"a\")] (project/edit \"a\" \"recorded\") [v \"recorded\"])) (f)")
     (let [history (sandbox/receipts ctx)
           wc @write-count]
       ;; Replay against a changed world
@@ -363,7 +418,7 @@
       (ok "replay: substitutes receipts"
           (= ["old" "recorded"]
              (sandbox/evaluate! ctx
-               "(defn f [] (let [v (project/read \"a\")] (project/write \"a\" \"recorded\") [v \"recorded\"])) (f)")))
+               "(defn f [] (let [v (project/read \"a\")] (project/edit \"a\" \"recorded\") [v \"recorded\"])) (f)")))
       (ok "replay: does not actuate"
           (= wc @write-count))
 
@@ -389,13 +444,13 @@
       (sandbox/load-receipts! ctx [])
       (sandbox/set-mode! ctx :record)
       (ok "replay: operation error raised while recording"
-          (denied? #(sandbox/evaluate! ctx "(project/fail)")))
+          (denied? #(sandbox/evaluate! ctx "(project/stat \"fail\")")))
       (let [error-history (sandbox/receipts ctx)
             fc @fail-count]
         (sandbox/load-receipts! ctx error-history)
         (sandbox/set-mode! ctx :replay)
         (ok "replay: recorded error replays"
-            (denied? #(sandbox/evaluate! ctx "(project/fail)")))
+            (denied? #(sandbox/evaluate! ctx "(project/stat \"fail\")")))
         (ok "replay: recorded error does not reobserve"
             (= fc @fail-count))))))
 
@@ -418,6 +473,18 @@
         (denied? #(sandbox/evaluate! b "x")))
     (ok "legacy: other context authority absent"
         (denied? #(sandbox/evaluate! b "(project/read \"a\")")))))
+
+;; Effects control replay treatment, not profile membership. A legacy pure
+;; operation executes in replay mode without consuming or producing receipts.
+(let [ctx (sandbox/create-context pure-ops)]
+  (sandbox/set-mode! ctx :record)
+  (ok "effects: pure operation executes while recording"
+      (= 2 (sandbox/evaluate! ctx "(project/inc* 1)")))
+  (ok "effects: pure operation produces no receipt"
+      (empty? (sandbox/receipts ctx)))
+  (sandbox/set-mode! ctx :replay)
+  (ok "effects: pure operation executes during replay"
+      (= 3 (sandbox/evaluate! ctx "(project/inc* 2)"))))
 
 ;; ═════════════════════════════════════════════════════════════════════════
 ;; 14. Unknown profile rejection
@@ -447,8 +514,8 @@
       #(sandbox/create-context
          {:operations all-ops
           :profile :agent/project-develop
-          :requested-capabilities #{:math/inc :world/read :world/write}
-          :authorized-capabilities #{:math/inc}})))
+          :requested-capabilities #{:project/read :project/edit}
+          :authorized-capabilities #{:project/read}})))
 
 ;; ═════════════════════════════════════════════════════════════════════════
 ;; 16. Fork preserves authority, not definitions
@@ -459,13 +526,18 @@
   (let [a (sandbox/create-context
             {:operations all-ops
              :profile :agent/project-read
-             :authorized-capabilities #{:math/inc :world/read}})]
+             :authorized-capabilities #{:project/read :project/list}})]
     (sandbox/evaluate! a "(def only-in-a 42)")
+    (sandbox/revoke! a :project/read)
     (let [b (sandbox/fork-context a)]
-      (ok "fork: authority preserved"
-          (= 2 (sandbox/evaluate! b "(project/inc* 1)")))
-      (ok "fork: observation preserved"
-          (= "old" (sandbox/evaluate! b "(project/read \"a\")")))
+      (ok "fork: unrevoked authority preserved"
+          (= ["a"] (sandbox/evaluate! b "(project/list*)")))
+      (ok "fork: revoked authority cannot be restored"
+          (denied? #(sandbox/evaluate! b "(project/read \"a\")")))
+      (ok "fork: authority description excludes revoked capability"
+          (not (some #{":project/read"}
+                     (:jolt.sandbox/authorized
+                      (sandbox/effective-authority b)))))
       (ok "fork: definition not shared"
           (denied? #(sandbox/evaluate! b "only-in-a"))))))
 

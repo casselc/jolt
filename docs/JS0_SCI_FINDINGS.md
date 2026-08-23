@@ -13,9 +13,9 @@ evaluator result only, not Samizdat integration authorization.
 
 | item | coordinate/result |
 | --- | --- |
-| Jolt base | `615e52517042d62d0f92fb55f78a24e89bfe7af8` (`main`, `origin/main`) |
-| JS0 branch | `js0-functional-sci` (this evidence) |
-| upstream/base | same commit; this checkout has no separate upstream remote |
+| Jolt fork base | `615e52517042d62d0f92fb55f78a24e89bfe7af8` (`main`, `origin/main`) |
+| JS0 branch / freeze tag | `js0-functional-sci` / `js0-functional-sci-freeze` (this evidence) |
+| jolt-lang/jolt upstream main | `f09c008a` (not the fork baseline; upstream has independently advanced) |
 | vendored SCI | `32d62a5136ad3dc148588752f5bcc4cc30b14752` |
 | Chez evidence lane | Linux, Chez Scheme `10.4.1` (`/usr/local/bin/scheme`) |
 | source compatibility gate | **417/424** forms; preserved gate passes its 416 floor |
@@ -54,20 +54,26 @@ special-cases.
   names are not projected.
 * Context A has definitions and `project/read`; Context B has neither.  Their
   state and authority differ.
+* Profiles have closed explicit capability-ID maxima: `:agent/minimal` grants
+  none; `:agent/project-read` grants only `:project/read`, `:project/list`,
+  `:project/search`, and `:project/stat`; `:agent/project-develop` adds only
+  `:project/edit`.  Thus a future observation such as `:network/get` is not
+  admitted merely because it is an observation.
 * Operations carry `:pure`, `:observation`, or `:actuation` classification.
-  Record mode stores ordered in-memory receipts `{id args result|error}`.
-  Replay executes surrounding SCI source while substituting receipt values and
-  never invokes the fixture host function.
+  Effect selects replay treatment, never profile membership. Record mode stores
+  ordered in-memory receipts `{id args result|error}` for observations and
+  actuations; trusted pure operations execute normally during replay and do
+  not consume a receipt.
 * Observation replay returns the historical value after the fixture world is
   changed.  Actuation replay reconstructs its return without another write.
   A helper containing read and write is replayed at its operation leaves.
   Changed args, wrong/exhausted calls, unconsumed receipts, unreconstructable
   values, and recorded host errors fail closed.
-* ContextSpec profiles `:agent/minimal`, `:agent/project-read`, and
-  `:agent/project-develop` enforce
-  `requested ⊆ authorized ⊆ profile maximum`. The effective description and
-  exact canonical coordinate use only inert data. A wrapper that remains
-  projected after host-side capability revocation is refused by dispatch.
+* ContextSpec profiles enforce `requested ⊆ authorized ⊆ profile maximum`.
+  The effective description and exact canonical coordinate use only inert data.
+  A wrapper that remains projected after host-side capability revocation is
+  refused by dispatch; a fork derives from current effective authority and
+  cannot restore a revoked capability.
 * The pure language is an explicit SCI `:allow` subset derived from bb4t's
   reviewed vocabulary. `letfn`, namespace discovery, `doc`, and
   `clojure.string` are deliberate JS0 exclusions; `loop`/`loop*` are included
@@ -126,7 +132,10 @@ functional sandbox, and authority conformance gates printed `OK`.
   parity, durable policy storage, or an API stability promise. The shared
   contract description is `test/chez/js0-evaluator-conformance.edn`.
 * There is no durable journal, session resume, filesystem capability, Samizdat,
-  Mycelium, bbagent migration, or full bb4t catalog here.
+  Mycelium, bbagent migration, or full bb4t catalog here. A receipt protocol
+  version is required before durable transcripts can cross this freeze: older
+  transcripts that recorded a host operation now classified `:pure` fail closed
+  rather than being silently reinterpreted.
 * The bb4t authority artifact was produced against a newer SCI revision.  Its
   96 cases cannot be claimed as cross-runtime parity from this slice.
 * Only Linux/Chez 10.4.1 was executed.  macOS, Windows, release-image behavior,

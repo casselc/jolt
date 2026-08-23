@@ -65,23 +65,29 @@
 ;; ═══════════════════════════════════════════════════════════════════════════
 
 (def profiles
-  "Context profiles defining the maximum operation effects each profile
-   permits.  A profile's :profile/allowed-effects is the set of :effect
-   values that operations may carry and still be authorized under this profile.
+  "Context profiles defining the exact maximum capability IDs each profile
+   permits.  Effects classify replay behavior; they do not grant authority.
 
    Profile hierarchy:
-     :agent/minimal       — only :pure effects (no world interaction)
-     :agent/project-read  — :pure + :observation (read-only world access)
-     :agent/project-develop — :pure + :observation + :actuation (read-write)"
+     :agent/minimal       — no semantic operation capabilities
+     :agent/project-read  — project read/list/search/stat
+     :agent/project-develop — project-read plus project edit"
   {:agent/minimal
    {:profile/id :agent/minimal
-    :profile/allowed-effects #{:pure}}
+    :profile/max-capabilities #{}}
    :agent/project-read
    {:profile/id :agent/project-read
-    :profile/allowed-effects #{:pure :observation}}
+    :profile/max-capabilities #{:project/read
+                                :project/list
+                                :project/search
+                                :project/stat}}
    :agent/project-develop
    {:profile/id :agent/project-develop
-    :profile/allowed-effects #{:pure :observation :actuation}}})
+    :profile/max-capabilities #{:project/read
+                                :project/list
+                                :project/search
+                                :project/stat
+                                :project/edit}}})
 
 ;; ═══════════════════════════════════════════════════════════════════════════
 ;; Canonical receipt domain
@@ -127,8 +133,7 @@
 
    Enforces:  requested ⊆ authorized ⊆ profile-max
 
-   where profile-max is the set of operation IDs whose :effect is in
-   the profile's :profile/allowed-effects."
+   where profile-max is the profile's explicit set of capability IDs."
   [operations
    {:keys [profile requested-capabilities authorized-capabilities]
     :or {requested-capabilities nil
@@ -140,13 +145,7 @@
       (throw (ex-info "Unknown profile"
                       {:jolt.sandbox/error :unknown-profile
                        :profile profile})))
-    (let [;; Compute the maximum set of operation IDs this profile can authorize
-          profile-max-ops
-          (set (map :id
-                    (filter (fn [{:keys [effect]}]
-                              (contains? (:profile/allowed-effects profile-data)
-                                         effect))
-                            operations)))
+    (let [profile-max (:profile/max-capabilities profile-data)
           ;; Default: if neither specified, requested = authorized = available.
           ;; If only authorized specified, requested defaults to authorized (not
           ;; to all ops, which would make requested > authorized fail).
@@ -161,13 +160,13 @@
                          :requested requested
                          :authorized authorized})))
       ;; authorized ⊆ profile-max
-      (when-not (every? profile-max-ops authorized)
-        (let [excess (remove profile-max-ops authorized)]
+      (when-not (every? profile-max authorized)
+        (let [excess (remove profile-max authorized)]
           (throw (ex-info "Authorized capabilities exceed profile maximum"
                           {:jolt.sandbox/error :profile-exceeded
                            :profile profile
                            :authorized authorized
-                           :profile-max profile-max-ops
+                           :profile-max profile-max
                            :excess excess}))))
       ;; All authorized caps must exist in provided operations
       (when-not (every? op-ids authorized)
@@ -195,12 +194,11 @@
    The description is fully canonical: all collections are sorted and
    contain only receipt-domain values."
   [state]
-  (let [{:keys [profile requested-capabilities authorized-capabilities operations]}
-        @state
+  (let [{:keys [profile requested-capabilities operations authorized]} @state
         ;; Dispatch uses :authorized as its single live authority source.  The
         ;; description must read that same value so attenuation/revocation never
         ;; attests authority the wrapper no longer has.
-        authorized-set (:authorized @state)]
+        authorized-set authorized]
     (inert
       {:jolt.sandbox/profile (str profile)
        :jolt.sandbox/requested (vec (sort (map str requested-capabilities)))
@@ -275,7 +273,7 @@
     ;; either authority before a concurrent revoke or authority after it, never
     ;; a mixed mode/transcript/authorization state.
     (let [{:keys [mode receipts cursor authorized]} @state
-          {:keys [id fn]} descriptor
+          {:keys [id effect fn]} descriptor
           ;; RECHECK: read the CURRENT authorized set from @state so that
           ;; runtime revocation is immediately effective.  The wrapper is
           ;; projected into the SCI context (fixture presence), but the
@@ -286,40 +284,44 @@
                                :op/id id})))
           ;; Canonicalize arguments AFTER the capability recheck.
           args (inert (vec args))]
-      (case mode
-        :normal (inert (apply fn args))
-        :record (try
-                  (let [result (inert (apply fn args))]
-                    (swap! receipts conj (receipt id args result))
-                    result)
-                  (catch Throwable error
-                    ;; A historical operation failure is just as observable as a
-                    ;; result.  Record it before rethrowing so replay never calls
-                    ;; the host in an attempt to rediscover it.
-                    (swap! receipts conj (error-receipt id args error))
-                    (throw error)))
-        :replay (let [i @cursor rs @receipts]
-                  (when (>= i (count rs))
-                    (throw (ex-info "Replay receipt exhaustion"
-                                    {:jolt.sandbox/error :exhausted
-                                     :op/id id :index i})))
-                  (let [r (nth rs i)]
-                    (when-not (= id (:op/id r))
-                      (throw (ex-info "Replay operation mismatch"
-                                      {:jolt.sandbox/error :operation-mismatch
-                                       :expected (:op/id r) :actual id})))
-                    (when-not (= args (:op/args r))
-                      (throw (ex-info "Replay operation arguments mismatch"
-                                      {:jolt.sandbox/error :args-mismatch
-                                       :op/id id
-                                       :expected (:op/args r)
-                                       :actual args})))
-                    (swap! cursor inc)
-                    (if (:op/error r)
-                      (throw (ex-info (:op/error r)
-                                      {:jolt.sandbox/error :recorded-operation-error
-                                       :op/id id}))
-                      (:op/result r))))))))
+      ;; Pure operations are deterministic and execute in every mode.  Effects
+      ;; select replay treatment only; profile authority is exclusively ID-based.
+      (if (= :pure effect)
+        (inert (apply fn args))
+        (case mode
+          :normal (inert (apply fn args))
+          :record (try
+                    (let [result (inert (apply fn args))]
+                      (swap! receipts conj (receipt id args result))
+                      result)
+                    (catch Throwable error
+                      ;; A historical operation failure is just as observable as a
+                      ;; result.  Record it before rethrowing so replay never calls
+                      ;; the host in an attempt to rediscover it.
+                      (swap! receipts conj (error-receipt id args error))
+                      (throw error)))
+          :replay (let [i @cursor rs @receipts]
+                    (when (>= i (count rs))
+                      (throw (ex-info "Replay receipt exhaustion"
+                                      {:jolt.sandbox/error :exhausted
+                                       :op/id id :index i})))
+                    (let [r (nth rs i)]
+                      (when-not (= id (:op/id r))
+                        (throw (ex-info "Replay operation mismatch"
+                                        {:jolt.sandbox/error :operation-mismatch
+                                         :expected (:op/id r) :actual id})))
+                      (when-not (= args (:op/args r))
+                        (throw (ex-info "Replay operation arguments mismatch"
+                                        {:jolt.sandbox/error :args-mismatch
+                                         :op/id id
+                                         :expected (:op/args r)
+                                         :actual args})))
+                      (swap! cursor inc)
+                      (if (:op/error r)
+                        (throw (ex-info (:op/error r)
+                                        {:jolt.sandbox/error :recorded-operation-error
+                                         :op/id id}))
+                        (:op/result r)))))))))
 
 ;; ═══════════════════════════════════════════════════════════════════════════
 ;; Context creation
@@ -331,7 +333,8 @@
    Accepts either:
 
    1. A vector of operation descriptors (legacy API):
-      All operations are authorized under the :agent/project-develop profile.
+      All operations are authorized under a private, unprofiled compatibility
+      maximum. New callers should use a context-spec and an explicit profile.
 
    2. A context-spec map:
       {:operations              vector of operation descriptors
@@ -351,14 +354,21 @@
    This ensures fixture trusted operation presence does not authorize
    absent capability — the wrapper recheck is the real gate."
   [ops-or-spec]
-  (let [raw-ops (if (vector? ops-or-spec) ops-or-spec (:operations ops-or-spec))
+  (let [legacy? (vector? ops-or-spec)
+        raw-ops (if legacy? ops-or-spec (:operations ops-or-spec))
         operations (checked-operations raw-ops)
-        spec (if (vector? ops-or-spec)
-               {:profile :agent/project-develop
-                :requested-capabilities (set (map :id operations))
-                :authorized-capabilities (set (map :id operations))}
-               ops-or-spec)
-        resolved (resolve-context-spec operations spec)
+        op-ids (set (map :id operations))
+        resolved (if legacy?
+                   ;; Preserve the original trusted vector API without widening
+                   ;; any named profile's exact maximum.
+                   {:profile :legacy/unprofiled
+                    :profile-data {:profile/id :legacy/unprofiled
+                                   :profile/max-capabilities op-ids}
+                    :requested-capabilities op-ids
+                    :authorized-capabilities op-ids
+                    :authorized op-ids
+                    :operations operations}
+                   (resolve-context-spec operations ops-or-spec))
         {:keys [authorized operations]} resolved
         state (atom (merge resolved
                            {:mode :normal
@@ -399,7 +409,13 @@
   "Removes a presently effective capability. Existing SCI Vars remain only as
    inert wrappers whose independent host-side dispatch check denies them."
   [state capability]
-  (swap! state update :authorized disj capability)
+  ;; This swap is the revocation linearization point. Keep every authority
+  ;; layer attenuated so requested ⊆ authorized remains true after revocation.
+  (swap! state (fn [s]
+                 (-> s
+                     (update :requested-capabilities disj capability)
+                     (update :authorized-capabilities disj capability)
+                     (update :authorized disj capability))))
   state)
 
 (defn receipts [state] @(:receipts @state))
@@ -437,8 +453,20 @@
    definitions or receipts from `state`."
   [state]
   (let [s @state]
-    (create-context
-      {:operations (:operations s)
-       :profile (:profile s)
-       :requested-capabilities (or (:requested-capabilities s) (:requested s))
-       :authorized-capabilities (or (:authorized-capabilities s) (:authorized s))})))
+    (if (= :legacy/unprofiled (:profile s))
+      ;; Rebuild legacy contexts through their private compatibility path, then
+      ;; attenuate before returning the child so a revoked capability is never
+      ;; observable there.
+      (let [child (create-context (vec (:operations s)))]
+        (doseq [capability (remove (:authorized s)
+                                   (map :id (:operations s)))]
+          (revoke! child capability))
+        child)
+      (create-context
+        {:operations (:operations s)
+         :profile (:profile s)
+         ;; Fork from current effective authority, never the creation-time grant.
+         :requested-capabilities
+         (set (filter (:authorized s)
+                      (or (:requested-capabilities s) (:requested s))))
+         :authorized-capabilities (:authorized s)}))))
