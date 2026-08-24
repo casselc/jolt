@@ -152,6 +152,7 @@ mono-nanos
 munge-name
 park-until-interrupt
 pop
+process-scope-run
 protocol-key-of
 protocol-methods
 proxy-super-call

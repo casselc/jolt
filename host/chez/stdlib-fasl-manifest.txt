@@ -78,3 +78,4 @@ jolt.util
 skip glojure.deps — requires glojure/deps/host.{jolt,clj,cljc} which is absent from the install roots at build time
 skip grenadine.host.glojure — top level references an unqualified `strings` symbol that does not resolve in the build image
 skip grenadine.cli — requires grenadine/build_info.{jolt,clj,cljc} (generated at release packaging), absent in a dev build
+skip jolt.sandbox — requires sci/core.{jolt,clj,cljc} from vendored SCI, absent from the install roots at build time

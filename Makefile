@@ -66,9 +66,10 @@ JOLT-TARGETS-NEEDING-DEPS := \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate \
-  jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
-  traceemit \
+  jolt jolt-debug jolt-release joltsmoke js0authority js0sandbox libconformance \
+  mandelbrot-num mathfl mvnhttp \
+  narrow numeric numwp oparity pic protoret printperf remint sbperf sci scievaluator \
+  selfhost shakelocal traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
 
@@ -496,6 +497,24 @@ sci:
 # intentionally lenient source-loading compatibility gate.
 scifunctional: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:deps {borkdude/sci {:local/root "vendor/sci"}}}' run test/chez/sci-functional-test.clj
+
+# JS0 evaluator acceptance (js1-runtime-current-upstream): the closed,
+# capability-bounded SCI evaluator contract on the current runtime — the
+# sandbox and authority conformance suites plus the upstream SCI functional
+# and nested-interrupt gates' test files. The Clojure suites run through
+# bin/jolt (script mode, like depsunit/grenadine) with scifunctional's
+# dependency form, so this lane stays runnable without the standalone binary;
+# `make scifunctional` and `make interruptnest` remain the per-gate CI lanes
+# for the same files. Opt-in: not part of make ci.
+js0sandbox:
+	@JOLT_NO_USER_DEPS=1 bin/jolt -Sdeps '{:deps {borkdude/sci {:local/root "vendor/sci"}}}' run test/chez/js0-sandbox-test.clj
+
+js0authority:
+	@JOLT_NO_USER_DEPS=1 bin/jolt -Sdeps '{:deps {borkdude/sci {:local/root "vendor/sci"}}}' run test/chez/js0_authority_conformance_test.clj
+
+scievaluator: js0sandbox js0authority
+	@JOLT_NO_USER_DEPS=1 bin/jolt -Sdeps '{:deps {borkdude/sci {:local/root "vendor/sci"}}}' run test/chez/sci-functional-test.clj
+	@$(CHEZ) --script test/chez/interrupt-nesting-test.ss
 
 # clojure-test-suite conformance: run the vendored jank-lang/clojure-test-suite
 # per-namespace under jolt, gated on the per-namespace baseline
