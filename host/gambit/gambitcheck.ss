@@ -143,6 +143,7 @@
 (define contract-syntax-shims
   '(with-mutex
     sa-foreign-procedure sa-foreign-procedure-blocking
+    sa-foreign-procedure-native-error
     sa-foreign-callable sa-foreign-callable-collect-safe))
 
 (define (bound? s)
@@ -369,6 +370,8 @@
   (check-raise-message "sa-foreign-procedure (syntax)" (lambda () (sa-foreign-procedure "f" (int) int))
                        "ffi is unsupported on the gambit target")
   (check-raise-message "sa-foreign-procedure-blocking (syntax)" (lambda () (sa-foreign-procedure-blocking "f" (int) int))
+                       "ffi is unsupported on the gambit target")
+  (check-raise-message "sa-foreign-procedure-native-error (syntax)" (lambda () (sa-foreign-procedure-native-error () "f" (int) int))
                        "ffi is unsupported on the gambit target")
   (check-raise-message "sa-foreign-callable (syntax)" (lambda () (sa-foreign-callable (lambda () 1) (int) int))
                        "ffi is unsupported on the gambit target")
