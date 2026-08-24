@@ -1103,6 +1103,475 @@
         (cons "descendants" (lambda (self)
           (apply jolt-vector (map make-proc-handle (proc-descendants (jhost-state self))))))))
 
+;; --- opt-in scoped process ownership (Linux) ----------------------------------
+;; The ProcessBuilder surface above is the JVM's: it owns ONE pid, destroy
+;; signals ONE pid, and nothing about it can guarantee a caller's timeout kills
+;; the work a child spawned — destroy-tree enumerates descendants and signals
+;; them one pid at a time, a snapshot racing the tree's own growth, and a child
+;; that ignores SIGTERM survives p/destroy indefinitely. This section is a
+;; separate, OPT-IN facility for the caller that wants the stronger contract:
+;; spawn into a process group jolt owns exclusively, and when the run times out
+;; (or the root exits leaving the group populated), TERM the WHOLE group, then
+;; KILL it, and return only once /proc confirms nothing live remains in the
+;; owned scope. Nothing above changes: unscoped semantics are exactly what they
+;; were, and this is reached only through jolt.host/process-scope-run.
+;;
+;; Linux-only by construction: the scope is a POSIX process group created with
+;; POSIX_SPAWN_SETPGROUP — 0x02 in glibc's spawn.h (probed) and musl's (musl
+;; git: include/spawn.h) — signalled with kill(-pgid, sig) (kill(2): a pid
+;; < -1 addresses every process in that group), and enumerated by scanning
+;; /proc/<pid>/stat whose fields after the last ')' are "state ppid pgrp ..."
+;; (probed: /proc/self/stat — pgrp is the 3rd token). A full new SESSION is
+;; deliberately not attempted: neither libc provides a posix_spawnattr_setsid
+;; setter (no such prototype or exported symbol here through glibc 2.43 —
+;; probed; musl's spawn.h defines only the macro). glibc 2.43's posix_spawn
+;; does honor the raw POSIX_SPAWN_SETSID bit (0x80, __USE_GNU-guarded —
+;; probed: a child spawned with the bit lands in its own session), but setting
+;; it means poking an opaque struct's flag word and the glibc FLOOR (2.26,
+;; amazonlinux:2) is unprobed, so the "distinct execution session" this
+;; facility creates is a distinct process GROUP in jolt's session, uniformly:
+;; the child's pgid is its own pid, jolt is not a member, and kill(-pgid) can
+;; never reach jolt or anything jolt spawned unscoped. A group also detaches
+;; the child from the terminal's foreground group, so ^C at a tty does not
+;; interrupt it — the controller's timeout is the only way it ends, which is
+;; the point of an owned scope.
+;;
+;; The argv boundary is DIRECT: posix_spawn execs the resolved program with the
+;; caller's argv — no /bin/sh, no shell quoting, no word splitting (the
+;; ProcessBuilder path above routes through `sh -c` to reuse its cd/env/
+;; redirect prefixes; here those are file actions and an explicit envp instead,
+;; so no launcher is involved at all). stdio is /dev/null on all three streams
+;; by design: no pipes means a child can never block on a full pipe buffer,
+;; so forced termination is always prompt and output capture is out of scope
+;; for this facility on purpose.
+(define proc-sc-attr-init
+  (jolt-foreign-proc-safe "posix_spawnattr_init" '(void*) 'int))
+(define proc-sc-attr-destroy
+  (jolt-foreign-proc-safe "posix_spawnattr_destroy" '(void*) 'int))
+(define proc-sc-attr-setpgroup
+  (jolt-foreign-proc-safe "posix_spawnattr_setpgroup" '(void* int) 'int))
+;; glibc/musl declare the flags argument short; bound as int, which is
+;; ABI-identical on the SysV x86-64 and aarch64 ABIs (both pass the argument in
+;; a 32-bit slot; the callee reads the low 16 bits) and keeps to this file's
+;; existing type vocabulary.
+(define proc-sc-attr-setflags
+  (jolt-foreign-proc-safe "posix_spawnattr_setflags" '(void* int) 'int))
+(define proc-sc-fa-addopen
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addopen" '(void* int string int int) 'int))
+;; addchdir_np is glibc 2.29+/musl 1.1.24+; jolt's floor builds reach older
+;; glibc (amazonlinux:2 is 2.26), so the binding is runtime-resolved and a
+;; request that needs it fails closed with an error instead of silently
+;; spawning in the wrong directory.
+(define proc-sc-fa-addchdir
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addchdir_np" '(void* string) 'int))
+
+(define proc-sc-POSIX-SPAWN-SETPGROUP 2)  ; probed: glibc + musl spawn.h
+(define proc-sc-O-RDWR 2)                 ; fcntl.h: stable on every Linux arch
+
+;; Everything the facility needs, present. proc-c-spawn/proc-fa-init/... are
+;; shared with the unscoped path; the attr entry points and kill are ours. Off
+;; Linux (no /proc) the exported fn throws rather than guessing.
+(define proc-scope-ok?
+  (and (eq? (sa-os-family) 'linux)
+       proc-c-spawn proc-fa-init proc-fa-destroy proc-sc-fa-addopen
+       proc-sc-attr-init proc-sc-attr-destroy proc-sc-attr-setpgroup
+       proc-sc-attr-setflags proc-kill proc-waitpid #t))
+
+;; Program resolution with the SAME shape as proc-program-resolvable? above
+;; (absolute: file must exist; slash-bearing: against the child cwd; bare: PATH
+;; scan) but returning the resolved path, since the scoped spawn execs the path
+;; itself rather than handing a shell a quoted token. -> path string or #f.
+(define (proc-sc-resolve-program prog effective-dir)
+  (cond
+    ((= (string-length prog) 0) #f)
+    ((char=? (string-ref prog 0) #\/) (and (file-exists? prog) prog))
+    ((proc-has-slash? prog)
+     (let ((p (proc-path-join (or effective-dir (getenv "JOLT_PWD") ".") prog)))
+       (and (file-exists? p) p)))
+    (else
+     (let ((path (getenv "PATH")))
+       (let loop ((dirs (if path (str-literal-split path ":") '())))
+         (cond ((null? dirs) #f)
+               ((and (> (string-length (car dirs)) 0)
+                     (file-exists? (proc-path-join (car dirs) prog))))
+               (else (loop (cdr dirs)))))))))
+
+;; One /proc pass answering BOTH ownership questions: which live processes are
+;; members of the owned group (pgrp == pgid), and which live processes descend
+;; from the root pid (ppid walk — catches a descendant that left the group via
+;; its own setsid while its parent link still names our tree). "Live" excludes
+;; Z (zombie) and X/x (dying): the process has terminated and can do nothing
+;; further; zombies that pid 1 has not reaped yet must not hold the confirm
+;; loop, and the root's own zombie is settled by waitpid afterwards. A process
+;; that escaped BOTH nets (setsid AND reparented through an exited
+;; intermediate) is unreachable by /proc topology — an inherent limit, and the
+;; same one proc-descendants has. Each read is guarded: a process is free to
+;; exit between the listing and the read. Returns (values members descendants).
+(define (proc-sc-scan root-pid pgid)
+  (let ((info (make-eqv-hashtable))     ; pid -> (state-char . pgrp)
+        (kids (make-eqv-hashtable)))    ; ppid -> (pid ...)
+    (for-each
+      (lambda (name)
+        (let ((pid (string->number name)))
+          (when (fixnum? pid)
+            (guard (e (#t #f))
+              (call-with-port (open-input-file (string-append "/proc/" name "/stat"))
+                (lambda (p)
+                  (let* ((s (get-string-all p))
+                         (rp (let scan ((i (- (string-length s) 1)))
+                               (cond ((< i 0) #f)
+                                     ((char=? (string-ref s i) #\)) i)
+                                     (else (scan (- i 1)))))))
+                    ;; comm can contain spaces and ')', so parse after the
+                    ;; LAST ')' exactly as proc-linux-ppid-map does. Tokens
+                    ;; start at state; ppid is 2nd, pgrp 3rd (probed).
+                    (when rp
+                      (let ((parts (filter (lambda (t) (> (string-length t) 0))
+                                           (str-literal-split
+                                             (substring s (+ rp 1) (string-length s)) " "))))
+                        (when (and (pair? parts) (pair? (cdr parts)) (pair? (cddr parts)))
+                          (let ((state (string-ref (car parts) 0))
+                                (ppid (string->number (cadr parts)))
+                                (pgrp (string->number (caddr parts))))
+                            (when (and (fixnum? ppid) (fixnum? pgrp))
+                              (hashtable-set! info pid (cons state pgrp))
+                              (hashtable-set! kids ppid
+                                (cons pid (hashtable-ref kids ppid '())))))))))))))))
+      (guard (e (#t '())) (directory-list "/proc")))
+    ;; let*: the members scan uses dead? from the sibling binding, which a
+    ;; parallel let would not make visible to initializers.
+    (let* ((live? (lambda (pid)
+                    (let ((c (hashtable-ref info pid #f)))
+                      (and c (not (memv (car c) '(#\Z #\X #\x)))))))
+           (dead? (lambda (c) (memv (car c) '(#\Z #\X #\x))))
+           (members
+            (let loop ((ps (vector->list (hashtable-keys info))) (acc '()))
+              (if (null? ps)
+                  acc
+                  (let ((c (hashtable-ref info (car ps) #f)))
+                    (loop (cdr ps)
+                          (if (and c (= (cdr c) pgid) (not (dead? c)))
+                              (cons (car ps) acc)
+                              acc)))))))
+      ;; Walk the ppid edges from the root, live-only, seen-set against cycles
+      ;; (pid reuse can, in principle, make the graph cyclic).
+      (let ((seen (make-eqv-hashtable)))
+        (let walk ((frontier (hashtable-ref kids root-pid '())) (acc '()))
+          (cond ((null? frontier) (values members (reverse acc)))
+                ((hashtable-ref seen (car frontier) #f) (walk (cdr frontier) acc))
+                (else
+                 (hashtable-set! seen (car frontier) #t)
+                 (walk (append (hashtable-ref kids (car frontier) '()) (cdr frontier))
+                       (if (live? (car frontier)) (cons (car frontier) acc) acc)))))))))
+
+;; (proc-sc-stat-entry pid) -> (state-char . ppid) | #f. One guarded read of
+;; /proc/<pid>/stat; #f covers every way a process can vanish underneath the
+;; read (exited, reaped, or the pid never existed).
+(define (proc-sc-stat-entry pid)
+  (guard (e (#t #f))
+    (call-with-port (open-input-file (string-append "/proc/" (number->string pid) "/stat"))
+      (lambda (p)
+        (let* ((s (get-string-all p))
+               (rp (let scan ((i (- (string-length s) 1)))
+                     (cond ((< i 0) #f)
+                           ((char=? (string-ref s i) #\)) i)
+                           (else (scan (- i 1)))))))
+          (and rp
+               (let ((parts (filter (lambda (t) (> (string-length t) 0))
+                                    (str-literal-split
+                                      (substring s (+ rp 1) (string-length s)) " "))))
+                 (and (pair? parts) (pair? (cdr parts))
+                      (let ((ppid (string->number (cadr parts))))
+                        (and (fixnum? ppid)
+                             (cons (string-ref (car parts) 0) ppid)))))))))))
+
+;; Live ppid chain from `pid` up to `ancestor`? THE revalidation for bare-pid
+;; kills: a pid recorded by an earlier scan may since have exited and been
+;; REUSED by an unrelated process, and killing that pid unconditionally could
+;; kill the newcomer. The chain is re-checked from /proc immediately before
+;; kill(2), confining the signal to a process that is still, provably, inside
+;; our tree. The check→kill window itself cannot be closed from userspace
+;; (only pidfd_send_signal closes it) — that residue is this facility's
+;; documented irreducible limitation. A descendant whose chain broke (an
+;; intermediate exited and it was reparented to init) fails the check and is
+;; NOT signalled — fail-closed: the survivor then surfaces in the confirm
+;; step's loud error instead of risking an innocent kill.
+(define (proc-sc-descendant-now? pid ancestor)
+  (let loop ((p pid) (hops 0))
+    (and (< hops 64)                            ; backstop; pid reuse cannot cycle
+         (let ((e (proc-sc-stat-entry p)))
+           (cond ((not e) #f)                   ; vanished: dead, or never ours
+                 ((= p ancestor) #t)
+                 ((memv (car e) '(#\Z #\X #\x)) #f)  ; dead: not ours to signal
+                 (else (loop (cdr e) (+ hops 1))))))))
+
+(define (proc-sc-kill-descendant! root-pid pid sig)
+  (when (proc-sc-descendant-now? pid root-pid)
+    (proc-kill pid sig)))
+
+;; The escalation ladder, scoped and evidence-honest:
+;;   1. one /proc scan says what the scope still holds;
+;;   2. a TERM wave — kill(-pgid) ONLY under a scan that just showed live
+;;      members. While ANY member is alive the pgid cannot be taken by a new
+;;      group (the kernel keeps the id hashed while a task references it as
+;;      its pgrp — table knowledge, not probed here), so a group signal sent
+;;      against a membered group is confined to the owned scope as far as
+;;      process group semantics permit. The scan→kill instant, in which the
+;;      last member could die and the id be reused, is the irreducible
+;;      PID/PGID-reuse residue — same one as above, only pidfd closes it.
+;;      Descendants that left the group (own setsid) get per-pid TERMs,
+;;      each revalidated against pid reuse;
+;;   3. a grace window for the wave to quiet the scope;
+;;   4. a KILL wave — same gating, same revalidation. Nothing less can clear
+;;      a tree that ignored TERM.
+;; kill(2) to a negative pid cannot hit jolt: jolt is not a member. A failing
+;; kill is not an error here (ESRCH: the scope emptied first — the race made
+;; visible); a kill failing for a real reason (EPERM against a setuid child
+;; that kept our pgid) shows up in the confirm step, named. Returns the
+;; STRONGEST signal with positive delivery evidence toward the owned scope —
+;; kill(2)'s own return decides (0 = a member existed to take it; -1/ESRCH =
+;; nothing was delivered) — or 0 when escalation was skipped because the
+;; scope was already quiet. The caller must not claim more than that: a root
+;; that in fact died of the earlier wave while the KILL wave merely reached
+;; another member still reports 128+9 in the unwaitable fallback; which wave
+;; killed the root is unknowable without pidfd, and 9 is the honest ceiling.
+(define (proc-sc-escalate! root-pid pgid grace-ms)
+  (call-with-values (lambda () (proc-sc-scan root-pid pgid))
+    (lambda (members descs)
+      (let ((sent
+              (if (and (pair? members) (zero? (proc-kill (- pgid) proc-SIGTERM)))
+                  proc-SIGTERM 0)))
+        (for-each (lambda (d) (proc-sc-kill-descendant! root-pid d proc-SIGTERM)) descs)
+        (let ((deadline (+ (jolt-mono-nanos) (* grace-ms 1000000))))
+          (let loop ((sent sent))
+            (call-with-values (lambda () (proc-sc-scan root-pid pgid))
+              (lambda (ms ds)
+                (cond ((and (null? ms) (null? ds)) sent)
+                      ((< (jolt-mono-nanos) deadline) (jolt-pause-ms 10) (loop sent))
+                      (else
+                       (let ((sent2
+                               (if (and (pair? ms) (zero? (proc-kill (- pgid) proc-SIGKILL)))
+                                   proc-SIGKILL sent)))
+                         (for-each (lambda (d) (proc-sc-kill-descendant! root-pid d proc-SIGKILL)) ds)
+                         sent2)))))))))))
+
+;; The waves were sent; the only honest way to know the scope is empty is to
+;; keep asking /proc until it agrees — and each pass ACTS on what the current
+;; scan shows rather than on the earlier waves' claims: a member can fork in
+;; the grace window and a wave delivered before the fork misses the child,
+;; which then shows up here as a fresh live member. Re-signalling uses the
+;; same confinement rules as the waves (group signal only under a scan that
+;; just showed members; per-pid kills revalidated). The one survivor no
+;; signal can move is uninterruptible sleep (D state): wait a bounded time,
+;; then fail LOUD — returning "cleaned up" while a descendant lives is
+;; precisely the false success this facility exists to make impossible.
+(define proc-sc-confirm-ms 5000)
+(define (proc-sc-confirm-empty! root-pid pgid)
+  (let ((deadline (+ (jolt-mono-nanos) (* proc-sc-confirm-ms 1000000))))
+    (let loop ()
+      (call-with-values (lambda () (proc-sc-scan root-pid pgid))
+        (lambda (members descendants)
+          (cond ((and (null? members) (null? descendants)) #t)
+                ((< (jolt-mono-nanos) deadline)
+                 (when (pair? members) (proc-kill (- pgid) proc-SIGKILL))
+                 (for-each (lambda (d) (proc-sc-kill-descendant! root-pid d proc-SIGKILL))
+                           descendants)
+                 (jolt-pause-ms 10) (loop))
+                (else
+                 (throw-jvm (quote java.lang.RuntimeException)
+                   (string-append "process-scope: survivors after SIGKILL (uninterruptible?): group "
+                     (proc-join " " (map number->string members))
+                     " descendants "
+                     (proc-join " " (map number->string descendants)))))))))))
+
+;; The root is jolt's direct child: reap it for the real status — waitpid's
+;; answer is the honest one and is what callers get whenever the reap succeeds.
+;; A root that reaps as unwaitable (ECHILD — something else got there, e.g. a
+;; SIGCHLD=SIG_IGN set after our restore) falls back to 128+sent-sig, where
+;; sent-sig is the strongest signal we have POSITIVE delivery evidence for
+;; toward the scope (0 when escalation was skipped outright). That fallback is
+;; an informed reconstruction, not a fact: which wave actually killed the root
+;; is unknowable from here. Bounded by the same cap as the confirm (the root
+;; is dead when this runs; the bound is a backstop, not an expectation).
+(define (proc-sc-reap-root pid sent-sig)
+  (let ((deadline (+ (jolt-mono-nanos) (* proc-sc-confirm-ms 1000000))))
+    (let loop ()
+      (call-with-values (lambda () (proc-waitpid-once pid #t))
+        (lambda (rc decoded err)
+          (cond (decoded decoded)
+                ((or (= rc 0) (= err proc-EINTR))
+                 (if (< (jolt-mono-nanos) deadline)
+                     (begin (jolt-pause-ms 5) (loop))
+                     (if (> sent-sig 0) (+ 128 sent-sig) 0)))
+                (else (if (> sent-sig 0) (+ 128 sent-sig) 0))))))))
+
+;; Fail-closed setup: EVERY posix_spawn attribute / file-action return code is
+;; checked BEFORE posix_spawn runs, and any failure aborts the spawn. The
+;; setflags call is the load-bearing one — if it failed silently the child
+;; would land in jolt's process group, every later kill(-pgid) would address a
+;; group that is not the scope (or nothing at all), and the ownership
+;; guarantee would be void while everything reported success. No scope
+;; operation may run ungrouped; a failed setup means no child exists.
+(define (proc-sc-check-rc! what rc)
+  (unless (= rc 0)
+    (throw-jvm (quote java.io.IOException)
+      (string-append "process-scope: " what " failed (rc " (number->string rc) ")"))))
+
+;; The structured request, a Clojure map:
+;;   :cmd          required — argv vector of strings; exec'd DIRECTLY, no shell
+;;   :timeout-ms   required — controller timeout; escalation starts when the
+;;                 root has not exited by then
+;;   :term-grace-ms optional — how long the TERM wave gets before KILL (200)
+;;   :dir           optional — child cwd (needs addchdir_np; error if absent)
+;;   :env           optional — map of strings; REPLACES the environment
+;;                 (ProcessBuilder.environment semantics); absent = inherit
+;; Returns {:pid p :exit code :timed-out bool} and guarantees that when it
+;; returns the owned scope holds nothing live: the root has exited AND been
+;; reaped, and /proc shows no live member of the group and no live descendant.
+;; That guarantee is not conditional on the timeout — a root that exits
+;; normally while leaving workers behind gets the same escalation, since the
+;; scope was owned either way. :exit is waitpid's own answer whenever the reap
+;; succeeds; only an unwaitable root falls back to 128+the strongest signal
+;; delivery was evidenced for (see proc-sc-escalate!). Exceptions, by design:
+;; survivors of SIGKILL in D state throw rather than return, and a failed
+;; posix_spawn setup throws before any child exists (proc-sc-check-rc!) so no
+;; scope operation can ever run ungrouped.
+(define (proc-scope-run req)
+  (unless proc-scope-ok?
+    (throw-jvm (quote UnsupportedOperationException)
+      "process-scope: requires Linux with posix_spawn process-group support"))
+  (let ((get (lambda (k d) (jolt-get-dispatch req k d))))
+    (let ((cmd-raw (get (jolt-keyword "cmd") #f))
+          (timeout-ms (get (jolt-keyword "timeout-ms") #f))
+          (grace-ms (get (jolt-keyword "term-grace-ms") 200))
+          (dir (get (jolt-keyword "dir") #f))
+          (env-map (get (jolt-keyword "env") #f)))
+      (unless (and cmd-raw (not (jolt-nil? cmd-raw)))
+        (throw-jvm (quote IllegalArgumentException)
+          "process-scope: :cmd (argv vector of strings) is required"))
+      (let ((cmd (map jolt-str-render-one (seq->list (jolt-seq cmd-raw)))))
+        (when (null? cmd)
+          (throw-jvm (quote IllegalArgumentException)
+            "process-scope: :cmd must not be empty"))
+        (unless (and timeout-ms (> (jnum->exact timeout-ms) 0))
+          (throw-jvm (quote IllegalArgumentException)
+            "process-scope: :timeout-ms (positive milliseconds) is required"))
+        (let ((timeout-n (jnum->exact timeout-ms))
+              (grace-n (max 0 (jnum->exact grace-ms)))
+              (dir-s (and dir (not (jolt-nil? dir)) (jolt-str-render-one dir))))
+          (when (and dir-s (not proc-sc-fa-addchdir))
+            (throw-jvm (quote UnsupportedOperationException)
+              "process-scope: :dir needs posix_spawn_file_actions_addchdir_np (glibc 2.29+)"))
+          (let* ((eff-dir (if dir-s (project-relative dir-s) (proc-effective-dir #f)))
+                 (prog (jolt-str-render-one (car cmd)))
+                 (path (proc-sc-resolve-program prog eff-dir)))
+            (unless path
+              (throw-jvm (quote java.io.IOException)
+                (string-append "process-scope: cannot run program \""
+                               prog "\": error=2, No such file or directory")))
+            (proc-ensure-reapable!)
+            ;; argv[0] is the caller's own spelling (what ps shows), exactly as
+            ;; ProcessBuilder passes cmdarray through; only the exec PATH is
+            ;; the resolved one. envp NULL = inherit, no marshalling needed.
+            ;; The env pairs render FIRST — jolt-str-render-one on a bad map
+            ;; value can throw, and nothing foreign is allocated yet.
+            (let* ((env-pairs (and env-map (not (jolt-nil? env-map))
+                                   (map (lambda (e)
+                                          (string-append
+                                            (jolt-str-render-one (jolt-nth e 0)) "="
+                                            (jolt-str-render-one (jolt-nth e 1))))
+                                        (seq->list (jolt-seq env-map)))))
+                   (argv (proc-marshal-argv cmd))
+                   (envp (and env-pairs (proc-marshal-argv env-pairs)))
+                   (fa (sa-foreign-alloc 128))
+                   ;; glibc's posix_spawnattr_t is 336 bytes (probed:
+                   ;; sizeof — two 128-byte sigsets plus fields); musl's is
+                   ;; the same shape (its spawn.h shows flags/pgrp + two
+                   ;; sigset_t + sched fields + pad). 512 covers both with
+                   ;; margin; init writes the real size, destroy reads it.
+                   (attr (sa-foreign-alloc 512))
+                   (pidbuf (sa-foreign-alloc 8))
+                   (pid
+                     (dynamic-wind
+                       (lambda () #f)
+                        (lambda ()
+                          (proc-sc-check-rc! "posix_spawn_file_actions_init" (proc-fa-init fa))
+                          (proc-sc-check-rc! "posix_spawn_file_actions_addopen (stdin)"
+                            (proc-sc-fa-addopen fa 0 "/dev/null" proc-sc-O-RDWR 0))
+                          (proc-sc-check-rc! "posix_spawn_file_actions_addopen (stdout)"
+                            (proc-sc-fa-addopen fa 1 "/dev/null" proc-sc-O-RDWR 0))
+                          (proc-sc-check-rc! "posix_spawn_file_actions_addopen (stderr)"
+                            (proc-sc-fa-addopen fa 2 "/dev/null" proc-sc-O-RDWR 0))
+                          (when dir-s
+                            (proc-sc-check-rc! "posix_spawn_file_actions_addchdir_np"
+                              (proc-sc-fa-addchdir fa dir-s)))
+                          (proc-sc-check-rc! "posix_spawnattr_init" (proc-sc-attr-init attr))
+                          (proc-sc-check-rc! "posix_spawnattr_setpgroup" (proc-sc-attr-setpgroup attr 0))
+                          (proc-sc-check-rc! "posix_spawnattr_setflags (POSIX_SPAWN_SETPGROUP)"
+                            (proc-sc-attr-setflags attr proc-sc-POSIX-SPAWN-SETPGROUP))
+                          ;; SEQUENTIAL lets (not one parallel let): p must be
+                          ;; read only after the spawn has written pidbuf — a
+                          ;; parallel let's initializer order is unspecified,
+                          ;; and Chez's compiled order runs right-to-left.
+                          (let ((rc (jolt-with-empty-sigmask
+                                      (lambda ()
+                                        (proc-c-spawn pidbuf path fa attr
+                                          (car argv) (if envp (car envp) 0))))))
+                            (let ((p (sa-foreign-ref 'int pidbuf 0)))
+                              (if (= rc 0)
+                                  p
+                                  (throw-jvm (quote java.io.IOException)
+                                    (string-append "process-scope: posix_spawn failed (errno "
+                                                   (number->string rc) ")"))))))
+                       (lambda ()
+                         (proc-fa-destroy fa) (proc-sc-attr-destroy attr)
+                         (sa-foreign-free fa) (sa-foreign-free attr)
+                         (sa-foreign-free pidbuf)
+                         (proc-free-argv argv)
+                         (when envp (proc-free-argv envp))))))
+              ;; The group is the scope and its id is the root's pid: pgroup 0
+              ;; + SETPGROUP makes the child its own group leader before exec
+              ;; (probed), so no grandchild can pre-date the group the way a
+              ;; parent-side setpgid race would allow.
+              (let ((pgid pid))
+                (let ((deadline (+ (jolt-mono-nanos) (* timeout-n 1000000))))
+                  (let loop ()
+                    (call-with-values (lambda () (proc-waitpid-once pid #t))
+                       (lambda (rc decoded err)
+                         (cond
+                           ;; root exited on its own — the scope may still hold
+                           ;; its workers; escalation is a no-op when it does
+                           ;; not (the entry scan finds nothing to signal).
+                           (decoded
+                            (proc-sc-escalate! pid pgid grace-n)
+                            (proc-sc-confirm-empty! pid pgid)
+                            (jolt-hash-map (jolt-keyword "pid") pid
+                                           (jolt-keyword "exit") decoded
+                                           (jolt-keyword "timed-out") #f))
+                           ;; timed out: TERM the group, grace, KILL, confirm.
+                           ;; sent is the strongest signal DELIVERY was
+                           ;; evidenced for — 0 if the scope quieted before any
+                           ;; wave landed, and the unwaitable-root fallback
+                           ;; claims no more than that.
+                           ((and (>= (jolt-mono-nanos) deadline) (or (= rc 0) (= err proc-EINTR)))
+                            (let ((sent (proc-sc-escalate! pid pgid grace-n)))
+                              (proc-sc-confirm-empty! pid pgid)
+                              (jolt-hash-map (jolt-keyword "pid") pid
+                                             (jolt-keyword "exit") (proc-sc-reap-root pid sent)
+                                             (jolt-keyword "timed-out") #t)))
+                           ;; ECHILD before any exit we saw: someone else
+                           ;; reaped the root (SIGCHLD=SIG_IGN set after our
+                           ;; restore). The scope answer is the same.
+                           ((and (< rc 0) (not (= err proc-EINTR)))
+                            (let ((sent (proc-sc-escalate! pid pgid grace-n)))
+                              (proc-sc-confirm-empty! pid pgid)
+                              (jolt-hash-map (jolt-keyword "pid") pid
+                                             (jolt-keyword "exit") (proc-sc-reap-root pid sent)
+                                             (jolt-keyword "timed-out") #f)))
+                           (else (jolt-pause-ms 10) (loop)))))))))))))))
+
+(def-var! "jolt.host" "process-scope-run" proc-scope-run)
+
 ;; --- CompletableFuture (Process.onExit().thenRun(f)) -------------------------
 ;; A minimal one-shot: thenRun spawns a thread that waits for the process to exit
 ;; and then runs the callback. Enough for babashka's :shutdown / :exit-fn hooks.
