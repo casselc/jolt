@@ -546,7 +546,165 @@
                  (catch Exception _ :threw)) :threw)
   (check-eq "scoped: missing :timeout-ms throws"
             (try (jolt.host/process-scope-run {:cmd ["true"]}) :no-throw
-                 (catch Exception _ :threw)) :threw))
+                 (catch Exception _ :threw)) :threw)
+
+  ;; --- separately bounded stdout/stderr capture (jolt.host/process-scope-run) --
+  ;; :out-bytes / :err-bytes replace that stream's /dev/null with a pipe the
+  ;; controller loop itself drains via poll(2) (both ends in ONE loop: the
+  ;; two-pipe deadlock is structurally impossible), memory stops at the
+  ;; caller's cap, and the cap REACHED is an abort that runs the same
+  ;; TERM/grace/KILL/confirm cleanup a timeout runs — with :timed-out still
+  ;; false, because the clock did not fire. Statuses: :complete = EOF seen
+  ;; (the string is the stream's ENTIRE output), :truncated = the byte cap was
+  ;; reached (exactly-the-cap and more-than-the-cap are deliberately not
+  ;; distinguished), :partial = the run ended with neither.
+
+  ;; clean output on both streams, generously bounded: full capture, no abort
+  (let [res (jolt.host/process-scope-run
+              {:cmd ["/bin/sh" "-c" "echo hello-out; echo hello-err 1>&2"]
+               :timeout-ms 10000 :out-bytes 1000 :err-bytes 1000})]
+    (check-eq "scoped capture: stdout string" (:out res) "hello-out\n")
+    (check-eq "scoped capture: stderr string" (:err res) "hello-err\n")
+    (check-eq "scoped capture: stdout complete" (:out-status res) :complete)
+    (check-eq "scoped capture: stderr complete" (:err-status res) :complete)
+    (check-eq "scoped capture: clean exit" (:exit res) 0)
+    (check-eq "scoped capture: not a timeout" (:timed-out res) false))
+
+  ;; callers not requesting capture keep the /dev/null default — observable in
+  ;; the RETURN SHAPE: no :out/:err keys at all, not empty strings
+  (let [res (jolt.host/process-scope-run
+              {:cmd ["/bin/sh" "-c" "echo noise; echo noise 1>&2"]
+               :timeout-ms 10000})]
+    (check-eq "scoped: no capture -> no :out key" (nil? (:out res)) true)
+    (check-eq "scoped: no capture -> no :out-status key" (nil? (:out-status res)) true)
+    (check-eq "scoped: no capture -> no :err key" (nil? (:err res)) true)
+    (check-eq "scoped: no capture -> exit passthrough" (:exit res) 0))
+
+  ;; stdout FLOOD: the cap is hit in milliseconds against a 20s clock, so the
+  ;; run can only have ended as a capture-overflow abort. The bound is honored
+  ;; exactly (never more bytes retained), the retained prefix is real, and the
+  ;; scope is dead when the call returns.
+  (let [res (jolt.host/process-scope-run
+              {:cmd ["/bin/sh" "-c"
+                     "echo FLOOD-START; while :; do echo 0123456789012345678901234567890123456789; done"]
+               :timeout-ms 20000 :out-bytes 64})]
+    (check-eq "scoped flood: overflow aborts long before the clock" (:timed-out res) false)
+    (check-eq "scoped flood: status is :truncated" (:out-status res) :truncated)
+    (check-eq "scoped flood: byte bound honored exactly" (count (:out res)) 64)
+    (check-eq "scoped flood: retained bytes are the true prefix"
+              (str/starts-with? (:out res) "FLOOD-START\n") true)
+    (check-eq "scoped flood: root is gone from /proc" (scope-proc-live? (:pid res)) false)
+    ;; an untrapping shell dies at the TERM wave (143); the KILL wave (137) is
+    ;; the documented backstop — both are honest outcomes of the ladder
+    (check-eq "scoped flood: killed by the overflow escalation"
+              (contains? #{137 143} (:exit res)) true))
+
+  ;; SEPARATE bounds: stderr floods past a tiny cap while the generously
+  ;; bounded stdout still captures completely — the abort killed the writer,
+  ;; then the final drain read stdout to EOF. One stream's overflow must not
+  ;; corrupt the other's capture.
+  (let [res (jolt.host/process-scope-run
+              {:cmd ["/bin/sh" "-c"
+                     (str "echo one-line; i=0; "
+                          "while [ $i -lt 100000 ]; do echo E$i 1>&2; i=$((i+1)); done; "
+                          "sleep 30")]
+               :timeout-ms 20000 :err-bytes 16 :out-bytes 4096})]
+    (check-eq "scoped: stderr flood truncates at its own cap" (:err-status res) :truncated)
+    (check-eq "scoped: stderr bound exact" (count (:err res)) 16)
+    (check-eq "scoped: bounded stdout still complete" (:out-status res) :complete)
+    (check-eq "scoped: bounded stdout content intact" (:out res) "one-line\n")
+    (check-eq "scoped: stderr overflow abort is not a timeout" (:timed-out res) false))
+
+  ;; output LARGER than the pipe buffer (~64K): a naive reader deadlocks here
+  ;; (the child blocks on the full pipe, the controller blocks on the child).
+  ;; The poll-integrated drain must keep both moving: 20000 lines (~108KB)
+  ;; captured whole.
+  (when (fs/which "seq")
+    (let [res (jolt.host/process-scope-run
+                {:cmd ["seq" "20000"] :timeout-ms 20000 :out-bytes 1000000})]
+      (check-eq "scoped: >pipe-buffer output captured whole" (:out-status res) :complete)
+      (check-eq "scoped: big output content intact" (str/ends-with? (:out res) "20000\n") true)
+      (check-eq "scoped: big output line count" (count (str/split-lines (:out res))) 20000)
+      (check-eq "scoped: big output clean exit" (:exit res) 0)))
+
+  ;; adversarial bytes: invalid UTF-8 must come back as an INERT string —
+  ;; lossy decode (U+FFFD per invalid byte), never an exception, never
+  ;; evaluated. café = valid C3 A9 passes through; FF is never valid.
+  (let [res (jolt.host/process-scope-run
+              {:cmd ["/bin/sh" "-c" "printf 'caf\\303\\251\\377\\n'"]
+               :timeout-ms 10000 :out-bytes 100})]
+    (check-eq "scoped: invalid utf-8 decodes lossily to an inert string"
+              (:out res) "caf\u00e9\uFFFD\n")
+    (check-eq "scoped: lossy decode is still complete" (:out-status res) :complete))
+
+  ;; :env / :dir compose with capture. The program is spelled ABSOLUTELY, so
+  ;; this stays a pure env/cwd composition — bare-PATH resolution is a
+  ;; separate arm of proc-sc-resolve-program with its own regression below.
+  (let [res (jolt.host/process-scope-run
+              {:cmd ["/bin/sh" "-c" "echo \"$JP_CAP in $(pwd)\""]
+               :env {"JP_CAP" "scoped"} :dir "/tmp"
+               :timeout-ms 10000 :out-bytes 1000})]
+    (check-eq "scoped capture: env replaced and cwd set" (:out res) "scoped in /tmp\n")
+    (check-eq "scoped capture: env/cwd run completes" (:out-status res) :complete))
+
+  ;; bare-PATH program resolution, as its own regression: the PATH-scan arm of
+  ;; proc-sc-resolve-program carried no consequent, so a SUCCESSFUL bare-name
+  ;; lookup returned the test's own #t instead of the joined path, and
+  ;; posix_spawn rejected #t as a foreign argument. Every pre-existing scoped
+  ;; caller spelled /bin/sh, so the arm had never run with a hit before the
+  ;; capture tests started using "seq" (which is fs/which-gated above). A bare
+  ;; "sh" must resolve through PATH here — asserted by CONTENT, so it fails
+  ;; whether resolution throws, mis-spawns, or captures nothing.
+  (check-eq "scoped: bare program name resolves through PATH"
+            (let [res (jolt.host/process-scope-run
+                        {:cmd ["sh" "-c" "echo BARE-PATH-OK"]
+                         :timeout-ms 10000 :out-bytes 100})]
+              [(:out-status res) (:out res)])
+            [:complete "BARE-PATH-OK\n"])
+
+  ;; capture bounds fail closed before anything is spawned — and must be
+  ;; INTEGRAL: jnum->exact's truncate would silently floor 2.5 to 2, so the
+  ;; bound is checked for integrality and a fraction is a caller error.
+  (check-eq "scoped: :out-bytes 0 throws"
+            (try (jolt.host/process-scope-run {:cmd ["true"] :timeout-ms 1000 :out-bytes 0})
+                 :no-throw (catch Exception _ :threw)) :threw)
+  (check-eq "scoped: fractional :out-bytes throws, never silently truncated"
+            (try (jolt.host/process-scope-run {:cmd ["true"] :timeout-ms 1000 :out-bytes 2.5})
+                 :no-throw (catch Exception _ :threw)) :threw)
+  (check-eq "scoped: negative :err-bytes throws"
+            (try (jolt.host/process-scope-run {:cmd ["true"] :timeout-ms 1000 :err-bytes -5})
+                 :no-throw (catch Exception _ :threw)) :threw)
+  (check-eq "scoped: :err-bytes non-numeric throws"
+            (try (jolt.host/process-scope-run {:cmd ["true"] :timeout-ms 1000 :err-bytes "big"})
+                 :no-throw (catch Exception _ :threw)) :threw)
+
+  ;; timeout with a TERM-resistant tree WHILE CAPTURING: the invariant under
+  ;; load — the flood-proof drain neither breaks the escalation ladder nor
+  ;; leaks the grandchild, and the grandchild's own stdout line (written
+  ;; through the root's inherited pipe) still arrives complete, because the
+  ;; final drain runs only after /proc confirms every writer is dead.
+  (let [pidf (str (fs/create-temp-file {:prefix "jp-scope-cap-" :suffix ".pid"}))
+        script (str "trap '' TERM; "
+                    "/bin/sh -c 'trap \"\" TERM; echo $$ > " pidf "; echo GRAND-OUT; sleep 60' & wait")
+        res (jolt.host/process-scope-run
+              {:cmd ["/bin/sh" "-c" script]
+               :timeout-ms 800 :term-grace-ms 250
+               :out-bytes 1000})]
+    (check-eq "scoped+capture: timed out" (:timed-out res) true)
+    (check-eq "scoped+capture: resistant root died to the KILL wave (:exit 137)"
+              (:exit res) 137)
+    (check-eq "scoped+capture: grandchild's line captured after the kill"
+              (:out res) "GRAND-OUT\n")
+    (check-eq "scoped+capture: capture complete after the scope emptied"
+              (:out-status res) :complete)
+    ;; the independently-published grandchild pid is dead, confirmed OUTSIDE
+    ;; the facility; assert first, nuke second, exactly like the unscoped case
+    (let [gpid (str/trim (slurp pidf))
+          leaked (scope-proc-live? gpid)]
+      (check-eq "scoped+capture: TERM-resistant grandchild is not alive after timeout"
+                leaked false)
+      (when leaked (scope-nuke-group (:pid res))))
+    (fs/delete-if-exists pidf)))
 
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
