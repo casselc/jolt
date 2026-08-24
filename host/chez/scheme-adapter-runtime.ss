@@ -273,6 +273,41 @@
   (syntax-rules ()
     ((_ name args res) (foreign-procedure __collect_safe name args res))))
 
+;; (sa-foreign-procedure-native-error (conv ...) name args res) -> procedure
+;; SYNTAX: build a foreign procedure whose invocation returns both the native
+;; result and the calling thread's native error slot as Scheme values. Chez
+;; captures that slot in the foreign-call return path, before collect-safe
+;; reactivation or later Scheme/native work can overwrite it.
+;;
+;; Select from the compiler target, not this process's machine-type: cross-image
+;; builds rebind #%$target-machine while the build host remains unchanged. An
+;; unrecognized target fails during expansion rather than guessing a nearby ABI.
+(define-syntax sa-native-error-convention-case
+  (lambda (x)
+    (syntax-case x ()
+      ((_ get-last-error-form errno-form)
+       (case (eval '(#%$target-machine))
+         ((i3nt ti3nt a6nt ta6nt arm64nt tarm64nt)
+          #'get-last-error-form)
+         ((i3le ti3le a6le ta6le
+           ppc32le tppc32le arm32le tarm32le
+           arm64le tarm64le rv64le trv64le la64le tla64le
+           i3osx ti3osx a6osx ta6osx
+           ppc32osx tppc32osx arm64osx tarm64osx)
+          #'errno-form)
+         (else
+          (error 'sa-foreign-procedure-native-error
+                 "unsupported target machine"
+                 (eval '(#%$target-machine)))))))))
+
+(define-syntax sa-foreign-procedure-native-error
+  (lambda (x)
+    (syntax-case x ()
+      ((_ (conv ...) name args res)
+       #'(sa-native-error-convention-case
+           (foreign-procedure __get_last_error conv ... name args res)
+           (foreign-procedure __errno conv ... name args res))))))
+
 ;; (sa-foreign-callable proc args res) -> foreign callable
 ;; SYNTAX: compile-time-typed foreign-callable creation, mirroring
 ;; sa-foreign-procedure. (sa-foreign-callable f (int) int) lowers to

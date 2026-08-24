@@ -154,10 +154,13 @@ sa-procedure-info
 # load-shared-object, foreign-entry?/foreign-callable-entry-point, or the
 # Windows-path eval'd foreign-procedure construction); adaptercheck loads the
 # runtime file and probes the combined environment. sa-foreign-procedure and
-# sa-foreign-procedure-blocking are SYNTAX (compile-time-typed lowering to the
-# native foreign-procedure form, __collect_safe in the blocking case) — a target
-# must provide them as macros with the same lowering. Permitted degradation, per
-# entry point:
+# sa-foreign-procedure-blocking and sa-foreign-procedure-native-error are SYNTAX
+# (compile-time-typed lowering to the native foreign-procedure form). The
+# blocking form marks a call collect-safe. The native-error form returns two
+# values — the native result and the calling thread's platform error code —
+# captured in the foreign-call return path; it accepts the same convention list
+# as sa-foreign-procedure. A target must provide them as macros with equivalent
+# lowering. Permitted degradation, per entry point:
 # - sa-lock-object/sa-unlock-object may BOTH no-op on a non-moving collector
 #   (never just one — that leaks or crashes);
 # - sa-load-shared-object must raise on targets without dlopen, and
@@ -189,6 +192,7 @@ sa-foreign-callable-entry-point
 sa-foreign-procedure-runtime
 sa-foreign-procedure
 sa-foreign-procedure-blocking
+sa-foreign-procedure-native-error
 #
 # tier: eval
 # interaction-environment: R7RS (scheme repl), not Chez-only. The ONLY host
