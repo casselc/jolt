@@ -119,7 +119,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
+  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -127,7 +127,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscali
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
+  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -272,6 +272,12 @@ fibers:
 # cleared before an idle wait forked a second immortal timer per call.
 asynctimer:
 	@$(CHEZ) --script test/chez/async-timer-test.ss
+
+# A nested run-interruptible extent restores the enclosing polling timer after
+# normal return, exception, or interruption, without sharing ownership between
+# application threads.
+interruptnest:
+	@$(CHEZ) --script test/chez/interrupt-nesting-test.ss
 
 # The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
 # against the number of vars in one frame, push/pop throughput, and the two
@@ -479,6 +485,12 @@ stdlibfasl: testbin
 # SCI conformance: load borkdude/sci's source through jolt (floor-gated).
 sci:
 	@$(CHEZ) --script host/chez/run-sci.ss
+
+# A complementary functional gate: load SCI through Jolt's ordinary dependency
+# path, then initialize and reuse real contexts. run-sci.ss remains the broad,
+# intentionally lenient source-loading compatibility gate.
+scifunctional: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:deps {borkdude/sci {:local/root "vendor/sci"}}}' run test/chez/sci-functional-test.clj
 
 # clojure-test-suite conformance: run the vendored jank-lang/clojure-test-suite
 # per-namespace under jolt, gated on the per-namespace baseline
