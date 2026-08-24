@@ -40,6 +40,39 @@
         (clojure.lang.Numbers/lte 2 2)
         (clojure.lang.Numbers/gte 2 2)
         (clojure.lang.Numbers/equiv 2 2)]))
+;; Discriminating overflow rows. Jolt has one exact-integer type (Chez
+;; bignums auto-reduce), so the checked statics PROMOTE past 2^63 where the
+;; JVM's Numbers ops throw ArithmeticException — the documented numeric-model
+;; divergence (test/conformance/known-divergences.edn, corpus row 3754). A
+;; wrapping or throwing implementation fails these rows.
+(ok "SCI compat: Numbers checked overflow promotes exactly"
+    (= [9223372036854775808N 9223372036854775808N
+        -9223372036854775809N 18446744073709551616N -9223372036854775809N]
+       [(clojure.lang.Numbers/add 9223372036854775807 1)
+        (clojure.lang.Numbers/inc 9223372036854775807)
+        (clojure.lang.Numbers/dec -9223372036854775808)
+        (clojure.lang.Numbers/multiply 4611686018427387904 4)
+        (clojure.lang.Numbers/minus -9223372036854775808 1)]))
+;; The unchecked statics must WRAP at exactly 64 bits like the JVM; a
+;; promoting implementation fails these rows.
+(ok "SCI compat: Numbers unchecked overflow wraps at 64 bits"
+    (= [-9223372036854775808 -9223372036854775808
+        9223372036854775807 0 9223372036854775807]
+       [(clojure.lang.Numbers/unchecked_add 9223372036854775807 1)
+        (clojure.lang.Numbers/unchecked_inc 9223372036854775807)
+        (clojure.lang.Numbers/unchecked_minus -9223372036854775808 1)
+        (clojure.lang.Numbers/unchecked_multiply 4611686018427387904 4)
+        (clojure.lang.Numbers/unchecked_dec -9223372036854775808)]))
+;; equiv is category-free value equality (the JVM's == semantics): a
+;; category-checking, =-like implementation fails the mixed-category rows.
+(ok "SCI compat: Numbers equiv is value equality across categories"
+    (= [true false true true true false]
+       [(clojure.lang.Numbers/equiv 2 2)
+        (clojure.lang.Numbers/equiv 1 2)
+        (clojure.lang.Numbers/equiv 1 1.0)
+        (clojure.lang.Numbers/equiv 1 1N)
+        (clojure.lang.Numbers/equiv 5/2 2.5)
+        (clojure.lang.Numbers/equiv 1 1.5)]))
 
 (let [world (atom {"a" "old"}) writes (atom 0) failures-at-host (atom 0)
       ops [{:id :math/inc :name 'inc* :effect :pure :fn inc}

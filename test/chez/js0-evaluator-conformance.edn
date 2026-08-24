@@ -1,12 +1,15 @@
-{:conformance/version 2
+{:conformance/version 3
  :conformance/scope :js0-current-runtime
  :baseline {:branch "js1-runtime-current-upstream"
-            :upstream "ea3313a0"}
+            :upstream "edda7aec"}
  :profiles [:agent/minimal :agent/project-read :agent/project-develop]
  :cases
  [{:case/id :host/sci-compat
    :assertions [:imap-cons-var :system-newline-var :thread-get-id
-                :numbers-unary :numbers-binary :numbers-comparison]}
+                :numbers-unary :numbers-binary :numbers-comparison
+                :numbers-checked-overflow-promotes
+                :numbers-unchecked-overflow-wraps-64
+                :numbers-equiv-value-equality]}
   {:case/id :language/positive-allowlist
    :assertions [:pure-computation :reviewed-special-forms
                 :loader-and-interop-absent :trusted-namespaces-absent]}
@@ -37,4 +40,5 @@
   {:case/id :interrupt/health
    :assertions [:nested-normal-restores-outer :nested-throw-restores-outer
                 :nested-interrupt-restores-outer :independent-worker-tokens
+                :child-inherits-no-poll-ownership
                 :tight-sci-loop-stops :post-interrupt-evaluation]}]}
