@@ -1,0 +1,40 @@
+{:conformance/version 2
+ :conformance/scope :js0-current-runtime
+ :baseline {:branch "js1-runtime-current-upstream"
+            :upstream "ea3313a0"}
+ :profiles [:agent/minimal :agent/project-read :agent/project-develop]
+ :cases
+ [{:case/id :host/sci-compat
+   :assertions [:imap-cons-var :system-newline-var :thread-get-id
+                :numbers-unary :numbers-binary :numbers-comparison]}
+  {:case/id :language/positive-allowlist
+   :assertions [:pure-computation :reviewed-special-forms
+                :loader-and-interop-absent :trusted-namespaces-absent]}
+  {:case/id :profile/context-spec
+   :assertions [:closed-profile-maxima :requested-subset-authorized
+                :authorized-subset-profile :authorized-operation-present
+                :minimal-denies-observation :read-denies-actuation
+                :develop-permits-actuation :unrequested-not-reserved]}
+  {:case/id :context/isolation
+   :assertions [:definitions-local :authority-local :fork-has-no-definitions
+                :fork-cannot-restore-revocation]}
+  {:case/id :dispatch/recheck
+   :assertions [:projected-wrapper-without-effective-capability-denied
+                :revocation-reflected-in-coordinate]}
+  {:case/id :value/canonical
+   :assertions [:inert-domain-only :map-order-independent
+                :live-and-ambiguous-values-refused]}
+  {:case/id :replay/observation-and-actuation
+   :assertions [:historical-observation :no-second-actuation
+                :operation-mismatch :argument-mismatch :exhausted :unconsumed
+                :historical-operation-error :no-second-error-observation
+                :pure-operation-no-receipt]}
+  {:case/id :language/inert-surface
+   :assertions [:trusted-static-derivation :sorted-distinct-symbols
+                :no-host-or-projected-handles :versioned-current-coordinate
+                :coordinate-print-binding-independent
+                :authority-coordinate-disjoint]}
+  {:case/id :interrupt/health
+   :assertions [:nested-normal-restores-outer :nested-throw-restores-outer
+                :nested-interrupt-restores-outer :independent-worker-tokens
+                :tight-sci-loop-stops :post-interrupt-evaluation]}]}
