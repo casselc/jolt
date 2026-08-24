@@ -270,8 +270,20 @@
 (define identity-num-statics (list (cons "fromBigInteger" (lambda (x) x))))
 (register-class-statics! "BigInt" identity-num-statics)
 (register-class-statics! "clojure.lang.BigInt" identity-num-statics)
+;; SCI's optimized interpreter emits the same direct Numbers calls as Clojure's
+;; compiler. Route them through Jolt's existing numeric-tower operators. This
+;; host compatibility surface does not itself project authority into an SCI
+;; Context.
 (register-class-statics! "clojure.lang.Numbers"
-  (list (cons "reduceBigInt" (lambda (x) x)) (cons "toRatio" (lambda (x) x))))
+  (list (cons "reduceBigInt" (lambda (x) x)) (cons "toRatio" (lambda (x) x))
+        (cons "inc" jolt-inc) (cons "dec" jolt-dec)
+        (cons "unchecked_inc" jolt-inc) (cons "unchecked_dec" jolt-dec)
+        (cons "isZero" jolt-zero?) (cons "isPos" jolt-pos?) (cons "isNeg" jolt-neg?)
+        (cons "add" jolt-add2) (cons "minus" jolt-sub2) (cons "multiply" jolt-mul2)
+        (cons "unchecked_add" jolt-add2) (cons "unchecked_minus" jolt-sub2)
+        (cons "unchecked_multiply" jolt-mul2) (cons "remainder" jolt-rem)
+        (cons "lt" jolt-lt2) (cons "gt" jolt-gt2)
+        (cons "lte" jolt-le2) (cons "gte" jolt-ge2) (cons "equiv" jolt=)))
 
 (define (now-millis)
   (let ((t (current-time 'time-utc)))
