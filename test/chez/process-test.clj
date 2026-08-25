@@ -3,6 +3,7 @@
 (ns process-test
   (:require [jolt.process :as p :refer [process sh check pipeline]]
             [jolt.fs :as fs]
+            [jolt.fibers :as fib]
             [clojure.string :as str]))
 
 (def failures (atom []))
@@ -400,9 +401,13 @@
 ;; grandchild pid 1 has not reaped yet is dead. RACE-HARDENED: the process may
 ;; exit between the stat check and the read, and a vanished /proc entry means
 ;; NOT live (exited), never an exception that kills the whole test file; a
-;; truncated/odd stat line is likewise not-live rather than a crash.
+;; truncated/odd stat line is likewise not-live rather than a crash. A BLANK
+;; pid is not-live too — "/proc//stat" kernel-normalizes to /proc/stat, whose
+;; header line has no ')' and used to read as a dead process, which turned any
+;; pid-publication failure into a silent pass (found when the interrupt test
+;; below caught its own Path-object pidf being unreadable).
 (defn- scope-proc-live? [pid]
-  (when pid
+  (when (and pid (not (str/blank? (str pid))))
     (try
       (let [s (slurp (str "/proc/" pid "/stat"))
             rp (.lastIndexOf s ")")]
@@ -704,7 +709,120 @@
       (check-eq "scoped+capture: TERM-resistant grandchild is not alive after timeout"
                 leaked false)
       (when leaked (scope-nuke-group (:pid res))))
-    (fs/delete-if-exists pidf)))
+    (fs/delete-if-exists pidf))
+
+  ;; --- interruption under jolt.host/run-interruptible ------------------------
+  ;; The borrow's timer escape aborts a run-interruptible body at an arbitrary
+  ;; safe point, so a scoped run interrupted mid-controller-loop must still owe
+  ;; the SAME TERM->grace->KILL->confirm-empty ladder a timeout gets — BEFORE
+  ;; the interruption reaches the caller. The ordering is observable because
+  ;; the tree is TERM-resistant: nothing in it can die before the KILL wave,
+  ;; which is at least term-grace-ms after the interrupt was noticed, so a
+  ;; caller already holding the interruption while /proc still shows the
+  ;; grandchild live proves cleanup was skipped or deferred past the
+  ;; propagation. fd leak: the run captures through :out-bytes, so there are
+  ;; real pipe fds to leak; /proc/self/fd is counted across the whole
+  ;; interrupted run. The 60s controller timeout means ONLY the interruption
+  ;; can end the run, so a :returned outcome is itself the failure signal.
+  (let [pidf (str (fs/create-temp-file {:prefix "jp-scope-int-" :suffix ".pid"}))
+        script (str "trap '' TERM; "
+                    "/bin/sh -c 'trap \"\" TERM; echo $$ > " pidf "; sleep 600' & wait")
+        token (jolt.host/make-interrupt)
+        outcome (promise)
+        fd-before (count (.list (java.io.File. "/proc/self/fd")))
+        runner (Thread. (fn []
+                          (deliver outcome
+                            (try [:returned
+                                  (jolt.host/run-interruptible
+                                    token
+                                    (fn [] (jolt.host/process-scope-run
+                                             {:cmd ["/bin/sh" "-c" script]
+                                              :timeout-ms 60000
+                                              :term-grace-ms 1200
+                                              :out-bytes 1000})))]
+                                  (catch Exception e [:threw e])))))]
+    (.start runner)
+    ;; the grandchild publishes its pid before it sleeps; a blank read means
+    ;; the tree is not up yet (the file exists from create-temp-file)
+    (loop [n 0]
+      (when (and (< n 200) (str/blank? (try (slurp pidf) (catch Exception _ ""))))
+        (Thread/sleep 50)
+        (recur (inc n))))
+    ;; a few quiet controller rounds, then interrupt the borrow mid-run
+    (Thread/sleep 300)
+    (jolt.host/interrupt! token)
+    ;; The allowance is DELIVERY patience, not assertion slack: from interrupt!
+    ;; to the caller holding the exception, the run owes grace (1200ms here) +
+    ;; the KILL wave + confirm-empty + final drain + the root reap — measured
+    ;; as long as ~26s end-to-end on a loaded runner. 45s is ~1.7x that while
+    ;; keeping the whole file's failure path under smoke.sh's 120s per-case
+    ;; cap (this box's baseline is ~64s). The cleanup assertion is unchanged:
+    ;; `leaked` and the fd count are sampled the instant the deref returns,
+    ;; so a slower cleanup still has to FINISH before the interruption lands.
+    (let [res (deref outcome 45000 :hung)
+          e (when (and (vector? res) (= :threw (first res))) (second res))
+          gpid (str/trim (try (slurp pidf) (catch Exception _ "")))
+          ;; sampled the instant the caller holds the interruption (or the
+          ;; failure shape): evidence first, cleanup second
+          leaked (scope-proc-live? gpid)
+          fd-after (count (.list (java.io.File. "/proc/self/fd")))]
+      (check-eq "scoped interrupt: the run is interrupted, not returned"
+                (and (vector? res) (= :threw (first res))) true)
+      (check-eq "scoped interrupt: it is the evaluator interruption"
+                (boolean (when e (:jolt/interrupted (ex-data e)))) true)
+      (check-eq "scoped interrupt: cleanup ran before the interruption landed"
+                leaked false)
+      (check-eq "scoped interrupt: no capture fds leaked" (= fd-after fd-before) true)
+      ;; belt and braces for a failed run: the leaked grandchild shares the
+      ;; root's group, and its pgid (3rd /proc stat field after the last ')')
+      ;; IS the root's pid — nuke the whole group so a regression cannot leave
+      ;; the resistant tree on the CI box
+      (when leaked
+        (let [s (try (slurp (str "/proc/" gpid "/stat")) (catch Exception _ ""))
+              rp (.lastIndexOf s ")")]
+          (when (>= rp 0)
+            (scope-nuke-group (nth (str/split (subs s (+ rp 2)) #"\s+") 2)))))
+      (fs/delete-if-exists pidf)))
+
+  ;; --- a scoped run ON A FIBER: parks must not be exits -----------------------
+  ;; The guard wind's after-part is suppressed on park unwinds (the loader's
+  ;; jolt-park-unwinding? seam) precisely so a QUIET park of the controller
+  ;; loop cannot fire the cleanup: on a fiber every quiet round parks, and an
+  ;; unguarded after-part killed the live scope and double-freed the scratch
+  ;; at the first park (observed as glibc "double free or corruption"). This
+  ;; regression pins the healthy behavior end to end. The child closes its
+  ;; stdout right after its line, so the capture sees EOF and retires while
+  ;; the child LIVES ON — from that moment the controller's quiet branch is
+  ;; jolt-pause-ms (a real fiber park every ~10ms) for the remaining ~2s,
+  ;; ~200 park/unwind/resume cycles straight through the guarded after-thunk,
+  ;; deterministically (no reliance on scheduler preemption). The run must
+  ;; come back having survived all of them: capture bytes intact and
+  ;; :complete, exit passthrough, no timeout, root gone, and the process's
+  ;; fd set balanced across the whole fiber run.
+  (let [fd-before (count (.list (java.io.File. "/proc/self/fd")))
+        f (fib/spawn (fn []
+                       (try
+                         (jolt.host/process-scope-run
+                           {:cmd ["sh" "-c" "echo FIBER-PARK-OUT; exec 1>&-; sleep 2"]
+                            :timeout-ms 30000 :out-bytes 1000})
+                         (catch Exception e [:threw e]))))
+        res (fib/join f 15000 ::hung)
+        fd-after (count (.list (java.io.File. "/proc/self/fd")))]
+    (check-eq "scoped fiber: run completes (not hung, not thrown)"
+              (map? res) true)
+    (check-eq "scoped fiber: output captured whole across ~200 parks"
+              (when (map? res) (:out res)) "FIBER-PARK-OUT\n")
+    (check-eq "scoped fiber: capture :complete via early EOF"
+              (when (map? res) (:out-status res)) :complete)
+    (check-eq "scoped fiber: exit passthrough" (when (map? res) (:exit res)) 0)
+    (check-eq "scoped fiber: not a timeout" (when (map? res) (:timed-out res)) false)
+    (check-eq "scoped fiber: root gone after normal completion"
+              (scope-proc-live? (when (map? res) (:pid res))) false)
+    (check-eq "scoped fiber: no capture fds leaked" (= fd-after fd-before) true)
+    ;; belt and braces: a leaked scope on a failed run gets nuked by group
+    (when (and (map? res) (scope-proc-live? (:pid res)))
+      (scope-nuke-group (:pid res))))
+  )
 
 (if (empty? @failures)
   (println "PROCESS-TEST OK")

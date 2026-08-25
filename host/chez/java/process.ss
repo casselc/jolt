@@ -1839,10 +1839,100 @@
                    ;; margin; init writes the real size, destroy reads it.
                    (attr (sa-foreign-alloc 512))
                    (pidbuf (sa-foreign-alloc 8))
-                   (pid
-                     ;; pipe() through posix_spawn under the same exclusion
-                     ;; the unscoped fd-level spawn uses: a capture pipe is
-                     ;; exactly the no-pipe2()/O_CLOEXEC window that mutex
+                   ;; --- interruption, and the one way out of a live scope ------
+                   ;; The controller's loop can be cut short two ways, neither
+                   ;; at a moment this file chooses: cooperatively, per round,
+                   ;; through the thread-interrupt box (jolt-interrupt-poll-
+                   ;; check! — the same per-round check the interruptible
+                   ;; blocking waits use), and asynchronously, from under
+                   ;; jolt.host/run-interruptible, whose borrowed-timer escape
+                   ;; (jolt-run-interruptible) aborts the computation at an
+                   ;; arbitrary safe point — anywhere between a successful
+                   ;; spawn and the loop's decision. A raw escape used to reach
+                   ;; nothing but the fd closes: the owned group, TERM-
+                   ;; resistant members included, survived as a leak and the
+                   ;; root as a zombie. So every exit now funnels through ONE
+                   ;; dynamic-wind whose after-part runs the SAME
+                   ;; TERM->grace->KILL->confirm-empty ladder (settle!) before
+                   ;; anything — the result, the survivors error, or the
+                   ;; interruption — reaches the caller. Wind order IS the
+                   ;; guarantee: this frame sits inside whatever borrow wraps
+                   ;; the call, so its after-part has finished by the time the
+                   ;; borrow throws "Evaluation interrupted". The root's pid is
+                   ;; armed in scope-pid as the FIRST act of a successful
+                   ;; spawn, so the wind can key its cleanup on "a child
+                    ;; exists" from that instruction onward. The read+arm runs
+                    ;; under masked interrupts at the spawn's return (see the
+                    ;; with-interrupts-disabled region below), so a pending
+                    ;; escape fires only AFTER the box is written: the
+                    ;; post-spawn arming window is closed, not merely narrow.
+                    (scope-pid (box #f))  ; #f until a child exists
+                    (settled? (box #f))   ; settle! has run TO COMPLETION
+                    (settle-threw? (box #f)) ; a settle! attempt ended in a
+                                              ; throw; the ladder is retired
+                    (sent-box (box 0))    ; strongest evidenced signal, for
+                                          ; proc-sc-reap-root's fallback
+                    (scratch (sa-foreign-alloc proc-sc-cap-chunk)))
+              (let* ((settle!
+                       ;; The ladder, ONCE per run, shared by every ending.
+                       ;; Memoized on COMPLETION, not entry: an escape
+                       ;; truncating a half-escalated scope finds settled?
+                       ;; still #f, so the wind's after-part re-runs the
+                       ;; ladder to its end — a truncation is not a throw,
+                       ;; and re-running is safe by construction (every wave
+                       ;; is gated on a fresh /proc scan; confirm on an
+                       ;; emptied scope is one no-op pass). A THROW latches
+                       ;; settle-threw? instead: a ladder that blew up
+                       ;; (confirm-empty's D-state survivors) is never
+                       ;; restarted — it would only blow up again — and the
+                       ;; exception is preserved by the caller of this
+                       ;; closure (finish! lets it propagate; the wind's
+                       ;; after-part re-raises its own after cleanup).
+                       (lambda ()
+                         (unless (or (unbox settled?) (unbox settle-threw?))
+                           ;; the clause RE-RAISES: a Chez guard clause that
+                           ;; only sets the latch would RETURN the box value
+                           ;; and swallow the survivors error whole — the
+                           ;; caller would get a result map as if the scope
+                           ;; had emptied (verified by probe: guard's value
+                           ;; substitutes for the throw unless (raise e)
+                           ;; ends the clause).
+                           (guard (e (#t (set-box! settle-threw? #t) (raise e)))
+                             (let ((root (unbox scope-pid)))
+                               (when root
+                                 (set-box! sent-box
+                                   (proc-sc-escalate! root root grace-n))
+                                 (proc-sc-confirm-empty! root root)
+                                 (proc-sc-final-drain! caps scratch))
+                               (set-box! settled? #t))))))
+                     (finish!
+                      ;; shared exit path: the ladder, then the answer. decoded
+                      ;; is the reaped status when the root was waited;
+                      ;; otherwise proc-sc-reap-root reconstructs it from the
+                      ;; strongest evidenced signal. timed-out? is STRICTLY the
+                      ;; controller clock — an overflow abort passes #f and the
+                      ;; :truncated status says why.
+                      (lambda (decoded timed-out?)
+                        (settle!)
+                        (apply jolt-hash-map
+                          (append
+                            (list (jolt-keyword "pid") (unbox scope-pid)
+                                  (jolt-keyword "exit")
+                                  (or decoded
+                                      (proc-sc-reap-root (unbox scope-pid)
+                                        (unbox sent-box)))
+                                  (jolt-keyword "timed-out") timed-out?)
+                            (apply append
+                              (map proc-sc-cap-rows
+                                (list (cons out-cap "out")
+                                      (cons err-cap "err")))))))))
+                (dynamic-wind
+                  (lambda () #f)
+                  (lambda ()
+                    (let ((pid
+                      ;; pipe() through posix_spawn under the same exclusion
+                      ;; the unscoped fd-level spawn uses: a capture pipe is
+                      ;; exactly the no-pipe2()/O_CLOEXEC window that mutex
                      ;; exists to close (see proc-spawn-fd-mutex above).
                      ;; spawned? flips only on a successful posix_spawn; the
                      ;; dynamic-wind after-part uses it to fail CLOSED on
@@ -1898,12 +1988,41 @@
                                (proc-sc-attr-setflags attr proc-sc-POSIX-SPAWN-SETPGROUP))
                              (let ((rc (jolt-with-empty-sigmask
                                          (lambda ()
-                                           (proc-c-spawn pidbuf path fa attr
-                                             (car argv) (if envp (car envp) 0))))))
-                               (let ((p (sa-foreign-ref 'int pidbuf 0)))
-                                 (if (= rc 0)
-                                     (begin
-                                       ;; the parent keeps ONLY the read ends:
+                                            (proc-c-spawn pidbuf path fa attr
+                                              (car argv) (if envp (car envp) 0))))))
+                                ;; A child exists as of posix_spawn's return, and
+                                ;; the guard is armed as the FIRST act — under
+                                ;; MASKED interrupts, which closes the post-spawn
+                                ;; arming window outright. Every instruction
+                                ;; between the kernel-side child creation and the
+                                ;; armed box is either inside the (uninterruptible
+                                ;; by polling) foreign call or this disabled
+                                ;; region; Chez holds a pending timer across
+                                ;; disabled interrupts and delivers it at the
+                                ;; enable — the delivery-on-enable rule the fiber
+                                ;; scheduler itself relies on (fibers.ss,
+                                ;; jolt-adjust-interrupts!) — so an escape pending
+                                ;; anywhere in the window fires with scope-pid
+                                ;; already set, and its unwind runs the ladder.
+                                ;; The region cannot park, allocate, or throw:
+                                ;; one memory read, one test, one box store.
+                                (with-interrupts-disabled
+                                  (when (= rc 0)
+                                    (set-box! scope-pid
+                                      (sa-foreign-ref 'int pidbuf 0))))
+                                (let ((p (sa-foreign-ref 'int pidbuf 0)))
+                                  (if (= rc 0)
+                                      (begin
+                                       ;; (scope-pid was armed in the masked
+                                       ;; region above — nothing further to do
+                                       ;; for the guard here.)
+                                       ;; An escape in the window before the
+                                       ;; write-end closes below leaves the
+                                       ;; parent's copies open; the guard's
+                                       ;; after-part closes both ends
+                                       ;; (proc-sc-cap-abort!), and the drain
+                                       ;; honestly reports :partial.
+                                        ;; the parent keeps ONLY the read ends:
                                        ;; its own write-end copies close now,
                                        ;; inside the excluded window — held any
                                        ;; longer, EOF on the read side would
@@ -1937,93 +2056,107 @@
                               (sa-foreign-free fa) (sa-foreign-free attr)
                               (sa-foreign-free pidbuf)
                               (proc-free-argv argv)
-                              (when envp (proc-free-argv envp))))))))
-               ;; The group is the scope and its id is the root's pid: pgroup 0
-               ;; + SETPGROUP makes the child its own group leader before exec
-              ;; (probed), so no grandchild can pre-date the group the way a
-              ;; parent-side setpgid race would allow.
-              (let ((pgid pid))
-                (let ((deadline (+ (jolt-mono-nanos) (* timeout-n 1000000)))
-                      (scratch (sa-foreign-alloc proc-sc-cap-chunk)))
-                  (let ((finish!
-                          ;; shared exit path: escalate, confirm, drain what
-                          ;; the killed writers left, answer. decoded is the
-                          ;; reaped status when the root was waited; otherwise
-                          ;; proc-sc-reap-root reconstructs it from the
-                          ;; strongest evidenced signal. timed-out? is
-                          ;; STRICTLY the controller clock — an overflow abort
-                          ;; passes #f and the :truncated status says why.
-                          (lambda (decoded timed-out?)
-                            (let ((sent (proc-sc-escalate! pid pgid grace-n)))
-                              (proc-sc-confirm-empty! pid pgid)
-                              ;; the scope is confirmed empty: every writer
-                              ;; the nets caught is dead, so EOF on the
-                              ;; capture pipes is now decidable — drain the
-                              ;; kernel's remainder (bounded in time; a
-                              ;; net-escaping writer leaves :partial, not a
-                              ;; hang)
-                              (proc-sc-final-drain! caps scratch)
-                              (apply jolt-hash-map
-                                (append
-                                  (list (jolt-keyword "pid") pid
-                                        (jolt-keyword "exit")
-                                        (or decoded (proc-sc-reap-root pid sent))
-                                        (jolt-keyword "timed-out") timed-out?)
-                                  (apply append
-                                    (map proc-sc-cap-rows
-                                      (list (cons out-cap "out")
-                                            (cons err-cap "err"))))))))))
-                    (dynamic-wind
-                      (lambda () #f)
-                      (lambda ()
+                               (when envp (proc-free-argv envp))))))))
+                      ;; The group is the scope and its id is the root's pid: pgroup 0
+                      ;; + SETPGROUP makes the child its own group leader before exec
+                      ;; (probed), so no grandchild can pre-date the group the way a
+                      ;; parent-side setpgid race would allow — settle! addresses every
+                      ;; wave to (root . root).
+                      (let ((deadline (+ (jolt-mono-nanos) (* timeout-n 1000000))))
                         (let loop ()
+                          ;; Cooperatively interruptible per round, the same check the
+                          ;; interruptible blocking waits use: the throw unwinds this wind,
+                          ;; whose after-part finishes the ladder before the interruption
+                          ;; reaches the caller.
+                          (jolt-interrupt-poll-check! "process-scope-run")
                           (call-with-values (lambda () (proc-waitpid-once pid #t))
                             (lambda (rc decoded err)
                               (cond
-                                ;; root exited on its own — the scope may still
-                                ;; hold its workers; escalation is a no-op when
-                                ;; it does not (the entry scan finds nothing to
-                                ;; signal).
+                                ;; root exited on its own — the scope may still hold its
+                                ;; workers; escalation is a no-op when it does not (the entry
+                                ;; scan finds nothing to signal).
                                 (decoded (finish! decoded #f))
-                                ;; timed out: TERM the group, grace, KILL,
-                                ;; confirm. sent is the strongest signal
-                                ;; DELIVERY was evidenced for — 0 if the scope
-                                ;; quieted before any wave landed, and the
-                                ;; unwaitable-root fallback claims no more
-                                ;; than that.
+                                ;; timed out: TERM the group, grace, KILL, confirm. sent is the
+                                ;; strongest signal DELIVERY was evidenced for — 0 if the scope
+                                ;; quieted before any wave landed, and the unwaitable-root
+                                ;; fallback claims no more than that.
                                 ((and (>= (jolt-mono-nanos) deadline)
                                       (or (= rc 0) (= err proc-EINTR)))
                                  (finish! #f #t))
-                                ;; ECHILD before any exit we saw: someone else
-                                ;; reaped the root (SIGCHLD=SIG_IGN set after
-                                ;; our restore). The scope answer is the same.
+                                ;; ECHILD before any exit we saw: someone else reaped the root
+                                ;; (SIGCHLD=SIG_IGN set after our restore). The scope answer is
+                                ;; the same.
                                 ((and (< rc 0) (not (= err proc-EINTR)))
                                  (finish! #f #f))
-                                ;; capture overflow: the SAME escalation and
-                                ;; the SAME no-live-scope confirmation a
-                                ;; timeout gets — but the clock did not fire,
-                                ;; so :timed-out stays false and the
-                                ;; overflowing stream's :truncated says why.
+                                ;; capture overflow: the SAME escalation and the SAME
+                                ;; no-live-scope confirmation a timeout gets — but the clock did
+                                ;; not fire, so :timed-out stays false and the overflowing
+                                ;; stream's :truncated says why.
                                 ((or (proc-sc-cap-overflow? out-cap)
-                                     (proc-sc-cap-overflow? err-cap))
+                                      (proc-sc-cap-overflow? err-cap))
                                  (finish! #f #f))
                                 (else
-                                  ;; the wait step doubles as the drain step:
-                                  ;; poll the live capture pipes with the same
-                                  ;; 10ms cadence (level-triggered readiness
-                                  ;; turns a flood into a tight drain loop),
-                                  ;; or take the plain pause there always was
-                                  ;; when no capture is live.
+                                  ;; the wait step doubles as the drain step: poll the live capture
+                                  ;; pipes with the same 10ms cadence (level-triggered readiness turns
+                                  ;; a flood into a tight drain loop), or take the plain pause there
+                                  ;; always was when no capture is live.
                                   (if (exists proc-sc-cap-live? caps)
-                                      (proc-sc-poll-drain! caps scratch 10)
-                                      (jolt-pause-ms 10))
-                                  (loop)))))))
-                      (lambda ()
-                        ;; every exit path — return, timeout, overflow, or the
-                        ;; survivors exception — closes the capture fds before
-                        ;; the scratch buffer goes away under them
-                        (for-each proc-sc-cap-close! caps)
-                        (sa-foreign-free scratch)))))))))))))
+                                       (proc-sc-poll-drain! caps scratch 10)
+                                       (jolt-pause-ms 10))
+                                  (loop)))))))))
+                  (lambda ()
+                     ;; A PARK is not an exit — the same jolt-park-unwinding? seam
+                     ;; load-namespace* and the object monitor use (loader.ss: cleanup
+                     ;; belonging to the real exit does not run on a park). On a fiber
+                     ;; this loop parks EVERY quiet round (jolt-pause-ms below, or the
+                     ;; scheduler parks it at a preemption between syscalls), and settle!
+                     ;; parks in its grace/confirm waits; an unguarded after-part fires at
+                     ;; each of those, killing the live scope and freeing the scratch and
+                     ;; capture fds the resumed run still uses — a double free, observed
+                     ;; as glibc "double free or corruption" from a scoped run on a go
+                     ;; block. REAL exits — normal return, a raise (the cooperative
+                     ;; InterruptedException, the survivors error), and
+                     ;; run-interruptible's escape — answer #f and clean up. No cheap park
+                     ;; can strand this wind either: nothing under it is jolt-emitted
+                     ;; code, so every park it reaches falls back to a capture park, which
+                     ;; rewinds the frame and keeps the winder on the chain — the real
+                     ;; exit still runs this after-part.
+                     (unless (jolt-park-unwinding?)
+                       (let ((pending #f))
+                         ;; ONE attempt, in a guard: a settle that already ran and THREW
+                         ;; (from finish! — D-state survivors) is retired by the settle-threw?
+                         ;; latch and no-ops here rather than re-running a blown ladder; the
+                         ;; only ladders this can still run are a first attempt (interruption /
+                         ;; async escape) or the completion re-run of an escape-TRUNCATED one
+                         ;; (no throw involved). A fresh throw out of that attempt is stashed,
+                         ;; not propagated — not yet.
+                         (guard (e (#t (set! pending e)))
+                           (let ((root (unbox scope-pid)))
+                             (when root
+                               (settle!)
+                               ;; An interrupted run still owes the root its waitpid: the one
+                               ;; artifact a confirmed-empty scope can leave behind is the root's
+                               ;; own zombie, and the answer is discarded — what follows this
+                               ;; unwind is the interruption, not a result map. On the paths that
+                               ;; answered, finish! has reaped already and this is one ECHILD
+                               ;; no-op.
+                               (proc-sc-reap-root root (unbox sent-box)))))
+                         ;; CLEANUP IS UNCONDITIONAL once past the park guard: a throwing
+                         ;; ladder (the survivors error — a D-state or EPERM survivor the
+                         ;; confirm step could not clear) must not leak the capture fds or the
+                         ;; scratch on its way out. abort! rather than close!: a run cut
+                         ;; short between pipe() and a successful spawn — or in the window
+                         ;; before the parent's write-end copies closed — can still be holding
+                         ;; the write end.
+                         (for-each proc-sc-cap-abort! caps)
+                         (sa-foreign-free scratch)
+                         ;; Only now does a throw from THIS after-part's own attempt
+                         ;; propagate — AFTER cleanup — replacing the interruption with the
+                         ;; survivor error, the louder and worse piece of news. A throw
+                         ;; already in flight from finish! never entered the guard above; it
+                         ;; simply continues past this wind, original condition intact.
+                         (when pending (raise pending))
+                     ))))))))))))
 
 (def-var! "jolt.host" "process-scope-run" proc-scope-run)
 
