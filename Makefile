@@ -820,8 +820,9 @@ certify:
 # CONTRACT.txt names + shim behavior. Detection-gated like certify — skips
 # cleanly when gambit-scheme is absent. NEVER bare gsc/gsi (gsc on PATH is
 # Ghostscript): always the brew-prefix binary.
-GAMBIT_GSI := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsi
-GAMBIT_GSC := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsc
+GAMBIT_PREFIX := $(shell brew --prefix gambit-scheme 2>/dev/null)
+GAMBIT_GSI := $(if $(GAMBIT_PREFIX),$(GAMBIT_PREFIX)/bin/gsi)
+GAMBIT_GSC := $(if $(GAMBIT_PREFIX),$(GAMBIT_PREFIX)/bin/gsc)
 
 # host/gambit/records-gambit.ss is GENERATED from the four host/chez records
 # files — records.ss, records-coll.ss, protocols.ss, records-dispatch.ss — (the
