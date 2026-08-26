@@ -114,7 +114,8 @@
   layout data. Field names are unique unqualified keywords; fields are fixed-size
   scalars, nested structs, or recursively nestable [:array positive-count type]
   descriptors. Chez supplies size, alignment, and offsets; array elements use
-  integer path components, for example [:matrix 1 2]."
+  integer path components, for example [:matrix 1 2]. Array metadata scales
+  with the declared shape rather than the product of array dimensions."
   [descriptor]
   (list 'jolt.ffi/__layout descriptor))
 
@@ -137,20 +138,41 @@
 (defn layout-size [layout] (:size (checked-layout layout)))
 (defn layout-alignment [layout] (:alignment (checked-layout layout)))
 
+(def ^:private layout-index-marker :jolt.ffi/index)
+
+(defn- resolve-field-path [layout path]
+  (let [counts (:jolt.ffi/array-counts layout)
+        strides (:jolt.ffi/array-strides layout)]
+    (loop [parts path compact [] delta 0]
+      (if (empty? parts)
+        [compact delta]
+        (let [part (first parts)]
+          (if (integer? part)
+            (let [count (get counts compact)
+                  stride (get strides compact)]
+              (when-not (and count stride (< part count))
+                (throw (ex-info "jolt.ffi: unknown layout field path" {:path path})))
+              (recur (rest parts)
+                     (conj compact layout-index-marker)
+                     (+ delta (* part stride))))
+            (recur (rest parts) (conj compact part) delta)))))))
+
 (defn field-offset [layout path]
   (let [layout (checked-layout layout)
         path (checked-field-path path)
+        [compact delta] (resolve-field-path layout path)
         offsets (:jolt.ffi/offsets layout)]
-    (when-not (contains? offsets path)
+    (when-not (contains? offsets compact)
       (throw (ex-info "jolt.ffi: unknown layout field path" {:path path})))
-    (get offsets path)))
+    (+ (get offsets compact) delta)))
 
 (defn- field-type [layout path]
-  (let [types (:jolt.ffi/types layout)]
-    (when-not (contains? types path)
+  (let [[compact _] (resolve-field-path layout path)
+        types (:jolt.ffi/types layout)]
+    (when-not (contains? types compact)
       (throw (ex-info "jolt.ffi: field path names a struct or array, not a scalar field"
                       {:path path})))
-    (get types path)))
+    (get types compact)))
 
 (defn read-field [pointer layout path]
   (let [layout (checked-layout layout)

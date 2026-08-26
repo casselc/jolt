@@ -1159,6 +1159,8 @@
 
 (declare ffi-layout-descendant-entries)
 
+(def ^:private ffi-layout-index-marker ::ffi-layout-index)
+
 (defn- ffi-layout-entry [type public-path emitted-path]
   (cons {:path public-path :emitted-path emitted-path :type type}
         (ffi-layout-descendant-entries type public-path emitted-path)))
@@ -1175,12 +1177,9 @@
      (range (count (:fields type)))
      (:fields type))
     (= :array (:ffi-kind type))
-    (mapcat
-     (fn [i]
-       (ffi-layout-entry (:type type)
-                         (conj public-path i)
-                         (conj emitted-path i)))
-     (range (:count type)))
+    (ffi-layout-entry (:type type)
+                      (conj public-path ffi-layout-index-marker)
+                      (conj emitted-path 0))
     :else
     (throw (ex-info "jolt.ffi: invalid analyzed layout type" {:type type}))))
 
@@ -1199,11 +1198,31 @@
   (str "(jolt-vector "
        (str/join " "
                  (map (fn [part]
-                        (if (string? part)
+                        (cond
+                          (= part ffi-layout-index-marker)
+                          "(keyword \"jolt.ffi\" \"index\")"
+                          (string? part)
                           (str "(keyword #f " (chez-str-lit part) ")")
-                          part))
+                          :else part))
                       path))
        ")"))
+
+(defn- ffi-layout-array-entries
+  ([layout] (ffi-layout-array-entries layout []))
+  ([type public-path]
+   (cond
+     (string? type) []
+     (= :struct (:ffi-kind type))
+     (mapcat (fn [field]
+               (ffi-layout-array-entries
+                (:type field) (conj public-path (:name field))))
+             (:fields type))
+     (= :array (:ffi-kind type))
+     (cons {:path public-path :count (:count type) :element-type (:type type)}
+           (ffi-layout-array-entries
+            (:type type) (conj public-path ffi-layout-index-marker)))
+     :else
+     (throw (ex-info "jolt.ffi: invalid analyzed layout type" {:type type})))))
 
 (defn- emit-layout-descriptor [type]
   (cond
@@ -1228,6 +1247,8 @@
         type-name (fresh-label "jolt_ffi_layout")
         align-name (fresh-label "jolt_ffi_layout_align")
         entries (vec (ffi-layout-entries layout))
+        arrays (mapv #(assoc % :element-name (fresh-label "jolt_ffi_layout_element"))
+                     (ffi-layout-array-entries layout))
         base (str "(make-ftype-pointer " type-name " 0)")
         offsets
         (str "(jolt-hash-map "
@@ -1248,10 +1269,34 @@
                         (str (emit-layout-path (:path entry)) " "
                              "(keyword #f " (chez-str-lit (:type entry)) ")")))
                     entries))
+             ")")
+        array-counts
+        (str "(jolt-hash-map "
+             (str/join
+              " "
+              (map (fn [entry]
+                     (str (emit-layout-path (:path entry)) " " (:count entry)))
+                   arrays))
+             ")")
+        array-strides
+        (str "(jolt-hash-map "
+             (str/join
+              " "
+              (map (fn [entry]
+                     (str (emit-layout-path (:path entry))
+                          " (ftype-sizeof " (:element-name entry) ")"))
+                   arrays))
              ")")]
     (str "(let () "
          "(define-ftype " type-name " " (emit-ffi-layout-ftype layout) ") "
          "(define-ftype " align-name " (struct [prefix unsigned-8] [value " type-name "])) "
+         (str/join
+          " "
+          (map (fn [entry]
+                 (str "(define-ftype " (:element-name entry) " "
+                      (emit-ffi-layout-ftype (:element-type entry)) ")"))
+               arrays))
+         (when (seq arrays) " ")
          "(jolt-hash-map "
          "(keyword \"jolt.ffi\" \"layout\") #t "
          "(keyword #f \"descriptor\") " (emit-layout-descriptor layout) " "
@@ -1260,6 +1305,8 @@
          "(ftype-pointer-address (ftype-&ref " align-name " (value) "
          "(make-ftype-pointer " align-name " 0))) "
          "(keyword \"jolt.ffi\" \"offsets\") " offsets " "
+         "(keyword \"jolt.ffi\" \"array-counts\") " array-counts " "
+         "(keyword \"jolt.ffi\" \"array-strides\") " array-strides " "
          "(keyword \"jolt.ffi\" \"types\") " types "))")))
 
 (defn- ffi-by-value? [type]

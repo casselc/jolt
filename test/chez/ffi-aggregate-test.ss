@@ -37,7 +37,7 @@
 (ev "(def nested-layout (jolt.ffi/__layout [:struct [[:tag :uint8] [:date [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]] [:tail :uint16]]]))")
 (ev "(def large-layout (jolt.ffi/__layout [:struct [[:a :uint64] [:b :uint64] [:c :uint64]]]))")
 (ev "(def packet-layout (jolt.ffi/__layout [:struct [[:tag :uint8] [:params [:array 4 :uint32]] [:dates [:array 2 [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]]]]))")
-(ev "(defn layout-offset [layout path] (get (:jolt.ffi/offsets layout) path))")
+(ev "(defn layout-offset [layout path] (loop [parts path compact [] delta 0] (if (empty? parts) (+ delta (get (:jolt.ffi/offsets layout) compact)) (let [part (first parts)] (if (integer? part) (recur (rest parts) (conj compact :jolt.ffi/index) (+ delta (* part (get (:jolt.ffi/array-strides layout) compact)))) (recur (rest parts) (conj compact part) delta))))))")
 (ev "(defn put-date [p year month day] (jolt.ffi/write p :int32 (layout-offset date-layout [:year]) year) (jolt.ffi/write p :uint8 (layout-offset date-layout [:month]) month) (jolt.ffi/write p :uint8 (layout-offset date-layout [:day]) day) p)")
 (ev "(defn put-large [p a b c] (jolt.ffi/write p :uint64 (layout-offset large-layout [:a]) a) (jolt.ffi/write p :uint64 (layout-offset large-layout [:b]) b) (jolt.ffi/write p :uint64 (layout-offset large-layout [:c]) c) p)")
 (ev "(defn put-packet [p tag base year month day] (jolt.ffi/write p :uint8 (layout-offset packet-layout [:tag]) tag) (doseq [i (range 4)] (jolt.ffi/write p :uint32 (layout-offset packet-layout [:params i]) (+ base i))) (put-date (+ p (layout-offset packet-layout [:dates 0])) year month day) (put-date (+ p (layout-offset packet-layout [:dates 1])) (inc year) (inc month) (inc day)) p)")

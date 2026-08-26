@@ -1,5 +1,11 @@
 # Changelog
 
+- Fixed-array layouts now retain one metadata entry per declared array shape
+  instead of enumerating every indexed element path. `field-offset`,
+  `read-field`, and `write-field` preserve the same indexed-path API while
+  resolving offsets from ABI-derived element strides; million-element flat and
+  nested arrays are covered by compactness and boundary controls.
+
 - Consolidate `read-into!`, `write-array`, and directional byte-array loans on
   one checked byte-array/range and vector-bytevector copy substrate. The older
   transfer functions now reject non-byte primitive arrays explicitly instead

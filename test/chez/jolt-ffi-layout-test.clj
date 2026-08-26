@@ -45,6 +45,12 @@
                                                     [:day :uint8]]]]]
                         [:matrix [:array 2 [:array 3 :uint16]]]
                         [:tail :uint16]]]))
+(def huge-array-layout
+  (ffi/layout [:struct [[:prefix :uint8]
+                        [:payload [:array 1000000 :uint8]]
+                        [:suffix :uint8]]]))
+(def huge-matrix-layout
+  (ffi/layout [:struct [[:matrix [:array 1000 [:array 1000 :uint8]]]]]))
 
 (check "flat size" (= (flat-size) (ffi/layout-size date-layout)))
 (check "flat alignment" (= (flat-align) (ffi/layout-alignment date-layout)))
@@ -64,6 +70,23 @@
        (= (arrays-matrix-1-2) (ffi/field-offset arrays-layout [:matrix 1 2])))
 (check "descriptor data" (= [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]
                             (:descriptor date-layout)))
+(check "million-element array metadata stays compact"
+       (= [4 1 1]
+          [(count (:jolt.ffi/offsets huge-array-layout))
+           (count (:jolt.ffi/array-counts huge-array-layout))
+           (count (:jolt.ffi/array-strides huge-array-layout))]))
+(check "million-element array resolves its final element arithmetically"
+       (= [1000002 1000000 1000001]
+          [(ffi/layout-size huge-array-layout)
+           (ffi/field-offset huge-array-layout [:payload 999999])
+           (ffi/field-offset huge-array-layout :suffix)]))
+(check "million-element nested array metadata stays shape-sized"
+       (= [3 2 2 1000000 999999]
+          [(count (:jolt.ffi/offsets huge-matrix-layout))
+           (count (:jolt.ffi/array-counts huge-matrix-layout))
+           (count (:jolt.ffi/array-strides huge-matrix-layout))
+           (ffi/layout-size huge-matrix-layout)
+           (ffi/field-offset huge-matrix-layout [:matrix 999 999])]))
 
 (let [p (ffi/alloc (ffi/layout-size nested-layout))]
   (try
@@ -98,6 +121,12 @@
        (rejects? #(ffi/read-field ffi/null arrays-layout :params)))
 (check "negative array index rejects"
        (rejects? #(ffi/field-offset arrays-layout [:params -1])))
+(check "array upper-bound index rejects"
+       (rejects? #(ffi/field-offset arrays-layout [:params 4])))
+(check "keyword in array position rejects"
+       (rejects? #(ffi/field-offset arrays-layout [:params :missing])))
+(check "index after scalar rejects"
+       (rejects? #(ffi/field-offset arrays-layout [:tag 0])))
 (check "path starting with array index rejects"
        (rejects? #(ffi/field-offset arrays-layout [0])))
 
