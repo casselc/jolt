@@ -53,18 +53,26 @@
               (seq dst) (seq all-bytes)))
 
   ;; --- bounds ---------------------------------------------------------------
-  (check-eq "read-into! past the end throws"
+  (check-eq "read-into! past the end throws IndexOutOfBoundsException"
             (try (ffi/read-into! buf (byte-array 8) 4 8) :no-throw
-                 (catch Throwable _ :threw))
-            :threw)
-  (check-eq "read-into! at a negative offset throws"
+                 (catch IndexOutOfBoundsException _ :out-of-bounds))
+            :out-of-bounds)
+  (check-eq "read-into! at a negative offset throws IndexOutOfBoundsException"
             (try (ffi/read-into! buf (byte-array 8) -1 2) :no-throw
-                 (catch Throwable _ :threw))
-            :threw)
-  (check-eq "write-array past the end throws"
+                 (catch IndexOutOfBoundsException _ :out-of-bounds))
+            :out-of-bounds)
+  (check-eq "write-array past the end throws IndexOutOfBoundsException"
             (try (ffi/write-array buf all-bytes 200 100) :no-throw
-                 (catch Throwable _ :threw))
-            :threw)
+                 (catch IndexOutOfBoundsException _ :out-of-bounds))
+            :out-of-bounds)
+  (check-eq "read-into! rejects a non-byte primitive array"
+            (try (ffi/read-into! buf (int-array 1) 0 1) :no-throw
+                 (catch IllegalArgumentException _ :rejected))
+            :rejected)
+  (check-eq "write-array rejects a non-byte primitive array"
+            (try (ffi/write-array buf (int-array [1])) :no-throw
+                 (catch IllegalArgumentException _ :rejected))
+            :rejected)
 
   ;; --- write-array slice ----------------------------------------------------
   (let [zeros (byte-array 512)]

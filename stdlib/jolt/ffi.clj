@@ -60,13 +60,42 @@
   defining-libraries answers which libraries supply distinct definitions. The
   fix is always to rebuild the dependent against the shared base library.
 
+  with-byte-array-pointer is a scoped, synchronous directional bridge, not a
+  zero-copy view. Legacy (arr f) and (arr off len f) arities are :in-out. The
+  (arr direction f) and (arr off len direction f) arities accept :in, :out, or
+  :in-out. Each calls f with [pointer validated-length]. It validates the
+  byte-array kind, direction, and subtraction-safe range before any allocation
+  or callback. :in copies selected signed bytes into a temporary native-octet
+  bytevector and discards native writes; :out starts the temporary zeroed and
+  copies native output back; :in-out does both. Output directions copy back on
+  normal return, jolt/host exception, and nonlocal exit. The temporary is locked
+  for a stable address only for f's dynamic extent. Native code must not retain
+  the pointer; the loaned range is owned by the scope while f runs. Read-only
+  :in loans of the same array may nest on one thread; every same-array nesting
+  involving :out or :in-out is rejected. Distinct-array nesting is allowed.
+  The callback must not yield, park, or perform an operation that parks its
+  fiber. A park cleans up the loan; attempting to resume it raises
+  IllegalStateException before callback code can continue.
+  Callers must prevent overlapping loan lifetimes or other access to the same
+  array across threads. Overlapping output snapshots can lose updates during
+  copy-back; even disjoint ranges are outside the supported contract because
+  the helper neither synchronizes access nor enforces cross-thread array
+  ownership. A captured continuation cannot re-enter a retired loan. It
+  performs no native call itself and captures no native error. If f calls a C
+  function whose errno/GetLastError matters, use {:capture-native-error true}
+  on that binding and return its captured pair from f; reading ffi/errno after
+  this scope returns is too late because copy-back and unlock cleanup intervene.
+
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
-  ptr->string/string->ptr/null/null?) are provided by the host, as are the
-  buffer moves: read-bytes/write-bytes decode and encode UTF-8, read-array/
+  ptr->string/string->ptr/null/null?) are provided by the host, as are
+  with-byte-array-pointer and the buffer moves: read-bytes/write-bytes decode
+  and encode UTF-8, read-array/
   write-array move raw octets to and from a byte-array, and read-into! fills a
   slice of an EXISTING byte-array — so a caller reading a stream whose length
   it already knows fills one buffer instead of regrowing an accumulator per
-  chunk. All of them move the block in one copy, not a byte at a time.
+  chunk. The raw-array moves reject other primitive-array kinds and throw
+  IndexOutOfBoundsException for an invalid slice. All of them move the block
+  in one copy, not a byte at a time.
 
   string->ptr and ptr->string round-trip nil: nil answers NULL and allocates
   nothing, NULL reads back as nil, and \"\" still allocates its NUL byte and
