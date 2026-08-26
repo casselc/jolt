@@ -596,6 +596,8 @@ cts: testbin
 # the babashka.ffi-compatible surface built on it — the four arena kinds and who
 # closes each, arena-owned blocks/strings/callbacks/views, the pointer
 # vocabulary, layout-shaped read and write, places, and the typed array moves.
+# The byte-array pointer gate covers directional scoped loans, range validation,
+# copy-back across every exit, nesting rules, and retired-continuation rejection.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
@@ -604,6 +606,7 @@ ffi:
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
 	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
 
 # Escape continuations (jolt.continuations, issue #736): the one-shot contract
 # call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber

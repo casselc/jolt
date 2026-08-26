@@ -27,6 +27,11 @@ when transposed.
 
 ### Added
 
+- **Directional scoped byte-array pointer loans.**
+  `with-byte-array-pointer` now accepts `:in`, `:out`, or `:in-out`, validates
+  ranges before allocating, copies output back across exceptional exits, and
+  rejects writable nesting or resuming a retired loan.
+
 - **`jolt.ffi` arenas: a group of allocations with one lifetime (#799).** Every
   foreign allocation used to be released one pointer at a time — `ffi/free` per
   block, `free-callable` per callback, a `try`/`finally` per scope — so a
@@ -147,6 +152,10 @@ when transposed.
   including a C-invoked callback.
 
 ### Changed
+
+- `read-into!`, `write-array`, and byte-array loans now share one checked
+  byte-array/range copy path. Non-byte primitive arrays and invalid slices fail
+  explicitly instead of being treated as native octets.
 
 - **BREAKING: `ffi/write` takes the value before the offset.** `(write p t v)`
   and `(write p t v offset)`, which is `babashka.ffi`'s order; it was

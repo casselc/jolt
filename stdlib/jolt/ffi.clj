@@ -115,13 +115,27 @@
   CAUTION: do not close an arena while C still holds one of its pointers. C can
   read released memory, and nothing raises.
 
+  with-byte-array-pointer is a scoped, synchronous directional bridge, not a
+  zero-copy view. Legacy (arr f) and (arr off len f) arities are :in-out. The
+  (arr direction f) and (arr off len direction f) arities accept :in, :out, or
+  :in-out and call f with [pointer validated-length]. :in copies into a native
+  snapshot and discards writes; :out starts zeroed and copies back; :in-out does
+  both. Output copies back on normal return, host exception, or nonlocal exit.
+  Read-only loans of one array may nest on one thread; same-array nesting that
+  includes a writable loan is rejected. The callback must not park, yield, or
+  retain the pointer. Resuming a continuation into a retired loan raises before
+  callback code continues. Capture errno/GetLastError inside the callback,
+  before copy-back and unlock cleanup run.
+
   The memory/library primitives (read/write/sizeof/load-library/ptr->string/
-  string->ptr/null/null?) are host-provided, as are the buffer moves:
+  string->ptr/null/null?) are host-provided, as are byte-array loans and the
+  buffer moves:
   read-bytes/write-bytes decode and encode UTF-8, read-array/write-array move
   raw octets to and from a byte-array, and read-into! fills a slice of an
   EXISTING byte-array — so a caller reading a stream whose length it already
-  knows fills one buffer instead of regrowing an accumulator per chunk. All of
-  them move the block in one copy, not a byte at a time.
+  knows fills one buffer instead of regrowing an accumulator per chunk. These
+  operations reject other primitive-array kinds and invalid ranges. All move
+  the block in one copy, not a byte at a time.
 
   string->ptr and ptr->string round-trip nil: nil answers NULL and allocates
   nothing, NULL reads back as nil, and \"\" still allocates its NUL byte and
