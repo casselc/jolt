@@ -126,6 +126,25 @@ read after the syscall rather than at it.
   and expands through the same grammar, so code written against core.incubator
   runs unchanged.
 
+- **Directional scoped byte-array pointer loans.** Existing
+  `with-byte-array-pointer` arities remain `:in-out`; new `(arr direction f)` and
+  `(arr off len direction f)` arities accept `:in`, `:out`, or `:in-out`.
+  Read-only loans skip copy-back, output loans start from zero and skip copy-in,
+  and output is copied back even on exceptional or nonlocal exit. Same-array
+  read-only loans may nest; every same-array nesting involving a writable loan
+  is rejected. Callbacks are non-parking: a fiber park cleans up the loan and
+  raises `IllegalStateException` if execution attempts to resume inside it.
+  Atomic native-error capture composes with output copy-back; callers must
+  capture inside the callback, before loan cleanup runs.
+
+### Changed
+
+- Consolidate `read-into!`, `write-array`, and directional byte-array loans on
+  one checked byte-array/range and vector-bytevector copy substrate. The older
+  transfer functions now reject non-byte primitive arrays explicitly instead
+  of silently treating their backing vectors as octets, and invalid slices
+  consistently throw `IndexOutOfBoundsException`.
+
 ### Fixed
 
 - **A socket read could answer EOF on a live connection, under load.**
