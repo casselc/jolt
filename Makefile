@@ -129,7 +129,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscali
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck installersmoke irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
@@ -795,6 +795,12 @@ parkcheck:
 # remembered.
 shelloutcheck:
 	@sh host/chez/shellout-check.sh
+
+# Keep the standalone installer aligned with the targets published by release
+# automation. The smoke test mocks uname/downloads and therefore runs on every
+# CI host without network access or a foreign machine.
+installersmoke:
+	@bash test/install-smoke.sh
 
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.

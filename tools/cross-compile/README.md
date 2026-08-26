@@ -201,12 +201,13 @@ This also means CI could build **every Linux artifact from any runner** —
 and, with mingw-w64, plausibly the Windows one too — without per-target
 runner hardware.
 
-## Why bother (beyond the issue)
+## Release use
 
-`.github/workflows/release.yml` ships **no x86_64-macos binary** — GitHub
-retired the Intel runners ("Intel Macs build from source"). Item 1–3 above
-would restore that artifact by cross-building `ta6osx` on the existing
-`macos-14` arm64 runner, POC'd here end to end.
+`.github/workflows/release.yml` cross-builds the `x86_64-macos` release on the
+`macos-14` arm64 runner because GitHub retired the Intel runners. It builds the
+`ta6osx` target pack, links with a macOS 11 deployment floor, and smoke-tests
+the result through Rosetta 2 before publishing it alongside the native
+artifacts.
 
 ## CI integration
 
@@ -215,13 +216,9 @@ would restore that artifact by cross-building `ta6osx` on the existing
   (ta6le → tarm64le, qemu-verified, byte-identical-output diff). It pins the
   machine-neutrality invariant: a change that bakes host state into the
   Scheme emission fails the diff. Not a per-push gate.
-- [`release-macos-x86_64.draft.yml`](release-macos-x86_64.draft.yml) — the
-  release.yml matrix row that restores the dropped x86_64-macos artifact by
-  cross-building on the arm64 runner (smoke via Rosetta, which GitHub's
-  macos-14 runners ship). Deliberately a draft outside `.github/workflows/`:
-  it is blocked on cross-target support in `build-jolt.ss` (the artifact is
-  jolt itself, which embeds the target's boots/stub/kernel). Move it into
-  release.yml with the `--target` PR.
+- [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — the
+  production matrix that uses the target-pack path for the Intel macOS archive
+  and verifies the cross-built binary through Rosetta 2.
 
 ## Observed timings (M-series Mac)
 
