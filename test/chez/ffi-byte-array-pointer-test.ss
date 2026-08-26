@@ -1,13 +1,15 @@
-;; ffi-byte-array-pointer-test.ss — scoped in-out byte-array pointer-loan gate
+;; ffi-byte-array-pointer-test.ss — scoped directional byte-array pointer-loan gate
 ;; for jolt.ffi/with-byte-array-pointer.
 ;;
 ;; Specifies the whole-array (arr f) and ranged (arr off len f) pointer-loan
-;; contract: validate exact byte-array kind + subtraction-safe range BEFORE
+;; contract: preserve the legacy :in-out arities and validate exact byte-array
+;; kind, direction, and subtraction-safe range BEFORE
 ;; temporary allocation, locking, or the callback; copy signed jolt bytes into a
 ;; private native-octet bytevector; lock it for a stable address only for the
 ;; callback's dynamic extent; copy native octets back as signed bytes on normal
-;; return, jolt/host exception, and nonlocal exit; reject same-array nesting on
-;; one owner thread while allowing distinct-array nesting; treat an inherited
+;; return, jolt/host exception, and nonlocal exit; :in skips copy-back, :out
+;; starts zeroed and skips copy-in; allow same-array nesting only for read-only
+;; :in loans while allowing distinct-array nesting; treat an inherited
 ;; thread-parameter cell as empty for a different owner thread without claiming
 ;; that overlapping same-array cross-thread loans are supported; and reject a
 ;; captured continuation's re-entry after first exit before the callback resumes.
@@ -81,6 +83,42 @@
                        (mapv #(jolt.ffi/read p :uint8 %) (range n)))))
                 (= [-128 -1 0 127] (vec a))))")))
 
+;; --- directions: copy only the side each native contract requires ------------
+(ok ":in exposes input and discards native writes"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [-128 -1 0 127])]
+              (and
+                (jolt.ffi/with-byte-array-pointer
+                  a :in
+                  (fn [p n]
+                    (let [before (mapv #(jolt.ffi/read p :uint8 %) (range n))]
+                      (c-fill-pointer p 201 n)
+                      (= [128 255 0 127] before))))
+                (= [-128 -1 0 127] (vec a))))")))
+(ok ":out starts zeroed and copies native output back"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3 4])]
+              (and
+                (jolt.ffi/with-byte-array-pointer
+                  a 1 2 :out
+                  (fn [p n]
+                    (let [zeroed? (= [0 0] (mapv #(jolt.ffi/read p :uint8 %) (range n)))]
+                      (c-fill-pointer p 202 n)
+                      zeroed?)))
+                (= [1 -54 -54 4] (vec a))))")))
+(ok "explicit :in-out performs both copies"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2 3])]
+              (and
+                (= [1 2 3]
+                   (jolt.ffi/with-byte-array-pointer
+                     a :in-out
+                     (fn [p n]
+                       (let [before (mapv #(jolt.ffi/read p :uint8 %) (range n))]
+                         (c-fill-pointer p 203 n)
+                         before))))
+                (= [-53 -53 -53] (vec a))))")))
+
 ;; --- empty ranges: exact-tail and whole --------------------------------------
 (ok "exact-tail empty pointer loan is valid"
     (jolt-truthy?
@@ -114,6 +152,12 @@
                      false (catch IndexOutOfBoundsException _ true))
                 (try (jolt.ffi/with-byte-array-pointer a 1 4611686018427387904 f)
                      false (catch IndexOutOfBoundsException _ true))
+                (try (jolt.ffi/with-byte-array-pointer a :sideways f)
+                     false (catch IllegalArgumentException _ true))
+                (try (jolt.ffi/with-byte-array-pointer a :ffi/in f)
+                     false (catch IllegalArgumentException _ true))
+                (try (jolt.ffi/with-byte-array-pointer a 0 1 \"in\" f)
+                     false (catch IllegalArgumentException _ true))
                 (zero? @calls)))")))
 
 ;; --- private scope: host exception, nonlocal control, pointer stability -------
@@ -124,7 +168,7 @@
        (tmp #f) (locked-inside? #f))
   (ok "temporary pointer stays stable through allocation and collection"
       (and (= 2 (ffi-with-scoped-byte-array-pointer "test"
-                 a 1 2
+                 a 1 2 (keyword #f "in-out")
                  (lambda (p n)
                    (set! tmp (reference-address->object p))
                    (set! locked-inside? (locked-object? tmp))
@@ -142,7 +186,7 @@
       (and
        (guard (e (#t (and (string=? (condition-message e) "host loan boom") #t)))
          (ffi-with-scoped-byte-array-pointer "test"
-          a 1 2
+          a 1 2 (keyword #f "in-out")
           (lambda (p n)
             (set! tmp (reference-address->object p))
             (set! locked-inside? (locked-object? tmp))
@@ -161,7 +205,7 @@
             (call/cc
              (lambda (escape)
                (ffi-with-scoped-byte-array-pointer "test"
-                a 2 1
+                a 2 1 (keyword #f "in-out")
                 (lambda (p n)
                   (set! tmp (reference-address->object p))
                   (set! locked-inside? (locked-object? tmp))
@@ -185,15 +229,57 @@
                   false
                   (catch Exception e (= \"jolt loan boom\" (.getMessage e))))
                 (= [-53 -53] (vec a))))")))
+(ok ":out copies partial output back on Jolt exception"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2])]
+              (and
+                (try
+                  (jolt.ffi/with-byte-array-pointer
+                    a :out (fn [p n]
+                             (jolt.ffi/write p :uint8 0 204)
+                             (throw (Exception. \"out loan boom\"))))
+                  false
+                  (catch Exception e (= \"out loan boom\" (.getMessage e))))
+                (= [-52 0] (vec a))))")))
+(ok ":in discards native changes on Jolt exception"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2])]
+              (and
+                (try
+                  (jolt.ffi/with-byte-array-pointer
+                    a :in (fn [p n]
+                            (c-fill-pointer p 205 n)
+                            (throw (Exception. \"in loan boom\"))))
+                  false
+                  (catch Exception e (= \"in loan boom\" (.getMessage e))))
+                (= [1 2] (vec a))))")))
 
-;; --- nesting: same-array rejected, distinct-array copies both back ------------
-(ok "same-array nesting is rejected and cross-array nesting copies both back"
+;; --- nesting: same-array read-only allowed, writable rejected -----------------
+(ok "same-array read-only nesting is allowed"
+    (jolt-truthy?
+      (ev "(let [a (byte-array [1 2])]
+              (jolt.ffi/with-byte-array-pointer a :in
+                (fn [pa na]
+                  (jolt.ffi/with-byte-array-pointer a 0 1 :in
+                    (fn [pb nb]
+                      (= [[1 2] [1]]
+                         [(mapv #(jolt.ffi/read pa :uint8 %) (range na))
+                          (mapv #(jolt.ffi/read pb :uint8 %) (range nb))]))))))")))
+(ok "same-array writable nesting is rejected and cross-array nesting copies both back"
     (jolt-truthy?
       (ev "(let [a (byte-array [1 2]) b (byte-array [3 4])]
               (and
                 (jolt.ffi/with-byte-array-pointer a
                   (fn [_ _]
                     (try (jolt.ffi/with-byte-array-pointer a (fn [_ _] false))
+                         false (catch IllegalStateException _ true))))
+                (jolt.ffi/with-byte-array-pointer a :in
+                  (fn [_ _]
+                    (try (jolt.ffi/with-byte-array-pointer a :out (fn [_ _] false))
+                         false (catch IllegalStateException _ true))))
+                (jolt.ffi/with-byte-array-pointer a :out
+                  (fn [_ _]
+                    (try (jolt.ffi/with-byte-array-pointer a :in (fn [_ _] false))
                          false (catch IllegalStateException _ true))))
                 (jolt.ffi/with-byte-array-pointer a
                   (fn [pa na]
@@ -215,7 +301,7 @@
            (done? #f) (child-result #f)
            (deadline (ms->deadline 5000))
            (parent-id (get-thread-id))
-           (cell (cons parent-id (list a))))
+           (cell (cons parent-id (list (cons a 'in-out)))))
       (parameterize ((ffi-byte-array-loan-cell cell))
         (fork-thread
          (lambda ()
@@ -246,7 +332,7 @@
         (guard (e (#t (list 'raised (condition-message e) visits)))
           (let ((value
                  (ffi-with-scoped-byte-array-pointer "test"
-                  a 0 1
+                  a 0 1 (keyword #f "in-out")
                   (lambda (p n)
                     (set! tmp (reference-address->object p))
                     (set! locked-inside? (locked-object? tmp))

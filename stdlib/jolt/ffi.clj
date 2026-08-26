@@ -48,19 +48,22 @@
   [:matrix 1 2]. The array field path itself names its base address and is not a
   scalar read/write target.
 
-  with-byte-array-pointer is a scoped, synchronous in-out bridge, not a
-  zero-copy view: (with-byte-array-pointer arr f) loans the whole signed byte
-  array and (with-byte-array-pointer arr off len f) loans one validated range.
-  Each calls f with [pointer validated-length]. It validates the byte-array
-  kind and subtraction-safe range before any allocation or callback, copies the
-  selected signed bytes into a temporary native-octet bytevector, locks it for a
-  stable address only for f's dynamic extent, then copies its octets back as
-  signed bytes on normal return, jolt/host exception, and nonlocal exit. Native
-  code must not retain the pointer; the loaned range is owned by copy-back while
-  f runs. A nested loan of the same array on one thread is rejected, while
-  distinct-array nesting is allowed. Callers must prevent overlapping loan
+  with-byte-array-pointer is a scoped, synchronous directional bridge, not a
+  zero-copy view. Legacy (arr f) and (arr off len f) arities are :in-out. The
+  (arr direction f) and (arr off len direction f) arities accept :in, :out, or
+  :in-out. Each calls f with [pointer validated-length]. It validates the
+  byte-array kind, direction, and subtraction-safe range before any allocation
+  or callback. :in copies selected signed bytes into a temporary native-octet
+  bytevector and discards native writes; :out starts the temporary zeroed and
+  copies native output back; :in-out does both. Output directions copy back on
+  normal return, jolt/host exception, and nonlocal exit. The temporary is locked
+  for a stable address only for f's dynamic extent. Native code must not retain
+  the pointer; the loaned range is owned by the scope while f runs. Read-only
+  :in loans of the same array may nest on one thread; every same-array nesting
+  involving :out or :in-out is rejected. Distinct-array nesting is allowed.
+  Callers must prevent overlapping loan
   lifetimes or other access to the same array across threads. Overlapping
-  snapshots can lose updates during copy-back; even disjoint ranges are outside
+  output snapshots can lose updates during copy-back; even disjoint ranges are outside
   the supported contract because the helper neither synchronizes access nor
   enforces cross-thread array ownership. A captured continuation cannot re-enter
   a retired loan. It performs no native call itself, so it captures no native

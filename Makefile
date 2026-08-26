@@ -511,8 +511,9 @@ cts: testbin
 # the aggregate gate covers structs passed and returned by C value.
 # ffi-byte-array-pointer: with-byte-array-pointer loans a stable pointer into a
 # private native-octet snapshot of a whole byte-array or one validated range to
-# a synchronous callback, copying native mutation back on normal, exceptional,
-# and nonlocal exit; same-array nesting and retired-continuation re-entry are
+# a synchronous callback. :in, :out, and :in-out select copy direction; output
+# copies back on normal, exceptional, and nonlocal exit. Same-array read-only
+# nesting is allowed; writable nesting and retired-continuation re-entry are
 # rejected.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss

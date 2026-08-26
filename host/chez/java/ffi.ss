@@ -323,13 +323,19 @@
 (def-var! "jolt.ffi" "read-into!" ffi-read-into!)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
 
-;; --- scoped, in-out byte-array pointer loans ---------------------------------
+;; --- scoped, directional byte-array pointer loans ----------------------------
 ;; A jolt byte-array is currently a SIGNED vector (jolt-array kind 'byte), not a
 ;; native bytevector — see ffi-byte-array-vector above, and do NOT change that
 ;; representation here. A pointer loan therefore owns a PRIVATE bytevector
 ;; snapshot: copying in masks each signed element to a native octet (byte & 0xff),
 ;; and copying out folds each native octet back to a signed element (na-u8->byte),
 ;; the same seam read-array!/write-array cross.
+;;
+;; Direction controls the two copies. :in copies arr into tmp and never copies
+;; back, :out starts tmp at zero and copies it back, and :in-out does both. The
+;; legacy arities select :in-out. Output copy-back runs on every first exit,
+;; including exceptional and nonlocal exit, so a partially filled native buffer
+;; remains observable to the caller. Direction is validated before allocation.
 ;;
 ;; Ownership/lifetime: the caller owns `arr`; this scope owns `tmp` from
 ;; allocation through its FIRST exit, and native code holds a borrowed pointer to
@@ -348,9 +354,10 @@
 ;; on that first exit; the before thunk then rejects a captured continuation
 ;; before its callback can resume or a second copy-back can run.
 ;;
-;; A thread parameter tracks same-owner-thread nested loans of the SAME array:
-;; two independent snapshots would give an order-dependent, lossy copy-back, so
-;; that case is rejected. Loans of DISTINCT arrays may nest. Chez thread
+;; A thread parameter tracks same-owner-thread nested loans of the SAME array.
+;; Read-only :in snapshots may nest; every other same-array combination is
+;; rejected because an output copy would make the views order-dependent or lose
+;; updates. Loans of DISTINCT arrays may nest. Chez thread
 ;; parameters are INHERITED (a forked thread starts with the creator's value),
 ;; so the cell carries the owning thread id and an inherited cell is treated as
 ;; empty for a different thread — the same owner-tag pattern as
@@ -371,7 +378,7 @@
       (throw-jvm (quote IndexOutOfBoundsException)
                  (string-append "jolt.ffi/" who
                                 ": byte-array range out of bounds")))))
-(define ffi-byte-array-loan-cell (make-thread-parameter #f))   ; (owner-id . arrays)
+(define ffi-byte-array-loan-cell (make-thread-parameter #f)) ; (owner-id . ((arr . mode) ...))
 (define (ffi-current-byte-array-loans)
   (let ((cell (ffi-byte-array-loan-cell)) (id (get-thread-id)))
     (if (and (pair? cell) (eqv? (car cell) id)) (cdr cell) '())))
@@ -382,24 +389,42 @@
 (define (ffi-copy-bytevector-to-vector! tmp dest start cnt)
   (do ((i 0 (+ i 1))) ((= i cnt))
     (vector-set! dest (+ start i) (na-u8->byte (bytevector-u8-ref tmp i)))))
+(define (ffi-byte-array-loan-mode who direction)
+  (cond ((eq? direction (keyword #f "in")) 'in)
+        ((eq? direction (keyword #f "out")) 'out)
+        ((eq? direction (keyword #f "in-out")) 'in-out)
+        (else
+         (throw-jvm
+          (quote IllegalArgumentException)
+          (string-append "jolt.ffi/" who
+                         ": direction must be :in, :out, or :in-out")))))
+(define (ffi-active-byte-array-loan active-loans arr)
+  (let loop ((loans active-loans))
+    (cond ((null? loans) #f)
+          ((eq? arr (caar loans)) (car loans))
+          (else (loop (cdr loans))))))
 ;; who names the public entry for error messages; `proc` is a Scheme callback
 ;; receiving (pointer validated-length) — distinct from the jolt fn the public
 ;; form wraps via jolt-invoke2. Exposed so the gate can exercise host exceptions
 ;; and nonlocal exits directly.
-(define (ffi-with-scoped-byte-array-pointer who arr off len proc)
+(define (ffi-with-scoped-byte-array-pointer who arr off len direction proc)
   (let* ((v (ffi-byte-array-vector who arr))
          (start (jnum->exact off))
          (cnt (jnum->exact len))
+         (mode (ffi-byte-array-loan-mode who direction))
          (owner-id (get-thread-id))
-         (active-loans (ffi-current-byte-array-loans)))
+         (active-loans (ffi-current-byte-array-loans))
+         (same-array-loan (ffi-active-byte-array-loan active-loans arr)))
     (ffi-check-array-range who v start cnt)
-    (when (memq arr active-loans)
+    (when (and same-array-loan
+               (not (and (eq? mode 'in) (eq? (cdr same-array-loan) 'in))))
       (throw-jvm (quote IllegalStateException)
                  (string-append "jolt.ffi/" who
-                                ": nested loan of the same byte-array")))
+                                ": nested writable loan of the same byte-array")))
     ;; All validation precedes the temporary allocation and lock.
     (let ((tmp (make-bytevector cnt 0)) (retired? #f))
-      (ffi-copy-vector-to-bytevector! v start tmp cnt)
+      (unless (eq? mode 'out)
+        (ffi-copy-vector-to-bytevector! v start tmp cnt))
       (sa-lock-object tmp)
       (dynamic-wind
         (lambda ()
@@ -408,7 +433,7 @@
                    "scoped byte-array pointer continuation cannot be re-entered")))
         (lambda ()
           (parameterize ((ffi-byte-array-loan-cell
-                          (cons owner-id (cons arr active-loans))))
+                          (cons owner-id (cons (cons arr mode) active-loans))))
             (proc (object->reference-address tmp) cnt)))
         (lambda ()
           ;; Retire before cleanup so a continuation can never resume with the
@@ -418,19 +443,28 @@
           (set! retired? #t)
           (dynamic-wind
             void
-            (lambda () (ffi-copy-bytevector-to-vector! tmp v start cnt))
+            (lambda ()
+              (unless (eq? mode 'in)
+                (ffi-copy-bytevector-to-vector! tmp v start cnt)))
             (lambda () (sa-unlock-object tmp))))))))
-(define (ffi-with-byte-array-pointer-range arr off len f)
+(define (ffi-with-byte-array-pointer-range arr off len direction f)
   (ffi-with-scoped-byte-array-pointer
-   "with-byte-array-pointer" arr off len
+   "with-byte-array-pointer" arr off len direction
    (lambda (p cnt) (jolt-invoke2 f p cnt))))
 (define ffi-with-byte-array-pointer
   (case-lambda
     ((arr f)
      (let ((v (ffi-byte-array-vector "with-byte-array-pointer" arr)))
-       (ffi-with-byte-array-pointer-range arr 0 (vector-length v) f)))
+       (ffi-with-byte-array-pointer-range
+        arr 0 (vector-length v) (keyword #f "in-out") f)))
+    ((arr direction f)
+     (let ((v (ffi-byte-array-vector "with-byte-array-pointer" arr)))
+       (ffi-with-byte-array-pointer-range arr 0 (vector-length v) direction f)))
     ((arr off len f)
-     (ffi-with-byte-array-pointer-range arr off len f))))
+     (ffi-with-byte-array-pointer-range
+      arr off len (keyword #f "in-out") f))
+    ((arr off len direction f)
+     (ffi-with-byte-array-pointer-range arr off len direction f))))
 (def-var! "jolt.ffi" "with-byte-array-pointer" ffi-with-byte-array-pointer)
 
 ;; --- string / bytevector marshaling ------------------------------------------

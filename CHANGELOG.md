@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expose their base offset. Layout and aggregate ABI gates compare scalar,
   nested-struct, and multidimensional arrays against compiled C witnesses.
 
+- **Directional scoped byte-array pointer loans.** Existing
+  `with-byte-array-pointer` arities remain `:in-out`; new `(arr direction f)` and
+  `(arr off len direction f)` arities accept `:in`, `:out`, or `:in-out`.
+  Read-only loans skip copy-back, output loans start from zero and skip copy-in,
+  and output is copied back even on exceptional or nonlocal exit. Same-array
+  read-only loans may nest; every nesting involving a writable loan is rejected.
+
 ## [0.7.27] - 2026-08-25
 
 `nth`'s three-argument form used to answer its not-found value for any receiver
