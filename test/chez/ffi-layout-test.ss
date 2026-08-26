@@ -19,6 +19,7 @@
 (ev "(def flat (jolt.ffi/__layout [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]))")
 (ev "(def padded (jolt.ffi/__layout [:struct [[:tag :uint8] [:value :double] [:tail :uint16]]]))")
 (ev "(def nested (jolt.ffi/__layout [:struct [[:tag :uint8] [:date [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]] [:tail :uint16]]]))")
+(ev "(def arrays (jolt.ffi/__layout [:struct [[:tag :uint8] [:params [:array 4 :float]] [:name [:array 5 :char]] [:dates [:array 2 [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]] [:matrix [:array 2 [:array 3 :uint16]]] [:tail :uint16]]]))")
 
 (for-each
  (lambda (row) (ok (car row) (= (c (cadr row)) (n (caddr row)))))
@@ -36,7 +37,16 @@
    ("nested struct" "jolt_layout_nested_date" "(get (:jolt.ffi/offsets nested) [:date])")
    ("nested year" "jolt_layout_nested_year" "(get (:jolt.ffi/offsets nested) [:date :year])")
    ("nested month" "jolt_layout_nested_month" "(get (:jolt.ffi/offsets nested) [:date :month])")
-   ("nested tail" "jolt_layout_nested_tail" "(get (:jolt.ffi/offsets nested) [:tail])")))
+   ("nested tail" "jolt_layout_nested_tail" "(get (:jolt.ffi/offsets nested) [:tail])")
+   ("arrays sizeof" "jolt_layout_arrays_size" "(:size arrays)")
+   ("arrays alignof" "jolt_layout_arrays_align" "(:alignment arrays)")
+   ("array container" "jolt_layout_arrays_params" "(get (:jolt.ffi/offsets arrays) [:params])")
+   ("array scalar element" "jolt_layout_arrays_params_3" "(get (:jolt.ffi/offsets arrays) [:params 3])")
+   ("char array element" "jolt_layout_arrays_name_4" "(get (:jolt.ffi/offsets arrays) [:name 4])")
+   ("struct array element" "jolt_layout_arrays_dates_1" "(get (:jolt.ffi/offsets arrays) [:dates 1])")
+   ("struct array nested field" "jolt_layout_arrays_dates_1_year" "(get (:jolt.ffi/offsets arrays) [:dates 1 :year])")
+   ("nested array scalar" "jolt_layout_arrays_matrix_1_2" "(get (:jolt.ffi/offsets arrays) [:matrix 1 2])")
+   ("arrays tail" "jolt_layout_arrays_tail" "(get (:jolt.ffi/offsets arrays) [:tail])")))
 
 (ok "descriptor retained as data"
     (jolt-truthy? (ev "(= (:descriptor flat) [:struct [[:year :int32] [:month :uint8] [:day :uint8]]])")))
@@ -50,6 +60,21 @@
                  [(jolt.ffi/read p :int32 (get (:jolt.ffi/offsets nested) [:date :year]))
                   (jolt.ffi/read p :uint16 (get (:jolt.ffi/offsets nested) [:tail]))])
               (finally (jolt.ffi/free p))))")))
+(ok "array descriptor retained as data"
+    (jolt-truthy?
+     (ev "(= (:descriptor arrays) [:struct [[:tag :uint8] [:params [:array 4 :float]] [:name [:array 5 :char]] [:dates [:array 2 [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]] [:matrix [:array 2 [:array 3 :uint16]]] [:tail :uint16]]])")))
+(ok "array element memory roundtrip"
+    (jolt-truthy?
+     (ev "(let [p (jolt.ffi/alloc (:size arrays))]
+            (try
+              (jolt.ffi/write p :float (get (:jolt.ffi/offsets arrays) [:params 3]) 3.5)
+              (jolt.ffi/write p :int32 (get (:jolt.ffi/offsets arrays) [:dates 1 :year]) -123456789)
+              (jolt.ffi/write p :uint16 (get (:jolt.ffi/offsets arrays) [:matrix 1 2]) 65535)
+              (= [3.5 -123456789 65535]
+                 [(jolt.ffi/read p :float (get (:jolt.ffi/offsets arrays) [:params 3]))
+                  (jolt.ffi/read p :int32 (get (:jolt.ffi/offsets arrays) [:dates 1 :year]))
+                  (jolt.ffi/read p :uint16 (get (:jolt.ffi/offsets arrays) [:matrix 1 2]))])
+              (finally (jolt.ffi/free p))))")))
 
 (for-each
  (lambda (row) (ok (car row) (rejects? (cdr row))))
@@ -59,7 +84,11 @@
    ("symbol field rejects" . "(jolt.ffi/__layout [:struct [[x :int]]])")
    ("void rejects" . "(jolt.ffi/__layout [:struct [[:x :void]]])")
    ("string rejects" . "(jolt.ffi/__layout [:struct [[:x :string]]])")
-   ("array rejects" . "(jolt.ffi/__layout [:struct [[:x [:array 4 :int]]]])")
+   ("zero array rejects" . "(jolt.ffi/__layout [:struct [[:x [:array 0 :int]]]])")
+   ("negative array rejects" . "(jolt.ffi/__layout [:struct [[:x [:array -1 :int]]]])")
+   ("fractional array rejects" . "(jolt.ffi/__layout [:struct [[:x [:array 1.5 :int]]]])")
+   ("malformed array rejects" . "(jolt.ffi/__layout [:struct [[:x [:array 4]]]])")
+   ("array void rejects" . "(jolt.ffi/__layout [:struct [[:x [:array 4 :void]]]])")
    ("nonliteral rejects" . "(let [d [:struct [[:x :int]]]] (jolt.ffi/__layout d))")))
 
 (printf "~a/~a passed~n" (- total fails) total)

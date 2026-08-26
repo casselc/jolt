@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Fixed arrays in `jolt.ffi` layouts and by-value structs.** A field type may
+  be `[:array positive-count element-type]`; element types may themselves be
+  fixed arrays or structs. Array indices are integer components in field paths,
+  so `[:params 3]`, `[:events 1 :frame]`, and `[:matrix 1 2]` work with
+  `field-offset`, `read-field`, and `write-field`. Array container paths still
+  expose their base offset. Layout and aggregate ABI gates compare scalar,
+  nested-struct, and multidimensional arrays against compiled C witnesses.
+
 ## [0.7.27] - 2026-08-25
 
 `nth`'s three-argument form used to answer its not-found value for any receiver

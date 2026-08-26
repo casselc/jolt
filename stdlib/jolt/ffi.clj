@@ -42,6 +42,12 @@
   are not supported. A fixed aggregate may precede :varargs, but aggregate
   variadic arguments and aggregate-return-plus-varargs are rejected.
 
+  Layout fields may use [:array positive-count element-type]. Arrays may contain
+  fixed-size scalars, nested structs, or other fixed arrays. Integer components
+  address elements in field paths: [:params 3], [:events 1 :frame], or
+  [:matrix 1 2]. The array field path itself names its base address and is not a
+  scalar read/write target.
+
   with-byte-array-pointer is a scoped, synchronous in-out bridge, not a
   zero-copy view: (with-byte-array-pointer arr f) loans the whole signed byte
   array and (with-byte-array-pointer arr off len f) loans one validated range.
@@ -101,7 +107,9 @@
 (defmacro layout
   "Compile a literal [:struct [[field type] ...]] descriptor into immutable ABI
   layout data. Field names are unique unqualified keywords; fields are fixed-size
-  scalars or nested structs. Chez supplies size, alignment, and offsets."
+  scalars, nested structs, or recursively nestable [:array positive-count type]
+  descriptors. Chez supplies size, alignment, and offsets; array elements use
+  integer path components, for example [:matrix 1 2]."
   [descriptor]
   (list 'jolt.ffi/__layout descriptor))
 
@@ -113,8 +121,11 @@
 (defn- checked-field-path [path]
   (let [p (if (keyword? path) [path] path)]
     (when-not (and (vector? p) (pos? (count p))
-                   (every? #(and (keyword? %) (nil? (namespace %))) p))
-      (throw (ex-info "jolt.ffi: field path must be an unqualified keyword or non-empty vector of them"
+                   (keyword? (first p)) (nil? (namespace (first p)))
+                   (every? #(or (and (keyword? %) (nil? (namespace %)))
+                                (and (integer? %) (not (neg? %))))
+                           p))
+      (throw (ex-info "jolt.ffi: field path must start with an unqualified keyword and contain only unqualified keywords or non-negative array indices"
                       {:path path})))
     p))
 
@@ -132,7 +143,7 @@
 (defn- field-type [layout path]
   (let [types (:jolt.ffi/types layout)]
     (when-not (contains? types path)
-      (throw (ex-info "jolt.ffi: field path names a struct, not a scalar field"
+      (throw (ex-info "jolt.ffi: field path names a struct or array, not a scalar field"
                       {:path path})))
     (get types path)))
 

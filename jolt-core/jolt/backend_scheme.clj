@@ -1140,19 +1140,49 @@
 (defn- ffi-type->chez [t]
   (or (ffi-types t) (throw (ex-info (str "jolt.ffi: unknown foreign type :" t) {}))))
 
-(defn- emit-ffi-layout-ftype [layout]
-  (str "(struct "
-       (str/join
-        " "
-        (map-indexed
-         (fn [i field]
-           (str "[f" i " "
-                (if (string? (:type field))
-                  (ffi-type->chez (:type field))
-                  (emit-ffi-layout-ftype (:type field)))
-                "]"))
-         (:fields layout)))
-       ")"))
+(defn- emit-ffi-layout-ftype [type]
+  (cond
+    (string? type) (ffi-type->chez type)
+    (= :struct (:ffi-kind type))
+    (str "(struct "
+         (str/join
+          " "
+          (map-indexed
+           (fn [i field]
+             (str "[f" i " " (emit-ffi-layout-ftype (:type field)) "]"))
+           (:fields type)))
+         ")")
+    (= :array (:ffi-kind type))
+    (str "(array " (:count type) " " (emit-ffi-layout-ftype (:type type)) ")")
+    :else
+    (throw (ex-info "jolt.ffi: invalid analyzed layout type" {:type type}))))
+
+(declare ffi-layout-descendant-entries)
+
+(defn- ffi-layout-entry [type public-path emitted-path]
+  (cons {:path public-path :emitted-path emitted-path :type type}
+        (ffi-layout-descendant-entries type public-path emitted-path)))
+
+(defn- ffi-layout-descendant-entries [type public-path emitted-path]
+  (cond
+    (string? type) []
+    (= :struct (:ffi-kind type))
+    (mapcat
+     (fn [i field]
+       (ffi-layout-entry (:type field)
+                         (conj public-path (:name field))
+                         (conj emitted-path (str "f" i))))
+     (range (count (:fields type)))
+     (:fields type))
+    (= :array (:ffi-kind type))
+    (mapcat
+     (fn [i]
+       (ffi-layout-entry (:type type)
+                         (conj public-path i)
+                         (conj emitted-path i)))
+     (range (:count type)))
+    :else
+    (throw (ex-info "jolt.ffi: invalid analyzed layout type" {:type type}))))
 
 (defn- ffi-layout-entries
   ([layout] (ffi-layout-entries layout [] []))
@@ -1160,31 +1190,38 @@
    (mapcat
     (fn [i field]
       (let [pp (conj public-path (:name field))
-            ep (conj emitted-path (str "f" i))
-            entry {:path pp :emitted-path ep :type (:type field)}]
-        (if (string? (:type field))
-          [entry]
-          (cons entry (ffi-layout-entries (:type field) pp ep)))))
+            ep (conj emitted-path (str "f" i))]
+        (ffi-layout-entry (:type field) pp ep)))
     (range (count (:fields layout)))
     (:fields layout))))
 
 (defn- emit-layout-path [path]
   (str "(jolt-vector "
-       (str/join " " (map (fn [n] (str "(keyword #f " (chez-str-lit n) ")")) path))
+       (str/join " "
+                 (map (fn [part]
+                        (if (string? part)
+                          (str "(keyword #f " (chez-str-lit part) ")")
+                          part))
+                      path))
        ")"))
 
-(defn- emit-layout-descriptor [layout]
-  (str "(jolt-vector (keyword #f \"struct\") (jolt-vector "
-       (str/join
-        " "
-        (map (fn [field]
-               (str "(jolt-vector (keyword #f " (chez-str-lit (:name field)) ") "
-                    (if (string? (:type field))
-                      (str "(keyword #f " (chez-str-lit (:type field)) ")")
-                      (emit-layout-descriptor (:type field)))
-                    ")"))
-             (:fields layout)))
-       "))"))
+(defn- emit-layout-descriptor [type]
+  (cond
+    (string? type) (str "(keyword #f " (chez-str-lit type) ")")
+    (= :struct (:ffi-kind type))
+    (str "(jolt-vector (keyword #f \"struct\") (jolt-vector "
+         (str/join
+          " "
+          (map (fn [field]
+                 (str "(jolt-vector (keyword #f " (chez-str-lit (:name field)) ") "
+                      (emit-layout-descriptor (:type field)) ")"))
+               (:fields type)))
+         "))")
+    (= :array (:ffi-kind type))
+    (str "(jolt-vector (keyword #f \"array\") " (:count type) " "
+         (emit-layout-descriptor (:type type)) ")")
+    :else
+    (throw (ex-info "jolt.ffi: invalid analyzed layout type" {:type type}))))
 
 (defn- emit-ffi-layout [node]
   (let [layout (:layout node)
