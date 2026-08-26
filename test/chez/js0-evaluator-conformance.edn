@@ -1,7 +1,8 @@
-{:conformance/version 3
+{:conformance/version 4
  :conformance/scope :js0-current-runtime
  :baseline {:branch "js1-runtime-current-upstream"
-            :upstream "edda7aec"}
+            :upstream "4c0022d4"
+            :head "157243e4"}
  :profiles [:agent/minimal :agent/project-read :agent/project-develop]
  :cases
  [{:case/id :host/sci-compat

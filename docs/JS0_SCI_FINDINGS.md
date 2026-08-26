@@ -3,10 +3,10 @@
 ## Record scope
 
 This is the current evidence record for branch `js1-runtime-current-upstream`,
-rebased onto an initially clean `upstream/main` at `edda7aec` on 2026-08-24.
-The implementation was re-derived against current source rather than
-cherry-picked. No tag, historical branch, vendor pin, submodule, or upstream
-configuration was changed.
+rebased onto current `upstream/main` at `4c0022d4` (merge of PR #735) on
+2026-08-25, HEAD `157243e4`. The implementation was re-derived against current
+source rather than cherry-picked. No tag, historical branch, vendor pin,
+submodule, or upstream configuration was changed.
 
 The historical JS0 records are distinct and unamended; this file does not
 claim that any of them ran against this baseline:
@@ -16,10 +16,12 @@ claim that any of them ran against this baseline:
   `js0-functional-sci-upstream-freeze` (contains `04dd42db`), plus the
   post-JS0 language-surface change `619ef196` on branch
   `js0-functional-sci-upstream`;
-* the immediately superseded current-runtime record (baseline `ea3313a0`) —
-  `c83196f2`, reachable from tag `js1-runtime-pre-upstream-sci-merge`.
+* the superseded current-runtime record (baseline `ea3313a0`) — `c83196f2`,
+  reachable from tag `js1-runtime-pre-upstream-sci-merge`;
+* the immediately superseded current-runtime record (baseline `edda7aec`) —
+  `279bca18`, reachable from tag `js1-runtime-pre-final`.
 
-Only this file, on this branch, claims the `edda7aec` baseline.
+Only this file, on this branch, claims the `4c0022d4` baseline.
 
 ## Current-runtime result
 
@@ -43,8 +45,8 @@ print bindings.
 ## Compatibility seams are upstream at this baseline
 
 SCI's vendored source at `32d62a5` needs four general host seams, and all four
-are upstream behavior at `edda7aec` — this branch adds no host changes for
-SCI:
+are upstream behavior at `4c0022d4` (each named commit verified an ancestor of
+the base) — this branch adds no host changes for SCI:
 
 1. `clojure.core/imap-cons`, referenced by SCI's ordinary record/deftype path,
    resolves to Jolt's existing `conj` semantics (upstream `92c110bc`,
@@ -152,7 +154,7 @@ upstream SCI functional and nested-interrupt gates' test files:
 The Clojure suites run through `bin/jolt` in script mode with the same
 `-Sdeps` local-root form as `scifunctional`, so the lane does not depend on
 the standalone-binary build. The lane is opt-in: `make ci` and `make test`
-are unchanged. `test/chez/js0-evaluator-conformance.edn` (version 3) is the
+are unchanged. `test/chez/js0-evaluator-conformance.edn` (version 4) is the
 assertion manifest for this record against this baseline.
 
 ## Source-loading classification
@@ -168,19 +170,29 @@ self-host fixpoint was still run and remained byte-identical.
 ## Verification on this exact working tree
 
 Environment: Linux, Chez Scheme 10.4.1 at `/usr/local/bin/scheme`; submodules
-at their current upstream pins, including SCI `32d62a5`.
+at their current upstream pins, including SCI `32d62a5`. One environment shim:
+this box ships `libuuid.so.1` without the `uuid-dev` linker symlink, so the
+`testbin`/standalone link steps ran with `LIBRARY_PATH=/tmp/opencode/lib` (a
+`libuuid.so` symlink). No repo file is involved.
 
 ```text
-git diff --check
-  PASS
+git diff --check   (working tree, and 4c0022d4..HEAD)
+  PASS (no whitespace errors)
 
 sh host/chez/manifest-check.sh
   manifest check: passed
+
+make selfhost CHEZ=/usr/local/bin/scheme
+  mint: 0 form(s) skipped
+  self-host fixpoint: rebuild == checked-in seed
 
 make testbin CHEZ=/usr/local/bin/scheme
   build-jolt: stdlib-fasl skip jolt.sandbox — requires sci/core.{jolt,clj,cljc}
     from vendored SCI, absent from the install roots at build time
   build-jolt: wrote target/release/jolt
+
+/usr/local/bin/scheme --script host/chez/run-sci.ss
+  SCI load: 417/424 forms ok (7 fail), above the preserved 416 floor
 
 make scievaluator CHEZ=/usr/local/bin/scheme
   JS0-SANDBOX OK                       (includes the discriminating Numbers
@@ -189,38 +201,36 @@ make scievaluator CHEZ=/usr/local/bin/scheme
   SCI-FUNCTIONAL-TEST OK
   9/9 interrupt nesting assertions passed
 
-make selfhost CHEZ=/usr/local/bin/scheme
-  mint: 0 form(s) skipped
-  self-host fixpoint: rebuild == checked-in seed
+bin/jolt run test/chez/process-test.clj
+  PROCESS-TEST OK — 136 checks, 0 failures, including the bounded-capture
+  (scoped flood), destroy-tree grandchild, scoped-interrupt, and
+  scoped-fiber (~200 park cycles) sections
 
-/usr/local/bin/scheme --script host/chez/run-sci.ss
-  SCI load: 417/424 forms ok (7 fail), above the preserved 416 floor
+make interruptnest CHEZ=/usr/local/bin/scheme
+  9/9 interrupt nesting assertions passed
 
 /usr/local/bin/scheme --script host/chez/run-unit.ss
-  unit gate: 1425/1425 passed
+  unit gate: 1455/1455 passed
 
-/usr/local/bin/scheme --script test/chez/values-test.ss
-  values-test: 108/108 passed
-
-/usr/local/bin/scheme --script host/chez/run-gosm.ss
-  gosm gate: 116/116 passed
-
-/usr/local/bin/scheme --script test/chez/thread-safety-test.ss
-  thread-safety-test: 42 checks, 0 failure(s)
-
-/usr/local/bin/scheme --script test/chez/async-timer-test.ss
-  16 checks, 0 failed
-
-/usr/local/bin/scheme --script test/chez/fibers-test.ss
-  fibers-test: 45 checks, 0 failure(s)
-
-/usr/local/bin/scheme --script test/chez/fibers-preempt-test.ss
-  fibers-preempt-test: 66 checks, 0 failure(s)
-
-/usr/local/bin/scheme --script test/chez/fibers-monitor-test.ss
-  fibers-monitor-test: 21 checks, 0 failure(s)
-  (the gate intentionally prints caught go-body `race` exceptions)
+make ci CHEZ=/usr/local/bin/scheme (-j16)
+  OK: ci gate passed (84 targets)
+  gate receipt: tree 398d9c4a22d5c131e5e229c40374113fff737f44312e5ed91ccd2449ed511bc9
+    at head 157243e4dcfd90e929c836feec8c8a1093e83d09
+  within it: values-test 108/108; unit 1455/1455; corpus and cts at their
+    pinned baselines (cts: 243 namespaces, pass 5987, fail 139, error 3 —
+    matches baseline); SCI load 417/424; SCI-FUNCTIONAL-TEST OK; gosm
+    116/116; thread-safety 42 checks, 0 failures; async-timer 16 checks,
+    0 failed; fibers 45/0, fibers-preempt 66/0, fibers-monitor 21/0,
+    fibers-process-io 36/0; cli smoke 177 passed, 0 failed (includes the
+    process-test case); certify ran against reference Clojure (self-test
+    11/11, arg-parse 8/8); gambitcheck/gambitboot skipped (gambit-scheme
+    not installed — detection-gated, as designed)
 ```
+
+The gate runs above preceded the final edit of this file and of
+`test/chez/js0-evaluator-conformance.edn` (the record update itself); no other
+file changed after the runs, so the `ci` receipt's tree hash predates exactly
+those two record edits.
 
 ## Manifest and standalone-build closure
 
@@ -239,11 +249,19 @@ does not require reminting.
 
 ## Unrun gates and nonclaims
 
-The full `make test`/`make ci`, debug standalone build, tree-shake/AOT
-lanes, the complete historical fiber matrix, macOS, Windows, and interrupted
-native-call behavior were not run. `make remint` was not run because no source
-in either seed emission list changed. The superseded quoted-Class and TZ tests
-were intentionally not added to this current-runtime slice.
+`make ci` (84 targets) and `make selfhost` each ran and passed on this tree;
+`make test` as the single composite invocation was not run separately from
+its two constituents. Still not run: the debug standalone build
+(`jolt-debug`), the git-dep tree-shake apps in `shakesmoke` (the local
+fixtures in `shakelocal` ran inside `ci`), the manual perf lanes
+(`aotcacheperf`, `printperf`, `sbperf`, `dynbench`, `fibersbench`,
+`fibersresidue`), `httpsfetch`, `libconformance`, the Gambit kernel/eval/web/
+profile lanes (gambit-scheme absent on this box; the Chez-side Gambit
+generation and seed checks inside `ci` passed), macOS, Windows, and
+interrupted native-call behavior. `make remint` was not run because no source
+in either seed emission list changed — confirmed by the byte-identical
+self-host fixpoint above. The superseded quoted-Class and TZ tests were
+intentionally not added to this current-runtime slice.
 
 This result is not a full bb4t corpus proof, durable authorization service,
 Samizdat claim, simulator, or guarantee that arbitrary native calls can be
