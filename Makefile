@@ -543,6 +543,12 @@ cts: testbin
 # layout gate compares declarative struct metadata and field access against C;
 # the aggregate gate covers structs passed and returned by C value; the native
 # error gate covers atomic errno/GetLastError capture and option composition.
+# ffi-byte-array-pointer: with-byte-array-pointer loans a stable pointer into a
+# private native-octet snapshot of a whole byte-array or one validated range to
+# a synchronous callback. :in, :out, and :in-out select copy direction; output
+# copies back on normal, exceptional, and nonlocal exit. Same-array read-only
+# nesting is allowed; writable nesting and retired-continuation re-entry are
+# rejected. A callback that parks is cleaned up and rejected on resume.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
@@ -550,6 +556,7 @@ ffi:
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
 
 # Escape continuations (jolt.continuations, issue #736): the one-shot contract
 # call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber
