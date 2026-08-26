@@ -1,0 +1,28 @@
+name: ci-only Intel installer
+
+on:
+  pull_request:
+    branches:
+      - codex/ci-current-main-base-20260826
+
+permissions:
+  contents: read
+
+jobs:
+  install-published-release:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install and run the published Intel release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = x86_64
+          install_dir="$RUNNER_TEMP/jolt-intel-install"
+          bash ./install --version 0.7.27 --dir "$install_dir"
+          test -x "$install_dir/jolt"
+          file "$install_dir/jolt" | grep -q 'x86_64'
+          "$install_dir/jolt" --version | grep -q '0.7.27'
