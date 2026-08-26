@@ -274,18 +274,33 @@
 ;; memory is unsigned octets and a byte-array element is a signed byte, so the
 ;; two directions fold and mask across that seam (bytevector-s8-ref/-u8-set!
 ;; are that fold).
-(define (ffi-bv->byte-vec! bv v off n)
-  (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v (+ off i) (bytevector-s8-ref bv i))))
-(define (ffi-byte-vec->bv! v off n)
+(define (ffi-byte-array-vector who arr)
+  (if (and (jolt-array? arr) (eq? (jolt-array-kind arr) 'byte))
+      (jolt-array-vec arr)
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append "jolt.ffi/" who ": expected byte-array"))))
+(define (ffi-check-array-range who v off len)
+  (let ((n (vector-length v)))
+    (when (or (< off 0) (< len 0) (> off n) (> len (- n off)))
+      (throw-jvm (quote IndexOutOfBoundsException)
+                 (string-append "jolt.ffi/" who
+                                ": byte-array range out of bounds")))))
+(define (ffi-copy-bytevector-to-vector! src dest start cnt)
+  (do ((i 0 (+ i 1))) ((= i cnt))
+    (vector-set! dest (+ start i) (bytevector-s8-ref src i))))
+(define (ffi-copy-vector-to-bytevector! src start dest cnt)
+  (do ((i 0 (+ i 1))) ((= i cnt))
+    (bytevector-u8-set! dest i
+                        (bitwise-and (exact (vector-ref src (+ start i))) #xff))))
+(define (ffi-byte-vector-slice->bytevector v off n)
   (let ((bv (make-bytevector n)))
-    (do ((i 0 (+ i 1))) ((= i n))
-      (bytevector-u8-set! bv i (bitwise-and (exact (vector-ref v (+ off i))) #xff)))
+    (ffi-copy-vector-to-bytevector! v off bv n)
     bv))
 
 (define (ffi-read-array ptr n)
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n)) (v (make-vector n 0)))
     (sa-foreign-bytes-ref! p bv n)
-    (ffi-bv->byte-vec! bv v 0 n)
+    (ffi-copy-bytevector-to-vector! bv v 0 n)
     (make-jolt-array v 'byte)))
 
 ;; (read-into! ptr arr off n) -> n. Copy n bytes at ptr into arr starting at off
@@ -293,31 +308,23 @@
 ;; of bounds — a short read that silently truncated would corrupt the buffer.
 (define (ffi-read-into! ptr arr off n)
   (let* ((n (jnum->exact n)) (off (jnum->exact off)) (p (jnum->exact ptr))
-         (v (jolt-array-vec arr)) (cap (vector-length v)))
-    (when (or (< off 0) (< n 0) (> (+ off n) cap))
-      (jolt-throw (jolt-ex-info "jolt.ffi/read-into!: range outside the byte-array"
-                                (jolt-hash-map (jolt-keyword "offset") off
-                                               (jolt-keyword "length") n
-                                               (jolt-keyword "capacity") cap))))
+         (v (ffi-byte-array-vector "read-into!" arr)))
+    (ffi-check-array-range "read-into!" v off n)
     (let ((bv (make-bytevector n)))
       (sa-foreign-bytes-ref! p bv n)
-      (ffi-bv->byte-vec! bv v off n)
+      (ffi-copy-bytevector-to-vector! bv v off n)
       n)))
 
 (define ffi-write-array
   (case-lambda
     ((ptr arr)
-     (let ((v (jolt-array-vec arr)))
+     (let ((v (ffi-byte-array-vector "write-array" arr)))
        (ffi-write-array ptr arr 0 (vector-length v))))
     ((ptr arr off n)
      (let* ((n (jnum->exact n)) (off (jnum->exact off)) (p (jnum->exact ptr))
-            (v (jolt-array-vec arr)) (cap (vector-length v)))
-       (when (or (< off 0) (< n 0) (> (+ off n) cap))
-         (jolt-throw (jolt-ex-info "jolt.ffi/write-array: range outside the byte-array"
-                                   (jolt-hash-map (jolt-keyword "offset") off
-                                                  (jolt-keyword "length") n
-                                                  (jolt-keyword "capacity") cap))))
-       (sa-foreign-bytes-set! p (ffi-byte-vec->bv! v off n) n)
+            (v (ffi-byte-array-vector "write-array" arr)))
+       (ffi-check-array-range "write-array" v off n)
+       (sa-foreign-bytes-set! p (ffi-byte-vector-slice->bytevector v off n) n)
        n))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-into!" ffi-read-into!)
@@ -367,28 +374,10 @@
 ;; Overlapping private snapshots can copy back in an order that loses updates;
 ;; even disjoint ranges remain outside the supported contract because this API
 ;; neither synchronizes access nor enforces array ownership across threads.
-(define (ffi-byte-array-vector who arr)
-  (if (and (jolt-array? arr) (eq? (jolt-array-kind arr) 'byte))
-      (jolt-array-vec arr)
-      (throw-jvm (quote IllegalArgumentException)
-                 (string-append "jolt.ffi/" who ": expected byte-array"))))
-(define (ffi-check-array-range who v off len)
-  (let ((n (vector-length v)))
-    (when (or (< off 0) (< len 0) (> off n) (> len (- n off)))
-      (throw-jvm (quote IndexOutOfBoundsException)
-                 (string-append "jolt.ffi/" who
-                                ": byte-array range out of bounds")))))
 (define ffi-byte-array-loan-cell (make-thread-parameter #f)) ; (owner-id . ((arr . mode) ...))
 (define (ffi-current-byte-array-loans)
   (let ((cell (ffi-byte-array-loan-cell)) (id (get-thread-id)))
     (if (and (pair? cell) (eqv? (car cell) id)) (cdr cell) '())))
-(define (ffi-copy-vector-to-bytevector! src start tmp cnt)
-  (do ((i 0 (+ i 1))) ((= i cnt))
-    (bytevector-u8-set! tmp i
-                        (bitwise-and (exact (vector-ref src (+ start i))) #xff))))
-(define (ffi-copy-bytevector-to-vector! tmp dest start cnt)
-  (do ((i 0 (+ i 1))) ((= i cnt))
-    (vector-set! dest (+ start i) (na-u8->byte (bytevector-u8-ref tmp i)))))
 (define (ffi-byte-array-loan-mode who direction)
   (cond ((eq? direction (keyword #f "in")) 'in)
         ((eq? direction (keyword #f "out")) 'out)

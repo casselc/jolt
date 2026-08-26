@@ -75,7 +75,9 @@
   write-array move raw octets to and from a byte-array, and read-into! fills a
   slice of an EXISTING byte-array — so a caller reading a stream whose length
   it already knows fills one buffer instead of regrowing an accumulator per
-  chunk. All of them move the block in one copy, not a byte at a time.
+  chunk. The raw-array moves reject other primitive-array kinds and throw
+  IndexOutOfBoundsException for an invalid slice. All of them move the block
+  in one copy, not a byte at a time.
 
   string->ptr and ptr->string round-trip nil: nil answers NULL and allocates
   nothing, NULL reads back as nil, and \"\" still allocates its NUL byte and

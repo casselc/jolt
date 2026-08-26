@@ -1,5 +1,11 @@
 # Changelog
 
+- Consolidate `read-into!`, `write-array`, and directional byte-array loans on
+  one checked byte-array/range and vector-bytevector copy substrate. The older
+  transfer functions now reject non-byte primitive arrays explicitly instead
+  of silently treating their backing vectors as octets, and invalid slices
+  consistently throw `IndexOutOfBoundsException`.
+
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
