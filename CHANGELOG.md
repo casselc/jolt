@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Directional scoped byte-array pointer loans.** Existing
+  `with-byte-array-pointer` arities remain `:in-out`; new `(arr direction f)` and
+  `(arr off len direction f)` arities accept `:in`, `:out`, or `:in-out`.
+  Read-only loans skip copy-back, output loans start from zero and skip copy-in,
+  and output is copied back even on exceptional or nonlocal exit. Same-array
+  read-only loans may nest; every same-array nesting involving a writable loan
+  is rejected. Callbacks are non-parking: a fiber park cleans up the loan and
+  raises `IllegalStateException` if execution attempts to resume inside it.
+  Atomic native-error capture composes with output copy-back; callers must
+  capture inside the callback, before loan cleanup runs.
+
+### Changed
+
+- Consolidate `read-into!`, `write-array`, and directional byte-array loans on
+  one checked byte-array/range and vector-bytevector copy substrate. The older
+  transfer functions now reject non-byte primitive arrays explicitly instead
+  of silently treating their backing vectors as octets, and invalid slices
+  consistently throw `IndexOutOfBoundsException`.
+
 ## [0.7.28] - 2026-08-27
 
 Two things a namespace does constantly — name a class and read a form — were
@@ -403,9 +424,35 @@ native-error capture.
   Metadata retains one entry per declared array shape and resolves indexed
   offsets from ABI-derived element strides, so even million-element flat and
   nested arrays remain compact.
+- **Directional scoped byte-array pointer loans.** Existing
+  `with-byte-array-pointer` arities remain `:in-out`; new `(arr direction f)` and
+  `(arr off len direction f)` arities accept `:in`, `:out`, or `:in-out`.
+  Read-only loans skip copy-back, output loans start from zero and skip copy-in,
+  and output is copied back even on exceptional or nonlocal exit. Same-array
+  read-only loans may nest; every same-array nesting involving a writable loan
+  is rejected. Callbacks are non-parking: a fiber park cleans up the loan and
+  raises `IllegalStateException` if execution attempts to resume inside it.
+  Atomic native-error capture composes with output copy-back; callers must
+  capture inside the callback, before loan cleanup runs.
+
+### Changed
+
+- Consolidate `read-into!`, `write-array`, and directional byte-array loans on
+  one checked byte-array/range and vector-bytevector copy substrate. The older
+  transfer functions now reject non-byte primitive arrays explicitly instead
+  of silently treating their backing vectors as octets, and invalid slices
+  consistently throw `IndexOutOfBoundsException`.
 
 ### Fixed
 
+- **`File.canRead`/`canWrite`/`canExecute` and `Files.isReadable`/`isWritable`/
+  `isExecutable` answer permissions, not existence.** All six reported whether
+  the file exists, so a read-only file came back writable and every regular file
+  came back executable — code testing writability before a write took the wrong
+  branch and found out at the open. `babashka.fs/writable?` and its siblings
+  route to `Files/is*able` and inherited it. They now ask `access(2)` about the
+  effective user, through one shared predicate so the `java.io` and
+  `java.nio.file` spellings cannot drift apart.
 - **A backtick nested inside a backtick is lowered inside-out.** Defining a
   macro that defines a macro — `` `(defmacro f [x#] `(g ~x#)) `` — raised
   "Unable to resolve symbol: x#" at the point the OUTER macro was defined,

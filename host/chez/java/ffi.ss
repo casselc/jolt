@@ -373,18 +373,33 @@
 ;; memory is unsigned octets and a byte-array element is a signed byte, so the
 ;; two directions fold and mask across that seam (bytevector-s8-ref/-u8-set!
 ;; are that fold).
-(define (ffi-bv->byte-vec! bv v off n)
-  (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v (+ off i) (bytevector-s8-ref bv i))))
-(define (ffi-byte-vec->bv! v off n)
+(define (ffi-byte-array-vector who arr)
+  (if (and (jolt-array? arr) (eq? (jolt-array-kind arr) 'byte))
+      (jolt-array-vec arr)
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append "jolt.ffi/" who ": expected byte-array"))))
+(define (ffi-check-array-range who v off len)
+  (let ((n (vector-length v)))
+    (when (or (< off 0) (< len 0) (> off n) (> len (- n off)))
+      (throw-jvm (quote IndexOutOfBoundsException)
+                 (string-append "jolt.ffi/" who
+                                ": byte-array range out of bounds")))))
+(define (ffi-copy-bytevector-to-vector! src dest start cnt)
+  (do ((i 0 (+ i 1))) ((= i cnt))
+    (vector-set! dest (+ start i) (bytevector-s8-ref src i))))
+(define (ffi-copy-vector-to-bytevector! src start dest cnt)
+  (do ((i 0 (+ i 1))) ((= i cnt))
+    (bytevector-u8-set! dest i
+                        (bitwise-and (exact (vector-ref src (+ start i))) #xff))))
+(define (ffi-byte-vector-slice->bytevector v off n)
   (let ((bv (make-bytevector n)))
-    (do ((i 0 (+ i 1))) ((= i n))
-      (bytevector-u8-set! bv i (bitwise-and (exact (vector-ref v (+ off i))) #xff)))
+    (ffi-copy-vector-to-bytevector! v off bv n)
     bv))
 
 (define (ffi-read-array ptr n)
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n)) (v (make-vector n 0)))
     (sa-foreign-bytes-ref! p bv n)
-    (ffi-bv->byte-vec! bv v 0 n)
+    (ffi-copy-bytevector-to-vector! bv v 0 n)
     (make-jolt-array v 'byte)))
 
 ;; (read-into! ptr arr off n) -> n. Copy n bytes at ptr into arr starting at off
@@ -392,35 +407,158 @@
 ;; of bounds — a short read that silently truncated would corrupt the buffer.
 (define (ffi-read-into! ptr arr off n)
   (let* ((n (jnum->exact n)) (off (jnum->exact off)) (p (jnum->exact ptr))
-         (v (jolt-array-vec arr)) (cap (vector-length v)))
-    (when (or (< off 0) (< n 0) (> (+ off n) cap))
-      (jolt-throw (jolt-ex-info "jolt.ffi/read-into!: range outside the byte-array"
-                                (jolt-hash-map (jolt-keyword "offset") off
-                                               (jolt-keyword "length") n
-                                               (jolt-keyword "capacity") cap))))
+         (v (ffi-byte-array-vector "read-into!" arr)))
+    (ffi-check-array-range "read-into!" v off n)
     (let ((bv (make-bytevector n)))
       (sa-foreign-bytes-ref! p bv n)
-      (ffi-bv->byte-vec! bv v off n)
+      (ffi-copy-bytevector-to-vector! bv v off n)
       n)))
 
 (define ffi-write-array
   (case-lambda
     ((ptr arr)
-     (let ((v (jolt-array-vec arr)))
+     (let ((v (ffi-byte-array-vector "write-array" arr)))
        (ffi-write-array ptr arr 0 (vector-length v))))
     ((ptr arr off n)
      (let* ((n (jnum->exact n)) (off (jnum->exact off)) (p (jnum->exact ptr))
-            (v (jolt-array-vec arr)) (cap (vector-length v)))
-       (when (or (< off 0) (< n 0) (> (+ off n) cap))
-         (jolt-throw (jolt-ex-info "jolt.ffi/write-array: range outside the byte-array"
-                                   (jolt-hash-map (jolt-keyword "offset") off
-                                                  (jolt-keyword "length") n
-                                                  (jolt-keyword "capacity") cap))))
-       (sa-foreign-bytes-set! p (ffi-byte-vec->bv! v off n) n)
+            (v (ffi-byte-array-vector "write-array" arr)))
+       (ffi-check-array-range "write-array" v off n)
+       (sa-foreign-bytes-set! p (ffi-byte-vector-slice->bytevector v off n) n)
        n))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-into!" ffi-read-into!)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
+
+;; --- scoped, directional byte-array pointer loans ----------------------------
+;; A jolt byte-array is currently a SIGNED vector (jolt-array kind 'byte), not a
+;; native bytevector — see ffi-byte-array-vector above, and do NOT change that
+;; representation here. A pointer loan therefore owns a PRIVATE bytevector
+;; snapshot: copying in masks each signed element to a native octet (byte & 0xff),
+;; and copying out reads each native octet as a signed byte, the same seam that
+;; read-into! and write-array cross.
+;;
+;; Direction controls the two copies. :in copies arr into tmp and never copies
+;; back, :out starts tmp at zero and copies it back, and :in-out does both. The
+;; legacy arities select :in-out. Output copy-back runs on every first exit,
+;; including exceptional and nonlocal exit, so a partially filled native buffer
+;; remains observable to the caller. Direction is validated before allocation.
+;;
+;; Ownership/lifetime: the caller owns `arr`; this scope owns `tmp` from
+;; allocation through its FIRST exit, and native code holds a borrowed pointer to
+;; `tmp` only while the callback runs. Native code must not retain, free, or use
+;; that pointer after the callback exits. Copy-back owns arr[start,start+cnt) for
+;; the callback's duration, so jolt code must not mutate that range concurrently.
+;; Other ranges and other arrays are not aliased by this temporary.
+;;
+;; Validation precedes allocation, locking, and the callback: kind
+;; (ffi-byte-array-vector) and subtraction-safe range (ffi-check-array-range, the
+;; same complete-range check read-into!/write-array use) run first. `tmp` is
+;; locked only for the callback extent, keeping its first-byte address stable
+;; across collection; object->reference-address is valid only while locked.
+;; dynamic-wind runs copy-back on normal return, jolt/host exceptions, AND
+;; nonlocal exits. Retiring before copy-back makes the address permanently dead
+;; on that first exit; the before thunk then rejects a captured continuation
+;; before its callback can resume or a second copy-back can run. A fiber park is
+;; also a Scheme-level unwind through this host dynamic-wind: cleanup runs, and
+;; resumption is rejected with IllegalStateException. The callback is therefore
+;; synchronous in the strong sense: it must not yield or otherwise park.
+;;
+;; A thread parameter tracks same-owner-thread nested loans of the SAME array.
+;; Read-only :in snapshots may nest; every other same-array combination is
+;; rejected because an output copy would make the views order-dependent or lose
+;; updates. Loans of DISTINCT arrays may nest. Chez thread
+;; parameters are INHERITED (a forked thread starts with the creator's value),
+;; so the cell carries the owning thread id and an inherited cell is treated as
+;; empty for a different thread — the same owner-tag pattern as
+;; thread-interrupt-cell in host-static-methods.ss and thread-handle-cell in io.ss.
+;; The owner tag is not a cross-thread exclusion mechanism. Callers must prevent
+;; overlapping loan lifetimes or other access to the same array across threads.
+;; Overlapping private snapshots can copy back in an order that loses updates;
+;; even disjoint ranges remain outside the supported contract because this API
+;; neither synchronizes access nor enforces array ownership across threads.
+(define ffi-byte-array-loan-cell (make-thread-parameter #f)) ; (owner-id . ((arr . mode) ...))
+(define (ffi-current-byte-array-loans)
+  (let ((cell (ffi-byte-array-loan-cell)) (id (get-thread-id)))
+    (if (and (pair? cell) (eqv? (car cell) id)) (cdr cell) '())))
+(define (ffi-byte-array-loan-mode who direction)
+  (cond ((eq? direction (keyword #f "in")) 'in)
+        ((eq? direction (keyword #f "out")) 'out)
+        ((eq? direction (keyword #f "in-out")) 'in-out)
+        (else
+         (throw-jvm
+          (quote IllegalArgumentException)
+          (string-append "jolt.ffi/" who
+                         ": direction must be :in, :out, or :in-out")))))
+(define (ffi-active-byte-array-loan active-loans arr)
+  (let loop ((loans active-loans))
+    (cond ((null? loans) #f)
+          ((eq? arr (caar loans)) (car loans))
+          (else (loop (cdr loans))))))
+;; who names the public entry for error messages; `proc` is a Scheme callback
+;; receiving (pointer validated-length) — distinct from the jolt fn the public
+;; form wraps via jolt-invoke2. Exposed so the gate can exercise host exceptions
+;; and nonlocal exits directly.
+(define (ffi-with-scoped-byte-array-pointer who arr off len direction proc)
+  (let* ((v (ffi-byte-array-vector who arr))
+         (start (jnum->exact off))
+         (cnt (jnum->exact len))
+         (mode (ffi-byte-array-loan-mode who direction))
+         (owner-id (get-thread-id))
+         (active-loans (ffi-current-byte-array-loans))
+         (same-array-loan (ffi-active-byte-array-loan active-loans arr)))
+    (ffi-check-array-range who v start cnt)
+    (when (and same-array-loan
+               (not (and (eq? mode 'in) (eq? (cdr same-array-loan) 'in))))
+      (throw-jvm (quote IllegalStateException)
+                 (string-append "jolt.ffi/" who
+                                ": nested writable loan of the same byte-array")))
+    ;; All validation precedes the temporary allocation and lock.
+    (let ((tmp (make-bytevector cnt 0)) (retired? #f))
+      (unless (eq? mode 'out)
+        (ffi-copy-vector-to-bytevector! v start tmp cnt))
+      (sa-lock-object tmp)
+      (dynamic-wind
+        (lambda ()
+          (when retired?
+            (throw-jvm
+             (quote IllegalStateException)
+             "jolt.ffi: scoped byte-array pointer continuation cannot be re-entered")))
+        (lambda ()
+          (parameterize ((ffi-byte-array-loan-cell
+                          (cons owner-id (cons (cons arr mode) active-loans))))
+            (proc (object->reference-address tmp) cnt)))
+        (lambda ()
+          ;; Retire before cleanup so a continuation can never resume with the
+          ;; old address. The nested wind still unlocks tmp if copy-back exposes
+          ;; an internal invariant failure; do not silently turn such corruption
+          ;; into a successful callback result. Under Scheme unwind semantics,
+          ;; that unreachable cleanup failure replaces the primary exit condition.
+          (set! retired? #t)
+          (dynamic-wind
+            void
+            (lambda ()
+              (unless (eq? mode 'in)
+                (ffi-copy-bytevector-to-vector! tmp v start cnt)))
+            (lambda () (sa-unlock-object tmp))))))))
+(define (ffi-with-byte-array-pointer-range arr off len direction f)
+  (ffi-with-scoped-byte-array-pointer
+   "with-byte-array-pointer" arr off len direction
+   (lambda (p cnt) (jolt-invoke2 f p cnt))))
+(define ffi-with-byte-array-pointer
+  (case-lambda
+    ((arr f)
+     (let ((v (ffi-byte-array-vector "with-byte-array-pointer" arr)))
+       (ffi-with-byte-array-pointer-range
+        arr 0 (vector-length v) (keyword #f "in-out") f)))
+    ((arr direction f)
+     (let ((v (ffi-byte-array-vector "with-byte-array-pointer" arr)))
+       (ffi-with-byte-array-pointer-range arr 0 (vector-length v) direction f)))
+    ((arr off len f)
+     (ffi-with-byte-array-pointer-range
+      arr off len (keyword #f "in-out") f))
+    ((arr off len direction f)
+     (ffi-with-byte-array-pointer-range arr off len direction f))))
+(def-var! "jolt.ffi" "with-byte-array-pointer" ffi-with-byte-array-pointer)
 
 ;; --- string / bytevector marshaling ------------------------------------------
 ;; A C string result already comes back as a jolt string (the `string` foreign
