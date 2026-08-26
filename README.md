@@ -47,9 +47,10 @@ Machine-readable index for coding agents: [`llms.txt`](llms.txt).
 
 Prebuilt binaries are self-contained — runtime, compiler, and stdlib in one
 executable — and need only the base system libraries: **Linux x86_64** wants
-glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+), **macOS arm64** wants
-macOS 14+. Anything else (Intel Mac, musl/Alpine, older glibc) is not supported
-by the prebuilt binaries — [build from source](CONTRIBUTING.md#build-from-source).
+glibc 2.17 or newer (CentOS 7+, Ubuntu 14.04+, Debian 8+, Amazon Linux 2+),
+**macOS arm64** wants macOS 14+, and **macOS x86_64** wants macOS 11+.
+Anything else (musl/Alpine, older glibc or older macOS) is not supported by the
+prebuilt binaries — [build from source](CONTRIBUTING.md#build-from-source).
 
 With Homebrew:
 
@@ -57,8 +58,9 @@ With Homebrew:
 brew install jolt-lang/jolt/jolt
 ```
 
-Or with the install script (installs to `/usr/local/bin` by default; `--dir <dir>`
-and `--version <v>` override that):
+Or with the install script (installs to `/usr/local/bin` as root and
+`~/.local/bin` otherwise; `$PREFIX/bin`, `--dir <dir>`, and `--version <v>`
+override those defaults):
 
 ```bash
 curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash

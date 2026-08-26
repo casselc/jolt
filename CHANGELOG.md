@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offsets from ABI-derived element strides, so even million-element flat and
   nested arrays remain compact.
 
+### Fixed
+
+- **The install script accepts the published Intel macOS artifact.** Release
+  automation restored `x86_64-macos` archives by cross-building them on Apple
+  Silicon, but `install` still rejected that target before attempting a
+  download. Intel macOS now follows the same checksum-verified release path as
+  the other prebuilt targets.
+
 ## [0.7.27] - 2026-08-25
 
 `nth`'s three-argument form used to answer its not-found value for any receiver
