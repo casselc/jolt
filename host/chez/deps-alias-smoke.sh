@@ -333,12 +333,13 @@ esac
 SPECPROJ="$root/test/chez/deps-alias/specproj"
 out="$(JOLT_PWD="$SPECPROJ" JOLT_QUIET=1 \
       JOLT_MAVEN_REPOSITORY="$tmp/spec-m2" \
-      "$JOLT" run -m specapp 2>&1 | tail -1)"
+      "$JOLT" run -m specapp 2>&1)"
 case "$out" in
-  "spec: true false") check "explicit spec.alpha dependency loads" ok ok ;;
+  *"spec: true false") check "explicit spec.alpha dependency loads" ok ok ;;
   *"Could not locate"*|*"could not"*|*"no such"*)
     echo "  SKIP: spec.alpha transitivity (spec artifacts not fetchable offline)" >&2 ;;
-  *) check "explicit spec.alpha dependency loads" "spec: true false" "$out" ;;
+  *) check "explicit spec.alpha dependency loads" "spec: true false" \
+           "$(printf '%s\n' "$out" | tail -1)" ;;
 esac
 
 # --- tools.deps CLI surface -------------------------------------------------
