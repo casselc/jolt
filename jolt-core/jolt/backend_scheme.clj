@@ -1727,9 +1727,9 @@
         ;; a chained comparison (<= a b c) means (and (<= a b) (<= b c)); the fast
         ;; binary op is 2-ary, so expand rather than pass 3+ args to it. order-args
         ;; binds each operand to a temp once, so reusing a temp across pairs is safe.
-        (order-args (fn [as])
+        (order-args (fn [as]
           (str "(and " (str/join " " (map (fn [pair] (str "(" op " " (first pair) " " (second pair) ")"))
-                                          (partition 2 1 as))) ")"))
+                                          (partition 2 1 as))) ")")))
         ;; Every fast-path op is BINARY — jolt-l+ and friends are 2-arg macros (3
         ;; operands is a syntax error at expansion, not a runtime one) and the
         ;; unchecked ops are 2-arg procs — while +/-/*/min/max are variadic. Lower N
@@ -1739,8 +1739,8 @@
         ;; appears exactly once and in source order, so this is safe whether or not
         ;; order-args bound them to temps.
         (> (count args) 2)
-        (order-args (fn [as])
-          (reduce (fn [acc a] (str "(" op " " acc " " a ")")) (first as) (rest as)))
+        (order-args (fn [as]
+          (reduce (fn [acc a] (str "(" op " " acc " " a ")")) (first as) (rest as))))
         ;; The other end: ONE operand. (+ x)/(* x)/(min x)/(max x) ARE x, and a
         ;; binary op has no 1-operand form to splice it into. A specialized operand
         ;; is already coerced (^long -> fixnum, ^double -> flonum), so unlike the
@@ -1808,7 +1808,7 @@
 (defn- emit-invoke [node]
   (let [tail? *tail?*]           ; capture: children below emit non-tail
    (binding [*tail?* false]
-    (let [fnode (:fn node)]
+    (let [fnode (:fn node)
         arg-nodes (:args node)
         args (mapv emit arg-nodes)
         tl (or (node-line node) 0)
@@ -1831,7 +1831,7 @@
                                 (str "jolt-invoke" (count args))
                                 "jolt-invoke")]
                    (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
-                                 (fn [operands] (emit-call tail? callee operands tl))))))
+                                 (fn [operands] (emit-call tail? callee operands tl)))))]
     (cond
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
@@ -1844,7 +1844,7 @@
       ;; The receiver is bound once — it feeds both the resolve and the application.
       (:devirt-type node)
       (order-args (fn [as]
-                     (let [r (fresh-label "_r$")]
+                     (let [r (fresh-label "_r$")
                           ;; a site whose impl has a contagion clone resolves the clone
                           ;; (fl* + exact->inexact on the :num operand) instead of the
                           ;; shared impl; otherwise the ordinary devirt-resolve. The
@@ -1868,7 +1868,7 @@
                                         (str "(if (and (pair? " c ") (fx= (car " c ") jolt-proto-epoch))"
                                              " (cdr " c ")"
                                              " (let ((_f " dv ")) (set! " c " (cons jolt-proto-epoch _f)) _f))"))
-                                      dv)
+                                      dv)]
                       (str "(let* ((" r " " (first as) ")) ("
                            resolver " " (str/join " " (cons r (rest as))) "))"))))
       ;; polymorphic inline cache: a protocol call the inference recognized (:proto)
@@ -2051,7 +2051,7 @@
       ;; below (which still uses the direct binding as the invoke target).
       (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
            (direct-link-fn? (:ns fnode) (:name fnode)))
-      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl))
+      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl)))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
@@ -2079,7 +2079,7 @@
                          (if (<= n 8)
                            (str "(make-jrec" n " " cached-desc " jolt-nil 0"
                                 (when (pos? n) (str " " (str/join " " as))) ")")
-                           (str "(let ((v (vector " (str/join " " as) "))) (make-jrec " cached-desc " v jolt-nil))")))))))
+                           (str "(let ((v (vector " (str/join " " as) "))) (make-jrec " cached-desc " v jolt-nil))"))))))
       ;; a late-bound :var call head can hold a procedure OR a non-applicable
       ;; value the RT dispatches (multimethod, keyword/coll IFn) — route via
       ;; jolt-invoke (transparent for a procedure).
@@ -2087,7 +2087,7 @@
       (invoke)
       ;; a computed callee can yield ANY IFn — route through jolt-invoke.
       :else
-      (invoke)))))
+      (invoke))))))
 
 ;; try/catch/finally. throw raises a Chez condition wrapping the jolt value
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
