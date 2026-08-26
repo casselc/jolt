@@ -400,7 +400,7 @@
     ;; All validation precedes the temporary allocation and lock.
     (let ((tmp (make-bytevector cnt 0)) (retired? #f))
       (ffi-copy-vector-to-bytevector! v start tmp cnt)
-      (lock-object tmp)
+      (sa-lock-object tmp)
       (dynamic-wind
         (lambda ()
           (when retired?
@@ -419,7 +419,7 @@
           (dynamic-wind
             void
             (lambda () (ffi-copy-bytevector-to-vector! tmp v start cnt))
-            (lambda () (unlock-object tmp))))))))
+            (lambda () (sa-unlock-object tmp))))))))
 (define (ffi-with-byte-array-pointer-range arr off len f)
   (ffi-with-scoped-byte-array-pointer
    "with-byte-array-pointer" arr off len

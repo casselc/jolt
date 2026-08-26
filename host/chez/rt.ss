@@ -172,8 +172,10 @@
     (syntax-case x ()
       ((_ (conv ...) name args res)
        #'(jolt-ffi-native-error-convention-case
-           (foreign-procedure __get_last_error conv ... name args res)
-           (foreign-procedure __errno conv ... name args res))))))
+           (sa-foreign-procedure-native-error
+            __get_last_error (conv ...) name args res)
+           (sa-foreign-procedure-native-error
+            __errno (conv ...) name args res))))))
 
 ;; --- how many processors can this process use ---------------------------------
 ;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
