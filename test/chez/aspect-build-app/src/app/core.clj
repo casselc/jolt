@@ -10,6 +10,15 @@
 (defn -main [& args]
   (let [x (or (first args) "ok")]
     (try
-      (println (str "result " (target/operation (evaluated-argument x))))
+      (if (= x "entry-number")
+        (println (str "result "
+                      (target/invoke-callback target/numeric-callback 40)))
+        (let [result (target/operation (evaluated-argument x))
+              callback-input (cond
+                               (= x "entry-recur") "recur"
+                               (= x "entry-throw") "throw"
+                               :else result)]
+          (println (str "result "
+                        (target/invoke-callback target/callback callback-input)))))
       (catch Exception e
         (println (str "caught " (ex-message e) " " (:kind (ex-data e))))))))

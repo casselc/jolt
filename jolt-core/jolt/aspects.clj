@@ -4,11 +4,11 @@
   Manifests are inert EDN owned by the instrumented library. A separately
   selected provider maps each manifest role to one qualified runtime advice
   var. The compiler resolves and validates that material before a build, then
-  this namespace rewrites resolved call IR before optimization.
+  this namespace rewrites selected call or function-entry IR before optimization.
 
-  V1 deliberately supports only resolved var-call join points. It is small
-  enough to keep matching deterministic and strict while establishing a public
-  compiler extension point that does not depend on source positions."
+  V1 supports resolved var-call join points and fixed-arity qualified function
+  entries. Both selectors are deterministic and strict, and neither depends on
+  source positions."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -119,6 +119,8 @@
     (fail "manifest :aspects must be a non-empty vector" {:resource resource}))
   (doseq [aspect (:aspects manifest)]
     (let [m (:match aspect)
+          call? (and (map? m) (contains? m :call))
+          entry? (and (map? m) (contains? m :entry))
           expected (get-in aspect [:expect :matches])]
       (when-not (map? aspect)
         (fail "each manifest aspect must be a map" {:resource resource :aspect aspect}))
@@ -128,12 +130,17 @@
         (fail "aspect :id must be a keyword" {:resource resource :aspect aspect}))
       (when-not (keyword? (:advice-role aspect))
         (fail "aspect :advice-role must be a keyword" {:resource resource :aspect aspect}))
-      (when-not (and (map? m) (symbol? (:ns m))
-                     (qualified-symbol? (:call m))
-                     (int? (:arity m)) (not (neg? (:arity m))))
-        (fail "v1 :match needs symbolic :ns, qualified :call, and non-negative integer :arity"
+      (when-not (and (map? m)
+                     (int? (:arity m)) (not (neg? (:arity m)))
+                     (or (and call? (not entry?) (symbol? (:ns m))
+                              (qualified-symbol? (:call m)))
+                         (and entry? (not call?)
+                              (qualified-symbol? (:entry m)))))
+        (fail (str "v1 :match needs either symbolic :ns plus qualified :call, "
+                   "or qualified :entry, and a non-negative integer :arity")
               {:resource resource :aspect (:id aspect) :match m}))
-      (reject-unknown-keys "aspect :match" m #{:ns :call :arity}
+      (reject-unknown-keys "aspect :match" m
+                           (if call? #{:ns :call :arity} #{:entry :arity})
                            {:resource resource :aspect (:id aspect)})
       (when-not (map? (:expect aspect))
         (fail "aspect :expect must be a map" {:resource resource :aspect (:id aspect)}))
@@ -283,13 +290,30 @@
          (= call-name (:name f))
          (= arity (count (:args node))))))
 
-(defn- site [owner-ns aspect node ordinal]
+(defn- call-site [owner-ns aspect node ordinal]
   {:aspect (:id aspect)
    :within owner-ns
    :call (get-in aspect [:match :call])
    :arity (count (:args node))
    :ordinal ordinal
    ;; Absolute checkout paths make reports needlessly machine-specific.
+   :position (select-keys (:pos node) [:line :column])})
+
+(defn- entry-match? [node aspect arity]
+  (let [[entry-ns entry-name] (split-fqn (get-in aspect [:match :entry]))]
+    (and (= :def (:op node))
+         (= :fn (get-in node [:init :op]))
+         (nil? (:rest arity))
+         (= entry-ns (:ns node))
+         (= entry-name (:name node))
+         (= (get-in aspect [:match :arity]) (count (:params arity))))))
+
+(defn- entry-site [node aspect arity ordinal]
+  {:aspect (:id aspect)
+   :within (:ns node)
+   :entry (get-in aspect [:match :entry])
+   :arity (count (:params arity))
+   :ordinal ordinal
    :position (select-keys (:pos node) [:line :column])})
 
 (defn- fresh-local [unit]
@@ -326,6 +350,73 @@
         wrapped (if (seq bindings) (ir/let-node bindings invoke) invoke)]
     (cond-> wrapped pos (assoc :pos pos))))
 
+(defn- remap-hints [hints old-names new-names]
+  (let [by-name (into {} (map vector old-names new-names))]
+    (mapv (fn [[name hint]] [(get by-name name name) hint]) hints)))
+
+(defn- entry-advice-body [unit aspect arity pos]
+  (let [[advice-ns advice-name] (split-fqn (:advice aspect))
+        join-point (select-keys aspect [:id :library :advice-role :contract :match])
+        names (:params arity)
+        evaluated-args (ir/vector-node (mapv ir/local names))
+        replace-args? (= :replace-args-v1 (:contract aspect))
+        replacement-names (when replace-args?
+                            (mapv (fn [_] (fresh-local unit)) names))
+        operation-inputs (or replacement-names names)
+        ;; The local loop is the original function's recur target. Moving the
+        ;; body directly into proceed's zero-arity thunk would retarget recur to
+        ;; that thunk and change both arity and advice lifecycle semantics.
+        operation-body {:op :loop
+                        :bindings (mapv (fn [name input]
+                                          [name (ir/local input)])
+                                        names operation-inputs)
+                        :body (:body arity)}
+        operation-arity (cond-> {:params (or replacement-names [])
+                                 :body operation-body}
+                          (and replace-args? (seq (:nhints arity)))
+                          (assoc :nhints (remap-hints (:nhints arity)
+                                                     names replacement-names)))
+        operation-fn (ir/fn-node nil [operation-arity])
+        advice-ref (cond-> (ir/var-ref advice-ns advice-name)
+                     pos (assoc :pos pos))
+        helper-name (if replace-args?
+                      "__invoke-instrumentation-around-replace-args"
+                      "__invoke-instrumentation-around")
+        helper-args (if (contains? #{:args-v1 :replace-args-v1}
+                                   (:contract aspect))
+                      [advice-ref (ir/quote-node join-point)
+                       evaluated-args operation-fn]
+                      [advice-ref (ir/quote-node join-point) operation-fn])]
+    (cond-> (ir/invoke (ir/var-ref "clojure.core" helper-name) helper-args)
+      pos (assoc :pos pos))))
+
+(defn- weave-entry-def [unit aspects node]
+  (if (and (= :def (:op node)) (= :fn (get-in node [:init :op])))
+    (let [entry-aspects (filterv #(contains? (:match %) :entry) aspects)
+          arities (get-in node [:init :arities])
+          woven-arities
+          (when (seq entry-aspects)
+            (mapv
+              (fn [arity]
+                (let [matches (filterv #(entry-match? node % arity) entry-aspects)]
+                  (when (> (count matches) 1)
+                    (fail "multiple selected aspects match the same function entry"
+                          {:site (entry-site node (first matches) arity 0)
+                           :aspects (mapv :id matches)}))
+                  (if-let [aspect (first matches)]
+                    (let [ordinal (inc (count (get @(:aspect-matches unit)
+                                                   (:id aspect))))]
+                      (swap! (:aspect-matches unit) update (:id aspect)
+                             (fnil conj []) (entry-site node aspect arity ordinal))
+                      (assoc arity :body
+                             (entry-advice-body unit aspect arity (:pos node))))
+                    arity)))
+              arities))]
+      (if woven-arities
+        (assoc-in node [:init :arities] woven-arities)
+        node))
+    node))
+
 (defn weave
   "Rewrite resolved calls selected for this compilation unit.
 
@@ -339,18 +430,20 @@
       root
       (letfn [(walk [node]
                 (let [node (ir/map-ir-children walk node)
-                      matches (filterv #(call-match? owner-ns (:match %) node) aspects)]
+                      matches (filterv #(and (contains? (:match %) :call)
+                                             (call-match? owner-ns (:match %) node))
+                                       aspects)]
                   (when (> (count matches) 1)
                     (fail "multiple selected aspects match the same call site"
-                          {:site (site owner-ns (first matches) node 0)
+                          {:site (call-site owner-ns (first matches) node 0)
                            :aspects (mapv :id matches)}))
                   (if-let [aspect (first matches)]
                     (let [ordinal (inc (count (get @(:aspect-matches unit) (:id aspect))))]
                       (swap! (:aspect-matches unit) update (:id aspect)
-                             (fnil conj []) (site owner-ns aspect node ordinal))
+                             (fnil conj []) (call-site owner-ns aspect node ordinal))
                       (advice-invoke unit aspect node))
                     node)))]
-        (assoc (walk root) :aspect-woven true)))))
+        (assoc (weave-entry-def unit aspects (walk root)) :aspect-woven true)))))
 
 (defn prepare-build-report!
   "Validate exact match counts and return the deterministic EDN weave report.
@@ -365,7 +458,7 @@
         (let [expected (get-in aspect [:expect :matches])
               actual (count (get matches (:id aspect)))]
           (when-not (= expected actual)
-            (fail (if (zero? actual) "aspect matched no call sites"
+            (fail (if (zero? actual) "aspect matched no join points"
                                       "aspect match count was ambiguous")
                   {:aspect (:id aspect) :expected expected :actual actual
                    :match (:match aspect)}))))
