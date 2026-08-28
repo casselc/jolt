@@ -404,8 +404,26 @@ inference, inlining, direct linking, and tree shaking. Unsupported keys,
 revision mismatches, missing roles, overlapping selectors, and exact match-count
 drift fail the build. The deterministic report omits absolute checkout paths,
 and the selected manifest/provider material contributes a stable identity to
-the compiled artifact. V1 does not yet cover async completion or function-entry,
-protocol, host-call, or callback join points.
+the compiled artifact. Jolt validates its exact match counts before native
+compilation and atomically publishes the report only after the output artifact
+succeeds, so a failed rebuild preserves the last valid executable/report pair.
+
+V1 deliberately covers only synchronous, resolved var-call sites. Validation
+against real libraries established the practical boundary:
+
+- ordinary protocol invocations that remain resolved calls work (Duratom load,
+  clear, and close);
+- generated `defrecord` method bodies need a future containing-definition or
+  generated-method selector before their internal calls can be named reliably;
+- higher-order callbacks such as a renderer invoking a supplied event handler
+  need a callback/function-entry join point;
+- immediate-mode GUI calls inside a frame loop are technically matchable but
+  are usually the wrong semantic level and can create prohibitive event volume;
+- async completion, host calls, and cross-thread context are also future
+  contracts, not behavior inferred by v1.
+
+These limits are why manifests should name stable semantic operations and pin
+exact revisions, rather than enumerate incidental low-level calls.
 
 Linking a binary needs Chez's kernel development files (`libkernel.a`,
 `scheme.h`) and a C compiler. They come with a from-source Chez install and with
