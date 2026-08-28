@@ -1246,6 +1246,23 @@ else
   fails=$((fails + 1))
 fi
 
+# Semantic concurrency histories — a bounded linearizability model over real
+# concurrent promise deliveries.  The journal/checker is deliberately test
+# support: a second real consumer belongs in jolt-hegel, not Jolt's stdlib.
+history_out="$($jolt run test/chez/concurrency-history-test.clj 2>&1)"
+if printf '%s' "$history_out" | grep -q 'CONCURRENCY-HISTORY-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: semantic concurrency histories"
+  if printf '%s\n' "$history_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$history_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$history_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$history_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.process — the stdlib sub-process API against real programs (capture, pipes,
 # stdin, :dir/:env, exit codes, signals). The file self-checks and prints a marker.
 #
