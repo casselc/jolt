@@ -1241,6 +1241,23 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.lifecycle/once-action -- one action execution and one published outcome
+# across repeated thread and fiber callers. The focused test also checks each
+# bounded semantic history against a sequential once-action model.
+lifecycle_out="$($jolt run test/chez/jolt-lifecycle-test.clj 2>&1)"
+if printf '%s' "$lifecycle_out" | grep -q 'JOLT-LIFECYCLE-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.lifecycle"
+  if printf '%s\n' "$lifecycle_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$lifecycle_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$lifecycle_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$lifecycle_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.process — the stdlib sub-process API against real programs (capture, pipes,
 # stdin, :dir/:env, exit codes, signals). The file self-checks and prints a marker.
 #
