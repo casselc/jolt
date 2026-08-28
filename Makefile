@@ -545,6 +545,17 @@ ffi:
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-byte-array-pointer-test.sh "$(CHEZ)"
 
+# Test-only semantic ownership model for the dynamic allocation arena. This is
+# intentionally separate from `ffi`: hegel.trace is under review in another
+# repository and must not become a production runtime dependency. Point the
+# target at that checkout after building this repository's test binary.
+ffi-trace: testbin
+	@test -n "$(JOLT_HEGEL_TRACE_ROOT)" || \
+	  (echo "JOLT_HEGEL_TRACE_ROOT must name a jolt-hegel checkout with hegel.trace" >&2; exit 2)
+	@HEGEL_LIBHEGEL_LIBRARY="$(HEGEL_LIBHEGEL_LIBRARY)" bin/jolt -Srepro \
+	  -Sdeps '{:paths ["test" "$(JOLT_HEGEL_TRACE_ROOT)/src" "$(JOLT_HEGEL_TRACE_ROOT)/resources"]}' \
+	  run test/chez/jolt-ffi-arena-trace-test.clj
+
 # Escape continuations (jolt.continuations, issue #736): the one-shot contract
 # call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber
 # is not an ownership boundary, and the four misuses. The cross-fiber rows are
