@@ -25,9 +25,10 @@ run_build() {
   output=$("$tmp/target/$mode/app" ok)
   expected='argument
 advice-before :test/target-call
-operation ok
-advice-after ok!
-result ok!'
+advice-args ["ok"]
+operation ok-woven
+advice-after ok-woven!
+result ok-woven!'
   if [ "$output" != "$expected" ]; then
     echo "FAIL: $mode output" >&2
     printf '%s\n' "$output" >&2
@@ -52,6 +53,7 @@ printf '%s\n' "$throw_output" | grep -q '^caught application failure :applicatio
 
 test -s "$tmp/target/aspects.edn"
 grep -q ':identity "v1-' "$tmp/target/aspects.edn"
+grep -q ':contract :replace-args-v1' "$tmp/target/aspects.edn"
 grep -q ':ordinal 1' "$tmp/target/aspects.edn"
 if grep -q "$tmp" "$tmp/target/aspects.edn"; then
   echo "FAIL: aspect report contains the checkout path" >&2

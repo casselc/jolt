@@ -225,22 +225,75 @@
 ;; It is deliberately in clojure.core rather than the compiler-only
 ;; jolt.aspects namespace so tree-shaken binaries can retain it as an ordinary
 ;; reached core def while dropping the rest of the compiler image.
-(defn __invoke-instrumentation-around [advice join-point operation]
+(defn __invoke-instrumentation-around
+  ([advice join-point operation]
+   (__invoke-instrumentation-around advice join-point nil operation false))
+  ([advice join-point evaluated-args operation]
+   (__invoke-instrumentation-around advice join-point evaluated-args operation true))
+  ([advice join-point evaluated-args operation args-contract?]
+   (let [state (atom {:called false})
+         proceed (fn []
+                   (when (:called @state)
+                     (throw (ex-info "instrumentation advice invoked proceed more than once"
+                                     {:join-point (:id join-point)})))
+                   (swap! state assoc :called true)
+                   (try
+                     (let [value (operation)]
+                       (swap! state assoc :completed true :value value)
+                       value)
+                     (catch :default e
+                       (swap! state assoc :completed true :error e)
+                       (throw e))))]
+     (try
+       (if args-contract?
+         (advice join-point evaluated-args proceed)
+         (advice join-point proceed))
+       (let [{:keys [called error value]} @state]
+         (if called
+           (if error (throw error) value)
+           (proceed)))
+       (catch :default advice-error
+         (let [{:keys [called error value]} @state]
+           (cond
+             error (throw error)
+             called value
+             :else (proceed))))))))
+
+(defn __invoke-instrumentation-around-replace-args
+  "Compiler runtime for the explicit `:replace-args-v1` contract.
+
+  Advice receives `[join-point evaluated-args proceed]`. Calling `proceed`
+  with no arguments invokes the target with the original evaluated arguments;
+  calling it with one vector invokes the target with that replacement vector.
+  A non-vector or wrong-arity replacement is an advice failure and therefore
+  fails open to the original arguments before the target has run. The target
+  still runs exactly once, and its result or exception identity wins over all
+  advice behavior."
+  [advice join-point evaluated-args operation]
   (let [state (atom {:called false})
-        proceed (fn []
-                  (when (:called @state)
-                    (throw (ex-info "instrumentation advice invoked proceed more than once"
-                                    {:join-point (:id join-point)})))
-                  (swap! state assoc :called true)
-                  (try
-                    (let [value (operation)]
-                      (swap! state assoc :completed true :value value)
-                      value)
-                    (catch :default e
-                      (swap! state assoc :completed true :error e)
-                      (throw e))))]
+        expected (count evaluated-args)
+        run-operation
+        (fn [call-args]
+          (when (:called @state)
+            (throw (ex-info "instrumentation advice invoked proceed more than once"
+                            {:join-point (:id join-point)})))
+          (when-not (and (vector? call-args) (= expected (count call-args)))
+            (throw (ex-info "instrumentation advice supplied invalid replacement arguments"
+                            {:join-point (:id join-point)
+                             :expected-arity expected})))
+          (swap! state assoc :called true)
+          (try
+            (let [value (apply operation call-args)]
+              (swap! state assoc :completed true :value value)
+              value)
+            (catch :default e
+              (swap! state assoc :completed true :error e)
+              (throw e))))
+        proceed (fn
+                  ([] (run-operation evaluated-args))
+                  ([replacement-args] (run-operation replacement-args)))]
     (try
-      (advice join-point proceed)
+      (advice join-point evaluated-args proceed)
       (let [{:keys [called error value]} @state]
         (if called
           (if error (throw error) value)

@@ -395,6 +395,40 @@ evaluation order, the operation's result, application exception identity, and
 exactly-once execution. Advice that throws, omits `proceed`, invokes it twice,
 or returns a replacement value fails open around the application operation.
 
+Providers that need the already-evaluated call arguments can opt into the
+explicit `:args-v1` contract per role:
+
+```clojure
+(def aspect-provider
+  {:schema 1
+   :libraries {'my/db "exact-revision"}
+   :roles {:db/client {:fn 'my.otel.db/around-execute
+                       :contract :args-v1}}})
+
+(defn around-execute [join-point evaluated-args proceed]
+  ;; evaluated-args is a vector in the call's ordinary left-to-right order.
+  (proceed))
+```
+
+The argument vector is observational: advice still cannot replace arguments,
+the application result, or the application exception. A plain qualified symbol
+keeps the original two-argument `:proceed-v1` contract.
+
+For join points such as outbound HTTP calls that must pass a copied argument
+with propagated context, use `:replace-args-v1`. Its three-argument advice may
+call `(proceed)` with the original evaluated arguments or
+`(proceed replacement-vector)` with a vector of exactly the target arity:
+
+```clojure
+(defn around-http [join-point [url request] proceed]
+  (proceed [url (assoc-in request [:headers "traceparent"] "...")]))
+```
+
+Arguments are still evaluated once before advice. A non-vector or wrong-arity
+replacement fails open to the original arguments before the target runs. After
+the target starts, it is never retried: its result or original exception wins,
+including when advice throws or calls `proceed` again.
+
 Matching uses analyzed, resolved var calls—not source lines—and runs before
 inference, inlining, direct linking, and tree shaking. Unsupported keys,
 revision mismatches, missing roles, overlapping selectors, and exact match-count
