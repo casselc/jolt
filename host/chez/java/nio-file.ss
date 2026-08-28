@@ -365,16 +365,26 @@
 ;; createTempFile(prefix, suffix, attrs*) | createTempFile(dir, prefix, suffix, attrs*)
 ;; createTempDirectory(prefix, attrs*)    | createTempDirectory(dir, prefix, attrs*)
 (define (nio-files-create-temp args dir?)
-  (let* ((args (filter (lambda (x) (not (jolt-array? x))) args))
-         (has-dir (and (pair? args) (or (nio-path? (car args)) (jfile? (car args)))))
+  (let* ((has-dir (and (pair? args) (or (nio-path? (car args)) (jfile? (car args)))))
          (base (if has-dir (npath-string-of (car args)) #f))
          (rest (if has-dir (cdr args) args))
          (prefix (if (and (pair? rest) (string? (car rest))) (car rest) ""))
          (suffix (if (and (not dir?) (pair? rest) (pair? (cdr rest)) (string? (cadr rest))) (cadr rest) ""))
+         (attrs (cond (dir? (if (pair? rest) (cdr rest) '()))
+                      ((and (pair? rest) (pair? (cdr rest))) (cddr rest))
+                      (else '())))
          (full (nio-temp-path base prefix suffix))
-         (fp (project-relative full)))
-    (if dir? (mkdir fp) (close-port (open-file-output-port fp (file-options no-fail))))
-    (when c-chmod (c-chmod fp (if dir? #o700 #o600)))
+         (fp (project-relative full))
+         (mode (nio-create-mode attrs (if dir? #o700 #o600))))
+    ;; TempFileHelper supplies owner-only permissions on POSIX when callers do
+    ;; not provide posix:permissions.  For directories, pass the selected mode
+    ;; to mkdir(2): both the default 0700 and an explicit FileAttribute must be
+    ;; true at the instant the name becomes visible, never repaired by chmod.
+    (if dir?
+        (nio-mkdir-atomic! fp mode)
+        (begin
+          (close-port (open-file-output-port fp (file-options no-fail)))
+          (nio-apply-mode-umask! fp mode)))
     (make-nio-path full)))
 
 ;; ---- walkFileTree + FileVisitor ---------------------------------------------
@@ -616,6 +626,7 @@
 (define c-link     (jolt-foreign-proc-safe "link"     '(string string) 'int))
 (define c-readlink (jolt-foreign-proc-safe "readlink" '(string u8* unsigned-long) 'long))
 (define c-chmod    (jolt-foreign-proc-safe "chmod"    '(string int) 'int))
+(define c-mkdir    (jolt-foreign-proc-safe "mkdir"    '(string int) 'int))
 (define (nio-is-symlink? fp)
   (and c-readlink (> (c-readlink fp (make-bytevector 1 0) 1) 0)))   ; readlink succeeds only on a link
 (define (nio-readlink fp)
@@ -770,26 +781,52 @@
 (register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "user-principal")))
                       (lambda (x) (jhost-state x)))
 
-;; PosixFilePermissions/asFileAttribute -> a FileAttribute the create ops apply
-;; by chmod after making the entry.
+;; PosixFilePermissions/asFileAttribute -> the POSIX FileAttribute understood by
+;; the Unix provider.  Directory create operations consume its mode before the
+;; mkdir(2), so the attribute is atomic as required by java.nio.file.Files.
 (define (file-attr? x) (and (jhost? x) (string=? (jhost-tag x) "file-attribute")))
 (register-class-statics! "java.nio.file.attribute.PosixFilePermissions"
   (list (cons "asFileAttribute" (lambda (perms) (make-jhost "file-attribute" perms)))))
+(register-host-methods! "file-attribute"
+  (list (cons "name"  (lambda (self) "posix:permissions"))
+        (cons "value" (lambda (self) (jhost-state self)))))
 
 
 ;; java.util.regex.Pattern statics (incl. quote) are registered once in
 ;; host-static-classes.ss — no per-file copy here.
 
-;; ---- umask-masked create perms, symlink-aware move/copy ---------------------
+;; ---- atomic create perms, symlink-aware move/copy ---------------------------
+;; Return the last posix:permissions attribute, matching the Unix JDK provider.
+;; mkdir(2) itself applies the process umask atomically.  Reading the umask by
+;; temporarily setting it to zero is process-global and creates a worse race, so
+;; creation code must never attempt to pre-mask the requested mode in user space.
+(define (nio-create-mode attrs default-mode)
+  (fold-left (lambda (mode a)
+               (if (file-attr? a)
+                   (posix-set->mode (jhost-state a))
+                   (throw-jvm (quote UnsupportedOperationException)
+                              "unsupported initial file attribute")))
+             default-mode (npath-spread-args attrs)))
+(define (nio-mkdir-atomic! fp mode)
+  (if c-mkdir
+      (unless (= (c-mkdir fp mode) 0)
+        (jolt-throw (jolt-ex-info fp empty-pmap)))
+      ;; Non-POSIX fallback: there is no creation-time mode facility.  Preserve
+      ;; directory creation, but reject permissions we cannot promise atomically.
+      (if (= mode #o777)
+          (mkdir fp)
+          (throw-jvm (quote UnsupportedOperationException)
+                     "atomic POSIX directory permissions are unavailable"))))
+
+;; File creation still uses the existing port primitive; keep its post-create
+;; permission application isolated here until that primitive grows O_EXCL mode
+;; support.  Directory paths must not call this helper.
 (define c-umask (jolt-foreign-proc-safe "umask" '(int) 'int))
 (define (nio-current-umask) (if c-umask (let ((old (c-umask 0))) (c-umask old) old) 0))
-;; chmod a created entry to the requested permission file-attribute, masked by
-;; the umask — exactly what java.nio.file's create* do.
-(define (nio-apply-attrs-umask! fp args)
+(define (nio-apply-mode-umask! fp mode)
   (let ((um (nio-current-umask)))
-    (for-each (lambda (a) (when (and (file-attr? a) c-chmod)
-                            (c-chmod fp (bitwise-and (posix-set->mode (jhost-state a)) (bitwise-not um)))))
-              (npath-spread-args args))))
+    (when (and mode c-chmod)
+      (c-chmod fp (bitwise-and mode (bitwise-not um))))))
 (define (nio-parent-of fp)
   (let loop ((i (- (string-length fp) 1)))
     (cond ((< i 0) "") ((char=? (string-ref fp i) #\/) (substring fp 0 i)) (else (loop (- i 1))))))
@@ -801,14 +838,19 @@
 (define (nio-dest-present? d) (or (file-exists? d) (nio-is-symlink? d)))
 (let ((files-create+move
        (list
-        (cons "createDirectory" (lambda (p . attrs) (mkdir (nfp p)) (nio-apply-attrs-umask! (nfp p) attrs) (->path p)))
+        (cons "createDirectory" (lambda (p . attrs)
+                                  (nio-mkdir-atomic! (nfp p) (nio-create-mode attrs #o777))
+                                  (->path p)))
         (cons "createFile" (lambda (p . attrs)
-                             (close-port (open-file-output-port (nfp p) (file-options no-fail)))
-                             (nio-apply-attrs-umask! (nfp p) attrs) (->path p)))
+                             (let ((mode (nio-create-mode attrs #f)))
+                               (close-port (open-file-output-port (nfp p) (file-options no-fail)))
+                               (nio-apply-mode-umask! (nfp p) mode)
+                               (->path p))))
         (cons "createDirectories" (lambda (p . attrs)
                                     (let ((missing (nio-missing-ancestors (nfp p))))
-                                      (mkdirs! (nfp p))
-                                      (for-each (lambda (d) (nio-apply-attrs-umask! d attrs)) missing))
+                                      (for-each (lambda (d)
+                                                  (nio-mkdir-atomic! d (nio-create-mode attrs #o777)))
+                                                missing))
                                     (->path p)))
         (cons "move" (lambda (src dst . opts)
                        (let ((s (nfp src)) (d (nfp dst)))
