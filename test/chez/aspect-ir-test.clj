@@ -14,6 +14,12 @@
      :advice 'provider.core/around
      :expect {:matches 1}}]})
 
+(def args-config
+  (assoc-in config [:aspects 0 :contract] :args-v1))
+
+(def replace-args-config
+  (assoc-in config [:aspects 0 :contract] :replace-args-v1))
+
 (defn invoke-node []
   (assoc (ir/invoke (ir/var-ref "dep.lib" "work")
                     [(ir/invoke (ir/var-ref "app.core" "left") [])
@@ -42,6 +48,52 @@
            (get-in @(:aspect-matches unit) [:test/call 0 :position])))
     (is (empty? (ir/tree-problems woven)))
     (is (= woven (aspects/weave unit woven)))))
+
+(deftest args-contract-weaving
+  (let [unit (types/new-unit)
+        _ (aspects/configure-unit! unit args-config)
+        woven (aspects/weave unit (ir/def-node "app.core" "run" (invoke-node)))
+        body (:init woven)
+        helper (:body body)
+        evaluated-args (nth (:args helper) 2)
+        thunk (nth (:args helper) 3)]
+    (is (= ["left" "right"] (mapv #(get-in % [1 :fn :name]) (:bindings body))))
+    (is (= :vector (:op evaluated-args)))
+    (is (= ["aspect_arg__1" "aspect_arg__2"]
+           (mapv :name (:items evaluated-args))))
+    (is (= :args-v1 (get-in helper [:args 1 :form :contract])))
+    (is (= ["aspect_arg__1" "aspect_arg__2"]
+           (mapv :name (get-in thunk [:arities 0 :body :args]))))
+    (is (empty? (ir/tree-problems woven)))
+    (let [configured (assoc args-config :schema 1 :weaver "test/v1"
+                                        :identity "args-contract" :report "/tmp/unused")
+          report (aspects/prepare-build-report! unit configured)]
+      (is (= :args-v1 (get-in report [:aspects 0 :contract]))))))
+
+(deftest replace-args-contract-weaving
+  (let [unit (types/new-unit)
+        _ (aspects/configure-unit! unit replace-args-config)
+        woven (aspects/weave unit (ir/def-node "app.core" "run" (invoke-node)))
+        body (:init woven)
+        helper (:body body)
+        evaluated-args (nth (:args helper) 2)
+        operation (nth (:args helper) 3)
+        params (get-in operation [:arities 0 :params])
+        target (get-in operation [:arities 0 :body])]
+    (is (= ["left" "right"] (mapv #(get-in % [1 :fn :name]) (:bindings body))))
+    (is (= "__invoke-instrumentation-around-replace-args"
+           (get-in helper [:fn :name])))
+    (is (= ["aspect_arg__1" "aspect_arg__2"]
+           (mapv :name (:items evaluated-args))))
+    (is (= ["aspect_arg__3" "aspect_arg__4"] params))
+    (is (= params (mapv :name (:args target))))
+    (is (= :replace-args-v1 (get-in helper [:args 1 :form :contract])))
+    (is (empty? (ir/tree-problems woven)))
+    (let [configured (assoc replace-args-config :schema 1 :weaver "test/v1"
+                                                :identity "replace-args-contract"
+                                                :report "/tmp/unused")
+          report (aspects/prepare-build-report! unit configured)]
+      (is (= :replace-args-v1 (get-in report [:aspects 0 :contract]))))))
 
 (deftest exact-resolved-match
   (doseq [node [(assoc (invoke-node) :fn (ir/var-ref "other.lib" "work"))
@@ -101,6 +153,138 @@
         (aspects/invoke-around (fn [_ proceed] (proceed)) {:id :x} (fn [] (throw boom)))
         (catch Exception e (reset! seen e)))
       (is (identical? boom @seen)))))
+
+(deftest invoke-around-args-semantics
+  (testing "evaluated arguments reach advice after left-to-right evaluation"
+    (let [events (atom [])
+          args [(do (swap! events conj :left) "left")
+                (do (swap! events conj :right) "right")]
+          result (aspects/invoke-around-args
+                   (fn [_ seen proceed]
+                     (swap! events conj [:advice seen])
+                     (proceed)
+                     :replacement)
+                   {:id :x} args
+                   (fn [] (swap! events conj :operation) :application))]
+      (is (= :application result))
+      (is (= [:left :right [:advice ["left" "right"]] :operation] @events))))
+  (testing "args advice skip, throw, and double proceed all fail open"
+    (doseq [advice [(fn [_ _ _] :skip)
+                    (fn [_ _ _] (throw (Exception. "advice")))
+                    (fn [_ _ proceed] (proceed) (proceed))]]
+      (let [calls (atom 0)]
+        (is (= :application
+               (aspects/invoke-around-args advice {:id :x} [:arg]
+                                           (fn [] (swap! calls inc) :application))))
+        (is (= 1 @calls)))))
+  (testing "args advice preserves the application exception object"
+    (let [boom (Exception. "app")
+          seen (atom nil)]
+      (try
+        (aspects/invoke-around-args (fn [_ _ proceed] (proceed))
+                                    {:id :x} [:arg] (fn [] (throw boom)))
+        (catch Exception e (reset! seen e)))
+      (is (identical? boom @seen)))))
+
+(deftest invoke-around-replace-args-semantics
+  (testing "zero proceed calls fail open to the original evaluated vector"
+    (let [calls (atom [])]
+      (is (= "left:right"
+             (aspects/invoke-around-replace-args
+               (fn [_ seen _] (is (= ["left" "right"] seen)) :skip)
+               {:id :x} ["left" "right"]
+               (fn [left right]
+                 (swap! calls conj [left right])
+                 (str left ":" right)))))
+      (is (= [["left" "right"]] @calls))))
+  (testing "one proceed call may supply one exact-arity replacement vector"
+    (let [calls (atom [])]
+      (is (= "new-left:new-right"
+             (aspects/invoke-around-replace-args
+               (fn [_ _ proceed] (proceed ["new-left" "new-right"]) :ignored)
+               {:id :x} ["left" "right"]
+               (fn [left right]
+                 (swap! calls conj [left right])
+                 (str left ":" right)))))
+      (is (= [["new-left" "new-right"]] @calls))))
+  (testing "non-vector and wrong-arity replacements fail open before execution"
+    (doseq [replacement [:not-a-vector [] ["too" "many"]]]
+      (let [calls (atom [])]
+        (is (= :original
+               (aspects/invoke-around-replace-args
+                 (fn [_ _ proceed] (proceed replacement))
+                 {:id :x} [:original]
+                 (fn [value] (swap! calls conj value) value))))
+        (is (= [:original] @calls)))))
+  (testing "multiple proceed attempts still execute the target exactly once"
+    (let [calls (atom [])]
+      (is (= :replacement
+             (aspects/invoke-around-replace-args
+               (fn [_ _ proceed]
+                 (proceed [:replacement])
+                 (proceed [:second]))
+               {:id :x} [:original]
+               (fn [value] (swap! calls conj value) value))))
+      (is (= [:replacement] @calls))))
+  (testing "application result identity wins when advice throws after proceed"
+    (let [sentinel (atom :application-result)
+          calls (atom 0)
+          result (aspects/invoke-around-replace-args
+                   (fn [_ _ proceed]
+                     (proceed [:replacement])
+                     (throw (Exception. "after target")))
+                   {:id :x} [:original]
+                   (fn [_] (swap! calls inc) sentinel))]
+      (is (identical? sentinel result))
+      (is (= 1 @calls))))
+  (testing "replacement execution preserves the application exception object"
+    (let [boom (Exception. "app")
+          seen (atom nil)]
+      (try
+        (aspects/invoke-around-replace-args
+          (fn [_ _ proceed] (proceed [:replacement]))
+          {:id :x} [:original]
+          (fn [_] (throw boom)))
+        (catch Exception e (reset! seen e)))
+      (is (identical? boom @seen)))))
+
+(deftest provider-role-schema
+  (let [validate-provider (ns-resolve 'jolt.aspects 'validate-provider)
+        base {:schema 1 :libraries {'test/lib "v1"}}]
+    (testing "legacy symbol roles remain valid"
+      (is (= 'provider.core/around
+             (get-in (validate-provider 'provider.core/aspect-provider
+                                        (assoc base :roles {:test/around 'provider.core/around}))
+                     [:roles :test/around]))))
+    (testing "the explicit args contract is valid"
+      (is (= :args-v1
+             (get-in (validate-provider
+                       'provider.core/aspect-provider
+                       (assoc base :roles {:test/around {:fn 'provider.core/around
+                                                         :contract :args-v1}}))
+                     [:roles :test/around :contract]))))
+    (testing "the explicit replacement-args contract is valid"
+      (is (= :replace-args-v1
+             (get-in (validate-provider
+                       'provider.core/aspect-provider
+                       (assoc base :roles {:test/around
+                                           {:fn 'provider.core/around
+                                            :contract :replace-args-v1}}))
+                     [:roles :test/around :contract]))))
+    (doseq [[label role expected]
+            [["unknown contract"
+              {:fn 'provider.core/around :contract :args-v2}
+              "jolt aspects: unsupported provider role contract"]
+             ["unknown key"
+              {:fn 'provider.core/around :contract :args-v1 :extra true}
+              "jolt aspects: provider role contains unsupported keys"]]]
+      (testing label
+        (let [message (try
+                        (validate-provider 'provider.core/aspect-provider
+                                           (assoc base :roles {:test/around role}))
+                        nil
+                        (catch Exception e (ex-message e)))]
+          (is (= expected message)))))))
 
 (deftest report-publication-follows-explicit-prepare
   (let [file (java.io.File/createTempFile "jolt-aspects" ".edn")
