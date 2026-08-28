@@ -36,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and expands through the same grammar, so code written against core.incubator
   runs unchanged.
 
+- **A scoped dynamic FFI allocation arena.** `with-arena` binds an allocator
+  for query builders and other call scopes whose number of sibling buffers is
+  known only at runtime. Every successful allocation is freed exactly once in
+  reverse order, including after partial construction failure; an allocator
+  invoked after its lexical scope closes is rejected.
+
 - **Directional scoped byte-array pointer loans.** Existing
   `with-byte-array-pointer` arities remain `:in-out`; new `(arr direction f)` and
   `(arr off len direction f)` arities accept `:in`, `:out`, or `:in-out`.
