@@ -361,6 +361,7 @@ buildsmoke: testbin
 # resolution, provider rooting, IR semantics, reports, and multiple build modes.
 aspectsmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh test/chez/aspect-build-smoke.sh
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh test/chez/aspect-native-error-build-smoke.sh
 
 # `jolt build --library` produces a shared object callable from C/C++/Rust.
 buildlibsmoke: testbin
