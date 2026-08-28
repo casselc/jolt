@@ -1,0 +1,4 @@
+{:paths ["src" "resources"]
+ :jolt/native
+ [{:name "native-error-helper"
+   :static {:archive "native/libnative-error-helper.a"}}]}

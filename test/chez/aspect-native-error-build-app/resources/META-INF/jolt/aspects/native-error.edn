@@ -1,0 +1,9 @@
+{:schema 1
+ :library {:id test/native-error-target :version "fixture-v1"}
+ :aspects
+ [{:id :test/native-error-call
+   :match {:ns app.native-error
+           :call app.native-error/block-fail
+           :arity 2}
+   :advice-role :test/native-error-around
+   :expect {:matches 1}}]}
