@@ -1,5 +1,6 @@
 (ns aspect-ir-test
   (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing run-tests]]
             [jolt.aspects :as aspects]
             [jolt.ir :as ir]
@@ -80,6 +81,60 @@
      :advice 'provider.core/around
      :contract :args-v1
      :expect {:matches 1}}]})
+
+(def filtered-complete-provider
+  {:schema 1
+   :libraries {'test/aspect-target "fixture-v1"}
+   :roles {:test/around {:fn 'provider.complete/around
+                         :contract :replace-args-v1}
+           :test/entry-around {:fn 'provider.complete/entry-around
+                               :contract :args-v1}
+           :test/numeric-entry-around
+           {:fn 'provider.complete/numeric-entry-around
+            :contract :replace-args-v1}}})
+
+(def filtered-second-provider
+  {:schema 1
+   :libraries {'test/aspect-target "fixture-v1"}
+   :roles {:test/around 'provider.partial/around
+           :test/entry-around 'provider.partial/entry-around
+           :test/numeric-entry-around 'provider.partial/numeric-entry-around}})
+
+(def filtered-incomplete-provider
+  {:schema 1
+   :libraries {'test/aspect-target "fixture-v1"}
+   :roles {:test/around 'provider.incomplete/around}})
+
+(def aspect-fixture-resource
+  "test/aspect-filter-probe.edn")
+
+(def aspect-fixture-manifest
+  {:schema 1
+   :library {:id 'test/aspect-target :version "fixture-v1"}
+   :aspects
+   [{:id :test/target-call
+     :match {:ns 'app.core :call 'app.target/operation :arity 1}
+     :advice-role :test/around
+     :expect {:matches 1}}
+    {:id :test/callback-entry
+     :match {:entry 'app.target/callback :arity 1}
+     :advice-role :test/entry-around
+     :expect {:matches 1}}
+    {:id :test/numeric-callback-entry
+     :match {:entry 'app.target/numeric-callback :arity 1}
+     :advice-role :test/numeric-entry-around
+     :expect {:matches 1}}]})
+
+(defn resolve-aspect-fixture [selection]
+  (let [file (java.io.File/createTempFile "jolt-aspect-filter" ".edn")]
+    (try
+      (spit file (pr-str aspect-fixture-manifest))
+      (with-redefs [io/resource
+                    (fn [resource]
+                      (when (= aspect-fixture-resource resource) file))]
+        (aspects/resolve-build-config [selection] "/tmp/unused"))
+      (finally
+        (.delete file)))))
 
 (defn entry-node []
   (assoc
@@ -603,28 +658,139 @@
         (is (= [:test/call :test/call] (:ids data)))))))
 
 (deftest selection-provider-schema
-  (let [provider-symbols (ns-resolve 'jolt.aspects 'selection-provider-symbols)]
+  (let [provider-symbols (ns-resolve 'jolt.aspects 'selection-provider-symbols)
+        selection-consumers (ns-resolve 'jolt.aspects 'selection-consumers)]
     (is (= ['provider.one/aspect-provider]
            (provider-symbols {:resource "a.edn" :provider 'provider.one})))
     (is (= ['provider.one/aspect-provider 'provider.two/custom]
            (provider-symbols {:resource "a.edn"
                               :providers ['provider.one 'provider.two/custom]})))
+    (is (= [{:selection-ordinal 1
+             :provider-var 'provider.one/aspect-provider
+             :roles [:test/around :test/tool]}
+            {:selection-ordinal 2
+             :provider-var 'provider.two/custom
+             :roles :all}]
+           (selection-consumers
+             {:resource "a.edn"
+              :consumers [{:provider 'provider.one
+                           :roles [:test/tool :test/around]}
+                          {:provider 'provider.two/custom :roles :all}]})))
     (doseq [[selection expected]
             [[{:resource "a.edn"}
-              "jolt aspects: aspect selection needs exactly one of :provider or :providers"]
+              (str "jolt aspects: aspect selection needs exactly one of :provider, "
+                   ":providers, or :consumers")]
              [{:resource "a.edn" :provider 'provider.one
                :providers ['provider.two]}
-              "jolt aspects: aspect selection needs exactly one of :provider or :providers"]
+              (str "jolt aspects: aspect selection needs exactly one of :provider, "
+                   ":providers, or :consumers")]
              [{:resource "a.edn" :providers []}
               "jolt aspects: selection :providers must be a non-empty vector"]
              [{:resource "a.edn" :providers 'provider.one}
               "jolt aspects: selection :providers must be a non-empty vector"]
              [{:resource "a.edn" :providers ['provider.one 'provider.one/aspect-provider]}
-              "jolt aspects: selection providers must be unique"]]]
+              "jolt aspects: selection consumers must name unique providers"]
+             [{:resource "a.edn" :consumers []}
+              "jolt aspects: selection :consumers must be a non-empty vector"]
+             [{:resource "a.edn" :consumers ['provider.one]}
+              "jolt aspects: each selection consumer must be a map"]
+             [{:resource "a.edn"
+               :consumers [{:provider 'provider.one}]}
+              "jolt aspects: selection consumer needs explicit :roles"]
+             [{:resource "a.edn"
+               :consumers [{:provider 'provider.one :roles []}]}
+              (str "jolt aspects: selection consumer :roles must be :all or a "
+                   "non-empty vector")]
+             [{:resource "a.edn"
+               :consumers [{:provider 'provider.one
+                            :roles [:test/around :test/around]}]}
+              "jolt aspects: selection consumer :roles must be unique"]
+             [{:resource "a.edn"
+               :consumers [{:provider 'provider.one :roles [:test/around]}
+                           {:provider 'provider.one/aspect-provider :roles :all}]}
+              "jolt aspects: selection consumers must name unique providers"]]]
       (is (= expected
              (try (provider-symbols selection)
                   nil
                    (catch Exception e (ex-message e))))))))
+
+(deftest filtered-consumer-resolution
+  (let [selection
+        {:resource aspect-fixture-resource
+         :consumers
+         [{:provider 'aspect-ir-test/filtered-complete-provider :roles :all}
+          {:provider 'aspect-ir-test/filtered-second-provider
+           :roles [:test/around]}]}
+        configured (resolve-aspect-fixture selection)
+        by-id (into {} (map (juxt :id identity) (:aspects configured)))
+        call-consumers (get-in by-id [:test/target-call :consumers])]
+    (is (= 3 (count (:aspects configured))))
+    (is (= ['aspect-ir-test/filtered-complete-provider
+            'aspect-ir-test/filtered-second-provider]
+           (mapv :provider call-consumers)))
+    (is (= [1 2] (mapv :ordinal call-consumers)))
+    (is (= [1 2] (mapv :selection-ordinal call-consumers)))
+    (is (= [:all [:test/around]] (mapv :roles call-consumers)))
+    (doseq [id [:test/callback-entry :test/numeric-callback-entry]]
+      (is (= ['aspect-ir-test/filtered-complete-provider]
+             (mapv :provider (get-in by-id [id :consumers]))))
+      (is (= [1] (mapv :ordinal (get-in by-id [id :consumers])))))
+    (testing "the weave report exposes normalized filters and both ordinals"
+      (let [unit (types/new-unit)
+            call-only (assoc configured :aspects [(get by-id :test/target-call)])
+            target (ir/invoke (ir/var-ref "app.target" "operation")
+                              [(ir/const "ok")])]
+        (aspects/configure-unit! unit call-only)
+        (aspects/weave unit (ir/def-node "app.core" "run" target))
+        (let [report (aspects/prepare-build-report! unit call-only)
+              consumers (get-in report [:aspects 0 :consumers])]
+          (is (= [1 2] (mapv :ordinal consumers)))
+          (is (= [1 2] (mapv :selection-ordinal consumers)))
+          (is (= [:all [:test/around]] (mapv :roles consumers))))))
+    (testing "selection order remains advice order at shared roles"
+      (let [reversed (resolve-aspect-fixture
+                       (update selection :consumers #(vec (reverse %))))
+            reversed-call (first (filter #(= :test/target-call (:id %))
+                                         (:aspects reversed)))]
+        (is (= ['aspect-ir-test/filtered-second-provider
+                'aspect-ir-test/filtered-complete-provider]
+               (mapv :provider (:consumers reversed-call))))
+        (is (not= (aspects/build-identity configured)
+                  (aspects/build-identity reversed)))))
+    (testing "role vector order is normalized in identity and reports"
+      (let [with-two (assoc-in selection [:consumers 1 :roles]
+                               [:test/numeric-entry-around :test/around])
+            reversed-roles (assoc-in selection [:consumers 1 :roles]
+                                      [:test/around :test/numeric-entry-around])
+            a (resolve-aspect-fixture with-two)
+            b (resolve-aspect-fixture reversed-roles)]
+        (is (= (aspects/build-identity a) (aspects/build-identity b)))
+        (is (= (:aspects a) (:aspects b)))))
+    (testing "an explicit filter is artifact-visible even when equivalent to all"
+      (let [all-roles [:test/around :test/entry-around
+                       :test/numeric-entry-around]
+            explicit (resolve-aspect-fixture
+                       (assoc-in selection [:consumers 0 :roles] all-roles))]
+        (is (= (mapv :id (:aspects configured))
+               (mapv :id (:aspects explicit))))
+        (is (not= (aspects/build-identity configured)
+                  (aspects/build-identity explicit)))))
+    (doseq [[label bad-selection expected]
+            [["unknown manifest role"
+              (assoc-in selection [:consumers 1 :roles] [:test/missing])
+              "jolt aspects: selection consumer names roles absent from the manifest"]
+             ["selected role missing from provider"
+              (-> selection
+                  (assoc-in [:consumers 1 :provider]
+                            'aspect-ir-test/filtered-incomplete-provider)
+                  (assoc-in [:consumers 1 :roles] [:test/entry-around]))
+              "jolt aspects: provider does not implement selected advice role"]]]
+      (testing label
+        (is (= expected
+               (try
+                 (resolve-aspect-fixture bad-selection)
+                 nil
+                 (catch Exception e (ex-message e)))))))))
 
 (deftest report-publication-follows-explicit-prepare
   (let [file (java.io.File/createTempFile "jolt-aspects" ".edn")
