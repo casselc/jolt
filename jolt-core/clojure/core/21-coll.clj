@@ -221,6 +221,37 @@
 (defn ex-cause [e]
   (let [e (ex-unwrap e)] (if (ex-info-val? e) (get e :cause) nil)))
 
+;; Compiler-generated synchronous instrumentation uses this runtime primitive.
+;; It is deliberately in clojure.core rather than the compiler-only
+;; jolt.aspects namespace so tree-shaken binaries can retain it as an ordinary
+;; reached core def while dropping the rest of the compiler image.
+(defn __invoke-instrumentation-around [advice join-point operation]
+  (let [state (atom {:called false})
+        proceed (fn []
+                  (when (:called @state)
+                    (throw (ex-info "instrumentation advice invoked proceed more than once"
+                                    {:join-point (:id join-point)})))
+                  (swap! state assoc :called true)
+                  (try
+                    (let [value (operation)]
+                      (swap! state assoc :completed true :value value)
+                      value)
+                    (catch :default e
+                      (swap! state assoc :completed true :error e)
+                      (throw e))))]
+    (try
+      (advice join-point proceed)
+      (let [{:keys [called error value]} @state]
+        (if called
+          (if error (throw error) value)
+          (proceed)))
+      (catch :default advice-error
+        (let [{:keys [called error value]} @state]
+          (cond
+            error (throw error)
+            called value
+            :else (proceed)))))))
+
 ;; Throwable->map: the reference data rendering of a throwable. :via chains
 ;; through ex-cause the way the reference walks getCause; :cause/:data come
 ;; from the root cause. Throwables carry no stack-trace elements here, so
@@ -414,4 +445,3 @@
   [v]
   (let [t (:test (meta v))]
     (if t (do (t) :ok) :no-test)))
-

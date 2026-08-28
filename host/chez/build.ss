@@ -481,6 +481,11 @@
 (define jolt-contagion-prepass!      (var-deref "jolt.backend-scheme" "contagion-prepass!"))
 (define jolt-contagion-prepass-done! (var-deref "jolt.backend-scheme" "contagion-prepass-done!"))
 (define jolt-reset-clone-prepass!    (var-deref "jolt.backend-scheme" "reset-clone-prepass!"))
+(define jolt-aspect-configure!       (var-deref "jolt.aspects" "configure-unit!"))
+(define jolt-aspect-provider-ns      (var-deref "jolt.aspects" "provider-namespaces"))
+(define jolt-aspect-weave            (var-deref "jolt.aspects" "weave"))
+(define jolt-aspect-finish!          (var-deref "jolt.aspects" "finish-build!"))
+(define jolt-aspect-identity         (var-deref "jolt.aspects" "build-identity"))
 
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
@@ -530,8 +535,12 @@
                                               (car nf) "\n")
                                              (current-error-port))
                                     (set! per-ns (cons #f per-ns))))
-                        (let ((n (ei-timed "wp: analyze"
-                                   (lambda () (jolt-ce-analyze (make-analyze-ctx (car nf)) f)))))
+                        (let* ((raw (ei-timed "wp: analyze"
+                                      (lambda () (jolt-ce-analyze (make-analyze-ctx (car nf)) f))))
+                               ;; Weaving belongs before whole-program inference.
+                               ;; The marked root is cached positionally; run-passes
+                               ;; sees :aspect-woven and does not apply it twice.
+                               (n (jolt-aspect-weave (ei-unit) raw)))
                           (set! nodes (cons n nodes))
                           (set! per-ns (cons n per-ns)))))))
               (ei-timed "wp: parse" (lambda () (ei-read-all src))))))
@@ -1173,7 +1182,7 @@
           (for-each (lambda (p) (put-string out (string-append "\n    " (car p) " " (cdr p)))) pairs)
           (put-string out "))\n"))))))
 
-(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? library?)
+(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? library? aspect-config)
   (ei-profile-init!)
   ;; Windows executables carry .exe; normalize here so the append-payload and
   ;; cc paths agree and the shell can run the result. A library keeps its own
@@ -1207,20 +1216,26 @@
     (bld-mkdir-p (string-append out-path ".build"))
     (bld-preload-static-natives! natives (string-append out-path ".build")))
    ;; 1. record app namespaces in dependency order as they finish loading.
-   (let ((app-order '()))
+   (let ((app-order '())
+         (aspect-providers (if (jolt-nil? aspect-config)
+                               '()
+                               (bld-strs (jolt-aspect-provider-ns aspect-config)))))
      (set! bld-boot-loaded
        (hashtable-copy loaded-ns #f))
      (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")
     (parameterize ((ldr-source-only? #t))    ; emit from source, never a compiled artifact
+      ;; Generated advice vars must be part of the same closed world as the app,
+      ;; including when the app source never explicitly requires the provider.
+      (for-each load-namespace aspect-providers)
       (load-namespace entry-ns))
     (set-ns-loaded-hook! (lambda (name file) #f))
     (ei-mark! "load app from source")
     ;; Build ordered ns list from the require graph (static scan of source files)
     ;; merged with the hook's load order. The graph gives post-order deps; the
     ;; hook captures dynamic requires the static scan can't see.
-    (let* ((graph (bld-require-closure (list entry-ns)))
+    (let* ((graph (bld-require-closure (append aspect-providers (list entry-ns))))
            (_prof-graph (ei-mark! "require-graph DFS"))
            (walked (reverse app-order))
            ;; graph without the entry-ns pair (it goes last)
@@ -1299,6 +1314,7 @@
                 ;; The build emits app + core forms that reference clojure.core, which
                 ;; must lower to var-deref, so prelude mode is on for the whole build.
                 (ei-fresh-unit!)
+                (jolt-aspect-configure! (ei-unit) aspect-config)
                 ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
                 ;; The passes run for every mode but dev. "release" and
                 ;; "optimized" differ only in the Chez compile parameters
@@ -1449,6 +1465,10 @@
                 ;; flow (build XOR eval per process), cheap to make robust.
                 (jolt-wp-set-record-shapes! (ei-unit) (jolt-hash-map))
                 (ei-clear-cached!)))))
+        ;; Exact cardinality is a build invariant, not a warning. Validate and
+        ;; write the report before any output artifact is compiled or replaced.
+        (unless (jolt-nil? aspect-config)
+          (jolt-aspect-finish! (ei-unit) aspect-config))
         (when drop-compiler? (display "jolt build: dropping compiler image (no runtime eval)\n"))
       (ei-mark! "emit app namespaces")
       (ei-acc-report!)
@@ -1486,6 +1506,13 @@
           (if split?
               (put-string out ";; app half — the runtime half is compiled separately (runtime.ss)\n")
               (bld-emit-runtime out drop-compiler? core-strs))
+          (unless (jolt-nil? aspect-config)
+            ;; Make plain and instrumented artifacts distinct even if a future
+            ;; optimizer happens to erase all observable advice machinery.
+            (put-string out (string-append
+                              "(define jolt-aspect-build-identity "
+                              (ei-str-lit (jolt-str-render-one (jolt-aspect-identity aspect-config)))
+                              ")\n")))
           ;; Load native libs, bake embedded resources, and point source roots at
           ;; the build-time app roots — all BEFORE the app forms. The app's
           ;; top-level forms run at binary startup (Sbuild_heap), and they include
@@ -2070,7 +2097,10 @@
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
-                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #f))
+                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #f
+                    (if (or (null? opt) (null? (cdr opt)) (null? (cddr opt)))
+                        jolt-nil
+                        (caddr opt))))
     jolt-nil))
 (def-var! "jolt.host" "build-library"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
@@ -2078,5 +2108,8 @@
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
-                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t))
+                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t
+                    (if (or (null? opt) (null? (cdr opt)) (null? (cddr opt)))
+                        jolt-nil
+                        (caddr opt))))
     jolt-nil))

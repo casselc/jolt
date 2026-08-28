@@ -14,6 +14,7 @@
 
   Portable Clojure: kernel-tier fns + seed primitives only."
   (:require [jolt.host :refer [inline-enabled? inference-enabled? record-shapes protocol-methods stash-inline! var-redefined?]]
+            [jolt.aspects :as aspects]
             [jolt.passes.fold :refer [const-fold]]
             [jolt.passes.numeric :as numeric]
             [jolt.passes.inline :refer [inline-node flatten-lets scalar-replace direct-call-edges]]
@@ -169,6 +170,10 @@
   ;; they must be the same object, or the record fold + inline fixpoint silently
   ;; degrade. build/emit-image and the gates all publish then pass the same unit.
   (when ir-validate? (report-ir! "analyze" node))
+  ;; A build configures its compilation unit before forms reach this pipeline.
+  ;; Weave resolved calls before inference, inlining, direct linking, and tree
+  ;; shaking. Plain builds and runtime compilation have no selected aspects.
+  (let [node (aspects/weave unit node)]
   ;; stash an inline-eligible defn so later call sites can splice it (closed-world
   ;; optimization only). Done before optimizing, from the analyzed node.
   ;;
@@ -223,4 +228,4 @@
       :else
       (const-fold node)))]
     (when ir-validate? (report-ir! "passes" result))
-    result)))
+    result))))
