@@ -26,13 +26,19 @@ run_build() {
   expected='argument
 advice-before :test/target-call
 advice-args ["ok"]
-operation ok-woven
-advice-after ok-woven!
+audit-before :test/target-call
+audit-args ["ok-woven"]
+operation ok-woven-inner
+audit-after ok-woven-inner!
+advice-after ok-woven-inner!
 entry-before :test/callback-entry
-entry-args ["ok-woven!"]
-callback ok-woven!
-entry-after ok-woven!?
-result ok-woven!?'
+entry-args ["ok-woven-inner!"]
+entry-audit-before :test/callback-entry
+entry-audit-args ["ok-woven-inner!"]
+callback ok-woven-inner!
+entry-audit-after ok-woven-inner!?
+entry-after ok-woven-inner!?
+result ok-woven-inner!?'
   if [ "$output" != "$expected" ]; then
     echo "FAIL: $mode output" >&2
     printf '%s\n' "$output" >&2
@@ -56,23 +62,33 @@ entry_recur_output=$("$tmp/target/release/app" entry-recur)
 expected_entry_recur='argument
 advice-before :test/target-call
 advice-args ["entry-recur"]
+audit-before :test/target-call
+audit-args ["entry-recur"]
 operation entry-recur
+audit-after entry-recur!
 advice-after entry-recur!
 entry-before :test/callback-entry
 entry-args ["recur"]
+entry-audit-before :test/callback-entry
+entry-audit-args ["recur"]
 callback recur
 callback done
+entry-audit-after done?
 entry-after done?
 result done?'
 test "$entry_recur_output" = "$expected_entry_recur"
 test "$(printf '%s\n' "$entry_recur_output" | grep -c '^entry-before ')" -eq 1
+test "$(printf '%s\n' "$entry_recur_output" | grep -c '^entry-audit-before ')" -eq 1
 
 entry_number_output=$("$tmp/target/release/app" entry-number)
 expected_entry_number='numeric-entry-before :test/numeric-callback-entry
 numeric-entry-args [40]
-numeric-callback 41
-numeric-entry-after 42
-result 42'
+numeric-audit-before :test/numeric-callback-entry
+numeric-audit-args [41]
+numeric-callback 42
+numeric-audit-after 43
+numeric-entry-after 43
+result 43'
 test "$entry_number_output" = "$expected_entry_number"
 
 entry_throw_output=$("$tmp/target/release/app" entry-throw)
@@ -83,21 +99,60 @@ if printf '%s\n' "$entry_throw_output" | grep -q '^entry-after '; then
   echo "FAIL: entry advice observed a return after an application exception" >&2
   exit 1
 fi
+if printf '%s\n' "$entry_throw_output" | grep -q '^entry-audit-after '; then
+  echo "FAIL: inner entry advice observed a return after an application exception" >&2
+  exit 1
+fi
 
 throw_output=$("$tmp/target/release/app" throw)
 printf '%s\n' "$throw_output" | grep -q '^caught application failure :application$'
 
 test -s "$tmp/target/aspects.edn"
 grep -q ':identity "v1-' "$tmp/target/aspects.edn"
+grep -q ':provider instrumentation.provider/aspect-provider' "$tmp/target/aspects.edn"
+grep -q ':provider instrumentation.audit-provider/aspect-provider' "$tmp/target/aspects.edn"
 grep -q ':contract :replace-args-v1' "$tmp/target/aspects.edn"
 grep -q ':entry app.target/callback' "$tmp/target/aspects.edn"
 grep -q ':entry app.target/numeric-callback' "$tmp/target/aspects.edn"
 grep -q ':contract :args-v1' "$tmp/target/aspects.edn"
 grep -q ':ordinal 1' "$tmp/target/aspects.edn"
+grep -q ':ordinal 2' "$tmp/target/aspects.edn"
 if grep -q "$tmp" "$tmp/target/aspects.edn"; then
   echo "FAIL: aspect report contains the checkout path" >&2
   exit 1
 fi
+
+# Provider order is observable advice order and therefore part of identity.
+cp "$tmp/deps.edn" "$tmp/deps.ordered.edn"
+ordered_identity=$(sed -n 's/.*:identity "\([^"]*\)".*/\1/p' "$tmp/target/aspects.edn")
+sed -i 's/instrumentation.provider instrumentation.audit-provider/instrumentation.audit-provider instrumentation.provider/' \
+  "$tmp/deps.edn"
+(cd "$tmp" && JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" build -m app.core -o target/reversed/app)
+reversed_identity=$(sed -n 's/.*:identity "\([^"]*\)".*/\1/p' "$tmp/target/aspects.edn")
+test -n "$ordered_identity"
+test -n "$reversed_identity"
+test "$ordered_identity" != "$reversed_identity"
+grep -q ':consumers \[{:advice instrumentation.audit-provider/' "$tmp/target/aspects.edn"
+cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
+cp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
+
+# Every consumer must implement every role in the selected manifest. A valid
+# first provider cannot mask an incomplete later provider.
+sed -i 's/instrumentation.audit-provider/instrumentation.incomplete-provider/' \
+  "$tmp/deps.edn"
+if (cd "$tmp" && JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" build -m app.core -o target/incomplete/app) \
+  >"$tmp/target/incomplete.log" 2>&1; then
+  echo "FAIL: incomplete second provider unexpectedly built" >&2
+  exit 1
+fi
+grep -q 'provider does not implement selected advice role' \
+  "$tmp/target/incomplete.log"
+grep -q 'instrumentation.incomplete-provider/aspect-provider' \
+  "$tmp/target/incomplete.log"
+cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
+cmp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
 
 cp "$tmp/deps.plain.edn" "$tmp/deps.edn"
 (cd "$tmp" && JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \

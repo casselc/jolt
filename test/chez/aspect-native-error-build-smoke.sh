@@ -36,6 +36,10 @@ test "$(printf '%s\n' "$instrumented_output" | grep '^journal ' | tail -n 1)" = 
 test "$(printf '%s\n' "$instrumented_output" | grep -c '^journal ')" -eq 3
 
 test -s "$tmp/app/target/native-error-aspects.edn"
+# This fixture intentionally retains singular :provider as the end-to-end
+# backward-compatibility gate while the primary fixture exercises :providers.
+grep -q ':provider instrumentation.native-error-provider/aspect-provider' \
+  "$tmp/app/target/native-error-aspects.edn"
 grep -q ':id :test/native-error-call' "$tmp/app/target/native-error-aspects.edn"
 grep -q ':contract :args-v1' "$tmp/app/target/native-error-aspects.edn"
 grep -q ':call app.native-error/block-fail' "$tmp/app/target/native-error-aspects.edn"

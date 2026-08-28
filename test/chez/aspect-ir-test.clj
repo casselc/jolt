@@ -53,6 +53,24 @@
     (catch Exception e
       {:message (ex-message e) :data (ex-data e)})))
 
+(def multi-consumer-config
+  {:aspects
+   [(-> (first (:aspects config))
+        (dissoc :advice :contract)
+        (assoc :consumers
+               [{:ordinal 1
+                :provider 'provider.outer/aspect-provider
+                 :advice 'provider.outer/around
+                 :contract :replace-args-v1}
+                {:ordinal 2
+                 :provider 'provider.middle/aspect-provider
+                 :advice 'provider.middle/around
+                 :contract :args-v1}
+                {:ordinal 3
+                 :provider 'provider.inner/aspect-provider
+                 :advice 'provider.inner/around
+                  :contract :replace-args-v1}]))]})
+
 (def entry-config
   {:aspects
    [{:id :test/entry
@@ -147,6 +165,45 @@
           report (aspects/prepare-build-report! unit configured)]
       (is (= :replace-args-v1 (get-in report [:aspects 0 :contract]))))))
 
+(deftest ordered-multi-consumer-call-weaving
+  (let [unit (types/new-unit)
+        _ (aspects/configure-unit! unit multi-consumer-config)
+        woven (aspects/weave unit (ir/def-node "app.core" "run" (invoke-node)))
+        body (:init woven)
+        outer (:body body)
+        outer-operation (nth (:args outer) 3)
+        middle (get-in outer-operation [:arities 0 :body])
+        middle-operation (nth (:args middle) 3)
+        inner (get-in middle-operation [:arities 0 :body])
+        inner-operation (nth (:args inner) 3)
+        target (get-in inner-operation [:arities 0 :body])]
+    (is (= ["left" "right"]
+           (mapv #(get-in % [1 :fn :name]) (:bindings body)))
+        "application arguments are evaluated once outside the whole chain")
+    (is (= "provider.outer" (get-in outer [:args 0 :ns])))
+    (is (= 1 (get-in outer [:args 1 :form :ordinal])))
+    (is (= 'provider.outer/aspect-provider
+           (get-in outer [:args 1 :form :provider])))
+    (is (= ["aspect_arg__3" "aspect_arg__4"]
+           (get-in outer-operation [:arities 0 :params])))
+    (is (= "provider.middle" (get-in middle [:args 0 :ns])))
+    (is (= 2 (get-in middle [:args 1 :form :ordinal])))
+    (is (= ["aspect_arg__3" "aspect_arg__4"]
+           (mapv :name (get-in middle [:args 2 :items])))
+        "outer replacements become the observational consumer's inputs")
+    (is (= [] (get-in middle-operation [:arities 0 :params])))
+    (is (= "provider.inner" (get-in inner [:args 0 :ns])))
+    (is (= 3 (get-in inner [:args 1 :form :ordinal])))
+    (is (= ["aspect_arg__3" "aspect_arg__4"]
+           (mapv :name (get-in inner [:args 2 :items])))
+        "non-replacing advice passes the current arguments downstream")
+    (is (= ["aspect_arg__5" "aspect_arg__6"]
+           (mapv :name (:args target)))
+        "inner replacement arguments reach the application target")
+    (is (= 1 (count (get @(:aspect-matches unit) :test/call)))
+        "consumer count does not multiply logical join-point matches")
+    (is (empty? (ir/tree-problems woven)))))
+
 (deftest fixed-function-entry-weaving
   (let [unit (types/new-unit)
         _ (aspects/configure-unit! unit entry-config)
@@ -191,6 +248,54 @@
         "replacement values retain the entry parameter's runtime coercion")
     (is (= [["x" {:op :local :name replacement}]]
            (get-in operation-arity [:body :bindings])))
+    (is (empty? (ir/tree-problems woven)))))
+
+(deftest ordered-multi-consumer-entry-weaving
+  (let [unit (types/new-unit)
+        configured
+        {:aspects
+         [(-> (first (:aspects entry-config))
+              (dissoc :advice :contract)
+              (assoc :consumers
+                      [{:ordinal 1 :provider 'provider.outer/aspect-provider
+                        :advice 'provider.outer/around
+                        :contract :replace-args-v1}
+                      {:ordinal 2 :provider 'provider.middle/aspect-provider
+                       :advice 'provider.middle/around
+                       :contract :args-v1}
+                      {:ordinal 3 :provider 'provider.inner/aspect-provider
+                       :advice 'provider.inner/around
+                       :contract :replace-args-v1}]))]}
+        hinted (assoc-in (entry-node) [:init :arities 0 :nhints] [["x" :long]])
+        _ (aspects/configure-unit! unit configured)
+        woven (aspects/weave unit hinted)
+        outer (get-in woven [:init :arities 0 :body])
+        outer-operation (nth (:args outer) 3)
+        outer-param (first (get-in outer-operation [:arities 0 :params]))
+        middle (get-in outer-operation [:arities 0 :body])
+        middle-operation (nth (:args middle) 3)
+        inner (get-in middle-operation [:arities 0 :body])
+        inner-operation (nth (:args inner) 3)
+        inner-param (first (get-in inner-operation [:arities 0 :params]))
+        loop-node (get-in inner-operation [:arities 0 :body])]
+    (is (= "provider.outer" (get-in outer [:args 0 :ns])))
+    (is (= "provider.middle" (get-in middle [:args 0 :ns])))
+    (is (= "provider.inner" (get-in inner [:args 0 :ns])))
+    (is (= [outer-param] (mapv :name (get-in middle [:args 2 :items])))
+        "outer entry replacement flows into observational advice")
+    (is (= [] (get-in middle-operation [:arities 0 :params])))
+    (is (= [outer-param] (mapv :name (get-in inner [:args 2 :items])))
+        "observational entry advice passes the replacement downstream")
+    (is (= [[outer-param :long]]
+           (get-in outer-operation [:arities 0 :nhints])))
+    (is (= [[inner-param :long]]
+           (get-in inner-operation [:arities 0 :nhints])))
+    (is (= :loop (:op loop-node)))
+    (is (= [["x" {:op :local :name inner-param}]] (:bindings loop-node)))
+    (is (= :recur (get-in loop-node [:body :op]))
+        "one innermost compiler loop retains the original recur target")
+    (is (= 1 (count (get @(:aspect-matches unit) :test/entry)))
+        "the entry is reported once regardless of consumer count")
     (is (empty? (ir/tree-problems woven)))))
 
 (deftest function-entry-exactness-and-overlap
@@ -497,6 +602,30 @@
         (is (= "jolt aspects: selected aspect ids must be unique" message))
         (is (= [:test/call :test/call] (:ids data)))))))
 
+(deftest selection-provider-schema
+  (let [provider-symbols (ns-resolve 'jolt.aspects 'selection-provider-symbols)]
+    (is (= ['provider.one/aspect-provider]
+           (provider-symbols {:resource "a.edn" :provider 'provider.one})))
+    (is (= ['provider.one/aspect-provider 'provider.two/custom]
+           (provider-symbols {:resource "a.edn"
+                              :providers ['provider.one 'provider.two/custom]})))
+    (doseq [[selection expected]
+            [[{:resource "a.edn"}
+              "jolt aspects: aspect selection needs exactly one of :provider or :providers"]
+             [{:resource "a.edn" :provider 'provider.one
+               :providers ['provider.two]}
+              "jolt aspects: aspect selection needs exactly one of :provider or :providers"]
+             [{:resource "a.edn" :providers []}
+              "jolt aspects: selection :providers must be a non-empty vector"]
+             [{:resource "a.edn" :providers 'provider.one}
+              "jolt aspects: selection :providers must be a non-empty vector"]
+             [{:resource "a.edn" :providers ['provider.one 'provider.one/aspect-provider]}
+              "jolt aspects: selection providers must be unique"]]]
+      (is (= expected
+             (try (provider-symbols selection)
+                  nil
+                   (catch Exception e (ex-message e))))))))
+
 (deftest report-publication-follows-explicit-prepare
   (let [file (java.io.File/createTempFile "jolt-aspects" ".edn")
         path (.getAbsolutePath file)
@@ -515,6 +644,24 @@
         (is (= report (edn/read-string (slurp file)))))
       (finally
         (.delete file)))))
+
+(deftest multi-consumer-report-is-one-logical-aspect
+  (let [unit (types/new-unit)
+        configured (assoc multi-consumer-config
+                          :schema 1 :weaver "test/v1"
+                          :identity "multi-consumer" :report "/tmp/unused")]
+    (aspects/configure-unit! unit configured)
+    (aspects/weave unit (ir/def-node "app.core" "run" (invoke-node)))
+    (let [report (aspects/prepare-build-report! unit configured)
+          aspect (get-in report [:aspects 0])]
+      (is (= 1 (count (:aspects report))))
+      (is (= [1 2 3] (mapv :ordinal (:consumers aspect))))
+      (is (= ['provider.outer/aspect-provider 'provider.middle/aspect-provider
+              'provider.inner/aspect-provider]
+             (mapv :provider (:consumers aspect))))
+      (is (= 'provider.outer/around (:advice aspect))
+          "schema-v1 top-level compatibility names the outer consumer")
+      (is (= [1] (mapv :ordinal (:sites aspect)))))))
 
 (let [{:keys [fail error]} (run-tests)]
   (when (pos? (+ fail error)) (System/exit 1)))
