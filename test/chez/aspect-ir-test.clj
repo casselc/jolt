@@ -78,6 +78,22 @@
     (is (= :ran (aspects/invoke-around (fn [_ _] :skipped) {:id :x} (fn [] :ran))))
     (is (= :ran (aspects/invoke-around (fn [_ _] (throw (Exception. "advice")))
                                        {:id :x} (fn [] :ran)))))
+  (testing "repeated proceed still executes the application exactly once"
+    (let [calls (atom 0)]
+      (is (= :ran
+             (aspects/invoke-around (fn [_ proceed] (proceed) (proceed))
+                                    {:id :x}
+                                    (fn [] (swap! calls inc) :ran))))
+      (is (= 1 @calls))))
+  (testing "advice failure after proceed cannot replace a completed result"
+    (let [calls (atom 0)]
+      (is (= :ran
+             (aspects/invoke-around (fn [_ proceed]
+                                      (proceed)
+                                      (throw (Exception. "after")))
+                                    {:id :x}
+                                    (fn [] (swap! calls inc) :ran))))
+      (is (= 1 @calls))))
   (testing "an application exception retains identity"
     (let [boom (Exception. "app")
           seen (atom nil)]
