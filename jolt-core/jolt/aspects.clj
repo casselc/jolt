@@ -88,8 +88,26 @@
   (cond
     (qualified-symbol? provider) provider
     (symbol? provider) (symbol (str provider) "aspect-provider")
-    :else (fail "selection :provider must be a namespace or qualified var symbol"
+    :else (fail "selection providers must be namespaces or qualified var symbols"
                 {:provider provider})))
+
+(defn- selection-provider-symbols [selection]
+  (let [provider? (contains? selection :provider)
+        providers? (contains? selection :providers)]
+    (when (= provider? providers?)
+      (fail "aspect selection needs exactly one of :provider or :providers"
+            {:selection selection}))
+    (let [providers (if provider?
+                      [(:provider selection)]
+                      (:providers selection))]
+      (when-not (and (vector? providers) (seq providers))
+        (fail "selection :providers must be a non-empty vector"
+              {:providers providers}))
+      (let [provider-vars (mapv provider-var-symbol providers)]
+        (when-not (= (count provider-vars) (count (distinct provider-vars)))
+          (fail "selection providers must be unique"
+                {:providers provider-vars}))
+        provider-vars))))
 
 (defn- provider-source [provider-ns]
   (let [base (str/replace provider-ns "." "/")]
@@ -202,48 +220,61 @@
       (fail ":jolt/build :aspects must be a vector" {:aspects selections}))
     (let [resolved
           (mapv
-            (fn [{:keys [resource provider] :as selection}]
+            (fn [{:keys [resource] :as selection}]
               (when-not (map? selection)
                 (fail "each aspect selection must be a map" {:selection selection}))
-              (reject-unknown-keys "aspect selection" selection #{:resource :provider}
+              (reject-unknown-keys "aspect selection" selection
+                                   #{:resource :provider :providers}
                                    {:selection selection})
               (let [manifest-text (resource-text resource)
                     manifest (validate-manifest resource (edn/read-string manifest-text))
-                    provider-var (provider-var-symbol provider)
-                    provider-value (if-let [v (requiring-resolve provider-var)]
-                                     (validate-provider provider-var @v)
-                                     (fail "provider var not found" {:provider provider-var}))
-                    provider-ns (namespace provider-var)
-                    roles (:roles provider-value)
                     library (:library manifest)
-                    supported-version (get (:libraries provider-value) (:id library))]
-                (when-not (= (:version library) supported-version)
-                  (fail "provider is incompatible with the manifest library revision"
-                        {:provider provider-var :library (:id library)
-                         :manifest-version (:version library)
-                         :provider-version supported-version}))
+                    providers
+                    (mapv
+                      (fn [provider-var]
+                        (let [provider-value
+                              (if-let [v (requiring-resolve provider-var)]
+                                (validate-provider provider-var @v)
+                                (fail "provider var not found" {:provider provider-var}))
+                              provider-ns (namespace provider-var)
+                              supported-version
+                              (get (:libraries provider-value) (:id library))]
+                          (when-not (= (:version library) supported-version)
+                            (fail "provider is incompatible with the manifest library revision"
+                                  {:provider provider-var :library (:id library)
+                                   :manifest-version (:version library)
+                                   :provider-version supported-version}))
+                          {:provider-var provider-var
+                           :provider-ns provider-ns
+                           :provider-bytes (provider-source provider-ns)
+                           :roles (:roles provider-value)}))
+                      (selection-provider-symbols selection))]
                 {:resource resource
                  :manifest-bytes manifest-text
-                 :provider-var provider-var
-                 :provider-ns provider-ns
-                 :provider-bytes (provider-source provider-ns)
+                 :providers providers
                  :library (:library manifest)
                  :aspects
                  (mapv (fn [aspect]
-                         (let [role (:advice-role aspect)
-                               role-value (get roles role)]
-                           (when-not role-value
-                             (fail "provider does not implement selected advice role"
-                                   {:provider provider-var :resource resource
-                                    :aspect (:id aspect) :role role}))
-                           (merge
-                             {:id (:id aspect)
-                              :resource resource
-                              :library (:library manifest)
-                              :match (:match aspect)
-                              :advice-role role
-                              :expect (:expect aspect)}
-                             (normalize-role role-value))))
+                         (let [role (:advice-role aspect)]
+                           {:id (:id aspect)
+                            :resource resource
+                            :library (:library manifest)
+                            :match (:match aspect)
+                            :advice-role role
+                            :expect (:expect aspect)
+                            :consumers
+                            (mapv
+                              (fn [ordinal {:keys [provider-var roles]}]
+                                (let [role-value (get roles role)]
+                                  (when-not role-value
+                                    (fail "provider does not implement selected advice role"
+                                          {:provider provider-var :resource resource
+                                           :aspect (:id aspect) :role role}))
+                                  (merge {:ordinal ordinal
+                                          :provider provider-var}
+                                         (normalize-role role-value))))
+                              (range 1 (inc (count providers)))
+                              providers)}))
                        (:aspects manifest))}))
             selections)
           aspects (vec (mapcat :aspects resolved))
@@ -251,8 +282,14 @@
       (when-not (= (count ids) (count (distinct ids)))
         (fail "selected aspect ids must be unique" {:ids (vec ids)}))
       (let [material {:weaver weaver-version
-                      :selections (mapv #(select-keys % [:resource :manifest-bytes
-                                                        :provider-var :provider-bytes]) resolved)
+                      :selections
+                      (mapv (fn [{:keys [resource manifest-bytes providers]}]
+                              {:resource resource
+                               :manifest-bytes manifest-bytes
+                               :providers
+                               (mapv #(select-keys % [:provider-var :provider-bytes])
+                                     providers)})
+                            resolved)
                       :aspects aspects}
             identity (stable-identity (canonical-str material))]
         {:schema schema-version
@@ -261,8 +298,12 @@
          ;; Both the mapping-var namespace and every runtime advice namespace
          ;; are explicit build roots. They need not be required by app source.
          :providers (vec (distinct
-                           (concat (map :provider-ns resolved)
-                                   (map (comp namespace :advice) aspects))))
+                           (concat
+                             (mapcat (fn [selection]
+                                       (map :provider-ns (:providers selection)))
+                                     resolved)
+                             (map (comp namespace :advice)
+                                  (mapcat :consumers aspects)))))
          :aspects (vec (sort-by (comp str :id) aspects))
          :report report-path}))))
 
@@ -319,20 +360,31 @@
 (defn- fresh-local [unit]
   (str "aspect_arg__" (swap! (:fresh-counter unit) inc)))
 
-(defn- advice-invoke [unit aspect node]
-  (let [[advice-ns advice-name] (split-fqn (:advice aspect))
+(defn- aspect-consumers [aspect]
+  (or (seq (:consumers aspect))
+      [{:ordinal 1
+        :provider (:provider aspect)
+        :advice (:advice aspect)
+        :contract (or (:contract aspect) :proceed-v1)}]))
+
+(defn- join-point [aspect consumer]
+  (merge (select-keys aspect [:id :library :advice-role :match])
+         (select-keys consumer [:provider :advice :contract :ordinal])))
+
+(defn- call-consumer-invoke [unit aspect consumer consumers node names]
+  (let [[advice-ns advice-name] (split-fqn (:advice consumer))
         pos (:pos node)
-        join-point (select-keys aspect [:id :library :advice-role :contract :match])
-        names (mapv (fn [_] (fresh-local unit)) (:args node))
-        bindings (mapv vector names (:args node))
         evaluated-args (ir/vector-node (mapv ir/local names))
-        replace-args? (= :replace-args-v1 (:contract aspect))
+        replace-args? (= :replace-args-v1 (:contract consumer))
         replacement-names (when replace-args?
-                            (mapv (fn [_] (fresh-local unit)) (:args node)))
-        operation (assoc node :args (mapv ir/local
-                                          (or replacement-names names)))
+                            (mapv (fn [_] (fresh-local unit)) names))
+        operation-names (or replacement-names names)
+        operation (if-let [next-consumer (first consumers)]
+                    (call-consumer-invoke unit aspect next-consumer
+                                          (next consumers) node operation-names)
+                    (assoc node :args (mapv ir/local operation-names)))
         advice-ref (cond-> (ir/var-ref advice-ns advice-name) pos (assoc :pos pos))
-        join-point-node (ir/quote-node join-point)
+        join-point-node (ir/quote-node (join-point aspect consumer))
         operation-fn (cond->
                        (ir/fn-node nil [{:params (or replacement-names [])
                                         :body operation}])
@@ -341,12 +393,19 @@
                       "__invoke-instrumentation-around-replace-args"
                       "__invoke-instrumentation-around")
         helper-args (if (contains? #{:args-v1 :replace-args-v1}
-                                   (:contract aspect))
+                                   (:contract consumer))
                       [advice-ref join-point-node evaluated-args operation-fn]
                       [advice-ref join-point-node operation-fn])
-        invoke (ir/invoke
-                 (ir/var-ref "clojure.core" helper-name)
-                 helper-args)
+        invoke (ir/invoke (ir/var-ref "clojure.core" helper-name) helper-args)]
+    (cond-> invoke pos (assoc :pos pos))))
+
+(defn- advice-invoke [unit aspect node]
+  (let [pos (:pos node)
+        names (mapv (fn [_] (fresh-local unit)) (:args node))
+        bindings (mapv vector names (:args node))
+        consumers (aspect-consumers aspect)
+        invoke (call-consumer-invoke unit aspect (first consumers)
+                                     (next consumers) node names)
         wrapped (if (seq bindings) (ir/let-node bindings invoke) invoke)]
     (cond-> wrapped pos (assoc :pos pos))))
 
@@ -354,28 +413,30 @@
   (let [by-name (into {} (map vector old-names new-names))]
     (mapv (fn [[name hint]] [(get by-name name name) hint]) hints)))
 
-(defn- entry-advice-body [unit aspect arity pos]
-  (let [[advice-ns advice-name] (split-fqn (:advice aspect))
-        join-point (select-keys aspect [:id :library :advice-role :contract :match])
-        names (:params arity)
+(defn- entry-consumer-invoke
+  [unit aspect consumer consumers arity pos original-names names]
+  (let [[advice-ns advice-name] (split-fqn (:advice consumer))
         evaluated-args (ir/vector-node (mapv ir/local names))
-        replace-args? (= :replace-args-v1 (:contract aspect))
+        replace-args? (= :replace-args-v1 (:contract consumer))
         replacement-names (when replace-args?
                             (mapv (fn [_] (fresh-local unit)) names))
         operation-inputs (or replacement-names names)
-        ;; The local loop is the original function's recur target. Moving the
-        ;; body directly into proceed's zero-arity thunk would retarget recur to
-        ;; that thunk and change both arity and advice lifecycle semantics.
-        operation-body {:op :loop
-                        :bindings (mapv (fn [name input]
-                                          [name (ir/local input)])
-                                        names operation-inputs)
-                        :body (:body arity)}
+        operation-body
+        (if-let [next-consumer (first consumers)]
+          (entry-consumer-invoke unit aspect next-consumer (next consumers)
+                                 arity pos original-names operation-inputs)
+          ;; The local loop is the original function's recur target. Moving the
+          ;; body directly into proceed's zero-arity thunk would retarget recur
+          ;; to that thunk and change advice lifecycle semantics.
+          {:op :loop
+           :bindings (mapv (fn [name input] [name (ir/local input)])
+                           original-names operation-inputs)
+           :body (:body arity)})
         operation-arity (cond-> {:params (or replacement-names [])
                                  :body operation-body}
                           (and replace-args? (seq (:nhints arity)))
                           (assoc :nhints (remap-hints (:nhints arity)
-                                                     names replacement-names)))
+                                                     original-names replacement-names)))
         operation-fn (ir/fn-node nil [operation-arity])
         advice-ref (cond-> (ir/var-ref advice-ns advice-name)
                      pos (assoc :pos pos))
@@ -383,12 +444,19 @@
                       "__invoke-instrumentation-around-replace-args"
                       "__invoke-instrumentation-around")
         helper-args (if (contains? #{:args-v1 :replace-args-v1}
-                                   (:contract aspect))
-                      [advice-ref (ir/quote-node join-point)
+                                   (:contract consumer))
+                      [advice-ref (ir/quote-node (join-point aspect consumer))
                        evaluated-args operation-fn]
-                      [advice-ref (ir/quote-node join-point) operation-fn])]
+                      [advice-ref (ir/quote-node (join-point aspect consumer))
+                       operation-fn])]
     (cond-> (ir/invoke (ir/var-ref "clojure.core" helper-name) helper-args)
       pos (assoc :pos pos))))
+
+(defn- entry-advice-body [unit aspect arity pos]
+  (let [names (:params arity)
+        consumers (aspect-consumers aspect)]
+    (entry-consumer-invoke unit aspect (first consumers) (next consumers)
+                           arity pos names names)))
 
 (defn- weave-entry-def [unit aspects node]
   (if (and (= :def (:op node)) (= :fn (get-in node [:init :op])))
@@ -467,14 +535,19 @@
        :identity (:identity config)
        :aspects
        (mapv (fn [aspect]
-               {:id (:id aspect)
-                :resource (:resource aspect)
-                :library (:library aspect)
-                :advice-role (:advice-role aspect)
-                :advice (:advice aspect)
-                :contract (:contract aspect)
-                :match (:match aspect)
-                :sites (vec (sort-by :ordinal (get matches (:id aspect))))})
+               (let [consumers (vec (aspect-consumers aspect))
+                     first-consumer (first consumers)]
+                 {:id (:id aspect)
+                  :resource (:resource aspect)
+                  :library (:library aspect)
+                  :advice-role (:advice-role aspect)
+                  ;; Retained for report schema-v1 readers. :consumers is the
+                  ;; authoritative ordered chain when more than one is present.
+                  :advice (:advice first-consumer)
+                  :contract (:contract first-consumer)
+                  :consumers consumers
+                  :match (:match aspect)
+                  :sites (vec (sort-by :ordinal (get matches (:id aspect))))}))
              (:aspects config))})))
 
 (defn publish-build-report!

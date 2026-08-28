@@ -359,9 +359,9 @@ Normal launches leave it disabled and silent.
 ### Build-selected instrumentation aspects
 
 `jolt build` can add synchronous instrumentation without changing a library's
-source or dependency graph. A library ships an inert EDN join-point manifest; a
-separately selected provider maps its semantic roles to runtime advice. Nothing
-activates merely because it is on the classpath.
+source or dependency graph. A library ships an inert EDN join-point manifest;
+one or more separately selected consumers map its semantic roles to runtime
+advice. Nothing activates merely because it is on the classpath.
 
 ```clojure
 ;; deps.edn
@@ -399,6 +399,30 @@ qualified provider var):
            :db/result {:fn 'my.otel.db/around-result
                        :contract :args-v1}}})
 ```
+
+Use ordered `:providers` when independent consumers need the same semantic
+join points—for example, OpenTelemetry plus a bounded event journal:
+
+```clojure
+{:jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/db.edn"
+    :providers [my.audit.db my.otel.db]}]}}
+```
+
+`:provider` and `:providers` are mutually exclusive. The vector must be
+non-empty and may not repeat a provider. Every selected provider must support
+the manifest's exact library revision and implement every selected role, so a
+partially instrumented build cannot silently succeed. The first provider is the
+outermost advice. Replacement arguments flow in order to downstream consumers
+and finally to the application; original argument expressions are still
+evaluated exactly once outside the whole chain.
+
+The weave report records the physical join point once and adds its ordered
+`:consumers`, including provider var, advice var, contract, and ordinal. The
+legacy top-level `:advice` and `:contract` fields continue to identify the first
+consumer for schema-v1 report readers. Provider order and the source bytes of
+every provider contribute to the artifact identity.
 
 An advice function receives `[join-point proceed]`. Jolt preserves argument
 evaluation order, the operation's result, application exception identity, and
