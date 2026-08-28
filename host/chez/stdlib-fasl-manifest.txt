@@ -62,6 +62,7 @@ jolt.parser.collections
 jolt.parser.combinators
 jolt.parser.monad
 jolt.parser.position
+jolt.publish
 jolt.process
 jolt.scheme
 jolt.socket

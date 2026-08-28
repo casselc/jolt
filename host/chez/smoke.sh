@@ -1061,6 +1061,26 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.publish — target-header ABI probe plus actual Jolt no-clobber publication.
+# The C probe compiles against the current Linux SDK and checks its real
+# renameat2 signature/constants and kernel-visible EEXIST/post-publication
+# conditions; the Jolt case then gates the public statuses and races through the
+# Jolt FFI. No non-Linux claim is made by either test.
+pub_out="$(sh test/chez/atomic-publish-abi-probe.sh 2>&1; $jolt run test/chez/atomic-publish-test.clj 2>&1)"
+if printf '%s' "$pub_out" | grep -q 'ATOMIC-PUBLISH-ABI-PROBE OK' \
+   && printf '%s' "$pub_out" | grep -q 'ATOMIC-PUBLISH-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.publish"
+  if printf '%s\n' "$pub_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$pub_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$pub_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$pub_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.host's libc timezone probe must not leave TZ set. It is process global,
 # and the capability check at boot ends on "UTC", so an unrestored write left
 # every jolt process answering UTC from localtime() while the machine was
