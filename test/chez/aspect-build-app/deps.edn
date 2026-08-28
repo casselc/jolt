@@ -2,5 +2,5 @@
  :jolt/build
  {:aspects
   [{:resource "META-INF/jolt/aspects/probe.edn"
-    :provider instrumentation.provider}]
+    :providers [instrumentation.provider instrumentation.audit-provider]}]
   :aspect-report "target/aspects.edn"}}
