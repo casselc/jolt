@@ -357,6 +357,57 @@ collection counts, reclaimed bytes, and heap size on stderr, marked at the
 native boot loader, the runtime files, each application namespace, and `-main`.
 Normal launches leave it disabled and silent.
 
+### Build-selected instrumentation aspects
+
+`jolt build` can add synchronous instrumentation without changing a library's
+source or dependency graph. A library ships an inert EDN join-point manifest; a
+separately selected provider maps its semantic roles to runtime advice. Nothing
+activates merely because it is on the classpath.
+
+```clojure
+;; deps.edn
+{:jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/db.edn"
+    :provider my.otel.db}]
+  :aspect-report "target/db-weave.edn"}}
+```
+
+The resource schema is intentionally narrow in v1:
+
+```clojure
+{:schema 1
+ :library {:id my/db :version "exact-revision"}
+ :aspects
+ [{:id :db/execute
+   :match {:ns my.db.impl :call my.db.driver/execute :arity 2}
+   :advice-role :db/client
+   :expect {:matches 1}}]}
+```
+
+The selected namespace exposes `aspect-provider` (or `:provider` may name a
+qualified provider var):
+
+```clojure
+(def aspect-provider
+  {:schema 1
+   :libraries {'my/db "exact-revision"}
+   :roles {:db/client 'my.otel.db/around-execute}})
+```
+
+An advice function receives `[join-point proceed]`. Jolt preserves argument
+evaluation order, the operation's result, application exception identity, and
+exactly-once execution. Advice that throws, omits `proceed`, invokes it twice,
+or returns a replacement value fails open around the application operation.
+
+Matching uses analyzed, resolved var calls—not source lines—and runs before
+inference, inlining, direct linking, and tree shaking. Unsupported keys,
+revision mismatches, missing roles, overlapping selectors, and exact match-count
+drift fail the build. The deterministic report omits absolute checkout paths,
+and the selected manifest/provider material contributes a stable identity to
+the compiled artifact. V1 does not yet cover async completion or function-entry,
+protocol, host-call, or callback join points.
+
 Linking a binary needs Chez's kernel development files (`libkernel.a`,
 `scheme.h`) and a C compiler. They come with a from-source Chez install and with
 the prebuilt jolt binary; a distro `chezscheme` package ships only the runtime,

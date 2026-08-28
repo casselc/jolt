@@ -108,7 +108,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci gate-run-test gate-run-ci gate-status \
+.PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
@@ -159,7 +159,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
+  smoke tracesmoke buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap unitcontext numeric oparity mathfl flarr \
@@ -417,6 +417,11 @@ irvalidate:
 # `jolt build` produces a working standalone binary.
 buildsmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/build-smoke.sh
+
+# Build-selected resolved-call instrumentation: strict manifest/provider
+# resolution, provider rooting, IR semantics, reports, and multiple build modes.
+aspectsmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh test/chez/aspect-build-smoke.sh
 
 # `jolt build --library` produces a shared object callable from C/C++/Rust.
 buildlibsmoke: testbin

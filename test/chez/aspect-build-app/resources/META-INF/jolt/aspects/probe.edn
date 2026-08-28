@@ -1,0 +1,7 @@
+{:schema 1
+ :library {:id test/aspect-target :version "fixture-v1"}
+ :aspects
+ [{:id :test/target-call
+   :match {:ns app.core :call app.target/operation :arity 1}
+   :advice-role :test/around
+   :expect {:matches 1}}]}
