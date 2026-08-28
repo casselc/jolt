@@ -411,19 +411,47 @@ join points—for example, OpenTelemetry plus a bounded event journal:
     :providers [my.audit.db my.otel.db]}]}}
 ```
 
-`:provider` and `:providers` are mutually exclusive. The vector must be
-non-empty and may not repeat a provider. Every selected provider must support
-the manifest's exact library revision and implement every selected role, so a
-partially instrumented build cannot silently succeed. The first provider is the
-outermost advice. Replacement arguments flow in order to downstream consumers
-and finally to the application; original argument expressions are still
-evaluated exactly once outside the whole chain.
+The legacy `:provider` and `:providers` forms are mutually exclusive. The
+`:providers` vector must be non-empty and may not repeat a provider. Every
+selected provider must support the manifest's exact library revision and
+implement every selected role, so a partially instrumented build cannot
+silently succeed. The first provider is the outermost advice. Replacement
+arguments flow in order to downstream consumers and finally to the application;
+original argument expressions are still evaluated exactly once outside the
+whole chain.
+
+When consumers intentionally cover different parts of one library manifest,
+use the explicit ordered `:consumers` form instead of installing transparent
+placeholder advice:
+
+```clojure
+{:jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/agent.edn"
+    :consumers
+    [{:provider my.event-journal
+      :roles [:agent/model :agent/run :agent/tool :agent/turn]}
+     {:provider my.otel.agent
+      :roles :all}]}]}}
+```
+
+Each consumer entry requires exactly `:provider` and `:roles`. Roles are either
+`:all` or a non-empty vector of unique keywords; vector order is normalized
+because it is a filter, not advice order. A filtered role must exist in the
+manifest, and its provider must implement it at the manifest's exact library
+revision. Manifest roles not selected by any consumer are intentionally not
+woven or match-count validated. Missing selected roles still fail the build;
+the compiler never treats a provider's omissions as an implicit filter.
+`:provider`, `:providers`, and `:consumers` are mutually exclusive, with the
+legacy forms retaining their all-role behavior.
 
 The weave report records the physical join point once and adds its ordered
-`:consumers`, including provider var, advice var, contract, and ordinal. The
+`:consumers`, including provider var, advice var, contract, site ordinal,
+selection ordinal, and normalized role filter. The
 legacy top-level `:advice` and `:contract` fields continue to identify the first
 consumer for schema-v1 report readers. Provider order and the source bytes of
-every provider contribute to the artifact identity.
+every provider contribute to the artifact identity, as do explicit role
+filters.
 
 An advice function receives `[join-point proceed]`. Jolt preserves argument
 evaluation order, the operation's result, application exception identity, and

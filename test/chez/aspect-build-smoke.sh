@@ -178,6 +178,49 @@ grep -q 'instrumentation.incomplete-provider/aspect-provider' \
 cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
 cmp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
 
+# Explicit consumer filters let an independent consumer select only semantic
+# roles it actually observes. The complete provider remains outermost at every
+# site; the audit provider participates only in the call role.
+cp "$tmp/deps.filtered.edn" "$tmp/deps.edn"
+(cd "$tmp" && JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" build -m app.core -o target/filtered/app)
+filtered_output=$("$tmp/target/filtered/app" ok)
+expected_filtered='argument
+advice-before :test/target-call
+advice-args ["ok"]
+audit-before :test/target-call
+audit-args ["ok-woven"]
+operation ok-woven-inner
+audit-after ok-woven-inner!
+advice-after ok-woven-inner!
+entry-before :test/callback-entry
+entry-args ["ok-woven-inner!"]
+callback ok-woven-inner!
+entry-after ok-woven-inner!?
+result ok-woven-inner!?'
+test "$filtered_output" = "$expected_filtered"
+filtered_identity=$(sed -n 's/.*:identity "\([^"]*\)".*/\1/p' "$tmp/target/aspects.edn")
+test -n "$filtered_identity"
+test "$(grep -o 'instrumentation.audit-provider/aspect-provider' \
+  "$tmp/target/aspects.edn" | wc -l)" -eq 1
+grep -q ':roles \[:test/around\]' "$tmp/target/aspects.edn"
+grep -q ':selection-ordinal 2' "$tmp/target/aspects.edn"
+
+# Expanding a filter changes the artifact identity and report even though the
+# same provider source and order remain selected.
+cp "$tmp/deps.filtered-more.edn" "$tmp/deps.edn"
+(cd "$tmp" && JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" build -m app.core -o target/filtered-more/app)
+filtered_more_identity=$(sed -n 's/.*:identity "\([^"]*\)".*/\1/p' "$tmp/target/aspects.edn")
+test -n "$filtered_more_identity"
+test "$filtered_identity" != "$filtered_more_identity"
+test "$(grep -o 'instrumentation.audit-provider/aspect-provider' \
+  "$tmp/target/aspects.edn" | wc -l)" -eq 2
+grep -q ':roles \[:test/around :test/entry-around\]' "$tmp/target/aspects.edn"
+
+cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
+cp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
+
 cp "$tmp/deps.plain.edn" "$tmp/deps.edn"
 (cd "$tmp" && JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
   "$jolt" build -m app.core -o target/plain/app)
