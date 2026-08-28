@@ -27,6 +27,24 @@
   [advice join-point operation]
   (clojure.core/__invoke-instrumentation-around advice join-point operation))
 
+(defn invoke-around-args
+  "The explicit `:args-v1` advice contract. `evaluated-args` is the vector of
+  original call arguments after their ordinary left-to-right evaluation.
+  Advice receives `[join-point evaluated-args proceed]`; application execution
+  and fail-open behavior are otherwise identical to `invoke-around`."
+  [advice join-point evaluated-args operation]
+  (clojure.core/__invoke-instrumentation-around
+    advice join-point evaluated-args operation))
+
+(defn invoke-around-replace-args
+  "The explicit `:replace-args-v1` advice contract. Advice sees the original
+  evaluated argument vector and may call `proceed` with either no arguments or
+  one exact-arity replacement vector. Invalid replacement advice fails open to
+  the original vector before application execution."
+  [advice join-point evaluated-args operation]
+  (clojure.core/__invoke-instrumentation-around-replace-args
+    advice join-point evaluated-args operation))
+
 (defn- fail [message data]
   (throw (ex-info (str "jolt aspects: " message) data)))
 
@@ -138,10 +156,32 @@
       (fail "provider :libraries must map library symbols to exact version strings"
             {:provider provider-var :library library :version version})))
   (doseq [[role advice] (:roles provider)]
-    (when-not (and (keyword? role) (qualified-symbol? advice))
-      (fail "provider roles must map keywords to qualified advice symbols"
+    (when-not (keyword? role)
+      (fail "provider role names must be keywords"
+            {:provider provider-var :role role}))
+    (cond
+      (qualified-symbol? advice) nil
+
+      (map? advice)
+      (do
+        (reject-unknown-keys "provider role" advice #{:fn :contract}
+                             {:provider provider-var :role role})
+        (when-not (qualified-symbol? (:fn advice))
+          (fail "provider contracted role :fn must be a qualified advice symbol"
+                {:provider provider-var :role role :fn (:fn advice)}))
+        (when-not (contains? #{:args-v1 :replace-args-v1} (:contract advice))
+          (fail "unsupported provider role contract"
+                {:provider provider-var :role role :contract (:contract advice)})))
+
+      :else
+      (fail "provider roles must map to a qualified advice symbol or a contracted role map"
             {:provider provider-var :role role :advice advice})))
   provider)
+
+(defn- normalize-role [role-value]
+  (if (map? role-value)
+    {:advice (:fn role-value) :contract (:contract role-value)}
+    {:advice role-value :contract :proceed-v1}))
 
 (defn resolve-build-config
   "Resolve and validate deps.edn :jolt/build :aspects selections.
@@ -184,18 +224,19 @@
                  :aspects
                  (mapv (fn [aspect]
                          (let [role (:advice-role aspect)
-                               advice (get roles role)]
-                           (when-not advice
+                               role-value (get roles role)]
+                           (when-not role-value
                              (fail "provider does not implement selected advice role"
                                    {:provider provider-var :resource resource
                                     :aspect (:id aspect) :role role}))
-                           {:id (:id aspect)
-                            :resource resource
-                            :library (:library manifest)
-                            :match (:match aspect)
-                            :advice-role role
-                            :advice advice
-                            :expect (:expect aspect)}))
+                           (merge
+                             {:id (:id aspect)
+                              :resource resource
+                              :library (:library manifest)
+                              :match (:match aspect)
+                              :advice-role role
+                              :expect (:expect aspect)}
+                             (normalize-role role-value))))
                        (:aspects manifest))}))
             selections)
           aspects (vec (mapcat :aspects resolved))
@@ -257,15 +298,31 @@
 (defn- advice-invoke [unit aspect node]
   (let [[advice-ns advice-name] (split-fqn (:advice aspect))
         pos (:pos node)
-        join-point (select-keys aspect [:id :library :advice-role :match])
+        join-point (select-keys aspect [:id :library :advice-role :contract :match])
         names (mapv (fn [_] (fresh-local unit)) (:args node))
         bindings (mapv vector names (:args node))
-        operation (assoc node :args (mapv ir/local names))
+        evaluated-args (ir/vector-node (mapv ir/local names))
+        replace-args? (= :replace-args-v1 (:contract aspect))
+        replacement-names (when replace-args?
+                            (mapv (fn [_] (fresh-local unit)) (:args node)))
+        operation (assoc node :args (mapv ir/local
+                                          (or replacement-names names)))
+        advice-ref (cond-> (ir/var-ref advice-ns advice-name) pos (assoc :pos pos))
+        join-point-node (ir/quote-node join-point)
+        operation-fn (cond->
+                       (ir/fn-node nil [{:params (or replacement-names [])
+                                        :body operation}])
+                       pos (assoc :pos pos))
+        helper-name (if replace-args?
+                      "__invoke-instrumentation-around-replace-args"
+                      "__invoke-instrumentation-around")
+        helper-args (if (contains? #{:args-v1 :replace-args-v1}
+                                   (:contract aspect))
+                      [advice-ref join-point-node evaluated-args operation-fn]
+                      [advice-ref join-point-node operation-fn])
         invoke (ir/invoke
-                 (ir/var-ref "clojure.core" "__invoke-instrumentation-around")
-                 [(cond-> (ir/var-ref advice-ns advice-name) pos (assoc :pos pos))
-                  (ir/quote-node join-point)
-                  (cond-> (ir/fn-node nil [{:params [] :body operation}]) pos (assoc :pos pos))])
+                 (ir/var-ref "clojure.core" helper-name)
+                 helper-args)
         wrapped (if (seq bindings) (ir/let-node bindings invoke) invoke)]
     (cond-> wrapped pos (assoc :pos pos))))
 
@@ -322,6 +379,7 @@
                 :library (:library aspect)
                 :advice-role (:advice-role aspect)
                 :advice (:advice aspect)
+                :contract (:contract aspect)
                 :match (:match aspect)
                 :sites (vec (sort-by :ordinal (get matches (:id aspect))))})
              (:aspects config))})))
