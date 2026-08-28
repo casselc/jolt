@@ -1501,6 +1501,22 @@
                _  (Files/deleteIfExists d)]
            [sz ex mt cpsz mvsz (pos? sz)])))"
    :expected "[5 true 1000 5 5 true]"}
+  {:suite "nio-files" :label "directory permissions are selected at creation"
+   :expr
+   "(do (import '[java.nio.file Files] '[java.nio.file.attribute FileAttribute PosixFilePermissions])
+        (let [d (Files/createTempDirectory \"jolt-nio-mode-\" (into-array FileAttribute []))
+              attr (PosixFilePermissions/asFileAttribute
+                    (PosixFilePermissions/fromString \"rwx------\"))
+              child (.resolve d \"explicit\")]
+          (try
+            (Files/createDirectory child (into-array FileAttribute [attr]))
+            [(PosixFilePermissions/toString
+              (Files/getPosixFilePermissions d (into-array java.nio.file.LinkOption [])))
+             (PosixFilePermissions/toString
+              (Files/getPosixFilePermissions child (into-array java.nio.file.LinkOption [])))
+             (.name attr)]
+            (finally (Files/deleteIfExists child) (Files/deleteIfExists d)))))"
+   :expected "[\"rwx------\" \"rwx------\" \"posix:permissions\"]"}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44* 0) (set! *set-u44* 9))" :expected :throws}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44b* 0) [(binding [*set-u44b* 99] (set! *set-u44b* 42) *set-u44b*) *set-u44b*])" :expected "[42 0]"}
   {:suite "vars / binding dynamic" :expr "(do (def not-dyn-u44 0) (binding [not-dyn-u44 1] not-dyn-u44))" :expected :throws}
