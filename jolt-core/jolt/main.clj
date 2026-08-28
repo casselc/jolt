@@ -4,6 +4,7 @@
   which hands it the raw argv; the project directory is JOLT_PWD (the user's cwd
   before the launcher cd'd to the jolt repo)."
   (:require [jolt.deps :as deps]
+            [jolt.aspects :as aspects]
             [clojure.string :as str]))
 
 (defn- project-dir [] (or (jolt.host/getenv "JOLT_PWD") "."))
@@ -608,7 +609,13 @@
             ;; different Chez machine. Needs a prepared target pack (--target-pack
             ;; DIR or $JOLT_TARGET_PACK) — see tools/cross-compile/README.md.
             target (:target opts)
-            target-pack (or (:target-pack opts) (System/getenv "JOLT_TARGET_PACK"))]
+            target-pack (or (:target-pack opts) (System/getenv "JOLT_TARGET_PACK"))
+            aspect-report (let [p (:aspect-report build)]
+                            (cond
+                              (nil? p) (str out ".build/aspects.edn")
+                              (str/starts-with? p "/") p
+                              :else (str pdir "/" p)))
+            aspect-config (aspects/resolve-build-config (:aspects build) aspect-report)]
         (when (and target library?)
           (throw (ex-info "cross build (--target) does not support --library yet" {})))
         (when (and target (nil? target-pack))
@@ -616,8 +623,8 @@
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake?)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack))))))
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? aspect-config)
+          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack aspect-config))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the
