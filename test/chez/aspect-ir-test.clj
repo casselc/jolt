@@ -1,5 +1,6 @@
 (ns aspect-ir-test
-  (:require [clojure.test :refer [deftest is testing run-tests]]
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer [deftest is testing run-tests]]
             [jolt.aspects :as aspects]
             [jolt.ir :as ir]
             [jolt.passes.types :as types]))
@@ -84,6 +85,25 @@
         (aspects/invoke-around (fn [_ proceed] (proceed)) {:id :x} (fn [] (throw boom)))
         (catch Exception e (reset! seen e)))
       (is (identical? boom @seen)))))
+
+(deftest report-publication-follows-explicit-prepare
+  (let [file (java.io.File/createTempFile "jolt-aspects" ".edn")
+        path (.getAbsolutePath file)
+        _ (.delete file)
+        unit (types/new-unit)
+        configured (assoc config :schema 1 :weaver "test/v1"
+                                 :identity "test-identity" :report path)]
+    (try
+      (aspects/configure-unit! unit configured)
+      (aspects/weave unit (ir/def-node "app.core" "run" (invoke-node)))
+      (let [report (aspects/prepare-build-report! unit configured)]
+        (is (not (.exists file)) "validation does not publish a report")
+        (is (= :test/call (get-in report [:aspects 0 :id])))
+        (aspects/publish-build-report! configured report)
+        (is (.exists file))
+        (is (= report (edn/read-string (slurp file)))))
+      (finally
+        (.delete file)))))
 
 (let [{:keys [fail error]} (run-tests)]
   (when (pos? (+ fail error)) (System/exit 1)))
