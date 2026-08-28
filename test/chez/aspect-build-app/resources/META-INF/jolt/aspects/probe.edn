@@ -4,4 +4,12 @@
  [{:id :test/target-call
    :match {:ns app.core :call app.target/operation :arity 1}
    :advice-role :test/around
+   :expect {:matches 1}}
+  {:id :test/callback-entry
+   :match {:entry app.target/callback :arity 1}
+   :advice-role :test/entry-around
+   :expect {:matches 1}}
+  {:id :test/numeric-callback-entry
+   :match {:entry app.target/numeric-callback :arity 1}
+   :advice-role :test/numeric-entry-around
    :expect {:matches 1}}]}
