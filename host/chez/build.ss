@@ -484,7 +484,8 @@
 (define jolt-aspect-configure!       (var-deref "jolt.aspects" "configure-unit!"))
 (define jolt-aspect-provider-ns      (var-deref "jolt.aspects" "provider-namespaces"))
 (define jolt-aspect-weave            (var-deref "jolt.aspects" "weave"))
-(define jolt-aspect-finish!          (var-deref "jolt.aspects" "finish-build!"))
+(define jolt-aspect-prepare-report!  (var-deref "jolt.aspects" "prepare-build-report!"))
+(define jolt-aspect-publish-report!  (var-deref "jolt.aspects" "publish-build-report!"))
 (define jolt-aspect-identity         (var-deref "jolt.aspects" "build-identity"))
 
 (define (bld-wp-infer! ordered)
@@ -1457,14 +1458,16 @@
                 ;; flow (build XOR eval per process), cheap to make robust.
                 (jolt-wp-set-record-shapes! (ei-unit) (jolt-hash-map))
                 (ei-clear-cached!)))))
-        ;; Exact cardinality is a build invariant, not a warning. Validate and
-        ;; write the report before any output artifact is compiled or replaced.
-        (unless (jolt-nil? aspect-config)
-          (jolt-aspect-finish! (ei-unit) aspect-config))
         (when drop-compiler? (display "jolt build: dropping compiler image (no runtime eval)\n"))
       (ei-mark! "emit app namespaces")
       (ei-acc-report!)
-      (let* ((builddir (string-append out-path ".build"))
+      (let* (;; Exact cardinality is a build invariant, not a warning. Validate
+             ;; it before compiling or replacing the output artifact, but keep
+             ;; the report in memory until that artifact succeeds.
+             (aspect-report (if (jolt-nil? aspect-config)
+                                jolt-nil
+                                (jolt-aspect-prepare-report! (ei-unit) aspect-config)))
+             (builddir (string-append out-path ".build"))
              (flat-ss  (string-append builddir "/flat.ss"))
              (flat-so  (string-append builddir "/flat.so"))
              (rt-ss    (string-append builddir "/runtime.ss"))
@@ -1667,7 +1670,12 @@
           (else
            (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c
                           (bld-native-link-flags natives)
-                          (and drop-compiler? (not bld-nt?)))))))))))
+                          (and drop-compiler? (not bld-nt?)))))
+        ;; All build paths above return only after the output artifact has been
+        ;; written successfully. `spit` itself is atomic, so readers observe the
+        ;; previous complete report or this complete report, never a partial one.
+        (unless (jolt-nil? aspect-config)
+          (jolt-aspect-publish-report! aspect-config aspect-report))))))))
 
 ;; --- self-contained link (in-process compile + append the boot to the stub) ---
 ;; compile-file runs against the DEFAULT interaction environment, so the boot's

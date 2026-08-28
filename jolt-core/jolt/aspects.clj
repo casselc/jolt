@@ -295,8 +295,12 @@
                     node)))]
         (assoc (walk root) :aspect-woven true)))))
 
-(defn finish-build!
-  "Validate exact match counts and write the deterministic EDN weave report."
+(defn prepare-build-report!
+  "Validate exact match counts and return the deterministic EDN weave report.
+
+  This deliberately performs no filesystem writes. The host build validates
+  before native compilation, then publishes the returned report only after the
+  output artifact succeeds."
   [unit config]
   (when config
     (let [matches @(:aspect-matches unit)]
@@ -308,20 +312,32 @@
                                       "aspect match count was ambiguous")
                   {:aspect (:id aspect) :expected expected :actual actual
                    :match (:match aspect)}))))
-      (let [report {:schema schema-version
-                    :weaver (:weaver config)
-                    :identity (:identity config)
-                    :aspects
-                    (mapv (fn [aspect]
-                            {:id (:id aspect)
-                             :resource (:resource aspect)
-                             :library (:library aspect)
-                             :advice-role (:advice-role aspect)
-                             :advice (:advice aspect)
-                             :match (:match aspect)
-                             :sites (vec (sort-by :ordinal (get matches (:id aspect))))})
-                          (:aspects config))}]
-        (when-let [parent (.getParentFile (io/file (:report config)))]
-          (.mkdirs parent))
-        (spit (:report config) (str (canonical-str report) "\n"))
-        report))))
+      {:schema schema-version
+       :weaver (:weaver config)
+       :identity (:identity config)
+       :aspects
+       (mapv (fn [aspect]
+               {:id (:id aspect)
+                :resource (:resource aspect)
+                :library (:library aspect)
+                :advice-role (:advice-role aspect)
+                :advice (:advice aspect)
+                :match (:match aspect)
+                :sites (vec (sort-by :ordinal (get matches (:id aspect))))})
+             (:aspects config))})))
+
+(defn publish-build-report!
+  "Atomically publish a previously validated report after artifact success."
+  [config report]
+  (when (and config report)
+    (when-let [parent (.getParentFile (io/file (:report config)))]
+      (.mkdirs parent))
+    ;; Jolt's spit writes through a sibling temporary and renames on success.
+    (spit (:report config) (str (canonical-str report) "\n"))
+    report))
+
+(defn finish-build!
+  "Compatibility entry point: validate and immediately publish the report."
+  [unit config]
+  (when-let [report (prepare-build-report! unit config)]
+    (publish-build-report! config report)))
