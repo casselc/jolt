@@ -1,0 +1,6 @@
+{:paths ["src" "resources"]
+ :jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/probe.edn"
+    :provider instrumentation.provider}]
+  :aspect-report "target/aspects.edn"}}
