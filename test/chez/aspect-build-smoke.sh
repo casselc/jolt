@@ -69,6 +69,7 @@ test "$plain_output" = "$expected_plain"
 
 # A stale exact selector fails before replacing an existing artifact.
 cp "$tmp/deps.instrumented.edn" "$tmp/deps.edn"
+cp "$tmp/target/aspects.edn" "$tmp/target/aspects-before-failure.edn"
 sed -i 's#app.target/operation#app.target/missing#' \
   "$tmp/resources/META-INF/jolt/aspects/probe.edn"
 if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
@@ -77,5 +78,6 @@ if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
   exit 1
 fi
 test "$("$tmp/target/release/app" ok)" = "$expected"
+cmp "$tmp/target/aspects-before-failure.edn" "$tmp/target/aspects.edn"
 
 echo "PASS: compiler-supported aspect build"
