@@ -10,7 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `jolt build` can select instrumentation aspect manifests and one or more
-  ordered providers. The compiler wraps exact resolved call sites and
+  ordered providers, including explicit per-provider role filters when
+  consumers intentionally cover different parts of one manifest. The compiler
+  wraps exact resolved call sites and
   fixed-arity function entries before optimization. Each provider can observe
   evaluated arguments or explicitly replace them while the compiler still
   guarantees one application execution, fail-open instrumentation, and

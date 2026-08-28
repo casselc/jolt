@@ -91,23 +91,83 @@
     :else (fail "selection providers must be namespaces or qualified var symbols"
                 {:provider provider})))
 
-(defn- selection-provider-symbols [selection]
+(defn- normalize-consumer-roles [roles consumer]
+  (cond
+    (= :all roles) :all
+
+    (and (vector? roles) (seq roles))
+    (do
+      (when-not (every? keyword? roles)
+        (fail "selection consumer :roles must contain only keywords"
+              {:consumer consumer :roles roles}))
+      (when-not (= (count roles) (count (distinct roles)))
+        (fail "selection consumer :roles must be unique"
+              {:consumer consumer :roles roles}))
+      ;; Role order does not affect advice order. Normalize it so equivalent
+      ;; filters have the same build identity and report representation.
+      (vec (sort-by str roles)))
+
+    :else
+    (fail "selection consumer :roles must be :all or a non-empty vector"
+          {:consumer consumer :roles roles})))
+
+(defn- selection-consumers [selection]
   (let [provider? (contains? selection :provider)
-        providers? (contains? selection :providers)]
-    (when (= provider? providers?)
-      (fail "aspect selection needs exactly one of :provider or :providers"
+        providers? (contains? selection :providers)
+        consumers? (contains? selection :consumers)
+        forms (count (filter true? [provider? providers? consumers?]))]
+    (when-not (= 1 forms)
+      (fail (str "aspect selection needs exactly one of :provider, :providers, "
+                 "or :consumers")
             {:selection selection}))
-    (let [providers (if provider?
-                      [(:provider selection)]
-                      (:providers selection))]
-      (when-not (and (vector? providers) (seq providers))
-        (fail "selection :providers must be a non-empty vector"
-              {:providers providers}))
-      (let [provider-vars (mapv provider-var-symbol providers)]
-        (when-not (= (count provider-vars) (count (distinct provider-vars)))
-          (fail "selection providers must be unique"
-                {:providers provider-vars}))
-        provider-vars))))
+    (let [raw-consumers
+          (cond
+            provider? [{:provider (:provider selection) :roles :all}]
+
+            providers?
+            (do
+              (when-not (and (vector? (:providers selection))
+                             (seq (:providers selection)))
+                (fail "selection :providers must be a non-empty vector"
+                      {:providers (:providers selection)}))
+              (mapv #(hash-map :provider % :roles :all) (:providers selection)))
+
+            :else
+            (do
+              (when-not (and (vector? (:consumers selection))
+                             (seq (:consumers selection)))
+                (fail "selection :consumers must be a non-empty vector"
+                      {:consumers (:consumers selection)}))
+              (:consumers selection)))
+          consumers
+          (mapv
+            (fn [selection-ordinal consumer]
+              (when-not (map? consumer)
+                (fail "each selection consumer must be a map"
+                      {:consumer consumer}))
+              (reject-unknown-keys "selection consumer" consumer
+                                   #{:provider :roles} {:consumer consumer})
+              (when-not (contains? consumer :provider)
+                (fail "selection consumer needs :provider"
+                      {:consumer consumer}))
+              (when-not (contains? consumer :roles)
+                (fail "selection consumer needs explicit :roles"
+                      {:consumer consumer}))
+              {:selection-ordinal selection-ordinal
+               :provider-var (provider-var-symbol (:provider consumer))
+               :roles (normalize-consumer-roles (:roles consumer) consumer)})
+            (range 1 (inc (count raw-consumers)))
+            raw-consumers)
+          provider-vars (mapv :provider-var consumers)]
+      (when-not (= (count provider-vars) (count (distinct provider-vars)))
+        (fail "selection consumers must name unique providers"
+              {:providers provider-vars}))
+      consumers)))
+
+(defn- selection-provider-symbols [selection]
+  ;; Retained as a narrow compatibility helper for callers/tests that only need
+  ;; the selected build roots. Resolution itself uses the richer descriptors.
+  (mapv :provider-var (selection-consumers selection)))
 
 (defn- provider-source [provider-ns]
   (let [base (str/replace provider-ns "." "/")]
@@ -212,8 +272,10 @@
   "Resolve and validate deps.edn :jolt/build :aspects selections.
 
   A provider may name a namespace (whose `aspect-provider` var is used) or a
-  qualified provider var. Returns nil for a plain build. The returned value is
-  host-neutral data suitable for passing into the host build API."
+  qualified provider var. Legacy :provider/:providers selections apply each
+  provider to every manifest role. Explicit :consumers selections require a
+  fail-closed :roles filter per ordered provider. Returns nil for a plain build.
+  The returned value is host-neutral data suitable for the host build API."
   [selections report-path]
   (when (seq selections)
     (when-not (vector? selections)
@@ -224,14 +286,23 @@
               (when-not (map? selection)
                 (fail "each aspect selection must be a map" {:selection selection}))
               (reject-unknown-keys "aspect selection" selection
-                                   #{:resource :provider :providers}
+                                   #{:resource :provider :providers :consumers}
                                    {:selection selection})
               (let [manifest-text (resource-text resource)
                     manifest (validate-manifest resource (edn/read-string manifest-text))
                     library (:library manifest)
+                    manifest-roles (set (map :advice-role (:aspects manifest)))
+                    selected-consumers (selection-consumers selection)
+                    _ (doseq [{:keys [provider-var roles]} selected-consumers
+                              :when (not= :all roles)]
+                        (let [unknown (vec (remove manifest-roles roles))]
+                          (when (seq unknown)
+                            (fail "selection consumer names roles absent from the manifest"
+                                  {:provider provider-var :resource resource
+                                   :roles unknown}))))
                     providers
                     (mapv
-                      (fn [provider-var]
+                      (fn [{:keys [provider-var roles selection-ordinal]}]
                         (let [provider-value
                               (if-let [v (requiring-resolve provider-var)]
                                 (validate-provider provider-var @v)
@@ -247,35 +318,49 @@
                           {:provider-var provider-var
                            :provider-ns provider-ns
                            :provider-bytes (provider-source provider-ns)
+                           :selection-ordinal selection-ordinal
+                           :selected-roles roles
                            :roles (:roles provider-value)}))
-                      (selection-provider-symbols selection))]
+                      selected-consumers)]
                 {:resource resource
                  :manifest-bytes manifest-text
                  :providers providers
                  :library (:library manifest)
                  :aspects
-                 (mapv (fn [aspect]
-                         (let [role (:advice-role aspect)]
-                           {:id (:id aspect)
-                            :resource resource
-                            :library (:library manifest)
-                            :match (:match aspect)
-                            :advice-role role
-                            :expect (:expect aspect)
-                            :consumers
-                            (mapv
-                              (fn [ordinal {:keys [provider-var roles]}]
-                                (let [role-value (get roles role)]
-                                  (when-not role-value
-                                    (fail "provider does not implement selected advice role"
-                                          {:provider provider-var :resource resource
-                                           :aspect (:id aspect) :role role}))
-                                  (merge {:ordinal ordinal
-                                          :provider provider-var}
-                                         (normalize-role role-value))))
-                              (range 1 (inc (count providers)))
-                              providers)}))
-                       (:aspects manifest))}))
+                 (->> (:aspects manifest)
+                      (keep
+                        (fn [aspect]
+                          (let [role (:advice-role aspect)
+                                applicable
+                                (filterv
+                                  (fn [{:keys [selected-roles]}]
+                                    (or (= :all selected-roles)
+                                        (some #(= role %) selected-roles)))
+                                  providers)]
+                            (when (seq applicable)
+                              {:id (:id aspect)
+                               :resource resource
+                               :library (:library manifest)
+                               :match (:match aspect)
+                               :advice-role role
+                               :expect (:expect aspect)
+                               :consumers
+                               (mapv
+                                 (fn [ordinal {:keys [provider-var roles selected-roles
+                                                      selection-ordinal]}]
+                                   (let [role-value (get roles role)]
+                                     (when-not role-value
+                                       (fail "provider does not implement selected advice role"
+                                             {:provider provider-var :resource resource
+                                              :aspect (:id aspect) :role role}))
+                                     (merge {:ordinal ordinal
+                                             :selection-ordinal selection-ordinal
+                                             :provider provider-var
+                                             :roles selected-roles}
+                                            (normalize-role role-value))))
+                                 (range 1 (inc (count applicable)))
+                                 applicable)}))))
+                      vec)}))
             selections)
           aspects (vec (mapcat :aspects resolved))
           ids (map :id aspects)]
@@ -287,7 +372,8 @@
                               {:resource resource
                                :manifest-bytes manifest-bytes
                                :providers
-                               (mapv #(select-keys % [:provider-var :provider-bytes])
+                               (mapv #(select-keys % [:provider-var :provider-bytes
+                                                     :selection-ordinal :selected-roles])
                                      providers)})
                             resolved)
                       :aspects aspects}
