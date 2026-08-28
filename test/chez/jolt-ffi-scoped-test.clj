@@ -94,6 +94,39 @@
               (with-redefs [ffi/free (fn [p] (swap! frees inc) (real-free p))]
                 (rejects? #(ffi/with-alloc [p 1] (throw (ex-info "boom" {})))))
               @frees)))
+(check "arena returns body value and frees dynamic siblings in reverse order"
+       (= [:answer [[:alloc 3 100] [:alloc 5 101] [:free 101] [:free 100]]]
+          (let [events (atom []) next-pointer (atom 99)
+                answer
+                (with-redefs
+                  [ffi/alloc (fn [n]
+                               (let [p (swap! next-pointer inc)]
+                                 (swap! events conj [:alloc n p])
+                                 p))
+                   ffi/free (fn [p] (swap! events conj [:free p]))]
+                  (ffi/with-arena [alloc!]
+                    (alloc! 3)
+                    (alloc! 5)
+                    :answer))]
+            [answer @events])))
+(check "arena frees completed allocations after partial construction failure"
+       (= [[:alloc 7 201] [:free 201]]
+          (let [events (atom []) calls (atom 0)]
+            (with-redefs
+              [ffi/alloc (fn [n]
+                           (if (= 2 (swap! calls inc))
+                             (throw (ex-info "allocation failed" {}))
+                             (do (swap! events conj [:alloc n 201]) 201)))
+               ffi/free (fn [p] (swap! events conj [:free p]))]
+              (rejects? #(ffi/with-arena [alloc!]
+                           (alloc! 7)
+                           (alloc! 9))))
+            @events)))
+(check "arena rejects an escaped allocator after scope exit"
+       (let [escaped (atom nil)]
+         (ffi/with-arena [alloc!]
+           (reset! escaped alloc!))
+         (rejects? #(@escaped 1))))
 (check "partial C string array frees members and array"
        (= 2 (let [real-free ffi/free real-string->ptr ffi/string->ptr
                   frees (atom 0) calls (atom 0)]

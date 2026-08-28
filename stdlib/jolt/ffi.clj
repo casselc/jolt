@@ -208,6 +208,12 @@
     (throw (str "jolt.ffi/" macro-name " requires [pointer value] binding")))
   binding)
 
+(defn- scope-binding [macro-name binding]
+  (when-not (and (vector? binding) (= 1 (count binding))
+                 (symbol? (first binding)))
+    (throw (str "jolt.ffi/" macro-name " requires [allocator] binding")))
+  (first binding))
+
 (defmacro with-alloc
   "Allocate byte-count bytes for pointer, evaluate body, and free exactly once.
   The pointer is valid only within body and must not escape the lexical scope."
@@ -215,6 +221,36 @@
   (let [[pointer byte-count] (helper-binding "with-alloc" binding)]
     `(let [~pointer (jolt.ffi/alloc ~byte-count)]
        (try ~@body (finally (jolt.ffi/free ~pointer))))))
+
+(defmacro with-arena
+  "Bind allocator to a scoped allocator for a dynamic number of sibling native
+  buffers. (allocator byte-count) registers each successful allocation and the
+  scope frees them exactly once in reverse order. Neither the allocator nor any
+  returned pointer may escape body; calling an escaped allocator after the scope
+  closes raises IllegalStateException. Prefer with-alloc/with-out/with-layout
+  when the allocation count is statically nested."
+  [binding & body]
+  (let [allocator (scope-binding "with-arena" binding)]
+    `(let [state# (atom {:open? true :pointers []})
+           ~allocator
+           (fn [byte-count#]
+             (locking state#
+               (when-not (:open? @state#)
+                 (throw (IllegalStateException.
+                         "jolt.ffi: scoped allocator is no longer live")))
+               (let [pointer# (jolt.ffi/alloc byte-count#)]
+                 (swap! state# update :pointers conj pointer#)
+                 pointer#)))]
+       (try
+         ~@body
+         (finally
+           (let [pointers#
+                 (locking state#
+                   (let [pointers# (:pointers @state#)]
+                     (reset! state# {:open? false :pointers []})
+                     pointers#))]
+             (doseq [pointer# (rseq pointers#)]
+               (jolt.ffi/free pointer#))))))))
 
 (defmacro with-out
   "Lexically allocate one scalar value of scalar-type."
