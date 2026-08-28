@@ -377,6 +377,10 @@ The resource schema is intentionally narrow in v1:
  [{:id :db/execute
    :match {:ns my.db.impl :call my.db.driver/execute :arity 2}
    :advice-role :db/client
+   :expect {:matches 1}}
+  {:id :db/result-callback
+   :match {:entry my.db.impl/consume-result :arity 1}
+   :advice-role :db/result
    :expect {:matches 1}}]}
 ```
 
@@ -387,7 +391,9 @@ qualified provider var):
 (def aspect-provider
   {:schema 1
    :libraries {'my/db "exact-revision"}
-   :roles {:db/client 'my.otel.db/around-execute}})
+   :roles {:db/client 'my.otel.db/around-execute
+           :db/result {:fn 'my.otel.db/around-result
+                       :contract :args-v1}}})
 ```
 
 An advice function receives `[join-point proceed]`. Jolt preserves argument
@@ -429,8 +435,9 @@ replacement fails open to the original arguments before the target runs. After
 the target starts, it is never retried: its result or original exception wins,
 including when advice throws or calls `proceed` again.
 
-Matching uses analyzed, resolved var calls—not source lines—and runs before
-inference, inlining, direct linking, and tree shaking. Unsupported keys,
+Call matching uses analyzed, resolved vars and entry matching uses qualified
+function definitions—not source lines. Both run before inference, inlining,
+direct linking, and tree shaking. Unsupported keys,
 revision mismatches, missing roles, overlapping selectors, and exact match-count
 drift fail the build. The deterministic report omits absolute checkout paths,
 and the selected manifest/provider material contributes a stable identity to
@@ -438,15 +445,27 @@ the compiled artifact. Jolt validates its exact match counts before native
 compilation and atomically publishes the report only after the output artifact
 succeeds, so a failed rebuild preserves the last valid executable/report pair.
 
-V1 deliberately covers only synchronous, resolved var-call sites. Validation
-against real libraries established the practical boundary:
+An `:entry` selector names one qualified function definition and one fixed
+arity. It is the stable seam for a higher-order callback whose invocation is
+through a local rather than a resolved var call. Entry advice receives the
+already-bound parameter vector and uses the same contracts and fail-open
+semantics as call advice. The compiler keeps `recur` inside the original
+function operation, so a recur does not create another advice lifecycle;
+ordinary named recursive calls are new function invocations and are advised.
+Variadic entry selectors are not part of v1 and therefore fail exact-match
+validation rather than guessing whether `:arity` means fixed slots or runtime
+arguments.
+
+V1 deliberately covers only synchronous resolved calls and qualified fixed
+function entries. Validation against real libraries established the practical
+boundary:
 
 - ordinary protocol invocations that remain resolved calls work (Duratom load,
   clear, and close);
 - generated `defrecord` method bodies need a future containing-definition or
   generated-method selector before their internal calls can be named reliably;
-- higher-order callbacks such as a renderer invoking a supplied event handler
-  need a callback/function-entry join point;
+- higher-order callbacks can select a stable qualified handler definition, but
+  anonymous handlers still need an owned named seam;
 - immediate-mode GUI calls inside a frame loop are technically matchable but
   are usually the wrong semantic level and can create prohibitive event volume;
 - async completion, host calls, and cross-thread context are also future

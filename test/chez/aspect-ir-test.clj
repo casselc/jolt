@@ -20,6 +20,25 @@
 (def replace-args-config
   (assoc-in config [:aspects 0 :contract] :replace-args-v1))
 
+(def entry-config
+  {:aspects
+   [{:id :test/entry
+     :library {:id 'test/lib :version "v1"}
+     :match {:entry 'app.core/callback :arity 1}
+     :advice-role :test/around
+     :advice 'provider.core/around
+     :contract :args-v1
+     :expect {:matches 1}}]})
+
+(defn entry-node []
+  (assoc
+    (ir/def-node
+      "app.core" "callback"
+      (ir/fn-node "callback"
+                  [{:params ["x"]
+                    :body {:op :recur :args [(ir/local "x")]}}]))
+    :pos {:file "/private/checkout/core.clj" :line 30 :column 1}))
+
 (defn invoke-node []
   (assoc (ir/invoke (ir/var-ref "dep.lib" "work")
                     [(ir/invoke (ir/var-ref "app.core" "left") [])
@@ -94,6 +113,97 @@
                                                 :report "/tmp/unused")
           report (aspects/prepare-build-report! unit configured)]
       (is (= :replace-args-v1 (get-in report [:aspects 0 :contract]))))))
+
+(deftest fixed-function-entry-weaving
+  (let [unit (types/new-unit)
+        _ (aspects/configure-unit! unit entry-config)
+        woven (aspects/weave unit (entry-node))
+        arity (get-in woven [:init :arities 0])
+        helper (:body arity)
+        evaluated-args (nth (:args helper) 2)
+        operation (nth (:args helper) 3)
+        operation-arity (get-in operation [:arities 0])
+        loop-node (:body operation-arity)]
+    (is (= ["x"] (:params arity)) "the public function signature is unchanged")
+    (is (= "__invoke-instrumentation-around" (get-in helper [:fn :name])))
+    (is (= :args-v1 (get-in helper [:args 1 :form :contract])))
+    (is (= ["x"] (mapv :name (:items evaluated-args))))
+    (is (= [] (:params operation-arity)))
+    (is (= :loop (:op loop-node)))
+    (is (= [["x" {:op :local :name "x"}]] (:bindings loop-node)))
+    (is (= :recur (get-in loop-node [:body :op]))
+        "the original recur remains inside the compiler-generated loop")
+    (is (= {:line 30 :column 1}
+           (get-in @(:aspect-matches unit) [:test/entry 0 :position])))
+    (is (= 'app.core/callback
+           (get-in @(:aspect-matches unit) [:test/entry 0 :entry])))
+    (is (empty? (ir/tree-problems woven)))))
+
+(deftest replace-args-function-entry-weaving
+  (let [unit (types/new-unit)
+        configured (assoc-in entry-config [:aspects 0 :contract]
+                             :replace-args-v1)
+        hinted (assoc-in (entry-node) [:init :arities 0 :nhints]
+                         [["x" :long]])
+        _ (aspects/configure-unit! unit configured)
+        woven (aspects/weave unit hinted)
+        helper (get-in woven [:init :arities 0 :body])
+        operation-arity (get-in helper [:args 3 :arities 0])
+        replacement (first (:params operation-arity))]
+    (is (= "__invoke-instrumentation-around-replace-args"
+           (get-in helper [:fn :name])))
+    (is (= [[replacement :long]] (:nhints operation-arity))
+        "replacement values retain the entry parameter's runtime coercion")
+    (is (= [["x" {:op :local :name replacement}]]
+           (get-in operation-arity [:body :bindings])))
+    (is (empty? (ir/tree-problems woven)))))
+
+(deftest function-entry-exactness-and-overlap
+  (doseq [node [(assoc (entry-node) :name "other")
+                (assoc-in (entry-node) [:init :arities 0 :params] ["x" "y"])
+                (assoc-in (entry-node) [:init :arities 0 :rest] "more")
+                (assoc (entry-node) :init (ir/const :not-a-function))]]
+    (let [unit (types/new-unit)
+          _ (aspects/configure-unit! unit entry-config)
+          woven (aspects/weave unit node)]
+      (is (empty? @(:aspect-matches unit)))
+      (is (= (:init node) (:init woven)))))
+  (let [unit (types/new-unit)
+        overlap (update entry-config :aspects conj
+                        (assoc (first (:aspects entry-config)) :id :test/other-entry))
+        _ (aspects/configure-unit! unit overlap)
+        message (try
+                  (aspects/weave unit (entry-node))
+                  nil
+                  (catch Exception e (ex-message e)))]
+    (is (= "jolt aspects: multiple selected aspects match the same function entry"
+           message))))
+
+(deftest manifest-selector-schema
+  (let [validate-manifest (ns-resolve 'jolt.aspects 'validate-manifest)
+        manifest (fn [match]
+                   {:schema 1
+                    :library {:id 'test/lib :version "v1"}
+                    :aspects [{:id :test/selector
+                               :match match
+                               :advice-role :test/around
+                               :expect {:matches 1}}]})]
+    (is (= {:entry 'app.core/callback :arity 1}
+           (get-in (validate-manifest
+                     "test.edn"
+                     (manifest {:entry 'app.core/callback :arity 1}))
+                   [:aspects 0 :match])))
+    (doseq [match [{:entry 'callback :arity 1}
+                   {:ns 'app.core :call 'dep.lib/work
+                    :entry 'app.core/callback :arity 1}
+                   {:entry 'app.core/callback :arity -1}]]
+      (is (= (str "jolt aspects: v1 :match needs either symbolic :ns plus "
+                  "qualified :call, or qualified :entry, and a non-negative "
+                  "integer :arity")
+             (try
+               (validate-manifest "test.edn" (manifest match))
+               nil
+               (catch Exception e (ex-message e))))))))
 
 (deftest exact-resolved-match
   (doseq [node [(assoc (invoke-node) :fn (ir/var-ref "other.lib" "work"))
