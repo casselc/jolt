@@ -495,6 +495,160 @@
                       (jolt-condition-wait cv mu))
                   (loop)))))))))))
 
+;; --- logical execution-context mutexes -------------------------------------
+;; A counted Chez mutex protects short runtime transitions and cannot surround
+;; code that may park.  A logical mutex is the complementary primitive: its
+;; owner is the current FIBER (or the current thread's stable interrupt box), so
+;; ownership survives a carrier switch while the bookkeeping mutex is released
+;; before the caller runs a line of its body.
+;;
+;; This is the common core already exercised independently by object monitors
+;; (java/concurrency.ss) and publication gates below.  It is deliberately new
+;; rather than a refactor of either consumer: the first slice establishes a
+;; reusable contract before asking existing, policy-bearing code to adopt it.
+;;
+;; #(bookkeeping-mutex condition owner depth owner-thread-box)
+(define logical-mutex-i-bk 0)
+(define logical-mutex-i-cv 1)
+(define logical-mutex-i-owner 2)
+(define logical-mutex-i-depth 3)
+(define logical-mutex-i-box 4)
+
+(define (jolt-logical-mutex-new)
+  (vector (make-mutex) (make-condition) #f 0 #f))
+
+(define (jolt-logical-mutex-self)
+  (or (jolt-current-fiber) (current-interrupt-box)))
+
+;; A fiber may become terminal and clear jolt-current-fiber before its winders
+;; run.  Permit only that fiber's own terminal unwind, on the carrier thread on
+;; which it acquired the mutex.  A live sibling fiber and another OS thread both
+;; fail this predicate.
+(define (jolt-logical-mutex-owner? lm me)
+  (let ((owner (vector-ref lm logical-mutex-i-owner)))
+    (or (eq? owner me)
+        (and (jolt-fiber? owner)
+             (not (jolt-current-fiber))
+             (eq? (vector-ref lm logical-mutex-i-box)
+                  (current-interrupt-box))
+             (memq (jolt-fiber-state owner) '(done dead))
+             #t))))
+
+(define (jolt-logical-mutex-try-enter/owner! lm me)
+  (jolt-with-mutex (vector-ref lm logical-mutex-i-bk)
+    (let ((owner (vector-ref lm logical-mutex-i-owner)))
+      (cond
+        ((eq? owner me)
+         (vector-set! lm logical-mutex-i-depth
+                      (fx+ 1 (vector-ref lm logical-mutex-i-depth)))
+         #t)
+        ((not owner)
+         (vector-set! lm logical-mutex-i-owner me)
+         (vector-set! lm logical-mutex-i-depth 1)
+         (vector-set! lm logical-mutex-i-box (current-interrupt-box))
+         #t)
+        (else #f)))))
+
+(define (jolt-logical-mutex-try-enter! lm)
+  (jolt-logical-mutex-try-enter/owner! lm (jolt-logical-mutex-self)))
+
+;; The only contended blocking boundary.  The leading assertion is part of its
+;; checked shape (park-lock-check.ss): an uncontended claim or reentry may occur
+;; under an unrelated counted lock because it cannot switch, but a contender
+;; must arrive with none held.  jolt-cv-wait commits a fiber waiter under bk and
+;; switches outside it; threads block on the same condition.  Both retake the
+;; ownership decision after every wake, so a wake is never mistaken for a handoff.
+(define (jolt-logical-mutex-wait! lm me)
+  (jolt-locks-assert-none! 'jolt-logical-mutex-wait!)
+  (let ((bk (vector-ref lm logical-mutex-i-bk))
+        (cv (vector-ref lm logical-mutex-i-cv)))
+    (jolt-cv-wait bk cv #f
+      (lambda (_)
+        (let ((owner (vector-ref lm logical-mutex-i-owner)))
+          (cond
+            ((not owner)
+             (vector-set! lm logical-mutex-i-owner me)
+             (vector-set! lm logical-mutex-i-depth 1)
+             (vector-set! lm logical-mutex-i-box (current-interrupt-box))
+             #t)
+            (else jolt-cv-again)))))
+    (void)))
+
+(define (jolt-logical-mutex-enter! lm)
+  (let ((me (jolt-logical-mutex-self)))
+    (unless (jolt-logical-mutex-try-enter/owner! lm me)
+      (jolt-logical-mutex-wait! lm me))))
+
+(define (jolt-logical-mutex-exit! lm)
+  (let ((me (jolt-logical-mutex-self))
+        (bk (vector-ref lm logical-mutex-i-bk))
+        (cv (vector-ref lm logical-mutex-i-cv)))
+    (jolt-with-mutex bk
+      (unless (jolt-logical-mutex-owner? lm me)
+        (error 'jolt-logical-mutex-exit! "not logical mutex owner"))
+      (let ((depth (fx- (vector-ref lm logical-mutex-i-depth) 1)))
+        (vector-set! lm logical-mutex-i-depth depth)
+        (when (fx=? depth 0)
+          ;; All caller writes precede this release.  Clearing and waking under
+          ;; the same bk contenders acquire supplies the publication edge and
+          ;; closes the registration/release lost-wakeup window.
+          (vector-set! lm logical-mutex-i-owner #f)
+          (vector-set! lm logical-mutex-i-box #f)
+          (jolt-cv-wake! cv))))))
+
+(define (jolt-logical-mutex-held-by-self? lm)
+  (jolt-with-mutex (vector-ref lm logical-mutex-i-bk)
+    (eq? (vector-ref lm logical-mutex-i-owner)
+         (jolt-logical-mutex-self))))
+
+;; Like ReentrantLock.getHoldCount: zero for a non-owner, never another
+;; context's raw depth.
+(define (jolt-logical-mutex-hold-count lm)
+  (jolt-with-mutex (vector-ref lm logical-mutex-i-bk)
+    (if (eq? (vector-ref lm logical-mutex-i-owner)
+             (jolt-logical-mutex-self))
+        (vector-ref lm logical-mutex-i-depth)
+        0)))
+
+(define (jolt-logical-mutex-locked? lm)
+  (jolt-with-mutex (vector-ref lm logical-mutex-i-bk)
+    (and (vector-ref lm logical-mutex-i-owner) #t)))
+
+(define (jolt-with-logical-mutex lm thunk)
+  ;; This is the arbitrary-body API, so fail before even an uncontended claim
+  ;; when an unrelated counted lock is held.  Low-level try/enter deliberately
+  ;; keep their narrower rule: a fast claim cannot switch, while their sole
+  ;; contended path asserts at jolt-logical-mutex-wait!.
+  (jolt-locks-assert-none! 'jolt-with-logical-mutex)
+  ;; Enter ONCE outside the wind.  Putting it in the before-thunk would reenter
+  ;; after every capture park.  The small enter -> wind-install seam may be
+  ;; involuntarily preempted, but enter has already recorded this fiber as owner,
+  ;; invokes no user code, and is uninterruptible; preemption preserves this
+  ;; continuation and resumes at the wind installation.  The object monitor and
+  ;; #18 publication gate rely on the same ordering.
+  (jolt-logical-mutex-enter! lm)
+  (let ((retired? #f))
+    (dynamic-wind
+      ;; A fiber rewind after a park is the one legal re-entry: the park after-
+      ;; thunk below leaves this scope active and ownership stayed on the fiber.
+      ;; A host continuation invoked after a REAL exit would otherwise resume
+      ;; body code without reacquiring; reject it before one instruction runs.
+      ;; Re-entering a raw multi-shot host continuation while its owner remains
+      ;; parked is unsupported; Jolt's public escapes reject cross-context use.
+      (lambda ()
+        (when retired?
+          (error 'jolt-with-logical-mutex
+                 "logical mutex scope continuation cannot be re-entered")))
+      thunk
+      ;; A capture park is not a terminal exit.  Keep ownership attached to the
+      ;; parked fiber; normal return, throw, escape continuation, and terminal
+      ;; unwind retire and release exactly once. Retire first, matching scoped
+      ;; FFI loans, so no stale rewind can race the release/wake transition.
+      (lambda ()
+        (unless (jolt-park-unwinding?)
+          (set! retired? #t)
+          (jolt-logical-mutex-exit! lm))))))
+
 ;; --- fiber-aware publication gates -----------------------------------------
 ;; A short counted mutex may protect a state transition, but it may not surround
 ;; code the runtime does not own: that code can park a fiber.  Lazy-seq and cseq
