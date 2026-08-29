@@ -188,6 +188,23 @@ grep -q ':consumers \[{:advice instrumentation.audit-provider/' "$tmp/target/asp
 cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
 cp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
 
+# A package-owned preset expands to the same join-point/provider selection,
+# remains visible in plan/explain output, and contributes provenance to the
+# artifact identity without changing application behavior.
+cp "$tmp/deps.preset.edn" "$tmp/deps.edn"
+run_build preset
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects plan) >"$tmp/target/aspects-preset-plan.edn"
+grep -q ':presets \[{:id :test/standard, :resource "META-INF/jolt/instrumentation/test/standard.edn"}\]' \
+  "$tmp/target/aspects-preset-plan.edn"
+preset_identity=$(sed -n 's/.*:identity "\([^"]*\)".*/\1/p' \
+  "$tmp/target/aspects.edn")
+test -n "$preset_identity"
+test "$preset_identity" != "$ordered_identity"
+
+cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
+cp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
+
 # Test-only control advice is inert unless the application explicitly opts in.
 cp "$tmp/deps.control.edn" "$tmp/deps.edn"
 sed -i 's/:allow-control-aspects true/:allow-control-aspects false/' "$tmp/deps.edn"
