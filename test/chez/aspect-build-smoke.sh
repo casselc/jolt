@@ -162,6 +162,37 @@ grep -q ':consumers \[{:advice instrumentation.audit-provider/' "$tmp/target/asp
 cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
 cp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
 
+# Test-only control advice is inert unless the application explicitly opts in.
+cp "$tmp/deps.control.edn" "$tmp/deps.edn"
+sed -i 's/:allow-control-aspects true/:allow-control-aspects false/' "$tmp/deps.edn"
+mkdir -p "$tmp/target/control-disabled"
+if (cd "$tmp" && JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" build -m app.core -o target/control-disabled/app) \
+  >"$tmp/target/control-disabled.log" 2>&1; then
+  echo "FAIL: control advice built without explicit opt-in" >&2
+  exit 1
+fi
+grep -q 'control advice requires :jolt/build :allow-control-aspects true' \
+  "$tmp/target/control-disabled.log"
+
+cp "$tmp/deps.control.edn" "$tmp/deps.edn"
+(cd "$tmp" && JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" build -m app.core -o target/control/app)
+test "$("$tmp/target/control/app" control-return)" = 'argument
+callback injected
+result injected?'
+test "$("$tmp/target/control/app" control-replace)" = 'argument
+operation replaced
+callback replaced!
+result replaced!?'
+test "$("$tmp/target/control/app" control-throw)" = 'argument
+caught injected failure :injected'
+grep -q ':control-enabled? true' "$tmp/target/aspects.edn"
+grep -q ':contract :control-v1' "$tmp/target/aspects.edn"
+
+cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
+cp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
+
 # Every consumer must implement every role in the selected manifest. A valid
 # first provider cannot mask an incomplete later provider.
 sed -i 's/instrumentation.audit-provider/instrumentation.incomplete-provider/' \
