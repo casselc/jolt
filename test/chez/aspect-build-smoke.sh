@@ -13,6 +13,51 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 cp -R "$fixture" "$tmp"
 cp "$tmp/deps.edn" "$tmp/deps.instrumented.edn"
 
+# Cooperative compiler metadata and call markers generate the exact published manifest
+# consumed by the ordinary resource/provider build path.
+manifest="$tmp/resources/META-INF/jolt/aspects/probe.edn"
+cp "$manifest" "$tmp/expected-generated-manifest.edn"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects manifest --check)
+# Namespace order is authoring-only. A root may compile an annotated dependency
+# transitively before that dependency's explicit turn; recompilation must not
+# duplicate its physical declarations.
+sed -i 's/:namespaces \[app.target app.core\]/:namespaces [app.core app.target]/' \
+  "$tmp/deps.edn"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache-reversed" \
+  "$jolt" aspects manifest --check)
+cp "$tmp/deps.instrumented.edn" "$tmp/deps.edn"
+printf '\n' >>"$manifest"
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+    "$jolt" aspects manifest --check) >"$tmp/stale-manifest.log" 2>&1; then
+  echo "FAIL: stale cooperative manifest passed --check" >&2
+  exit 1
+fi
+grep -q 'generated aspect manifest is stale' "$tmp/stale-manifest.log"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects manifest)
+cmp "$tmp/expected-generated-manifest.edn" "$manifest"
+
+# The analyzer rejects entry annotations on declarations and non-functions;
+# these source fixtures cover the metadata frontend before it becomes IR.
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache-invalid-decl" \
+    "$jolt" -e "(require 'app.invalid-decl)") \
+    >"$tmp/invalid-decl.log" 2>&1; then
+  echo "FAIL: annotated declare compiled" >&2
+  exit 1
+fi
+grep -q 'jolt aspect entry metadata requires an initialized function definition' \
+  "$tmp/invalid-decl.log"
+
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache-invalid-value" \
+    "$jolt" -e "(require 'app.invalid-value)") \
+    >"$tmp/invalid-value.log" 2>&1; then
+  echo "FAIL: annotated non-function compiled" >&2
+  exit 1
+fi
+grep -q 'jolt aspect entry metadata requires a function definition' \
+  "$tmp/invalid-value.log"
+
 run_build() {
   mode=$1
   shift
@@ -165,6 +210,7 @@ grep -q ':provider instrumentation.audit-provider/aspect-provider' "$tmp/target/
 grep -q ':contract :replace-args-v1' "$tmp/target/aspects.edn"
 grep -q ':entry app.target/callback' "$tmp/target/aspects.edn"
 grep -q ':entry app.target/numeric-callback' "$tmp/target/aspects.edn"
+grep -q ':marker :test/target-call' "$tmp/target/aspects.edn"
 grep -q ':contract :args-v1' "$tmp/target/aspects.edn"
 grep -q ':ordinal 1' "$tmp/target/aspects.edn"
 grep -q ':ordinal 2' "$tmp/target/aspects.edn"

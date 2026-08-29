@@ -162,6 +162,12 @@
 ;;   :meta-expr              a :def's evaluated metadata expression.
 ;;   :pos                    reader source position {:line :column :file}.
 ;;   :letrec                 a :let that must lower to letrec* (mutual recursion).
+;;   :aspect-marker          literal {:id keyword :role keyword} attached by the
+;;                           analyzer's inert jolt.aspects/at boundary; consumed
+;;                           by the aspect pass before optimization.
+;;   :aspect-entry           literal {:id keyword :role keyword :arity? int}
+;;                           derived from namespaced def metadata; consumed by
+;;                           the aspect pass and omitted from runtime var meta.
 (def node-ops
   #{:const :local :var :the-var :host :host-static :host-new :if :do :invoke :def
     :let :loop :recur :fn :vector :map :set :quote :throw :coerce :try :host-call

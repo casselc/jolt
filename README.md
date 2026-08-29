@@ -388,6 +388,59 @@ The resource schema is intentionally narrow in v1:
    :expect {:matches 1}}]}
 ```
 
+Library authors can generate that same ABI from cooperative compiler annotations
+instead of assembling it by hand. Configure the library identity and published
+resource path once:
+
+```clojure
+;; library deps.edn
+{:paths ["src"]
+ :jolt/aspects
+ {:library {:id my/db :version "exact-revision"}
+  :namespaces [my.db.api my.db.impl]
+  :manifest "src/META-INF/jolt/aspects/db.edn"}}
+```
+
+Annotate fixed-arity function entries with ordinary definition metadata. A
+single-arity definition derives its arity; a multi-arity definition requires an
+explicit `:jolt.aspects/arity` selecting exactly one clause:
+
+```clojure
+(defn ^{:jolt.aspects/id :db/result-callback
+        :jolt.aspects/role :db/result}
+  consume-result [result]
+  ...)
+```
+
+Use `jolt.aspects/at` inside a function definition for an individual qualified
+or namespace-aliased call:
+
+```clojure
+(ns my.db.impl
+  (:require [jolt.aspects :as aspects]
+            [my.db.driver :as driver]))
+
+(defn execute [connection query]
+  (aspects/at {:id :db/execute :role :db/client}
+    (driver/execute connection query)))
+```
+
+`at` is a compiler marker, not an instrumentation wrapper. In a plain build it
+evaluates the original call directly and adds no runtime boundary. Generated
+call selectors retain the resolved target plus a marker refinement, so two
+otherwise identical calls in one namespace remain independently selectable.
+
+```bash
+jolt aspects manifest          # write the configured resource
+jolt aspects manifest --check  # fail if compiler annotations and EDN drift
+```
+
+Commit and publish the generated manifest with the library. Applications and
+providers consume it through the ordinary `:jolt/build :aspects` selection
+shown above; source annotations do not create a second provider or weaving
+protocol. External manifests remain the supported path for libraries that do
+not participate.
+
 The selected namespace exposes `aspect-provider` (or `:provider` may name a
 qualified provider var):
 
