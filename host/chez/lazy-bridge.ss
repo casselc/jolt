@@ -32,17 +32,17 @@
 ;; forking or forcing, never both, so no node is being realized on the lock-free
 ;; path at the instant the flag turns on; and fork-thread establishes happens-
 ;; before, so the spawned child observes the flip. Once multi-threaded, force takes
-;; a per-node mutex created lazily under a shared init lock, restoring the original
-;; double-checked-locking behavior.
+;; a per-node publication gate created lazily under a shared init lock.
 (define jolt-mt? #f)
 (define (jolt-mark-mt!) (set! jolt-mt? #t))
 
-;; guards lazy creation of a node's mutex on the multi-threaded path
+;; guards lazy creation of a node's fiber-aware publication gate on the
+;; multi-threaded path
 (define jolt-lazyseq-lock-init (make-mutex))
 (define (jolt-lazyseq-ensure-lock! x)
   (jolt-with-mutex jolt-lazyseq-lock-init
     (or (jolt-lazyseq-lock x)
-        (let ((m (make-mutex))) (jolt-lazyseq-lock-set! x m) m))))
+        (let ((m (jolt-publication-gate-new))) (jolt-lazyseq-lock-set! x m) m))))
 
 (define (jolt-make-lazy-seq thunk) (make-jolt-lazyseq thunk jolt-nil #f #f #f))
 
@@ -68,16 +68,25 @@
         (jolt-lazyseq-thunk-set! x #f)
         r)))
   ;; Single-threaded: no lock, and the fast realized? read is safe. Once a second
-  ;; thread exists, the fast read is NOT safe: run! stores val then realized? with
-  ;; no barrier between them, so on a weak memory model (ARM64) a lock-free reader
-  ;; can see realized?#t while val is still the thunk and leak a closure out as a
-  ;; seq. So on the multi-threaded path every access — reads included — goes through
-  ;; the per-node mutex, whose acquire/release order the writer and reader against.
+  ;; thread exists, a lock-free read is NOT safe: run! stores val then realized?
+  ;; with no barrier between them, so on a weak memory model (ARM64) a reader can
+  ;; see realized?#t while val is stale. A terminal record is stable, though, so
+  ;; the multi-threaded fast path takes the gate's bookkeeping mutex only long
+  ;; enough to observe that publication has completed; that acquire orders the
+  ;; payload read without a redundant logical claim/release pair.
   (cond
     ((not jolt-mt?) (if (jolt-lazyseq-realized? x) (deliver) (run!)))
-    (else                                          ; multi-threaded: always lock
-     (jolt-with-mutex (jolt-lazyseq-ensure-lock! x)     ; locking on a lazily-made mutex
-       (if (jolt-lazyseq-realized? x) (deliver) (run!))))))
+    (else
+     (let ((gate (jolt-lazyseq-ensure-lock! x)))
+       ;; Read terminal first, then acquire bk and require the publisher gone.
+       ;; The other order could observe unowned, race a new owner that publishes
+       ;; realized?, and deliver before that owner's release/fence.
+       (if (and (jolt-lazyseq-realized? x)
+                (jolt-publication-gate-unowned? gate))
+           (deliver)
+           (jolt-with-publication-gate gate
+             (lambda ()
+               (if (jolt-lazyseq-realized? x) (deliver) (run!)))))))))
 
 ;; Shadow fork-thread so any spawn (future/agent/core.async/process, all loaded
 ;; after this file) flips jolt-mt? on and joins the live-thread set. Captured in a

@@ -180,8 +180,8 @@
             jolt-nil
             (make-cseq (pvec-nth-d v i1 jolt-nil) #f #f (cseq-kind s) v i1 #f #f)))))
 (define (seq-first s) (cseq-head s))
-;; guards lazy creation of a cell's tail mutex on the multi-threaded path (mirrors
-;; force-lazyseq's lock-init). A cseq cell is shared across threads once its owning
+;; guards lazy creation of a cell's publication gate on the multi-threaded path
+;; (mirrors force-lazyseq's lock-init). A cseq cell is shared across threads once its owning
 ;; lazyseq node is realized (every future/agent walking the same seq reads the SAME
 ;; cell), so without serialization two threads can both see forced?#f, both run the
 ;; tail thunk, and publish tail/forced? non-atomically — a third reader can then see
@@ -191,12 +191,13 @@
 (define (cseq-ensure-lock! s)
   (jolt-with-mutex cseq-lock-init
     (or (cseq-lock s)
-        (let ((m (make-mutex))) (cseq-lock-set! s m) m))))
+        (let ((m (jolt-publication-gate-new))) (cseq-lock-set! s m) m))))
 (define (seq-more s)                  ; force the tail; returns a seq (cseq | jolt-nil)
   ;; Single-threaded: the fast forced? read is safe. Multi-threaded: it is NOT — the
   ;; tail/forced? stores below are unordered, so a lock-free reader on ARM64 can see
-  ;; forced?#t with tail still the thunk-procedure. So once jolt-mt? flips, every
-  ;; access goes through the per-cell mutex, reads included (mirrors force-lazyseq).
+  ;; forced?#t with tail still the thunk-procedure. Once jolt-mt? flips, a terminal
+  ;; fast read first observes the gate unowned under its bookkeeping mutex, the
+  ;; acquire side of the publication fence (mirrors force-lazyseq).
   ;; A cvec cell has no thunk: its tail follows from its own fields, so it is
   ;; COMPUTED here rather than run. It is still memoized, which is where this
   ;; beats the reference implementation — Clojure's ChunkedCons.next() rebuilds a
@@ -210,10 +211,17 @@
      (if (cseq-forced? s) (cseq-tail s)
          (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) ((cseq-tail s)))))
            (cseq-tail-set! s t) (cseq-forced?-set! s #t) t)))
-    (else (jolt-with-mutex (cseq-ensure-lock! s)     ; multi-threaded: always lock
-            (if (cseq-forced? s) (cseq-tail s)
-                (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) ((cseq-tail s)))))
-                  (cseq-tail-set! s t) (cseq-forced?-set! s #t) t))))))
+    (else
+     (let ((gate (cseq-ensure-lock! s)))
+       ;; Terminal first, then acquire bk and require the publisher gone; the
+       ;; reverse order admits a claim/publish race between the two reads.
+       (if (and (cseq-forced? s) (jolt-publication-gate-unowned? gate))
+           (cseq-tail s)
+           (jolt-with-publication-gate gate
+             (lambda ()
+               (if (cseq-forced? s) (cseq-tail s)
+                   (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) ((cseq-tail s)))))
+                     (cseq-tail-set! s t) (cseq-forced?-set! s #t) t)))))))))
 
 ;; The empty seq (Clojure's empty list ()), distinct from nil. The (unused) field
 ;; defeats Chez's interning of fieldless records, so an empty list carrying

@@ -74,7 +74,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
-        coreasyncproof \
+        coreasyncproof lazyonceproof \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
@@ -257,6 +257,9 @@ hasheq:
 # carrier. It runs with the pool pinned to ONE carrier, which is what makes "8
 # bodies parked at the same time, all of them resuming" mean that a fiber released
 # its carrier rather than held it.
+# fibers-publication-test.ss is the lazy realization gate: lazyseq and cseq
+# publication may span arbitrary user code, including a fiber park, without
+# carrying a counted runtime lock across that park.
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
 	@$(CHEZ) --script test/chez/fibers-state-test.ss
@@ -268,6 +271,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-sm-test.ss
 	@$(CHEZ) --script test/chez/fibers-preempt-test.ss
 	@$(CHEZ) --script test/chez/fibers-lock-test.ss
+	@$(CHEZ) --script test/chez/fibers-publication-test.ss
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 	@$(CHEZ) --script test/chez/async-alts-order-test.ss
@@ -277,6 +281,11 @@ fibers:
 # mutation and a non-vacuous boundary execution.
 coreasyncproof:
 	@sh test/formal/check-core-async.sh
+
+# Bounded ownership/publication proof for fiber-safe lazyseq and cseq
+# realization, including mutation controls and their distinct error policies.
+lazyonceproof:
+	@sh test/formal/check-lazy-once.sh
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own
 # deadline however far away the pending ones are, and the thread is forked once.

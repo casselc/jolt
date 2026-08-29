@@ -93,29 +93,9 @@
 ;;    the current thread's flag, matching the JVM. currentThread / .interrupt /
 ;;    .isInterrupted are wired in io.ss, where the thread handle is built.
 
-;; Per-thread interrupt flag, lazily allocated so each OS thread gets its own box.
-;; A thread handle (from currentThread) captures this box, so .interrupt from
-;; another thread sets the target thread's flag.
-;;
-;; A VIRTUAL REGISTER and not a thread parameter, and the reason is the bug this
-;; used to carry a workaround for: a Chez thread parameter is INHERITED, so a
-;; forked thread started out holding its PARENT's box and interrupting the child
-;; set the parent's flag. That was patched by storing (thread-id . box) and
-;; comparing the id on every read. A vreg has the property directly — a freshly
-;; forked thread starts every slot at fixnum 0 — so the id compare, the pair, and
-;; the (get-thread-id) call all go away, and what is left is one register read.
-;; That read is on the hot path: every interruptible wait consults it before
-;; deciding, including the ones that never wait (a deref of a delivered promise),
-;; and so do Thread/interrupted, .isInterrupted, monitor enter/exit and
-;; ReentrantLock's owner check.
-(define jolt-vreg-interrupt-box 9)      ; rt.ss owns the slot map; 0-8 were taken
-(define (current-interrupt-box)
-  (let ((b (virtual-register jolt-vreg-interrupt-box)))
-    (if (box? b)
-        b
-        (let ((nb (box #f)))
-          (set-virtual-register! jolt-vreg-interrupt-box nb)
-          nb))))
+;; The per-thread interrupt box and its virtual-register slot live in locks.ss,
+;; beside the wait machinery that consumes them.  A thread handle captures this
+;; box, so .interrupt from another thread sets the target thread's flag.
 ;; A thread jolt itself forked already HAS a flag — the box its Thread object hands
 ;; .interrupt — so it must not lazily allocate a second one. The child adopts that
 ;; box as its own before running the body; without this, .interrupt from outside
