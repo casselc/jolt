@@ -8,6 +8,9 @@
 ;; the case raises. These cover host-specific behavior (dot-forms, java statics, io,
 ;; reader, walk, …) that isn't in the JVM-portable corpus. Global state is reset
 ;; between cases for per-case isolation.
+;; :stderr-contains optionally captures stderr and requires the given stable
+;; fragment. This makes reporting behavior falsifiable without coupling a row to
+;; a complete platform-specific stack trace.
 ;;
 ;;   chez --script host/chez/run-unit.ss
 (import (chezscheme))
@@ -39,7 +42,16 @@
 (define kw-suite    (keyword #f "suite"))
 (define kw-expr     (keyword #f "expr"))
 (define kw-expected (keyword #f "expected"))
+(define kw-stderr-contains (keyword #f "stderr-contains"))
 (define kw-throws   (keyword #f "throws"))
+
+(define (string-contains? haystack needle)
+  (let ((hn (string-length haystack)) (nn (string-length needle)))
+    (let loop ((i 0))
+      (cond
+        ((fx>? (fx+ i nn) hn) #f)
+        ((string=? (substring haystack i (fx+ i nn)) needle) #t)
+        (else (loop (fx+ i 1)))))))
 
 (load "host/chez/run-case-isolation.ss")
 
@@ -56,18 +68,32 @@
            (suite (jolt-get row kw-suite))
            (expr (jolt-get row kw-expr))
            (expected (jolt-get row kw-expected))
+           (stderr-contains (jolt-get row kw-stderr-contains))
            (throws? (eq? expected kw-throws))
-           (sink (open-output-string)))
+           (sink (open-output-string))
+           (error-sink (open-output-string))
+           (error-port (if (jolt-nil? stderr-contains)
+                           (current-error-port)
+                           error-sink)))
       (bump! suite-total suite)
       (guard (e (#t (if throws?
                         (begin (set! pass (+ pass 1)) (bump! suite-pass suite))
                         (set! fails (cons (list suite expr "raised") fails)))))
-        (let ((got (jolt-repl-str
-                     (parameterize ((current-output-port sink))
-                       (jolt-compile-eval (string-append "(do " expr ")") "user")))))
+        (let* ((got (jolt-repl-str
+                      (parameterize ((current-output-port sink)
+                                     (current-error-port error-port))
+                        (jolt-compile-eval (string-append "(do " expr ")") "user"))))
+               (stderr-got (get-output-string error-sink))
+               (stderr-ok? (or (jolt-nil? stderr-contains)
+                               (string-contains? stderr-got stderr-contains))))
           (cond
             (throws? (set! fails (cons (list suite expr (string-append "expected throw; got " got)) fails)))
-            ((string=? got expected) (begin (set! pass (+ pass 1)) (bump! suite-pass suite)))
+            ((and (string=? got expected) stderr-ok?)
+             (begin (set! pass (+ pass 1)) (bump! suite-pass suite)))
+            ((not stderr-ok?)
+             (set! fails (cons (list suite expr
+                               (string-append "stderr missing `" stderr-contains
+                                              "`; got `" stderr-got "`")) fails)))
             (else (set! fails (cons (list suite expr
                     (string-append "want `" expected "` got `" got "`")) fails))))))
       (zj-reset!))
