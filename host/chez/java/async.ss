@@ -41,11 +41,18 @@
 ;; because the alt-takers/alt-putters lists ARE the shared waiter lists: a
 ;; fiber's <! registers as an alt-taker, exactly as alts! does.
 (define-record-type alt-handler
-  (fields fmu (mutable active?) wmu wcv mailbox (mutable wake))
-  (nongenerative alt-handler-v2))
+  (fields id fmu (mutable active?) wmu wcv mailbox (mutable wake))
+  (nongenerative alt-handler-v3))
+(define alt-handler-id-mu (make-mutex))
+(define alt-handler-next-id 0)
+(define (alt-handler-alloc-id!)
+  (jolt-with-mutex alt-handler-id-mu
+    (let ((id alt-handler-next-id))
+      (set! alt-handler-next-id (+ id 1))
+      id)))
 (define (alt-handler-alloc . wake)
   ((record-constructor (record-type-descriptor alt-handler))
-   (make-mutex) #t (make-mutex) (make-condition) (vector #f #f #f)
+   (alt-handler-alloc-id!) (make-mutex) #t (make-mutex) (make-condition) (vector #f #f #f)
    (if (pair? wake) (car wake) #f)))
 
 ;; --- channels ---------------------------------------------------------------
@@ -60,9 +67,10 @@
 ;; pending alt-handler registrations (alts! ops parked on this channel). xrf is the
 ;; transducer reducing fn (or #f); exh the ex-handler (or #f).
 (define-record-type async-chan
-  (fields mu cv (mutable items) cap kind (mutable closed?) (mutable xrf) (mutable takew)
+  (fields mu cv (mutable items) cap kind (mutable closed?) (mutable xrf)
+          (mutable xrf-completed?) (mutable takew)
           exh (mutable alt-takers) (mutable alt-putters))
-  (nongenerative async-chan-v3))
+  (nongenerative async-chan-v4))
 
 (define (ac-unblocking? ch)
   (and (memq (async-chan-kind ch) '(dropping sliding promise)) #t))
@@ -114,6 +122,55 @@
     (and (alt-handler-active? h)
          (begin (alt-handler-active?-set! h #f) #t))))
 
+(define (alt-active? h)
+  (jolt-with-mutex (alt-handler-fmu h) (alt-handler-active? h)))
+
+;; Atomically claim a rendezvous pair. Stable handler ids impose one lock order
+;; across channels, preventing the opposite-order deadlock that two independent
+;; claims would permit. A shared alts handler cannot rendezvous with itself.
+(define (alt-claim-pair! a b)
+  (and (not (eq? a b))
+       (let* ((a-first? (< (alt-handler-id a) (alt-handler-id b)))
+              (first (if a-first? a b))
+              (second (if a-first? b a)))
+         (jolt-with-mutex (alt-handler-fmu first)
+           (jolt-with-mutex (alt-handler-fmu second)
+             (and (alt-handler-active? a)
+                  (alt-handler-active? b)
+                  (begin
+                    (alt-handler-active?-set! a #f)
+                    (alt-handler-active?-set! b #f)
+                    #t)))))))
+
+(define (ac-prune-inactive-putters! ch)
+  ;; Shared alts handlers can lose on another channel while this channel stays
+  ;; full. Prune independently of capacity so stale registrations cannot defer
+  ;; close-time transducer completion.
+  (async-chan-alt-putters-set!
+   ch (filter (lambda (hp) (alt-active? (car hp)))
+              (async-chan-alt-putters ch))))
+
+(define (ac-prune-inactive-takers! ch)
+  (async-chan-alt-takers-set!
+   ch (filter alt-active? (async-chan-alt-takers ch))))
+
+(define (ac-distinct-taker takers put-handler)
+  (let loop ((takers takers))
+    (cond ((null? takers) #f)
+          ((eq? put-handler (car takers)) (loop (cdr takers)))
+          (else (car takers)))))
+
+(define (ac-compatible-pair ch)
+  ;; A mixed alts may register the same handler on both sides. Do not let that
+  ;; self-incompatible FIFO head hide a later putter that can pair with the
+  ;; oldest taker (or vice versa).
+  (let loop ((putters (async-chan-alt-putters ch)))
+    (if (null? putters)
+        #f
+        (let* ((hp (car putters))
+               (take-h (ac-distinct-taker (async-chan-alt-takers ch) (car hp))))
+          (if take-h (vector hp take-h) (loop (cdr putters)))))))
+
 ;; alt-deliver! — call ONLY after alt-claim! returned #t. The mailbox write and
 ;; the wake decision happen under wmu so a fiber-waiter's park (which checks the
 ;; mailbox and sets its state under the SAME wmu, see jolt-fiber-waiter-wait!)
@@ -143,6 +200,12 @@
 ;; no progress.
 (define (ac-notify! ch)
   (let loop ()
+    ;; A successful pair claim can deactivate duplicate registrations owned by
+    ;; either selected handler.  Prune on every fixed-point pass, not only on
+    ;; entry, so quiescence never retains registrations made stale by this very
+    ;; notification cycle.
+    (ac-prune-inactive-putters! ch)
+    (ac-prune-inactive-takers! ch)
     (let ((progress #f))
       ;; Step 1: drain queue → alt-takers
       (let ((q (async-chan-items ch)))
@@ -173,7 +236,7 @@
                  (else
                   (if (> (async-chan-cap ch) 0)
                       (< (ac-qlen ch) (async-chan-cap ch))
-                      (> (async-chan-takew ch) 0))))
+                      (and (ac-qempty? ch) (> (async-chan-takew ch) 0)))))
                (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
                (if (alt-claim! h)
                    (begin
@@ -181,7 +244,7 @@
                      (cond
                        ((async-chan-xrf ch)
                         (let ((r (ac-xrf-apply ch v)))
-                          (when (jolt-reduced? r) (ac-close! ch))))
+                          (when (jolt-reduced? r) (ac-abort! ch))))
                        (else
                         (case (async-chan-kind ch)
                           ((dropping sliding)
@@ -201,31 +264,33 @@
                    (set! progress #t)) ; dead registration
                (drain-putters))
               (else #f)))))
+      (ac-maybe-complete-closed-xrf! ch)
       ;; Step 3: pair alt-putters with alt-takers directly (unbuffered channels
       ;; where a putter and taker are both parked). Only when a blocking taker
       ;; or active alt-taker exists to consume the value.
       (let pair-loop ()
-        (when (and (pair? (async-chan-alt-putters ch))
-                   (pair? (async-chan-alt-takers ch))
-                   (or (> (async-chan-takew ch) 0)
-                       (ormap (lambda (h) (alt-handler-active? h))
-                              (async-chan-alt-takers ch))))
-          (let* ((hp (car (async-chan-alt-putters ch)))
-                 (h (car hp)) (v (cdr hp)))
-            (if (alt-claim! h)
-                (begin
-                  (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
-                  ;; Commit the value: unbuffered rendezvous push
-                  (let ((box (vector #f)))
-                    (ac-qpush! ch (cons v box))
-                    (condition-broadcast (async-chan-cv ch)))
-                  (alt-deliver! h #t ch)
-                  (set! progress #t)
-                  (pair-loop))
-                (begin
-                  (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
-                  (set! progress #t)
-                  (pair-loop))))))
+        (let ((pair (ac-compatible-pair ch)))
+          (when pair
+          (let* ((hp (vector-ref pair 0))
+                 (put-h (car hp)) (v (cdr hp))
+                 (take-h (vector-ref pair 1)))
+              (if (alt-claim-pair! put-h take-h)
+                  (begin
+                    (async-chan-alt-putters-set!
+                     ch (remp (lambda (entry) (eq? entry hp))
+                              (async-chan-alt-putters ch)))
+                    (async-chan-alt-takers-set!
+                     ch (remp (lambda (h) (eq? h take-h))
+                              (async-chan-alt-takers ch)))
+                    (alt-deliver! put-h #t ch)
+                    (alt-deliver! take-h v ch)
+                    (set! progress #t)
+                    (pair-loop))
+                  (begin
+                    (ac-prune-inactive-putters! ch)
+                    (ac-prune-inactive-takers! ch)
+                    (set! progress #t)
+                    (pair-loop)))))))
       (when progress (loop))))
   (condition-broadcast (async-chan-cv ch)))
 
@@ -257,8 +322,8 @@
                         (async-chan-xrf ch)))))
       (apply jolt-invoke xrf ch v))))
 
-(define (ac-make cap kind xrf) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f xrf 0 #f '() '()))
-(define (ac-make/exh cap kind exh) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f #f 0 exh '() '()))
+(define (ac-make cap kind xrf) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f xrf #f 0 #f '() '()))
+(define (ac-make/exh cap kind exh) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f #f #f 0 exh '() '()))
 
 ;; (chan) | (chan n) | (chan buf) | (chan n|buf xform) | (chan n|buf xform exh)
 (define (jolt-async-chan . args)
@@ -284,20 +349,39 @@
 ;; close! (idempotent): mark closed, flush a stateful transducer's completion,
 ;; notify pending alt handlers, and wake everyone. ac-close! assumes the lock is
 ;; held; the public form takes it.
+(define (ac-complete-xrf! ch)
+  (unless (async-chan-xrf-completed? ch)
+    (async-chan-xrf-completed?-set! ch #t)
+    (guard (e (#t (async-report-uncaught! "transducer completion on close!" e)))
+      (ac-xrf-apply ch))))
+
+(define (ac-maybe-complete-closed-xrf! ch)
+  (when (and (async-chan-closed? ch)
+             (async-chan-xrf ch)
+             (null? (async-chan-alt-putters ch)))
+    (ac-complete-xrf! ch)))
+
+;; Reducer termination differs from public close: inputs still queued have been
+;; accepted, so their callbacks succeed, but they must never step the completed
+;; reducing function.
+(define (ac-abort! ch)
+  (for-each (lambda (hp)
+              (let ((h (car hp)))
+                (when (alt-claim! h) (alt-deliver! h #t ch))))
+            (async-chan-alt-putters ch))
+  (async-chan-alt-putters-set! ch '())
+  (ac-close! ch))
+
 (define (ac-close! ch)
   (unless (async-chan-closed? ch)
     (async-chan-closed?-set! ch #t)
-    (when (async-chan-xrf ch)
-      (guard (e (#t (async-report-uncaught! "transducer completion on close!" e)))
-        (ac-xrf-apply ch)))
     (ac-notify! ch)
-    ;; claim+deliver to every remaining alt-taker (nil) and alt-putter (#f)
+    (ac-maybe-complete-closed-xrf! ch)
+    ;; Pending puts survive public close and remain drainable. Remaining takers
+    ;; see nil after buffered values and pending rendezvous puts are exhausted.
     (for-each (lambda (h) (when (alt-claim! h) (alt-deliver! h jolt-nil ch)))
               (async-chan-alt-takers ch))
     (async-chan-alt-takers-set! ch '())
-    (for-each (lambda (hp) (when (alt-claim! (car hp)) (alt-deliver! (car hp) #f ch)))
-              (async-chan-alt-putters ch))
-    (async-chan-alt-putters-set! ch '())
     (condition-broadcast (async-chan-cv ch)))
   jolt-nil)
 (define (jolt-async-close! ch) (jolt-with-mutex (async-chan-mu ch) (ac-close! ch)))
@@ -305,50 +389,40 @@
 ;; >! / >!! — put, blocking. false if closed; nil may not be put. With a
 ;; transducer the value is run through it (one put -> zero or more channel values);
 ;; a `reduced` result closes the channel.
-(define (jolt-async-give ch v)
+(define (ac-registration-visible! ch registered!)
+  ;; Called with the channel mutex held. Async put!/take! waits use this hook to
+  ;; make their pending registration observable before the public call returns.
+  (when registered!
+    (registered!)
+    (condition-broadcast (async-chan-cv ch))))
+
+(define (ac-handler-await h)
+  (jolt-with-mutex (alt-handler-wmu h)
+    (let ((mb (alt-handler-mailbox h)))
+      (let loop ()
+        (unless (vector-ref mb 0)
+          (jolt-condition-wait (alt-handler-wcv h) (alt-handler-wmu h))
+          (loop)))
+      (vector-ref mb 1))))
+
+(define (jolt-async-give/registered ch v registered!)
   (async-check-put! v)
-  (jolt-with-mutex (async-chan-mu ch)
-    (cond
-      ((async-chan-closed? ch) #f)
-      ((async-chan-xrf ch)
-       (if (not (ac-unblocking? ch))
-           ;; Fixed buffered with xform: wait for room, then apply xform.
-           ;; The xform step may overfill transiently (e.g. mapcat); the NEXT put
-           ;; will wait again.
-           (let loop ()
-             (cond ((async-chan-closed? ch) #f)
-                   ((< (ac-qlen ch) (async-chan-cap ch))
-                    (let ((r (ac-xrf-apply ch v)))
-                      (when (jolt-reduced? r) (ac-close! ch))
-                      #t))
-                   (else (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))
-           ;; Unbuffered with xform: apply immediately (output goes to rendezvous queue)
-           (let ((r (ac-xrf-apply ch v)))
-             (when (jolt-reduced? r) (ac-close! ch))
-             #t)))
-      (else
-       (case (async-chan-kind ch)
-         ((dropping sliding) (ac-buf-give! ch v) #t)
-          ;; a promise channel takes ONE value, delivered to every taker; further
-          ;; puts are dropped. Never blocks.
-          ((promise) (when (ac-qempty? ch)
-                       (ac-qpush! ch (cons v #f)))
-                     (ac-notify! ch)
-                     #t)
-          (else
-           (if (> (async-chan-cap ch) 0)
-               (let loop ()                                    ; buffered fixed: wait for room
-                 (cond ((async-chan-closed? ch) #f)
-                       ((< (ac-qlen ch) (async-chan-cap ch))
-                        (ac-qpush! ch (cons v #f)) (ac-notify! ch) #t)
-                       (else (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))
-               (let ((box (vector #f)))                        ; unbuffered: rendezvous
-                 (ac-qpush! ch (cons v box))
-                 (ac-notify! ch)
-                  (let loop ()
-                   (if (vector-ref box 0)
-                       #t
-                       (begin (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))))))))))
+  (let ((r
+         (jolt-with-mutex (async-chan-mu ch)
+           (case (ac-try-give!/locked ch v)
+             ((ok) #t)
+             ((closed) #f)
+             (else
+              (let ((h (alt-handler-alloc)))
+                (async-chan-alt-putters-set!
+                 ch (append (async-chan-alt-putters ch) (list (cons h v))))
+                (ac-registration-visible! ch registered!)
+                (ac-notify! ch)
+                h))))))
+    (if (alt-handler? r) (ac-handler-await r) r)))
+
+(define (jolt-async-give ch v)
+  (jolt-async-give/registered ch v #f))
 
 ;; remove + return the head value, waking a parked rendezvous putter.
 (define (ac-take-head! ch)
@@ -366,17 +440,17 @@
 ;; <! / <!! — take, blocking. Drains buffered values, then nil once closed + empty.
 ;; A promise channel PEEKS — its one value stays for every taker.
 ;; When the queue is empty, drains pending alt-putters before parking.
-(define (jolt-async-take ch)
+(define (jolt-async-take/registered ch registered!)
   (jolt-with-mutex (async-chan-mu ch)
     (let loop ()
       (cond ((eq? (async-chan-kind ch) 'promise)
              (cond ((not (ac-qempty? ch)) (ac-peek ch))
                    ((async-chan-closed? ch) jolt-nil)
-                   (else (ac-take-wait ch) (loop))))
+                   (else (ac-take-wait ch registered!) (loop))))
             ((not (ac-qempty? ch)) (ac-take-head! ch))
-            ((async-chan-closed? ch) jolt-nil)
             ;; drain an alt-putter if one is parked (no xform chans — those
-            ;; complete immediately into the buffer via ac-buf-give!)
+            ;; are drained into their required buffer by ac-notify!). This must
+            ;; precede closed?: puts registered before public close survive it.
             ((and (pair? (async-chan-alt-putters ch))
                   (not (async-chan-xrf ch)))
              (let* ((hp (car (async-chan-alt-putters ch)))
@@ -391,12 +465,17 @@
                        (condition-broadcast (async-chan-cv ch)))
                      (ac-take-head! ch))
                    (loop))))  ; dead registration, retry
-            (else (ac-take-wait ch) (loop))))))
+            ((async-chan-closed? ch) jolt-nil)
+            (else (ac-take-wait ch registered!) (loop))))))
+
+(define (jolt-async-take ch)
+  (jolt-async-take/registered ch #f))
 
 ;; park in a take, tracking the waiter count so a concurrent offer! to an
 ;; unbuffered channel can see that a taker is ready.
-(define (ac-take-wait ch)
+(define (ac-take-wait ch registered!)
   (async-chan-takew-set! ch (fx+ 1 (async-chan-takew ch)))
+  (ac-registration-visible! ch registered!)
   (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch))
   (async-chan-takew-set! ch (fx- (async-chan-takew ch) 1)))
 
@@ -405,22 +484,24 @@
 ;; ac-poll!/locked: mutex must already be held.
 (define ac-poll-empty (list 'empty))
 (define (ac-poll!/locked ch)
-  (cond ((and (eq? (async-chan-kind ch) 'promise) (not (ac-qempty? ch))) (ac-peek ch))
-        ((not (ac-qempty? ch)) (ac-take-head! ch))
-        ((async-chan-closed? ch) jolt-nil)
-        ((and (pair? (async-chan-alt-putters ch)) (not (async-chan-xrf ch)))
-         (let* ((hp (car (async-chan-alt-putters ch)))
-                (h (car hp)) (v (cdr hp)))
-           (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
-           (if (alt-claim! h)
-               (begin
-                 (alt-deliver! h #t ch)
-                 (let ((box (vector #f)))
-                   (ac-qpush! ch (cons v box))
-                   (condition-broadcast (async-chan-cv ch)))
-                 (ac-take-head! ch))
-               ac-poll-empty)))
-        (else ac-poll-empty)))
+  (ac-prune-inactive-putters! ch)
+  (let loop ()
+    (cond ((and (eq? (async-chan-kind ch) 'promise) (not (ac-qempty? ch))) (ac-peek ch))
+          ((not (ac-qempty? ch)) (ac-take-head! ch))
+          ((and (pair? (async-chan-alt-putters ch)) (not (async-chan-xrf ch)))
+           (let* ((hp (car (async-chan-alt-putters ch)))
+                  (h (car hp)) (v (cdr hp)))
+             (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
+             (if (alt-claim! h)
+                 (begin
+                   (alt-deliver! h #t ch)
+                   (let ((box (vector #f)))
+                     (ac-qpush! ch (cons v box))
+                     (condition-broadcast (async-chan-cv ch)))
+                   (ac-take-head! ch))
+                 (loop))))
+          ((async-chan-closed? ch) jolt-nil)
+          (else ac-poll-empty))))
 (define (ac-poll! ch)
   (jolt-with-mutex (async-chan-mu ch) (ac-poll!/locked ch)))
 
@@ -432,10 +513,11 @@
     ((async-chan-closed? ch) 'closed)
     ((async-chan-xrf ch) (if (and (not (ac-unblocking? ch))
                                   (> (async-chan-cap ch) 0)
-                            (>= (ac-qlen ch) (async-chan-cap ch)))
+                                  (or (pair? (async-chan-alt-putters ch))
+                                      (>= (ac-qlen ch) (async-chan-cap ch))))
                        'full
                        (let ((r (ac-xrf-apply ch v)))
-                         (when (jolt-reduced? r) (ac-close! ch)) 'ok)))
+                         (when (jolt-reduced? r) (ac-abort! ch)) 'ok)))
     (else
      (case (async-chan-kind ch)
        ((dropping sliding) (ac-buf-give! ch v) 'ok)
@@ -443,7 +525,8 @@
        (else
         (cond
           ((> (async-chan-cap ch) 0)
-           (if (< (ac-qlen ch) (async-chan-cap ch))
+           (if (and (null? (async-chan-alt-putters ch))
+                    (< (ac-qlen ch) (async-chan-cap ch)))
                (begin (ac-qpush! ch (cons v #f)) (ac-notify! ch) 'ok)
                'full))
           ;; a waiting taker makes the rendezvous possible: a thread parked in a
@@ -452,9 +535,11 @@
           ;; the alt-taker clause, offer!/put! to an unbuffered channel would
           ;; report 'full while a fiber waited, and put! would fork a thread
           ;; instead of completing on the caller.
-          ((or (> (async-chan-takew ch) 0)
-               (ormap (lambda (h) (alt-handler-active? h))
-                      (async-chan-alt-takers ch)))
+          ((and (ac-qempty? ch)
+                (null? (async-chan-alt-putters ch))
+                (or (> (async-chan-takew ch) 0)
+                    (ormap (lambda (h) (alt-handler-active? h))
+                           (async-chan-alt-takers ch))))
            (let ((box (vector #f)))
              (ac-qpush! ch (cons v box))
              (ac-notify! ch)
@@ -616,25 +701,48 @@
                     (lambda () (jolt-async-close! w)))
     w))
 
-;; (put! ch v [cb [on-caller?]]) — async put, optional completion callback. If the
-;; put completes immediately and on-caller? (default #t), the callback runs on the
-;; calling thread; otherwise on another thread. Returns true unless already closed.
+;; (put! ch v [cb [on-caller?]]) — async put, optional completion callback. The
+;; enqueue-or-closed decision is one caller-side mutex transaction; only waiting
+;; for an already-owned pending token is delegated to a worker.
 (define (jolt-async-put! ch v . rest)
   (let* ((cb (if (pair? rest) (car rest) jolt-nil))
          (on-caller? (if (and (pair? rest) (pair? (cdr rest))) (jolt-truthy? (cadr rest)) #t))
-         (call-cb (lambda (ok) (unless (jolt-nil? cb) (jolt-invoke cb ok)))))
-    (case (ac-try-give! ch v)
-      ((ok) (if on-caller? (call-cb #t) (fork-thread (lambda () (*txn* #f) (call-cb #t)))) #t)
-      ((closed) (if on-caller? (call-cb #f) (fork-thread (lambda () (*txn* #f) (call-cb #f)))) #f)
-      (else (fork-thread (lambda () (*txn* #f) (call-cb (jolt-async-give ch v)))) #t))))
+         (call-cb (lambda (ok) (unless (jolt-nil? cb) (jolt-invoke cb ok))))
+         (result
+          (jolt-with-mutex (async-chan-mu ch)
+            (case (ac-try-give!/locked ch v)
+              ((ok) #t)
+              ((closed) #f)
+              (else
+               (let ((h (alt-handler-alloc)))
+                 (async-chan-alt-putters-set!
+                  ch (append (async-chan-alt-putters ch) (list (cons h v))))
+                 (ac-notify! ch)
+                 h))))))
+    (cond
+      ((alt-handler? result)
+       (fork-thread (lambda () (*txn* #f) (call-cb (ac-handler-await result))))
+       #t)
+      (on-caller? (call-cb result) result)
+      (else (fork-thread (lambda () (*txn* #f) (call-cb result))) result))))
 
 ;; (take! ch cb [on-caller?]) — async take. Same on-caller? rule as put!.
 (define (jolt-async-take! ch cb . rest)
   (let* ((on-caller? (if (pair? rest) (jolt-truthy? (car rest)) #t))
          (call-cb (lambda (v) (unless (jolt-nil? cb) (jolt-invoke cb v))))
-         (r (ac-poll! ch)))
+         (r
+          (jolt-with-mutex (async-chan-mu ch)
+            (let ((value (ac-poll!/locked ch)))
+              (if (eq? value ac-poll-empty)
+                  (let ((h (alt-handler-alloc)))
+                    (async-chan-alt-takers-set!
+                     ch (append (async-chan-alt-takers ch) (list h)))
+                    (ac-notify! ch)
+                    h)
+                  value)))))
     (cond
-      ((eq? r ac-poll-empty) (fork-thread (lambda () (*txn* #f) (call-cb (jolt-async-take ch)))))
+      ((alt-handler? r)
+       (fork-thread (lambda () (*txn* #f) (call-cb (ac-handler-await r)))))
       (on-caller? (call-cb r))
       (else (fork-thread (lambda () (*txn* #f) (call-cb r)))))
     jolt-nil))
@@ -899,9 +1007,11 @@
                           (let ((ch (car entry)) (is-put (cdr entry)))
                             (jolt-with-mutex (async-chan-mu ch)
                               (if is-put
-                                  (async-chan-alt-putters-set! ch
-                                    (remp (lambda (hp) (eq? (car hp) h))
-                                          (async-chan-alt-putters ch)))
+                                  (begin
+                                    (async-chan-alt-putters-set! ch
+                                      (remp (lambda (hp) (eq? (car hp) h))
+                                            (async-chan-alt-putters ch)))
+                                    (ac-notify! ch))
                                   (async-chan-alt-takers-set! ch
                                     (remp (lambda (x) (eq? x h))
                                           (async-chan-alt-takers ch)))))))
@@ -940,8 +1050,10 @@
                                            (or (async-chan-closed? ch)
                                                (memq (async-chan-kind ch) '(dropping sliding promise))
                                                (and (> (async-chan-cap ch) 0)
+                                                    (null? (async-chan-alt-putters ch))
                                                     (< (ac-qlen ch) (async-chan-cap ch)))
                                                (and (fx=? (async-chan-cap ch) 0)
+                                                    (null? (async-chan-alt-putters ch))
                                                     (> (async-chan-takew ch) 0)))))
                                       (cond
                                         ((not ready?)
