@@ -405,7 +405,7 @@
 ;;   dispatched the running fiber with, so the park's finally walk knows where to stop
 ;; slot 8: values.ss jolt-vreg-symcell-cache — this thread's bounded identity
 ;;   front cache over the symbol-string pool (intern-symbol-cell)
-;; slot 9: java/host-static-methods.ss jolt-vreg-interrupt-box — this thread's
+;; slot 9: locks.ss jolt-vreg-interrupt-box — this thread's
 ;;   interrupt flag. A vreg and NOT a thread parameter on purpose: a thread
 ;;   parameter is inherited by a forked thread, so the box had to carry the
 ;;   owning thread's id and be re-checked on every read; a vreg starts at

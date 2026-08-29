@@ -87,7 +87,7 @@
                           (cseq-kind x) (cseq-cvec x) (cseq-ci x) (cseq-crest x) (cseq-lock x)))
     ((jolt-lazyseq? x) (make-jolt-lazyseq (jolt-lazyseq-thunk x) (jolt-lazyseq-val x)
                                           (jolt-lazyseq-realized? x) (jolt-lazyseq-error? x)
-                                          (make-mutex)))
+                                          #f))
     (else x)))                          ; procedure
 
 ;; Obj.withMeta returns `this` when the metadata is unchanged, and the JVM

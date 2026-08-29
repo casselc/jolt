@@ -82,6 +82,13 @@
 (define switch-points '(jolt-fiber-to-scheduler! jolt-sm-park!))
 (define assertion 'jolt-locks-assert-none!)
 
+;; A function on this list may reach a switch point without making its callers
+;; parkers only while it directly asserts that no counted lock is held before
+;; every direct call that can park.
+;; This is deliberately a one-name escape hatch, not an annotation mechanism:
+;; deleting or moving the assertion makes the teeth check fail closed.
+(define guarded-park-boundaries '(jolt-publication-gate-wait!))
+
 ;; The closure's seeds: the switch points themselves and the two wrappers that
 ;; exist only to reach them.
 (define park-seeds
@@ -223,7 +230,8 @@
 ;; ---------------------------------------------------------------------------
 ;; per-file collection
 ;; ---------------------------------------------------------------------------
-;; A "unit" is one top-level definition: (file name calls locked-calls locked-any).
+;; A "unit" is one top-level definition:
+;; (file name calls locked-calls locked-any raw-body).
 ;; calls is every operator-position symbol in the body (the call graph edge set),
 ;; locked-calls the operator-position subset inside a jolt-with-mutex, and
 ;; locked-any every symbol inside one in any position. Top-level forms that are not
@@ -235,6 +243,7 @@
 (define (unit-calls u) (caddr u))
 (define (unit-locked u) (cadddr u))
 (define (unit-locked-any u) (car (cddddr u)))
+(define (unit-body u) (cadr (cddddr u)))
 
 (define (definition-name d)
   (and (pair? d) (eq? 'define (car d)) (pair? (cdr d))
@@ -247,7 +256,7 @@
         (when operator? (set! calls (cons sym calls)))
         (when (and in-lock? operator?) (set! locked (cons sym locked)))
         (when in-lock? (set! locked-any (cons sym locked-any)))))
-    (list file name calls locked locked-any)))
+    (list file name calls locked locked-any forms)))
 
 (define (collect-file file)
   (let loop ((ds (read-datums file)) (acc '()))
@@ -283,7 +292,8 @@
       (let ((changed #f))
         (for-each
           (lambda (u)
-            (unless (hashtable-ref parks (unit-name u) #f)
+            (unless (or (memq (unit-name u) guarded-park-boundaries)
+                        (hashtable-ref parks (unit-name u) #f))
               (when (let loop ((cs (unit-calls u)))
                       (cond ((null? cs) #f)
                             ((hashtable-ref parks (car cs) #f) #t)
@@ -334,7 +344,7 @@
 ;; the teeth check: the switch points must still call the assertion
 ;; ---------------------------------------------------------------------------
 
-(define (missing-assertions units)
+(define (missing-switch-assertions units)
   (let loop ((sps switch-points) (missing '()))
     (cond
       ((null? sps) (reverse missing))
@@ -353,6 +363,85 @@
                           (else (g (cdr ds)))))
                   missing)
                  (else (cons (cons sp "does not call the assertion") missing)))))))))
+
+;; Syntactic proof for guarded boundaries. The assertion must be the first raw
+;; body form and an ordinary direct call -- not merely the first call the walker
+;; happens to encounter, which would accept `(when false (assert))`. unit-calls
+;; is accumulated in reverse walk order, hence the reverse below. A boundary is
+;; trusted only if it has at least one direct parker and that leading assertion
+;; precedes every one. This catches deletion, reordering, and dead-branching.
+(define (leading-assertion? u)
+  (let ((body (unit-body u)))
+    (and (pair? body)
+         (let ((f (car body)))
+           (and (pair? f) (eq? (car f) assertion))))))
+
+(define (bad-guarded-boundaries units parks)
+  (let loop ((names guarded-park-boundaries) (bad '()))
+    (if (null? names)
+        (reverse bad)
+        (let* ((name (car names))
+               (defs (filter (lambda (u) (eq? (unit-name u) name)) units)))
+          (loop
+            (cdr names)
+            (cond
+              ((null? defs) (cons (cons name "not defined anywhere") bad))
+              ((and (null? (cdr defs))
+                    (leading-assertion? (car defs))
+                    (let scan ((calls (reverse (unit-calls (car defs))))
+                               (asserted? #f) (saw-parker? #f))
+                      (cond
+                        ((null? calls) (and asserted? saw-parker?))
+                        ((eq? (car calls) assertion)
+                         (scan (cdr calls) #t saw-parker?))
+                        ((hashtable-ref parks (car calls) #f)
+                         (and asserted? (scan (cdr calls) asserted? #t)))
+                        (else (scan (cdr calls) asserted? saw-parker?)))))
+               bad)
+              (else
+               (cons (cons name "must call the lock assertion before every direct parker")
+                     bad))))))))
+
+;; Mutation/teeth check over synthetic units. A guarded boundary that directly
+;; calls the assertion must cut propagation; deletion, reordering, conditional
+;; placement, and duplicate-definition escape attempts must all be detected.
+(define (guarded-boundary-self-test)
+  (let* ((mk (lambda (name calls body)
+               (list "synthetic" name calls '() '() body)))
+         ;; Unit call lists are stored in reverse source order.
+         (good (list (mk 'jolt-publication-gate-wait!
+                         '(jolt-fiber-to-scheduler! jolt-locks-assert-none!)
+                         '((jolt-locks-assert-none! 'guard)
+                           (jolt-fiber-to-scheduler! f)))
+                     (mk 'synthetic-caller '(jolt-publication-gate-wait!)
+                         '((jolt-publication-gate-wait! gate me)))))
+         (deleted (list (mk 'jolt-publication-gate-wait!
+                            '(jolt-fiber-to-scheduler!)
+                            '((jolt-fiber-to-scheduler! f)))))
+         (reordered (list (mk 'jolt-publication-gate-wait!
+                              '(jolt-locks-assert-none! jolt-fiber-to-scheduler!)
+                              '((jolt-fiber-to-scheduler! f)
+                                (jolt-locks-assert-none! 'guard)))))
+         (conditional (list (mk 'jolt-publication-gate-wait!
+                                '(jolt-fiber-to-scheduler! jolt-locks-assert-none! when)
+                                '((when #f (jolt-locks-assert-none! 'guard))
+                                  (jolt-fiber-to-scheduler! f)))))
+         (duplicate (append good
+                            (list (mk 'jolt-publication-gate-wait!
+                                      '(jolt-fiber-to-scheduler!)
+                                      '((jolt-fiber-to-scheduler! f))))))
+         (parks (build-parkers good))
+         (deleted-parks (build-parkers deleted))
+         (reordered-parks (build-parkers reordered))
+         (conditional-parks (build-parkers conditional))
+         (duplicate-parks (build-parkers duplicate)))
+    (and (not (hashtable-ref parks 'jolt-publication-gate-wait! #f))
+         (not (hashtable-ref parks 'synthetic-caller #f))
+         (null? (bad-guarded-boundaries good parks))
+         (pair? (bad-guarded-boundaries deleted deleted-parks))
+         (pair? (bad-guarded-boundaries reordered reordered-parks))
+         (pair? (bad-guarded-boundaries conditional conditional-parks))
+         (pair? (bad-guarded-boundaries duplicate duplicate-parks)))))
 
 ;; ---------------------------------------------------------------------------
 ;; allowlist
@@ -444,7 +533,9 @@
       (exit 1))
     (let* ((parks (build-parkers units))
            (got (map finding->line (findings units parks)))
-           (missing (missing-assertions units)))
+           (missing (append (missing-switch-assertions units)
+                            (bad-guarded-boundaries units parks)))
+           (self-test-ok? (guarded-boundary-self-test)))
       (cond
         ((and (pair? args) (string=? (car args) "--regen"))
          (write-allowlist! got)
@@ -454,6 +545,8 @@
          (let ((want (allowlist-lines)) (problems '()))
            (define (add! s) (set! problems (cons s problems)))
            ;; the teeth first: without the runtime half this check is a lint
+           (unless self-test-ok?
+             (add! "  CHECKER SELF-TEST FAILED: guarded park boundary mutation was not detected"))
            (for-each
              (lambda (m)
                (add! (string-append "  SWITCH POINT UNGUARDED: " (symbol->string (car m))

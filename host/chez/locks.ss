@@ -49,6 +49,21 @@
 ;; the correct answer for a thread that never runs fibers.
 (define jolt-vreg-locks 7)
 (define (jolt-locks-held) (virtual-register jolt-vreg-locks))
+
+;; Slot 9: this OS thread's stable identity and cooperative-interrupt flag.  The
+;; wait machinery below has always consumed current-interrupt-box; defining the
+;; slot beside that machinery instead of much later in java/host-static-methods.ss
+;; also gives the early publication gate below a thread identity during runtime
+;; bring-up.  A virtual register, rather than a thread parameter, is load-bearing:
+;; a newly forked thread starts at 0 instead of inheriting its parent's box.
+(define jolt-vreg-interrupt-box 9)
+(define (current-interrupt-box)
+  (let ((b (virtual-register jolt-vreg-interrupt-box)))
+    (if (box? b)
+        b
+        (let ((nb (box #f)))
+          (set-virtual-register! jolt-vreg-interrupt-box nb)
+          nb))))
 ;; Always ERR TOWARDS HELD. enter! runs BEFORE the acquire and exit! runs AFTER
 ;; the release, so the window on each side reads "a lock is held" when one is not
 ;; quite held yet or no longer is. That costs at most a deferred preemption; the
@@ -479,6 +494,128 @@
                       (jolt-condition-wait cv mu (jolt-millis->time deadline))
                       (jolt-condition-wait cv mu))
                   (loop)))))))))))
+
+;; --- fiber-aware publication gates -----------------------------------------
+;; A short counted mutex may protect a state transition, but it may not surround
+;; code the runtime does not own: that code can park a fiber.  Lazy-seq and cseq
+;; realization need exactly the other shape.  One owner runs arbitrary code with
+;; no counted lock held, while contenders wait; the owner's identity and reentry
+;; depth survive a fiber park as ordinary fields.
+;;
+;; #(bookkeeping-mutex condition owner depth owner-thread-box)
+;;
+;; The gate deliberately does NOT own a value/error policy.  A lazy-seq caches a
+;; thrown realization and a cseq tail currently retries one; both also permit a
+;; same-owner recursive realization.  Keeping those policies in their records
+;; preserves them while this primitive supplies the shared ownership/publication
+;; boundary.
+(define publication-gate-i-bk 0)
+(define publication-gate-i-cv 1)
+(define publication-gate-i-owner 2)
+(define publication-gate-i-depth 3)
+(define publication-gate-i-box 4)
+
+(define (jolt-publication-gate-new)
+  (vector (make-mutex) (make-condition) #f 0 #f))
+
+;; Terminal records are stable, so a reader needs only establish that the
+;; publishing owner has released.  Taking bk is the acquire side of that
+;; publication fence; once it observes no owner, the record-specific terminal
+;; flag and payload may be read without claiming and releasing the gate again.
+(define (jolt-publication-gate-unowned? gate)
+  (jolt-with-mutex (vector-ref gate publication-gate-i-bk)
+    (not (vector-ref gate publication-gate-i-owner))))
+
+(define (jolt-publication-gate-self)
+  (or (jolt-current-fiber) (current-interrupt-box)))
+
+;; A fiber's own winders can run after its terminal transition has cleared the
+;; current-fiber register.  Accept that one narrow release case, as the object
+;; monitor does: the recorded owner is terminal and this is its carrier thread.
+(define (jolt-publication-gate-owner? gate me)
+  (let ((owner (vector-ref gate publication-gate-i-owner)))
+    (or (eq? owner me)
+        (and (jolt-fiber? owner)
+             (not (jolt-current-fiber))
+             (eq? (vector-ref gate publication-gate-i-box)
+                  (current-interrupt-box))
+             (memq (jolt-fiber-state owner) '(done dead))
+             #t))))
+
+(define (jolt-publication-gate-try-enter! gate me)
+  (let ((bk (vector-ref gate publication-gate-i-bk)))
+    (jolt-with-mutex bk
+      (let ((owner (vector-ref gate publication-gate-i-owner)))
+        (cond
+          ((eq? owner me)
+           (vector-set! gate publication-gate-i-depth
+                        (fx+ 1 (vector-ref gate publication-gate-i-depth)))
+           #t)
+          ((not owner)
+           (vector-set! gate publication-gate-i-owner me)
+           (vector-set! gate publication-gate-i-depth 1)
+           (vector-set! gate publication-gate-i-box (current-interrupt-box))
+           #t)
+          (else #f))))))
+
+;; Named guarded-park boundary.  The static park/lock checker stops propagation
+;; through this one function only while it can also prove the assertion remains
+;; a direct call here.  A contender may wait, but never while an unrelated
+;; counted runtime lock is held.  The fast path above preserves the old behavior
+;; for uncontended (including already-realized) forcing inside short regions.
+(define (jolt-publication-gate-wait! gate me)
+  (jolt-locks-assert-none! 'jolt-publication-gate-wait!)
+  (let ((bk (vector-ref gate publication-gate-i-bk))
+        (cv (vector-ref gate publication-gate-i-cv)))
+    ;; jolt-cv-wait commits a fiber waiter under bk and switches outside it; a
+    ;; thread waits on cv.  Every wake retakes this decision, so a broadcast is
+    ;; information only and cannot hand ownership to two contenders.
+    (jolt-cv-wait bk cv #f
+      (lambda (_)
+        (let ((owner (vector-ref gate publication-gate-i-owner)))
+          (cond
+            ((not owner)
+             (vector-set! gate publication-gate-i-owner me)
+             (vector-set! gate publication-gate-i-depth 1)
+             (vector-set! gate publication-gate-i-box
+                          (current-interrupt-box))
+             #t)
+            (else jolt-cv-again)))))
+    (void)))
+
+(define (jolt-publication-gate-enter! gate)
+  (let ((me (jolt-publication-gate-self)))
+    (unless (jolt-publication-gate-try-enter! gate me)
+      (jolt-publication-gate-wait! gate me))))
+
+(define (jolt-publication-gate-exit! gate)
+  (let ((me (jolt-publication-gate-self))
+        (bk (vector-ref gate publication-gate-i-bk))
+        (cv (vector-ref gate publication-gate-i-cv)))
+    (jolt-with-mutex bk
+      (unless (jolt-publication-gate-owner? gate me)
+        (error 'jolt-publication-gate-exit! "not publication gate owner"))
+      (let ((depth (fx- (vector-ref gate publication-gate-i-depth) 1)))
+        (vector-set! gate publication-gate-i-depth depth)
+        (when (fx=? depth 0)
+          ;; Record-specific payload/error/realized writes happened before this
+          ;; release.  Clear ownership and wake under the same bookkeeping lock
+          ;; on which contenders decide to wait, closing the lost-wakeup window.
+          (vector-set! gate publication-gate-i-owner #f)
+          (vector-set! gate publication-gate-i-box #f)
+          (jolt-cv-wake! cv))))))
+
+(define (jolt-with-publication-gate gate thunk)
+  (jolt-publication-gate-enter! gate)
+  (dynamic-wind
+    (lambda () #f)
+    thunk
+    ;; A capture park is not an exit.  Ownership remains attached to the fiber
+    ;; while it is off-CPU and this after-thunk releases only on a real return or
+    ;; throw, exactly like jolt-with-monitor.
+    (lambda ()
+      (unless (jolt-park-unwinding?)
+        (jolt-publication-gate-exit! gate)))))
 
 ;; --- interruptible waiting --------------------------------------------------
 ;; (jolt-cv-wait-interruptibly who mu cv deadline decide)
