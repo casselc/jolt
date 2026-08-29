@@ -85,9 +85,10 @@
 ;; A function on this list may reach a switch point without making its callers
 ;; parkers only while it directly asserts that no counted lock is held before
 ;; every direct call that can park.
-;; This is deliberately a one-name escape hatch, not an annotation mechanism:
+;; This is deliberately a tiny explicit list, not an annotation mechanism:
 ;; deleting or moving the assertion makes the teeth check fail closed.
-(define guarded-park-boundaries '(jolt-publication-gate-wait!))
+(define guarded-park-boundaries
+  '(jolt-logical-mutex-wait! jolt-publication-gate-wait!))
 
 ;; The closure's seeds: the switch points themselves and the two wrappers that
 ;; exist only to reach them.
@@ -405,29 +406,33 @@
 ;; Mutation/teeth check over synthetic units. A guarded boundary that directly
 ;; calls the assertion must cut propagation; deletion, reordering, conditional
 ;; placement, and duplicate-definition escape attempts must all be detected.
-(define (guarded-boundary-self-test)
-  (let* ((mk (lambda (name calls body)
+(define (guarded-boundary-self-test/one boundary)
+  ;; Isolate the synthetic fixture to the boundary under test; the live list
+  ;; may contain several definitions that intentionally are not in this tiny
+  ;; synthetic unit set.
+  (fluid-let ((guarded-park-boundaries (list boundary)))
+    (let* ((mk (lambda (name calls body)
                (list "synthetic" name calls '() '() body)))
          ;; Unit call lists are stored in reverse source order.
-         (good (list (mk 'jolt-publication-gate-wait!
+         (good (list (mk boundary
                          '(jolt-fiber-to-scheduler! jolt-locks-assert-none!)
                          '((jolt-locks-assert-none! 'guard)
                            (jolt-fiber-to-scheduler! f)))
-                     (mk 'synthetic-caller '(jolt-publication-gate-wait!)
-                         '((jolt-publication-gate-wait! gate me)))))
-         (deleted (list (mk 'jolt-publication-gate-wait!
+                     (mk 'synthetic-caller (list boundary)
+                         (list (list boundary 'gate 'me)))))
+         (deleted (list (mk boundary
                             '(jolt-fiber-to-scheduler!)
                             '((jolt-fiber-to-scheduler! f)))))
-         (reordered (list (mk 'jolt-publication-gate-wait!
+         (reordered (list (mk boundary
                               '(jolt-locks-assert-none! jolt-fiber-to-scheduler!)
                               '((jolt-fiber-to-scheduler! f)
                                 (jolt-locks-assert-none! 'guard)))))
-         (conditional (list (mk 'jolt-publication-gate-wait!
+         (conditional (list (mk boundary
                                 '(jolt-fiber-to-scheduler! jolt-locks-assert-none! when)
                                 '((when #f (jolt-locks-assert-none! 'guard))
                                   (jolt-fiber-to-scheduler! f)))))
          (duplicate (append good
-                            (list (mk 'jolt-publication-gate-wait!
+                            (list (mk boundary
                                       '(jolt-fiber-to-scheduler!)
                                       '((jolt-fiber-to-scheduler! f))))))
          (parks (build-parkers good))
@@ -435,13 +440,19 @@
          (reordered-parks (build-parkers reordered))
          (conditional-parks (build-parkers conditional))
          (duplicate-parks (build-parkers duplicate)))
-    (and (not (hashtable-ref parks 'jolt-publication-gate-wait! #f))
+    (and (not (hashtable-ref parks boundary #f))
          (not (hashtable-ref parks 'synthetic-caller #f))
          (null? (bad-guarded-boundaries good parks))
          (pair? (bad-guarded-boundaries deleted deleted-parks))
          (pair? (bad-guarded-boundaries reordered reordered-parks))
          (pair? (bad-guarded-boundaries conditional conditional-parks))
-         (pair? (bad-guarded-boundaries duplicate duplicate-parks)))))
+         (pair? (bad-guarded-boundaries duplicate duplicate-parks))))))
+
+(define (guarded-boundary-self-test)
+  (let loop ((names guarded-park-boundaries))
+    (or (null? names)
+        (and (guarded-boundary-self-test/one (car names))
+             (loop (cdr names))))))
 
 ;; ---------------------------------------------------------------------------
 ;; allowlist
