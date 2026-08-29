@@ -69,7 +69,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
-  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit niotemp unitcontext \
+  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit niotemp unitconcurrent unitcontext \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
@@ -124,7 +124,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit niotemp documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit unitconcurrent niotemp documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
@@ -328,6 +328,11 @@ corpus:
 # Host-specific unit cases.
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
+
+# Dynamic-dependency rows use a private root per run.  Exercise two overlapping
+# runners, assert distinct ownership, and pin exception diagnostics.
+unitconcurrent:
+	@JOLT_CHEZ="$(CHEZ)" sh test/chez/unit-concurrent-test.sh
 
 # createTempDirectory retries when another creator wins its first candidate.
 niotemp:
