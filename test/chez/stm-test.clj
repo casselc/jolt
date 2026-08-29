@@ -189,6 +189,44 @@
   (chk "atomic-reentrant-update: updateAndGet fn may re-enter the same atomic"
        (= 11 (deref t 5000 :hang))))
 
+;; AtomicReference.compareAndSet is a reference-identity operation on the JVM.
+;; Equal but separately allocated values must not satisfy its expected-value
+;; check. Pin both the failed stale CAS and the successful identity CAS so a
+;; value-equality mutation cannot pass by changing the cell anyway.
+(let [actual (list :same)
+      stale-equal (list :same)
+      replacement (list :replacement)
+      a (java.util.concurrent.atomic.AtomicReference. actual)
+      stale-result (.compareAndSet a stale-equal replacement)
+      after-stale (.get a)
+      identity-result (.compareAndSet a actual replacement)]
+  (chk "atomic-reference-cas-identity: fixture is equal but not identical"
+       (and (= actual stale-equal) (not (identical? actual stale-equal))))
+  (chk "atomic-reference-cas-identity: equal stale reference cannot update"
+       (and (false? stale-result) (identical? actual after-stale)))
+  (chk "atomic-reference-cas-identity: identical expected reference updates"
+       (and (true? identity-result) (identical? replacement (.get a)))))
+
+;; The sibling atomic shims model primitive fields, not object references; their
+;; CAS remains value-based after AtomicReference takes the identity comparator.
+;; Use independently parsed bignums for AtomicLong because fixnums may be eq?
+;; even when they came from separate expressions, which would let an identity
+;; comparator mutation survive this test.
+(let [long-actual (Long/parseLong "9223372036854775806")
+      long-expected (Long/parseLong "9223372036854775806")
+      long-next (Long/parseLong "9223372036854775805")
+      i (java.util.concurrent.atomic.AtomicInteger. 1000)
+      l (java.util.concurrent.atomic.AtomicLong. long-actual)
+      b (java.util.concurrent.atomic.AtomicBoolean. false)]
+  (chk "atomic-primitive-cas-value: long fixture is equal but not identical"
+       (and (= long-actual long-expected)
+            (not (identical? long-actual long-expected))))
+  (chk "atomic-primitive-cas-value: Integer/Long/Boolean retain value CAS"
+       (and (.compareAndSet i 1000 1001)
+            (.compareAndSet l long-expected long-next)
+            (.compareAndSet b false true)
+            (= [1001 long-next true] [(.get i) (.get l) (.get b)]))))
+
 (if (empty? @failures)
   (println "STM OK")
   (doseq [f @failures] (println "FAIL:" f)))
