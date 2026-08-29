@@ -773,26 +773,50 @@
 ;; java.util.concurrent.atomic.Atomic{Reference,Integer,Long,Boolean}: a
 ;; thread-safe mutable cell (mutex-guarded, shared heap). One "atomic" jhost
 ;; serves all four; the numeric ops are meaningful only on Integer/Long.
-(define (make-atomic init)
-  (make-jhost "atomic" (vector (box init) (make-mutex))))
+;; AtomicReference CAS compares object identity, while the primitive wrappers
+;; compare their unboxed values. Keep that closed distinction in the cell
+;; instead of making the shared CAS path guess from the values it contains (or
+;; calling a stored, potentially generic comparator while the mutex is held).
+(define (make-atomic init kind)
+  (make-jhost "atomic" (vector (box init) (make-mutex) kind)))
 (define (atomic-box self) (vector-ref (jhost-state self) 0))
 (define (atomic-lock self) (vector-ref (jhost-state self) 1))
+(define (atomic-kind self) (vector-ref (jhost-state self) 2))
 ;; CAS under the atomic's mutex. updateAndGet/getAndUpdate run the user fn
 ;; LOCK-FREE in a CAS retry loop (JVM parity), so the fn may re-enter the same
 ;; atomic; a mutex-held fn deadlocked on the non-recursive Chez mutex there
 ;; (PSL R4 cluster 4).
 (define (atomic-cas! self o n)
-  (jolt-with-mutex (atomic-lock self)
-    (if (jolt=2 (unbox (atomic-box self)) o)
-        (begin (set-box! (atomic-box self) n) #t) #f)))
-(let ((ref-ctor (lambda args (make-atomic (if (pair? args) (car args) jolt-nil))))
-      (num-ctor (lambda args (make-atomic (if (pair? args) (car args) 0))))
-      (bool-ctor (lambda args (make-atomic (if (pair? args) (car args) #f)))))
+  ;; Primitive method arguments are converted before entering Java's CAS. Do
+  ;; the modeled conversion before taking the counted lock as well: casts may
+  ;; throw, while the critical section below must remain leaf-only.
+  (let* ((kind (atomic-kind self))
+         (expected (case kind
+                     ((integer) (jolt-int-cast o))
+                     ((long) (jolt-long-cast o))
+                     (else o)))
+         (next (case kind
+                 ((integer) (jolt-int-cast n))
+                 ((long) (jolt-long-cast n))
+                 (else n))))
+    (jolt-with-mutex (atomic-lock self)
+      (let ((current (unbox (atomic-box self))))
+        (if (case kind
+              ((reference boolean) (eq? current expected))
+              ((integer long)
+               (and (integer? current) (exact? current) (= current expected)))
+              (else #f))
+            (begin (set-box! (atomic-box self) next) #t) #f)))))
+(let ((ref-ctor (lambda args (make-atomic (if (pair? args) (car args) jolt-nil) 'reference)))
+      (int-ctor (lambda args (make-atomic (if (pair? args) (car args) 0) 'integer)))
+      (long-ctor (lambda args (make-atomic (if (pair? args) (car args) 0) 'long)))
+      (bool-ctor (lambda args (make-atomic (if (pair? args) (car args) #f) 'boolean))))
   (for-each (lambda (n) (register-class-ctor! n ref-ctor))
             '("AtomicReference" "java.util.concurrent.atomic.AtomicReference"))
-  (for-each (lambda (n) (register-class-ctor! n num-ctor))
-            '("AtomicInteger" "java.util.concurrent.atomic.AtomicInteger"
-              "AtomicLong" "java.util.concurrent.atomic.AtomicLong"))
+  (for-each (lambda (n) (register-class-ctor! n int-ctor))
+            '("AtomicInteger" "java.util.concurrent.atomic.AtomicInteger"))
+  (for-each (lambda (n) (register-class-ctor! n long-ctor))
+            '("AtomicLong" "java.util.concurrent.atomic.AtomicLong"))
   (for-each (lambda (n) (register-class-ctor! n bool-ctor))
             '("AtomicBoolean" "java.util.concurrent.atomic.AtomicBoolean")))
 (register-host-methods! "atomic"
