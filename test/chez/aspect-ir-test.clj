@@ -923,6 +923,87 @@
                  nil
                  (catch Exception e (ex-message e)))))))))
 
+(deftest aspect-plan-is-source-free-and-explainable-before-or-after-build
+  (let [selection {:resource aspect-fixture-resource
+                   :consumers
+                   [{:provider 'aspect-ir-test/filtered-complete-provider
+                     :roles :all}
+                    {:provider 'aspect-ir-test/filtered-second-provider
+                     :roles [:test/around]}]}
+        configured (resolve-aspect-fixture selection)
+        plan (aspects/plan-data configured)
+        call (first (filter #(= :test/target-call (:id %)) (:aspects plan)))
+        site-for (fn [aspect]
+                   (let [match (:match aspect)
+                         call? (contains? match :call)
+                         target (if call? (:call match) (:entry match))]
+                     {:aspect (:id aspect)
+                      :within (if call? (str (:ns match)) (namespace target))
+                      (if call? :call :entry) target
+                      :arity (:arity match)
+                      :ordinal 1
+                      :position {:line 12 :column 7}}))
+        report {:schema (:schema plan)
+                :weaver (:weaver plan)
+                :identity (:identity plan)
+                :control-enabled? (:control-enabled? plan)
+                :aspects (mapv (fn [aspect]
+                                 {:id (:id aspect) :sites [(site-for aspect)]})
+                               (:aspects plan))}
+        static-lines (aspects/explain-lines plan)
+        observed-lines (aspects/explain-lines plan report "fixture.edn")]
+    (is (= :instrumented (:status plan)))
+    (is (= (:identity configured) (:identity plan)))
+    (is (= [1 2] (mapv :ordinal (:consumers call))))
+    (is (not-any? #(contains? % :provider-bytes) (:consumers call)))
+    (is (not (.contains (pr-str plan) "manifest-bytes")))
+    (is (not (contains? plan :report)))
+    (is (some #(.startsWith % "aspect :test/target-call") static-lines))
+    (is (not-any? #(.startsWith % "  observed sites:") static-lines))
+    (is (some #(= "observed report: fixture.edn" %) observed-lines))
+    (is (some #(= "  observed sites: 1" %) observed-lines))
+    (is (some #(.contains % ":within \"app.core\"") observed-lines)))
+  (is (= {:schema 1 :weaver "jolt.aspect-ir/v1" :status :plain
+          :identity "plain" :control-enabled? false
+          :providers [] :aspects []}
+         (aspects/plan-data nil))))
+
+(deftest aspect-explain-rejects-stale-or-unbounded-reports
+  (let [configured (resolve-aspect-fixture
+                    {:resource aspect-fixture-resource
+                     :provider 'aspect-ir-test/filtered-complete-provider})
+        plan (aspects/plan-data configured)
+        site-for (fn [aspect]
+                   (let [match (:match aspect)
+                         call? (contains? match :call)
+                         target (if call? (:call match) (:entry match))]
+                     {:aspect (:id aspect)
+                      :within (if call? (str (:ns match)) (namespace target))
+                      (if call? :call :entry) target
+                      :arity (:arity match)
+                      :ordinal 1
+                      :position {:line 1 :column 1}}))
+        report {:schema (:schema plan)
+                :weaver (:weaver plan)
+                :identity (:identity plan)
+                :control-enabled? (:control-enabled? plan)
+                :aspects (mapv (fn [aspect]
+                                 {:id (:id aspect) :sites [(site-for aspect)]})
+                               (:aspects plan))}
+        message (fn [candidate]
+                  (try
+                    (aspects/explain-lines plan candidate)
+                    nil
+                    (catch Exception e (ex-message e))))]
+    (is (= "jolt aspects: build report does not match the selected build"
+           (message (assoc report :identity "stale"))))
+    (is (= "jolt aspects: build report contains unsupported keys"
+           (message (assoc report :unexpected "not rendered"))))
+    (is (= "jolt aspects: build report site contains unsupported keys"
+           (message (assoc-in report [:aspects 0 :sites 0 :secret] "not rendered"))))
+    (is (= "jolt aspects: build report aspects do not match the selected build"
+           (message (assoc-in report [:aspects 0 :id] :other/aspect))))))
+
 (deftest report-publication-follows-explicit-prepare
   (let [file (java.io.File/createTempFile "jolt-aspects" ".edn")
         path (.getAbsolutePath file)
