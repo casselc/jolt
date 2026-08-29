@@ -5,6 +5,8 @@
   before the launcher cd'd to the jolt repo)."
   (:require [jolt.deps :as deps]
             [jolt.aspects :as aspects]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]))
 
 (defn- project-dir [] (or (jolt.host/getenv "JOLT_PWD") "."))
@@ -46,10 +48,15 @@
                                    " not found — tried " (pr-str cands) " for " (name plat))
                               {:native spec})))))))))
 
-;; Apply a resolved project's roots on top of the current (jolt-core) roots so app
-;; namespaces resolve while jolt.* stays loadable, then load its native deps.
-(defn- apply-project! [{:keys [roots natives]}]
-  (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
+;; Apply only a resolved project's source roots. Introspection commands need
+;; provider namespaces to resolve, but must not load project native libraries or
+;; run their constructors merely to describe a build.
+(defn- apply-project-roots! [{:keys [roots]}]
+  (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots))))))
+
+;; Runtime/build commands additionally load the resolved native dependencies.
+(defn- apply-project! [{:keys [natives] :as resolved}]
+  (apply-project-roots! resolved)
   (load-natives! natives))
 
 ;; Aliases selected by a leading -A:… — bound around the re-dispatch so every
@@ -548,6 +555,41 @@
                                      cands (if (string? c) [c] (vec c))]
                                  (into [(if (:optional spec) "opt" "req")] cands))))))))
 
+(defn- project-path [path]
+  (when path
+    (let [file (io/file path)]
+      (str (if (.isAbsolute file) file (io/file (project-dir) path))))))
+
+(defn- cmd-aspects [more]
+  (let [[subcommand report-arg & extra] more]
+    (when (or (nil? subcommand) (seq extra)
+              (and (= "plan" subcommand) report-arg)
+              (not (contains? #{"plan" "explain"} subcommand)))
+      (throw (ex-info "usage: jolt aspects plan | jolt aspects explain [REPORT]"
+                      {:args (vec more)})))
+    (let [{:keys [build] :as resolved} (resolve-current)
+          _ (apply-project-roots! resolved)
+          configured-report (project-path (:aspect-report build))
+          config (aspects/resolve-build-config
+                  (:aspects build) configured-report
+                  (:allow-control-aspects build))
+          plan (aspects/plan-data config)]
+      (case subcommand
+        "plan" (prn plan)
+        "explain"
+        (let [explicit? (some? report-arg)
+              report-path (or (project-path report-arg) configured-report)
+              report-file (some-> report-path io/file)
+              _ (when (and explicit? (not (.isFile report-file)))
+                  (throw (ex-info (str "aspect report not found: " report-arg)
+                                  {:report report-arg})))
+              report (when (and report-file (.isFile report-file))
+                       (edn/read-string (slurp report-file)))
+              label (when report
+                      (if explicit? report-arg
+                          (or (:aspect-report build) "configured build report")))]
+          (run! println (aspects/explain-lines plan report label)))))))
+
 (defn- cmd-build [more]
   (let [{:keys [project-paths embed-dirs build] :as resolved}
         (resolve-current)]
@@ -683,6 +725,8 @@
   (println "              [--target MACHINE --target-pack DIR]")
   (println "                         compile a standalone binary (--target cross-compiles")
   (println "                         for another Chez machine; see tools/cross-compile)")
+  (println "  aspects plan           resolve and print selected manifests and consumers")
+  (println "  aspects explain [FILE] explain selection and optional observed build report")
   (println "  path                   print the resolved source roots")
   (println "  tasks                  list the project's bb.edn/deps.edn :tasks")
   (println "  <task> [args]          run a task (`run <task>` and `run --parallel")
@@ -792,7 +836,7 @@
       ;; (babashka's :override-builtin). Checked here, after the two commands
       ;; that read no project at all, so it costs nothing a command doesn't
       ;; already pay: everything below resolves the project anyway.
-      (and (#{"run" "repl" "nrepl-server" "path" "build" "tasks"} cmd)
+      (and (#{"run" "repl" "nrepl-server" "path" "build" "aspects" "tasks"} cmd)
            (builtin-overridden? cmd))
       (run-task cmd more false)
 
@@ -801,6 +845,7 @@
       (= cmd "nrepl-server")             (nrepl more)
       (= cmd "path")                     (cmd-path)
       (= cmd "tasks")                    (cmd-tasks)
+      (= cmd "aspects")                  (cmd-aspects more)
       ;; -Sdeps '<edn>' — an extra deps.edn map merged last into the chain,
       ;; bound around the re-dispatch of the remaining argv.
       (= cmd "-Sdeps")
