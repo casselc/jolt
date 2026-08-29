@@ -93,6 +93,47 @@
     (slurp url)
     (fail (str "manifest resource not found: " resource) {:resource resource})))
 
+(defn- validate-preset [resource preset]
+  (when-not (map? preset)
+    (fail "preset must be an EDN map" {:resource resource}))
+  (reject-unknown-keys "preset" preset #{:schema :id :selections}
+                       {:resource resource})
+  (when-not (= schema-version (:schema preset))
+    (fail "unsupported preset schema"
+          {:resource resource :expected schema-version :actual (:schema preset)}))
+  (when-not (keyword? (:id preset))
+    (fail "preset :id must be a keyword" {:resource resource :id (:id preset)}))
+  (when-not (and (vector? (:selections preset)) (seq (:selections preset)))
+    (fail "preset :selections must be a non-empty vector" {:resource resource}))
+  (doseq [selection (:selections preset)]
+    (when-not (map? selection)
+      (fail "each preset selection must be a map"
+            {:resource resource :selection selection}))
+    (reject-unknown-keys "preset selection" selection
+                         #{:resource :provider :providers :consumers}
+                         {:resource resource :selection selection})
+    (when-not (contains? selection :resource)
+      (fail "preset selection needs :resource"
+            {:resource resource :selection selection})))
+  preset)
+
+(defn- expand-selection [selection]
+  (when-not (map? selection)
+    (fail "each aspect selection must be a map" {:selection selection}))
+  (if (contains? selection :preset)
+    (do
+      (reject-unknown-keys "aspect preset selection" selection #{:preset}
+                           {:selection selection})
+      (let [resource (:preset selection)
+            preset-text (resource-text resource)
+            preset (validate-preset resource (edn/read-string preset-text))
+            provenance {:id (:id preset)
+                        :resource resource
+                        :preset-bytes preset-text}]
+        (mapv #(hash-map :selection % :preset provenance)
+              (:selections preset))))
+    [{:selection selection}]))
+
 (defn- provider-var-symbol [provider]
   (cond
     (qualified-symbol? provider) provider
@@ -282,7 +323,9 @@
   "Resolve and validate deps.edn :jolt/build :aspects selections.
 
   A provider may name a namespace (whose `aspect-provider` var is used) or a
-  qualified provider var. Legacy :provider/:providers selections apply each
+  qualified provider var. A `{:preset resource-name}` selection expands a
+  package-owned preset into ordinary selections before validation. Legacy
+  :provider/:providers selections apply each
   provider to every manifest role. Explicit :consumers selections require a
   fail-closed :roles filter per ordered provider. Test-only `:control-v1`
   consumers additionally require explicit build opt-in. Returns nil for a plain
@@ -296,11 +339,11 @@
   (when (seq selections)
     (when-not (vector? selections)
       (fail ":jolt/build :aspects must be a vector" {:aspects selections}))
-    (let [resolved
+    (let [expanded-selections (vec (mapcat expand-selection selections))
+          resolved
           (mapv
-            (fn [{:keys [resource] :as selection}]
-              (when-not (map? selection)
-                (fail "each aspect selection must be a map" {:selection selection}))
+            (fn [{:keys [selection preset]}]
+              (let [{:keys [resource]} selection]
               (reject-unknown-keys "aspect selection" selection
                                    #{:resource :provider :providers :consumers}
                                    {:selection selection})
@@ -339,6 +382,7 @@
                            :roles (:roles provider-value)}))
                       selected-consumers)]
                 {:resource resource
+                 :preset preset
                  :manifest-bytes manifest-text
                  :providers providers
                  :library (:library manifest)
@@ -376,8 +420,8 @@
                                             (normalize-role role-value))))
                                  (range 1 (inc (count applicable)))
                                  applicable)}))))
-                      vec)}))
-            selections)
+                      vec)})))
+            expanded-selections)
           aspects (vec (mapcat :aspects resolved))
           ids (map :id aspects)]
       (when-not (= (count ids) (count (distinct ids)))
@@ -393,8 +437,9 @@
       (let [material {:weaver weaver-version
                       :allow-control-aspects (boolean allow-control-aspects?)
                       :selections
-                      (mapv (fn [{:keys [resource manifest-bytes providers]}]
+                      (mapv (fn [{:keys [resource preset manifest-bytes providers]}]
                               {:resource resource
+                               :preset preset
                                :manifest-bytes manifest-bytes
                                :providers
                                (mapv #(select-keys % [:provider-var :provider-bytes
@@ -407,6 +452,11 @@
          :weaver weaver-version
          :identity identity
          :control-enabled? (boolean allow-control-aspects?)
+         :presets (->> resolved
+                       (keep :preset)
+                       (map #(select-keys % [:id :resource]))
+                       distinct
+                       vec)
          ;; Both the mapping-var namespace and every runtime advice namespace
          ;; are explicit build roots. They need not be required by app source.
          :providers (vec (distinct
@@ -460,6 +510,7 @@
      :status :plain
      :identity "plain"
      :control-enabled? false
+     :presets []
      :providers []
      :aspects []}
     {:schema (:schema config)
@@ -467,6 +518,7 @@
      :status :instrumented
      :identity (:identity config)
      :control-enabled? (:control-enabled? config)
+     :presets (vec (:presets config))
      :providers (vec (:providers config))
      :aspects
      (mapv (fn [aspect]
@@ -574,6 +626,9 @@
        [(str "aspect build: " (name (:status plan)))
         (str "identity: " (:identity plan))
         (str "control advice: " (if (:control-enabled? plan) "enabled" "disabled"))]
+       (map (fn [{:keys [id resource]}]
+              (str "preset " id " from " resource))
+            (:presets plan))
        (when report [(str "observed report: " (or report-label "validated input"))])
        (mapcat
         (fn [aspect]

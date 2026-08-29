@@ -118,6 +118,24 @@
        (finally
          (.delete file))))))
 
+(defn resolve-preset-fixture [preset]
+  (let [manifest-file (java.io.File/createTempFile "jolt-aspect-manifest" ".edn")
+        preset-file (java.io.File/createTempFile "jolt-aspect-preset" ".edn")
+        preset-resource "test/aspect-standard-preset.edn"]
+    (try
+      (spit manifest-file (pr-str aspect-fixture-manifest))
+      (spit preset-file (pr-str preset))
+      (with-redefs [io/resource
+                    (fn [resource]
+                      (cond
+                        (= aspect-fixture-resource resource) manifest-file
+                        (= preset-resource resource) preset-file
+                        :else nil))]
+        (aspects/resolve-build-config [{:preset preset-resource}] "/tmp/unused"))
+      (finally
+        (.delete manifest-file)
+        (.delete preset-file)))))
+
 (defn entry-node []
   (assoc
     (ir/def-node
@@ -921,7 +939,49 @@
                (try
                  (resolve-aspect-fixture bad-selection)
                  nil
-                 (catch Exception e (ex-message e)))))))))
+               (catch Exception e (ex-message e)))))))))
+
+(deftest package-owned-preset-resolution
+  (let [selection {:resource aspect-fixture-resource
+                   :providers ['aspect-ir-test/filtered-complete-provider
+                               'aspect-ir-test/filtered-second-provider]}
+        preset {:schema 1
+                :id :test/standard
+                :selections [selection]}
+        direct (resolve-aspect-fixture selection)
+        configured (resolve-preset-fixture preset)
+        plan (aspects/plan-data configured)]
+    (is (= [{:id :test/standard
+             :resource "test/aspect-standard-preset.edn"}]
+           (:presets configured)))
+    (is (= (:presets configured) (:presets plan)))
+    (is (= (:aspects direct) (:aspects configured))
+        "a preset expands through the ordinary selection pipeline")
+    (is (not= (aspects/build-identity direct)
+              (aspects/build-identity configured))
+        "preset provenance participates in artifact identity")
+    (is (not (.contains (pr-str plan) ":preset-bytes"))
+        "the printable plan omits preset source bytes")
+    (is (some #(= (str "preset :test/standard from "
+                       "test/aspect-standard-preset.edn") %)
+              (aspects/explain-lines plan))))
+  (doseq [[preset expected]
+          [[{:schema 2 :id :test/bad :selections [{}]}
+            "jolt aspects: unsupported preset schema"]
+           [{:schema 1 :id 'test/bad :selections [{}]}
+            "jolt aspects: preset :id must be a keyword"]
+           [{:schema 1 :id :test/bad :selections []}
+            "jolt aspects: preset :selections must be a non-empty vector"]
+           [{:schema 1 :id :test/bad
+             :selections [{:preset "nested.edn"}]}
+            "jolt aspects: preset selection contains unsupported keys"]
+           [{:schema 1 :id :test/bad :selections [{}]}
+            "jolt aspects: preset selection needs :resource"]]]
+    (is (= expected
+           (try
+             (resolve-preset-fixture preset)
+             nil
+             (catch Exception e (ex-message e)))))))
 
 (deftest aspect-plan-is-source-free-and-explainable-before-or-after-build
   (let [selection {:resource aspect-fixture-resource
@@ -965,7 +1025,7 @@
     (is (some #(.contains % ":within \"app.core\"") observed-lines)))
   (is (= {:schema 1 :weaver "jolt.aspect-ir/v1" :status :plain
           :identity "plain" :control-enabled? false
-          :providers [] :aspects []}
+          :presets [] :providers [] :aspects []}
          (aspects/plan-data nil))))
 
 (deftest aspect-explain-rejects-stale-or-unbounded-reports

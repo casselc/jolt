@@ -397,8 +397,35 @@ qualified provider var):
    :libraries {'my/db "exact-revision"}
    :roles {:db/client 'my.otel.db/around-execute
            :db/result {:fn 'my.otel.db/around-result
-                       :contract :args-v1}}})
+           :contract :args-v1}}})
 ```
+
+Instrumentation packages can publish named, inert preset resources so an
+application does not have to copy the library-resource/provider wiring. A
+preset expands into the same ordinary selections before validation:
+
+```clojure
+;; deps.edn
+{:jolt/build
+ {:aspects
+  [{:preset
+    "META-INF/jolt/instrumentation/http-server/basic.edn"}]}}
+
+;; package resource
+{:schema 1
+ :id :otel/http-server/basic
+ :selections
+ [{:resource "META-INF/jolt/aspects/http-server.edn"
+   :provider
+   otel.instrumentation.http-server/basic-aspect-provider}]}
+```
+
+Preset resources may contain multiple selections but cannot recursively select
+other presets. Their identity and resource name contribute to the artifact
+identity and appear in `jolt aspects plan`; their source bytes do not. The
+instrumented library still owns its provider-neutral join-point manifest, while
+the instrumentation package owns the provider and any basic/detailed/debug
+policy variants.
 
 Use ordered `:providers` when independent consumers need the same semantic
 join points—for example, OpenTelemetry plus a bounded event journal:
