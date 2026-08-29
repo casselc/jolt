@@ -80,7 +80,12 @@ misbehavior, not a crash.
   non-moving collector (never just one). `sa-foreign-procedure-runtime`
   constructs an FP from a runtime signature — Chez needs eval for this; a
   target with native runtime construction (Guile `pointer->procedure`) does
-  it directly.
+  it directly. `sa-foreign-procedure-native-error-runtime` is the same
+  runtime-signature construction with atomic errno/GetLastError capture; it
+  must return both values from the call boundary and must not read the error
+  slot in a later host operation. The requested convention follows the native
+  API contract, not the operating system: Windows CRT `_open`/`_mkdir` use
+  `__errno`, while Win32 APIs such as `CreateFile` use `__get_last_error`.
 - **native-compile**: `sa-compile-file` takes a target-neutral profile
   ((optimize . 0..3) (inspector-info . bool) (source-info . bool)
   (compressed . bool)); map what you have, ignore the rest. On raise, the AOT

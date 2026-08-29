@@ -321,8 +321,10 @@
 (define nio-temp-counter 0)
 (define nio-temp-mutex (make-mutex))
 (define (nio-tmp-dir) (or (getenv "TMPDIR") "/tmp"))
-;; A temp path in `dir` (default the system temp dir), unique across processes
-;; via now-millis + a retry counter, like java.nio.file's createTemp*.
+;; A temp path candidate in `dir` (default the system temp dir).  The timestamp
+;; plus process-local counter makes collisions unlikely, but it cannot prove
+;; uniqueness across processes: creation is the authority and createTempDirectory
+;; retries when mkdir(2) reports that another creator won the candidate.
 (define (nio-temp-path dir prefix suffix)
   (let ((d (let ((d (or dir (nio-tmp-dir))))
              (if (char=? (string-ref d (- (string-length d) 1)) #\/) d (string-append d "/")))))
@@ -373,19 +375,30 @@
          (attrs (cond (dir? (if (pair? rest) (cdr rest) '()))
                       ((and (pair? rest) (pair? (cdr rest))) (cddr rest))
                       (else '())))
-         (full (nio-temp-path base prefix suffix))
-         (fp (project-relative full))
          (mode (nio-create-mode attrs (if dir? #o700 #o600))))
-    ;; TempFileHelper supplies owner-only permissions on POSIX when callers do
-    ;; not provide posix:permissions.  For directories, pass the selected mode
-    ;; to mkdir(2): both the default 0700 and an explicit FileAttribute must be
-    ;; true at the instant the name becomes visible, never repaired by chmod.
-    (if dir?
-        (nio-mkdir-atomic! fp mode)
-        (begin
-          (close-port (open-file-output-port fp (file-options no-fail)))
-          (nio-apply-mode-umask! fp mode)))
-    (make-nio-path full)))
+    (let retry ()
+      (let* ((full (nio-temp-path base prefix suffix))
+             (fp (project-relative full)))
+        ;; TempFileHelper supplies owner-only permissions on POSIX when callers
+        ;; do not provide posix:permissions.  For directories, pass the selected
+        ;; mode to mkdir(2): both the default 0700 and an explicit FileAttribute
+        ;; must be true at the instant the name becomes visible, never repaired
+        ;; by chmod.  A pre-create existence check is insufficient across
+        ;; processes; retry only when the failed candidate now exists, and
+        ;; preserve every other mkdir failure.
+        (if dir?
+            (let-values (((result native-error)
+                          (nio-mkdir-native-result fp mode)))
+              (cond ((= result 0) (make-nio-path full))
+                    ((nio-native-exists-error? native-error) (retry))
+                    (else (nio-raise-create-error fp native-error))))
+            (let-values (((fd native-error)
+                          (nio-open-native-result fp mode)))
+              (cond ((>= fd 0)
+                     (nio-close-created-file fd)
+                     (make-nio-path full))
+                    ((nio-native-exists-error? native-error) (retry))
+                    (else (nio-raise-create-error fp native-error)))))))))
 
 ;; ---- walkFileTree + FileVisitor ---------------------------------------------
 ;; FileVisitResult values — distinct tokens; babashka.fs maps :continue etc. to
@@ -626,7 +639,10 @@
 (define c-link     (jolt-foreign-proc-safe "link"     '(string string) 'int))
 (define c-readlink (jolt-foreign-proc-safe "readlink" '(string u8* unsigned-long) 'long))
 (define c-chmod    (jolt-foreign-proc-safe "chmod"    '(string int) 'int))
-(define c-mkdir    (jolt-foreign-proc-safe "mkdir"    '(string int) 'int))
+(define nio-c-mkdir
+  (if (eq? (sa-os-family) 'windows)
+      (jolt-foreign-proc-native-error-safe __errno "_mkdir" '(string) 'int)
+      (jolt-foreign-proc-native-error-safe __errno "mkdir" '(string int) 'int)))
 (define (nio-is-symlink? fp)
   (and c-readlink (> (c-readlink fp (make-bytevector 1 0) 1) 0)))   ; readlink succeeds only on a link
 (define (nio-readlink fp)
@@ -807,20 +823,83 @@
                    (throw-jvm (quote UnsupportedOperationException)
                               "unsupported initial file attribute")))
              default-mode (npath-spread-args attrs)))
+(define (nio-native-exists-error-for-convention? convention code)
+  (if (eq? convention '__get_last_error)
+      (or (= code 80) (= code 183)) ; ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+      (= code 17)))                 ; EEXIST from POSIX and Windows CRT errno
+(define (nio-native-exists-error? code)
+  ;; mkdir/open on POSIX and _mkdir/_open on Windows are libc/CRT APIs.  Their
+  ;; contract is errno even on Windows; Win32 error codes apply only to Win32
+  ;; CreateFile/CreateDirectory bindings.
+  (nio-native-exists-error-for-convention? '__errno code))
+(define (nio-raise-create-error fp native-error)
+  (if (nio-native-exists-error? native-error)
+      (throw-jvm (quote FileAlreadyExistsException) fp)
+      (jolt-throw
+        (jolt-ex-info
+          (string-append "unable to create " fp
+                         " (native error " (number->string native-error) ")")
+          empty-pmap))))
+(define (nio-mkdir-native-result fp mode)
+  (unless nio-c-mkdir
+    (throw-jvm (quote UnsupportedOperationException)
+               "atomic directory creation with native-error capture is unavailable"))
+  (if (eq? (sa-os-family) 'windows)
+      (nio-c-mkdir fp)
+      (nio-c-mkdir fp mode)))
 (define (nio-mkdir-atomic! fp mode)
-  (if c-mkdir
-      (unless (= (c-mkdir fp mode) 0)
-        (jolt-throw (jolt-ex-info fp empty-pmap)))
-      ;; Non-POSIX fallback: there is no creation-time mode facility.  Preserve
-      ;; directory creation, but reject permissions we cannot promise atomically.
-      (if (= mode #o777)
-          (mkdir fp)
-          (throw-jvm (quote UnsupportedOperationException)
-                     "atomic POSIX directory permissions are unavailable"))))
+  (let-values (((result native-error) (nio-mkdir-native-result fp mode)))
+    (unless (= result 0) (nio-raise-create-error fp native-error))))
 
-;; File creation still uses the existing port primitive; keep its post-create
-;; permission application isolated here until that primitive grows O_EXCL mode
-;; support.  Directory paths must not call this helper.
+;; open(2) is the file analogue of the mkdir(2) helper above: O_CREAT|O_EXCL
+;; makes name ownership one atomic operation and the mode is applied at the
+;; instant the name becomes visible.  Chez's `(file-options no-fail)` is not an
+;; exclusive-create primitive: it opens an existing file and truncates it.
+;;
+;; This is an OS-backed Files implementation detail, not a general FFI lifetime
+;; abstraction.  Keep it here until the adapter grows a portable exclusive-file
+;; primitive; callers must never reconstruct these platform flag values.
+(define nio-c-open
+  (if (eq? (sa-os-family) 'windows)
+      (jolt-foreign-proc-native-error-safe __errno "_open" '(string int int) 'int)
+      (jolt-foreign-proc-native-error-safe
+        __errno ((__varargs_after 2)) "open" '(string int int) 'int)))
+(define nio-c-close
+  (if (eq? (sa-os-family) 'windows)
+      (jolt-foreign-proc-safe "_close" '(int) 'int)
+      (jolt-foreign-proc-safe "close" '(int) 'int)))
+(define (nio-open-exclusive-flags-for-family family)
+  (case family
+    ((macos) (bitwise-ior #x1 #x200 #x800))       ; O_WRONLY|O_CREAT|O_EXCL
+    ((windows) (bitwise-ior #x1 #x100 #x400 #x8000)) ; plus _O_BINARY
+    (else (bitwise-ior #x1 #x40 #x80))))
+(define nio-open-exclusive-flags
+  (nio-open-exclusive-flags-for-family (sa-os-family)))
+(define (nio-native-create-mode mode)
+  (if (eq? (sa-os-family) 'windows)
+      (bitwise-ior (if (> (bitwise-and mode #o444) 0) #x100 0) ; _S_IREAD
+                   (if (> (bitwise-and mode #o222) 0) #x80 0)) ; _S_IWRITE
+      mode))
+(define (nio-open-native-result fp mode)
+  (unless (and nio-c-open nio-c-close)
+    (throw-jvm (quote UnsupportedOperationException)
+               "atomic exclusive file creation with native-error capture is unavailable"))
+  (nio-c-open fp nio-open-exclusive-flags (nio-native-create-mode mode)))
+(define (nio-close-created-file fd)
+  ;; O_EXCL has already established ownership and this descriptor has no
+  ;; buffered writes.  A close error cannot turn the operation into a collision,
+  ;; and retrying close after EINTR is unsafe on targets that already released
+  ;; and reused the descriptor.  Match Files' create-only contract: close once,
+  ;; ignore its advisory result, and never reclassify the successful creation.
+  (nio-c-close fd))
+(define (nio-create-file-atomic! fp mode)
+  (let-values (((fd native-error) (nio-open-native-result fp mode)))
+    (if (>= fd 0)
+        (nio-close-created-file fd)
+        (nio-raise-create-error fp native-error))))
+
+;; Retained for copy/move paths that preserve an existing source mode after
+;; their destination has been created by a different primitive.
 (define c-umask (jolt-foreign-proc-safe "umask" '(int) 'int))
 (define (nio-current-umask) (if c-umask (let ((old (c-umask 0))) (c-umask old) old) 0))
 (define (nio-apply-mode-umask! fp mode)
@@ -842,9 +921,8 @@
                                   (nio-mkdir-atomic! (nfp p) (nio-create-mode attrs #o777))
                                   (->path p)))
         (cons "createFile" (lambda (p . attrs)
-                             (let ((mode (nio-create-mode attrs #f)))
-                               (close-port (open-file-output-port (nfp p) (file-options no-fail)))
-                               (nio-apply-mode-umask! (nfp p) mode)
+                             (let ((mode (nio-create-mode attrs #o666)))
+                               (nio-create-file-atomic! (nfp p) mode)
                                (->path p))))
         (cons "createDirectories" (lambda (p . attrs)
                                     (let ((missing (nio-missing-ancestors (nfp p))))

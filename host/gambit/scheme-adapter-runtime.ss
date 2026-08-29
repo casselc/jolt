@@ -246,6 +246,9 @@
 (define (sa-foreign-procedure-runtime name args res blocking?)
   (sa-ffi-raise 'sa-foreign-procedure-runtime))
 
+(define (sa-foreign-procedure-native-error-runtime error-convention name args res)
+  (sa-ffi-raise 'sa-foreign-procedure-native-error-runtime))
+
 ;; (sa-foreign-alloc n) -> pointer
 ;; Allocate N raw bytes of foreign memory. Contract: malloc-style foreign
 ;; allocation. Degradation: raise — jolt.ffi surfaces that as a clean
