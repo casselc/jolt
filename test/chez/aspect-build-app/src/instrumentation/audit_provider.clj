@@ -1,4 +1,5 @@
-(ns instrumentation.audit-provider)
+(ns instrumentation.audit-provider
+  (:require [instrumentation.provider :as provider]))
 
 (def aspect-provider
   {:schema 1
@@ -12,6 +13,7 @@
             :contract :replace-args-v1}}})
 
 (defn around [join-point evaluated-args proceed]
+  (provider/assert-runtime-site! join-point)
   (println (str "audit-before " (:id join-point)))
   (println (str "audit-args " (pr-str evaluated-args)))
   (let [original (first evaluated-args)
@@ -22,6 +24,7 @@
     :ignored-audit-result))
 
 (defn entry-around [join-point evaluated-args proceed]
+  (provider/assert-runtime-site! join-point)
   (println (str "entry-audit-before " (:id join-point)))
   (println (str "entry-audit-args " (pr-str evaluated-args)))
   (let [value (proceed)]
@@ -29,6 +32,7 @@
     :ignored-audit-result))
 
 (defn numeric-entry-around [join-point evaluated-args proceed]
+  (provider/assert-runtime-site! join-point)
   (println (str "numeric-audit-before " (:id join-point)))
   (println (str "numeric-audit-args " (pr-str evaluated-args)))
   (let [value (proceed [(inc (first evaluated-args))])]
