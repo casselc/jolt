@@ -413,7 +413,7 @@ preset expands into the same ordinary selections before validation:
 
 ;; package resource
 {:schema 1
- :id :otel/http-server/basic
+ :id :otel.http-server/basic
  :selections
  [{:resource "META-INF/jolt/aspects/http-server.edn"
    :provider
