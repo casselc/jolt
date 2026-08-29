@@ -64,6 +64,9 @@
           exh (mutable alt-takers) (mutable alt-putters))
   (nongenerative async-chan-v3))
 
+(define (ac-unblocking? ch)
+  (and (memq (async-chan-kind ch) '(dropping sliding promise)) #t))
+
 (define (ac-qnew) (vector '() '() 0))
 (define (ac-qlen ch) (vector-ref (async-chan-items ch) 2))
 (define (ac-qempty? ch) (fx=? 0 (vector-ref (async-chan-items ch) 2)))
@@ -94,6 +97,7 @@
     ((dropping) (when (< (ac-qlen ch) (async-chan-cap ch)) (ac-qpush! ch (cons v #f))))
     ((sliding)  (when (>= (ac-qlen ch) (async-chan-cap ch)) (ac-qdrop-oldest! ch))
                 (ac-qpush! ch (cons v #f)))
+    ((promise)  (when (ac-qempty? ch) (ac-qpush! ch (cons v #f))))
     (else       (ac-qpush! ch (cons v #f))))      ; fixed: caller ensured room
   (ac-notify! ch))
 
@@ -147,7 +151,13 @@
             (let ((h (car (async-chan-alt-takers ch))))
               (async-chan-alt-takers-set! ch (cdr (async-chan-alt-takers ch)))
               (if (alt-claim! h)
-                  (begin (alt-deliver! h (ac-take-head! ch) ch) (set! progress #t))
+                  (begin
+                    (alt-deliver! h
+                                  (if (eq? (async-chan-kind ch) 'promise)
+                                      (ac-peek ch)
+                                      (ac-take-head! ch))
+                                  ch)
+                    (set! progress #t))
                   (set! progress #t)) ; dead registration — dropped
               (drain-takers)))))
       ;; Step 2: drain alt-putters → capacity
@@ -159,7 +169,7 @@
               ;; can accept right now?
               ((case (async-chan-kind ch)
                  ((dropping sliding) #t)
-                 ((promise) (and (ac-qempty? ch) #t))
+                 ((promise) #t)
                  (else
                   (if (> (async-chan-cap ch) 0)
                       (< (ac-qlen ch) (async-chan-cap ch))
@@ -242,7 +252,9 @@
                       (let ((else (jolt-invoke exh (jolt-unwrap-throw e))))
                         (unless (jolt-nil? else) (ac-buf-give! ch else))
                         (async-chan-xrf ch))   ; treat as non-reduced
-                      (raise e))))
+                      (begin
+                        (async-report-uncaught! "core.async transducer" e)
+                        (async-chan-xrf ch)))))
       (apply jolt-invoke xrf ch v))))
 
 (define (ac-make cap kind xrf) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f xrf 0 #f '() '()))
@@ -253,14 +265,21 @@
   (let ((buf (if (pair? args) (car args) jolt-nil))
         (xform (if (and (pair? args) (pair? (cdr args))) (cadr args) jolt-nil))
         (exh (if (and (pair? args) (pair? (cdr args)) (pair? (cddr args))) (caddr args) jolt-nil)))
+    (when (and (jolt-truthy? xform) (not (jolt-truthy? buf)))
+      (jolt-throw
+       (host-new "AssertionError"
+                 "Assert failed: buffer must be supplied when transducer is")))
     (let-values (((cap kind)
                   (cond ((async-buffer? buf) (values (async-buffer-n buf) (async-buffer-kind buf)))
                         ((and (number? buf) (> buf 0)) (values buf 'fixed))
                         (else (values 0 'unbuffered)))))
-      (let ((ch (ac-make/exh cap kind (if (jolt-nil? exh) #f exh))))
-        (unless (jolt-nil? xform)
+      (let ((ch (ac-make/exh cap kind (if (jolt-truthy? exh) exh #f))))
+        (when (jolt-truthy? xform)
           (async-chan-xrf-set! ch (jolt-invoke xform (ac-make-add-rf ch))))
         ch))))
+
+(define (jolt-async-promise-chan . args)
+  (apply jolt-async-chan (cons (make-async-buffer 1 'promise) args)))
 
 ;; close! (idempotent): mark closed, flush a stateful transducer's completion,
 ;; notify pending alt handlers, and wake everyone. ac-close! assumes the lock is
@@ -292,7 +311,7 @@
     (cond
       ((async-chan-closed? ch) #f)
       ((async-chan-xrf ch)
-       (if (> (async-chan-cap ch) 0)
+       (if (not (ac-unblocking? ch))
            ;; Fixed buffered with xform: wait for room, then apply xform.
            ;; The xform step may overfill transiently (e.g. mapcat); the NEXT put
            ;; will wait again.
@@ -411,7 +430,8 @@
   (async-check-put! v)
   (cond
     ((async-chan-closed? ch) 'closed)
-    ((async-chan-xrf ch) (if (and (> (async-chan-cap ch) 0)
+    ((async-chan-xrf ch) (if (and (not (ac-unblocking? ch))
+                                  (> (async-chan-cap ch) 0)
                             (>= (ac-qlen ch) (async-chan-cap ch)))
                        'full
                        (let ((r (ac-xrf-apply ch v)))
@@ -812,12 +832,28 @@
 ;; --- alts! entry point -------------------------------------------------------
 ;; (__do-alts ports priority?) — ports is a jolt vector of channels or [ch val]
 ;; put specs. Returns a jolt vector [val port]. priority? is a boolean: #t
-;; starts scanning at index 0 (declared order); #f picks a random start.
+;; scans in declared order; #f uses a fresh Fisher-Yates permutation.
 ;; LOCK ORDER: channel mu → fmu → wmu. Never hold two channel mutexes at once.
+(define (alts-index-order n priority?)
+  (let ((order (make-vector n)))
+    (let fill ((i 0))
+      (when (fx<? i n)
+        (vector-set! order i i)
+        (fill (fx+ i 1))))
+    (unless (jolt-truthy? priority?)
+      (let shuffle ((i (fx- n 1)))
+        (when (fx>? i 0)
+          (let* ((j (jolt-random (fx+ i 1)))
+                 (at-i (vector-ref order i)))
+            (vector-set! order i (vector-ref order j))
+            (vector-set! order j at-i)
+            (shuffle (fx- i 1))))))
+    order))
+
 (define (jolt-async-do-alts ports priority?)
   (let* ((n (pvec-count ports))
-         (start (if (jolt-truthy? priority?) 0 (jolt-random n)))
-         (idx-of (lambda (k) (let ((m (fx+ start k))) (if (fx<? m n) m (fx- m n))))))
+         (order (alts-index-order n priority?))
+         (idx-of (lambda (k) (vector-ref order k))))
     ;; FAST PASS: one non-blocking attempt per op, no handler. Consumption here IS
     ;; the alts result, so consuming directly is correct on this pass only.
     (let fast-loop ((k 0))
@@ -902,7 +938,6 @@
                                   (jolt-with-mutex (async-chan-mu ch)
                                     (let ((ready?
                                            (or (async-chan-closed? ch)
-                                               (async-chan-xrf ch)
                                                (memq (async-chan-kind ch) '(dropping sliding promise))
                                                (and (> (async-chan-cap ch) 0)
                                                     (< (ac-qlen ch) (async-chan-cap ch)))
@@ -971,7 +1006,7 @@
 ;; --- install clojure.core.async ---------------------------------------------
 (define (cca-def! name v) (def-var! "clojure.core.async" name v))
 (cca-def! "chan" jolt-async-chan)
-(cca-def! "promise-chan" (lambda args (ac-make 1 'promise #f)))
+(cca-def! "promise-chan" jolt-async-promise-chan)
 (cca-def! "chan?" async-chan?)
 (cca-def! "buffer" jolt-async-buffer)
 (cca-def! "dropping-buffer" jolt-async-dropping-buffer)

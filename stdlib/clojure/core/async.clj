@@ -452,11 +452,13 @@
   (let [ports (vec ports)
         has-default (contains? opts :default)]
     ;; one fast non-blocking scan for :default support
-    (let [start (if (:priority opts) 0 (rand-int (count ports)))
-          n (count ports)
+    (let [n (count ports)
+          order (if (:priority opts)
+                  (vec (range n))
+                  (shuffle (range n)))
           hit (loop [k 0]
                 (when (< k n)
-                  (let [j (+ start k) i (if (< j n) j (- j n))]
+                  (let [i (nth order k)]
                     (or (alt-attempt (nth ports i))
                         (recur (inc k))))))]
       (if hit

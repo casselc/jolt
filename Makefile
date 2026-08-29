@@ -269,6 +269,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-lock-test.ss
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
+	@$(CHEZ) --script test/chez/async-alts-order-test.ss
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own
 # deadline however far away the pending ones are, and the thread is forked once.
