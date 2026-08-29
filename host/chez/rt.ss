@@ -177,6 +177,45 @@
            (sa-foreign-procedure-native-error
             __errno (conv ...) name args res))))))
 
+;; Optional process symbol + atomic native-error capture.  This composes the
+;; fail-closed lookup policy of jolt-foreign-proc-safe with call-boundary error
+;; capture.  Unlike jolt-ffi-native-error-procedure's public OS-default policy,
+;; ERROR-CONVENTION is explicit: a Windows CRT routine reports errno, while a
+;; Win32 API reports GetLastError.  On Windows the runtime constructor keeps an
+;; absent optional symbol out of fasl relocations.
+(define-syntax jolt-foreign-proc-native-error-safe
+  (lambda (x)
+    (syntax-case x (quote)
+      ((_ error-convention name (quote args) (quote res))
+       (with-syntax
+           ((win #'(guard (e (#t #f))
+                    (sa-load-shared-object #f)
+                    (and (sa-foreign-entry? name)
+                         (sa-foreign-procedure-native-error-runtime
+                           'error-convention name (quote args) (quote res)))))
+            (unx #'(guard (e (#t #f))
+                    (sa-load-shared-object #f)
+                    (and (sa-foreign-entry? name)
+                         (sa-foreign-procedure-native-error
+                           error-convention () name args res)))))
+         #'(if (eq? (sa-os-family) 'windows) win unx)))
+      ;; Variadic native call (open(2)'s optional mode argument).  Windows x64
+      ;; uses one ABI for named and variadic arguments, so its runtime builder
+      ;; drops the convention just like jolt-foreign-proc-safe does.
+      ((_ error-convention conv name (quote args) (quote res))
+       (with-syntax
+           ((win #'(guard (e (#t #f))
+                    (sa-load-shared-object #f)
+                    (and (sa-foreign-entry? name)
+                         (sa-foreign-procedure-native-error-runtime
+                           'error-convention name (quote args) (quote res)))))
+            (unx #'(guard (e (#t #f))
+                    (sa-load-shared-object #f)
+                    (and (sa-foreign-entry? name)
+                         (sa-foreign-procedure-native-error
+                           error-convention conv name args res)))))
+         #'(if (eq? (sa-os-family) 'windows) win unx))))))
+
 ;; --- how many processors can this process use ---------------------------------
 ;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
 ;; pmap's look-ahead window read. Each host is asked the question the JVM asks

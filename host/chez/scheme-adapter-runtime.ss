@@ -325,6 +325,16 @@
             `(foreign-procedure __collect_safe ,name ,args ,res)
             `(foreign-procedure ,name ,args ,res))))
 
+;; (sa-foreign-procedure-native-error-runtime error-convention name args res)
+;; -> foreign procedure
+;; Runtime-signature analogue for an atomically captured native error slot.
+;; Windows uses this after proving the symbol exists so an optional entry never
+;; becomes a load-time fasl relocation.  `error-convention` is the literal Chez
+;; convention required by the API: Windows CRT calls use __errno even though
+;; direct Win32 APIs use __get_last_error.
+(define (sa-foreign-procedure-native-error-runtime error-convention name args res)
+  (eval `(foreign-procedure ,error-convention ,name ,args ,res)))
+
 ;; (sa-foreign-alloc n) -> pointer
 ;; Allocate N raw bytes of foreign memory; the caller owns them and must release
 ;; them with sa-foreign-free. Contract: malloc-style foreign allocation.
