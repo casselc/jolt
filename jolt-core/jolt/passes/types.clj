@@ -128,6 +128,7 @@
    ;; selected descriptors and match evidence here prevents an in-process build
    ;; from leaking aspects into a later plain build.
    :aspects (atom [])
+   :aspect-build-identity (atom "plain")
    :aspect-matches (atom {})})
 
 ;; build a per-run env: a snapshot of the installed config plus this run's flags and

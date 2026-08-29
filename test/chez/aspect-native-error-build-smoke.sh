@@ -44,6 +44,7 @@ grep -q ':id :test/native-error-call' "$tmp/app/target/native-error-aspects.edn"
 grep -q ':contract :args-v1' "$tmp/app/target/native-error-aspects.edn"
 grep -q ':call app.native-error/block-fail' "$tmp/app/target/native-error-aspects.edn"
 grep -q ':ordinal 1' "$tmp/app/target/native-error-aspects.edn"
+grep -q ':site-id "v1-' "$tmp/app/target/native-error-aspects.edn"
 
 # Compose two independent consumers around the captured native result. Both
 # must observe the same exact [result native-error] vector, in provider order,
