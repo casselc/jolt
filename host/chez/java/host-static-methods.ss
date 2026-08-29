@@ -832,15 +832,18 @@
 ;; Written at RUN time (System/setProperty) from whatever thread calls it, so the
 ;; mutations and the whole-table scan take a mutex; the single-key read on the
 ;; getProperty path stays unlocked (strong general table — see rt.ss's var-table
-;; note). read-then-write is one step so the returned previous value is the one
-;; this call actually replaced.
+;; note). Value rendering can invoke arbitrary user code (a deftype's toString),
+;; so normalize it before entering the counted lock. The read-then-write remains
+;; one locked step, so the returned previous value is the one this call actually
+;; replaced even when another setter runs while normalization is in flight.
 (define sys-prop-mu (make-mutex))
 (define sys-prop-table (make-hashtable string-hash string=?))
 (define (sys-set-property k v)
-  (jolt-with-mutex sys-prop-mu
-    (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
-      (hashtable-set! sys-prop-table k (if (string? v) v (jolt-str-render-one v)))
-      prev)))
+  (let ((normalized (if (string? v) v (jolt-str-render-one v))))
+    (jolt-with-mutex sys-prop-mu
+      (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
+        (hashtable-set! sys-prop-table k normalized)
+        prev))))
 (define (sys-clear-property k)
   (jolt-with-mutex sys-prop-mu
     (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))

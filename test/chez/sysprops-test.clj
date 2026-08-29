@@ -5,7 +5,9 @@
 ;; unknown keys answer nil exactly as the JVM's do.
 ;; Run: bin/jolt run test/chez/sysprops-test.clj (smoke.sh greps for
 ;; "SYSPROPS-TEST OK").
-(ns sysprops-test)
+(ns sysprops-test
+  (:require [jolt.fibers :as fib]
+            [jolt.scheme :as scheme]))
 
 (def failures (atom []))
 
@@ -53,6 +55,68 @@
 (check-eq "an unknown key takes the default"
           (System/getProperty "no.such.property" "fallback")
           "fallback")
+
+;; A non-string value is normalized through its toString method. That is
+;; arbitrary user code and may park a fiber, so it must run before sys-prop-mu's
+;; counted critical section. The barriers make the race deterministic:
+;;
+;;   1. the slow setter enters toString and parks on release;
+;;   2. a thread replaces "initial" with "racer" while rendering is suspended;
+;;   3. the slow setter resumes, atomically replaces "racer", and returns it.
+;;
+;; Restoring rendering beneath sys-prop-mu has several independent teeth: the
+;; renderer observes one counted lock, its promise deref is rejected instead of
+;; parking, and the previous-value chain/final value differ. The body catches that
+;; failure so the negative mutation terminates instead of wedging the test.
+(deftype ParkingPropertyValue [entered release locks-seen calls]
+  Object
+  (toString [_]
+    (swap! calls inc)
+    (deliver entered true)
+    (swap! locks-seen conj (scheme/call "jolt-locks-held"))
+    @release
+    "slow-rendered"))
+
+(let [key "jolt.sysprops.render-lock-test"
+      _ (System/clearProperty key)
+      _ (System/setProperty key "initial")
+      entered (promise)
+      release (promise)
+      locks-seen (atom [])
+      calls (atom 0)
+      value (ParkingPropertyValue. entered release locks-seen calls)
+      slow (fib/spawn
+             (fn []
+               (try
+                 {:prev (System/setProperty key value)}
+                 (catch Throwable e
+                   {:error [(.getName (class e)) (ex-message e)]}))))
+      entered-result (deref entered 2000 ::not-entered)
+      state-before-race
+      (loop [n 100000]
+        (let [s (fib/state slow)]
+          (if (or (= s :parked) (not (pos? n)))
+            s
+            (do (Thread/yield) (recur (dec n))))))
+      racer-started (promise)
+      racer-done (promise)
+      _ (future
+          (deliver racer-started true)
+          (deliver racer-done (System/setProperty key "racer")))
+      racer-started-result (deref racer-started 2000 ::not-started)
+      racer-before-release (deref racer-done 2000 ::blocked)
+      _ (deliver release true)
+      slow-result (fib/join slow 2000 ::timed-out)
+      racer-result (if (= ::blocked racer-before-release)
+                     (deref racer-done 2000 ::timed-out)
+                     racer-before-release)
+      final-value (System/getProperty key)]
+  (check-eq "setProperty renders user values outside its counted lock and preserves atomic replacement"
+            [entered-result state-before-race @locks-seen @calls racer-started-result
+             racer-before-release racer-result slow-result final-value]
+            [true :parked [0] 1 true "initial" "initial"
+             {:prev "racer"} "slow-rendered"])
+  (System/clearProperty key))
 
 (if (empty? @failures)
   (println "SYSPROPS-TEST OK")
