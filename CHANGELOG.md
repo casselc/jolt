@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preservation of application results and exceptions. Provider order is part
   of the deterministic build identity and match report. The report publishes
   only after the output artifact succeeds, and builds without an aspect
-  selection remain unchanged.
+  selection remain unchanged. Runtime join points include a deterministic,
+  build-scoped site identity and the corresponding report-compatible site
+  descriptor so independent consumers can correlate the same woven operation.
 
 ## [0.8.0] - 2026-08-31
 

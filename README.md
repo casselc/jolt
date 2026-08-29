@@ -452,6 +452,16 @@ consumer for schema-v1 report readers. Provider order and the source bytes of
 every provider contribute to the artifact identity, as do explicit role
 filters.
 
+At runtime every consumer receives the same physical-site provenance in its
+join-point map: `:site` is the exact site record published in the build report,
+`:site-id` is its deterministic compact identity, and `:build-identity` names the exact
+selected manifest/provider configuration. A site ID reproduces for the same
+build identity and site descriptor; changing the selected instrumentation
+configuration deliberately moves both identities. Checkout-absolute paths are
+excluded. Providers and offline tools can therefore correlate independent
+consumers at one site without reimplementing compiler-private hashing, and
+reject histories recorded by a different woven artifact.
+
 An advice function receives `[join-point proceed]`. Jolt preserves argument
 evaluation order, the operation's result, application exception identity, and
 exactly-once execution. Advice that throws, omits `proceed`, invokes it twice,

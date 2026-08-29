@@ -159,6 +159,7 @@
         body (:init woven)
         bindings (:bindings body)
         helper (:body body)
+        join-point (get-in helper [:args 1 :form])
         thunk (nth (:args helper) 2)
         original (get-in thunk [:arities 0 :body])]
     (is (:aspect-woven woven))
@@ -169,6 +170,10 @@
     (is (= ["aspect_arg__1" "aspect_arg__2"] (mapv :name (:args original))))
     (is (= "clojure.core" (get-in helper [:fn :ns])))
     (is (= "__invoke-instrumentation-around" (get-in helper [:fn :name])))
+    (is (= "plain" (:build-identity join-point)))
+    (is (string? (:site-id join-point)))
+    (is (= (get-in @(:aspect-matches unit) [:test/call 0])
+           (:site join-point)))
     (is (= {:line 12 :column 7}
            (get-in @(:aspect-matches unit) [:test/call 0 :position])))
     (is (empty? (ir/tree-problems woven)))
@@ -231,7 +236,8 @@
         middle-operation (nth (:args middle) 3)
         inner (get-in middle-operation [:arities 0 :body])
         inner-operation (nth (:args inner) 3)
-        target (get-in inner-operation [:arities 0 :body])]
+        target (get-in inner-operation [:arities 0 :body])
+        join-points (mapv #(get-in % [:args 1 :form]) [outer middle inner])]
     (is (= ["left" "right"]
            (mapv #(get-in % [1 :fn :name]) (:bindings body)))
         "application arguments are evaluated once outside the whole chain")
@@ -249,6 +255,9 @@
     (is (= [] (get-in middle-operation [:arities 0 :params])))
     (is (= "provider.inner" (get-in inner [:args 0 :ns])))
     (is (= 3 (get-in inner [:args 1 :form :ordinal])))
+    (is (apply = (map :site-id join-points))
+        "all consumers share one logical runtime site identity")
+    (is (apply = (map :site join-points)))
     (is (= ["aspect_arg__3" "aspect_arg__4"]
            (mapv :name (get-in inner [:args 2 :items])))
         "non-replacing advice passes the current arguments downstream")
@@ -265,6 +274,7 @@
         woven (aspects/weave unit (entry-node))
         arity (get-in woven [:init :arities 0])
         helper (:body arity)
+        join-point (get-in helper [:args 1 :form])
         evaluated-args (nth (:args helper) 2)
         operation (nth (:args helper) 3)
         operation-arity (get-in operation [:arities 0])
@@ -272,6 +282,10 @@
     (is (= ["x"] (:params arity)) "the public function signature is unchanged")
     (is (= "__invoke-instrumentation-around" (get-in helper [:fn :name])))
     (is (= :args-v1 (get-in helper [:args 1 :form :contract])))
+    (is (= "plain" (:build-identity join-point)))
+    (is (string? (:site-id join-point)))
+    (is (= (get-in @(:aspect-matches unit) [:test/entry 0])
+           (:site join-point)))
     (is (= ["x"] (mapv :name (:items evaluated-args))))
     (is (= [] (:params operation-arity)))
     (is (= :loop (:op loop-node)))
@@ -285,6 +299,28 @@
     (is (= "app.core"
            (get-in @(:aspect-matches unit) [:test/entry 0 :within])))
     (is (empty? (ir/tree-problems woven)))))
+
+(deftest runtime-site-identity-is-reproducible-and-build-scoped
+  (let [site-id (fn [identity]
+                  (let [unit (types/new-unit)
+                        configured (assoc config :identity identity)]
+                    (aspects/configure-unit! unit configured)
+                    (-> (aspects/weave unit
+                                       (ir/def-node "app.core" "run" (invoke-node)))
+                        :init :body :args second :form :site-id)))
+        first-id (site-id "build-a")]
+    (is (= first-id (site-id "build-a"))
+        "the same selected build and report-compatible site reproduce exactly")
+    (is (not= first-id (site-id "build-b"))
+        "the build selection identity scopes replay selectors")))
+
+(deftest configure-unit-resets-runtime-site-provenance
+  (let [unit (types/new-unit)]
+    (aspects/configure-unit! unit {:identity "woven-a" :aspects []})
+    (is (= "woven-a" @(:aspect-build-identity unit)))
+    (aspects/configure-unit! unit nil)
+    (is (= "plain" @(:aspect-build-identity unit))
+        "a later plain in-process build cannot inherit woven provenance")))
 
 (deftest replace-args-function-entry-weaving
   (let [unit (types/new-unit)
@@ -819,9 +855,12 @@
                           :schema 1 :weaver "test/v1"
                           :identity "multi-consumer" :report "/tmp/unused")]
     (aspects/configure-unit! unit configured)
-    (aspects/weave unit (ir/def-node "app.core" "run" (invoke-node)))
-    (let [report (aspects/prepare-build-report! unit configured)
-          aspect (get-in report [:aspects 0])]
+    (let [woven (aspects/weave unit
+                               (ir/def-node "app.core" "run" (invoke-node)))
+          runtime-join-point (get-in woven [:init :body :args 1 :form])
+          report (aspects/prepare-build-report! unit configured)
+          aspect (get-in report [:aspects 0])
+          report-site (get-in aspect [:sites 0])]
       (is (= 1 (count (:aspects report))))
       (is (= [1 2 3] (mapv :ordinal (:consumers aspect))))
       (is (= ['provider.outer/aspect-provider 'provider.middle/aspect-provider
@@ -829,7 +868,10 @@
              (mapv :provider (:consumers aspect))))
       (is (= 'provider.outer/around (:advice aspect))
           "schema-v1 top-level compatibility names the outer consumer")
-      (is (= [1] (mapv :ordinal (:sites aspect)))))))
+      (is (= [1] (mapv :ordinal (:sites aspect))))
+      (is (= (:site-id runtime-join-point) (:site-id report-site)))
+      (is (= (:site runtime-join-point) report-site)
+          "runtime consumers and offline readers share one exact site record"))))
 
 (let [{:keys [fail error]} (run-tests)]
   (when (pos? (+ fail error)) (System/exit 1)))

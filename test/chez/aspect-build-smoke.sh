@@ -133,6 +133,7 @@ printf '%s\n' "$throw_output" | grep -q '^caught application failure :applicatio
 
 test -s "$tmp/target/aspects.edn"
 grep -q ':identity "v1-' "$tmp/target/aspects.edn"
+grep -q ':site-id "v1-' "$tmp/target/aspects.edn"
 grep -q ':provider instrumentation.provider/aspect-provider' "$tmp/target/aspects.edn"
 grep -q ':provider instrumentation.audit-provider/aspect-provider' "$tmp/target/aspects.edn"
 grep -q ':contract :replace-args-v1' "$tmp/target/aspects.edn"
