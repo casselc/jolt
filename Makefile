@@ -109,6 +109,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
+        coreasyncproof \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
@@ -305,6 +306,12 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 	@$(CHEZ) --script test/chez/async-alts-order-test.ss
+
+# Bounded safety/progress proofs for the core.async waiter protocol. Each model
+# must reject its reference counterexample while accepting both a known-bad
+# mutation and a non-vacuous boundary execution.
+coreasyncproof:
+	@sh test/formal/check-core-async.sh
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own
 # deadline however far away the pending ones are, and the thread is forked once.
