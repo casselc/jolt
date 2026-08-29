@@ -1356,6 +1356,16 @@
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) f (future (a/alts!! [[c :v]]))] (Thread/sleep 50) (a/close! c) (let [[v p] @f] [v (= p c)])))" :expected "[false true]"}
   ;; 9. transducer chan works through alts put
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc))] (a/alts!! [[c 1]]) (a/<!! c)))" :expected "2"}
+  ;; Non-priority alts must randomize the complete candidate order. A random
+  ;; cyclic start biases earlier ready ports when some intervening ports are not
+  ;; ready (two ready followed by two empty ports produces a structural 75/25
+  ;; split). The broad bound rejects that algorithm without demanding flaky
+  ;; perfect uniformity.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [cs (vec (repeatedly 4 #(a/chan 1))) _ (a/>!! (cs 0) :a) _ (a/>!! (cs 1) :b) counts (loop [i 0 m {:a 0 :b 0}] (if (= i 2000) m (let [[v _] (a/alts!! cs)] (a/>!! (if (= v :a) (cs 0) (cs 1)) v) (recur (inc i) (update m v inc)))))] (and (< 700 (:a counts) 1300) (< 700 (:b counts) 1300))))" :expected "true"}
+  ;; Bypass the Clojure fast pass so the native __do-alts permutation has its
+  ;; own falsification control. Both ready ports must be selected uniformly even
+  ;; when followed by two empty ports.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [cs (vec (repeatedly 4 #(a/chan 1))) _ (a/>!! (cs 0) :a) _ (a/>!! (cs 1) :b) counts (loop [i 0 m {:a 0 :b 0}] (if (= i 2000) m (let [[v _] (a/__do-alts cs false)] (a/>!! (if (= v :a) (cs 0) (cs 1)) v) (recur (inc i) (update m v inc)))))] (and (< 700 (:a counts) 1300) (< 700 (:b counts) 1300))))" :expected "true"}
   ;; 10. mult/tap smoke — proves the dataflow layer still works
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) m (a/mult c) t1 (a/chan) t2 (a/chan)] (a/tap m t1) (a/tap m t2) (a/>!! c :x) [(a/<!! t1) (a/<!! t2)]))" :expected "[:x :x]"}
   ;; clojure.test — instance? in is still reports correctly (instance? is a fn)
@@ -1379,6 +1389,34 @@
   {:suite "io" :expr "(do (require '[clojure.java.io :as io]) (let [d (doto (java.io.File/createTempFile \"jtd\" \".d\") (.delete) (.mkdir)) child (java.io.File. d \"child.txt\")] (spit child \"x\") (let [deleted (.delete d)] (.delete child) (.delete d) deleted)))" :expected "false"}
   ;; Stage B — fixed-buffer transducer puts block when full
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc)) p (future (a/>!! c 1) (a/>!! c 2) (a/>!! c 3) :done)] (Thread/sleep 100) (let [parked (not (realized? p)) v1 (a/<!! c) v2 (a/<!! c) v3 (a/<!! c) result @p] [parked v1 v2 v3 result])))" :expected "[true 2 3 4 :done]"}
+  ;; core.async requires a real buffer when a transducer is supplied.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (try (a/chan nil (map inc)) :accepted (catch AssertionError _ :rejected)))" :expected ":rejected"}
+  ;; Promise channels support the same transducer and exception-handler contract
+  ;; as buffered channels; the native constructor must not discard those args.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/promise-chan (map inc))] (a/>!! c 1) (a/<!! c)))" :expected "2"}
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/promise-chan (map (fn [_] (throw (ex-info \"boom\" {})))) (fn [_] 42))] (a/>!! c 1) (a/<!! c)))" :expected "42"}
+  ;; Promise buffers are unblocking even after delivery: every put completes and
+  ;; runs the transducer, while only the first transformed output is retained.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [calls (atom 0) c (a/promise-chan (map #(do (swap! calls inc) %))) _ (a/>!! c 1) p (future (a/>!! c 2)) result (deref p 1000 :timed-out)] (when (= :timed-out result) (a/close! c) (deref p 1000 nil)) [result @calls (a/<!! c)]))" :expected "[true 2 1]"}
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [calls (atom 0) c (a/promise-chan (map #(do (swap! calls inc) %)))] [(a/offer! c 1) (a/offer! c 2) @calls (a/poll! c)]))" :expected "[true true 2 1]"}
+  ;; Direct native alts must not report a transformed promise put as accepted
+  ;; without actually invoking the transducer.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [calls (atom 0) c (a/promise-chan (map #(do (swap! calls inc) %))) _ (a/>!! c 1) [accepted port] (a/__do-alts [[c 2]] false)] [accepted (= port c) @calls (a/<!! c)]))" :expected "[true true 2 1]"}
+  ;; A full transformed fixed buffer is not ready for an alts put. Native
+  ;; registration must wait rather than claim the branch and report a phantom
+  ;; success without running the transducer.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc)) _ (a/>!! c 1) p (future (a/__do-alts [[c 2]] false)) early (deref p 250 :timed-out) first-value (a/<!! c) final (deref p 1000 :timed-out)] [early first-value (first final) (= c (second final)) (a/poll! c)]))" :expected "[:timed-out 2 true true 3]"}
+  ;; A pending alt take must peek rather than remove the promise. Multi-output
+  ;; transducers may not install a different value for later takers.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/promise-chan (mapcat #(vector % (inc %)))) a1 (future (first (a/alts!! [c]))) a2 (future (first (a/alts!! [c])))] (Thread/sleep 100) (a/>!! c 1) (let [r1 (deref a1 1000 :timed-out) r2 (deref a2 1000 :timed-out)] (when (or (= :timed-out r1) (= :timed-out r2)) (a/close! c) (deref a1 1000 nil) (deref a2 1000 nil)) [r1 r2 (a/poll! c)])))" :expected "[1 1 1]"}
+  ;; Dropping and sliding buffers are also unblocking under a transducer; later
+  ;; puts run the xform rather than waiting for capacity.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (mapv (fn [[buffer expected]] (let [calls (atom 0) c (a/chan buffer (map #(do (swap! calls inc) (inc %)))) _ (a/>!! c 1) p (future (a/>!! c 2)) result (deref p 1000 :timed-out)] (when (= :timed-out result) (a/close! c) (deref p 1000 nil)) [result @calls (a/<!! c) expected])) [[(a/dropping-buffer 1) 2] [(a/sliding-buffer 1) 3]]))" :expected "[[true 2 2 2] [true 2 3 3]]"}
+  ;; Clojure truthiness governs optional xforms; false means absent.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [a (a/chan nil false) b (a/chan 1 false) p (a/promise-chan false)] [(a/chan? a) (a/>!! b 1) (a/<!! b) (a/>!! p 2) (a/<!! p)]))" :expected "[true true 1 true 2]"}
+  ;; Without an explicit handler, an xform failure is reported to the default
+  ;; uncaught handler and the put completes without producing a value.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (mapv (fn [handler] (let [c (a/promise-chan (map (fn [_] (throw (ex-info \"expected-xform-failure\" {})))) handler)] [(try (a/>!! c 1) :completed (catch Throwable _ :threw)) (a/poll! c)])) [nil false]))" :expected "[[:completed nil] [:completed nil]]" :stderr-contains "Exception in core.async transducer:"}
   ;; Stage B — pending rendezvous put parks until consumed (does NOT complete on close)
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) p (future (a/>!! c :v))] (Thread/sleep 50) (a/close! c) [(a/<!! c) @p]))" :expected "[:v true]"}
   ;; io-thread is the FIBER carrier (jolt-579): the three names pick the three
