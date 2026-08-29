@@ -1591,6 +1591,27 @@
              (.name attr)]
             (finally (Files/deleteIfExists child) (Files/deleteIfExists d)))))"
    :expected "[\"rwx------\" \"rwx------\" \"posix:permissions\"]"}
+  {:suite "nio-files" :label "createFile is exclusive and applies permissions at creation"
+   :expr
+   "(do (import '[java.nio.file Files] '[java.nio.file.attribute FileAttribute PosixFilePermissions])
+        (let [d (Files/createTempDirectory \"jolt-nio-file-mode-\" (into-array FileAttribute []))
+              attr (PosixFilePermissions/asFileAttribute
+                    (PosixFilePermissions/fromString \"rw-------\"))
+              f (.resolve d \"exclusive\")]
+          (try
+            (Files/createFile f (into-array FileAttribute [attr]))
+            (Files/write f (.getBytes \"sentinel\") (into-array java.nio.file.OpenOption []))
+            (let [raised? (try (Files/createFile f (into-array FileAttribute [attr])) false
+                               (catch java.nio.file.FileAlreadyExistsException _ true))
+                  windows? (.contains (.toLowerCase (System/getProperty \"os.name\")) \"win\")]
+              [raised?
+               (apply str (map char (Files/readAllBytes f)))
+               (or windows?
+                   (= \"rw-------\"
+                      (PosixFilePermissions/toString
+                       (Files/getPosixFilePermissions f (into-array java.nio.file.LinkOption [])))))])
+            (finally (Files/deleteIfExists f) (Files/deleteIfExists d)))))"
+   :expected "[true \"sentinel\" true]"}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44* 0) (set! *set-u44* 9))" :expected :throws}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44b* 0) [(binding [*set-u44b* 99] (set! *set-u44b* 42) *set-u44b*) *set-u44b*])" :expected "[42 0]"}
   {:suite "vars / binding dynamic" :expr "(do (def not-dyn-u44 0) (binding [not-dyn-u44 1] not-dyn-u44))" :expected :throws}
