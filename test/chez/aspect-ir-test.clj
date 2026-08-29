@@ -3,6 +3,7 @@
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing run-tests]]
             [jolt.aspects :as aspects]
+            [jolt.fibers :as fibers]
             [jolt.ir :as ir]
             [jolt.passes.types :as types]))
 
@@ -21,13 +22,18 @@
 (def replace-args-config
   (assoc-in config [:aspects 0 :contract] :replace-args-v1))
 
+(def control-config
+  (-> config
+      (assoc :control-enabled? true)
+      (assoc-in [:aspects 0 :contract] :control-v1)))
+
 (def multi-consumer-config
   {:aspects
    [(-> (first (:aspects config))
         (dissoc :advice :contract)
         (assoc :consumers
                [{:ordinal 1
-                :provider 'provider.outer/aspect-provider
+                 :provider 'provider.outer/aspect-provider
                  :advice 'provider.outer/around
                  :contract :replace-args-v1}
                 {:ordinal 2
@@ -72,6 +78,12 @@
    :libraries {'test/aspect-target "fixture-v1"}
    :roles {:test/around 'provider.incomplete/around}})
 
+(def control-provider
+  {:schema 1
+   :libraries {'test/aspect-target "fixture-v1"}
+   :roles {:test/around {:fn 'provider.control/around
+                         :contract :control-v1}}})
+
 (def aspect-fixture-resource
   "test/aspect-filter-probe.edn")
 
@@ -92,16 +104,19 @@
      :advice-role :test/numeric-entry-around
      :expect {:matches 1}}]})
 
-(defn resolve-aspect-fixture [selection]
-  (let [file (java.io.File/createTempFile "jolt-aspect-filter" ".edn")]
-    (try
-      (spit file (pr-str aspect-fixture-manifest))
-      (with-redefs [io/resource
-                    (fn [resource]
-                      (when (= aspect-fixture-resource resource) file))]
-        (aspects/resolve-build-config [selection] "/tmp/unused"))
-      (finally
-        (.delete file)))))
+(defn resolve-aspect-fixture
+  ([selection] (resolve-aspect-fixture selection false))
+  ([selection allow-control-aspects?]
+   (let [file (java.io.File/createTempFile "jolt-aspect-filter" ".edn")]
+     (try
+       (spit file (pr-str aspect-fixture-manifest))
+       (with-redefs [io/resource
+                     (fn [resource]
+                       (when (= aspect-fixture-resource resource) file))]
+         (aspects/resolve-build-config [selection] "/tmp/unused"
+                                       allow-control-aspects?))
+       (finally
+         (.delete file))))))
 
 (defn entry-node []
   (assoc
@@ -191,6 +206,18 @@
                                                 :report "/tmp/unused")
           report (aspects/prepare-build-report! unit configured)]
       (is (= :replace-args-v1 (get-in report [:aspects 0 :contract]))))))
+
+(deftest control-contract-weaving
+  (let [unit (types/new-unit)
+        _ (aspects/configure-unit! unit control-config)
+        woven (aspects/weave unit (ir/def-node "app.core" "run" (invoke-node)))
+        helper (get-in woven [:init :body])
+        operation (nth (:args helper) 3)]
+    (is (= "__invoke-instrumentation-control" (get-in helper [:fn :name])))
+    (is (= :control-v1 (get-in helper [:args 1 :form :contract])))
+    (is (= 2 (count (get-in operation [:arities 0 :params])))
+        "control proceed can supply one exact-arity replacement vector")
+    (is (empty? (ir/tree-problems woven)))))
 
 (deftest ordered-multi-consumer-call-weaving
   (let [unit (types/new-unit)
@@ -546,6 +573,126 @@
         (catch Exception e (reset! seen e)))
       (is (identical? boom @seen)))))
 
+(deftest invoke-control-semantics
+  (testing "advice may replace the return or throw without running the target"
+    (let [calls (atom 0)
+          boom (Exception. "injected")
+          returned (aspects/invoke-control
+                     (fn [_ args _] [:replaced args])
+                     {:id :x} [:original]
+                     (fn [_] (swap! calls inc) :target))
+          thrown (atom nil)]
+      (try
+        (aspects/invoke-control (fn [_ _ _] (throw boom))
+                                {:id :x} [:original]
+                                (fn [_] (swap! calls inc) :target))
+        (catch Exception e (reset! thrown e)))
+      (is (= [:replaced [:original]] returned))
+      (is (identical? boom @thrown))
+      (is (zero? @calls))))
+  (testing "proceed runs once with original or exact-arity replacement arguments"
+    (let [calls (atom [])]
+      (is (= :advice-result
+             (aspects/invoke-control
+               (fn [_ _ proceed]
+                 (is (= "new-left:new-right"
+                        (proceed ["new-left" "new-right"])))
+                 :advice-result)
+               {:id :x} ["left" "right"]
+               (fn [left right]
+                 (swap! calls conj [left right])
+                 (str left ":" right)))))
+      (is (= [["new-left" "new-right"]] @calls))
+      (is (= :original
+             (aspects/invoke-control (fn [_ _ proceed] (proceed))
+                                     {:id :x} [:original] identity)))))
+  (testing "advice controls exceptions before and after target execution"
+    (let [after (Exception. "after")
+          application (Exception. "application")
+          calls (atom 0)
+          seen (fn [f]
+                 (try (f) nil (catch Exception e e)))]
+      (is (identical?
+            after
+            (seen #(aspects/invoke-control
+                     (fn [_ _ proceed]
+                       (proceed)
+                       (throw after))
+                     {:id :x} []
+                     (fn [] (swap! calls inc) :ran)))))
+      (is (= 1 @calls))
+      (is (identical?
+            application
+            (seen #(aspects/invoke-control
+                     (fn [_ _ proceed] (proceed))
+                     {:id :x} []
+                     (fn [] (throw application))))))
+      (is (= :recovered
+             (aspects/invoke-control
+               (fn [_ _ proceed]
+                 (try (proceed)
+                      (catch Exception _ :recovered)))
+               {:id :x} []
+               (fn [] (throw application)))))))
+  (testing "invalid, repeated, escaped, and cross-thread proceed fail closed"
+    (let [calls (atom 0)
+          escaped (atom nil)
+          message-of (fn [f]
+                       (try (f) nil (catch Exception e (ex-message e))))]
+      (is (= "control advice supplied invalid replacement arguments"
+             (message-of
+               #(aspects/invoke-control (fn [_ _ proceed] (proceed []))
+                                        {:id :x} [:one] identity))))
+      (is (= "control advice invoked proceed more than once"
+             (message-of
+               #(aspects/invoke-control
+                  (fn [_ _ proceed]
+                    (proceed)
+                    (proceed))
+                  {:id :x} [:one]
+                  (fn [_] (swap! calls inc) :ran)))))
+      (is (= 1 @calls))
+      (is (= :skipped
+             (aspects/invoke-control
+               (fn [_ _ proceed] (reset! escaped proceed) :skipped)
+               {:id :x} [:one] identity)))
+      (is (= "control advice invoked proceed outside its dynamic extent"
+             (message-of #(@escaped))))
+      (is (= "control advice invoked proceed from a non-owner execution context"
+             (aspects/invoke-control
+               (fn [_ _ proceed]
+                 @(future (message-of proceed)))
+               {:id :x} [:one] identity)))
+      (let [retry-calls (atom 0)]
+        (is (= "control advice invoked proceed more than once"
+               (message-of
+                 #(aspects/invoke-control
+                    (fn [_ _ proceed]
+                      (try (proceed []) (catch Exception _ nil))
+                      (proceed [:one]))
+                    {:id :x} [:one]
+                    (fn [_] (swap! retry-calls inc) :ran)))))
+        (is (zero? @retry-calls)
+            "an invalid owner invocation poisons the one-shot capability"))))
+  (testing "a different fiber on the same carrier is not the owner"
+    (fibers/set-carrier-count! 1)
+    (let [calls (atom 0)
+          message-of (fn [f]
+                       (try (f) nil (catch Exception e (ex-message e))))
+          result
+          (fibers/join
+            (fibers/spawn
+              (fn []
+                (aspects/invoke-control
+                  (fn [_ _ proceed]
+                    (fibers/join
+                      (fibers/spawn (fn [] (message-of proceed)))))
+                  {:id :x} []
+                  (fn [] (swap! calls inc) :target-ran)))))]
+      (is (= "control advice invoked proceed from a non-owner execution context"
+             result))
+      (is (zero? @calls)))))
+
 (deftest provider-role-schema
   (let [validate-provider (ns-resolve 'jolt.aspects 'validate-provider)
         base {:schema 1 :libraries {'test/lib "v1"}}]
@@ -569,6 +716,14 @@
                                            {:fn 'provider.core/around
                                             :contract :replace-args-v1}}))
                      [:roles :test/around :contract]))))
+    (testing "the explicit control contract is valid"
+      (is (= :control-v1
+             (get-in (validate-provider
+                       'provider.core/aspect-provider
+                       (assoc base :roles {:test/around
+                                           {:fn 'provider.core/around
+                                            :contract :control-v1}}))
+                     [:roles :test/around :contract]))))
     (doseq [[label role expected]
             [["unknown contract"
               {:fn 'provider.core/around :contract :args-v2}
@@ -583,6 +738,55 @@
                         nil
                         (catch Exception e (ex-message e)))]
           (is (= expected message)))))))
+
+(deftest control-provider-requires-explicit-build-opt-in
+  (let [selection {:resource aspect-fixture-resource
+                   :consumers [{:provider 'aspect-ir-test/control-provider
+                                :roles [:test/around]}]}
+        message (try
+                  (resolve-aspect-fixture selection)
+                  nil
+                  (catch Exception e (ex-message e)))
+        enabled (resolve-aspect-fixture selection true)]
+    (is (= (str "jolt aspects: control advice requires :jolt/build "
+                ":allow-control-aspects true")
+           message))
+    (is (:control-enabled? enabled))
+    (is (= :control-v1 (get-in enabled [:aspects 0 :consumers 0 :contract])))
+    (is (= [:test/target-call] (mapv :id (:aspects enabled))))))
+
+(deftest compiler-boundary-rechecks-control-opt-in
+  (let [normalized
+        {:aspects
+         [{:id :test/control
+           :consumers [{:ordinal 1
+                        :provider 'provider.control/aspect-provider
+                        :advice 'provider.control/around
+                        :contract :control-v1}]}]}
+        legacy {:aspects [{:id :test/control
+                           :provider 'provider.control/aspect-provider
+                           :advice 'provider.control/around
+                           :contract :control-v1}]}
+        message (fn [config]
+                  (try
+                    (aspects/configure-unit! (types/new-unit) config)
+                    nil
+                    (catch Exception e (ex-message e))))]
+    (doseq [config [normalized legacy]]
+      (is (= (str "jolt aspects: control advice reached compiler without "
+                  "explicit enablement")
+             (message config))))
+    (is (nil? (message (assoc normalized :control-enabled? true))))))
+
+(deftest control-opt-in-must-be-boolean
+  (let [selection {:resource aspect-fixture-resource
+                   :consumers [{:provider 'aspect-ir-test/control-provider
+                                :roles [:test/around]}]}]
+    (is (= "jolt aspects: :jolt/build :allow-control-aspects must be boolean"
+           (try
+             (resolve-aspect-fixture selection :yes)
+             nil
+             (catch Exception e (ex-message e)))))))
 
 (deftest selection-provider-schema
   (let [provider-symbols (ns-resolve 'jolt.aspects 'selection-provider-symbols)
