@@ -618,7 +618,9 @@
                               (nil? p) (str out ".build/aspects.edn")
                               (str/starts-with? p "/") p
                               :else (str pdir "/" p)))
-            aspect-config (aspects/resolve-build-config (:aspects build) aspect-report)]
+            aspect-config (aspects/resolve-build-config
+                            (:aspects build) aspect-report
+                            (:allow-control-aspects build))]
         (when (and target library?)
           (throw (ex-info "cross build (--target) does not support --library yet" {})))
         (when (and target (nil? target-pack))
