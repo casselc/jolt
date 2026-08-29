@@ -305,6 +305,43 @@
             called value
             :else (proceed)))))))
 
+(defn __invoke-instrumentation-control
+  "Compiler runtime for the explicitly enabled test-only `:control-v1`
+  contract. Advice receives `[join-point evaluated-args proceed]`; its return
+  or throw becomes the application's return or throw. `proceed` may run the
+  target at most once, only during the advice call and on its owner thread,
+  using either the original arguments or one exact-arity replacement vector."
+  [advice join-point evaluated-args operation]
+  (let [active (atom true)
+        called (atom false)
+        owner (Thread/currentThread)
+        owner-fiber (jolt.host/current-fiber)
+        expected (count evaluated-args)
+        run-operation
+        (fn [call-args]
+          (when-not @active
+            (throw (ex-info "control advice invoked proceed outside its dynamic extent"
+                            {:join-point (:id join-point)})))
+          (when-not (and (identical? owner (Thread/currentThread))
+                         (identical? owner-fiber (jolt.host/current-fiber)))
+            (throw (ex-info "control advice invoked proceed from a non-owner execution context"
+                            {:join-point (:id join-point)})))
+          (when-not (compare-and-set! called false true)
+            (throw (ex-info "control advice invoked proceed more than once"
+                            {:join-point (:id join-point)})))
+          (when-not (and (vector? call-args) (= expected (count call-args)))
+            (throw (ex-info "control advice supplied invalid replacement arguments"
+                            {:join-point (:id join-point)
+                             :expected-arity expected})))
+          (apply operation call-args))
+        proceed (fn
+                  ([] (run-operation evaluated-args))
+                  ([replacement-args] (run-operation replacement-args)))]
+    (try
+      (advice join-point evaluated-args proceed)
+      (finally
+        (reset! active false)))))
+
 ;; Throwable->map: the reference data rendering of a throwable. :via chains
 ;; through ex-cause the way the reference walks getCause; :cause/:data come
 ;; from the root cause. Throwables carry no stack-trace elements here, so

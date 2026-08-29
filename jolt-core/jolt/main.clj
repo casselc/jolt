@@ -654,7 +654,9 @@
                               (nil? p) (str out ".build/aspects.edn")
                               (str/starts-with? p "/") p
                               :else (str pdir "/" p)))
-            aspect-config (aspects/resolve-build-config (:aspects build) aspect-report)]
+            aspect-config (aspects/resolve-build-config
+                            (:aspects build) aspect-report
+                            (:allow-control-aspects build))]
         (when (and target (nil? target-pack))
           (throw (ex-info "--target needs a target pack: --target-pack DIR (or $JOLT_TARGET_PACK)" {:target target})))
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
