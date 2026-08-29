@@ -395,6 +395,7 @@
 
 (defn configure-unit! [unit config]
   (reset! (:aspects unit) (vec (or (:aspects config) [])))
+  (reset! (:aspect-build-identity unit) (or (:identity config) "plain"))
   (reset! (:aspect-matches unit) {})
   nil)
 
@@ -453,11 +454,19 @@
         :advice (:advice aspect)
         :contract (or (:contract aspect) :proceed-v1)}]))
 
-(defn- join-point [aspect consumer]
+(defn- runtime-site-id [unit site]
+  (stable-identity
+    (canonical-str {:build-identity @(:aspect-build-identity unit)
+                    :site site})))
+
+(defn- join-point [unit aspect consumer site]
   (merge (select-keys aspect [:id :library :advice-role :match])
+         {:build-identity @(:aspect-build-identity unit)
+          :site-id (runtime-site-id unit site)
+          :site site}
          (select-keys consumer [:provider :advice :contract :ordinal])))
 
-(defn- call-consumer-invoke [unit aspect consumer consumers node names]
+(defn- call-consumer-invoke [unit aspect consumer consumers node names site]
   (let [[advice-ns advice-name] (split-fqn (:advice consumer))
         pos (:pos node)
         evaluated-args (ir/vector-node (mapv ir/local names))
@@ -467,10 +476,10 @@
         operation-names (or replacement-names names)
         operation (if-let [next-consumer (first consumers)]
                     (call-consumer-invoke unit aspect next-consumer
-                                          (next consumers) node operation-names)
+                                          (next consumers) node operation-names site)
                     (assoc node :args (mapv ir/local operation-names)))
         advice-ref (cond-> (ir/var-ref advice-ns advice-name) pos (assoc :pos pos))
-        join-point-node (ir/quote-node (join-point aspect consumer))
+        join-point-node (ir/quote-node (join-point unit aspect consumer site))
         operation-fn (cond->
                        (ir/fn-node nil [{:params (or replacement-names [])
                                         :body operation}])
@@ -485,13 +494,13 @@
         invoke (ir/invoke (ir/var-ref "clojure.core" helper-name) helper-args)]
     (cond-> invoke pos (assoc :pos pos))))
 
-(defn- advice-invoke [unit aspect node]
+(defn- advice-invoke [unit aspect node site]
   (let [pos (:pos node)
         names (mapv (fn [_] (fresh-local unit)) (:args node))
         bindings (mapv vector names (:args node))
         consumers (aspect-consumers aspect)
         invoke (call-consumer-invoke unit aspect (first consumers)
-                                     (next consumers) node names)
+                                     (next consumers) node names site)
         wrapped (if (seq bindings) (ir/let-node bindings invoke) invoke)]
     (cond-> wrapped pos (assoc :pos pos))))
 
@@ -500,7 +509,7 @@
     (mapv (fn [[name hint]] [(get by-name name name) hint]) hints)))
 
 (defn- entry-consumer-invoke
-  [unit aspect consumer consumers arity pos original-names names]
+  [unit aspect consumer consumers arity pos original-names names site]
   (let [[advice-ns advice-name] (split-fqn (:advice consumer))
         evaluated-args (ir/vector-node (mapv ir/local names))
         replace-args? (= :replace-args-v1 (:contract consumer))
@@ -510,7 +519,7 @@
         operation-body
         (if-let [next-consumer (first consumers)]
           (entry-consumer-invoke unit aspect next-consumer (next consumers)
-                                 arity pos original-names operation-inputs)
+                                 arity pos original-names operation-inputs site)
           ;; The local loop is the original function's recur target. Moving the
           ;; body directly into proceed's zero-arity thunk would retarget recur
           ;; to that thunk and change advice lifecycle semantics.
@@ -531,18 +540,18 @@
                       "__invoke-instrumentation-around")
         helper-args (if (contains? #{:args-v1 :replace-args-v1}
                                    (:contract consumer))
-                      [advice-ref (ir/quote-node (join-point aspect consumer))
+                      [advice-ref (ir/quote-node (join-point unit aspect consumer site))
                        evaluated-args operation-fn]
-                      [advice-ref (ir/quote-node (join-point aspect consumer))
+                      [advice-ref (ir/quote-node (join-point unit aspect consumer site))
                        operation-fn])]
     (cond-> (ir/invoke (ir/var-ref "clojure.core" helper-name) helper-args)
       pos (assoc :pos pos))))
 
-(defn- entry-advice-body [unit aspect arity pos]
+(defn- entry-advice-body [unit aspect arity pos site]
   (let [names (:params arity)
         consumers (aspect-consumers aspect)]
     (entry-consumer-invoke unit aspect (first consumers) (next consumers)
-                           arity pos names names)))
+                           arity pos names names site)))
 
 (defn- weave-entry-def [unit aspects node]
   (if (and (= :def (:op node)) (= :fn (get-in node [:init :op])))
@@ -559,11 +568,12 @@
                            :aspects (mapv :id matches)}))
                   (if-let [aspect (first matches)]
                     (let [ordinal (inc (count (get @(:aspect-matches unit)
-                                                   (:id aspect))))]
+                                                   (:id aspect))))
+                          site (entry-site node aspect arity ordinal)]
                       (swap! (:aspect-matches unit) update (:id aspect)
-                             (fnil conj []) (entry-site node aspect arity ordinal))
+                             (fnil conj []) site)
                       (assoc arity :body
-                             (entry-advice-body unit aspect arity (:pos node))))
+                             (entry-advice-body unit aspect arity (:pos node) site)))
                     arity)))
               arities))]
       (if woven-arities
@@ -592,10 +602,11 @@
                           {:site (call-site owner-ns (first matches) node 0)
                            :aspects (mapv :id matches)}))
                   (if-let [aspect (first matches)]
-                    (let [ordinal (inc (count (get @(:aspect-matches unit) (:id aspect))))]
+                    (let [ordinal (inc (count (get @(:aspect-matches unit) (:id aspect))))
+                          site (call-site owner-ns aspect node ordinal)]
                       (swap! (:aspect-matches unit) update (:id aspect)
-                             (fnil conj []) (call-site owner-ns aspect node ordinal))
-                      (advice-invoke unit aspect node))
+                             (fnil conj []) site)
+                      (advice-invoke unit aspect node site))
                     node)))]
         (assoc (weave-entry-def unit aspects (walk root)) :aspect-woven true)))))
 
