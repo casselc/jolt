@@ -169,9 +169,7 @@ Substrate-inherent, same acceptance shape as the integer-box model. Note
 `hash` parity for strings is still JVM-exact — hashing converts to UTF-16
 units internally.
 
-Two adjacent accepted divergences: `compare-and-set!` compares with value
-equality (`:concurrency-model` — Chez immediates and reconstructed values have
-no stable reference identity), and `subvec` is an eager O(n) copy rather than
+One adjacent accepted divergence: `subvec` is an eager O(n) copy rather than
 an O(1) view (value-identical; the class residue is `:seq-type-model`, but the
 cost contract differs — don't rely on O(1) `subvec` of huge vectors).
 

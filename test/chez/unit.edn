@@ -1698,6 +1698,11 @@
   {:suite "atomics" :label "reset-vals! returns [old new]" :expected "[5 9]" :expr "(let [a (atom 5)] (reset-vals! a 9))"}
   {:suite "atomics" :label "compare-and-set! true on match and sets" :expected "[true 6]" :expr "(let [a (atom 5)] [(compare-and-set! a 5 6) (deref a)])"}
   {:suite "atomics" :label "compare-and-set! false on mismatch and no set" :expected "[false 5]" :expr "(let [a (atom 5)] [(compare-and-set! a 0 6) (deref a)])"}
+  ;; JVM Atom.compareAndSet is identity-based. Distinct equal lazy values are a
+  ;; non-vacuous control: value equality would also realize both bodies while the
+  ;; atom mutex is held, allowing arbitrary user work (and a fiber park) inside a
+  ;; counted-lock region.
+  {:suite "atomics" :label "compare-and-set! uses identity and does not force equal lazy values" :expected "[false 0 true]" :expr "(let [calls (atom 0) actual (lazy-seq (swap! calls inc) (list :x)) expected (lazy-seq (swap! calls inc) (list :x)) a (atom actual)] [(compare-and-set! a expected :changed) @calls (identical? actual @a)])"}
   ;; The receiver check. swap!/reset! run jolt-need-atom and report the JVM's cast
   ;; failure; the other three reached a record accessor directly, so a non-atom got
   ;; a condition naming jolt's own record type ("... is not of type #<record type
