@@ -851,6 +851,22 @@
   (let-values (((result native-error) (nio-mkdir-native-result fp mode)))
     (unless (= result 0) (nio-raise-create-error fp native-error))))
 
+;; createDirectories differs from createDirectory only after mkdir(2) reports
+;; EEXIST: another creator may have won the same path component.  The captured
+;; native result is the authority for entering this arm; a pre-create exists?
+;; check cannot distinguish that race.  Re-observe the colliding name and
+;; continue only while it denotes a directory.  If it was deleted or replaced
+;; by a non-directory before this check, fail closed.  Like the JDK operation,
+;; this is not a persistent directory handle: a later deletion/replacement can
+;; still invalidate a component after it has been accepted.
+(define (nio-mkdir-or-existing-directory! fp mode)
+  (let-values (((result native-error) (nio-mkdir-native-result fp mode)))
+    (cond ((= result 0) #t)
+          ((and (nio-native-exists-error? native-error)
+                (file-directory? fp))
+           #t)
+          (else (nio-raise-create-error fp native-error)))))
+
 ;; open(2) is the file analogue of the mkdir(2) helper above: O_CREAT|O_EXCL
 ;; makes name ownership one atomic operation and the mode is applied at the
 ;; instant the name becomes visible.  Chez's `(file-options no-fail)` is not an
@@ -913,6 +929,15 @@
   (let loop ((p fp) (acc '()))
     (cond ((or (string=? p "") (string=? p "/") (file-exists? p)) acc)
           (else (loop (nio-parent-of p) (cons p acc))))))
+(define (nio-create-directories! fp mode)
+  (let ((missing (nio-missing-ancestors fp)))
+    ;; Even an empty missing chain must pass through the atomic result path: the
+    ;; target may be an existing regular file, which is not successful
+    ;; createDirectories.
+    (if (null? missing)
+        (nio-mkdir-or-existing-directory! fp mode)
+        (for-each (lambda (d) (nio-mkdir-or-existing-directory! d mode))
+                  missing))))
 ;; is the dest present as a link (even broken) or a real file?
 (define (nio-dest-present? d) (or (file-exists? d) (nio-is-symlink? d)))
 (let ((files-create+move
@@ -925,10 +950,9 @@
                                (nio-create-file-atomic! (nfp p) mode)
                                (->path p))))
         (cons "createDirectories" (lambda (p . attrs)
-                                    (let ((missing (nio-missing-ancestors (nfp p))))
-                                      (for-each (lambda (d)
-                                                  (nio-mkdir-atomic! d (nio-create-mode attrs #o777)))
-                                                missing))
+                                    (let* ((fp (nfp p))
+                                           (mode (nio-create-mode attrs #o777)))
+                                      (nio-create-directories! fp mode))
                                     (->path p)))
         (cons "move" (lambda (src dst . opts)
                        (let ((s (nfp src)) (d (nfp dst)))
