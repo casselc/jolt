@@ -106,5 +106,68 @@
 (ok "registration explores more than cyclic rotations"
     (> (distinct-count registration-orders) 4))
 
+;; A shared alts handler can lose on another channel while this transformed
+;; channel remains full. Its inactive registration must be pruned independently
+;; of capacity so explicit close can complete the xform immediately and once.
+(let* ((ch (jolt-async-chan 1))
+       (h (alt-handler-alloc))
+       (completion-count 0)
+       (original-ac-xrf-apply ac-xrf-apply))
+  (jolt-async-give ch 'buffered)
+  (alt-claim! h)
+  (async-chan-alt-putters-set! ch (list (cons h 'stale)))
+  (async-chan-xrf-set! ch #t)
+  (set! ac-xrf-apply
+    (lambda (target . args)
+      (when (and (eq? target ch) (null? args))
+        (set! completion-count (+ completion-count 1)))
+      target))
+  (jolt-async-close! ch)
+  (set! ac-xrf-apply original-ac-xrf-apply)
+  (ok "inactive full-buffer put registration pruned at close"
+      (null? (async-chan-alt-putters ch)))
+  (ok "pruned registration permits exactly-once xform completion"
+      (= completion-count 1)))
+
+;; Observe the atomic-pair invariant at the runtime seam used by ac-notify!.
+;; This is the executable boundary case from the bounded SMT model: a shared
+;; alts handler is both the FIFO put and take head, while a distinct compatible
+;; putter waits behind it.  Progress must skip the self-pair, claim exactly one
+;; distinct pair, and leave neither selected handler active.
+(let* ((ch (jolt-async-chan))
+       (shared (alt-handler-alloc))
+       (peer (alt-handler-alloc))
+       (claim-events '())
+       (original-alt-claim-pair! alt-claim-pair!))
+  (set! alt-claim-pair!
+    (lambda (put-h take-h)
+      (let* ((put-before (alt-active? put-h))
+             (take-before (alt-active? take-h))
+             (claimed? (original-alt-claim-pair! put-h take-h))
+             (event (vector (alt-handler-id put-h)
+                            (alt-handler-id take-h)
+                            put-before take-before claimed?
+                            (alt-active? put-h) (alt-active? take-h))))
+        (set! claim-events (cons event claim-events))
+        claimed?)))
+  (async-chan-alt-putters-set!
+   ch (list (cons shared 'self) (cons peer 'external)))
+  (async-chan-alt-takers-set! ch (list shared))
+  (jolt-with-mutex (async-chan-mu ch) (ac-notify! ch))
+  (set! alt-claim-pair! original-alt-claim-pair!)
+  (let ((event (and (= (length claim-events) 1) (car claim-events))))
+    (ok "mixed alts makes one compatible pair claim" event)
+    (ok "pair claim never rendezvous a handler with itself"
+        (and event (not (= (vector-ref event 0) (vector-ref event 1)))))
+    (ok "both handlers are active at pair linearization"
+        (and event (vector-ref event 2) (vector-ref event 3)))
+    (ok "compatible pair claim succeeds"
+        (and event (vector-ref event 4)))
+    (ok "successful pair claim consumes both handler identities"
+        (and event (not (vector-ref event 5)) (not (vector-ref event 6))))
+    (ok "claimed and stale mixed registrations are removed"
+        (and (null? (async-chan-alt-putters ch))
+             (null? (async-chan-alt-takers ch))))))
+
 (printf "\nasync alts order: ~a assertions, ~a failures\n" total fails)
 (exit (if (= fails 0) 0 1))

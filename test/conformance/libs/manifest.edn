@@ -76,18 +76,16 @@
    ;; exceptions_test the JVM's uncaught-exception handler, and buffers_test the
    ;; upstream buffer implementations rather than jolt's native ones.
    ;;
-   ;; The 7 remaining failures are all in async_test. Two pending put!/take!
+   ;; The 5 remaining failures are all in async_test. Two pending put!/take!
    ;; cases assert the JVM implementation's completing-thread callback placement;
    ;; the public contract leaves pending + on-caller? true placement unspecified.
-   ;; Two counterpart-after-return cases expose jolt's asynchronous worker
-   ;; registration: the complementary operation can miss an operation whose
-   ;; public put!/take! call has already returned. That is a real compatibility
-   ;; gap under bounded history testing, though not by itself a value-loss or
-   ;; linearizability counterexample. The remaining supersets are intentional:
-   ;; two assert the JVM's 1024 pending-operation cap (jolt is unbounded), and one
-   ;; requires a parking op outside go to fail (jolt's operations work anywhere).
+   ;; The remaining supersets are intentional: two assert the JVM's 1024
+   ;; pending-operation cap (jolt is unbounded), and one requires a parking op
+   ;; outside go to fail (jolt's operations work anywhere). The former
+   ;; counterpart-after-return failures are now fixed by caller-side atomic
+   ;; registration shared across callback, blocking, fiber and alts providers.
    :tolerance 0
-   :expect {:tests 31 :pass 211 :fail 7 :error 0}}
+   :expect {:tests 31 :pass 213 :fail 5 :error 0}}
 
   {:name "core.cache"
    :paths ["src/main/clojure" "src/test/clojure"]
