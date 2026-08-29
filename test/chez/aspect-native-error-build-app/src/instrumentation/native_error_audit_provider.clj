@@ -1,4 +1,5 @@
-(ns instrumentation.native-error-audit-provider)
+(ns instrumentation.native-error-audit-provider
+  (:require [instrumentation.native-error-provider :as primary]))
 
 (def ^:private journal-limit 4)
 (def ^:private journal (atom []))
@@ -11,6 +12,7 @@
                 vec))))
 
 (defn around [join-point evaluated-args proceed]
+  (primary/assert-runtime-site! join-point)
   (record! [:audit-enter (:id join-point) evaluated-args])
   (let [value (proceed)]
     (record! [:audit-return (:id join-point) value])
