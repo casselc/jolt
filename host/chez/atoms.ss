@@ -110,12 +110,14 @@
     (jolt-atom-notify a old v)
     v))
 
-;; compare-and-set! keeps jolt= (value) semantics, done atomically under the lock.
+;; Atom.compareAndSet compares the expected value by identity, like the JVM.
+;; Besides being the public contract, eq? keeps generic equality dispatch and
+;; lazy realization out of the atom's short counted-lock region.
 (define (jolt-compare-and-set! a oldv newv)
   (jolt-need-atom a)
   (jolt-atom-validate a newv)
   (let ((swapped (jolt-with-mutex (jolt-atom-lock a)
-                   (if (jolt= (jolt-atom-val a) oldv)
+                   (if (eq? (jolt-atom-val a) oldv)
                        (begin (jolt-atom-val-set! a newv) #t)
                        #f))))
     (when swapped (jolt-atom-notify a oldv newv))
