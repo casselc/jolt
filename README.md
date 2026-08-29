@@ -452,6 +452,23 @@ consumer for schema-v1 report readers. Provider order and the source bytes of
 every provider contribute to the artifact identity, as do explicit role
 filters.
 
+Inspect selection before compiling with `jolt aspects plan`. Its deterministic
+EDN contains the static identity, manifests, matches, and ordered consumers, but
+never source bytes, the configured report path, or checkout-local paths.
+`jolt aspects explain [REPORT]` renders the same selection for humans and, when
+given a report, adds observed sites only after validating its schema, weaver,
+build identity, control mode, aspect set, match counts, and site shapes. An
+explicitly missing or stale report is an error; omitting `REPORT` uses an
+existing configured `:aspect-report` when available and otherwise explains only
+the static plan.
+
+Planning installs dependency source roots so the selected provider vars can be
+resolved, but it does not load the project's declared `:jolt/native` objects.
+Provider namespaces are trusted executable configuration in v1: resolving a
+provider var evaluates that namespace's top-level forms. Keep provider
+namespaces declarative and side-effect-free. A future inert provider artifact
+can remove that remaining resolution-time execution.
+
 An advice function receives `[join-point proceed]`. Jolt preserves argument
 evaluation order, the operation's result, application exception identity, and
 exactly-once execution. Advice that throws, omits `proceed`, invokes it twice,
