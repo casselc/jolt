@@ -447,6 +447,154 @@
 (defn build-identity [config]
   (or (:identity config) "plain"))
 
+(defn plan-data
+  "Return the stable, source-free aspect selection plan for a resolved build.
+
+  Provider and manifest source bytes participate in the build identity during
+  resolution but are deliberately absent here. The plan is therefore safe to
+  print, diff, cache as evidence, or hand to tooling before compilation."
+  [config]
+  (if-not config
+    {:schema schema-version
+     :weaver weaver-version
+     :status :plain
+     :identity "plain"
+     :control-enabled? false
+     :providers []
+     :aspects []}
+    {:schema (:schema config)
+     :weaver (:weaver config)
+     :status :instrumented
+     :identity (:identity config)
+     :control-enabled? (:control-enabled? config)
+     :providers (vec (:providers config))
+     :aspects
+     (mapv (fn [aspect]
+             (-> (select-keys aspect
+                              [:id :resource :library :match :advice-role :expect])
+                 (assoc :consumers
+                        (mapv #(select-keys % [:ordinal :selection-ordinal
+                                              :provider :roles :advice :contract])
+                              (aspect-consumers aspect)))))
+           (:aspects config))}))
+
+(defn- valid-site-position? [position]
+  (and (map? position)
+       (empty? (remove #{:line :column} (keys position)))
+       (every? integer? (vals position))))
+
+(defn- validate-observed-site [aspect site]
+  (when-not (map? site)
+    (fail "build report site must be a map"
+          {:aspect (:id aspect) :site-type (type site)}))
+  (reject-unknown-keys "build report site" site
+                       #{:aspect :within :call :entry :arity :ordinal :position}
+                       {:aspect (:id aspect)})
+  (let [match (:match aspect)
+        call? (contains? match :call)
+        target (if call? (:call match) (:entry match))
+        expected-within (if call? (str (:ns match)) (namespace target))]
+    (when-not (and (= (:id aspect) (:aspect site))
+                   (= expected-within (:within site))
+                   (= target (get site (if call? :call :entry)))
+                   (= (:arity match) (:arity site))
+                   (integer? (:ordinal site))
+                   (pos? (:ordinal site))
+                   (valid-site-position? (:position site))
+                   (= call? (contains? site :call))
+                   (= (not call?) (contains? site :entry)))
+      (fail "build report site does not match selected aspect"
+            {:aspect (:id aspect) :ordinal (:ordinal site)}))
+    (select-keys site [:aspect :within (if call? :call :entry)
+                       :arity :ordinal :position])))
+
+(defn validate-build-report
+  "Validate that a report is an observation of this exact static plan.
+
+  Returns a bounded projection containing only aspect ids and source-free site
+  identities suitable for display. A matching schema alone is insufficient:
+  weaver, build identity, control opt-in, selected aspects, match counts, and
+  each reported site must all agree with the plan."
+  [plan report]
+  (when-not (map? report)
+    (fail "build report must be an EDN map" {:report-type (type report)}))
+  (reject-unknown-keys "build report" report
+                       #{:schema :weaver :identity :control-enabled? :aspects}
+                       {})
+  (doseq [[key expected] [[:schema (:schema plan)]
+                          [:weaver (:weaver plan)]
+                          [:identity (:identity plan)]
+                          [:control-enabled? (boolean (:control-enabled? plan))]]]
+    (when-not (= expected (get report key))
+      (fail "build report does not match the selected build"
+            {:field key :expected expected :actual (get report key)})))
+  (when-not (vector? (:aspects report))
+    (fail "build report :aspects must be a vector" {}))
+  (let [planned (:aspects plan)
+        reported (:aspects report)
+        planned-ids (mapv :id planned)
+        reported-ids (mapv :id reported)]
+    (when-not (= planned-ids reported-ids)
+      (fail "build report aspects do not match the selected build"
+            {:expected planned-ids :actual reported-ids}))
+    {:aspects
+     (mapv
+      (fn [aspect observed]
+        (when-not (map? observed)
+          (fail "build report aspect must be a map"
+                {:aspect (:id aspect) :aspect-type (type observed)}))
+        (let [sites (:sites observed)
+              expected (get-in aspect [:expect :matches])]
+          (when-not (vector? sites)
+            (fail "build report aspect :sites must be a vector"
+                  {:aspect (:id aspect)}))
+          (when-not (= expected (count sites))
+            (fail "build report site count does not match the selected aspect"
+                  {:aspect (:id aspect) :expected expected :actual (count sites)}))
+          (let [projected (mapv #(validate-observed-site aspect %) sites)
+                ordinals (mapv :ordinal projected)]
+            (when-not (= (vec (range 1 (inc (count projected)))) ordinals)
+              (fail "build report site ordinals must be contiguous and ordered"
+                    {:aspect (:id aspect) :ordinals ordinals}))
+            {:id (:id aspect) :sites projected})))
+      planned reported)}))
+
+(defn explain-lines
+  "Render a deterministic human explanation of plan and optional build report.
+
+  A plan explains static selection. A report adds observed source sites from an
+  actual compile; it is never treated as current merely because it exists."
+  ([plan] (explain-lines plan nil nil))
+  ([plan report] (explain-lines plan report nil))
+  ([plan report report-label]
+   (let [report (when report (validate-build-report plan report))
+         reported (into {} (map (juxt :id identity)) (:aspects report))]
+     (vec
+      (concat
+       [(str "aspect build: " (name (:status plan)))
+        (str "identity: " (:identity plan))
+        (str "control advice: " (if (:control-enabled? plan) "enabled" "disabled"))]
+       (when report [(str "observed report: " (or report-label "validated input"))])
+       (mapcat
+        (fn [aspect]
+          (let [observed (get reported (:id aspect))
+                sites (:sites observed)]
+            (concat
+             [(str "aspect " (:id aspect)
+                   " library " (get-in aspect [:library :id])
+                   "@" (get-in aspect [:library :version]))
+              (str "  match " (pr-str (:match aspect))
+                   " role " (:advice-role aspect))]
+             (map (fn [consumer]
+                    (str "  consumer " (:ordinal consumer) " "
+                         (:provider consumer) " " (:contract consumer)
+                         " -> " (:advice consumer)))
+                  (:consumers aspect))
+             (when observed
+               (cons (str "  observed sites: " (count sites))
+                     (map (fn [site] (str "    " (pr-str site))) sites))))))
+        (:aspects plan)))))))
+
 (defn- split-fqn [sym]
   [(namespace sym) (name sym)])
 

@@ -49,6 +49,57 @@ result ok-woven-inner!?'
 "$jolt" "$repo/test/chez/aspect-ir-test.clj"
 run_build release
 cp "$tmp/target/aspects.edn" "$tmp/target/release-aspects.edn"
+
+# The actual CLI, not merely the source-loaded unit namespace, must expose a
+# deterministic source-free plan and accept only a report for this exact build.
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects plan) >"$tmp/target/aspects-plan.edn"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects plan) >"$tmp/target/aspects-plan-again.edn"
+cmp "$tmp/target/aspects-plan.edn" "$tmp/target/aspects-plan-again.edn"
+grep -q ':status :instrumented' "$tmp/target/aspects-plan.edn"
+grep -q ':identity "v1-' "$tmp/target/aspects-plan.edn"
+if grep -q ':report\|target/aspects.edn\|'"$tmp" "$tmp/target/aspects-plan.edn"; then
+  echo "FAIL: aspect plan contains a report or machine-specific path" >&2
+  exit 1
+fi
+
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects explain target/aspects.edn) >"$tmp/target/aspects-explain.txt"
+grep -q '^observed report: target/aspects.edn$' "$tmp/target/aspects-explain.txt"
+grep -q '^  observed sites: 1$' "$tmp/target/aspects-explain.txt"
+
+cp "$tmp/target/aspects.edn" "$tmp/target/aspects-stale.edn"
+sed -i 's/:identity "[^"]*"/:identity "stale"/' "$tmp/target/aspects-stale.edn"
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+    "$jolt" aspects explain target/aspects-stale.edn) \
+    >"$tmp/target/aspects-stale.log" 2>&1; then
+  echo "FAIL: stale aspect report was presented as an observation" >&2
+  exit 1
+fi
+grep -q 'build report does not match the selected build' \
+  "$tmp/target/aspects-stale.log"
+
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+    "$jolt" aspects explain target/does-not-exist.edn) \
+    >"$tmp/target/aspects-missing.log" 2>&1; then
+  echo "FAIL: explicit missing aspect report was silently ignored" >&2
+  exit 1
+fi
+grep -q 'aspect report not found: target/does-not-exist.edn' \
+  "$tmp/target/aspects-missing.log"
+
+# Planning resolves provider source but must not load unrelated native objects.
+cp "$tmp/deps.edn" "$tmp/deps.before-native-plan.edn"
+sed -i '/ :jolt\/build/i\ :jolt/native [{:name "must-not-load"\
+  :linux ["libjolt_aspects_introspection_missing.so"]\
+  :darwin ["libjolt_aspects_introspection_missing.dylib"]\
+  :windows ["jolt_aspects_introspection_missing.dll"]}]' "$tmp/deps.edn"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects plan) >"$tmp/target/aspects-native-free-plan.edn"
+cmp "$tmp/target/aspects-plan.edn" "$tmp/target/aspects-native-free-plan.edn"
+cp "$tmp/deps.before-native-plan.edn" "$tmp/deps.edn"
+
 run_build dev --dev
 cmp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
 run_build release-open --no-direct-link
