@@ -45,6 +45,15 @@
   (clojure.core/__invoke-instrumentation-around-replace-args
     advice join-point evaluated-args operation))
 
+(defn invoke-control
+  "The explicitly enabled, test-only `:control-v1` contract. Advice receives
+  `[join-point evaluated-args proceed]`; its return or throw controls the
+  application outcome. `proceed` is owner-thread, dynamic-extent, at-most-once,
+  and accepts either no arguments or one exact-arity replacement vector."
+  [advice join-point evaluated-args operation]
+  (clojure.core/__invoke-instrumentation-control
+    advice join-point evaluated-args operation))
+
 (defn- fail [message data]
   (throw (ex-info (str "jolt aspects: " message) data)))
 
@@ -254,7 +263,8 @@
         (when-not (qualified-symbol? (:fn advice))
           (fail "provider contracted role :fn must be a qualified advice symbol"
                 {:provider provider-var :role role :fn (:fn advice)}))
-        (when-not (contains? #{:args-v1 :replace-args-v1} (:contract advice))
+        (when-not (contains? #{:args-v1 :replace-args-v1 :control-v1}
+                             (:contract advice))
           (fail "unsupported provider role contract"
                 {:provider provider-var :role role :contract (:contract advice)})))
 
@@ -274,9 +284,15 @@
   A provider may name a namespace (whose `aspect-provider` var is used) or a
   qualified provider var. Legacy :provider/:providers selections apply each
   provider to every manifest role. Explicit :consumers selections require a
-  fail-closed :roles filter per ordered provider. Returns nil for a plain build.
-  The returned value is host-neutral data suitable for the host build API."
-  [selections report-path]
+  fail-closed :roles filter per ordered provider. Test-only `:control-v1`
+  consumers additionally require explicit build opt-in. Returns nil for a plain
+  build. The returned value is host-neutral data suitable for the host build API."
+  ([selections report-path]
+   (resolve-build-config selections report-path false))
+  ([selections report-path allow-control-aspects?]
+  (when-not (contains? #{nil false true} allow-control-aspects?)
+    (fail ":jolt/build :allow-control-aspects must be boolean"
+          {:allow-control-aspects allow-control-aspects?}))
   (when (seq selections)
     (when-not (vector? selections)
       (fail ":jolt/build :aspects must be a vector" {:aspects selections}))
@@ -366,7 +382,16 @@
           ids (map :id aspects)]
       (when-not (= (count ids) (count (distinct ids)))
         (fail "selected aspect ids must be unique" {:ids (vec ids)}))
+      (let [control-consumers
+            (vec (for [aspect aspects
+                       consumer (:consumers aspect)
+                       :when (= :control-v1 (:contract consumer))]
+                   {:aspect (:id aspect) :provider (:provider consumer)}))]
+        (when (and (seq control-consumers) (not= true allow-control-aspects?))
+          (fail "control advice requires :jolt/build :allow-control-aspects true"
+                {:consumers control-consumers})))
       (let [material {:weaver weaver-version
+                      :allow-control-aspects (boolean allow-control-aspects?)
                       :selections
                       (mapv (fn [{:keys [resource manifest-bytes providers]}]
                               {:resource resource
@@ -381,6 +406,7 @@
         {:schema schema-version
          :weaver weaver-version
          :identity identity
+         :control-enabled? (boolean allow-control-aspects?)
          ;; Both the mapping-var namespace and every runtime advice namespace
          ;; are explicit build roots. They need not be required by app source.
          :providers (vec (distinct
@@ -391,9 +417,25 @@
                              (map (comp namespace :advice)
                                   (mapcat :consumers aspects)))))
          :aspects (vec (sort-by (comp str :id) aspects))
-         :report report-path}))))
+         :report report-path})))))
+
+(defn- aspect-consumers [aspect]
+  (or (seq (:consumers aspect))
+      [{:ordinal 1
+        :provider (:provider aspect)
+        :advice (:advice aspect)
+        :contract (or (:contract aspect) :proceed-v1)}]))
 
 (defn configure-unit! [unit config]
+  (let [control-consumers
+        (vec (for [aspect (:aspects config)
+                   consumer (aspect-consumers aspect)
+                   :when (= :control-v1 (:contract consumer))]
+               {:aspect (:id aspect) :provider (:provider consumer)}))]
+    (when (and (seq control-consumers)
+               (not= true (:control-enabled? config)))
+      (fail "control advice reached compiler without explicit enablement"
+            {:consumers control-consumers})))
   (reset! (:aspects unit) (vec (or (:aspects config) [])))
   (reset! (:aspect-build-identity unit) (or (:identity config) "plain"))
   (reset! (:aspect-matches unit) {})
@@ -447,13 +489,6 @@
 (defn- fresh-local [unit]
   (str "aspect_arg__" (swap! (:fresh-counter unit) inc)))
 
-(defn- aspect-consumers [aspect]
-  (or (seq (:consumers aspect))
-      [{:ordinal 1
-        :provider (:provider aspect)
-        :advice (:advice aspect)
-        :contract (or (:contract aspect) :proceed-v1)}]))
-
 (defn- runtime-site-id [unit site]
   (stable-identity
     (canonical-str {:build-identity @(:aspect-build-identity unit)
@@ -470,7 +505,8 @@
   (let [[advice-ns advice-name] (split-fqn (:advice consumer))
         pos (:pos node)
         evaluated-args (ir/vector-node (mapv ir/local names))
-        replace-args? (= :replace-args-v1 (:contract consumer))
+        replace-args? (contains? #{:replace-args-v1 :control-v1}
+                                 (:contract consumer))
         replacement-names (when replace-args?
                             (mapv (fn [_] (fresh-local unit)) names))
         operation-names (or replacement-names names)
@@ -484,10 +520,11 @@
                        (ir/fn-node nil [{:params (or replacement-names [])
                                         :body operation}])
                        pos (assoc :pos pos))
-        helper-name (if replace-args?
-                      "__invoke-instrumentation-around-replace-args"
+        helper-name (case (:contract consumer)
+                      :control-v1 "__invoke-instrumentation-control"
+                      :replace-args-v1 "__invoke-instrumentation-around-replace-args"
                       "__invoke-instrumentation-around")
-        helper-args (if (contains? #{:args-v1 :replace-args-v1}
+        helper-args (if (contains? #{:args-v1 :replace-args-v1 :control-v1}
                                    (:contract consumer))
                       [advice-ref join-point-node evaluated-args operation-fn]
                       [advice-ref join-point-node operation-fn])
@@ -512,7 +549,8 @@
   [unit aspect consumer consumers arity pos original-names names site]
   (let [[advice-ns advice-name] (split-fqn (:advice consumer))
         evaluated-args (ir/vector-node (mapv ir/local names))
-        replace-args? (= :replace-args-v1 (:contract consumer))
+        replace-args? (contains? #{:replace-args-v1 :control-v1}
+                                 (:contract consumer))
         replacement-names (when replace-args?
                             (mapv (fn [_] (fresh-local unit)) names))
         operation-inputs (or replacement-names names)
@@ -535,10 +573,11 @@
         operation-fn (ir/fn-node nil [operation-arity])
         advice-ref (cond-> (ir/var-ref advice-ns advice-name)
                      pos (assoc :pos pos))
-        helper-name (if replace-args?
-                      "__invoke-instrumentation-around-replace-args"
+        helper-name (case (:contract consumer)
+                      :control-v1 "__invoke-instrumentation-control"
+                      :replace-args-v1 "__invoke-instrumentation-around-replace-args"
                       "__invoke-instrumentation-around")
-        helper-args (if (contains? #{:args-v1 :replace-args-v1}
+        helper-args (if (contains? #{:args-v1 :replace-args-v1 :control-v1}
                                    (:contract consumer))
                       [advice-ref (ir/quote-node (join-point unit aspect consumer site))
                        evaluated-args operation-fn]
@@ -630,6 +669,7 @@
       {:schema schema-version
        :weaver (:weaver config)
        :identity (:identity config)
+       :control-enabled? (boolean (:control-enabled? config))
        :aspects
        (mapv (fn [aspect]
                (let [consumers (vec (aspect-consumers aspect))
