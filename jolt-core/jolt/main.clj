@@ -601,33 +601,80 @@
 
 (defn- cmd-aspects [more]
   (let [[subcommand report-arg & extra] more]
-    (when (or (nil? subcommand) (seq extra)
-              (and (= "plan" subcommand) report-arg)
-              (not (contains? #{"plan" "explain"} subcommand)))
-      (throw (ex-info "usage: jolt aspects plan | jolt aspects explain [REPORT]"
-                      {:args (vec more)})))
-    (let [{:keys [build] :as resolved} (resolve-current)
-          _ (apply-project-roots! resolved)
-          configured-report (project-path (:aspect-report build))
-          config (aspects/resolve-build-config
-                  (:aspects build) configured-report
-                  (:allow-control-aspects build))
-          plan (aspects/plan-data config)]
-      (case subcommand
-        "plan" (prn plan)
-        "explain"
-        (let [explicit? (some? report-arg)
-              report-path (or (project-path report-arg) configured-report)
-              report-file (some-> report-path io/file)
-              _ (when (and explicit? (not (.isFile report-file)))
-                  (throw (ex-info (str "aspect report not found: " report-arg)
-                                  {:report report-arg})))
-              report (when (and report-file (.isFile report-file))
-                       (edn/read-string (slurp report-file)))
-              label (when report
-                      (if explicit? report-arg
-                          (or (:aspect-report build) "configured build report")))]
-          (run! println (aspects/explain-lines plan report label)))))))
+    (when (nil? subcommand)
+      (throw (ex-info
+              (str "usage: jolt aspects plan | jolt aspects explain [REPORT] | "
+                   "jolt aspects manifest [--check]")
+              {:args (vec more)})))
+    (if (= "manifest" subcommand)
+      (do
+        (when (or (seq extra)
+                  (and report-arg (not= "--check" report-arg)))
+          (throw (ex-info "usage: jolt aspects manifest [--check]"
+                          {:args (vec more)})))
+        (let [{:keys [aspect-authoring] :as resolved}
+              (resolve-current)
+              _ (apply-project-roots! resolved)
+              configured-path (:manifest aspect-authoring)
+              _ (when-not (string? configured-path)
+                  (throw (ex-info
+                          "jolt aspects manifest needs :jolt/aspects :manifest path"
+                          {:jolt/aspects aspect-authoring})))
+              path (project-path configured-path)
+              file (io/file path)
+              temp-dir (java.nio.file.Files/createTempDirectory
+                        "jolt-aspects-"
+                        (into-array java.nio.file.attribute.FileAttribute []))]
+          (try
+            (let [rendered
+                  (binding [*compile-path* (str temp-dir)]
+                    (aspects/render-manifest
+                     (aspects/collect-manifest aspect-authoring compile)))]
+              (if (= "--check" report-arg)
+                (if (and (.isFile file) (= rendered (slurp file)))
+                  (println (str "aspect manifest is current: " configured-path))
+                  (throw (ex-info (str "generated aspect manifest is stale: "
+                                       configured-path)
+                                  {:manifest configured-path})))
+                (do
+                  (when-some [parent (.getParentFile file)]
+                    (.mkdirs parent))
+                  (spit file rendered)
+                  (println (str "wrote aspect manifest: " configured-path)))))
+            (finally
+              (jolt.host/delete-tree! (str temp-dir))))))
+      (do
+        (when (or (seq extra)
+                  (and (= "plan" subcommand) report-arg)
+                  (not (contains? #{"plan" "explain"} subcommand)))
+          (throw (ex-info
+                  (str "usage: jolt aspects plan | jolt aspects explain [REPORT] | "
+                       "jolt aspects manifest [--check]")
+                  {:args (vec more)})))
+        (let [{:keys [build] :as resolved} (resolve-current)
+              _ (apply-project-roots! resolved)
+              configured-report (project-path (:aspect-report build))
+              config (aspects/resolve-build-config
+                      (:aspects build) configured-report
+                      (:allow-control-aspects build))
+              plan (aspects/plan-data config)]
+          (case subcommand
+            "plan" (prn plan)
+            "explain"
+            (let [explicit? (some? report-arg)
+                  report-path (or (project-path report-arg) configured-report)
+                  report-file (some-> report-path io/file)
+                  _ (when (and explicit? (not (.isFile report-file)))
+                      (throw (ex-info (str "aspect report not found: " report-arg)
+                                      {:report report-arg})))
+                  report (when (and report-file (.isFile report-file))
+                           (edn/read-string (slurp report-file)))
+                  label (when report
+                          (if explicit? report-arg
+                              (or (:aspect-report build)
+                                  "configured build report")))]
+              (run! println
+                    (aspects/explain-lines plan report label)))))))))
 
 (defn- cmd-build [more]
   (let [{:keys [project-paths embed-dirs build] :as resolved}
@@ -769,6 +816,8 @@
   (println "                         (see tools/cross-compile)")
   (println "  aspects plan           resolve and print selected manifests and consumers")
   (println "  aspects explain [FILE] explain selection and optional observed build report")
+  (println "  aspects manifest       compile cooperative annotations into EDN")
+  (println "  aspects manifest --check  fail when the generated manifest is stale")
   (println "  path                   print the resolved source roots")
   (println "  tasks                  list the project's bb.edn/deps.edn :tasks")
   (println "  <task> [args]          run a task (`run <task>` and `run --parallel")

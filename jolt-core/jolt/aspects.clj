@@ -6,9 +6,9 @@
   var. The compiler resolves and validates that material before a build, then
   this namespace rewrites selected call or function-entry IR before optimization.
 
-  V1 supports resolved var-call join points and fixed-arity qualified function
-  entries. Both selectors are deterministic and strict, and neither depends on
-  source positions."
+  V1 supports resolved var-call join points, optional cooperative call markers,
+  and fixed-arity qualified function entries. Selectors are deterministic and
+  strict, and none depends on source positions."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -53,6 +53,23 @@
   [advice join-point evaluated-args operation]
   (clojure.core/__invoke-instrumentation-control
     advice join-point evaluated-args operation))
+
+(defn __at
+  "Runtime fallback for the cooperative call-site marker. Compiled code removes
+  this boundary in the analyzer; interpreted fallback still evaluates and
+  returns the marked expression unchanged."
+  [_declaration value]
+  value)
+
+(defmacro at
+  "Mark one qualified or namespace-aliased call as a cooperative join point.
+
+  The literal declaration is `{:id keyword :role keyword}`. Plain builds retain
+  the call's ordinary behavior with no runtime wrapper. `jolt aspects manifest`
+  emits the marker through the same schema-1 manifest ABI used by external
+  instrumentation packs."
+  [declaration expression]
+  `(jolt.aspects/__at ~declaration ~expression))
 
 (defn- fail [message data]
   (throw (ex-info (str "jolt aspects: " message) data)))
@@ -261,14 +278,17 @@
       (when-not (and (map? m)
                      (int? (:arity m)) (not (neg? (:arity m)))
                      (or (and call? (not entry?) (symbol? (:ns m))
-                              (qualified-symbol? (:call m)))
+                              (qualified-symbol? (:call m))
+                              (or (not (contains? m :marker))
+                                  (keyword? (:marker m))))
                          (and entry? (not call?)
                               (qualified-symbol? (:entry m)))))
         (fail (str "v1 :match needs either symbolic :ns plus qualified :call, "
                    "or qualified :entry, and a non-negative integer :arity")
               {:resource resource :aspect (:id aspect) :match m}))
       (reject-unknown-keys "aspect :match" m
-                           (if call? #{:ns :call :arity} #{:entry :arity})
+                           (if call? #{:ns :call :arity :marker}
+                                     #{:entry :arity})
                            {:resource resource :aspect (:id aspect)})
       (when-not (map? (:expect aspect))
         (fail "aspect :expect must be a map" {:resource resource :aspect (:id aspect)}))
@@ -278,6 +298,73 @@
         (fail "v1 :expect needs a positive integer :matches"
               {:resource resource :aspect (:id aspect) :expect (:expect aspect)}))))
   manifest)
+
+;; ---------------------------------------------------------------------------
+;; The collector is dynamically scoped across the compiler's nested namespace
+;; loads. Explicit owner namespaces keep annotations in transitive dependencies
+;; from leaking into the package's published manifest.
+(def ^:private ^:dynamic *declaration-sink* nil)
+(def ^:private ^:dynamic *declaration-namespaces* #{})
+
+(defn- manifest-from-declarations [library declarations]
+  (when-not (and (map? library)
+                 (symbol? (:id library))
+                 (string? (:version library)))
+    (fail "source manifest :library needs symbolic :id and string :version"
+          {:library library}))
+  (reject-unknown-keys "source manifest :library" library #{:id :version}
+                       {:library library})
+  (let [aspects (->> declarations (sort-by (comp str :id)) vec)
+        ids (map :id aspects)]
+    (when-not (= (count ids) (count (distinct ids)))
+      (fail "cooperative join-point ids must be unique" {:ids (vec ids)}))
+    (when (empty? aspects)
+      (fail "source manifest found no cooperative join-point declarations" {}))
+    (validate-manifest "<generated>"
+                       {:schema schema-version
+                        :library library
+                        :aspects aspects})))
+
+(defn render-manifest
+  "Render generated manifest data deterministically, including a final newline."
+  [manifest]
+  (let [render-aspect
+        (fn [aspect]
+          (str "{:id " (pr-str (:id aspect))
+               "\n   :match " (canonical-str (:match aspect))
+               "\n   :advice-role " (pr-str (:advice-role aspect))
+               "\n   :expect " (canonical-str (:expect aspect)) "}"))]
+    (str "{:schema " (:schema manifest)
+         "\n :library " (canonical-str (:library manifest))
+         "\n :aspects\n ["
+         (str/join "\n  " (map render-aspect (:aspects manifest)))
+         "]}\n")))
+
+(defn collect-manifest
+  "Compile configured annotation-owning namespaces and return their manifest.
+
+  `compile!` receives each namespace symbol. Annotation discovery observes the
+  same analyzed IR the weaver sees, after ordinary namespace resolution and
+  macro expansion. The caller chooses the compile output location."
+  [authoring compile!]
+  (when-not (map? authoring)
+    (fail "deps.edn :jolt/aspects must be a map" {:jolt/aspects authoring}))
+  (reject-unknown-keys "deps.edn :jolt/aspects" authoring
+                       #{:library :manifest :namespaces} {:jolt/aspects authoring})
+  (let [namespaces (:namespaces authoring)]
+    (when-not (and (vector? namespaces) (seq namespaces)
+                   (every? #(and (symbol? %) (nil? (namespace %))) namespaces))
+      (fail "deps.edn :jolt/aspects :namespaces needs a non-empty vector of namespace symbols"
+            {:namespaces namespaces}))
+    (when-not (= (count namespaces) (count (distinct namespaces)))
+      (fail "deps.edn :jolt/aspects :namespaces must be unique"
+            {:namespaces namespaces}))
+    (let [sink (atom {})]
+      (binding [*declaration-sink* sink
+                *declaration-namespaces* (set namespaces)]
+        (doseq [ns-name namespaces]
+          (compile! ns-name)))
+      (manifest-from-declarations (:library authoring) (vals @sink)))))
 
 (defn- validate-provider [provider-var provider]
   (when-not (and (map? provider) (= schema-version (:schema provider))
@@ -540,10 +627,12 @@
     (fail "build report site must be a map"
           {:aspect (:id aspect) :site-type (type site)}))
   (reject-unknown-keys "build report site" site
-                       #{:aspect :within :call :entry :arity :ordinal :position}
+                       #{:aspect :within :call :entry :marker
+                         :arity :ordinal :position}
                        {:aspect (:id aspect)})
   (let [match (:match aspect)
         call? (contains? match :call)
+        marker (:marker match)
         target (if call? (:call match) (:entry match))
         expected-within (if call? (str (:ns match)) (namespace target))]
     (when-not (and (= (:id aspect) (:aspect site))
@@ -554,11 +643,14 @@
                    (pos? (:ordinal site))
                    (valid-site-position? (:position site))
                    (= call? (contains? site :call))
-                   (= (not call?) (contains? site :entry)))
+                   (= (not call?) (contains? site :entry))
+                   (= marker (:marker site))
+                   (= (some? marker) (contains? site :marker)))
       (fail "build report site does not match selected aspect"
             {:aspect (:id aspect) :ordinal (:ordinal site)}))
-    (select-keys site [:aspect :within (if call? :call :entry)
-                       :arity :ordinal :position])))
+    (select-keys site (cond-> [:aspect :within (if call? :call :entry)
+                              :arity :ordinal :position]
+                       marker (conj :marker)))))
 
 (defn validate-build-report
   "Validate that a report is an observation of this exact static plan.
@@ -653,24 +745,32 @@
 (defn- split-fqn [sym]
   [(namespace sym) (name sym)])
 
-(defn- call-match? [owner-ns {:keys [ns call arity]} node]
-  (let [f (:fn node)
+(defn- call-match? [owner-ns aspect node]
+  (let [{:keys [ns call arity marker]} (:match aspect)
+        f (:fn node)
+        source-marker (:aspect-marker node)
         [call-ns call-name] (split-fqn call)]
     (and (= :invoke (:op node))
          (= (str ns) owner-ns)
          (= :var (:op f))
          (= call-ns (:ns f))
          (= call-name (:name f))
-         (= arity (count (:args node))))))
+         (= arity (count (:args node)))
+         (or (nil? marker)
+             (and (= marker (:id source-marker))
+                  (= (:advice-role aspect) (:role source-marker)))))))
 
 (defn- call-site [owner-ns aspect node ordinal]
-  {:aspect (:id aspect)
-   :within owner-ns
-   :call (get-in aspect [:match :call])
-   :arity (count (:args node))
-   :ordinal ordinal
-   ;; Absolute checkout paths make reports needlessly machine-specific.
-   :position (select-keys (:pos node) [:line :column])})
+  (cond->
+   {:aspect (:id aspect)
+    :within owner-ns
+    :call (get-in aspect [:match :call])
+    :arity (count (:args node))
+    :ordinal ordinal
+    ;; Absolute checkout paths make reports needlessly machine-specific.
+    :position (select-keys (:pos node) [:line :column])}
+    (get-in aspect [:match :marker])
+    (assoc :marker (get-in aspect [:match :marker]))))
 
 (defn- entry-match? [node aspect arity]
   (let [[entry-ns entry-name] (split-fqn (get-in aspect [:match :entry]))]
@@ -823,6 +923,100 @@
         node))
     node))
 
+(defn- entry-declaration [node]
+  (when-some [declaration (:aspect-entry node)]
+    (when-not (and (= :def (:op node)) (= :fn (get-in node [:init :op])))
+      (fail "aspect entry declaration requires a function definition"
+            {:namespace (:ns node) :definition (:name node)}))
+      (let [data {:namespace (:ns node) :definition (:name node)
+                  :declaration declaration}]
+        (when-not (map? declaration)
+          (fail "aspect entry metadata must be a literal map" data))
+        (reject-unknown-keys "aspect entry metadata" declaration
+                             #{:id :role :arity} data)
+        (when-not (keyword? (:id declaration))
+          (fail "annotated entry :id must be a keyword" data))
+        (when-not (keyword? (:role declaration))
+          (fail "annotated entry :role must be a keyword" data))
+        (let [arities (get-in node [:init :arities])
+              _ (when (some :rest arities)
+                  (fail "annotated function entries must be fixed arity" data))
+              available (mapv #(count (:params %)) arities)
+              requested (:arity declaration)
+              arity (cond
+                      (some? requested)
+                      (do
+                        (when-not (and (int? requested) (not (neg? requested)))
+                          (fail "annotated entry :arity must be a non-negative integer" data))
+                        (when-not (= 1 (count (filter #(= requested %) available)))
+                          (fail "annotated entry :arity must select exactly one function arity"
+                                (assoc data :available-arities available)))
+                        requested)
+
+                      (= 1 (count available)) (first available)
+
+                      :else
+                      (fail "multi-arity annotated entry needs explicit :arity"
+                            (assoc data :available-arities available)))]
+          {:id (:id declaration)
+           :match {:entry (symbol (:ns node) (:name node)) :arity arity}
+           :advice-role (:role declaration)
+           :expect {:matches 1}}))))
+
+(defn- marker-declaration [owner-ns node]
+  (when-some [declaration (:aspect-marker node)]
+    (let [f (:fn node)
+          data {:namespace owner-ns :declaration declaration}]
+      (when-not (and (= :invoke (:op node)) (= :var (:op f)))
+        (fail "jolt.aspects/at must resolve to a var call" data))
+      {:id (:id declaration)
+       :match {:ns (symbol owner-ns)
+               :call (symbol (:ns f) (:name f))
+               :arity (count (:args node))
+               :marker (:id declaration)}
+       :advice-role (:role declaration)
+       :expect {:matches 1}})))
+
+(defn- record-declaration! [site declaration]
+  (swap! *declaration-sink*
+         (fn [observed]
+           (if-some [prior (get observed site)]
+             (do
+               (when-not (= prior declaration)
+                 (fail "cooperative join point changed while compiling"
+                       {:site site :first prior :later declaration}))
+               observed)
+             (assoc observed site declaration)))))
+
+(defn- collect-declarations! [root]
+  (let [owner-ns (str (or (:ns root) (:fnsrc-ns root)))
+        root-site [:root owner-ns (:name root) (:pos root)]]
+    (when (and *declaration-sink*
+               (contains? *declaration-namespaces* (symbol owner-ns)))
+      (when-some [entry (entry-declaration root)]
+        (when-not (map? (:pos root))
+          (fail "cooperative entry declaration has no compiler source position"
+                {:entry (get-in entry [:match :entry])}))
+        (record-declaration! [:entry root-site] entry))
+      (letfn [(walk [node path]
+                (when-some [marker (marker-declaration owner-ns node)]
+                  (when-not (and (= :def (:op root))
+                                 (= :fn (get-in root [:init :op])))
+                    (fail "cooperative call declarations must be inside a function definition"
+                          {:call (get-in marker [:match :call])
+                           :namespace owner-ns}))
+                  (when-not (map? (:pos root))
+                    (fail "cooperative call declaration has no compiler source position"
+                          {:call (get-in marker [:match :call])}))
+                  (record-declaration! [:call root-site path] marker))
+                (let [child-index (atom -1)]
+                  (ir/reduce-ir-children
+                   (fn [acc child]
+                     (walk child (conj path (swap! child-index inc)))
+                     acc)
+                   nil node)))]
+        (walk root [])))))
+
 (defn weave
   "Rewrite resolved calls selected for this compilation unit.
 
@@ -830,14 +1024,15 @@
   not revisited by this walk. Match counts are accumulated for the build's
   fail-closed finalization and deterministic report."
   [unit root]
+  (collect-declarations! root)
   (let [aspects @(:aspects unit)
-        owner-ns (str (:ns root))]
+        owner-ns (str (or (:ns root) (:fnsrc-ns root)))]
     (if (or (:aspect-woven root) (empty? aspects) (str/blank? owner-ns))
       root
       (letfn [(walk [node]
                 (let [node (ir/map-ir-children walk node)
                       matches (filterv #(and (contains? (:match %) :call)
-                                             (call-match? owner-ns (:match %) node))
+                                             (call-match? owner-ns % node))
                                        aspects)]
                   (when (> (count matches) 1)
                     (fail "multiple selected aspects match the same call site"
