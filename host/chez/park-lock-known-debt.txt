@@ -30,4 +30,3 @@ host/chez/java/sm.ss jolt-sm-fiber-put dispatch ac-notify! 1 issue=chucklehead-d
 host/chez/java/sm.ss jolt-sm-fiber-put dispatch jolt-chan-locked-give! 1 issue=chucklehead-dev/jolt-aspect-packs#21
 host/chez/java/sm.ss jolt-sm-fiber-take dispatch ac-notify! 1 issue=chucklehead-dev/jolt-aspect-packs#21
 host/chez/java/sm.ss jolt-sm-fiber-take dispatch ac-poll!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/regex.ss regex-parsed-entry dispatch java-pattern->sre 1 issue=chucklehead-dev/jolt-aspect-packs#40
