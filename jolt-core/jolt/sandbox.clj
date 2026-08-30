@@ -41,7 +41,17 @@
    :agent/project-develop
    {:profile/id :agent/project-develop
     :profile/max-capabilities #{:project/read :project/list :project/search
-                                :project/stat :project/edit}}})
+                                :project/stat :project/edit}}
+   ;; JS2. Project EXECUTION is a genuinely new authority class, not a
+   ;; narrower way to spend :project/edit, so it gets its own capability and
+   ;; its own profile rather than widening the develop maximum. A develop
+   ;; binding must not gain :project/run merely because this profile exists:
+   ;; the maxima above are unchanged, and resolve-context-spec refuses
+   ;; :project/run under either of them.
+   :agent/project-execute
+   {:profile/id :agent/project-execute
+    :profile/max-capabilities #{:project/read :project/list :project/search
+                                :project/stat :project/edit :project/run}}})
 
 (defn inert
   "Canonicalize a value into the receipt domain.

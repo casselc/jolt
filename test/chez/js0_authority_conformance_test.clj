@@ -18,6 +18,7 @@
 
 (def world (atom {"a" "old"}))
 (def writes (atom 0))
+(def runs (atom 0))
 (def host-failures (atom 0))
 (def pure-op {:id :math/inc :name 'inc* :effect :pure :fn inc})
 (def read-op {:id :project/read :name 'read :effect :observation
@@ -41,9 +42,17 @@
                     v)})
 (def network-op {:id :network/get :name 'network-get :effect :observation
                  :fn (fn [_] "network")})
+(def run-op {:id :project/run :name 'run :effect :actuation
+             :fn (fn
+                   ([argv] (swap! runs inc) {:exit 0 :argv (vec argv)})
+                   ([argv options]
+                    (swap! runs inc)
+                    {:exit 0 :argv (vec argv) :options options}))})
 (def read-caps #{:project/read :project/list :project/search :project/stat})
 (def develop-caps (conj read-caps :project/edit))
-(def all-ops [pure-op read-op list-op search-op stat-op edit-op network-op])
+(def execute-caps (conj develop-caps :project/run))
+(def all-ops [pure-op read-op list-op search-op stat-op edit-op network-op
+              run-op])
 
 ;; Closed profile maxima and attenuation.
 (ok "minimal maximum is closed" (= #{} (get-in sandbox/profiles
@@ -56,6 +65,24 @@
     (= develop-caps (get-in sandbox/profiles
                             [:agent/project-develop
                              :profile/max-capabilities])))
+;; JS2. The execution capability is its own, and adding it did NOT widen any
+;; profile that existed before it.
+(ok "execute maximum is closed"
+    (= execute-caps (get-in sandbox/profiles
+                            [:agent/project-execute
+                             :profile/max-capabilities])))
+(ok "project-read still excludes project/run"
+    (not (contains? (get-in sandbox/profiles
+                            [:agent/project-read :profile/max-capabilities])
+                    :project/run)))
+(ok "project-develop still excludes project/run"
+    (not (contains? (get-in sandbox/profiles
+                            [:agent/project-develop :profile/max-capabilities])
+                    :project/run)))
+(ok "project-execute includes project/run"
+    (contains? (get-in sandbox/profiles
+                       [:agent/project-execute :profile/max-capabilities])
+               :project/run))
 
 (let [minimal (sandbox/create-context
                 {:operations all-ops :profile :agent/minimal
@@ -284,6 +311,97 @@
                   "(.toString 1)"]]
     (ok (str "deny surface: " source)
         (denied? #(sandbox/evaluate! ctx source)))))
+
+
+;; ── JS2: the execution capability ──────────────────────────────────────────
+;; project/run is authority a develop binding does not have, is reachable
+;; under :agent/project-execute, attenuates like every other capability, and
+;; records and replays through the SAME receipt mechanism as project/edit —
+;; a replayed run performs zero real executions.
+(ok "develop rejects execution authorization"
+    (error-is? :profile-exceeded
+               #(sandbox/create-context
+                  {:operations all-ops :profile :agent/project-develop
+                   :authorized-capabilities execute-caps})))
+(ok "read rejects execution authorization"
+    (error-is? :profile-exceeded
+               #(sandbox/create-context
+                  {:operations all-ops :profile :agent/project-read
+                   :authorized-capabilities (conj read-caps :project/run)})))
+(ok "execute rejects an unknown execution capability"
+    (error-is? :profile-exceeded
+               #(sandbox/create-context
+                  {:operations all-ops :profile :agent/project-execute
+                   :authorized-capabilities (conj execute-caps :network/get)})))
+(ok "execute rejects requesting run beyond authorization"
+    (error-is? :over-request
+               #(sandbox/create-context
+                  {:operations all-ops :profile :agent/project-execute
+                   :requested-capabilities execute-caps
+                   :authorized-capabilities develop-caps})))
+
+(let [develop (sandbox/create-context
+                {:operations all-ops :profile :agent/project-develop
+                 :authorized-capabilities develop-caps})
+      execute (sandbox/create-context
+                {:operations all-ops :profile :agent/project-execute
+                 :authorized-capabilities execute-caps})
+      attenuated (sandbox/create-context
+                   {:operations all-ops :profile :agent/project-execute
+                    :authorized-capabilities develop-caps})]
+  (ok "develop denies project/run"
+      (denied? #(sandbox/evaluate! develop "(project/run [\"echo\"])")))
+  (ok "execute permits project/run"
+      (= {:exit 0 :argv ["echo" "hi"]}
+         (sandbox/evaluate! execute "(project/run [\"echo\" \"hi\"])")))
+  (ok "execute permits the options arity"
+      (= {:argv ["echo"] :exit 0 :options {:cwd "."}}
+         (sandbox/evaluate! execute "(project/run [\"echo\"] {:cwd \".\"})")))
+  (ok "attenuation removes profile-permitted run"
+      (denied? #(sandbox/evaluate! attenuated "(project/run [\"echo\"])")))
+  ;; Against the live fixture world rather than a literal: earlier blocks in
+  ;; this file have already exercised the edit op, so what "a" holds here is
+  ;; whatever they left. The claim is that the read still WORKS, not what the
+  ;; fixture happens to contain.
+  (ok "attenuated execute keeps its other authority"
+      (= (get @world "a") (sandbox/evaluate! attenuated "(project/read \"a\")")))
+  (ok "revocation removes run from a live context"
+      (do (sandbox/revoke! execute :project/run)
+          (denied? #(sandbox/evaluate! execute "(project/run [\"echo\"])")))))
+
+(let [ctx (sandbox/create-context
+            {:operations all-ops :profile :agent/project-execute
+             :authorized-capabilities execute-caps})]
+  (sandbox/set-mode! ctx :record)
+  (sandbox/evaluate! ctx "(project/run [\"jolt\" \"-M:test\"])")
+  (let [rs (sandbox/receipts ctx)
+        before @runs]
+    (ok "an execution records one receipt" (= 1 (count rs)))
+    (ok "the receipt names the operation and its argv"
+        (= {:op/id :project/run :op/args [["jolt" "-M:test"]]
+            :op/result {:argv ["jolt" "-M:test"] :exit 0}}
+           (first rs)))
+    (sandbox/load-receipts! ctx rs)
+    (sandbox/set-mode! ctx :replay)
+    (ok "replay returns the historical execution result"
+        (= {:argv ["jolt" "-M:test"] :exit 0}
+           (sandbox/evaluate! ctx "(project/run [\"jolt\" \"-M:test\"])")))
+    (ok "replay performed ZERO real executions" (= before @runs))
+    (sandbox/load-receipts! ctx rs)
+    (sandbox/set-mode! ctx :replay)
+    (ok "a replayed execution with different argv fails closed"
+        (error-is? :args-mismatch
+                   #(sandbox/evaluate! ctx "(project/run [\"jolt\" \"-M:other\"])")))
+    (ok "a mismatched replay still performed zero executions" (= before @runs))
+    (sandbox/load-receipts! ctx [])
+    (sandbox/set-mode! ctx :replay)
+    (ok "an unrecorded execution exhausts the transcript"
+        (error-is? :exhausted
+                   #(sandbox/evaluate! ctx "(project/run [\"jolt\"])")))
+    (sandbox/load-receipts! ctx rs)
+    (sandbox/set-mode! ctx :replay)
+    (ok "an unconsumed execution receipt fails closed"
+        (error-is? :unconsumed #(sandbox/evaluate! ctx "(+ 1 1)")))))
 
 (if (empty? @failures)
   (println "JS0-AUTHORITY-CONFORMANCE OK")
