@@ -280,7 +280,9 @@
             "java.util.List" "java.util.Set" "java.util.Collection" "java.util.Map"
             "java.util.Iterator" "java.lang.Iterable" "java.lang.CharSequence"
             "java.lang.Appendable" "java.lang.Comparable" "java.lang.Runnable"
-            "java.util.concurrent.Callable" "java.io.Serializable"
+            "java.util.concurrent.Callable" "java.util.concurrent.Executor"
+            "java.util.concurrent.ExecutorService" "java.util.concurrent.Future"
+            "java.util.concurrent.RunnableFuture" "java.io.Serializable"
             "java.lang.AutoCloseable" "java.io.Closeable" "java.io.Flushable"
             "java.lang.Readable"
             ;; interfaces the graph modeled as concrete classes, so .isInterface
@@ -499,6 +501,7 @@
 (jch-register-supers! "java.io.UncheckedIOException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.util.concurrent.RejectedExecutionException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.util.concurrent.ExecutionException" '("java.lang.Exception"))
+(jch-register-supers! "java.util.concurrent.TimeoutException" '("java.lang.Exception"))
 (jch-register-supers! "java.time.DateTimeException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.time.format.DateTimeParseException" '("java.time.DateTimeException"))
 (jch-register-supers! "java.text.ParseException" '("java.lang.Exception"))
@@ -682,6 +685,18 @@
 (jch-register-supers! "java.lang.Comparable" '())
 (jch-register-supers! "java.lang.Runnable" '())
 (jch-register-supers! "java.util.concurrent.Callable" '())
+(jch-register-supers! "java.util.concurrent.Executor" '())
+(jch-register-supers! "java.util.concurrent.ExecutorService"
+                      '("java.util.concurrent.Executor" "java.lang.AutoCloseable"))
+(jch-register-supers! "java.util.concurrent.AbstractExecutorService"
+                      '("java.util.concurrent.ExecutorService"))
+(jch-register-supers! "java.util.concurrent.ThreadPoolExecutor"
+                      '("java.util.concurrent.AbstractExecutorService"))
+(jch-register-supers! "java.util.concurrent.Future" '())
+(jch-register-supers! "java.util.concurrent.RunnableFuture"
+                      '("java.lang.Runnable" "java.util.concurrent.Future"))
+(jch-register-supers! "java.util.concurrent.FutureTask"
+                      '("java.util.concurrent.RunnableFuture"))
 ;; java.time temporal interfaces — base abstractions the concrete time classes implement
 (jch-register-supers! "java.time.temporal.TemporalAccessor" '())
 (jch-mark-interface! "java.time.temporal.TemporalAccessor")
@@ -751,6 +766,8 @@
 (for-each (lambda (p) (hashtable-set! jhost-tag->fqn (car p) (cdr p)))
   '(("user-thread" . "java.lang.Thread")
     ("abq" . "java.util.concurrent.ArrayBlockingQueue")
+    ("executor-service" . "java.util.concurrent.ExecutorService")
+    ("thread-pool-executor" . "java.util.concurrent.ThreadPoolExecutor")
     ("future-task" . "java.util.concurrent.FutureTask")
     ("instant" . "java.time.Instant")
     ("local-date" . "java.time.LocalDate")
