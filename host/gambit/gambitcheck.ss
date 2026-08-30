@@ -276,6 +276,40 @@
   ;; with-mutex macro: body value + no deadlock
   (check "with-mutex returns body value"
          (with-mutex (make-mutex) 42) 42)
+  ;; The backend-neutral logical mutex used by shared extension machinery is
+  ;; reentrant, releases on non-local exit, and excludes another thread.
+  (let ((lm (jolt-logical-mutex-new)))
+    (check "logical mutex starts unlocked"
+           (jolt-logical-mutex-locked? lm) #f)
+    (check "logical mutex is reentrant and returns the body value"
+           (jolt-with-logical-mutex
+             lm
+             (lambda ()
+               (jolt-with-logical-mutex
+                 lm
+                 (lambda ()
+                   (list (jolt-logical-mutex-held-by-self? lm)
+                         (jolt-logical-mutex-hold-count lm))))))
+           '(#t 2))
+    (check "logical mutex scoped exit releases"
+           (jolt-logical-mutex-locked? lm) #f)
+    (let ((escaped
+            (call/cc
+              (lambda (leave)
+                (jolt-with-logical-mutex lm (lambda () (leave 'escaped)))))))
+      (check "logical mutex releases on continuation escape"
+             (list escaped (jolt-logical-mutex-locked? lm))
+             '(escaped #f)))
+    (jolt-logical-mutex-enter! lm)
+    (let* ((other-result (vector #f))
+           (t (fork-thread
+                (lambda ()
+                  (vector-set! other-result 0
+                               (jolt-logical-mutex-try-enter! lm))))))
+      (thread-join! t)
+      (check "logical mutex excludes another thread"
+             (vector-ref other-result 0) #f))
+    (jolt-logical-mutex-exit! lm))
   ;; parameter fork-inheritance (the G0 pin)
   (let ((p (make-thread-parameter 1))
         (result (make-thread-parameter #f)))
