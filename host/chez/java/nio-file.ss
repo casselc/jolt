@@ -637,7 +637,7 @@
 (define c-symlink  (jolt-foreign-proc-safe "symlink"  '(string string) 'int))
 (define c-link     (jolt-foreign-proc-safe "link"     '(string string) 'int))
 (define c-readlink (jolt-foreign-proc-safe "readlink" '(string u8* unsigned-long) 'long))
-(define c-chmod    (jolt-foreign-proc-safe "chmod"    '(string int) 'int))
+(define c-chmod    fs-c-chmod)
 (define (nio-is-symlink? fp)
   (and c-readlink (> (c-readlink fp (make-bytevector 1 0) 1) 0)))   ; readlink succeeds only on a link
 (define (nio-readlink fp)
@@ -716,7 +716,7 @@
 
 ;; ---- stat-backed perms + real path (increment: what the fs suite exercises) --
 ;; st_mode lives at a platform-specific offset in struct stat; read only that.
-(define nio-macos? (eq? (sa-os-family) 'macos))
+(define nio-macos? fs-stat-macos?)
 ;; struct stat field offsets are platform ABIs, not portable: verified for
 ;; Darwin (st_mode@4/st_uid@16, all arches) and x86_64 Linux glibc
 ;; (st_mode@24/st_uid@28 -- ground-truthed via offsetof probes). aarch64 Linux
@@ -725,23 +725,18 @@
 ;; clear error instead. st_mtim@88 is identical on both Linux ABIs, so the
 ;; mtime readers stay unguarded. Add a verified branch (not a guess) when a
 ;; new host is brought up.
-(define nio-x86-64-linux? (and (eq? (sa-arch) 'x86-64) (eq? (sa-endian) 'little)))
-(define nio-stat-layout-known? (or nio-macos? nio-x86-64-linux?))
+(define nio-x86-64-linux? fs-stat-x86-64-linux?)
+(define nio-stat-layout-known? fs-stat-layout-known?)
 (define (nio-stat-layout-guard! who)
   (unless nio-stat-layout-known?
     (jolt-throw (jolt-host-throwable "java.lang.UnsupportedOperationException"
       (string-append who " is not supported on this host: unverified struct stat layout for "
                      (sa-host-tag))))))
-(define c-stat (jolt-foreign-proc-safe "stat" '(string u8*) 'int))
+(define c-stat fs-c-stat)
 (define (nio-stat-mode fp)
-  (and c-stat
-       (begin
-         (nio-stat-layout-guard! "getPosixFilePermissions")
-         (let ((buf (make-bytevector 256 0)))
-           (and (= 0 (c-stat fp buf))
-                (if nio-macos?
-                    (bytevector-u16-ref buf 4 (native-endianness))
-                    (bytevector-u32-ref buf 24 (native-endianness))))))))
+  (begin
+    (nio-stat-layout-guard! "getPosixFilePermissions")
+    (fs-stat-mode fp)))
 ;; resolve symlinks; #f if the path is absent. One binding of realpath(3) for
 ;; the whole runtime, in java/io.ss, which loads before this file and needs it
 ;; for File.getCanonicalPath.

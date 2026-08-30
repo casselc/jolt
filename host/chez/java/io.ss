@@ -449,6 +449,33 @@
   (if (eq? (sa-os-family) 'windows)
       (jolt-foreign-proc-safe "_close" '(int) 'int)
       (jolt-foreign-proc-safe "close" '(int) 'int)))
+(define fs-windows-kernel32-loaded?
+  (and (eq? (sa-os-family) 'windows)
+       (guard (_ (#t #f)) (sa-load-shared-object "kernel32.dll") #t)))
+(define fs-c-rename-replace
+  ;; Chez 10.4.1's Windows `rename-file` refuses to replace an existing path.
+  ;; MoveFileEx supplies the replace contract that POSIX rename(2) already has.
+  (jolt-ffi-native-error-convention-case
+      (jolt-foreign-proc-native-error-safe
+        __get_last_error "MoveFileExW" '(wstring wstring unsigned-32) 'int)
+      (jolt-foreign-proc-native-error-safe __errno "rename" '(string string) 'int)))
+(define fs-c-chmod (jolt-foreign-proc-safe "chmod" '(string int) 'int))
+(define fs-c-stat (jolt-foreign-proc-safe "stat" '(string u8*) 'int))
+(define fs-stat-macos? (eq? (sa-os-family) 'macos))
+(define fs-stat-x86-64-linux?
+  (and (eq? (sa-os-family) 'linux) (eq? (sa-arch) 'x86-64)
+       (eq? (sa-endian) 'little)))
+(define fs-stat-layout-known? (or fs-stat-macos? fs-stat-x86-64-linux?))
+(define (fs-stat-mode fp)
+  ;; These are the same ABI-grounded offsets consumed by java.nio.file. Other
+  ;; hosts return #f rather than guessing; replacement remains atomic there but
+  ;; cannot promise to preserve a pre-existing POSIX mode.
+  (and fs-c-stat fs-stat-layout-known?
+       (let ((buf (make-bytevector 256 0)))
+         (and (= 0 (fs-c-stat fp buf))
+              (if fs-stat-macos?
+                  (bytevector-u16-ref buf 4 (native-endianness))
+                  (bytevector-u32-ref buf 24 (native-endianness)))))))
 (define (fs-native-exists-error-for-convention? convention code)
   (if (eq? convention '__get_last_error)
       (or (= code 80) (= code 183))
@@ -489,14 +516,41 @@
     (throw-jvm (quote UnsupportedOperationException)
                "atomic exclusive file creation with native-error capture is unavailable"))
   (fs-c-open-exclusive fp fs-open-exclusive-flags (fs-native-create-mode mode)))
-(define (fs-create-file-exclusive-result fp mode)
+(define (fs-publish-replace-native-result from to)
+  (unless fs-c-rename-replace
+    (throw-jvm (quote UnsupportedOperationException)
+               "atomic replacement with native-error capture is unavailable"))
+  (if (eq? (sa-os-family) 'windows)
+      ;; MOVEFILE_REPLACE_EXISTING. The sibling-temp invariant keeps the move on
+      ;; one volume. This is one native replacement operation, but Windows file
+      ;; systems/open-handle sharing need not provide every POSIX rename detail.
+      (fs-c-rename-replace from to 1)
+      (fs-c-rename-replace from to)))
+(define (fs-publish-replace-result from to)
+  (let-values (((result native-error)
+                (fs-publish-replace-native-result from to)))
+    (values (if (if (eq? (sa-os-family) 'windows)
+                    (not (= result 0))
+                    (= result 0))
+                'published 'error)
+            native-error)))
+(define (fs-open-file-exclusive-result fp mode)
+  ;; Keep the successful descriptor open so a caller can retain ownership of
+  ;; the inode it created.  Creating exclusively, closing, and reopening by
+  ;; pathname would reintroduce a delete/recreate gap between those operations.
   (let-values (((fd native-error) (fs-open-exclusive-native-result fp mode)))
     (if (>= fd 0)
+        (values 'created native-error fd)
+        (values (fs-create-status native-error) native-error #f))))
+(define (fs-create-file-exclusive-result fp mode)
+  (let-values (((status native-error fd)
+                (fs-open-file-exclusive-result fp mode)))
+    (if (eq? status 'created)
         (begin
           ;; Retry-after-EINTR is unsafe if another thread has reused the fd.
           (fs-c-close fd)
           (values 'created native-error))
-        (values (fs-create-status native-error) native-error))))
+        (values status native-error))))
 (define (fs-parent-path p)
   (let loop ((i (- (string-length p) 1)))
     (cond ((< i 0) "")
@@ -1099,6 +1153,95 @@
 
 (define io-counter-mutex (make-mutex))
 (define spit-tmp-counter 0)
+(define (spit-temp-path target stamp n)
+  (string-append target ".spit-tmp-" (number->string stamp) "-"
+                 (number->string n)))
+(define (spit-open-owned-temp target mode)
+  ;; The timestamp/counter pair is only a candidate generator. O_EXCL is the
+  ;; authority for ownership, so independent processes choosing the same name
+  ;; cannot share or truncate a temporary inode.
+  (let ((stamp (sa-real-time-ms))
+        (first (jolt-with-mutex io-counter-mutex
+                 (begin (set! spit-tmp-counter (+ spit-tmp-counter 1))
+                        spit-tmp-counter))))
+    (let loop ((n first))
+      (let ((tmp (spit-temp-path target stamp n)))
+        (let-values (((status native-error fd)
+                      (fs-open-file-exclusive-result tmp mode)))
+          (case status
+            ((created) (values tmp fd))
+            ((exists) (loop (+ n 1)))
+            (else
+             (throw-jvm (quote java.io.IOException)
+                        (string-append "unable to create temporary file " tmp
+                                       " (native error "
+                                       (number->string native-error) ")")))))))))
+
+;; Injectable seams make every ownership transition observable without changing
+;; the production state machine. Once a port is returned it, not raw cleanup,
+;; owns the descriptor; the state advances before close so an exceptional close
+;; can never be retried against a descriptor the port may already have released.
+(define spit-open-output-port
+  (lambda (fd) (open-fd-output-port fd (buffer-mode block) (native-transcoder))))
+(define spit-write-output! (lambda (port text) (put-string port text)))
+(define spit-flush-output! (lambda (port) (flush-output-port port)))
+(define spit-close-output! (lambda (port) (close-port port)))
+(define spit-close-fd! (lambda (fd) (fs-c-close fd)))
+(define spit-delete-temp! (lambda (tmp) (delete-file tmp)))
+(define (spit-publish-temp-result tmp target)
+  (fs-publish-replace-result tmp target))
+
+(define (spit-preserve-mode! tmp target-mode)
+  ;; On verified POSIX ABIs preserve the existing inode's permission bits.
+  ;; Windows has ACLs rather than this mode contract; MoveFileEx publishes the
+  ;; sibling's inherited ACL and this shim does not attempt an ACL clone.
+  (when (and target-mode fs-c-chmod
+             (not (= 0 (fs-c-chmod tmp (bitwise-and target-mode #o777)))))
+    (throw-jvm (quote java.io.IOException)
+               (string-append "unable to preserve target permissions on " tmp))))
+
+(define (spit-write-and-publish! tmp fd target target-mode text)
+  ;; One dynamic extent owns tmp from the successful exclusive open until
+  ;; publication. It also covers continuation jumps and thread interruption:
+  ;; dynamic-wind cleanup closes the sole current owner, then removes an
+  ;; unpublished name.
+  (let ((owner 'fd) (port #f) (published? #f) (body-error #f))
+    (define (release-owner!)
+      (case owner
+        ((fd) (set! owner 'none) (spit-close-fd! fd))
+        ((port) (set! owner 'none) (spit-close-output! port))
+        (else #f)))
+    (define (cleanup!)
+      ;; Preserve the primary close failure, but never let it strand the temp.
+      (let ((close-error #f))
+        (guard (e (#t (set! close-error e))) (release-owner!))
+        (unless published?
+          (guard (_ (#t #f)) (spit-delete-temp! tmp)))
+        ;; An after-thunk failure must not hide the write/flush/publish failure
+        ;; that caused this unwind. Explicit close failures occur in the body
+        ;; and still propagate normally.
+        (when (and close-error (not body-error)) (raise close-error))))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda ()
+        (guard (e (#t (set! body-error e) (raise e)))
+          (set! port (spit-open-output-port fd))
+          (set! owner 'port)
+          (spit-write-output! port text)
+          (spit-flush-output! port)
+          (release-owner!)
+          ;; New targets retain open(0666)&umask. Existing POSIX targets retain
+          ;; their prior mode where the host stat layout is known.
+          (spit-preserve-mode! tmp target-mode)
+          (let-values (((status native-error)
+                        (spit-publish-temp-result tmp target)))
+            (unless (eq? status 'published)
+              (throw-jvm (quote java.io.IOException)
+                         (string-append "unable to publish temporary file " tmp
+                                        " (native error "
+                                        (number->string native-error) ")")))
+            (set! published? #t))))
+      cleanup!)))
 (define (jolt-spit path content . opts)
   ;; Render BEFORE any file is touched — a throwing toString used to leave the
   ;; target truncated. The non-append write goes to a temp file in the same
@@ -1109,15 +1252,14 @@
     (if (spit-append? opts)
         (with-port (open-output-file p 'append)
           (lambda (port) (put-string port text)))
-        (let ((tmp (string-append p ".spit-tmp-"
-                                   (number->string (sa-real-time-ms)) "-"
-                                   (number->string (jolt-with-mutex io-counter-mutex
-                                                     (begin (set! spit-tmp-counter (+ spit-tmp-counter 1))
-                                                            spit-tmp-counter))))))
-          (with-port (open-output-file tmp 'replace)
-            (lambda (port) (put-string port text)))
-          (guard (e (#t (guard (_ (#t #f)) (delete-file tmp)) (raise e)))
-            (rename-file tmp p))))
+        (let ((target-mode (fs-stat-mode p)))
+          (let-values (((tmp fd) (spit-open-owned-temp p #o666)))
+          ;; A sibling temp keeps the rename on one filesystem. Replacement is
+          ;; atomic on POSIX and uses MoveFileEx(REPLACE_EXISTING) on Windows.
+          ;; This is not a durability protocol: neither file nor parent directory
+          ;; is fsync'd, and exotic/remote filesystems may provide weaker
+          ;; visibility guarantees.
+            (spit-write-and-publish! tmp fd p target-mode text))))
     jolt-nil))
 
 ;; (flush) is (.flush *out*) on the JVM. When *out* holds a real writer — a
