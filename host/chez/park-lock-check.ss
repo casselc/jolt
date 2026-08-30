@@ -65,6 +65,7 @@
 ;;   sh host/chez/park-lock-check.sh          check against the allowlist
 ;;   sh host/chez/park-lock-check.sh --regen  regenerate it (review the diff!)
 (import (chezscheme))
+(load "host/chez/static-analysis-debt.ss")
 
 (define scope-roots '("host/chez" "host/chez/java"))
 (define allowlist-file "host/chez/park-lock-allowlist.txt")
@@ -1280,123 +1281,6 @@
          (not (has? 'syntax-safe 'dispatch))
          (not (has? 'deferred-safe 'dispatch)))))
 
-;; ---------------------------------------------------------------------------
-;; issue-tagged dispatch debt
-;; ---------------------------------------------------------------------------
-
-(define (words s)
-  (let ((n (string-length s)))
-    (let loop ((i 0) (start #f) (out '()))
-      (cond
-        ((= i n)
-         (reverse (if start (cons (substring s start i) out) out)))
-        ((char-whitespace? (string-ref s i))
-         (loop (+ i 1) #f
-               (if start (cons (substring s start i) out) out)))
-        (else (loop (+ i 1) (or start i) out))))))
-
-(define (join-with-space xs)
-  (if (null? xs) ""
-      (let loop ((rest (cdr xs)) (out (car xs)))
-        (if (null? rest) out
-            (loop (cdr rest) (string-append out " " (car rest)))))))
-
-(define (issue-token? s)
-  (let ((lp (string-length issue-prefix)) (ls (string-length s)))
-    (and (> ls lp)
-         (string=? issue-prefix (substring s 0 lp))
-         (for-all char-numeric? (string->list (substring s lp ls)))
-         (let ((n (string->number (substring s lp ls))))
-           (and n (integer? n) (> n 0))))))
-
-;; Parsed debt: (key count issue raw). The exact key is the finding's first four
-;; fields; count and issue are separate so a change cannot hide behind text.
-(define (parse-debt-line line)
-  (let ((ws (words line)))
-    (and (= (length ws) 6)
-         (string=? (list-ref ws 2) "dispatch")
-         (let ((count (string->number (list-ref ws 4))))
-           (and count (integer? count) (> count 0)
-                (issue-token? (list-ref ws 5))
-                (list (join-with-space (list-head ws 4)) count
-                      (list-ref ws 5) line))))))
-
-(define (read-data-lines path)
-  (if (file-exists? path)
-      (let ((p (open-input-file path)))
-        (let loop ((out '()))
-          (let ((line (get-line p)))
-            (cond ((eof-object? line) (close-port p) (reverse out))
-                  ((or (string=? line "")
-                       (and (> (string-length line) 0)
-                            (char=? #\# (string-ref line 0))))
-                   (loop out))
-                  (else (loop (cons line out)))))))
-      '()))
-
-;; -> (entries . errors), rejecting malformed rows and duplicate exact keys.
-(define (validate-debt-lines lines)
-  (let ((seen (make-hashtable string-hash string=?)))
-    (let loop ((ls lines) (entries '()) (errors '()))
-      (if (null? ls)
-          (cons (reverse entries) (reverse errors))
-          (let ((entry (parse-debt-line (car ls))))
-            (cond
-              ((not entry)
-               (loop (cdr ls) entries
-                     (cons (string-append "malformed debt entry: " (car ls)) errors)))
-              ((hashtable-ref seen (car entry) #f)
-               (loop (cdr ls) entries
-                     (cons (string-append "duplicate debt key: " (car entry)) errors)))
-              (else
-               (hashtable-set! seen (car entry) #t)
-               (loop (cdr ls) (cons entry entries) errors))))))))
-
-(define (debt-problems got-lines validated)
-  (let ((entries (car validated)) (errors (cdr validated))
-        (by-key (make-hashtable string-hash string=?))
-        (got-by-key (make-hashtable string-hash string=?)))
-    (for-each (lambda (e) (hashtable-set! by-key (car e) e)) entries)
-    (for-each (lambda (g) (hashtable-set! got-by-key (line-key g) g)) got-lines)
-    (let ((problems errors))
-      (for-each
-        (lambda (g)
-          (let* ((key (line-key g)) (entry (hashtable-ref by-key key #f)))
-            (cond ((not entry)
-                   (set! problems (cons (string-append "untagged new dispatch: " g) problems)))
-                  ((> (line-count g) (cadr entry))
-                   (set! problems
-                     (cons (string-append "increased dispatch debt: " g " (was "
-                                          (number->string (cadr entry)) ")") problems)))
-                  ((< (line-count g) (cadr entry))
-                   (set! problems
-                     (cons (string-append "decreased/stale dispatch debt: " (cadddr entry)
-                                          " -> " (number->string (line-count g))) problems))))))
-        got-lines)
-      (for-each
-        (lambda (entry)
-          (unless (hashtable-ref got-by-key (car entry) #f)
-            (set! problems
-              (cons (string-append "dropped/stale dispatch debt: " (cadddr entry)
-                                   " -> 0") problems))))
-        entries)
-      (reverse problems))))
-
-(define (debt-self-test)
-  (let* ((g1 "synthetic f dispatch jolt= 1")
-         (g2 "synthetic f dispatch jolt= 2")
-         (good "synthetic f dispatch jolt= 1 issue=chucklehead-dev/jolt-aspect-packs#26")
-         (higher "synthetic f dispatch jolt= 2 issue=chucklehead-dev/jolt-aspect-packs#26")
-         (bad "synthetic f dispatch jolt= 1")
-         (valid-good (validate-debt-lines (list good))))
-    (and (null? (debt-problems (list g1) valid-good))
-         (pair? (debt-problems (list g1) (validate-debt-lines '())))
-         (pair? (debt-problems (list g2) valid-good))
-         (pair? (debt-problems '() valid-good))
-         (pair? (debt-problems (list g1) (validate-debt-lines (list higher))))
-         (pair? (cdr (validate-debt-lines (list bad))))
-         (pair? (cdr (validate-debt-lines (list good good)))))))
-
 (define (primitive-whitelist-self-test)
   (and (eq? (primitive-head-name '($primitive 3 fx+)) 'fx+)
        (eq? (primitive-head-name '($primitive fx+)) 'fx+)
@@ -1436,33 +1320,8 @@
 ;; main
 ;; ---------------------------------------------------------------------------
 
-;; A line is "<file> <definition> <kind> <callee> <count>". The KEY is everything
-;; but the count, so a site keeps its identity while its count moves.
-(define (last-space l)
-  (let loop ((i (- (string-length l) 1)))
-    (cond ((< i 0) #f)
-          ((char=? #\space (string-ref l i)) i)
-          (else (loop (- i 1))))))
-
-(define (line-key l)
-  (let ((i (last-space l))) (if i (substring l 0 i) l)))
-
-(define (line-count l)
-  (let ((i (last-space l)))
-    (if i (or (string->number (substring l (+ i 1) (string-length l))) 0) 0)))
-
-;; "…/loader.ss ldr-begin-load! park ldr-wait-for-load! 1" -> the kind field
-(define (line-kind l)
-  (let loop ((i 0) (spaces 0) (start 0))
-    (cond
-      ((>= i (string-length l)) "")
-      ((char=? #\space (string-ref l i))
-       (cond ((= spaces 2) (substring l start i))
-             (else (loop (+ i 1) (+ spaces 1) (+ i 1)))))
-      (else (loop (+ i 1) spaces start)))))
-
 (define (fix-hint l)
-  (if (string=? "dispatch" (line-kind l))
+  (if (string=? "dispatch" (analysis-finding-kind l))
       (string-append " — this region hands control to code the lock did not write,"
                      " which may park; move the call out of the region")
       (string-append " — commit under the lock and switch outside it"
@@ -1471,7 +1330,7 @@
 (define (find-line key lines)
   (let loop ((ls lines))
     (cond ((null? ls) #f)
-          ((string=? key (line-key (car ls))) (car ls))
+          ((string=? key (analysis-finding-key (car ls))) (car ls))
           (else (loop (cdr ls))))))
 
 (define (main args)
@@ -1492,16 +1351,20 @@
     (let* ((parks (build-parkers units))
            (dispatches (build-dispatchers units))
            (got (map finding->line (findings units parks dispatches)))
-           (park-got (filter (lambda (g) (string=? "park" (line-kind g))) got))
-           (dispatch-got (filter (lambda (g) (string=? "dispatch" (line-kind g))) got))
-           (debt (validate-debt-lines (read-data-lines debt-file)))
+           (park-got
+             (filter (lambda (g) (string=? "park" (analysis-finding-kind g))) got))
+           (dispatch-got
+             (filter (lambda (g) (string=? "dispatch" (analysis-finding-kind g))) got))
+           (debt
+             (analysis-validate-debt-lines
+               (analysis-read-data-lines debt-file) '("dispatch") issue-prefix))
            (missing (append (missing-switch-assertions units)
                             (bad-guarded-boundaries units parks)
                             (bad-trusted-callbacks units parks dispatches)
                             (bad-trusted-direct-dispatch-sites units)))
            (self-test-ok? (and (guarded-boundary-self-test)
                                (dispatch-self-test)
-                               (debt-self-test)
+                               (analysis-debt-self-test '("dispatch") issue-prefix)
                                (primitive-whitelist-self-test))))
       (cond
         ((and (pair? args) (string=? (car args) "--self-test"))
@@ -1533,24 +1396,26 @@
              missing)
            (for-each
              (lambda (p) (add! (string-append "  DEBT: " p)))
-             (debt-problems dispatch-got debt))
+             (analysis-debt-problems dispatch-got debt))
            (for-each
              (lambda (g)
-               (let ((w (find-line (line-key g) want)))
+               (let ((w (find-line (analysis-finding-key g) want)))
                  (cond
                    ((not w)
                     (add! (string-append "  NEW site: " g (fix-hint g))))
-                   ((> (line-count g) (line-count w))
+                   ((> (analysis-finding-count g) (analysis-finding-count w))
                     (add! (string-append "  MORE of them: " g " (was "
-                                         (number->string (line-count w)) ")"
+                                         (number->string (analysis-finding-count w)) ")"
                                          (fix-hint g)))))))
              park-got)
            (for-each
              (lambda (w)
-               (let ((g (find-line (line-key w) park-got)))
-                 (when (< (if g (line-count g) 0) (line-count w))
+               (let ((g (find-line (analysis-finding-key w) park-got)))
+                 (when (< (if g (analysis-finding-count g) 0)
+                          (analysis-finding-count w))
                    (add! (string-append "  STALE allowlist entry: " w " -> "
-                                        (number->string (if g (line-count g) 0))
+                                        (number->string
+                                          (if g (analysis-finding-count g) 0))
                                         " — rerun with --regen")))))
              want)
            (cond
