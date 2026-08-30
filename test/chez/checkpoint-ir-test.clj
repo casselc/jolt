@@ -74,6 +74,28 @@
     (backend/set-emit-unit! unit)
     (is (:error (attempt #(backend/emit checkpoint-decl))))
     (is (= "(jolt-checkpoint! \"test.poller/after-reserve-unlock\" '(continue yield))"
+           (backend/emit controlled)))
+    (is (= "(jolt-checkpoint-continue! \"test.poller/record-only\")"
+           (backend/emit
+            (assoc controlled
+                   :id :test.poller/record-only
+                   :dispositions #{:continue}))))))
+
+(deftest controlled-emission-fails-closed-on-unsupported-targets
+  (let [unit (types/new-unit)
+        _ (checkpoints/configure-unit! unit :controlled)
+        controlled (checkpoints/lower unit checkpoint-decl)]
+    (backend/set-emit-unit! unit)
+    (backend/set-target! :gambit)
+    (try
+      (let [failure (:error (attempt #(backend/emit controlled)))]
+        (is failure)
+        (is (= :gambit (:target (ex-data failure))))
+        (is (= (:id checkpoint-decl) (:id (ex-data failure)))))
+      (finally
+        (backend/set-target! :chez)))
+    ;; The failed target attempt must not poison later Chez emission.
+    (is (= "(jolt-checkpoint! \"test.poller/after-reserve-unlock\" '(continue yield))"
            (backend/emit controlled)))))
 
 (deftest effect-evidence-distinguishes-erased-and-controlled-profiles

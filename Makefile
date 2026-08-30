@@ -96,7 +96,7 @@ export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric checkpoint-erasure checkpoints effects futurehost buildlibsmoke buildsmoke \
+  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric checkpoint-erasure checkpoint-runtime checkpoints effects futurehost buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
@@ -165,7 +165,7 @@ CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirect
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body checkpoints checkpoint-erasure effects regions dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
+  inline inline-body checkpoints checkpoint-runtime checkpoint-erasure effects regions dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams futurehost \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions regexcache gosm asynctimer interruptnest taggedmethods threadsafety atomicnumeric
@@ -707,6 +707,11 @@ effects:
 checkpoints:
 	@$(CHEZ) --script test/chez/checkpoint-analyzer-test.ss
 	@bin/jolt test/chez/checkpoint-ir-test.clj
+
+# Chez record/continue controller: explicit actors, exact site registration,
+# validated inert plans, immutable snapshots, and fail-closed action sites.
+checkpoint-runtime:
+	@$(CHEZ) --script test/chez/checkpoint-runtime-test.ss
 
 # Optimized whole-program erasure: emitted app/effect/region artifacts are
 # identical to checkpoint-free source, contain no checkpoint residue, and the

@@ -215,3 +215,9 @@ unchecked-math?
 var-redefined?
 wall-nanos
 with-monitor
+checkpoint-bind-actor!
+checkpoint-install-plan!
+checkpoint-register-site!
+checkpoint-reset!
+checkpoint-snapshot
+checkpoint-unbind-actor!

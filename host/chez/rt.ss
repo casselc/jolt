@@ -1730,3 +1730,9 @@
 ;; walks jolt collections, var cells and atoms, prints paths through the printers,
 ;; and reads proc-name-tbl to write a fn as its var's name.
 (load "host/chez/state-image.ss")
+
+;; Controlled-build checkpoints load after the persistent collection layer and
+;; state image.  Their controller state is process-local test/control data, not
+;; application state to serialize, and compiler output calls jolt-checkpoint!
+;; directly.
+(load "host/chez/checkpoints.ss")

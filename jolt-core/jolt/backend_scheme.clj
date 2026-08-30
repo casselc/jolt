@@ -2451,14 +2451,24 @@
     :checkpoint-decl
     (throw (ex-info "emit: unlowered checkpoint declaration"
                     {:id (:id node) :dispositions (:dispositions node)}))
-    ;; Controlled output is structural in this slice: the Scheme runtime entry
-    ;; is intentionally unresolved until the controller half lands.
+    ;; Controlled output targets the Chez checkpoint runtime ABI. Other Scheme
+    ;; targets must fail here rather than emit a call that their runtime cannot
+    ;; resolve.
     :checkpoint
-    (let [id (:id node)
-          disposition-names (map name (sort-by name (:dispositions node)))]
-      (str "(jolt-checkpoint! "
-           (chez-str-lit (str (namespace id) "/" (name id)))
-           " '(" (str/join " " disposition-names) "))"))
+    (let [_ (when (not= :chez (target))
+              (throw (ex-info "emit: controlled checkpoints are unsupported on this target"
+                              {:target (target) :id (:id node)})))
+          id (:id node)
+          dispositions (:dispositions node)
+          encoded-id (chez-str-lit (str (namespace id) "/" (name id)))]
+      (if (= #{:continue} dispositions)
+        ;; This closed leaf is the only checkpoint operation permitted beneath
+        ;; a counted runtime lock. It may record runtime-owned data, but cannot
+        ;; select an action, invoke user code, transfer control, or park.
+        (str "(jolt-checkpoint-continue! " encoded-id ")")
+        (let [disposition-names (map name (sort-by name dispositions))]
+          (str "(jolt-checkpoint! " encoded-id
+               " '(" (str/join " " disposition-names) "))"))))
     :const (emit-const (:val node))
     :local (munge-name (:name node))
     ;; late-bound var: read the cell's current root at use time. A value-position

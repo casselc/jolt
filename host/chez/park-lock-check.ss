@@ -106,6 +106,64 @@
 (define trusted-dynamic-call '|trusted-procedure-valued-dispatch|)
 (define local-recursive-call '|local-recursive-call|)
 
+;; Checkpoints have a deliberately asymmetric ABI.  The compiler emits the
+;; closed continue-only leaf with one canonical literal identifier; every call
+;; through the generic entry point may select an action and is therefore a
+;; counted-lock hazard.  Keep the hazard as a synthetic call-graph node so a
+;; wrapper around either an action-bearing call or an unsupported leaf shape is
+;; rejected transitively without contaminating the reviewed continue-only leaf.
+(define checkpoint-continue-call 'jolt-checkpoint-continue!)
+(define checkpoint-generic-call 'jolt-checkpoint!)
+(define checkpoint-hazard-call '|checkpoint-action-or-unknown|)
+
+(define (checkpoint-entrypoint? x)
+  (or (eq? x checkpoint-continue-call)
+      (eq? x checkpoint-generic-call)))
+
+(define (qualified-checkpoint-id? x)
+  (and (string? x)
+       (let ((n (string-length x)))
+         (and (> n 2)
+              (let loop ((i 1))
+                (cond ((>= i (- n 1)) #f)
+                      ((char=? (string-ref x i) #\/) #t)
+                      (else (loop (+ i 1)))))))))
+
+(define (canonical-continue-checkpoint-call? x resolved)
+  (and (eq? resolved checkpoint-continue-call)
+       (= (length x) 2)
+       (qualified-checkpoint-id? (cadr x))))
+
+;; Scheme macro wrappers are outside the supported checkpoint surface. Jolt
+;; checkpoint declarations are compiler-owned IR, and ordinary named Scheme
+;; procedures already participate in the transitive hazard closure. Scan syntax
+;; transformer data structurally (including templates) so expansion identity is
+;; never required for this safety property.
+(define (checkpoint-symbols-in-syntax x)
+  (cond ((symbol? x) (if (checkpoint-entrypoint? x) (list x) '()))
+        ((pair? x)
+         (append (checkpoint-symbols-in-syntax (car x))
+                 (checkpoint-symbols-in-syntax (cdr x))))
+        (else '())))
+
+(define (emit-checkpoint-syntax-hazards forms in-lock? emit)
+  (for-each (lambda (sym) (emit sym in-lock? #f))
+            (checkpoint-symbols-in-syntax forms)))
+
+(define (walk-local-syntax d lexical-lock? manual-lock? bound emit)
+  (let ((bindings (and (pair? (cdr d)) (cadr d))))
+    (when (list? bindings)
+      (for-each
+        (lambda (binding)
+          ;; Exclude the macro's binding name; only its transformer is policy
+          ;; relevant. A macro may happen to use a checkpoint-like local name.
+          (when (and (pair? binding) (pair? (cdr binding)))
+            (emit-checkpoint-syntax-hazards
+              (cdr binding) (or lexical-lock? (pair? manual-lock?)) emit)))
+        bindings))
+    ;; Transformer execution is compile-time. Runtime effects live in the body.
+    (walk-forms (cddr d) lexical-lock? manual-lock? bound emit)))
+
 ;; Chez reads #N%op as ($primitive N op), and #%op as ($primitive op).
 ;; Only the current arithmetic/bitwise leaves are exempt: they cannot invoke a
 ;; callback, transfer control, block, or park. A new/unknown primitive fails
@@ -750,7 +808,14 @@
 (define (walk x lexical-lock? manual-lock? bound emit)
   (define in-lock? (or lexical-lock? (pair? manual-lock?)))
   (cond
-    ((symbol? x) (emit x in-lock? #f))   ; a value position: (apply jolt-invoke …)
+    ((symbol? x)
+     ;; A checkpoint entry point escaping as a value loses the syntactic proof
+     ;; that the closed leaf has canonical arity and a literal qualified ID.
+     ;; Record a hard hazard in addition to the value-flow edge used to follow
+     ;; top-level aliases and alias chains.
+     (when (checkpoint-entrypoint? x)
+       (emit checkpoint-hazard-call in-lock? #t))
+     (emit x in-lock? #f))               ; a value position: (apply jolt-invoke …)
     ((not (pair? x)) (void))
     ((not (list? x))                     ; improper: (a . b) — walk both halves
      (walk (car x) lexical-lock? manual-lock? bound emit)
@@ -770,7 +835,14 @@
          ((case-lambda)
           (parameterize ((logical-effects-enabled? #f))
             (walk-case-lambda x lexical-lock? manual-lock? bound emit)))
-         ((define define-syntax) (walk-define x lexical-lock? manual-lock? bound emit))
+         ((define) (walk-define x lexical-lock? manual-lock? bound emit))
+         ((define-syntax)
+          ;; Preserve this as a structural hard finding instead of trying to
+          ;; infer the names and shapes of its eventual expansions.
+          (emit-checkpoint-syntax-hazards
+            (cddr x) in-lock? emit))
+         ((let-syntax letrec-syntax)
+          (walk-local-syntax x lexical-lock? manual-lock? bound emit))
          ((case) (walk-case x lexical-lock? manual-lock? bound emit))
          ((cond) (walk-cond x lexical-lock? manual-lock? bound emit))
          ((guard) (walk-guard x lexical-lock? manual-lock? bound emit))
@@ -856,7 +928,12 @@
                   ;; The list's runtime shape is not statically available, so
                   ;; callback positions cannot be recovered soundly.
                   (when (pair? (synchronous-callback-positions target))
-                    ((logical-hard-emitter) 'unsupported-synchronous-apply target)))
+                    ((logical-hard-emitter) 'unsupported-synchronous-apply target))
+                  ;; Even the closed leaf is unsupported through apply: neither
+                  ;; its arity nor its literal ID remains statically visible.
+                  (when (or (eq? target checkpoint-continue-call)
+                            (eq? target checkpoint-generic-call))
+                    (emit checkpoint-hazard-call in-lock? #t)))
                 ;; `apply` invokes its first argument. Record every named target,
                 ;; not only today's generic seeds. A computed target is opaque
                 ;; procedure-valued dispatch and therefore fails closed.
@@ -869,7 +946,13 @@
                 (let ((resolved (resolve-operator head bound)))
                   (when (eq? resolved logical-lock-form)
                     ((logical-hard-emitter) 'unsupported-alias logical-lock-form))
-                  (emit resolved in-lock? #t)))
+                  (cond
+                    ((canonical-continue-checkpoint-call? x resolved)
+                     (emit checkpoint-continue-call in-lock? #t))
+                    ((or (eq? resolved checkpoint-continue-call)
+                         (eq? resolved checkpoint-generic-call))
+                     (emit checkpoint-hazard-call in-lock? #t))
+                    (else (emit resolved in-lock? #t)))))
                ;; the head may itself be a form: ((f x) y)
                ;; Only explicitly reviewed arithmetic/bitwise Chez primitives
                ;; are leaves. Unknown primitive heads fall through to dynamic.
@@ -884,7 +967,7 @@
 ;; ---------------------------------------------------------------------------
 ;; A "unit" is one top-level definition:
 ;; (file name calls locked-calls raw-body logical-calls acquisitions edges
-;;  unknowns synchronous-calls).
+;;  unknowns synchronous-calls value-symbols).
 ;; calls is every operator-position symbol in the body (the call graph edge set),
 ;; and locked-calls is its subset inside a counted-lock region. Top-level forms
 ;; that are not definitions use a file-unique name so file-scope locks are read.
@@ -899,6 +982,7 @@
 (define (unit-logical-edges u) (if (> (length u) 7) (list-ref u 7) '()))
 (define (unit-logical-unknowns u) (if (> (length u) 8) (list-ref u 8) '()))
 (define (unit-logical-sync-calls u) (if (> (length u) 9) (list-ref u 9) '()))
+(define (unit-value-symbols u) (if (> (length u) 10) (list-ref u 10) '()))
 
 (define (definition-name d)
   (and (pair? d) (eq? 'define (car d)) (pair? (cdr d))
@@ -966,7 +1050,7 @@
 (define (collect-unit file name forms bound)
   (let ((calls '()) (locked '()) (logical-calls '())
         (logical-acquires '()) (logical-edges '()) (logical-unknowns '())
-        (logical-sync-calls '()))
+        (logical-sync-calls '()) (value-symbols '()))
     (parameterize
       ((current-logical-regions '())
        (logical-acquire-emitter
@@ -994,6 +1078,7 @@
       (walk-forms forms #f '() (trusted-bound name bound)
         (lambda (sym in-lock? operator?)
           (when operator? (set! calls (cons sym calls)))
+          (unless operator? (set! value-symbols (cons sym value-symbols)))
           (when (and in-lock? operator?) (set! locked (cons sym locked)))
           ;; Structural census: these capabilities may not be stored or selected
           ;; as values. Canonical wrapper calls are handled without walking the
@@ -1017,7 +1102,7 @@
                 (set! logical-calls (cons (cons owner sym) logical-calls)))
               (current-logical-regions))))))
     (list file name calls locked forms logical-calls logical-acquires
-          logical-edges logical-unknowns logical-sync-calls)))
+          logical-edges logical-unknowns logical-sync-calls value-symbols)))
 
 (define (collect-case-lambda-unit file name clauses)
   (let ((parts
@@ -1029,7 +1114,7 @@
       (fold-left (lambda (out u) (append (list-ref u i) out)) '() parts))
     (list file name (join-field 2) (join-field 3) clauses
           (join-field 5) (join-field 6) (join-field 7) (join-field 8)
-          (join-field 9))))
+          (join-field 9) (join-field 10))))
 
 (define (collect-definition file d)
   (let ((nm (definition-name d)))
@@ -1108,6 +1193,29 @@
           units)
         (when changed (grow))))
     dispatches))
+
+(define (build-checkpoint-hazards units)
+  (let ((hazards (make-eq-hashtable)))
+    (hashtable-set! hazards checkpoint-hazard-call #t)
+    (let grow ()
+      (let ((changed #f))
+        (for-each
+          (lambda (u)
+            (unless (hashtable-ref hazards (unit-name u) #f)
+              (when (or (exists (lambda (c) (hashtable-ref hazards c #f))
+                                (unit-calls u))
+                        ;; A procedure capability stored or returned as a value
+                        ;; is intentionally fail-closed. This second edge class
+                        ;; follows `(define cp jolt-checkpoint!)` and arbitrary
+                        ;; chains such as `(define cp2 cp)` without treating the
+                        ;; canonical direct leaf's operator as a value escape.
+                        (exists (lambda (v) (hashtable-ref hazards v #f))
+                                (unit-value-symbols u)))
+                (hashtable-set! hazards (unit-name u) #t)
+                (set! changed #t))))
+          units)
+        (when changed (grow))))
+    hazards))
 
 (define (build-logical-dispatchers units)
   (let ((dispatches (make-eq-hashtable)))
@@ -1281,6 +1389,33 @@
                              (lambda (s) (or (eq? s dynamic-call)
                                              (hashtable-ref dispatches s #f)))))
                     out)))))
+    (lambda (a b) (string<? (finding->line a) (finding->line b)))))
+
+(define (checkpoint-findings units hazards)
+  (sort-list
+    (fold-left
+      (lambda (out u)
+        (append
+          (tally->findings (unit-file u) (unit-name u) 'checkpoint
+            (tally (unit-locked u)
+                   (lambda (s) (hashtable-ref hazards s #f))))
+          out))
+      '() units)
+    (lambda (a b) (string<? (finding->line a) (finding->line b)))))
+
+;; Checkpoint entry points are non-storable capabilities.  This structural
+;; finding is intentionally independent of the enclosing unit's name: forms
+;; such as `(set! cp jolt-checkpoint!)` and `define-values` are collected in a
+;; synthetic top-level unit, where an alias-name analysis cannot be sound.
+(define (checkpoint-value-findings units)
+  (sort-list
+    (fold-left
+      (lambda (out u)
+        (append
+          (tally->findings (unit-file u) (unit-name u) 'checkpoint-value
+            (tally (unit-value-symbols u) checkpoint-entrypoint?))
+          out))
+      '() units)
     (lambda (a b) (string<? (finding->line a) (finding->line b)))))
 
 (define (logical-dispatch-findings units dispatches)
@@ -1770,6 +1905,180 @@
          (not (has? 'syntax-safe 'dispatch))
          (not (has? 'deferred-safe 'dispatch)))))
 
+(define (checkpoint-disposition-self-test)
+  (let* ((direct-continue
+           (collect-unit "synthetic" 'checkpoint-direct-continue-safe
+             '((jolt-with-mutex mu
+                 (jolt-checkpoint-continue! "test/direct"))) '(mu)))
+         (continue-helper
+           (collect-unit "synthetic" 'checkpoint-continue-helper
+             '((jolt-checkpoint-continue! "test/helper")) '()))
+         (through-continue
+           (collect-unit "synthetic" 'checkpoint-through-continue-safe
+             '((jolt-with-mutex mu (checkpoint-continue-helper))) '(mu)))
+         (direct-generic
+           (collect-unit "synthetic" 'checkpoint-direct-generic-mutation
+             '((jolt-with-mutex mu
+                 (jolt-checkpoint! "test/generic" '(continue yield)))) '(mu)))
+         (generic-helper
+           (collect-unit "synthetic" 'checkpoint-generic-helper
+             '((jolt-checkpoint! "test/helper" '(continue fault))) '()))
+         (through-generic
+           (collect-unit "synthetic" 'checkpoint-through-generic-mutation
+             '((jolt-with-mutex mu (checkpoint-generic-helper))) '(mu)))
+         (generic-wrapper
+           (collect-unit "synthetic" 'checkpoint-generic-wrapper
+             '((checkpoint-generic-helper)) '()))
+         (through-wrapper
+           (collect-unit "synthetic" 'checkpoint-through-wrapper-mutation
+             '((jolt-with-mutex mu (checkpoint-generic-wrapper))) '(mu)))
+         (dynamic-id
+           (collect-unit "synthetic" 'checkpoint-dynamic-id-mutation
+             '((jolt-with-mutex mu (jolt-checkpoint-continue! id))) '(mu id)))
+         (malformed-id
+           (collect-unit "synthetic" 'checkpoint-malformed-id-mutation
+             '((jolt-with-mutex mu
+                 (jolt-checkpoint-continue! "unqualified"))) '(mu)))
+         (leaf-extra-argument
+           (collect-unit "synthetic" 'checkpoint-leaf-arity-mutation
+             '((jolt-with-mutex mu
+                 (jolt-checkpoint-continue! "test/arity" extra))) '(mu extra)))
+         (applied
+           (collect-unit "synthetic" 'checkpoint-apply-mutation
+             '((jolt-with-mutex mu
+                 (apply jolt-checkpoint-continue! args))) '(mu args)))
+         ;; Exercise the real top-level definition collector: these exact value
+         ;; aliases were the escape that the operator-only call graph missed.
+         (generic-alias
+           (collect-definition "synthetic" '(define cp jolt-checkpoint!)))
+         (through-generic-alias
+           (collect-unit "synthetic" 'checkpoint-through-generic-alias-mutation
+             '((jolt-with-mutex mu
+                 (cp "test/alias" '(continue yield))))
+             '(mu)))
+         (generic-alias-chain
+           (collect-definition "synthetic" '(define cp2 cp)))
+         (through-generic-alias-chain
+           (collect-unit "synthetic"
+             'checkpoint-through-generic-alias-chain-mutation
+             '((jolt-with-mutex mu
+                 (cp2 "test/alias-chain" '(continue fault)))) '(mu)))
+         (continue-alias
+           (collect-definition "synthetic"
+             '(define continue-cp jolt-checkpoint-continue!)))
+         (through-continue-alias
+           (collect-unit "synthetic" 'checkpoint-through-continue-alias-mutation
+             '((jolt-with-mutex mu
+                 (continue-cp "test/continue-alias"))) '(mu)))
+         (through-continue-alias-dynamic
+           (collect-unit "synthetic"
+             'checkpoint-through-continue-alias-dynamic-mutation
+             '((jolt-with-mutex mu (continue-cp id))) '(mu id)))
+         (set-alias
+           (collect-definition "synthetic"
+             '(set! mutable-cp jolt-checkpoint!)))
+         (define-values-alias
+           (collect-definition "synthetic"
+             '(define-values (values-cp)
+                (values jolt-checkpoint-continue!))))
+         (define-syntax-wrapper
+           (collect-definition "define-syntax-synthetic"
+             '(define-syntax checkpoint-macro
+                (syntax-rules ()
+                  ((_ id dispositions)
+                   (jolt-checkpoint! id dispositions))))))
+         (through-define-syntax
+           (collect-unit "synthetic"
+             'checkpoint-through-define-syntax-mutation
+             '((jolt-with-mutex mu
+                 (checkpoint-macro "test/macro" '(continue yield)))) '(mu)))
+         (local-syntax-wrapper
+           (collect-unit "synthetic" 'checkpoint-local-syntax-mutation
+             '((let-syntax
+                 ((local-checkpoint
+                    (syntax-rules ()
+                      ((_ id)
+                       (jolt-checkpoint-continue! id)))))
+                 (jolt-with-mutex mu
+                   (local-checkpoint "test/local-macro")))) '(mu)))
+         (local-recursive-syntax-wrapper
+           (collect-unit "synthetic" 'checkpoint-local-recursive-syntax-mutation
+             '((letrec-syntax
+                 ((local-checkpoint
+                    (syntax-rules ()
+                      ((_ id dispositions)
+                       (jolt-checkpoint! id dispositions)))))
+                 (jolt-with-mutex mu
+                   (local-checkpoint
+                     "test/local-recursive-macro" '(continue cancel))))) '(mu)))
+         (manual
+           (collect-unit "synthetic" 'checkpoint-manual-lock-mutation
+             '((jolt-lock! mu)
+               (jolt-checkpoint! "test/manual" '(continue cancel))
+               (jolt-unlock! mu)) '(mu)))
+         (after-unlock
+           (collect-unit "synthetic" 'checkpoint-after-unlock-safe
+             '((jolt-lock! mu)
+               (snapshot-state)
+               (jolt-unlock! mu)
+               (jolt-checkpoint! "test/after" '(continue barrier))) '(mu)))
+         (before-unlock
+           (collect-unit "synthetic" 'checkpoint-before-unlock-mutation
+             '((jolt-lock! mu)
+               (snapshot-state)
+               (jolt-checkpoint! "test/before" '(continue barrier))
+               (jolt-unlock! mu)) '(mu)))
+         (units
+           (list direct-continue continue-helper through-continue direct-generic
+                 generic-helper through-generic generic-wrapper through-wrapper
+                 dynamic-id malformed-id leaf-extra-argument applied manual
+                 generic-alias through-generic-alias generic-alias-chain
+                 through-generic-alias-chain continue-alias
+                 through-continue-alias through-continue-alias-dynamic
+                 set-alias define-values-alias
+                 define-syntax-wrapper through-define-syntax
+                 local-syntax-wrapper local-recursive-syntax-wrapper
+                 after-unlock before-unlock))
+         (hazards (build-checkpoint-hazards units))
+         (got (checkpoint-findings units hazards))
+         (value-got (checkpoint-value-findings units)))
+    (define (has? name)
+      (exists (lambda (f) (eq? (cadr f) name)) got))
+    (define (has-value? unit-name entrypoint)
+      (exists
+        (lambda (f)
+          (and (eq? (cadr f) unit-name)
+               (eq? (cadddr f) entrypoint)))
+        value-got))
+    (and (not (has? 'checkpoint-direct-continue-safe))
+         (not (has-value? 'checkpoint-direct-continue-safe
+                          checkpoint-continue-call))
+         (not (has? 'checkpoint-through-continue-safe))
+         (has? 'checkpoint-direct-generic-mutation)
+         (has? 'checkpoint-through-generic-mutation)
+         (has? 'checkpoint-through-wrapper-mutation)
+         (has? 'checkpoint-dynamic-id-mutation)
+         (has? 'checkpoint-malformed-id-mutation)
+         (has? 'checkpoint-leaf-arity-mutation)
+         (has? 'checkpoint-apply-mutation)
+         (has? 'checkpoint-through-generic-alias-mutation)
+         (has? 'checkpoint-through-generic-alias-chain-mutation)
+         (has? 'checkpoint-through-continue-alias-mutation)
+         (has? 'checkpoint-through-continue-alias-dynamic-mutation)
+         (has-value? 'cp checkpoint-generic-call)
+         (has-value? 'continue-cp checkpoint-continue-call)
+         (has-value? 'synthetic::toplevel checkpoint-generic-call)
+         (has-value? 'synthetic::toplevel checkpoint-continue-call)
+         (has-value? 'define-syntax-synthetic::toplevel
+                     checkpoint-generic-call)
+         (has-value? 'checkpoint-local-syntax-mutation
+                     checkpoint-continue-call)
+         (has-value? 'checkpoint-local-recursive-syntax-mutation
+                     checkpoint-generic-call)
+         (has? 'checkpoint-manual-lock-mutation)
+         (not (has? 'checkpoint-after-unlock-safe))
+         (has? 'checkpoint-before-unlock-mutation))))
+
 (define (logical-region-self-test)
   (let ((locks (make-eq-hashtable)))
     (for-each (lambda (x) (hashtable-set! locks x #t)) '(mu-a mu-b mu-c))
@@ -2160,6 +2469,7 @@
       (exit 1))
     (let* ((parks (build-parkers units))
            (dispatches (build-dispatchers units))
+           (checkpoint-hazards (build-checkpoint-hazards units))
            (logical-dispatchers (build-logical-dispatchers units))
            (logical-acquires (build-logical-acquisitions units))
            (logical-edges (logical-order-edges units logical-acquires))
@@ -2170,6 +2480,11 @@
              (filter (lambda (g) (string=? "park" (analysis-finding-kind g))) got))
            (dispatch-got
              (filter (lambda (g) (string=? "dispatch" (analysis-finding-kind g))) got))
+           (checkpoint-got
+             (map finding->line
+                  (checkpoint-findings units checkpoint-hazards)))
+           (checkpoint-value-got
+             (map finding->line (checkpoint-value-findings units)))
            (logical-dispatch-got
              (map finding->line
                   (logical-dispatch-findings units logical-dispatchers)))
@@ -2186,6 +2501,7 @@
                             (bad-trusted-direct-dispatch-sites units)))
            (self-test-ok? (and (guarded-boundary-self-test)
                                (dispatch-self-test)
+                               (checkpoint-disposition-self-test)
                                (logical-region-self-test)
                                (analysis-debt-self-test '("dispatch") issue-prefix)
                                (primitive-whitelist-self-test))))
@@ -2205,7 +2521,7 @@
         ((and (pair? args) (string=? (car args) "--self-test"))
          (if (and self-test-ok? (null? missing))
              (begin
-               (printf "park/lock checker self-test: PASS (guard/receiver, counted and logical transitive dispatch, named/transitive logical acquisition, reentry/deferred controls, unknown identity and cycle mutations, manual/control/compound-expression/alias/apply mutations, primitive whitelist safe/unknown teeth, call-site trusted callbacks, issue-tagged debt mutations)\n")
+               (printf "park/lock checker self-test: PASS (guard/receiver, counted and logical transitive dispatch, checkpoint literal/dynamic/direct/transitive/manual/after-unlock/value-alias/set!/define-values/define-syntax/local-syntax mutations, named/transitive logical acquisition, reentry/deferred controls, unknown identity and cycle mutations, manual/control/compound-expression/alias/apply mutations, primitive whitelist safe/unknown teeth, call-site trusted callbacks, issue-tagged debt mutations)\n")
                (exit 0))
              (begin
                (printf "park/lock checker self-test: FAILED\n")
@@ -2222,7 +2538,17 @@
            (define (add! s) (set! problems (cons s problems)))
            ;; the teeth first: without the runtime half this check is a lint
            (unless self-test-ok?
-             (add! "  CHECKER SELF-TEST FAILED: park guard or dispatch/manual-lock mutation was not detected"))
+             (add! "  CHECKER SELF-TEST FAILED: park, dispatch, checkpoint, or manual-lock mutation was not detected"))
+           (for-each
+             (lambda (g)
+               (add! (string-append "  CHECKPOINT UNDER COUNTED LOCK: " g)))
+             checkpoint-got)
+           (for-each
+             (lambda (g)
+               (add! (string-append
+                       "  STORED CHECKPOINT CAPABILITY: " g
+                       " — call the canonical entry point directly")))
+             checkpoint-value-got)
            (for-each
              (lambda (m)
                (add! (string-append "  SWITCH POINT UNGUARDED: " (symbol->string (car m))
@@ -2269,9 +2595,11 @@
               (printf "park/lock check: FAILED\n")
               (exit 1))
              (else
-              (printf "park/lock check: passed (~a files, ~a definitions, ~a can park, ~a park allowlist, ~a counted dispatch debts, ~a logical dispatch debts, ~a logical order edges)\n"
+              (printf "park/lock check: passed (~a files, ~a definitions, ~a can park, ~a park allowlist, ~a checkpoint hazards, ~a stored checkpoint capabilities, ~a counted dispatch debts, ~a logical dispatch debts, ~a logical order edges)\n"
                       (length files) (length units)
                       (vector-length (hashtable-keys parks)) (length park-got)
+                      (length checkpoint-got)
+                      (length checkpoint-value-got)
                       (length dispatch-got) (length logical-dispatch-got)
                       (length logical-edges))
               (exit 0)))))))))
