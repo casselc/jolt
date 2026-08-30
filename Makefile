@@ -96,7 +96,7 @@ export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric buildlibsmoke buildsmoke \
+  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
@@ -165,7 +165,7 @@ CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirect
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions regexcache gosm asynctimer interruptnest taggedmethods threadsafety atomicnumeric
@@ -953,6 +953,12 @@ adaptercheck:
 # allowlist records today's unmigrated sites and must only ever shrink.
 lockcheck:
 	@sh host/chez/lock-check.sh
+
+# Static-analysis gates share one strict, issue-tagged debt lifecycle instead of
+# growing private allowlist parsers. Keep this boundary test separate so a future
+# consumer cannot silently weaken the common protocol while parkcheck stays green.
+analysisdebt:
+	@$(CHEZ) --script host/chez/static-analysis-debt-test.ss
 
 # The other half of the same rule: a fiber never leaves the CPU while its carrier
 # holds a counted lock. lockcheck above proves the runtime can TELL that a lock is
