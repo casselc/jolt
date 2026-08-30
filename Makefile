@@ -96,7 +96,7 @@ export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric buildlibsmoke buildsmoke \
+  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric futurehost buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
@@ -109,7 +109,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
-        atomicnumeric coreasyncproof lazyonceproof logicalmutexproof extensions regexcache \
+        atomicnumeric futurehost coreasyncproof lazyonceproof logicalmutexproof extensions regexcache \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
@@ -167,7 +167,7 @@ CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirect
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
-  systemstreams \
+  systemstreams futurehost \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions regexcache gosm asynctimer interruptnest taggedmethods threadsafety atomicnumeric
 TEST-GATES := submodules selfhost ci
 
@@ -735,6 +735,25 @@ atomicnumeric:
 	  fi; \
 	else \
 	  echo "Atomic numeric JVM oracle: SKIP (clojure not installed)"; \
+	fi
+
+# FutureTask/Future and ExecutorService/Executor are one modeled host-class
+# contract: identity/hierarchy, deref/Get exception shape, and concurrency
+# semantics must match reference JVM Clojure (#46).  One portable source file
+# is the oracle for both runtimes, including the negative paths.
+futurehost:
+	@command -v clojure >/dev/null 2>&1 || { \
+	  echo "Future host-model JVM oracle: FAIL (clojure is required)" >&2; exit 1; }
+	@mkdir -p target/future-host
+	@clojure -Srepro -M test/chez/future-host-oracle.clj \
+	  > target/future-host/jvm.edn
+	@./bin/jolt test/chez/future-host-oracle.clj \
+	  > target/future-host/jolt.edn
+	@if cmp -s target/future-host/jvm.edn target/future-host/jolt.edn; then \
+	  echo "Future host-model JVM oracle: OK"; \
+	else \
+	  diff -u target/future-host/jvm.edn target/future-host/jolt.edn; \
+	  exit 1; \
 	fi
 
 # Native record field reads: a keyword lookup on a statically-known record reads
