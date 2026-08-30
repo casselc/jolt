@@ -65,7 +65,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
-  gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate \
+  gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate extensions \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
@@ -74,7 +74,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
-        coreasyncproof lazyonceproof logicalmutexproof \
+        coreasyncproof lazyonceproof logicalmutexproof extensions \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
@@ -133,7 +133,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
+  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions gosm asynctimer interruptnest threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -294,6 +294,15 @@ lazyonceproof:
 # Bounded ownership/progress/publication model for the reusable logical mutex.
 logicalmutexproof:
 	@sh test/formal/check-logical-mutex.sh
+
+# Extension-point declaration, refinement, and provider publication are whole
+# semantic operations protected by the execution-context logical mutex.  This
+# gate exercises parking generic dispatch, concurrent union/epochs, reentrant
+# fail-fast publication, and also reruns the mutex ownership/unwind contract the
+# registry inherits.
+extensions:
+	@$(CHEZ) --script test/chez/logical-mutex-test.ss
+	@$(CHEZ) --script test/chez/extensions-concurrency-test.ss
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own
 # deadline however far away the pending ones are, and the thread is forked once.
