@@ -165,7 +165,9 @@ CLJ
 {:paths ["src" "out/src"]}
 EDN
   bin="$tmp/app-bin"
-  if JOLT_PWD="$tmp" "$jolt" build -m cpsmoke.core -o "$bin" >/dev/null 2>&1 && [ -x "$bin" ]; then
+  build_h_log="$tmp/build-h.log"
+  if JOLT_PWD="$tmp" "$jolt" build -m cpsmoke.core -o "$bin" \
+       >"$build_h_log" 2>&1 && [ -x "$bin" ]; then
     # Run it with BOTH the sources and the artifacts moved away. A namespace the
     # build silently dropped would otherwise be reloaded off disk at run time and
     # the binary would look fine.
@@ -175,6 +177,7 @@ EDN
     check "(h) built binary is standalone" "63 :dynamically-required" "$out_h"
   else
     echo "FAIL: (h) jolt build failed in a project with compiled artifacts on a path"
+    sed 's/^/    | /' "$build_h_log"
     fails=$((fails+1))
   fi
 
