@@ -34,6 +34,8 @@
 ;;      as a thread-backed one does
 ;;   7. the spawner's dynamic bindings reach the body, and its transaction does
 ;;      not (the rule async-go-spawn-thread and jolt-fiber-go-spawn both enforce)
+;;   8. every compiler-declared execution-transfer seam runs its body on a
+;;      distinct execution context, never inline on the spawning caller
 ;;
 ;; ONE CARRIER for the whole file, pinned before the first spawn: it makes check 5
 ;; mean what it says, and it also means any body that pins its carrier hangs
@@ -73,7 +75,8 @@
 (jolt-load-string overlay-src)
 (ev "(require '[clojure.core.async
                 :refer [chan <! >! <!! >!! close! timeout alts!! go
-                        thread thread-call io-thread go-monitor *go-backend*]])")
+                        thread-spawn fiber-spawn thread thread-call io-thread
+                        go-monitor *go-backend*]])")
 
 ;; Every wait a check makes is bounded: :timeout instead of a hung gate.
 (ev "(defn iot-await [ch ms]
@@ -187,6 +190,39 @@
     (jolt=2 (kw "bound") (ev "(binding [*iot-v* :bound] (<!! (io-thread *iot-v*)))")))
 (ok "7b. the body does not join the spawner's transaction"
     (eq? #f (ev "(dosync (<!! (io-thread (clojure.lang.LockingTransaction/isRunning))))")))
+
+;; --- 8. the compiler's execution-transfer contract ---------------------------
+;; effects.clj treats these bodies as separately summarized deferred subjects.
+;; That is sound only while no seam invokes its body on the spawning caller.
+;; Thread/currentThread identity is the direct observation: fibers may share a
+;; carrier with siblings, but that carrier is not this test's caller thread.
+(printf "\n== 8. scheduler bodies never execute inline on the spawning caller ==\n")
+(define r8
+  (ev "(let [caller (Thread/currentThread)
+             ct (chan 1) _ (>!! ct :thread-ready)
+             cf (chan 1) _ (>!! cf :fiber-ready)]
+         [(<!! (thread-call (fn [] (identical? caller (Thread/currentThread))) :mixed))
+          (<!! (thread-call (fn [] (identical? caller (Thread/currentThread))) :io))
+          (<!! (thread-spawn (fn [] (identical? caller (Thread/currentThread)))))
+          (<!! (fiber-spawn (fn [] (identical? caller (Thread/currentThread)))))
+          (binding [*go-backend* :thread]
+            (<!! (go (identical? caller (Thread/currentThread)))))
+          (binding [*go-backend* :fiber]
+            (<!! (go (identical? caller (Thread/currentThread)))))
+          (binding [*go-backend* :thread]
+            (<!! (go [(identical? caller (Thread/currentThread)) (<! ct)])))
+          (binding [*go-backend* :fiber]
+            (<!! (go [(identical? caller (Thread/currentThread)) (<! cf)])))])"))
+(ok "8a. thread-call :mixed transfers off the caller" (eq? #f (jv-nth r8 0)))
+(ok "8b. thread-call :io transfers off the caller" (eq? #f (jv-nth r8 1)))
+(ok "8c. thread-spawn transfers off the caller" (eq? #f (jv-nth r8 2)))
+(ok "8d. fiber-spawn transfers off the caller" (eq? #f (jv-nth r8 3)))
+(ok "8e. go-spawn :thread transfers off the caller" (eq? #f (jv-nth r8 4)))
+(ok "8f. go-spawn :fiber transfers off the caller" (eq? #f (jv-nth r8 5)))
+(ok "8g. __sm-spawn :thread transfers off the caller"
+    (eq? #f (jv-nth (jv-nth r8 6) 0)))
+(ok "8h. __sm-spawn :fiber transfers off the caller"
+    (eq? #f (jv-nth (jv-nth r8 7) 0)))
 
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))
