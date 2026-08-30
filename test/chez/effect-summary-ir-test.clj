@@ -432,6 +432,23 @@
     (effects/record-phase! u :optimized known)
     (is (empty? (effects/verify-transition! u :woven :optimized)))))
 
+(deftest optimization-cannot-hide-scheduler-effects-behind-unknown
+  (doseq [effect [:jolt.effect/park
+                  :jolt.effect/native-block
+                  :jolt.effect/user-dispatch]]
+    (let [u (unit)
+          unknown (fixed-def "app/root" 0 (call "missing/work" []))
+          known (fixed-def "app/root" 0 (call "runtime/known" []))]
+      (effects/configure-declarations! u {"runtime/known" {:effects #{effect}}})
+      (effects/record-phase! u :woven unknown)
+      (effects/record-phase! u :optimized known)
+      (is (= [{:rule :jolt.rule/optimization-adds-no-effect
+               :subject (get-in (summary (effects/finalize-phase! u :woven)
+                                         "app/root")
+                                [:subject])
+               :added [effect]}]
+             (effects/verify-transition! u :woven :optimized))))))
+
 (deftest phase-verification-preserves-or-refines-unknown-provenance
   (testing "weaving cannot erase a source unknown witness"
     (let [u (unit)

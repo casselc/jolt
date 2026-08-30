@@ -16,6 +16,16 @@
 
 (def phases #{:plain :woven :optimized})
 
+;; Unknown is the top of the general may-effect lattice, so optimization may
+;; refine it into an ordinary concrete effect. These effects are different:
+;; they change whether execution may park a fiber, pin a carrier, or invoke
+;; application-controlled code. A later structural region checker relies on
+;; optimization never making one newly visible behind an earlier top.
+(def optimization-protected-effects
+  #{:jolt.effect/park
+    :jolt.effect/native-block
+    :jolt.effect/user-dispatch})
+
 (defn configure-analysis-context!
   "Select the compiler-mode epoch represented by unit's phase registries.
   Ordinary builds configure one context. Low-level pass harnesses may reuse a
@@ -578,9 +588,13 @@
                   missing (if (= from :plain)
                             (remove (get bc :effects) (get ac :effects))
                             [])
-                  added (if (and (= to :optimized) (not (get ac :unknown?)))
-                          (remove (get ac :effects) (get bc :effects))
-                          [])
+                  all-added (if (= to :optimized)
+                              (remove (get ac :effects) (get bc :effects))
+                              [])
+                  added (if (get ac :unknown?)
+                          (filter #(contains? optimization-protected-effects %)
+                                  all-added)
+                          all-added)
                   missing-witnesses
                   (if (= from :plain)
                     (remove (get bc :unknown-witnesses #{})
