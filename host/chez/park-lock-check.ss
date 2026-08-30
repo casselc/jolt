@@ -923,21 +923,30 @@
 (define (guarded-boundary-self-test)
   (let* ((mk (lambda (name calls body)
                (list "synthetic" name calls '() body)))
+         (logical-good
+           (mk 'jolt-logical-mutex-wait!
+               '(jolt-fiber-to-scheduler! jolt-locks-assert-none!)
+               '((jolt-locks-assert-none! 'logical-guard)
+                 (jolt-fiber-to-scheduler! f))))
          ;; Unit call lists are stored in reverse source order.
-         (good (list (mk 'jolt-publication-gate-wait!
+         (good (list logical-good
+                     (mk 'jolt-publication-gate-wait!
                          '(jolt-fiber-to-scheduler! jolt-locks-assert-none!)
                          '((jolt-locks-assert-none! 'guard)
                            (jolt-fiber-to-scheduler! f)))
                      (mk 'synthetic-caller '(jolt-publication-gate-wait!)
                          '((jolt-publication-gate-wait! gate me)))))
-         (deleted (list (mk 'jolt-publication-gate-wait!
+         (deleted (list logical-good
+                        (mk 'jolt-publication-gate-wait!
                             '(jolt-fiber-to-scheduler!)
                             '((jolt-fiber-to-scheduler! f)))))
-         (reordered (list (mk 'jolt-publication-gate-wait!
+         (reordered (list logical-good
+                          (mk 'jolt-publication-gate-wait!
                               '(jolt-locks-assert-none! jolt-fiber-to-scheduler!)
                               '((jolt-fiber-to-scheduler! f)
                                 (jolt-locks-assert-none! 'guard)))))
-         (conditional (list (mk 'jolt-publication-gate-wait!
+         (conditional (list logical-good
+                            (mk 'jolt-publication-gate-wait!
                                 '(jolt-fiber-to-scheduler! jolt-locks-assert-none! when)
                                 '((when #f (jolt-locks-assert-none! 'guard))
                                   (jolt-fiber-to-scheduler! f)))))

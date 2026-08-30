@@ -4,16 +4,8 @@
 # validates only the local finding key, count, and issue-tag shape.
 # Format: <file> <definition> dispatch <callee> <count> issue=chucklehead-dev/jolt-aspect-packs#NN
 # New, increased, decreased, dropped, malformed, duplicate, or untagged findings fail.
-host/chez/atoms.ss jolt-compare-and-set! dispatch jolt= 1 issue=chucklehead-dev/jolt-aspect-packs#22
 host/chez/atoms.ss jolt-add-watch dispatch jolt-watch-add 2 issue=chucklehead-dev/jolt-aspect-packs#24
 host/chez/atoms.ss jolt-remove-watch dispatch jolt=2 2 issue=chucklehead-dev/jolt-aspect-packs#24
-host/chez/extensions.ss jolt-refine-extension! dispatch ext-check-value! 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! dispatch ext-kw 2 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! dispatch ext-parse-fields 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! dispatch jolt-assoc1 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! dispatch jolt-contains? 2 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! dispatch pmap-fold-fwd 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension-point! dispatch ext-same-declaration? 1 issue=chucklehead-dev/jolt-aspect-packs#33
 host/chez/java/async.ss ac-poll! dispatch ac-poll!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
 host/chez/java/async.ss ac-try-give! dispatch ac-try-give!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
 host/chez/java/async.ss jolt-async-close! dispatch ac-close! 1 issue=chucklehead-dev/jolt-aspect-packs#21
@@ -38,8 +30,4 @@ host/chez/java/sm.ss jolt-sm-fiber-put dispatch ac-notify! 1 issue=chucklehead-d
 host/chez/java/sm.ss jolt-sm-fiber-put dispatch jolt-chan-locked-give! 1 issue=chucklehead-dev/jolt-aspect-packs#21
 host/chez/java/sm.ss jolt-sm-fiber-take dispatch ac-notify! 1 issue=chucklehead-dev/jolt-aspect-packs#21
 host/chez/java/sm.ss jolt-sm-fiber-take dispatch ac-poll!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/host-static-classes.ss atomic-cas! dispatch jolt=2 1 issue=chucklehead-dev/jolt-aspect-packs#23
-host/chez/java/host-static-classes.ss host/chez/java/host-static-classes.ss::toplevel dispatch jnum->exact 2 issue=chucklehead-dev/jolt-aspect-packs#35
-host/chez/java/host-static-classes.ss register-tagged-methods! dispatch tag->method-key 1 issue=chucklehead-dev/jolt-aspect-packs#34
-host/chez/java/host-static-methods.ss sys-set-property dispatch jolt-str-render-one 1 issue=chucklehead-dev/jolt-aspect-packs#25
 host/chez/regex.ss regex-parsed-entry dispatch java-pattern->sre 1 issue=chucklehead-dev/jolt-aspect-packs#40
