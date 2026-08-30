@@ -1500,18 +1500,20 @@
 ;; Single-key reads of both stay unlocked — strong hashtables, per var-table.
 (define hsc-mu (make-mutex))
 
-;; The probe and the create are ONE step. Split, two threads registering methods
-;; for one tag each built their own inner table and published it over the other's,
-;; so every method in the loser's batch vanished — the same shape as the protocol
-;; registry's type-registry. The member writes go under the same lock, since they
-;; mutate the table this just published.
+;; Normalizing an arbitrary tag can render it, hence invoke arbitrary user code
+;; that may park or register another tag. Do that before the counted lock. The
+;; probe and the create remain ONE locked step: split, two threads registering
+;; methods for one tag each built their own inner table and published it over the
+;; other's, so every method in the loser's batch vanished — the same shape as the
+;; protocol registry's type-registry. The member writes go under the same lock,
+;; since they mutate the table this just published.
 (define (register-tagged-methods! tag members)
-  (jolt-with-mutex hsc-mu
-    (let* ((key (tag->method-key tag))
-           (h (or (hashtable-ref tagged-methods-tbl key #f)
-                  (let ((nh (make-hashtable string-hash string=?)))
-                    (hashtable-set! tagged-methods-tbl key nh) nh))))
-      (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members))))
+  (let ((key (tag->method-key tag)))
+    (jolt-with-mutex hsc-mu
+      (let ((h (or (hashtable-ref tagged-methods-tbl key #f)
+                   (let ((nh (make-hashtable string-hash string=?)))
+                     (hashtable-set! tagged-methods-tbl key nh) nh))))
+        (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))))
 
 ;; htable arm: dispatch (.method obj a*) through the table's tag method registry;
 ;; an unregistered method falls through (sorted colls are htables too).
