@@ -12,6 +12,8 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [jolt.aspect-contracts :as contracts]
+            [jolt.canonical-edn :as canonical]
             [jolt.ir :as ir]))
 
 (def ^:private schema-version 1)
@@ -82,16 +84,6 @@
     (when unknown
       (fail (str label " contains unsupported keys")
             (assoc data :unknown (vec (sort-by str unknown)))))))
-
-(defn- canonical-str [x]
-  (cond
-    (map? x) (str "{" (str/join " "
-                           (map (fn [[k v]] (str (canonical-str k) " " (canonical-str v)))
-                                (sort-by (comp pr-str key) x))) "}")
-    (vector? x) (str "[" (str/join " " (map canonical-str x)) "]")
-    (set? x) (str "#{" (str/join " " (map canonical-str (sort-by pr-str x))) "}")
-    (seq? x) (str "(" (str/join " " (map canonical-str x)) ")")
-    :else (pr-str x)))
 
 (defn- stable-identity [s]
   ;; Artifact/cache separation needs a deterministic full-content identity, not
@@ -331,11 +323,11 @@
   (let [render-aspect
         (fn [aspect]
           (str "{:id " (pr-str (:id aspect))
-               "\n   :match " (canonical-str (:match aspect))
+               "\n   :match " (canonical/canonical-str (:match aspect))
                "\n   :advice-role " (pr-str (:advice-role aspect))
-               "\n   :expect " (canonical-str (:expect aspect)) "}"))]
+               "\n   :expect " (canonical/canonical-str (:expect aspect)) "}"))]
     (str "{:schema " (:schema manifest)
-         "\n :library " (canonical-str (:library manifest))
+         "\n :library " (canonical/canonical-str (:library manifest))
          "\n :aspects\n ["
          (str/join "\n  " (map render-aspect (:aspects manifest)))
          "]}\n")))
@@ -391,7 +383,7 @@
         (when-not (qualified-symbol? (:fn advice))
           (fail "provider contracted role :fn must be a qualified advice symbol"
                 {:provider provider-var :role role :fn (:fn advice)}))
-        (when-not (contains? #{:args-v1 :replace-args-v1 :control-v1}
+        (when-not (contains? contracts/contracted-provider-contracts
                              (:contract advice))
           (fail "unsupported provider role contract"
                 {:provider provider-var :role role :contract (:contract advice)})))
@@ -534,7 +526,7 @@
                                      providers)})
                             resolved)
                       :aspects aspects}
-            identity (stable-identity (canonical-str material))]
+            identity (stable-identity (canonical/canonical-str material))]
         {:schema schema-version
          :weaver weaver-version
          :identity identity
@@ -818,11 +810,11 @@
          (select-keys consumer [:provider :advice :contract :ordinal])))
 
 (defn- call-consumer-invoke [unit aspect consumer consumers node names site]
-  (let [[advice-ns advice-name] (split-fqn (:advice consumer))
+  (let [contract (contracts/contract-spec (:contract consumer))
+        [advice-ns advice-name] (split-fqn (:advice consumer))
         pos (:pos node)
         evaluated-args (ir/vector-node (mapv ir/local names))
-        replace-args? (contains? #{:replace-args-v1 :control-v1}
-                                 (:contract consumer))
+        replace-args? (:replacement-args? contract)
         replacement-names (when replace-args?
                             (mapv (fn [_] (fresh-local unit)) names))
         operation-names (or replacement-names names)
@@ -831,17 +823,19 @@
                                           (next consumers) node operation-names site)
                     (assoc node :args (mapv ir/local operation-names)))
         advice-ref (cond-> (ir/var-ref advice-ns advice-name) pos (assoc :pos pos))
-        join-point-node (ir/quote-node (join-point unit aspect consumer site))
+        join-point-data (join-point unit aspect consumer site)
+        ;; A compiler-only preservation token on the literal that physically
+        ;; travels through inlining. Effect analysis recomputes semantics from
+        ;; each phase's tree; it does not trust a summary annotation copied from
+        ;; an earlier phase.
+        join-point-node (assoc (ir/quote-node join-point-data)
+                               :aspect-site-id (:site-id join-point-data))
         operation-fn (cond->
                        (ir/fn-node nil [{:params (or replacement-names [])
                                         :body operation}])
                        pos (assoc :pos pos))
-        helper-name (case (:contract consumer)
-                      :control-v1 "__invoke-instrumentation-control"
-                      :replace-args-v1 "__invoke-instrumentation-around-replace-args"
-                      "__invoke-instrumentation-around")
-        helper-args (if (contains? #{:args-v1 :replace-args-v1 :control-v1}
-                                   (:contract consumer))
+        helper-name (:helper-name contract)
+        helper-args (if (:evaluated-args? contract)
                       [advice-ref join-point-node evaluated-args operation-fn]
                       [advice-ref join-point-node operation-fn])
         invoke (ir/invoke (ir/var-ref "clojure.core" helper-name) helper-args)]
@@ -863,10 +857,10 @@
 
 (defn- entry-consumer-invoke
   [unit aspect consumer consumers arity pos original-names names site]
-  (let [[advice-ns advice-name] (split-fqn (:advice consumer))
+  (let [contract (contracts/contract-spec (:contract consumer))
+        [advice-ns advice-name] (split-fqn (:advice consumer))
         evaluated-args (ir/vector-node (mapv ir/local names))
-        replace-args? (contains? #{:replace-args-v1 :control-v1}
-                                 (:contract consumer))
+        replace-args? (:replacement-args? contract)
         replacement-names (when replace-args?
                             (mapv (fn [_] (fresh-local unit)) names))
         operation-inputs (or replacement-names names)
@@ -889,16 +883,13 @@
         operation-fn (ir/fn-node nil [operation-arity])
         advice-ref (cond-> (ir/var-ref advice-ns advice-name)
                      pos (assoc :pos pos))
-        helper-name (case (:contract consumer)
-                      :control-v1 "__invoke-instrumentation-control"
-                      :replace-args-v1 "__invoke-instrumentation-around-replace-args"
-                      "__invoke-instrumentation-around")
-        helper-args (if (contains? #{:args-v1 :replace-args-v1 :control-v1}
-                                   (:contract consumer))
-                      [advice-ref (ir/quote-node (join-point unit aspect consumer site))
-                       evaluated-args operation-fn]
-                      [advice-ref (ir/quote-node (join-point unit aspect consumer site))
-                       operation-fn])]
+        join-point-data (join-point unit aspect consumer site)
+        join-point-node (assoc (ir/quote-node join-point-data)
+                               :aspect-site-id (:site-id join-point-data))
+        helper-name (:helper-name contract)
+        helper-args (if (:evaluated-args? contract)
+                      [advice-ref join-point-node evaluated-args operation-fn]
+                      [advice-ref join-point-node operation-fn])]
     (cond-> (ir/invoke (ir/var-ref "clojure.core" helper-name) helper-args)
       pos (assoc :pos pos))))
 
@@ -1113,7 +1104,7 @@
     (when-let [parent (.getParentFile (io/file (:report config)))]
       (.mkdirs parent))
     ;; Jolt's spit writes through a sibling temporary and renames on success.
-    (spit (:report config) (str (canonical-str report) "\n"))
+    (spit (:report config) (str (canonical/canonical-str report) "\n"))
     report))
 
 (defn finish-build!

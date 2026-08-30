@@ -1,0 +1,601 @@
+(ns jolt.passes.effects
+  "Compilation-unit effect summaries for analyzed Jolt IR.
+
+  This pass deliberately starts with effects visible in user/library IR:
+  resolved calls, opaque invocation, and aspect join-point preservation.  The
+  counted/logical mutex rules for the hand-written Chez runtime remain in
+  host/chez/park-lock-check.ss; those mutex regions do not exist in this IR.
+
+  Summaries are recomputed at :plain, :woven, and :optimized checkpoints.  The
+  authoritative state lives on the compilation unit, not on IR nodes: inlining
+  and scalar replacement are allowed to replace nodes wholesale."
+  (:require [clojure.java.io :as io]
+            [jolt.aspect-contracts :as aspect-contracts]
+            [jolt.canonical-edn :as canonical]
+            [jolt.ir :refer [reduce-ir-children closed-world-opt-out?]]))
+
+(def phases #{:plain :woven :optimized})
+
+(defn configure-analysis-context!
+  "Select the compiler-mode epoch represented by unit's phase registries.
+  Ordinary builds configure one context. Low-level pass harnesses may reuse a
+  unit while changing linkage/optimization flags; a new context starts fresh
+  evidence instead of comparing two different compiler configurations as if
+  they were duplicate observations of one build."
+  [unit context]
+  (when-let [context-cell (get unit :effect-analysis-context)]
+    (let [prior @context-cell]
+      (when (not= prior context)
+        (reset! context-cell context)
+        (reset! (:effect-phase-roots unit)
+                {:plain {} :woven {} :optimized {}})
+        (reset! (:effect-reports unit) {})
+        (reset! (:effect-findings unit) [])
+        (when-let [source-ids (:effect-source-ids unit)]
+          (reset! source-ids {})))))
+  unit)
+
+(defn- fqn [node]
+  (str (get node :ns) "/" (get node :name)))
+
+(defn- arity-shape [arity]
+  (if (get arity :rest)
+    {:variadic-min (count (get arity :params))}
+    {:fixed (count (get arity :params))}))
+
+(defn- subject [node arity source-id]
+  (cond-> {:kind :var-arity
+           :fqn (fqn node)
+           :definition-position (select-keys (get node :pos) [:line :column])
+           :arity (arity-shape arity)}
+    source-id (assoc :source-id source-id)))
+
+(defn- initializer-subject [node source-id]
+  (cond-> {:kind :var-init
+           :fqn (fqn node)
+           :definition-position (select-keys (get node :pos) [:line :column])}
+    source-id (assoc :source-id source-id)))
+
+(defn- position [node]
+  ;; Build evidence is portable and source-neutral. The surrounding subject
+  ;; identifies the function; line/column locate the call without publishing a
+  ;; checkout path or making identical sources produce different bytes.
+  (select-keys (get node :pos) [:line :column]))
+
+(defn- top-level-subject [node source-id]
+  ;; Reader positions remain stable while weave/optimization replace the root.
+  ;; The namespace is stamped by analyze even when the root itself is not a def.
+  (cond-> {:kind :top-level-form
+           :namespace (str (or (get node :fnsrc-ns) (get node :ns) "<unknown>"))
+           :op (get node :op)
+           :position (position node)}
+    source-id (assoc :source-id source-id)))
+
+(defn- source-id!
+  "Return a path-neutral source token stable for this compilation unit. The
+  absolute reader path is used only as an internal key and never enters build
+  evidence. First-observation order is deterministic in Jolt's serial compiler
+  walk and remains shared by all three analysis phases."
+  [unit node]
+  (or (get node :effect-source-id)
+      (when-let [file (get-in node [:pos :file])]
+        (when-let [source-ids (:effect-source-ids unit)]
+          (let [m (swap! source-ids
+                         (fn [ids]
+                           (if (contains? ids file)
+                             ids
+                             (assoc ids file {:ordinal (count ids)}))))]
+            (get m file))))))
+
+(defn- callee [node argc]
+  {:fqn (fqn node) :argc argc})
+
+(defn- join-site-id [node]
+  (some (fn [arg]
+          (when (= :quote (get arg :op))
+            (or (get arg :aspect-site-id)
+                (get-in arg [:form :site-id]))))
+        (get node :args)))
+
+(defn- node-evidence [node]
+  {:effects #{}
+   :callees #{}
+   :aspect-sites (if-let [site-id (get node :aspect-site-id)] #{site-id} #{})
+   :opaque-calls []})
+
+(defn- merge-direct [a b]
+  {:effects (into (get a :effects #{}) (get b :effects #{}))
+   :callees (into (get a :callees #{}) (get b :callees #{}))
+   :aspect-sites (into (get a :aspect-sites #{}) (get b :aspect-sites #{}))
+   :opaque-calls (into (get a :opaque-calls []) (get b :opaque-calls []))})
+
+(def empty-direct
+  {:effects #{} :callees #{} :aspect-sites #{} :opaque-calls []})
+
+(declare summarize-eval)
+
+(defn- summarize-children [node]
+  (reduce-ir-children
+    (fn [acc child] (merge-direct acc (summarize-eval child)))
+    (node-evidence node)
+    node))
+
+(defn- summarize-fn-body [fn-node]
+  ;; Aspect operation thunks are generated with one arity.  Be conservative if
+  ;; that invariant changes: every arity is potentially selected by the helper.
+  (reduce (fn [acc arity]
+            (merge-direct acc (summarize-eval (get arity :body))))
+          empty-direct
+          (get fn-node :arities)))
+
+(defn- opaque-call [node kind]
+  {:effects #{:jolt.effect/user-dispatch}
+   :callees #{}
+   :aspect-sites #{}
+   :opaque-calls [{:kind kind :position (position node)}]})
+
+(defn- summarize-invoke [node]
+  (let [target (get node :fn)
+        args (get node :args)
+        target-fqn (when (= :var (get target :op)) (fqn target))
+        children (summarize-children node)]
+    (cond
+      (aspect-contracts/helper-call-spec target-fqn (count args))
+      ;; Weaving moves the original operation into a literal function and passes
+      ;; advice as a var value.  A structural walk correctly treats function
+      ;; construction as effect-free, so make the helper's synchronous behavior
+      ;; explicit here: it may invoke both advice and operation.
+      (let [contract (aspect-contracts/helper-call-spec target-fqn (count args))
+            advice (nth args (:advice-index contract))
+            operation (nth args (:operation-index contract))
+            site-id (join-site-id node)
+            advice-edge (if (= :var (get advice :op))
+                          {:effects #{}
+                           ;; Helper args are advice, join-point, optional
+                           ;; evaluated-args, operation. Advice receives every
+                           ;; helper argument after advice, including operation
+                           ;; as its proceed argument.
+                           :callees #{(callee advice (:advice-argc contract))}
+                           :aspect-sites #{}
+                           :opaque-calls []}
+                          (opaque-call node :aspect-advice))
+            operation-effects (if (= :fn (get operation :op))
+                                (summarize-fn-body operation)
+                                (opaque-call node :aspect-operation))]
+        (merge-direct
+          children
+          (merge-direct
+            advice-edge
+            (merge-direct
+              operation-effects
+              {:effects #{:jolt.effect/user-dispatch}
+               :callees #{}
+               :aspect-sites (if site-id #{site-id} #{})
+               :opaque-calls []}))))
+
+      (and target-fqn (aspect-contracts/helper-fqn? target-fqn))
+      (merge-direct children (opaque-call node :aspect-helper-shape))
+
+      target-fqn
+      (merge-direct children
+                    {:effects #{}
+                     :callees #{(callee target (count args))}
+                     :aspect-sites #{}
+                     :opaque-calls []})
+
+      :else
+      (merge-direct children
+                    (opaque-call node
+                                 (if (contains? #{:host :host-static :ffi-fn}
+                                                (get target :op))
+                                   :host-invoke
+                                   :dynamic-invoke))))))
+
+(defn summarize-eval
+  "Summarize effects incurred by evaluating node now. Function literal bodies
+  are deferred and therefore excluded, except when an aspect helper explicitly
+  invokes its generated operation thunk."
+  [node]
+  (cond
+    (= :fn (get node :op)) empty-direct
+    (= :ffi-callable (get node :op)) empty-direct
+    (= :invoke (get node :op)) (summarize-invoke node)
+    (= :host-call (get node :op))
+    (merge-direct (summarize-children node) (opaque-call node :host-call))
+    (= :host-new (get node :op))
+    (merge-direct (summarize-children node) (opaque-call node :host-new))
+    :else (summarize-children node)))
+
+(defn- as-summary [direct subject closed-world?]
+  (assoc direct
+         :subject subject
+         :closed-world? (if closed-world? true false)))
+
+(defn- definition-evaluation [node]
+  ;; Def evaluation includes initializer construction/execution and evaluated
+  ;; metadata. A function literal body remains deferred, but its metadata need
+  ;; not be. This is distinct from every callable arity subject.
+  (reduce (fn [acc child] (merge-direct acc (summarize-eval child)))
+          empty-direct
+          (filter some? [(get node :init) (get node :meta-expr)])))
+
+(defn- source-identified-subject? [s]
+  (boolean
+    (seq (or (get s :definition-position)
+             (get s :position)))))
+
+(defn summarize-node
+  "Return direct summaries for every runtime-evaluated top-level subject.
+  Function defs produce a var-initializer subject plus one subject per arity;
+  other initialized defs produce an initializer subject, and non-def roots use
+  their namespace/source position. closed-world? applies only to callable
+  arities because redefining a var does not make its already-run initializer
+  dynamically dispatchable."
+  ([node] (summarize-node node (not (closed-world-opt-out? (get node :meta))) nil))
+  ([node closed-world?]
+   (summarize-node node closed-world? nil))
+  ([node closed-world? source-id]
+   (summarize-node node closed-world? source-id node))
+  ([node closed-world? source-id identity-node]
+   (cond
+     (and (= :def (get node :op)) (= :fn (get-in node [:init :op])))
+     (into [(as-summary (definition-evaluation node)
+                        (initializer-subject identity-node source-id) true)]
+           (map (fn [arity]
+                  (as-summary (summarize-eval (get arity :body))
+                              (subject identity-node arity source-id) closed-world?))
+                (get-in node [:init :arities])))
+
+     (and (= :def (get node :op)) (get node :init))
+     [(as-summary (definition-evaluation node)
+                  (initializer-subject identity-node source-id) true)]
+
+     ;; Source declares currently carry static metadata only, but the IR schema
+     ;; permits an evaluated :meta-expr on any def. Preserve that contract rather
+     ;; than silently dropping a future/synthetic declare's metadata effects.
+     (and (= :def (get node :op)) (get node :no-init))
+     (if (get node :meta-expr)
+       [(as-summary (definition-evaluation node)
+                    (initializer-subject identity-node source-id) true)]
+       [])
+
+     :else
+     [(as-summary (summarize-eval node)
+                  (top-level-subject identity-node source-id) true)])))
+
+(defn record-phase!
+  "Record node's direct summaries at phase. Repeated identical observation is
+  idempotent. A different summary for the same phase/subject is a compiler
+  consistency failure rather than a last-write-wins overwrite."
+  ([unit phase node] (record-phase! unit phase node
+                                    (not (closed-world-opt-out? (get node :meta)))))
+  ([unit phase node closed-world?]
+   (record-phase! unit phase node closed-world? node))
+  ([unit phase node closed-world? identity-node]
+   (when-not (contains? phases phase)
+     (throw (ex-info "unknown Jolt effect-analysis phase" {:phase phase})))
+   (let [summaries (summarize-node node closed-world?
+                                   (source-id! unit identity-node)
+                                   identity-node)]
+     (swap! (:effect-phase-roots unit)
+            (fn [all]
+              (assoc all phase
+                     (reduce (fn [m summary]
+                               (let [s (get summary :subject)]
+                                 (if-let [prior (get m s)]
+                                   (do
+                                     ;; Source builds identify roots by their
+                                     ;; reader position, so a disagreement means
+                                     ;; two compiler paths summarized the same
+                                     ;; source differently. Low-level Scheme gate
+                                     ;; harnesses also reuse one unit across many
+                                     ;; independent, string-analyzed roots that
+                                     ;; carry no position; retain their historical
+                                     ;; scratch replacement behavior.
+                                     (when (and (source-identified-subject? s)
+                                                (not= prior summary))
+                                       (throw
+                                         (ex-info
+                                           (str
+                                             "Jolt effect subject changed within one phase: "
+                                             (pr-str
+                                               {:phase phase :subject s
+                                                :first (dissoc prior :subject)
+                                                :later (dissoc summary :subject)}))
+                                           {:phase phase :subject s
+                                            :first prior :later summary})))
+                                     (if (= prior summary) m (assoc m s summary)))
+                                   (assoc m s summary))))
+                             (get all phase {})
+                             summaries))))
+     (swap! (:effect-reports unit) dissoc phase)
+     summaries)))
+
+(defn configure-declarations!
+  "Install exact external effect declarations keyed by fqn string. A declaration
+  is {:effects #{...} :unknown? boolean}; omitted :unknown? means false."
+  [unit declarations]
+  (reset! (:effect-declarations unit) declarations)
+  (reset! (:effect-reports unit) {})
+  unit)
+
+(defn- matching-subject [summaries call]
+  (let [f (get call :fqn)
+        argc (get call :argc)
+        candidates (filter (fn [s]
+                             (and (= :var-arity (get-in s [:subject :kind]))
+                                  (get s :closed-world?)
+                                  (= f (get-in s [:subject :fqn]))))
+                           (vals summaries))
+        fixed (filterv #(= argc (get-in % [:subject :arity :fixed])) candidates)
+        variadic (filterv (fn [s]
+                            (let [n (get-in s [:subject :arity :variadic-min])]
+                              (and n (>= argc n))))
+                          candidates)
+        matches (if (seq fixed) fixed variadic)]
+    ;; Multiple closed-world definitions for one callable shape are not a
+    ;; closed world. Fail conservatively instead of selecting map iteration
+    ;; order and attributing another definition's behavior to the call.
+    (when (= 1 (count matches)) (first matches))))
+
+(defn- declared-summary [declarations call]
+  (when-let [d (get declarations (get call :fqn))]
+    {:closure {:effects (get d :effects #{})
+               :aspect-sites #{}
+               :unresolved #{}
+               :unknown-witnesses #{}
+               :unknown? (if (get d :unknown?) true false)}}))
+
+(defn- unresolved-witness [call]
+  {:kind :unresolved-var :fqn (get call :fqn) :argc (get call :argc)})
+
+(defn- close-one [summaries declarations summary]
+  (let [start {:effects (get summary :effects #{})
+               :aspect-sites (get summary :aspect-sites #{})
+               :unresolved #{}
+               :unknown-witnesses (set (get summary :opaque-calls))
+               :unknown? (boolean
+                           (or (not (get summary :closed-world?))
+                               (seq (get summary :opaque-calls))))}]
+    (reduce
+      (fn [acc call]
+        (let [target (matching-subject summaries call)
+              external (when-not target (declared-summary declarations call))
+              closure (cond target (get target :closure)
+                            external (get external :closure)
+                            :else {:effects #{} :aspect-sites #{}
+                                   :unresolved #{} :unknown-witnesses #{}
+                                   :unknown? true})
+              missing-witness (when (and (not target) (not external))
+                                (unresolved-witness call))]
+          (cond-> {:effects (into (get acc :effects) (get closure :effects #{}))
+                   :aspect-sites (into (get acc :aspect-sites)
+                                       (get closure :aspect-sites #{}))
+                   :unresolved (into (get acc :unresolved #{})
+                                     (get closure :unresolved #{}))
+                   :unknown-witnesses
+                   (into (get acc :unknown-witnesses #{})
+                         (get closure :unknown-witnesses #{}))
+                   :unknown? (or (get acc :unknown?) (get closure :unknown?))}
+            missing-witness
+            (assoc :unresolved (conj (get acc :unresolved #{}) missing-witness)
+                   :unknown-witnesses
+                   (conj (get acc :unknown-witnesses #{}) missing-witness)))))
+      start
+      (sort-by (fn [call] [(get call :fqn) (get call :argc)])
+               (get summary :callees)))))
+
+(defn- set-grows? [before after]
+  (every? #(contains? after %) before))
+
+(defn- closure-grows? [before after]
+  (and (set-grows? (get before :effects #{}) (get after :effects #{}))
+       (set-grows? (get before :aspect-sites #{}) (get after :aspect-sites #{}))
+       (set-grows? (get before :unresolved #{}) (get after :unresolved #{}))
+       (set-grows? (get before :unknown-witnesses #{})
+                   (get after :unknown-witnesses #{}))
+       (or (not (get before :unknown?)) (get after :unknown?))))
+
+(defn- close-fixpoint [roots declarations]
+  (let [initial (reduce-kv (fn [m k summary]
+                             (assoc m k (assoc summary :closure
+                                               {:effects (get summary :effects #{})
+                                                :aspect-sites (get summary :aspect-sites #{})
+                                                :unresolved #{}
+                                                :unknown-witnesses
+                                                (set (get summary :opaque-calls))
+                                                :unknown? (boolean
+                                                            (or (not (get summary :closed-world?))
+                                                                (seq (get summary :opaque-calls))))})))
+                           {} roots)
+        cap (+ 1 (count roots))]
+    (loop [i 0 summaries initial]
+      (let [next (reduce-kv (fn [m k summary]
+                              (assoc m k (assoc summary :closure
+                                                (close-one summaries declarations summary))))
+                            {} summaries)]
+        (doseq [[k before] summaries]
+          (when-not (closure-grows? (get before :closure)
+                                    (get-in next [k :closure]))
+            (throw (ex-info "Jolt effect closure is not monotone"
+                            {:subject k
+                             :before (get before :closure)
+                             :after (get-in next [k :closure])}))))
+        (cond
+          (= summaries next) next
+          (>= i cap)
+          (throw (ex-info "Jolt effect summary fixpoint did not converge"
+                          {:subjects (count roots)}))
+          :else (recur (inc i) next))))))
+
+(defn finalize-phase!
+  "Compute and retain a deterministic closure report for phase. Missing direct
+  callees and opaque calls remain unknown; declarations are the only escape."
+  [unit phase]
+  (when-not (contains? phases phase)
+    (throw (ex-info "unknown Jolt effect-analysis phase" {:phase phase})))
+  (let [roots (get @(:effect-phase-roots unit) phase {})
+        closed (close-fixpoint roots @(:effect-declarations unit))
+        summaries (mapv (fn [s]
+                          (let [closure (get s :closure)]
+                            {:subject (get s :subject)
+                             :direct {:effects (get s :effects)
+                                      :callees (get s :callees)
+                                      :aspect-sites (get s :aspect-sites)
+                                      :opaque-calls (get s :opaque-calls)}
+                             :closure closure}))
+                        (sort-by (fn [s] (pr-str (get s :subject))) (vals closed)))
+        report {:schema 1 :analysis "jolt.effects/v1" :phase phase
+                :summaries summaries}]
+    (swap! (:effect-reports unit) assoc phase report)
+    report))
+
+(defn phase-report [unit phase]
+  (or (get @(:effect-reports unit) phase)
+      (finalize-phase! unit phase)))
+
+(defn- summaries-by-subject [report]
+  (into {} (map (fn [s] [(get s :subject) s]) (get report :summaries))))
+
+(defn- subject-coverage-findings [from to a b]
+  (let [ak (set (keys a))
+        bk (set (keys b))
+        missing (vec (sort-by pr-str (remove bk ak)))
+        added (vec (sort-by pr-str (remove ak bk)))]
+    (cond-> []
+      (seq missing)
+      (conj {:rule :jolt.rule/phase-subjects-preserved
+             :from from :to to :missing missing})
+      (seq added)
+      (conj {:rule :jolt.rule/phase-subjects-stable
+             :from from :to to :added added}))))
+
+(defn verify-transition!
+  "Verify semantic preservation between phase reports. Plain effects must remain
+  possible after weaving. Optimization may refine a may-analysis by removing
+  possibilities; it may add a concrete effect only when the woven summary was
+  already unknown (top). It must not introduce unknown behavior, change the
+  subject set, or lose woven aspect-site evidence."
+  [unit from to]
+  (let [a (summaries-by-subject (phase-report unit from))
+        b (summaries-by-subject (phase-report unit to))
+        subjects (sort-by pr-str (filter #(contains? b %) (keys a)))
+        findings
+        (reduce
+          (fn [out subject]
+            (let [ac (get-in a [subject :closure])
+                  bc (get-in b [subject :closure])
+                  missing (if (= from :plain)
+                            (remove (get bc :effects) (get ac :effects))
+                            [])
+                  added (if (and (= to :optimized) (not (get ac :unknown?)))
+                          (remove (get ac :effects) (get bc :effects))
+                          [])
+                  sites-changed (and (= from :woven) (= to :optimized)
+                                     (not= (get ac :aspect-sites)
+                                           (get bc :aspect-sites)))
+                  new-unknown (and (= to :optimized)
+                                   (not (get ac :unknown?))
+                                   (get bc :unknown?))]
+              (cond-> out
+                (seq missing) (conj {:rule :jolt.rule/plain-effect-preserved
+                                     :subject subject :missing (vec missing)})
+                (seq added) (conj {:rule :jolt.rule/optimization-adds-no-effect
+                                   :subject subject :added (vec added)})
+                sites-changed (conj {:rule :jolt.rule/aspect-sites-preserved
+                                     :subject subject
+                                     :before (get ac :aspect-sites)
+                                     :after (get bc :aspect-sites)})
+                new-unknown (conj {:rule :jolt.rule/optimization-adds-no-unknown
+                                   :subject subject}))))
+          (subject-coverage-findings from to a b)
+          subjects)]
+    (swap! (:effect-findings unit) into findings)
+    findings))
+
+(defn verify-phases!
+  "Finalize and verify every currently recorded compiler phase."
+  [unit]
+  (doseq [phase [:plain :woven :optimized]] (finalize-phase! unit phase))
+  (let [empty-phases
+        (keep (fn [phase]
+                (when (empty? (get (phase-report unit phase) :summaries))
+                  {:rule :jolt.rule/phase-has-subjects :phase phase}))
+              [:plain :woven :optimized])
+        findings (into (vec empty-phases)
+                       (into (verify-transition! unit :plain :woven)
+                             (verify-transition! unit :woven :optimized)))]
+    (when (seq findings)
+      (throw (ex-info "Jolt effect-analysis phase invariant failed"
+                      {:findings findings})))
+    {:schema 1
+     :analysis "jolt.effects/verification-v1"
+     :phases [:plain :woven :optimized]
+     :findings []}))
+
+(defn- ordered-set [xs]
+  (vec (sort-by pr-str xs)))
+
+(defn- canonical-summary [summary]
+  (let [direct (get summary :direct)
+        closure (get summary :closure)]
+    {:subject (get summary :subject)
+     :direct {:effects (ordered-set (get direct :effects))
+              :callees (vec (sort-by (fn [c] [(get c :fqn) (get c :argc)])
+                                     (get direct :callees)))
+              :aspect-sites (vec (sort (get direct :aspect-sites)))
+              :opaque-calls (vec (sort-by pr-str (get direct :opaque-calls)))}
+     :closure
+     (cond-> {:effects (ordered-set (get closure :effects))
+              :aspect-sites (vec (sort (get closure :aspect-sites)))
+              :unknown? (if (get closure :unknown?) true false)}
+       (seq (get closure :unresolved))
+       (assoc :unresolved (vec (sort-by (fn [c] [(get c :fqn) (get c :argc)])
+                                        (get closure :unresolved))))
+       (seq (get closure :unknown-witnesses))
+       (assoc :unknown-witnesses
+              (vec (sort-by pr-str (get closure :unknown-witnesses)))))}))
+
+(defn- canonical-phase [report]
+  (let [summaries (mapv canonical-summary (get report :summaries))]
+    {:phase (get report :phase)
+     :coverage {:subjects (count summaries)
+                :subject-kinds
+                (into (sorted-map)
+                      (map (fn [[kind xs]] [kind (count xs)])
+                           (group-by #(get-in % [:subject :kind]) summaries)))}
+     :summaries summaries}))
+
+(defn prepare-build-report!
+  "Validate the completed unit and return deterministic, source-neutral effect
+  evidence. This does no I/O so a failed native build cannot publish evidence
+  for an artifact that was never produced."
+  [unit]
+  (let [verification (verify-phases! unit)]
+    {:schema 1
+     :analysis "jolt.effects/build-v1"
+     :build-identity @(:aspect-build-identity unit)
+     :analysis-context (when-let [cell (get unit :effect-analysis-context)] @cell)
+     :analysis-contract
+     {:plain-to-woven :effects-preserved
+      :woven-to-optimized :may-refinement
+      :effect-elimination-certificates? false}
+     :declarations
+     (mapv (fn [[name declaration]]
+             {:fqn name
+              :effects (ordered-set (get declaration :effects #{}))
+              :unknown? (if (get declaration :unknown?) true false)})
+           (sort-by first @(:effect-declarations unit)))
+     :phases (mapv (fn [phase]
+                     (canonical-phase (phase-report unit phase)))
+                   [:plain :woven :optimized])
+     :verification verification}))
+
+(defn publish-build-report!
+  "Atomically publish prepared effect evidence after the output artifact exists."
+  [path report]
+  (when-let [parent (.getParentFile (io/file path))]
+    (.mkdirs parent))
+  ;; Jolt's spit owns sibling-temp creation, flush, and atomic replacement.
+  (spit path (str (canonical/canonical-str report) "\n"))
+  report)
