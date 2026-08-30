@@ -947,10 +947,13 @@ lockcheck:
 # holds a counted lock. lockcheck above proves the runtime can TELL that a lock is
 # held; this one proves nothing parks while one is. It reads every host .ss as data,
 # closes "can park" over the call graph, and fails on a call to anything in that
-# closure from inside a jolt-with-mutex region — which is what the previous lexical
-# scan could not see, because the park was one call past the region (jolt-04ee). It
-# also fails if a switch point stops calling the runtime assertion, so the two
-# halves cannot be removed independently.
+# closure, or generic/procedure-valued dispatch, from inside a lexical or balanced
+# manual counted-lock region. The transitive closure is what the previous lexical
+# scan could not see, because the defect was one call past the region (jolt-04ee).
+# It also fails if a switch point stops calling the runtime assertion, so the two
+# halves cannot be removed independently. Known generic-dispatch debt is exact-
+# count and issue-tagged in host/chez/park-lock-known-debt.txt; the park allowlist
+# stays empty.
 parkcheck:
 	@sh host/chez/park-lock-check.sh
 
