@@ -61,7 +61,7 @@ export LIBRARY_PATH := $(subst $(space),:,$(strip $(CHEZSCHEME-LIB-DIRS)))$(if $
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
+  aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
@@ -73,7 +73,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
+.PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke atomicnumeric \
         coreasyncproof lazyonceproof \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
@@ -133,7 +133,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
+  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety atomicnumeric
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -632,6 +632,12 @@ gosm:
 # the same bug class through a core.async pipeline sweep.
 threadsafety:
 	@$(CHEZ) --script test/chez/thread-safety-test.ss
+
+# AtomicInteger/AtomicLong delta conversion must finish before their counted
+# state-transition mutex is entered; also pins typed failures and concurrent
+# leaf read/add/write serialization (jolt-aspect-packs#35).
+atomicnumeric:
+	@$(CHEZ) --script test/chez/atomic-numeric-test.ss
 
 # Native record field reads: a keyword lookup on a statically-known record reads
 # the field by its declared slot (jrec-field-at) instead of jolt-get; the value
