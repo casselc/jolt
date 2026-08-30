@@ -197,6 +197,10 @@
 ;;   :aspect-entry           literal {:id keyword :role keyword :arity? int}
 ;;                           derived from namespaced def metadata; consumed by
 ;;                           the aspect pass and omitted from runtime var meta.
+;;   :aspect-site-id         stable compiler-selected join-point identity on the
+;;                           generated quoted join-point literal; recomputed
+;;                           effect evidence uses it to prove optimization did
+;;                           not erase instrumentation.
 (def node-ops
   #{:const :local :var :the-var :host :host-static :host-new :if :do :invoke :def
     :let :loop :recur :fn :vector :map :set :quote :throw :coerce :try :host-call

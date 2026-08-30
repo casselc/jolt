@@ -651,6 +651,12 @@ infer:
 wp:
 	@$(CHEZ) --script host/chez/run-wp.ss
 
+# Compilation-unit effect summaries over raw, woven, and optimized Jolt IR.
+# The focused suite runs portably on the checked-in seed; whole-build gates also
+# exercise the hooks compiled into jolt.passes.
+effects:
+	@bin/jolt test/chez/effect-summary-ir-test.clj
+
 # Protocol-call devirtualization: a monomorphic call resolves its impl by the
 # inferred record tag (find-protocol-method) instead of routing through the
 # protocol var; the result must match ordinary dispatch.

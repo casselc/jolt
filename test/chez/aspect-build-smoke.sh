@@ -67,6 +67,23 @@ run_build() {
   fi
   (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" $extra_env \
     "$jolt" build -m app.core -o "target/$mode/app" "$@")
+  effect_report="$tmp/target/$mode/app.build/effects.edn"
+  test -s "$effect_report"
+  grep -q ':analysis "jolt.effects/build-v1"' "$effect_report"
+  grep -q ':phase :plain' "$effect_report"
+  grep -q ':phase :woven' "$effect_report"
+  grep -q ':phase :optimized' "$effect_report"
+  # A phase label with an empty summary vector is vacuous evidence. The compiler
+  # must publish both an explicit positive count and at least one subject.
+  grep -Eq ':coverage \{:subject-kinds \{[^}]+\} :subjects [1-9][0-9]*\}' \
+    "$effect_report"
+  grep -q ':summaries \[{' "$effect_report"
+  grep -q ':verification {:analysis "jolt.effects/verification-v1" :findings \[\]' \
+    "$effect_report"
+  if grep -q "$tmp" "$effect_report"; then
+    echo "FAIL: effect report contains the checkout path" >&2
+    exit 1
+  fi
   output=$("$tmp/target/$mode/app" ok)
   expected='argument
 advice-before :test/target-call
@@ -94,6 +111,10 @@ result ok-woven-inner!?'
 "$jolt" "$repo/test/chez/aspect-ir-test.clj"
 run_build release
 cp "$tmp/target/aspects.edn" "$tmp/target/release-aspects.edn"
+cp "$tmp/target/release/app.build/effects.edn" "$tmp/target/release-effects.edn"
+run_build release-repeat
+cmp "$tmp/target/release-effects.edn" \
+  "$tmp/target/release-repeat/app.build/effects.edn"
 
 # The actual CLI, not merely the source-loaded unit namespace, must expose a
 # deterministic source-free plan and accept only a report for this exact build.
