@@ -220,6 +220,23 @@
       (is (= #{{:fqn "app/first" :argc 0}}
              (get-in (first (:summaries report)) [:direct :callees]))))))
 
+(deftest compiler-precision-annotations-do-not-change-effect-identity
+  (let [u (unit)
+        body (assoc (call "app/work" [])
+                    :pos {:line 8 :column 4}
+                    :devirt-type "app.Before")
+        node (assoc (fixed-def "app/run" 0 body)
+                    :pos {:file "/checkout/app.clj" :line 5 :column 1})
+        refined (assoc-in node [:init :arities 0 :body :devirt-type]
+                          "app.After")]
+    (effects/record-phase! u :plain node)
+    (effects/record-phase! u :plain refined)
+    (let [closed (effects/closed-phase-summaries u :plain)
+          summary (some #(when (= :var-arity (get-in % [:subject :kind])) %)
+                        (vals closed))]
+      (is (= "app.After" (get-in summary [:analysis-node :devirt-type])))
+      (is (= #{{:fqn "app/work" :argc 0}} (:callees summary))))))
+
 (deftest distinct-source-files-cannot-collide-at-the-same-position
   (let [u (unit)
         positioned (fn [file target]

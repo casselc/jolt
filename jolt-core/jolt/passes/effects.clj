@@ -343,8 +343,16 @@
                                      ;; independent, string-analyzed roots that
                                      ;; carry no position; retain their historical
                                      ;; scratch replacement behavior.
+                                     ;; :analysis-node is retained for later
+                                     ;; contextual passes, but compiler-only
+                                     ;; annotations on that tree (devirt/type
+                                     ;; precision) may legitimately improve when
+                                     ;; a low-level gate reanalyzes one source in
+                                     ;; the same phase. Only the semantic direct
+                                     ;; summary participates in consistency.
                                      (when (and (source-identified-subject? s)
-                                                (not= prior summary))
+                                                (not= (dissoc prior :analysis-node)
+                                                      (dissoc summary :analysis-node)))
                                        (throw
                                          (ex-info
                                            (str
@@ -355,6 +363,8 @@
                                                 :later (dissoc summary :subject)}))
                                            {:phase phase :subject s
                                             :first prior :later summary})))
+                                     ;; Retain the latest analysis tree even when
+                                     ;; its semantic summary is unchanged.
                                      (if (= prior summary) m (assoc m s summary)))
                                    (assoc m s summary))))
                              (get all phase {})
