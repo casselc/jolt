@@ -150,11 +150,13 @@
 ;;   - pw-byte-port-memo receives only Chez's standard stream openers;
 ;;   - ldr-libs-update! receives only loader-owned set transforms;
 ;;   - jolt-lock-wait receives only runtime decision thunks implementing its
-;;     documented decide-under-mutex protocol.
+;;     documented decide-under-mutex protocol;
+;;   - maybe-cc-range receives only parse-cc-body's named-let continuation.
 (define trusted-direct-dispatch-sites
   '((pw-byte-port-memo 2 (standard-output-port standard-error-port))
     (ldr-libs-update! 1 (lambda))
-    (jolt-lock-wait 2 (lambda))))
+    (jolt-lock-wait 2 (lambda))
+    (maybe-cc-range 6 (loop))))
 
 ;; Chez procedures whose callback positions are invoked synchronously before the
 ;; consumer returns. Positions are one-based in the argument list. Literal
@@ -598,30 +600,43 @@
                              (walk-forms (cdr cl) lexical-lock? key-state bound emit)))
             (cddr d))))
 
+(define (walk-arrow-receiver receiver lexical-lock? manual-lock? bound emit)
+  ;; `cond` and `guard` evaluate the receiver expression and then invoke the
+  ;; resulting procedure synchronously.  A literal lambda is therefore fully
+  ;; visible and must be analyzed in the current region; it is not an opaque
+  ;; dynamic call.  A computed receiver remains fail-closed after its expression
+  ;; has been evaluated.
+  (cond
+    ((symbol? receiver)
+     (emit (resolve-operator receiver bound)
+           (or lexical-lock? (pair? manual-lock?)) #t))
+    ((and (pair? receiver) (eq? (car receiver) 'lambda))
+     (walk-lambda-body receiver lexical-lock? manual-lock? bound emit))
+    (else
+     (walk receiver lexical-lock? manual-lock? bound emit)
+     (emit dynamic-call (or lexical-lock? (pair? manual-lock?)) #t))))
+
 (define (walk-cond d lexical-lock? manual-lock? bound emit)
   (let loop ((clauses (cdr d)) (fallthrough manual-lock?))
     (unless (null? clauses)
       (let ((cl (car clauses)))
        (when (pair? cl)
-        ;; The clause list itself is not a procedure application. `=>` is the
-        ;; exception: cond invokes the receiver value, so record one dynamic
-        ;; dispatch in addition to walking its expressions.
-        (let ((arrow (memq '=> cl)))
-          (when (and arrow (pair? (cdr arrow)))
-            (let ((receiver (cadr arrow)))
-              (cond ((symbol? receiver)
-                     (emit (resolve-operator receiver bound)
-                           (or lexical-lock? (pair? manual-lock?)) #t))
-                    (else (emit dynamic-call
-                                (or lexical-lock? (pair? manual-lock?)) #t))))))
         (if (eq? (car cl) 'else)
-            (walk-forms (filter (lambda (x) (not (eq? x '=>))) (cdr cl))
-                        lexical-lock? fallthrough bound emit)
+            (walk-forms (cdr cl) lexical-lock? fallthrough bound emit)
             (begin
               (walk (car cl) lexical-lock? fallthrough bound emit)
               (let ((test-state (manual-state-after (car cl) fallthrough)))
-                (walk-forms (filter (lambda (x) (not (eq? x '=>))) (cdr cl))
-                            lexical-lock? test-state bound emit)
+                (let ((arrow (memq '=> (cdr cl))))
+                  (if (and arrow (pair? (cdr arrow)))
+                      (begin
+                        (walk-arrow-receiver (cadr arrow) lexical-lock?
+                                             test-state bound emit)
+                        ;; Invalid trailing forms remain visible to the checker
+                        ;; instead of becoming an analysis hole.
+                        (walk-forms (cddr arrow) lexical-lock?
+                                    test-state bound emit))
+                      (walk-forms (cdr cl) lexical-lock?
+                                  test-state bound emit)))
                 (set! fallthrough test-state)))))
        (loop (cdr clauses) fallthrough)))))
 
@@ -639,16 +654,25 @@
       (for-each
         (lambda (cl)
           (when (pair? cl)
-            (let ((arrow (memq '=> cl)))
-              (when (and arrow (pair? (cdr arrow)))
-                (let ((receiver (cadr arrow)))
-                  (emit (if (symbol? receiver)
-                            (resolve-operator receiver bound)
-                            dynamic-call)
-                        (or lexical-lock? (pair? caught-state)) #t))))
-            (walk-forms cl lexical-lock? caught-state
-                        (if (symbol? (caadr d)) (cons (caadr d) bound) bound)
-                        emit)))
+            (let ((clause-bound
+                    (if (symbol? (caadr d)) (cons (caadr d) bound) bound)))
+              (if (eq? (car cl) 'else)
+                  (walk-forms (cdr cl) lexical-lock? caught-state
+                              clause-bound emit)
+                  (begin
+                    (walk (car cl) lexical-lock? caught-state clause-bound emit)
+                    (let* ((test-state
+                             (manual-state-after (car cl) caught-state))
+                           (arrow (memq '=> (cdr cl))))
+                      (if (and arrow (pair? (cdr arrow)))
+                          (begin
+                            (walk-arrow-receiver
+                              (cadr arrow) lexical-lock? test-state
+                              clause-bound emit)
+                            (walk-forms (cddr arrow) lexical-lock? test-state
+                                        clause-bound emit))
+                          (walk-forms (cdr cl) lexical-lock? test-state
+                                      clause-bound emit))))))))
         (cdadr d))))))
 
 (define (walk-do d lexical-lock? manual-lock? bound emit)
@@ -1630,6 +1654,35 @@
                          '((jolt-with-mutex mu
                              (guard (e (#t => leaf)) (raise problem))))
                          '(mu problem)))
+         (cond-arrow-literal
+           (collect-unit "synthetic" 'cond-arrow-literal-safe
+                         '((jolt-with-mutex mu
+                             (cond ((ready?) => (lambda (v) v)))))
+                         '(mu)))
+         (cond-arrow-literal-dispatch
+           (collect-unit "synthetic" 'cond-arrow-literal-mutation
+                         '((jolt-with-mutex mu
+                             (cond ((ready?) =>
+                                    (lambda (v) (jolt-invoke v))))))
+                         '(mu)))
+         (cond-arrow-computed
+           (collect-unit "synthetic" 'cond-arrow-computed-mutation
+                         '((jolt-with-mutex mu
+                             (cond ((ready?) => (if p f g)))))
+                         '(mu p f g)))
+         (guard-arrow-literal
+           (collect-unit "synthetic" 'guard-arrow-literal-safe
+                         '((jolt-with-mutex mu
+                             (guard (e (#t => (lambda (v) v)))
+                               (raise problem))))
+                         '(mu problem)))
+         (guard-arrow-literal-dispatch
+           (collect-unit "synthetic" 'guard-arrow-literal-mutation
+                         '((jolt-with-mutex mu
+                             (guard (e (#t =>
+                                        (lambda (v) (jolt-invoke v))))
+                               (raise problem))))
+                         '(mu problem)))
          (trusted-only (collect-unit "synthetic" 'jolt-lock-wait
                                      '((jolt-with-mutex mu (decide)))
                                      '(mu decide)))
@@ -1662,7 +1715,9 @@
                       argument-balanced and-escape and-balanced cond-escape when-escape
                       cond-balanced if-launder if-acquire apply-helper
                       computed-apply computed-apply-safe do-test-escape guard-arrow
-                      guard-arrow-safe trusted-only
+                      guard-arrow-safe cond-arrow-literal
+                      cond-arrow-literal-dispatch cond-arrow-computed
+                      guard-arrow-literal guard-arrow-literal-dispatch trusted-only
                       trusted-plus-opaque safe
                       syntax-safe deferred-safe))
          (parks (build-parkers units))
@@ -1702,6 +1757,11 @@
          (has? 'do-test-lock-mutation 'dispatch)
          (has? 'guard-arrow-mutation 'dispatch)
          (not (has? 'guard-arrow-safe 'dispatch))
+         (not (has? 'cond-arrow-literal-safe 'dispatch))
+         (has? 'cond-arrow-literal-mutation 'dispatch)
+         (has? 'cond-arrow-computed-mutation 'dispatch)
+         (not (has? 'guard-arrow-literal-safe 'dispatch))
+         (has? 'guard-arrow-literal-mutation 'dispatch)
          (has? 'jolt-lock-wait 'dispatch)
          (memq trusted-dynamic-call (unit-locked trusted-only))
          (not (memq dynamic-call (unit-locked trusted-only)))
