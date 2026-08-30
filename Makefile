@@ -105,11 +105,11 @@ JOLT-TARGETS-NEEDING-DEPS := \
   narrow numeric numwp oparity pic protoret printperf regexcache remint sbperf sci selfhost shakelocal \
   traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit javasiocreate niodirectories niotemp unitconcurrent unitcontext \
-  taggedmethods threadsafety values wp ci
+  spitatomic taggedmethods threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
-        atomicnumeric futurehost coreasyncproof lazyonceproof logicalmutexproof extensions regexcache \
+        atomicnumeric futurehost coreasyncproof lazyonceproof logicalmutexproof extensions regexcache spitatomic \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
@@ -159,7 +159,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirectories niotemp documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirectories niotemp spitatomic documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
@@ -404,6 +404,10 @@ niodirectories:
 # java.io.File creation shares NIO's exclusive native result seam.
 javasiocreate:
 	@$(CHEZ) --script test/chez/java-io-create-test.ss
+
+# spit reserves and writes one O_EXCL-created sibling inode through publish.
+spitatomic:
+	@JOLT_CHEZ="$(CHEZ)" sh test/chez/spit-atomic-test.sh
 
 # The jolt half of the known-divergences :documented gate: every entry's :check
 # must render exactly its recorded :jolt value, its :jvm and :jolt must differ,
