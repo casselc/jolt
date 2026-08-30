@@ -496,6 +496,12 @@ eturn)) (loop (- n 1)))
 (define (jolt-logical-mutex-new)
   (vector (make-mutex) #f 0))
 
+(define (jolt-logical-mutex-owner-identity)
+  ;; The owner is the logical execution context, not merely its SRFI-18
+  ;; carrier.  Gambit's continuation fibers all run on one thread, so using
+  ;; current-thread alone makes sibling fibers look reentrant.
+  (or (jolt-current-fiber) (current-thread)))
+
 (define (jolt-logical-mutex-try-enter/owner! lm me)
   (cond
     ((eq? (vector-ref lm logical-mutex-i-owner) me)
@@ -509,10 +515,11 @@ eturn)) (loop (- n 1)))
     (else #f)))
 
 (define (jolt-logical-mutex-try-enter! lm)
-  (jolt-logical-mutex-try-enter/owner! lm (current-thread)))
+  (jolt-logical-mutex-try-enter/owner!
+    lm (jolt-logical-mutex-owner-identity)))
 
 (define (jolt-logical-mutex-enter! lm)
-  (let ((me (current-thread)))
+  (let ((me (jolt-logical-mutex-owner-identity)))
     (if (eq? (vector-ref lm logical-mutex-i-owner) me)
         (vector-set! lm logical-mutex-i-depth
                      (+ 1 (vector-ref lm logical-mutex-i-depth)))
@@ -522,7 +529,8 @@ eturn)) (loop (- n 1)))
           (vector-set! lm logical-mutex-i-depth 1)))))
 
 (define (jolt-logical-mutex-exit! lm)
-  (unless (eq? (vector-ref lm logical-mutex-i-owner) (current-thread))
+  (unless (eq? (vector-ref lm logical-mutex-i-owner)
+               (jolt-logical-mutex-owner-identity))
     (error 'jolt-logical-mutex-exit! "not logical mutex owner"))
   (let ((depth (- (vector-ref lm logical-mutex-i-depth) 1)))
     (vector-set! lm logical-mutex-i-depth depth)
@@ -531,7 +539,8 @@ eturn)) (loop (- n 1)))
       (mutex-unlock! (vector-ref lm logical-mutex-i-mutex)))))
 
 (define (jolt-logical-mutex-held-by-self? lm)
-  (eq? (vector-ref lm logical-mutex-i-owner) (current-thread)))
+  (eq? (vector-ref lm logical-mutex-i-owner)
+       (jolt-logical-mutex-owner-identity)))
 
 (define (jolt-logical-mutex-hold-count lm)
   (if (jolt-logical-mutex-held-by-self? lm)

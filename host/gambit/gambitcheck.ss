@@ -553,7 +553,24 @@
   ;; yield from 20 frames down
   (let ((f (sa-fiber-spawn (lambda () (deep-yield 20) 'deep-ok))))
     (sa-fiber-run-all)
-    (check "deep yield: result" (jolt-fiber-result f) 'deep-ok)))
+    (check "deep yield: result" (jolt-fiber-result f) 'deep-ok))
+  ;; A logical mutex is owned by an execution context, not its carrier thread.
+  ;; The first fiber yields while retaining ownership; a sibling on the same
+  ;; carrier must not be mistaken for a reentrant acquisition.
+  (let ((lm (jolt-logical-mutex-new))
+        (sibling-entered? #f))
+    (sa-fiber-spawn
+      (lambda ()
+        (jolt-logical-mutex-enter! lm)
+        (sa-fiber-yield)
+        (jolt-logical-mutex-exit! lm)))
+    (sa-fiber-spawn
+      (lambda ()
+        (set! sibling-entered? (jolt-logical-mutex-try-enter! lm))
+        (when sibling-entered? (jolt-logical-mutex-exit! lm))))
+    (sa-fiber-run-all)
+    (check "logical mutex distinguishes sibling fibers on one carrier"
+           sibling-entered? #f)))
 
 ;; ---- main --------------------------------------------------------------------
 
