@@ -27,6 +27,10 @@
 ;;   3. report every call to a parker or generic-dispatch boundary inside either
 ;;      a jolt-with-mutex body or a balanced manual jolt-lock!/jolt-unlock!
 ;;      region, naming the file, the enclosing definition and the callee.
+;;   4. identify every jolt-with-logical-mutex region by its top-level mutex
+;;      binding, report generic dispatch there as separate issue-backed debt,
+;;      close named acquisitions through helpers, and reject unknown identities
+;;      or a cycle in the resulting whole-program lock-order graph.
 ;;
 ;; Step 2 is the whole value: the lexical scan this replaces found NOTHING in the
 ;; pre-fix loader, because ldr-begin-load!'s region called ldr-wait-for-load! and
@@ -44,6 +48,10 @@
 ;;              procedure-valued operator directly in a region is also reported;
 ;;              treating every internal higher-order helper as a transitive seed
 ;;              made unrelated runtime code one giant false-positive component.
+;;   logical-dispatch
+;;              the same explicit generic boundary while a named logical mutex
+;;              is held. It may park safely, but remains a semantic reentry and
+;;              contention obligation owned by that logical region.
 ;;
 ;; WHAT IT DOES NOT DO, stated rather than left to be discovered:
 ;;
@@ -70,6 +78,7 @@
 (define scope-roots '("host/chez" "host/chez/java"))
 (define allowlist-file "host/chez/park-lock-allowlist.txt")
 (define debt-file "host/chez/park-lock-known-debt.txt")
+(define logical-debt-file "host/chez/logical-region-known-debt.txt")
 (define issue-prefix "issue=chucklehead-dev/jolt-aspect-packs#")
 
 ;; The two switch points. Every park in the runtime ends at one of them, and each
@@ -147,6 +156,17 @@
     (ldr-libs-update! 1 (lambda))
     (jolt-lock-wait 2 (lambda))))
 
+;; Chez procedures whose callback positions are invoked synchronously before the
+;; consumer returns. Positions are one-based in the argument list. Literal
+;; callback bodies can therefore be analyzed in the caller's execution region;
+;; a computed callback remains an explicit dispatch boundary.
+(define synchronous-callback-consumers
+  '((for-each 1) (filter 1)))
+
+(define (synchronous-callback-positions name)
+  (let ((entry (assq name synchronous-callback-consumers)))
+    (if entry (cdr entry) '())))
+
 (define (trusted-bound name bound)
   (let ((spec (assq name trusted-direct-dispatch-sites)))
     (if (not spec)
@@ -168,6 +188,29 @@
 (define lock-form 'jolt-with-mutex)
 (define manual-lock-calls '(jolt-lock! jolt-chan-lock!))
 (define manual-unlock-calls '(jolt-unlock! jolt-chan-unlock!))
+
+;; Logical mutexes deliberately permit arbitrary work and fiber parks.  They
+;; therefore need a different property from counted locks: generic dispatch is
+;; reviewed as an explicit obligation, while nested named acquisitions form a
+            ;; whole-program lock-order graph whose cycles are rejected.  Dynamic parameters
+;; let the existing syntax-aware walker carry region identity without growing a
+;; second, subtly different source walker.
+(define logical-lock-form 'jolt-with-logical-mutex)
+(define unknown-logical-lock '|unknown-logical-mutex|)
+(define known-logical-locks (make-parameter (make-eq-hashtable)))
+(define current-logical-regions (make-parameter '()))
+(define logical-effects-enabled? (make-parameter #t))
+(define logical-acquire-emitter (make-parameter (lambda (held acquired) (void))))
+(define logical-hard-emitter (make-parameter (lambda (kind detail) (void))))
+
+(define (logical-lock-identity x bound)
+  (if (symbol? x)
+      (let ((target (resolve-bound-operator x bound)))
+        (if (and (not (eq? target dynamic-call))
+                 (hashtable-ref (known-logical-locks) target #f))
+            target
+            unknown-logical-lock))
+      unknown-logical-lock))
 
 ;; ---------------------------------------------------------------------------
 ;; small helpers
@@ -542,8 +585,9 @@
 (define (walk-define d lexical-lock? manual-lock? bound emit)
   ;; (define (name . formals) body …) or (define name expr)
   (if (pair? (cadr d))
-      (walk-forms (cddr d) lexical-lock? manual-lock?
-                  (append (formal-names (cdadr d)) bound) emit)
+      (parameterize ((logical-effects-enabled? #f))
+        (walk-forms (cddr d) lexical-lock? manual-lock?
+                    (append (formal-names (cdadr d)) bound) emit))
       (walk-forms (cddr d) lexical-lock? manual-lock? bound emit)))
 
 (define (walk-case d lexical-lock? manual-lock? bound emit)
@@ -658,6 +702,27 @@
       (when (pair? (cdddr d))
         (walk (cadddr d) lexical-lock? branch-held bound emit)))))
 
+(define (walk-synchronous-callback-call d consumer positions
+                                        lexical-lock? manual-lock? bound emit)
+  (define in-lock? (or lexical-lock? (pair? manual-lock?)))
+  (emit consumer in-lock? #t)
+  (let loop ((args (cdr d)) (position 1))
+    (unless (null? args)
+      (let ((arg (car args)))
+        (if (memv position positions)
+            (cond
+              ((and (pair? arg) (eq? (car arg) 'lambda))
+               (walk-lambda-body arg lexical-lock? manual-lock? bound emit))
+              ((symbol? arg)
+               (emit (resolve-operator arg bound) in-lock? #t))
+              (else
+               ;; The callback expression is evaluated first; its resulting
+               ;; procedure is then invoked synchronously and opaquely.
+               (walk arg lexical-lock? manual-lock? bound emit)
+               (emit dynamic-call in-lock? #t)))
+            (walk arg lexical-lock? manual-lock? bound emit))
+        (loop (cdr args) (+ position 1))))))
+
 (define (walk x lexical-lock? manual-lock? bound emit)
   (define in-lock? (or lexical-lock? (pair? manual-lock?)))
   (cond
@@ -672,8 +737,15 @@
          ((quote) (void))                ; data, not code
          ((let let* letrec letrec* let-values let*-values)
           (walk-let x lexical-lock? manual-lock? bound emit))
-         ((lambda) (walk-lambda-body x lexical-lock? manual-lock? bound emit))
-         ((case-lambda) (walk-case-lambda x lexical-lock? manual-lock? bound emit))
+         ;; An ordinary lambda literal is created now but its body is deferred.
+         ;; Keep walking it for the general call graph, while excluding its body
+         ;; from the enclosing unit's synchronous logical-region effects.
+         ((lambda)
+          (parameterize ((logical-effects-enabled? #f))
+            (walk-lambda-body x lexical-lock? manual-lock? bound emit)))
+         ((case-lambda)
+          (parameterize ((logical-effects-enabled? #f))
+            (walk-case-lambda x lexical-lock? manual-lock? bound emit)))
          ((define define-syntax) (walk-define x lexical-lock? manual-lock? bound emit))
          ((case) (walk-case x lexical-lock? manual-lock? bound emit))
          ((cond) (walk-cond x lexical-lock? manual-lock? bound emit))
@@ -685,10 +757,60 @@
           ;; effects of the spawning definition while that definition's carrier
           ;; holds a counted lock. Walk only any non-thunk trailing arguments.
           (emit head in-lock? #t)
+          (when (pair? (cdr x))
+            (let ((thunk-expr (cadr x)))
+              ;; A literal body is deferred to the child. A computed thunk
+              ;; expression is evaluated synchronously before the spawn.
+              (unless (and (pair? thunk-expr) (eq? (car thunk-expr) 'lambda))
+                (walk thunk-expr lexical-lock? manual-lock? bound emit))))
           (when (pair? (cddr x))
             (walk-forms (cddr x) lexical-lock? manual-lock? bound emit)))
          (else
           (cond
+            ((and (symbol? head)
+                  (pair? (synchronous-callback-positions
+                           (resolve-operator head bound))))
+             (let ((consumer (resolve-operator head bound)))
+               (walk-synchronous-callback-call
+                 x consumer (synchronous-callback-positions consumer)
+                 lexical-lock? manual-lock? bound emit)))
+            ;; A logical mutex's first argument is evaluated before acquisition;
+            ;; its literal thunk body runs in the named logical region.  Keep
+            ;; acquisition separate from dispatch: an acyclic named edge is
+            ;; useful inventory, whereas opaque work is reviewable debt.
+            ((eq? head logical-lock-form)
+             ;; Preserve the ordinary call for counted-lock analysis without
+             ;; double-attributing this analyzer-owned wrapper as dispatch in an
+             ;; enclosing logical region.
+             (parameterize ((logical-effects-enabled? #f))
+               (emit head in-lock? #t))
+             (if (= (length x) 3)
+                 (let* ((lock-expr (cadr x))
+                        (thunk-expr (caddr x))
+                        (effects? (logical-effects-enabled?))
+                        (lock-id (logical-lock-identity lock-expr bound)))
+                   ;; Scheme evaluates both arguments before the wrapper enters.
+                   (walk lock-expr lexical-lock? manual-lock? bound emit)
+                   (unless (and (pair? thunk-expr)
+                                (eq? (car thunk-expr) 'lambda))
+                     (walk thunk-expr lexical-lock? manual-lock? bound emit))
+                   ((logical-acquire-emitter) (current-logical-regions) lock-id)
+                   (parameterize
+                     ((current-logical-regions
+                        (cons lock-id (current-logical-regions)))
+                      (logical-effects-enabled? effects?))
+                     (if (and (pair? thunk-expr)
+                              (eq? (car thunk-expr) 'lambda))
+                         (walk-lambda-body thunk-expr lexical-lock? manual-lock?
+                                           bound emit)
+                         ;; Invocation, unlike expression evaluation, occurs
+                         ;; after acquisition and is necessarily opaque.
+                         (emit dynamic-call
+                               (or lexical-lock? (pair? manual-lock?)) #t))))
+                 (begin
+                   ((logical-hard-emitter) 'unsupported-wrapper-arity
+                    logical-lock-form)
+                   (walk-forms (cdr x) lexical-lock? manual-lock? bound emit))))
             ;; THE REGION. (jolt-with-mutex mu body …): the mutex expression is
             ;; evaluated before the lock is taken, the body under it.
             ((eq? head lock-form)
@@ -702,6 +824,15 @@
                ;; but is invoked. Model that call shape directly so ordinary
                ;; argument values remain ordinary.
                ((and (eq? head 'apply) (pair? (cdr x)))
+                (let ((target (if (symbol? (cadr x))
+                                  (resolve-operator (cadr x) bound)
+                                  dynamic-call)))
+                  (when (eq? target logical-lock-form)
+                    ((logical-hard-emitter) 'unsupported-apply logical-lock-form))
+                  ;; The list's runtime shape is not statically available, so
+                  ;; callback positions cannot be recovered soundly.
+                  (when (pair? (synchronous-callback-positions target))
+                    ((logical-hard-emitter) 'unsupported-synchronous-apply target)))
                 ;; `apply` invokes its first argument. Record every named target,
                 ;; not only today's generic seeds. A computed target is opaque
                 ;; procedure-valued dispatch and therefore fails closed.
@@ -711,7 +842,10 @@
                       in-lock? #t)
                 (emit head in-lock? #t))
                ((symbol? head)
-                (emit (resolve-operator head bound) in-lock? #t))
+                (let ((resolved (resolve-operator head bound)))
+                  (when (eq? resolved logical-lock-form)
+                    ((logical-hard-emitter) 'unsupported-alias logical-lock-form))
+                  (emit resolved in-lock? #t)))
                ;; the head may itself be a form: ((f x) y)
                ;; Only explicitly reviewed arithmetic/bitwise Chez primitives
                ;; are leaves. Unknown primitive heads fall through to dynamic.
@@ -725,7 +859,8 @@
 ;; per-file collection
 ;; ---------------------------------------------------------------------------
 ;; A "unit" is one top-level definition:
-;; (file name calls locked-calls raw-body).
+;; (file name calls locked-calls raw-body logical-calls acquisitions edges
+;;  unknowns synchronous-calls).
 ;; calls is every operator-position symbol in the body (the call graph edge set),
 ;; and locked-calls is its subset inside a counted-lock region. Top-level forms
 ;; that are not definitions use a file-unique name so file-scope locks are read.
@@ -735,34 +870,166 @@
 (define (unit-calls u) (caddr u))
 (define (unit-locked u) (cadddr u))
 (define (unit-body u) (car (cddddr u)))
+(define (unit-logical-calls u) (if (> (length u) 5) (list-ref u 5) '()))
+(define (unit-logical-acquires u) (if (> (length u) 6) (list-ref u 6) '()))
+(define (unit-logical-edges u) (if (> (length u) 7) (list-ref u 7) '()))
+(define (unit-logical-unknowns u) (if (> (length u) 8) (list-ref u 8) '()))
+(define (unit-logical-sync-calls u) (if (> (length u) 9) (list-ref u 9) '()))
 
 (define (definition-name d)
   (and (pair? d) (eq? 'define (car d)) (pair? (cdr d))
        (if (pair? (cadr d)) (car (cadr d)) (cadr d))))
 
+(define (logical-lock-definition-name d)
+  (and (list? d) (= (length d) 3) (eq? (car d) 'define)
+       (symbol? (cadr d))
+       (let ((rhs (caddr d)))
+         (and (list? rhs) (= (length rhs) 1)
+              (eq? (car rhs) 'jolt-logical-mutex-new)
+              (cadr d)))))
+
+(define (analyze-logical-lock-identities datums)
+  (let ((locks (make-eq-hashtable)) (definitions (make-eq-hashtable))
+        (mutations (make-eq-hashtable)) (identity-errors '()))
+    (define (scan-mutations x)
+      (cond
+        ((not (pair? x)) (void))
+        ((and (list? x) (pair? x) (eq? (car x) 'quote)) (void))
+        ((and (list? x) (>= (length x) 2) (eq? (car x) 'set!)
+              (symbol? (cadr x)))
+         (hashtable-set! mutations (cadr x) #t)
+         (for-each scan-mutations (cddr x)))
+        (else
+         (scan-mutations (car x))
+         (scan-mutations (cdr x)))))
+    (for-each
+      (lambda (d)
+        (let ((defined (definition-name d))
+              (lock-name (logical-lock-definition-name d)))
+          (when defined
+            (hashtable-set! definitions defined
+              (+ 1 (hashtable-ref definitions defined 0))))
+          (when lock-name (hashtable-set! locks lock-name #t))
+          (scan-mutations d)))
+      datums)
+    (for-each
+      (lambda (name)
+        (let ((count (hashtable-ref definitions name 0)))
+          (unless (= count 1)
+            (set! identity-errors
+              (cons (string-append "logical mutex " (symbol->string name)
+                                   " has " (number->string count)
+                                   " top-level definitions")
+                    identity-errors)))
+          (when (hashtable-ref mutations name #f)
+            (set! identity-errors
+              (cons (string-append "logical mutex " (symbol->string name)
+                                   " is mutated with set!")
+                    identity-errors)))))
+      (vector->list (hashtable-keys locks)))
+    (cons locks (sort-list identity-errors string<?))))
+
+(define (discover-logical-locks files)
+  (let ((datums '()) (read-errors '()))
+    (for-each
+      (lambda (file)
+        (guard (e (#t (set! read-errors (cons file read-errors))))
+          (set! datums (append (read-datums file) datums))))
+      files)
+    (let ((analysis (analyze-logical-lock-identities datums)))
+      (list (car analysis) (reverse read-errors) (cdr analysis)))))
+
 (define (collect-unit file name forms bound)
-  (let ((calls '()) (locked '()))
-    (walk-forms forms #f '() (trusted-bound name bound)
-      (lambda (sym in-lock? operator?)
-        (when operator? (set! calls (cons sym calls)))
-        (when (and in-lock? operator?) (set! locked (cons sym locked)))))
-    (list file name calls locked forms)))
+  (let ((calls '()) (locked '()) (logical-calls '())
+        (logical-acquires '()) (logical-edges '()) (logical-unknowns '())
+        (logical-sync-calls '()))
+    (parameterize
+      ((current-logical-regions '())
+       (logical-acquire-emitter
+         (lambda (held acquired)
+           (when (logical-effects-enabled?)
+             (set! logical-acquires (cons acquired logical-acquires))
+             (when (eq? acquired unknown-logical-lock)
+               (set! logical-unknowns
+                 (cons '(unknown-acquisition . wrapper) logical-unknowns)))
+             (for-each
+               (lambda (owner)
+                 (cond
+                   ((or (eq? owner unknown-logical-lock)
+                        (eq? acquired unknown-logical-lock))
+                    (set! logical-unknowns
+                      (cons '(unknown-order-edge . wrapper) logical-unknowns)))
+                   ;; Reentrant acquisition is valid and is not an order edge.
+                   ((not (eq? owner acquired))
+                    (set! logical-edges
+                      (cons (cons owner acquired) logical-edges)))))
+               held))))
+       (logical-hard-emitter
+         (lambda (kind detail)
+           (set! logical-unknowns (cons (cons kind detail) logical-unknowns)))))
+      (walk-forms forms #f '() (trusted-bound name bound)
+        (lambda (sym in-lock? operator?)
+          (when operator? (set! calls (cons sym calls)))
+          (when (and in-lock? operator?) (set! locked (cons sym locked)))
+          ;; Structural census: these capabilities may not be stored or selected
+          ;; as values. Canonical wrapper calls are handled without walking the
+          ;; head, and approved low-level calls are checked below.
+          (when (and (not operator?)
+                     (memq sym '(jolt-with-logical-mutex
+                                 jolt-logical-mutex-enter!
+                                 jolt-logical-mutex-exit!)))
+            (set! logical-unknowns
+              (cons (cons 'unsupported-capability-value sym) logical-unknowns)))
+          (when (and operator?
+                     (memq sym '(jolt-logical-mutex-enter!
+                                 jolt-logical-mutex-exit!))
+                     (not (eq? name 'jolt-with-logical-mutex)))
+            (set! logical-unknowns
+              (cons (cons 'unsupported-low-level sym) logical-unknowns)))
+          (when (and operator? (logical-effects-enabled?))
+            (set! logical-sync-calls (cons sym logical-sync-calls))
+            (for-each
+              (lambda (owner)
+                (set! logical-calls (cons (cons owner sym) logical-calls)))
+              (current-logical-regions))))))
+    (list file name calls locked forms logical-calls logical-acquires
+          logical-edges logical-unknowns logical-sync-calls)))
+
+(define (collect-case-lambda-unit file name clauses)
+  (let ((parts
+          (map (lambda (clause)
+                 (collect-unit file name (cdr clause)
+                   (formal-names (car clause))))
+               clauses)))
+    (define (join-field i)
+      (fold-left (lambda (out u) (append (list-ref u i) out)) '() parts))
+    (list file name (join-field 2) (join-field 3) clauses
+          (join-field 5) (join-field 6) (join-field 7) (join-field 8)
+          (join-field 9))))
+
+(define (collect-definition file d)
+  (let ((nm (definition-name d)))
+    (if nm
+        (let ((rhs (and (not (pair? (cadr d)))
+                        (pair? (cddr d)) (caddr d))))
+          (cond
+            ((and (list? rhs) (pair? rhs) (eq? (car rhs) 'lambda))
+             (collect-unit file nm (cddr rhs) (formal-names (cadr rhs))))
+            ((and (list? rhs) (pair? rhs) (eq? (car rhs) 'case-lambda))
+             (collect-case-lambda-unit file nm (cdr rhs)))
+            (else
+             (collect-unit file nm (cddr d)
+               (if (pair? (cadr d)) (formal-names (cdadr d)) '())))))
+        (collect-unit file
+          (string->symbol (string-append file "::toplevel"))
+          (list d) '()))))
 
 (define (collect-file file)
   (let loop ((ds (read-datums file)) (acc '()))
     (cond
       ((null? ds) (reverse acc))
       (else
-       (let* ((d (car ds))
-              (nm (definition-name d)))
-         (loop (cdr ds)
-               (cons (if nm
-                         (collect-unit file nm (cddr d)
-                           (if (pair? (cadr d)) (formal-names (cdadr d)) '()))
-                         (collect-unit file
-                           (string->symbol (string-append file "::toplevel"))
-                           (list d) '()))
-                     acc)))))))
+       (loop (cdr ds) (cons (collect-definition file (car ds)) acc))))))
 
 ;; ---------------------------------------------------------------------------
 ;; the closure: which host definitions can park
@@ -818,6 +1085,147 @@
         (when changed (grow))))
     dispatches))
 
+(define (build-logical-dispatchers units)
+  (let ((dispatches (make-eq-hashtable)))
+    (for-each (lambda (s) (hashtable-set! dispatches s #t)) dispatch-seeds)
+    (hashtable-set! dispatches dynamic-call #t)
+    (let grow ()
+      (let ((changed #f))
+        (for-each
+          (lambda (u)
+            (unless (hashtable-ref dispatches (unit-name u) #f)
+              (when (exists (lambda (c) (hashtable-ref dispatches c #f))
+                            (unit-logical-sync-calls u))
+                (hashtable-set! dispatches (unit-name u) #t)
+                (set! changed #t))))
+          units)
+        (when changed (grow))))
+    dispatches))
+
+;; ---------------------------------------------------------------------------
+;; logical-region summaries and lock-order graph
+;; ---------------------------------------------------------------------------
+
+(define (adjoinq x xs) (if (memq x xs) xs (cons x xs)))
+(define (symbol<? a b) (string<? (symbol->string a) (symbol->string b)))
+(define (logical-edge<? a b)
+  (or (symbol<? (car a) (car b))
+      (and (eq? (car a) (car b)) (symbol<? (cdr a) (cdr b)))))
+
+(define (build-logical-acquisitions units)
+  (let ((acquires (make-eq-hashtable)))
+    (for-each
+      (lambda (u)
+        (hashtable-set! acquires (unit-name u)
+          (fold-left (lambda (xs x) (adjoinq x xs)) '()
+                     (unit-logical-acquires u))))
+      units)
+    (let grow ()
+      (let ((changed #f))
+        (for-each
+          (lambda (u)
+            (let ((before (hashtable-ref acquires (unit-name u) '())))
+              (let ((after
+                      (fold-left
+                        (lambda (xs callee)
+                          (fold-left (lambda (ys lock) (adjoinq lock ys)) xs
+                                     (hashtable-ref acquires callee '())))
+                        before (unit-logical-sync-calls u))))
+                (unless (= (length before) (length after))
+                  (hashtable-set! acquires (unit-name u) after)
+                  (set! changed #t)))))
+          units)
+        (when changed (grow))))
+    acquires))
+
+;; An edge is (held . acquired). Include direct lexical nesting and acquisitions
+;; reached transitively through a named helper called while HELD. Unknown
+;; identities are retained as hard findings rather than becoming graph nodes.
+(define (logical-order-edges units acquires)
+  (let ((edges '()))
+    (define (add-edge! edge)
+      (unless (or (eq? (car edge) (cdr edge)) (member edge edges))
+        (set! edges (cons edge edges))))
+    (for-each
+      (lambda (u)
+        (for-each add-edge! (unit-logical-edges u))
+        (for-each
+          (lambda (site)
+            (for-each
+              (lambda (acquired) (add-edge! (cons (car site) acquired)))
+              (hashtable-ref acquires (cdr site) '())))
+          (unit-logical-calls u)))
+      units)
+    (sort-list edges logical-edge<?)))
+
+(define (logical-unknown-findings units acquires)
+  (let ((out '()))
+    (define (add! line) (unless (member line out) (set! out (cons line out))))
+    (for-each
+      (lambda (u)
+        (for-each
+          (lambda (problem)
+            (add!
+              (string-append (unit-file u) " " (symbol->string (unit-name u))
+                             " " (symbol->string (car problem)) " "
+                             (symbol->string (cdr problem)))))
+          (unit-logical-unknowns u))
+        (for-each
+          (lambda (site)
+            (when (and (not (eq? (car site) unknown-logical-lock))
+                       (memq unknown-logical-lock
+                             (hashtable-ref acquires (cdr site) '())))
+              (add!
+                (string-append (unit-file u) " " (symbol->string (unit-name u))
+                               " transitive-unknown "
+                               (symbol->string (car site)) "->"
+                               (symbol->string (cdr site))))))
+          (unit-logical-calls u)))
+      units)
+    (sort-list out string<?)))
+
+;; Return one concrete cycle path, or #f. Reentrant self-acquisition was removed
+;; while constructing the graph, so every returned cycle is an order inversion.
+(define (logical-order-cycle edges)
+  (let ((nodes '()) (adj (make-eq-hashtable)))
+    (for-each
+      (lambda (edge)
+        (unless (or (eq? (car edge) unknown-logical-lock)
+                    (eq? (cdr edge) unknown-logical-lock))
+          (set! nodes (adjoinq (car edge) (adjoinq (cdr edge) nodes)))
+          (hashtable-set! adj (car edge)
+            (adjoinq (cdr edge) (hashtable-ref adj (car edge) '())))))
+      edges)
+    (set! nodes (sort-list nodes symbol<?))
+    (for-each
+      (lambda (node)
+        (hashtable-set! adj node
+          (sort-list (hashtable-ref adj node '()) symbol<?)))
+      nodes)
+    (let ((done (make-eq-hashtable)) (active (make-eq-hashtable)))
+      (letrec
+        ((visit
+           (lambda (node path)
+             (cond
+               ((hashtable-ref active node #f)
+                (let ((cycle (memq node path)))
+                  (and cycle (append cycle (list node)))))
+               ((hashtable-ref done node #f) #f)
+               (else
+                (hashtable-set! active node #t)
+                (let loop ((next (hashtable-ref adj node '())))
+                  (cond
+                    ((null? next)
+                     (hashtable-delete! active node)
+                     (hashtable-set! done node #t)
+                     #f)
+                    (else
+                     (let ((found (visit (car next) (append path (list node)))))
+                       (if found found (loop (cdr next))))))))))))
+        (let loop ((rest nodes))
+          (and (pair? rest)
+               (or (visit (car rest) '()) (loop (cdr rest)))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; findings
 ;; ---------------------------------------------------------------------------
@@ -849,6 +1257,27 @@
                              (lambda (s) (or (eq? s dynamic-call)
                                              (hashtable-ref dispatches s #f)))))
                     out)))))
+    (lambda (a b) (string<? (finding->line a) (finding->line b)))))
+
+(define (logical-dispatch-findings units dispatches)
+  (sort-list
+    (fold-left
+      (lambda (out u)
+        (let ((t (make-eq-hashtable)))
+          (for-each
+            (lambda (site)
+              (when (or (eq? (cdr site) dynamic-call)
+                        (hashtable-ref dispatches (cdr site) #f))
+                (let ((key
+                        (string->symbol
+                          (string-append (symbol->string (car site)) "->"
+                                         (symbol->string (cdr site))))))
+                  (hashtable-set! t key (+ 1 (hashtable-ref t key 0))))))
+            (unit-logical-calls u))
+          (append (tally->findings (unit-file u) (unit-name u)
+                                   'logical-dispatch t)
+                  out)))
+      '() units)
     (lambda (a b) (string<? (finding->line a) (finding->line b)))))
 
 (define (finding->line f)
@@ -1281,6 +1710,318 @@
          (not (has? 'syntax-safe 'dispatch))
          (not (has? 'deferred-safe 'dispatch)))))
 
+(define (logical-region-self-test)
+  (let ((locks (make-eq-hashtable)))
+    (for-each (lambda (x) (hashtable-set! locks x #t)) '(mu-a mu-b mu-c))
+    (parameterize ((known-logical-locks locks))
+      (let* ((direct
+               (collect-unit "synthetic" 'direct
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda () (jolt-invoke f x)))) '()))
+             (dispatch-helper
+               (collect-unit "synthetic" 'dispatch-helper
+                 '((jolt-invoke f x)) '()))
+             (through-dispatch
+               (collect-unit "synthetic" 'through-dispatch
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda () (dispatch-helper)))) '()))
+             (opaque-body
+               (collect-unit "synthetic" 'opaque-body
+                 '((jolt-with-logical-mutex mu-a thunk)) '(thunk)))
+             (safe-leaf
+               (collect-unit "synthetic" 'safe-leaf
+                 '((jolt-with-logical-mutex mu-a (lambda () (#3%fx+ 1 2)))) '()))
+             (sync-callback
+               (collect-unit "synthetic" 'sync-callback
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (for-each
+                         (lambda (x)
+                           (jolt-invoke f x)
+                           (jolt-with-logical-mutex mu-b (lambda () x)))
+                         xs)))) '()))
+             (sync-alias
+               (collect-unit "synthetic" 'sync-alias
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (let ((each for-each))
+                         (each
+                           (lambda (x)
+                             (jolt-with-logical-mutex mu-b (lambda () x)))
+                           xs))))) '()))
+             (sync-shadow
+               (collect-unit "synthetic" 'sync-shadow
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (let ((for-each deferred-consumer))
+                         (for-each
+                           (lambda (x)
+                             (jolt-with-logical-mutex mu-b (lambda () x)))
+                           xs))))) '()))
+             (computed-callback-factory
+               (collect-unit "synthetic" 'computed-callback-factory
+                 '((jolt-with-logical-mutex mu-b (lambda () callback))) '()))
+             (sync-computed
+               (collect-unit "synthetic" 'sync-computed
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (for-each (computed-callback-factory) xs)))) '()))
+             (deferred-factory
+               (collect-unit "synthetic" 'deferred-factory
+                 '((lambda ()
+                     (jolt-with-logical-mutex mu-b
+                       (lambda () (jolt-invoke f x))))) '()))
+             (through-deferred
+               (collect-unit "synthetic" 'through-deferred
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda () (deferred-factory)))) '()))
+             (nested
+               (collect-unit "synthetic" 'nested
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (jolt-with-logical-mutex mu-b (lambda () 1))))) '()))
+             (helper
+               (collect-unit "synthetic" 'helper
+                 '((jolt-with-logical-mutex mu-b (lambda () 1))) '()))
+             (through-helper
+               (collect-unit "synthetic" 'through-helper
+                 '((jolt-with-logical-mutex mu-a (lambda () (helper)))) '()))
+             (reentrant
+               (collect-unit "synthetic" 'reentrant
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (jolt-with-logical-mutex mu-a (lambda () 1))))) '()))
+             (deferred
+               (collect-unit "synthetic" 'deferred
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (fork-thread
+                         (lambda ()
+                           (jolt-with-logical-mutex mu-b (lambda () 1))))))) '()))
+             (computed-factory
+               (collect-unit "synthetic" 'computed-factory
+                 '((jolt-with-logical-mutex mu-b (lambda () thunk))) '()))
+             (fork-computed
+               (collect-unit "synthetic" 'fork-computed
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda () (fork-thread (computed-factory))))) '()))
+             (wrapper-computed
+               (collect-unit "synthetic" 'wrapper-computed
+                 '((jolt-with-logical-mutex mu-a (computed-factory))) '()))
+             (unknown
+               (collect-unit "synthetic" 'unknown
+                 '((jolt-with-logical-mutex (choose-lock) (lambda () 1))) '()))
+             (unknown-held
+               (collect-unit "synthetic" 'unknown-held
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (jolt-with-logical-mutex runtime-lock
+                         (lambda () 1))))) '(runtime-lock)))
+             (shadowed
+               (collect-unit "synthetic" 'shadowed
+                 '((jolt-with-logical-mutex mu-a (lambda () 1))) '(mu-a)))
+             (let-shadowed
+               (collect-unit "synthetic" 'let-shadowed
+                 '((let ((mu-a runtime-lock))
+                     (jolt-with-logical-mutex mu-a (lambda () 1)))) '()))
+             (malformed
+               (collect-unit "synthetic" 'malformed
+                 '((jolt-with-logical-mutex mu-a)) '()))
+             (aliased
+               (collect-unit "synthetic" 'aliased
+                 '((let ((hold jolt-with-logical-mutex))
+                     (hold mu-a (lambda () 1)))) '()))
+             (applied
+               (collect-unit "synthetic" 'applied
+                 '((apply jolt-with-logical-mutex
+                          (list mu-a (lambda () 1)))) '()))
+             (apply-argument
+               (collect-unit "synthetic" 'apply-argument
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (apply f
+                         (list
+                           (jolt-with-logical-mutex mu-b (lambda () 1)))))))
+                 '(f)))
+             (apply-synchronous
+               (collect-unit "synthetic" 'apply-synchronous
+                 '((apply for-each args)) '()))
+             (low-level
+               (collect-unit "synthetic" 'low-level
+                 '((jolt-logical-mutex-enter! mu-a)) '()))
+             (top-long
+               (collect-definition "synthetic"
+                 '(define top-long
+                    (lambda ()
+                      (jolt-with-logical-mutex mu-a
+                        (lambda () (jolt-invoke f x)))))))
+             (top-case-long
+               (collect-definition "synthetic"
+                 '(define top-case-long
+                    (case-lambda
+                      (() (jolt-with-logical-mutex mu-a
+                            (lambda () (jolt-invoke f x))))
+                      ((x) x)))))
+             (nested-define
+               (collect-unit "synthetic" 'nested-define
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (define (later)
+                         (jolt-with-logical-mutex mu-b (lambda () 1)))
+                       1))) '()))
+             (top-alias
+               (collect-definition "synthetic"
+                 '(define hold jolt-with-logical-mutex)))
+             (computed-head
+               (collect-unit "synthetic" 'computed-head
+                 '(((if p jolt-with-logical-mutex other)
+                    mu-a (lambda () 1))) '()))
+             (back-edge
+               (collect-unit "synthetic" 'back-edge
+                 '((jolt-with-logical-mutex mu-b
+                     (lambda ()
+                       (jolt-with-logical-mutex mu-a (lambda () 1))))) '()))
+             (dispatch-units
+               (list direct dispatch-helper through-dispatch opaque-body safe-leaf
+                     sync-callback sync-computed computed-callback-factory
+                     top-long top-case-long deferred-factory through-deferred))
+             (dispatches (build-logical-dispatchers dispatch-units))
+             (all (list helper through-helper))
+             (acquires (build-logical-acquisitions all))
+             (transitive-edges (logical-order-edges all acquires))
+             (acyclic-edges
+               (logical-order-edges (list nested)
+                 (build-logical-acquisitions (list nested))))
+             (cycle-edges
+               (logical-order-edges (list nested back-edge)
+                 (build-logical-acquisitions (list nested back-edge))))
+             (prefix-a
+               (collect-unit "synthetic" 'prefix-a
+                 '((jolt-with-logical-mutex mu-a
+                     (lambda ()
+                       (jolt-with-logical-mutex mu-b (lambda () 1))))) '()))
+             (prefix-b
+               (collect-unit "synthetic" 'prefix-b
+                 '((jolt-with-logical-mutex mu-b
+                     (lambda ()
+                       (jolt-with-logical-mutex mu-c (lambda () 1))))) '()))
+             (prefix-c
+               (collect-unit "synthetic" 'prefix-c
+                 '((jolt-with-logical-mutex mu-c
+                     (lambda ()
+                       (jolt-with-logical-mutex mu-b (lambda () 1))))) '()))
+             (prefix-units (list prefix-a prefix-b prefix-c))
+             (prefix-cycle
+               (logical-order-cycle
+                 (logical-order-edges prefix-units
+                   (build-logical-acquisitions prefix-units))))
+             (identity-analysis
+               (analyze-logical-lock-identities
+                 '((define mu-a (jolt-logical-mutex-new))
+                   (define mu-a other)
+                   (set! mu-a replacement)))))
+        (let ((failures 0))
+          (define (exact label actual expected)
+            (unless (equal? actual expected)
+              (set! failures (+ failures 1))
+              (printf "logical-region self-test FAIL ~a\n  expected: ~s\n  actual:   ~s\n"
+                      label expected actual)))
+          (exact 'dispatch-findings
+            (map finding->line
+              (logical-dispatch-findings
+                (list direct through-dispatch opaque-body safe-leaf sync-callback
+                      sync-computed top-long top-case-long through-deferred)
+                dispatches))
+            '("synthetic direct logical-dispatch mu-a->jolt-invoke 1"
+              "synthetic opaque-body logical-dispatch mu-a->procedure-valued-dispatch 1"
+              "synthetic sync-callback logical-dispatch mu-a->jolt-invoke 1"
+              "synthetic sync-computed logical-dispatch mu-a->procedure-valued-dispatch 1"
+              "synthetic through-dispatch logical-dispatch mu-a->dispatch-helper 1"
+              "synthetic top-case-long logical-dispatch mu-a->jolt-invoke 1"
+              "synthetic top-long logical-dispatch mu-a->jolt-invoke 1"))
+          (exact 'direct-edge (unit-logical-edges nested) '((mu-a . mu-b)))
+          (exact 'transitive-edge transitive-edges '((mu-a . mu-b)))
+          (exact 'reentrant-control (unit-logical-edges reentrant) '())
+          (exact 'deferred-control (unit-logical-edges deferred) '())
+          (exact 'synchronous-callback-edge
+                 (unit-logical-edges sync-callback) '((mu-a . mu-b)))
+          (exact 'synchronous-callback-alias
+                 (unit-logical-edges sync-alias) '((mu-a . mu-b)))
+          (exact 'synchronous-callback-shadow
+                 (unit-logical-edges sync-shadow) '())
+          (exact 'synchronous-computed-callback-edge
+            (logical-order-edges
+              (list computed-callback-factory sync-computed)
+              (build-logical-acquisitions
+                (list computed-callback-factory sync-computed)))
+            '((mu-a . mu-b)))
+          (exact 'nested-define-control
+                 (unit-logical-edges nested-define) '())
+          (exact 'apply-argument-evaluation
+                 (unit-logical-edges apply-argument) '((mu-a . mu-b)))
+          ;; Only a computed fork thunk expression is synchronous; the literal
+          ;; child body and an ordinary returned lambda remain deferred.
+          (exact 'computed-fork-expression
+            (logical-order-edges (list computed-factory fork-computed)
+              (build-logical-acquisitions (list computed-factory fork-computed)))
+            '((mu-a . mu-b)))
+          (exact 'computed-wrapper-evaluation
+            (logical-order-edges (list computed-factory wrapper-computed)
+              (build-logical-acquisitions (list computed-factory wrapper-computed)))
+            '())
+          (exact 'computed-wrapper-dispatch
+            (map finding->line
+              (logical-dispatch-findings (list wrapper-computed)
+                (build-logical-dispatchers
+                  (list computed-factory wrapper-computed))))
+            '("synthetic wrapper-computed logical-dispatch mu-a->procedure-valued-dispatch 1"))
+          (exact 'computed-fork-dispatch-side
+            (map finding->line
+              (logical-dispatch-findings (list fork-computed)
+                (build-logical-dispatchers
+                  (list computed-factory fork-computed))))
+            '())
+          (exact 'ordinary-deferred-lambda
+            (logical-order-edges (list deferred-factory through-deferred)
+              (build-logical-acquisitions (list deferred-factory through-deferred)))
+            '())
+          (exact 'unknown-identities
+            (logical-unknown-findings
+              (list unknown unknown-held shadowed let-shadowed)
+              (build-logical-acquisitions
+                (list unknown unknown-held shadowed let-shadowed)))
+            '("synthetic let-shadowed unknown-acquisition wrapper"
+              "synthetic shadowed unknown-acquisition wrapper"
+              "synthetic unknown unknown-acquisition wrapper"
+              "synthetic unknown-held unknown-acquisition wrapper"
+              "synthetic unknown-held unknown-order-edge wrapper"))
+          (exact 'unsupported-syntax
+            (logical-unknown-findings
+              (list aliased applied apply-synchronous computed-head low-level
+                    malformed top-alias)
+              (build-logical-acquisitions
+                (list aliased applied apply-synchronous computed-head low-level
+                      malformed top-alias)))
+            '("synthetic aliased unsupported-alias jolt-with-logical-mutex"
+              "synthetic aliased unsupported-capability-value jolt-with-logical-mutex"
+              "synthetic applied unsupported-apply jolt-with-logical-mutex"
+              "synthetic applied unsupported-capability-value jolt-with-logical-mutex"
+              "synthetic apply-synchronous unsupported-synchronous-apply for-each"
+              "synthetic computed-head unsupported-capability-value jolt-with-logical-mutex"
+              "synthetic hold unsupported-capability-value jolt-with-logical-mutex"
+              "synthetic low-level unsupported-low-level jolt-logical-mutex-enter!"
+              "synthetic malformed unsupported-wrapper-arity jolt-with-logical-mutex"))
+          (exact 'acyclic-control (logical-order-cycle acyclic-edges) #f)
+          (exact 'two-node-cycle (logical-order-cycle cycle-edges)
+                 '(mu-a mu-b mu-a))
+          (exact 'trimmed-prefix-cycle prefix-cycle '(mu-b mu-c mu-b))
+          (exact 'identity-discovery (cdr identity-analysis)
+            '("logical mutex mu-a has 2 top-level definitions"
+              "logical mutex mu-a is mutated with set!"))
+          (exact 'identity-discovery-lock
+                 (hashtable-ref (car identity-analysis) 'mu-a #f) #t)
+          (= failures 0))))))
+
 (define (primitive-whitelist-self-test)
   (and (eq? (primitive-head-name '($primitive 3 fx+)) 'fx+)
        (eq? (primitive-head-name '($primitive fx+)) 'fx+)
@@ -1335,42 +2076,76 @@
 
 (define (main args)
   (let* ((files (find-files))
-         (units (let loop ((fs files) (acc '()) (errs '()))
-                  (if (null? fs)
-                      (cons acc (reverse errs))
-                      (guard (e (#t (loop (cdr fs) acc
-                                          (cons (car fs) errs))))
-                        (loop (cdr fs) (append (collect-file (car fs)) acc) errs)))))
-         (bad-reads (cdr units))
+         (logical-lock-scan (discover-logical-locks files))
+         (units
+           (parameterize ((known-logical-locks (car logical-lock-scan)))
+             (let loop ((fs files) (acc '()) (errs '()))
+               (if (null? fs)
+                   (cons acc (reverse errs))
+                   (guard (e (#t (loop (cdr fs) acc
+                                       (cons (car fs) errs))))
+                     (loop (cdr fs) (append (collect-file (car fs)) acc) errs))))))
+         (bad-reads (append (cadr logical-lock-scan) (cdr units)))
+         (logical-identity-errors (caddr logical-lock-scan))
          (units (car units)))
     ;; A file that will not read is a HOLE, not something to skip past.
     (unless (null? bad-reads)
       (for-each (lambda (f) (printf "  UNREADABLE: ~a\n" f)) bad-reads)
       (printf "park/lock check: FAILED\n")
       (exit 1))
+    (unless (null? logical-identity-errors)
+      (for-each (lambda (problem) (printf "  LOGICAL IDENTITY: ~a\n" problem))
+                logical-identity-errors)
+      (printf "park/lock check: FAILED\n")
+      (exit 1))
     (let* ((parks (build-parkers units))
            (dispatches (build-dispatchers units))
+           (logical-dispatchers (build-logical-dispatchers units))
+           (logical-acquires (build-logical-acquisitions units))
+           (logical-edges (logical-order-edges units logical-acquires))
+           (logical-cycle (logical-order-cycle logical-edges))
+           (logical-unknowns (logical-unknown-findings units logical-acquires))
            (got (map finding->line (findings units parks dispatches)))
            (park-got
              (filter (lambda (g) (string=? "park" (analysis-finding-kind g))) got))
            (dispatch-got
              (filter (lambda (g) (string=? "dispatch" (analysis-finding-kind g))) got))
+           (logical-dispatch-got
+             (map finding->line
+                  (logical-dispatch-findings units logical-dispatchers)))
            (debt
              (analysis-validate-debt-lines
                (analysis-read-data-lines debt-file) '("dispatch") issue-prefix))
+           (logical-debt
+             (analysis-validate-debt-lines
+               (analysis-read-data-lines logical-debt-file)
+               '("logical-dispatch") issue-prefix))
            (missing (append (missing-switch-assertions units)
                             (bad-guarded-boundaries units parks)
                             (bad-trusted-callbacks units parks dispatches)
                             (bad-trusted-direct-dispatch-sites units)))
            (self-test-ok? (and (guarded-boundary-self-test)
                                (dispatch-self-test)
+                               (logical-region-self-test)
                                (analysis-debt-self-test '("dispatch") issue-prefix)
                                (primitive-whitelist-self-test))))
       (cond
+        ((and (pair? args) (string=? (car args) "--logical-report"))
+         (for-each (lambda (line) (printf "~a\n" line)) logical-dispatch-got)
+         (for-each
+           (lambda (edge)
+             (printf "logical-acquire ~a->~a\n"
+                     (symbol->string (car edge)) (symbol->string (cdr edge))))
+           logical-edges)
+         (for-each
+           (lambda (site) (printf "logical-unknown ~a\n" site))
+           logical-unknowns)
+         (when logical-cycle (printf "logical-cycle ~s\n" logical-cycle))
+         (exit 0))
         ((and (pair? args) (string=? (car args) "--self-test"))
          (if (and self-test-ok? (null? missing))
              (begin
-               (printf "park/lock checker self-test: PASS (guard/receiver, transitive dynamic-helper, manual/control/compound-expression/alias/apply mutations, primitive whitelist safe/unknown teeth, safe/deferred controls, call-site trusted callbacks, issue-tagged debt mutations)\n")
+               (printf "park/lock checker self-test: PASS (guard/receiver, counted and logical transitive dispatch, named/transitive logical acquisition, reentry/deferred controls, unknown identity and cycle mutations, manual/control/compound-expression/alias/apply mutations, primitive whitelist safe/unknown teeth, call-site trusted callbacks, issue-tagged debt mutations)\n")
                (exit 0))
              (begin
                (printf "park/lock checker self-test: FAILED\n")
@@ -1398,6 +2173,16 @@
              (lambda (p) (add! (string-append "  DEBT: " p)))
              (analysis-debt-problems dispatch-got debt))
            (for-each
+             (lambda (p) (add! (string-append "  LOGICAL DEBT: " p)))
+             (analysis-debt-problems logical-dispatch-got logical-debt))
+           (for-each
+             (lambda (site)
+               (add! (string-append "  UNKNOWN LOGICAL MUTEX: " site)))
+             logical-unknowns)
+           (when logical-cycle
+             (add! (string-append "  LOGICAL LOCK-ORDER CYCLE: "
+                                  (format "~s" logical-cycle))))
+           (for-each
              (lambda (g)
                (let ((w (find-line (analysis-finding-key g) want)))
                  (cond
@@ -1424,10 +2209,11 @@
               (printf "park/lock check: FAILED\n")
               (exit 1))
              (else
-              (printf "park/lock check: passed (~a files, ~a definitions, ~a can park, ~a park allowlist, ~a issue-tagged dispatch debts)\n"
+              (printf "park/lock check: passed (~a files, ~a definitions, ~a can park, ~a park allowlist, ~a counted dispatch debts, ~a logical dispatch debts, ~a logical order edges)\n"
                       (length files) (length units)
                       (vector-length (hashtable-keys parks)) (length park-got)
-                      (length dispatch-got))
+                      (length dispatch-got) (length logical-dispatch-got)
+                      (length logical-edges))
               (exit 0)))))))))
 
 (main (cdr (command-line)))

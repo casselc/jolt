@@ -58,6 +58,15 @@
                      '("a.ss alpha dispatch invoke 1 issue=example/ledger#7"
                        "a.ss alpha dispatch invoke 1 issue=example/ledger#8")
                      kinds prefix))))
+(check "finding-kind migration requires explicit ledger review"
+       (equal?
+         (analysis-debt-problems
+           '("a.ss alpha logical-dispatch invoke 1")
+           (analysis-validate-debt-lines
+             '("a.ss alpha dispatch invoke 1 issue=example/ledger#7")
+             '("dispatch" "logical-dispatch") prefix))
+         '("untagged new finding: a.ss alpha logical-dispatch invoke 1"
+           "dropped/stale debt: a.ss alpha dispatch invoke 1 issue=example/ledger#7 -> 0")))
 
 (if (= failures 0)
     (begin (printf "STATIC-ANALYSIS-DEBT-TEST OK (~a checks)\n" checks) (exit 0))
