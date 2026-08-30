@@ -103,7 +103,32 @@ run_build() {
                                     :jolt.effect/native-block)))
                   (:summaries phase))
             (throw (ex-info "effect report has no precise native-block evidence"
-                            {:phase (:phase phase)})))))') >/dev/null
+                            {:phase (:phase phase)})))
+          (let [summaries (:summaries phase)
+                caller (some (fn [summary]
+                               (when (= "app.core/scheduled-native-effect"
+                                        (get-in summary [:subject :fqn]))
+                                 summary))
+                             summaries)
+                transfer (first (get-in caller [:closure :transfers]))
+                deferred (some (fn [summary]
+                                 (when (= (:subject transfer) (:subject summary))
+                                   summary))
+                               summaries)]
+            (when-not
+              (and caller deferred
+                   (= :jolt.transfer/scheduled (:kind transfer))
+                   (contains? (set (get-in caller [:closure :effects]))
+                              :jolt.effect/schedule)
+                   (not (contains? (set (get-in caller [:closure :effects]))
+                                   :jolt.effect/native-block))
+                   (contains? (set (get-in deferred [:closure :effects]))
+                              :jolt.effect/native-block)
+                   (false? (get-in caller [:closure :unknown?]))
+                   (false? (get-in deferred [:closure :unknown?])))
+              (throw (ex-info "effect report has no precise go transfer evidence"
+                              {:phase (:phase phase)
+                               :caller caller :deferred deferred}))))))') >/dev/null
   if grep -q "$tmp" "$effect_report"; then
     echo "FAIL: effect report contains the checkout path" >&2
     exit 1

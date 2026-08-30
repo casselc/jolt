@@ -65,7 +65,9 @@
                        :site (position node)
                        :effects (canonical-effects effect-set)
                        :unknown? (if (get closure :unknown?) true false)}
-          blocking? (contains? effect-set :jolt.effect/native-block)
+          forbidden (effects/effects-for-rule
+                      :jolt.rule/no-native-block-under-logical-monitor)
+          blocking? (boolean (some forbidden effect-set))
           unknown? (get closure :unknown?)]
       {:regions [observation]
        :findings
@@ -172,6 +174,7 @@
      :analysis-contract
      {:lexical-region-stacks? true
       :transitive-effects? true
+      :declared-execution-transfers? true
       :interprocedural-region-stacks? false
       :bare-monitor-control-flow? false}
      :phases phase-reports

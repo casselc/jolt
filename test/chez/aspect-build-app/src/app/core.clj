@@ -2,6 +2,7 @@
   ;; Intentionally does not require instrumentation.provider. The selected
   ;; provider must become a compiler-supplied closed-world build root.
   (:require [app.target :as target]
+            [clojure.core.async :as async]
             [jolt.aspects :as aspects]))
 
 ;; A real compiler-visible primitive effect keeps the build evidence's positive
@@ -11,6 +12,13 @@
 
 (defn precise-native-effect []
   (c-usleep 0))
+
+;; Real macroexpanded execution-transfer evidence. The body is never invoked by
+;; the fixture binary, but the compiler must still retain it as a deferred
+;; subject: scheduling is immediate; the native block happens on the selected
+;; go carrier later.
+(defn scheduled-native-effect []
+  (async/go (precise-native-effect)))
 
 (defn evaluated-argument [x]
   (println "argument")

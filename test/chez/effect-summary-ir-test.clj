@@ -45,6 +45,10 @@
            %)
         (:summaries report)))
 
+(defn deferred-summaries [report]
+  (filterv #(= :deferred-arity (get-in % [:subject :kind]))
+           (:summaries report)))
+
 (deftest every-aspect-contract-has-one-round-trip-helper-shape
   (doseq [contract (sort (keys aspect-contracts/contracts))]
     (let [spec (aspect-contracts/contract-spec contract)]
@@ -160,6 +164,87 @@
     (let [s (summary (effects/finalize-phase! u :plain) "app/make-callback")]
       (is (empty? (get-in s [:direct :effects])))
       (is (false? (get-in s [:closure :unknown?]))))))
+
+(deftest scheduler-transfer-creates-a-separate-deferred-subject
+  (let [u (unit)
+        body (assoc (call "runtime/block" []) :pos {:line 9 :column 7})
+        callback (ir/fn-node nil [{:params ["k"] :body body}])
+        spawn (assoc (call "clojure.core.async/__sm-spawn" [callback])
+                     :pos {:line 8 :column 5})
+        node (fixed-def "app/run" 0 spawn)]
+    (effects/configure-declarations!
+      u {"runtime/block" {:effects #{:jolt.effect/native-call
+                                     :jolt.effect/native-block}}})
+    (effects/record-phase! u :plain node)
+    (let [report (effects/finalize-phase! u :plain)
+          caller (summary report "app/run")
+          deferred (first (deferred-summaries report))
+          transfer (first (get-in caller [:direct :transfers]))]
+      (is (= #{:jolt.effect/schedule}
+             (get-in caller [:closure :effects])))
+      (is (= :jolt.transfer/scheduled (:kind transfer)))
+      (is (= (:subject deferred) (:subject transfer)))
+      (is (= {:fixed 1} (get-in deferred [:subject :arity])))
+      (is (= #{:jolt.effect/native-call :jolt.effect/native-block}
+             (get-in deferred [:closure :effects])))
+      (is (false? (get-in caller [:closure :unknown?])))
+      (is (false? (get-in deferred [:closure :unknown?]))))))
+
+(deftest dynamic-scheduler-target-is-an-explicit-unknown-transfer
+  (let [u (unit)
+        spawn (assoc (call "clojure.core.async/go-spawn" [(ir/local "work")])
+                     :pos {:line 11 :column 3})
+        node (fixed-def "app/run" 1 spawn)]
+    (effects/record-phase! u :plain node)
+    (let [caller (summary (effects/finalize-phase! u :plain) "app/run")
+          transfer (first (get-in caller [:closure :transfers]))]
+      (is (= #{:jolt.effect/schedule}
+             (get-in caller [:closure :effects])))
+      (is (= {:kind :jolt.transfer/scheduled
+              :target "clojure.core.async/go-spawn"
+              :argument 0
+              :carrier :selected-go-backend
+              :site {:line 11 :column 3}
+              :origin-fqn nil
+              :unknown? true}
+             transfer))
+      ;; Unknown deferred behavior is not confused with unknown immediate
+      ;; evaluation: the scheduler call itself is fully classified.
+      (is (false? (get-in caller [:closure :unknown?]))))))
+
+(deftest inlining-preserves-the-origin-transfer-subject
+  (let [u (unit)
+        callback (ir/fn-node nil
+                             [{:params [] :body (call "runtime/work" [])}])
+        spawn (assoc (call "clojure.core.async/go-spawn" [callback])
+                     :pos {:line 8 :column 5})
+        callee (fixed-def "app/spawn" 0 spawn)
+        caller (fixed-def "app/run" 0 (call "app/spawn" []))
+        inlined-spawn (assoc spawn :inline-chain [["app/spawn" 20]])
+        optimized-caller (fixed-def "app/run" 0 inlined-spawn)]
+    (effects/configure-declarations!
+      u {"runtime/work" {:effects #{:effect/work}}})
+    (doseq [node [callee caller]]
+      (effects/record-phase! u :woven node))
+    (doseq [node [callee optimized-caller]]
+      (effects/record-phase! u :optimized node))
+    (let [woven (effects/finalize-phase! u :woven)
+          optimized (effects/finalize-phase! u :optimized)
+          before (first (get-in (summary woven "app/run")
+                                [:closure :transfers]))
+          after (first (get-in (summary optimized "app/run")
+                               [:closure :transfers]))]
+      (is (= (:subject before) (:subject after)))
+      (is (= {:kind :var-origin :fqn "app/spawn"}
+             (get-in before [:subject :owner])))
+      (is (empty? (effects/verify-transition! u :woven :optimized))))))
+
+(deftest contextual-effect-rules-are-optimization-protected
+  (doseq [[rule required] effects/safety-critical-effects
+          :when (not= rule
+                      :jolt.rule/optimization-preserves-scheduler-effects)]
+    (is (every? effects/optimization-protected-effects required)
+        (str rule " depends only on optimization-protected effects"))))
 
 (deftest top-level-initializers-and-bare-forms-are-explicit-subjects
   (let [u (unit)
@@ -542,8 +627,10 @@
       (is (= "test-build" (:build-identity first-report)))
       (is (= {:plain-to-woven :effects-preserved
               :woven-to-optimized :may-refinement
+              :execution-transfers :separate-deferred-subjects
               :effect-elimination-certificates? false}
              (:analysis-contract first-report)))
+      (is (= 6 (count (:execution-contracts first-report))))
       (is (= ["runtime/a" "runtime/b"]
              (mapv :fqn (:declarations first-report))))
       (is (= [:effect/a :effect/z]

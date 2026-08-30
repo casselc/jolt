@@ -127,6 +127,40 @@
       (is (empty? (:findings report)))
       (is (empty? (:limitations report))))))
 
+(deftest scheduled-body-owns-its-own-monitor-region
+  (let [u (unit)
+        block (assoc (call "runtime/block" []) :pos {:line 9 :column 9})
+        callback (ir/fn-node nil [{:params ["k"] :body (locking block)}])
+        spawn (assoc (call "clojure.core.async/__sm-spawn" [callback])
+                     :pos {:line 7 :column 5})
+        node (fixed-def "app/run" spawn)]
+    (effects/configure-declarations!
+      u {"runtime/block" {:effects #{:jolt.effect/native-block}}})
+    (record! u :plain node)
+    (let [report (regions/analyze-phase u :plain)
+          finding (first (:findings report))]
+      (is (= 3 (get-in report [:coverage :subjects])))
+      (is (= :jolt.rule/no-native-block-under-logical-monitor
+             (:rule finding)))
+      (is (= :deferred-arity (get-in finding [:subject :kind])))
+      (is (= {:line 9 :column 9} (:site finding))))))
+
+(deftest outer-monitor-does-not-leak-into-scheduled-execution
+  (let [u (unit)
+        block (assoc (call "runtime/block" []) :pos {:line 9 :column 9})
+        callback (ir/fn-node nil [{:params [] :body block}])
+        spawn (assoc (call "clojure.core.async/go-spawn" [callback])
+                     :pos {:line 7 :column 5})
+        node (fixed-def "app/run" (locking spawn))]
+    (effects/configure-declarations!
+      u {"runtime/block" {:effects #{:jolt.effect/native-block}}})
+    (record! u :plain node)
+    (let [report (regions/analyze-phase u :plain)
+          observation (first (:regions report))]
+      (is (= [:jolt.effect/schedule] (:effects observation)))
+      (is (empty? (:findings report)))
+      (is (empty? (:limitations report))))))
+
 (deftest clean-three-phase-report-is-deterministic
   (let [u (unit)
         node (fixed-def "app/run"
@@ -142,6 +176,7 @@
       (is (= "build-1" (:build-identity a)))
       (is (= {:lexical-region-stacks? true
               :transitive-effects? true
+              :declared-execution-transfers? true
               :interprocedural-region-stacks? false
               :bare-monitor-control-flow? false}
              (:analysis-contract a)))

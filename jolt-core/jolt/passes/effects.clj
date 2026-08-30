@@ -16,15 +16,52 @@
 
 (def phases #{:plain :woven :optimized})
 
+;; Execution-transfer contracts are deliberately separate from ordinary effect
+;; declarations. Calling one of these functions evaluates its arguments now,
+;; but invokes the selected callable later/on another execution context. Folding
+;; the callable body into the caller's immediate effects would make a monitor
+;; around `go` appear to protect the go body, which is false. The transfer edge
+;; instead points at a separately summarized deferred-arity subject.
+(def execution-transfer-contracts
+  {;; The CPS and fallback expansions of clojure.core.async/go.
+   ["clojure.core.async/__sm-spawn" 1]
+   {:argument 0 :kind :jolt.transfer/scheduled :carrier :selected-go-backend}
+   ["clojure.core.async/go-spawn" 1]
+   {:argument 0 :kind :jolt.transfer/scheduled :carrier :selected-go-backend}
+   ;; Explicit carrier entry points used by thread-call/io-thread.
+   ["clojure.core.async/thread-spawn" 1]
+   {:argument 0 :kind :jolt.transfer/scheduled :carrier :thread}
+   ["clojure.core.async/fiber-spawn" 1]
+   {:argument 0 :kind :jolt.transfer/scheduled :carrier :fiber}
+   ;; Public thread-call accepts an optional workload selector.
+   ["clojure.core.async/thread-call" 1]
+   {:argument 0 :kind :jolt.transfer/scheduled :carrier :workload-selected}
+   ["clojure.core.async/thread-call" 2]
+   {:argument 0 :kind :jolt.transfer/scheduled :carrier :workload-selected}})
+
+;; Contextual consumers name the concrete effect classes whose preservation
+;; they rely on. Keeping this registry beside the effect lattice prevents a new
+;; region checker from silently depending on an effect that optimization is
+;; still allowed to reveal only after weaving.
+(def safety-critical-effects
+  {:jolt.rule/optimization-preserves-scheduler-effects
+   #{:jolt.effect/park
+     :jolt.effect/native-block
+     :jolt.effect/user-dispatch
+     :jolt.effect/schedule}
+   :jolt.rule/no-native-block-under-logical-monitor
+   #{:jolt.effect/native-block}})
+
+(defn effects-for-rule [rule]
+  (get safety-critical-effects rule #{}))
+
 ;; Unknown is the top of the general may-effect lattice, so optimization may
 ;; refine it into an ordinary concrete effect. These effects are different:
 ;; they change whether execution may park a fiber, pin a carrier, or invoke
 ;; application-controlled code. A later structural region checker relies on
 ;; optimization never making one newly visible behind an earlier top.
 (def optimization-protected-effects
-  #{:jolt.effect/park
-    :jolt.effect/native-block
-    :jolt.effect/user-dispatch})
+  (effects-for-rule :jolt.rule/optimization-preserves-scheduler-effects))
 
 (defn configure-analysis-context!
   "Select the compiler-mode epoch represented by unit's phase registries.
@@ -117,17 +154,23 @@
 (defn- node-evidence [node]
   {:effects #{}
    :callees #{}
+   :transfers #{}
+   :transfer-bodies []
    :aspect-sites (if-let [site-id (get node :aspect-site-id)] #{site-id} #{})
    :opaque-calls []})
 
 (defn- merge-direct [a b]
   {:effects (into (get a :effects #{}) (get b :effects #{}))
    :callees (into (get a :callees #{}) (get b :callees #{}))
+   :transfers (into (get a :transfers #{}) (get b :transfers #{}))
+   :transfer-bodies (into (get a :transfer-bodies [])
+                          (get b :transfer-bodies []))
    :aspect-sites (into (get a :aspect-sites #{}) (get b :aspect-sites #{}))
    :opaque-calls (into (get a :opaque-calls []) (get b :opaque-calls []))})
 
 (def empty-direct
-  {:effects #{} :callees #{} :aspect-sites #{} :opaque-calls []})
+  {:effects #{} :callees #{} :transfers #{} :transfer-bodies []
+   :aspect-sites #{} :opaque-calls []})
 
 (declare summarize-eval)
 
@@ -148,6 +191,8 @@
 (defn- opaque-call [node kind]
   {:effects #{:jolt.effect/user-dispatch}
    :callees #{}
+   :transfers #{}
+   :transfer-bodies []
    :aspect-sites #{}
    :opaque-calls [{:kind kind :position (position node)}]})
 
@@ -158,6 +203,8 @@
   {:effects (cond-> #{:jolt.effect/native-call}
               (get ffi-node :blocking) (conj :jolt.effect/native-block))
    :callees #{}
+   :transfers #{}
+   :transfer-bodies []
    :aspect-sites #{}
    :opaque-calls []})
 
@@ -166,6 +213,39 @@
   ;; caller.  A foreign-fn binding still has the one concrete arity described by
   ;; the remaining signature entries.
   {:fixed (count (remove #(= "varargs" %) (get ffi-node :argtypes)))})
+
+(defn- transfer-origin-fqn [node]
+  (or (some-> node :inline-chain first first)
+      (get node :effect-owner-fqn)))
+
+(defn- transfer-evidence [node target-fqn contract]
+  (let [argument (get contract :argument)
+        callable (nth (get node :args) argument nil)
+        base {:kind (get contract :kind)
+              :target target-fqn
+              :argument argument
+              :carrier (get contract :carrier)
+              :site (position node)
+              :origin-fqn (transfer-origin-fqn node)}]
+    (if (= :fn (get callable :op))
+      {:effects #{:jolt.effect/schedule}
+       :callees #{}
+       :transfers #{}
+       :transfer-bodies
+       (mapv (fn [arity]
+               (assoc base
+                      :arity (arity-shape arity)
+                      :direct (summarize-eval (get arity :body))
+                      :analysis-node (get arity :body)))
+             (get callable :arities))
+       :aspect-sites #{}
+       :opaque-calls []}
+      {:effects #{:jolt.effect/schedule}
+       :callees #{}
+       :transfers #{(assoc base :unknown? true)}
+       :transfer-bodies []
+       :aspect-sites #{}
+       :opaque-calls []})))
 
 (defn- summarize-invoke [node]
   (let [target (get node :fn)
@@ -189,6 +269,8 @@
                            ;; helper argument after advice, including operation
                            ;; as its proceed argument.
                            :callees #{(callee advice (:advice-argc contract))}
+                           :transfers #{}
+                           :transfer-bodies []
                            :aspect-sites #{}
                            :opaque-calls []}
                           (opaque-call node :aspect-advice))
@@ -203,6 +285,8 @@
               operation-effects
               {:effects #{:jolt.effect/user-dispatch}
                :callees #{}
+               :transfers #{}
+               :transfer-bodies []
                :aspect-sites (if site-id #{site-id} #{})
                :opaque-calls []}))))
 
@@ -212,10 +296,19 @@
       (= :ffi-fn (get target :op))
       (merge-direct children (ffi-call-effects target))
 
+      (get execution-transfer-contracts [target-fqn (count args)])
+      (merge-direct
+        children
+        (transfer-evidence
+          node target-fqn
+          (get execution-transfer-contracts [target-fqn (count args)])))
+
       target-fqn
       (merge-direct children
                     {:effects #{}
                      :callees #{(callee target (count args))}
+                     :transfers #{}
+                     :transfer-bodies []
                      :aspect-sites #{}
                      :opaque-calls []})
 
@@ -251,6 +344,64 @@
                   :closed-world? (if closed-world? true false))
      analysis-node (assoc :analysis-node analysis-node))))
 
+(declare expand-direct-transfers)
+
+(defn- transfer-owner [owner transfer]
+  (cond
+    (get transfer :origin-fqn)
+    {:kind :var-origin :fqn (get transfer :origin-fqn)}
+
+    (get owner :fqn)
+    {:kind :var-origin :fqn (get owner :fqn)}
+
+    (= :deferred-arity (get owner :kind))
+    owner
+
+    :else
+    (select-keys owner [:kind :namespace :source-id :position])))
+
+(defn- deferred-subject [owner transfer ordinal]
+  {:kind :deferred-arity
+   :owner (transfer-owner owner transfer)
+   :transfer-kind (get transfer :kind)
+   :target (get transfer :target)
+   :argument (get transfer :argument)
+   :carrier (get transfer :carrier)
+   :site (get transfer :site)
+   :ordinal ordinal
+   :arity (get transfer :arity)})
+
+(defn- transfer-ref [transfer subject]
+  (assoc (select-keys transfer [:kind :target :argument :carrier :site])
+         :subject subject))
+
+(defn- expand-direct-transfers
+  "Replace private literal-body records with public transfer edges and return
+  separately analyzable deferred-arity summaries, recursively."
+  [direct owner]
+  (let [bodies (get direct :transfer-bodies [])
+        base (dissoc direct :transfer-bodies)]
+    (reduce
+      (fn [[parent children] [ordinal transfer]]
+        (let [child-subject (deferred-subject owner transfer ordinal)
+              [child-direct descendants]
+              (expand-direct-transfers (get transfer :direct) child-subject)
+              child (as-summary child-direct child-subject true
+                                (get transfer :analysis-node))]
+          [(update parent :transfers conj (transfer-ref transfer child-subject))
+           (into children (cons child descendants))]))
+      [base []]
+      (map-indexed vector bodies))))
+
+(defn- expand-summary [summary]
+  (let [[direct deferred]
+        (expand-direct-transfers (dissoc summary :subject :closed-world?
+                                         :analysis-node)
+                                 (get summary :subject))
+        root (merge direct
+                    (select-keys summary [:subject :closed-world? :analysis-node]))]
+    (into [root] deferred)))
+
 (defn- definition-evaluation [node]
   ;; Def evaluation includes initializer construction/execution and evaluated
   ;; metadata. A function literal body remains deferred, but its metadata need
@@ -277,42 +428,44 @@
   ([node closed-world? source-id]
    (summarize-node node closed-world? source-id node))
   ([node closed-world? source-id identity-node]
-   (cond
-     (and (= :def (get node :op)) (= :fn (get-in node [:init :op])))
-     (into [(as-summary (definition-evaluation node)
-                        (initializer-subject identity-node source-id) true)]
-           (map (fn [arity]
-                  (as-summary (summarize-eval (get arity :body))
-                              (subject identity-node arity source-id) closed-world?
-                              (get arity :body)))
-                (get-in node [:init :arities])))
+   (mapcat
+     expand-summary
+     (cond
+       (and (= :def (get node :op)) (= :fn (get-in node [:init :op])))
+       (into [(as-summary (definition-evaluation node)
+                          (initializer-subject identity-node source-id) true)]
+             (map (fn [arity]
+                    (as-summary (summarize-eval (get arity :body))
+                                (subject identity-node arity source-id) closed-world?
+                                (get arity :body)))
+                  (get-in node [:init :arities])))
 
-     (and (= :def (get node :op)) (= :ffi-fn (get-in node [:init :op])))
-     (let [ffi-node (get node :init)]
-       [(as-summary (definition-evaluation node)
-                    (initializer-subject identity-node source-id) true)
-        (as-summary (ffi-call-effects ffi-node)
-                    (callable-subject identity-node
-                                      (ffi-arity-shape ffi-node)
-                                      source-id)
-                    closed-world?)])
+       (and (= :def (get node :op)) (= :ffi-fn (get-in node [:init :op])))
+       (let [ffi-node (get node :init)]
+         [(as-summary (definition-evaluation node)
+                      (initializer-subject identity-node source-id) true)
+          (as-summary (ffi-call-effects ffi-node)
+                      (callable-subject identity-node
+                                        (ffi-arity-shape ffi-node)
+                                        source-id)
+                      closed-world?)])
 
-     (and (= :def (get node :op)) (get node :init))
-     [(as-summary (definition-evaluation node)
-                  (initializer-subject identity-node source-id) true)]
-
-     ;; Source declares currently carry static metadata only, but the IR schema
-     ;; permits an evaluated :meta-expr on any def. Preserve that contract rather
-     ;; than silently dropping a future/synthetic declare's metadata effects.
-     (and (= :def (get node :op)) (get node :no-init))
-     (if (get node :meta-expr)
+       (and (= :def (get node :op)) (get node :init))
        [(as-summary (definition-evaluation node)
                     (initializer-subject identity-node source-id) true)]
-       [])
 
-     :else
-     [(as-summary (summarize-eval node)
-                  (top-level-subject identity-node source-id) true node)])))
+       ;; Source declares currently carry static metadata only, but the IR schema
+       ;; permits an evaluated :meta-expr on any def. Preserve that contract rather
+       ;; than silently dropping a future/synthetic declare's metadata effects.
+       (and (= :def (get node :op)) (get node :no-init))
+       (if (get node :meta-expr)
+         [(as-summary (definition-evaluation node)
+                      (initializer-subject identity-node source-id) true)]
+         [])
+
+       :else
+       [(as-summary (summarize-eval node)
+                    (top-level-subject identity-node source-id) true node)]))))
 
 (defn record-phase!
   "Record node's direct summaries at phase. Repeated identical observation is
@@ -467,6 +620,7 @@
 (defn- close-one [summaries declarations summary]
   (let [start {:effects (get summary :effects #{})
                :aspect-sites (get summary :aspect-sites #{})
+               :transfers (get summary :transfers #{})
                :unresolved #{}
                :unknown-witnesses (set (get summary :opaque-calls))
                :unknown? (boolean
@@ -486,6 +640,8 @@
           (cond-> {:effects (into (get acc :effects) (get closure :effects #{}))
                    :aspect-sites (into (get acc :aspect-sites)
                                        (get closure :aspect-sites #{}))
+                   :transfers (into (get acc :transfers #{})
+                                    (get closure :transfers #{}))
                    :unresolved (into (get acc :unresolved #{})
                                      (get closure :unresolved #{}))
                    :unknown-witnesses
@@ -506,6 +662,7 @@
 (defn- closure-grows? [before after]
   (and (set-grows? (get before :effects #{}) (get after :effects #{}))
        (set-grows? (get before :aspect-sites #{}) (get after :aspect-sites #{}))
+       (set-grows? (get before :transfers #{}) (get after :transfers #{}))
        (set-grows? (get before :unresolved #{}) (get after :unresolved #{}))
        (set-grows? (get before :unknown-witnesses #{})
                    (get after :unknown-witnesses #{}))
@@ -516,6 +673,7 @@
                              (assoc m k (assoc summary :closure
                                                {:effects (get summary :effects #{})
                                                 :aspect-sites (get summary :aspect-sites #{})
+                                                :transfers (get summary :transfers #{})
                                                 :unresolved #{}
                                                 :unknown-witnesses
                                                 (set (get summary :opaque-calls))
@@ -583,6 +741,7 @@
                             {:subject (get s :subject)
                              :direct {:effects (get s :effects)
                                       :callees (get s :callees)
+                                      :transfers (get s :transfers)
                                       :aspect-sites (get s :aspect-sites)
                                       :opaque-calls (get s :opaque-calls)}
                              :closure closure}))
@@ -599,9 +758,15 @@
 (defn- summaries-by-subject [report]
   (into {} (map (fn [s] [(get s :subject) s]) (get report :summaries))))
 
+(defn- phase-stable-subject? [subject]
+  ;; Deferred subjects are code identities discovered through transfer sites.
+  ;; Optimization may prove a transfer unreachable and remove that subject;
+  ;; ordinary callable/top-level subjects must remain phase-stable.
+  (not= :deferred-arity (get subject :kind)))
+
 (defn- subject-coverage-findings [from to a b]
-  (let [ak (set (keys a))
-        bk (set (keys b))
+  (let [ak (set (filter phase-stable-subject? (keys a)))
+        bk (set (filter phase-stable-subject? (keys b)))
         missing (vec (sort-by pr-str (remove bk ak)))
         added (vec (sort-by pr-str (remove ak bk)))]
     (cond-> []
@@ -658,6 +823,14 @@
                   sites-changed (and (= from :woven) (= to :optimized)
                                      (not= (get ac :aspect-sites)
                                            (get bc :aspect-sites)))
+                  missing-transfers
+                  (if (= from :plain)
+                    (remove (get bc :transfers #{}) (get ac :transfers #{}))
+                    [])
+                  added-transfers
+                  (if (= to :optimized)
+                    (remove (get ac :transfers #{}) (get bc :transfers #{}))
+                    [])
                   new-unknown (and (= to :optimized)
                                    (not (get ac :unknown?))
                                    (get bc :unknown?))]
@@ -682,6 +855,14 @@
                 (conj {:rule :jolt.rule/optimization-adds-no-unresolved-call
                        :subject subject
                        :added (vec (sort-by pr-str added-unresolved))})
+                (seq missing-transfers)
+                (conj {:rule :jolt.rule/plain-transfer-preserved
+                       :subject subject
+                       :missing (vec (sort-by pr-str missing-transfers))})
+                (seq added-transfers)
+                (conj {:rule :jolt.rule/optimization-adds-no-transfer
+                       :subject subject
+                       :added (vec (sort-by pr-str added-transfers))})
                 sites-changed (conj {:rule :jolt.rule/aspect-sites-preserved
                                      :subject subject
                                      :before (get ac :aspect-sites)
@@ -723,11 +904,13 @@
      :direct {:effects (ordered-set (get direct :effects))
               :callees (vec (sort-by (fn [c] [(get c :fqn) (get c :argc)])
                                      (get direct :callees)))
+              :transfers (vec (sort-by pr-str (get direct :transfers)))
               :aspect-sites (vec (sort (get direct :aspect-sites)))
               :opaque-calls (vec (sort-by pr-str (get direct :opaque-calls)))}
      :closure
      (cond-> {:effects (ordered-set (get closure :effects))
               :aspect-sites (vec (sort (get closure :aspect-sites)))
+              :transfers (vec (sort-by pr-str (get closure :transfers)))
               :unknown? (if (get closure :unknown?) true false)}
        (seq (get closure :unresolved))
        (assoc :unresolved (vec (sort-by (fn [c] [(get c :fqn) (get c :argc)])
@@ -759,7 +942,12 @@
      :analysis-contract
      {:plain-to-woven :effects-preserved
       :woven-to-optimized :may-refinement
+      :execution-transfers :separate-deferred-subjects
       :effect-elimination-certificates? false}
+     :execution-contracts
+     (mapv (fn [[[fqn argc] contract]]
+             (assoc contract :fqn fqn :arity {:fixed argc}))
+           (sort-by (comp pr-str first) execution-transfer-contracts))
      :declarations
      (mapv (fn [[key declaration]]
              (let [[name arity] (if (vector? key) key [key nil])]
