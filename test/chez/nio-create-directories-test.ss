@@ -52,8 +52,8 @@
          (barrier-mu (make-mutex))
          (arrivals 0)
          (errors (vector #f #f))
-         (original-c-mkdir nio-c-mkdir)
-         (original-step nio-mkdir-or-existing-directory!))
+         (original-c-mkdir fs-c-mkdir)
+         (original-step fs-create-directories-result))
     (define (barrier!)
       (let ((deadline (+ (now-secs) 10.0)))
         (with-mutex barrier-mu (set! arrivals (+ arrivals 1)))
@@ -66,13 +66,17 @@
     (nio-mkdir-atomic! base #o700)
     (dynamic-wind
       (lambda ()
-        (set! nio-c-mkdir
+        (set! fs-c-mkdir
           (lambda args
             (when (string=? (car args) first) (barrier!))
             (apply original-c-mkdir args)))
         (when strict-mutation?
-          (set! nio-mkdir-or-existing-directory!
-            (lambda (fp mode) (nio-mkdir-atomic! fp mode)))))
+          (set! fs-create-directories-result
+            (lambda (fp mode)
+              (let-values (((status native-error) (original-step fp mode)))
+                (if (eq? status 'exists)
+                    (values 'error native-error)
+                    (values status native-error)))))))
       (lambda ()
         (let ((threads
                (map (lambda (index)
@@ -85,8 +89,8 @@
           ;; leaving the explicitly bounded rendezvous.
           (for-each thread-join threads)))
       (lambda ()
-        (set! nio-c-mkdir original-c-mkdir)
-        (set! nio-mkdir-or-existing-directory! original-step)))
+        (set! fs-c-mkdir original-c-mkdir)
+        (set! fs-create-directories-result original-step)))
     (vector leaf arrivals errors)))
 
 (define (test-same-chain-races!)
@@ -149,16 +153,16 @@
 (define (test-non-eexist-failure!)
   (at! "non-EEXIST failure")
   (let ((denied (string-append root "/denied"))
-        (calls 0) (raised? #f) (original nio-c-mkdir))
+        (calls 0) (raised? #f) (original fs-c-mkdir))
     (nio-mkdir-atomic! denied #o700)
     (dynamic-wind
       (lambda ()
-        (set! nio-c-mkdir
+        (set! fs-c-mkdir
           (lambda _ (set! calls (+ calls 1)) (values -1 13))))
       (lambda ()
         (guard (e (#t (set! raised? #t)))
           (nio-create-directories! denied #o700)))
-      (lambda () (set! nio-c-mkdir original)))
+      (lambda () (set! fs-c-mkdir original)))
     (check "non-EEXIST native failure is not reclassified" raised?)
     (check "non-EEXIST native failure is not retried" (= calls 1))))
 
@@ -166,11 +170,11 @@
   ;; EEXIST is provisionally tolerable only while its name denotes a directory.
   (at! "deleted EEXIST winner")
   (let ((path (string-append root "/vanished"))
-        (raised? #f) (original nio-c-mkdir))
+        (raised? #f) (original fs-c-mkdir))
     (nio-mkdir-atomic! path #o700)
     (dynamic-wind
       (lambda ()
-        (set! nio-c-mkdir
+        (set! fs-c-mkdir
           (lambda args
             (let-values (((result native-error) (apply original args)))
               (when (and (not (= result 0)) (string=? (car args) path))
@@ -179,16 +183,16 @@
       (lambda ()
         (guard (e (#t (set! raised? #t)))
           (nio-create-directories! path #o700)))
-      (lambda () (set! nio-c-mkdir original)))
+      (lambda () (set! fs-c-mkdir original)))
     (check "deleted EEXIST winner fails closed" raised?)
     (check "deleted EEXIST winner remains absent" (not (file-exists? path))))
   (at! "replaced EEXIST winner")
   (let ((path (string-append root "/replaced"))
-        (raised? #f) (original nio-c-mkdir))
+        (raised? #f) (original fs-c-mkdir))
     (nio-mkdir-atomic! path #o700)
     (dynamic-wind
       (lambda ()
-        (set! nio-c-mkdir
+        (set! fs-c-mkdir
           (lambda args
             (let-values (((result native-error) (apply original args)))
               (when (and (not (= result 0)) (string=? (car args) path))
@@ -198,7 +202,7 @@
       (lambda ()
         (guard (e (#t (set! raised? #t)))
           (nio-create-directories! path #o700)))
-      (lambda () (set! nio-c-mkdir original)))
+      (lambda () (set! fs-c-mkdir original)))
     (check "non-directory replacement after EEXIST fails closed" raised?)
     (check "replacement sentinel is preserved"
            (string=? (read-text path) "replacement-sentinel"))))

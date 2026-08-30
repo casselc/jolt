@@ -872,11 +872,14 @@
 ;; cache dir was never created and open-output-file failed. Native mkdir +
 ;; path-parent recursion is portable (mirrors build.ss bld-mkdir-p).
 (define (aot-mkdir-p dir)
-  (unless (or (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
-    (aot-mkdir-p (path-parent dir))
-    ;; tolerate the benign race (created concurrently); re-raise a real failure.
-    (guard (e (#t (unless (file-exists? dir) (raise e))))
-      (mkdir dir))))
+  (unless (or (string=? dir "") (string=? dir "/") (string=? dir "."))
+    (let-values (((status native-error)
+                  (fs-create-directories-result dir #o777)))
+      (unless (memq status '(created exists))
+        (error 'jolt-loader
+               (string-append "unable to create directory " dir
+                              " (native error "
+                              (number->string native-error) ")"))))))
 ;; Publish the cached .scm/.so atomically. Parallel jolt processes (e.g. the cts
 ;; gate's workers) share one cache dir and can compile the SAME namespace at once;
 ;; writing straight to base.so let a reader's (file-exists? so)+load see a fasl

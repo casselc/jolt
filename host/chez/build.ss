@@ -43,13 +43,14 @@
 
 ;; mkdir -p without a subprocess (the self-contained build shells out to nothing).
 (define (bld-mkdir-p dir)
-  (unless (or (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
-    (bld-mkdir-p (path-parent dir))
-    ;; tolerate only the benign race (someone else created it) — a real mkdir
-    ;; failure (permissions) used to surface later as a less specific
-    ;; open-output-file error.
-    (guard (e (#t (unless (file-exists? dir) (raise e))))
-      (mkdir dir))))
+  (unless (or (string=? dir "") (string=? dir "/") (string=? dir "."))
+    (let-values (((status native-error)
+                  (fs-create-directories-result dir #o777)))
+      (unless (memq status '(created exists))
+        (error 'jolt-build
+               (string-append "unable to create directory " dir
+                              " (native error "
+                              (number->string native-error) ")"))))))
 
 (define (bld-contains? s sub)
   (let ((ns (string-length s)) (nsub (string-length sub)))
@@ -1877,6 +1878,9 @@
 ;;
 ;; It also means a failed link leaves no output rather than a half-overwritten one.
 (define (bld-clear-output! out-path)
+  ;; check-then-create-allow: delete-before-executable-replace
+  ;; Deliberate destructive replacement probe, not name admission: macOS needs
+  ;; the old executable inode removed before the later output is written.
   (when (file-exists? out-path) (delete-file out-path)))
 
 (define (bld-copy-file! from to)

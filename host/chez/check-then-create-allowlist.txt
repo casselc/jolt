@@ -1,0 +1,3 @@
+# id|reviewed reason
+delete-before-executable-replace|Existing executable inode is deliberately deleted before replacement for macOS code-signing correctness.
+optional-blob-read-before-unrelated-output|Optional stdlib blob is an input probe; the later main.c output has a different path and purpose.

@@ -94,7 +94,7 @@
   (put-bytevector p (string->utf8 "sentinel"))
   (close-port p))
 (let-values (((fd native-error) (nio-open-native-result existing-file #o600)))
-  (when (>= fd 0) (nio-c-close fd))
+  (when (>= fd 0) (fs-c-close fd))
   (check "exclusive open collision returns failure" (< fd 0))
   (check "exclusive open collision captures EEXIST at the call boundary"
          (nio-native-exists-error? native-error)))
@@ -119,6 +119,10 @@
     (let ((s (utf8->string (get-bytevector-all p))))
       (close-port p)
       s)))
+(define (write-text path text)
+  (let ((p (open-file-output-port path (file-options no-fail))))
+    (put-bytevector p (string->utf8 text))
+    (close-port p)))
 
 (let ((path (npath-string-of temp-file-result)))
   (check "temp file retried exactly once after collision" (= attempts 2))
@@ -136,21 +140,70 @@
 (check "createFile does not truncate an existing path"
        (string=? (read-text existing-file) "sentinel"))
 
+;; FileChannel/open with CREATE admits an existing file without modifying it.
+;; The former missing?-then-no-fail-open path could truncate a race winner.
+(host-static-call "FileChannel" "open" (make-nio-path existing-file)
+                  (make-oopt 'create) (make-oopt 'write))
+(check "FileChannel CREATE preserves an existing file"
+       (string=? (read-text existing-file) "sentinel"))
+
 (define new-file (string-append root "/created-file"))
 (nio-create-file-atomic! new-file #o600)
 (when permission-inspection?
   (check "createFile applies permissions at creation"
          (= (bitwise-and (nio-stat-mode new-file) #o777) #o600)))
 
+;; Files.copy must create the destination atomically after its earlier policy
+;; observation. Force that observation stale: the shared seam must reject both
+;; file and directory race winners rather than overwrite/accept them.
+(define copy-source (string-append root "/copy-source"))
+(define copy-dest (string-append root "/copy-dest"))
+(write-text copy-source "source")
+(write-text copy-dest "copy-winner")
+(define original-dest-present? nio-dest-present?)
+(define copy-raised? #f)
+(dynamic-wind
+  (lambda () (set! nio-dest-present? (lambda _ #f)))
+  (lambda ()
+    (guard (e (#t (set! copy-raised? #t)))
+      (host-static-call "Files" "copy"
+                        (make-nio-path copy-source) (make-nio-path copy-dest))))
+  (lambda () (set! nio-dest-present? original-dest-present?)))
+(check "Files.copy rejects a file winner after a stale observation" copy-raised?)
+(check "Files.copy preserves a file race winner"
+       (string=? (read-text copy-dest) "copy-winner"))
+
+(define copy-source-dir (string-append root "/copy-source-dir"))
+(define copy-dest-dir (string-append root "/copy-dest-dir"))
+(nio-mkdir-atomic! copy-source-dir #o700)
+(nio-mkdir-atomic! copy-dest-dir #o700)
+(set! copy-raised? #f)
+(dynamic-wind
+  (lambda () (set! nio-dest-present? (lambda _ #f)))
+  (lambda ()
+    (guard (e (#t (set! copy-raised? #t)))
+      (host-static-call "Files" "copy"
+                        (make-nio-path copy-source-dir) (make-nio-path copy-dest-dir))))
+  (lambda () (set! nio-dest-present? original-dest-present?)))
+(check "Files.copy rejects a directory winner after a stale observation" copy-raised?)
+
+(define copied-file (string-append root "/copied-file"))
+(host-static-call "Files" "copy" (make-nio-path copy-source) (make-nio-path copied-file))
+(check "Files.copy creates an absent file destination"
+       (string=? (read-text copied-file) "source"))
+(define copied-dir (string-append root "/copied-dir"))
+(host-static-call "Files" "copy" (make-nio-path copy-source-dir) (make-nio-path copied-dir))
+(check "Files.copy creates an absent directory destination" (file-directory? copied-dir))
+
 ;; A non-collision native failure must propagate immediately.  Inject EACCES
 ;; after path generation; the old post-failure existence classification could
 ;; retry or mislabel depending on a concurrent filesystem change.
-(define original-c-open nio-c-open)
+(define original-c-open fs-c-open-exclusive)
 (define denied-attempts 0)
 (define denied-raised? #f)
 (dynamic-wind
   (lambda ()
-    (set! nio-c-open (lambda _ (values -1 13))) ; POSIX EACCES control
+    (set! fs-c-open-exclusive (lambda _ (values -1 13))) ; POSIX EACCES control
     (set! nio-temp-path
       (lambda _
         (set! denied-attempts (+ denied-attempts 1))
@@ -160,17 +213,17 @@
       (nio-files-create-temp
         (list (make-nio-path root) "denied-" ".tmp") #f)))
   (lambda ()
-    (set! nio-c-open original-c-open)
+    (set! fs-c-open-exclusive original-c-open)
     (set! nio-temp-path original-temp-path)))
 (check "non-EEXIST file failure propagates" denied-raised?)
 (check "non-EEXIST file failure is not retried" (= denied-attempts 1))
 
-(define original-c-mkdir nio-c-mkdir)
+(define original-c-mkdir fs-c-mkdir)
 (set! denied-attempts 0)
 (set! denied-raised? #f)
 (dynamic-wind
   (lambda ()
-    (set! nio-c-mkdir (lambda _ (values -1 13)))
+    (set! fs-c-mkdir (lambda _ (values -1 13)))
     (set! nio-temp-path
       (lambda _
         (set! denied-attempts (+ denied-attempts 1))
@@ -180,7 +233,7 @@
       (nio-files-create-temp
         (list (make-nio-path root) "denied-") #t)))
   (lambda ()
-    (set! nio-c-mkdir original-c-mkdir)
+    (set! fs-c-mkdir original-c-mkdir)
     (set! nio-temp-path original-temp-path)))
 (check "non-EEXIST directory failure propagates" denied-raised?)
 (check "non-EEXIST directory failure is not retried" (= denied-attempts 1))

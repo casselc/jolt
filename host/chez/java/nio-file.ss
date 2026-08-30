@@ -329,17 +329,16 @@
   (let ((d (let ((d (or dir (nio-tmp-dir))))
              (if (char=? (string-ref d (- (string-length d) 1)) #\/) d (string-append d "/")))))
     (let loop ()
-      ;; the increment and the read are ONE step. Read after the release and two
-      ;; threads see the same value, so they build the same path — and the
-      ;; file-exists? retry below does not catch it, since neither has created
-      ;; the file yet and the caller that creates it second clobbers the first.
+      ;; The increment and read are one step. The native create in the caller is
+      ;; still the authority for uniqueness across processes and handles even a
+      ;; forced counter/timestamp collision.
       (let* ((n (jolt-with-mutex nio-temp-mutex
                   (set! nio-temp-counter (+ nio-temp-counter 1))
                   nio-temp-counter))
              (full (string-append d (if (string? prefix) prefix "")
                                   (number->string (now-millis)) "-" (number->string n)
                                   (if (string? suffix) suffix ""))))
-        (if (file-exists? (project-relative full)) (loop) full)))))
+        full))))
 
 (let ((files-statics
        (list
@@ -639,10 +638,6 @@
 (define c-link     (jolt-foreign-proc-safe "link"     '(string string) 'int))
 (define c-readlink (jolt-foreign-proc-safe "readlink" '(string u8* unsigned-long) 'long))
 (define c-chmod    (jolt-foreign-proc-safe "chmod"    '(string int) 'int))
-(define nio-c-mkdir
-  (if (eq? (sa-os-family) 'windows)
-      (jolt-foreign-proc-native-error-safe __errno "_mkdir" '(string) 'int)
-      (jolt-foreign-proc-native-error-safe __errno "mkdir" '(string int) 'int)))
 (define (nio-is-symlink? fp)
   (and c-readlink (> (c-readlink fp (make-bytevector 1 0) 1) 0)))   ; readlink succeeds only on a link
 (define (nio-readlink fp)
@@ -824,14 +819,12 @@
                               "unsupported initial file attribute")))
              default-mode (npath-spread-args attrs)))
 (define (nio-native-exists-error-for-convention? convention code)
-  (if (eq? convention '__get_last_error)
-      (or (= code 80) (= code 183)) ; ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
-      (= code 17)))                 ; EEXIST from POSIX and Windows CRT errno
+  (fs-native-exists-error-for-convention? convention code))
 (define (nio-native-exists-error? code)
   ;; mkdir/open on POSIX and _mkdir/_open on Windows are libc/CRT APIs.  Their
   ;; contract is errno even on Windows; Win32 error codes apply only to Win32
   ;; CreateFile/CreateDirectory bindings.
-  (nio-native-exists-error-for-convention? '__errno code))
+  (fs-native-exists-error? code))
 (define (nio-raise-create-error fp native-error)
   (if (nio-native-exists-error? native-error)
       (throw-jvm (quote FileAlreadyExistsException) fp)
@@ -841,12 +834,7 @@
                          " (native error " (number->string native-error) ")")
           empty-pmap))))
 (define (nio-mkdir-native-result fp mode)
-  (unless nio-c-mkdir
-    (throw-jvm (quote UnsupportedOperationException)
-               "atomic directory creation with native-error capture is unavailable"))
-  (if (eq? (sa-os-family) 'windows)
-      (nio-c-mkdir fp)
-      (nio-c-mkdir fp mode)))
+  (fs-mkdir-native-result fp mode))
 (define (nio-mkdir-atomic! fp mode)
   (let-values (((result native-error) (nio-mkdir-native-result fp mode)))
     (unless (= result 0) (nio-raise-create-error fp native-error))))
@@ -872,42 +860,21 @@
 ;; instant the name becomes visible.  Chez's `(file-options no-fail)` is not an
 ;; exclusive-create primitive: it opens an existing file and truncates it.
 ;;
-;; This is an OS-backed Files implementation detail, not a general FFI lifetime
-;; abstraction.  Keep it here until the adapter grows a portable exclusive-file
-;; primitive; callers must never reconstruct these platform flag values.
-(define nio-c-open
-  (if (eq? (sa-os-family) 'windows)
-      (jolt-foreign-proc-native-error-safe __errno "_open" '(string int int) 'int)
-      (jolt-foreign-proc-native-error-safe
-        __errno ((__varargs_after 2)) "open" '(string int int) 'int)))
-(define nio-c-close
-  (if (eq? (sa-os-family) 'windows)
-      (jolt-foreign-proc-safe "_close" '(int) 'int)
-      (jolt-foreign-proc-safe "close" '(int) 'int)))
+;; The OS-backed primitive and platform constants live in java/io.ss because it
+;; loads first and both File and Files consume one exclusive-create seam.
 (define (nio-open-exclusive-flags-for-family family)
-  (case family
-    ((macos) (bitwise-ior #x1 #x200 #x800))       ; O_WRONLY|O_CREAT|O_EXCL
-    ((windows) (bitwise-ior #x1 #x100 #x400 #x8000)) ; plus _O_BINARY
-    (else (bitwise-ior #x1 #x40 #x80))))
-(define nio-open-exclusive-flags
-  (nio-open-exclusive-flags-for-family (sa-os-family)))
+  (fs-open-exclusive-flags-for-family family))
 (define (nio-native-create-mode mode)
-  (if (eq? (sa-os-family) 'windows)
-      (bitwise-ior (if (> (bitwise-and mode #o444) 0) #x100 0) ; _S_IREAD
-                   (if (> (bitwise-and mode #o222) 0) #x80 0)) ; _S_IWRITE
-      mode))
+  (fs-native-create-mode mode))
 (define (nio-open-native-result fp mode)
-  (unless (and nio-c-open nio-c-close)
-    (throw-jvm (quote UnsupportedOperationException)
-               "atomic exclusive file creation with native-error capture is unavailable"))
-  (nio-c-open fp nio-open-exclusive-flags (nio-native-create-mode mode)))
+  (fs-open-exclusive-native-result fp mode))
 (define (nio-close-created-file fd)
   ;; O_EXCL has already established ownership and this descriptor has no
   ;; buffered writes.  A close error cannot turn the operation into a collision,
   ;; and retrying close after EINTR is unsafe on targets that already released
   ;; and reused the descriptor.  Match Files' create-only contract: close once,
   ;; ignore its advisory result, and never reclassify the successful creation.
-  (nio-c-close fd))
+  (fs-c-close fd))
 (define (nio-create-file-atomic! fp mode)
   (let-values (((fd native-error) (nio-open-native-result fp mode)))
     (if (>= fd 0)
@@ -925,19 +892,10 @@
 (define (nio-parent-of fp)
   (let loop ((i (- (string-length fp) 1)))
     (cond ((< i 0) "") ((char=? (string-ref fp i) #\/) (substring fp 0 i)) (else (loop (- i 1))))))
-(define (nio-missing-ancestors fp)   ; the not-yet-existing path chain, shallowest first
-  (let loop ((p fp) (acc '()))
-    (cond ((or (string=? p "") (string=? p "/") (file-exists? p)) acc)
-          (else (loop (nio-parent-of p) (cons p acc))))))
 (define (nio-create-directories! fp mode)
-  (let ((missing (nio-missing-ancestors fp)))
-    ;; Even an empty missing chain must pass through the atomic result path: the
-    ;; target may be an existing regular file, which is not successful
-    ;; createDirectories.
-    (if (null? missing)
-        (nio-mkdir-or-existing-directory! fp mode)
-        (for-each (lambda (d) (nio-mkdir-or-existing-directory! d mode))
-                  missing))))
+  (let-values (((status native-error) (fs-create-directories-result fp mode)))
+    (unless (memq status '(created exists))
+      (nio-raise-create-error fp native-error))))
 ;; is the dest present as a link (even broken) or a real file?
 (define (nio-dest-present? d) (or (file-exists? d) (nio-is-symlink? d)))
 (let ((files-create+move
@@ -999,8 +957,11 @@
 (let ((fc-statics
        (list (cons "open" (lambda (path . opts)
                             (let ((fp (nfp path)))
-                              (when (and (nio-opts-have? opts oopt-sym 'create) (not (file-exists? fp)))
-                                (close-port (open-file-output-port fp (file-options no-fail))))
+                              (when (nio-opts-have? opts oopt-sym 'create)
+                                (let-values (((status native-error)
+                                              (fs-create-file-exclusive-result fp #o666)))
+                                  (unless (memq status '(created exists))
+                                    (nio-raise-create-error fp native-error))))
                               (make-jhost "file-channel" fp)))))))
   (register-class-statics! "FileChannel" fc-statics)
   (register-class-statics! "java.nio.channels.FileChannel" fc-statics))
@@ -1050,8 +1011,9 @@
                             (cond
                               ((and (nio-opts-nofollow? opts) (nio-is-symlink? s))
                                (when c-symlink (c-symlink (or (nio-readlink s) "") d)))
-                              ((file-directory? s) (unless (file-exists? d) (mkdir d)))
+                              ((file-directory? s) (nio-mkdir-atomic! d #o777))
                               (else
+                               (nio-create-file-atomic! d #o666)
                                (nio-write-bv! d (nio-read-bv s))
                                (let ((mode (nio-stat-mode s)))            ; preserve source perms
                                  (when (and mode c-chmod) (c-chmod d (bitwise-and mode #o777))))

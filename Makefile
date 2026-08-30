@@ -104,7 +104,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
-  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit niodirectories niotemp unitconcurrent unitcontext \
+  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit javasiocreate niodirectories niotemp unitconcurrent unitcontext \
   taggedmethods threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
@@ -159,13 +159,13 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit unitconcurrent niodirectories niotemp documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirectories niotemp documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions gosm asynctimer interruptnest taggedmethods threadsafety atomicnumeric
@@ -393,6 +393,10 @@ niotemp:
 # createDirectories tolerates only a colliding directory created by a racer.
 niodirectories:
 	@$(CHEZ) --script test/chez/nio-create-directories-test.ss
+
+# java.io.File creation shares NIO's exclusive native result seam.
+javasiocreate:
+	@$(CHEZ) --script test/chez/java-io-create-test.ss
 
 # The jolt half of the known-divergences :documented gate: every entry's :check
 # must render exactly its recorded :jolt value, its :jvm and :jolt must differ,
@@ -956,6 +960,10 @@ lockcheck:
 # stays empty.
 parkcheck:
 	@sh host/chez/park-lock-check.sh
+
+# Creation syscalls, not pre-create existence snapshots, own name admission.
+checkthencreate:
+	@sh host/chez/check-then-create-check.sh
 
 # jolt.host/sh is Chez's `system`, which is cmd.exe on Windows: `mkdir -p a/b`
 # there creates a directory named `-p`, and mv/rm/touch/test/find are not
