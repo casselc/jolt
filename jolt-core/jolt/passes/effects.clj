@@ -50,6 +50,13 @@
            :arity (arity-shape arity)}
     source-id (assoc :source-id source-id)))
 
+(defn- callable-subject [node shape source-id]
+  (cond-> {:kind :var-arity
+           :fqn (fqn node)
+           :definition-position (select-keys (get node :pos) [:line :column])
+           :arity shape}
+    source-id (assoc :source-id source-id)))
+
 (defn- initializer-subject [node source-id]
   (cond-> {:kind :var-init
            :fqn (fqn node)
@@ -134,6 +141,22 @@
    :aspect-sites #{}
    :opaque-calls [{:kind kind :position (position node)}]})
 
+(defn- ffi-call-effects [ffi-node]
+  ;; A typed foreign-fn is a closed callable contract in the IR.  The native
+  ;; operation is effectful even when it promises not to block; :blocking adds
+  ;; the stronger carrier/scheduler hazard used by region verification.
+  {:effects (cond-> #{:jolt.effect/native-call}
+              (get ffi-node :blocking) (conj :jolt.effect/native-block))
+   :callees #{}
+   :aspect-sites #{}
+   :opaque-calls []})
+
+(defn- ffi-arity-shape [ffi-node]
+  ;; :varargs is an ABI boundary marker, not an argument supplied by the Jolt
+  ;; caller.  A foreign-fn binding still has the one concrete arity described by
+  ;; the remaining signature entries.
+  {:fixed (count (remove #(= "varargs" %) (get ffi-node :argtypes)))})
+
 (defn- summarize-invoke [node]
   (let [target (get node :fn)
         args (get node :args)
@@ -175,6 +198,9 @@
 
       (and target-fqn (aspect-contracts/helper-fqn? target-fqn))
       (merge-direct children (opaque-call node :aspect-helper-shape))
+
+      (= :ffi-fn (get target :op))
+      (merge-direct children (ffi-call-effects target))
 
       target-fqn
       (merge-direct children
@@ -246,6 +272,16 @@
                               (subject identity-node arity source-id) closed-world?))
                 (get-in node [:init :arities])))
 
+     (and (= :def (get node :op)) (= :ffi-fn (get-in node [:init :op])))
+     (let [ffi-node (get node :init)]
+       [(as-summary (definition-evaluation node)
+                    (initializer-subject identity-node source-id) true)
+        (as-summary (ffi-call-effects ffi-node)
+                    (callable-subject identity-node
+                                      (ffi-arity-shape ffi-node)
+                                      source-id)
+                    closed-world?)])
+
      (and (= :def (get node :op)) (get node :init))
      [(as-summary (definition-evaluation node)
                   (initializer-subject identity-node source-id) true)]
@@ -311,10 +347,46 @@
      (swap! (:effect-reports unit) dissoc phase)
      summaries)))
 
+(defn- validate-declaration-key! [key]
+  (when-not
+    (or (string? key)
+        (and (vector? key)
+             (= 2 (count key))
+             (string? (nth key 0))
+             (let [shape (nth key 1)]
+               (and (map? shape)
+                    (= 1 (count shape))
+                    (or (and (contains? shape :fixed)
+                             (integer? (get shape :fixed))
+                             (not (neg? (get shape :fixed))))
+                        (and (contains? shape :variadic-min)
+                             (integer? (get shape :variadic-min))
+                             (not (neg? (get shape :variadic-min)))))))))
+    (throw (ex-info "invalid Jolt effect declaration key"
+                    {:key key
+                     :expected "fqn string or [fqn {:fixed n|:variadic-min n}]"}))))
+
+(defn- validate-declaration! [key declaration]
+  (validate-declaration-key! key)
+  (when-not (and (map? declaration)
+                 (set? (get declaration :effects #{}))
+                 (every? keyword? (get declaration :effects #{}))
+                 (or (not (contains? declaration :unknown?))
+                     (boolean? (get declaration :unknown?))))
+    (throw (ex-info "invalid Jolt effect declaration"
+                    {:key key :declaration declaration}))))
+
 (defn configure-declarations!
-  "Install exact external effect declarations keyed by fqn string. A declaration
-  is {:effects #{...} :unknown? boolean}; omitted :unknown? means false."
+  "Install exact external effect declarations. A string key applies to every
+  arity for compatibility; [fqn {:fixed n}] and
+  [fqn {:variadic-min n}] are arity-aware. A declaration is
+  {:effects #{...} :unknown? boolean}; omitted :unknown? means false."
   [unit declarations]
+  (when-not (map? declarations)
+    (throw (ex-info "Jolt effect declarations must be a map"
+                    {:declarations declarations})))
+  (doseq [[key declaration] declarations]
+    (validate-declaration! key declaration))
   (reset! (:effect-declarations unit) declarations)
   (reset! (:effect-reports unit) {})
   unit)
@@ -338,8 +410,26 @@
     ;; order and attributing another definition's behavior to the call.
     (when (= 1 (count matches)) (first matches))))
 
+(defn- declared-effect [declarations call]
+  (let [name (get call :fqn)
+        argc (get call :argc)
+        exact (get declarations [name {:fixed argc}])
+        variadic
+        (->> declarations
+             (keep (fn [[key declaration]]
+                     (when (and (vector? key)
+                                (= name (nth key 0 nil))
+                                (map? (nth key 1 nil))
+                                (integer? (get (nth key 1) :variadic-min))
+                                (>= argc (get (nth key 1) :variadic-min)))
+                       [(get (nth key 1) :variadic-min) declaration])))
+             (sort-by first >)
+             first
+             second)]
+    (or exact variadic (get declarations name))))
+
 (defn- declared-summary [declarations call]
-  (when-let [d (get declarations (get call :fqn))]
+  (when-let [d (declared-effect declarations call)]
     {:closure {:effects (get d :effects #{})
                :aspect-sites #{}
                :unresolved #{}
@@ -491,6 +581,24 @@
                   added (if (and (= to :optimized) (not (get ac :unknown?)))
                           (remove (get ac :effects) (get bc :effects))
                           [])
+                  missing-witnesses
+                  (if (= from :plain)
+                    (remove (get bc :unknown-witnesses #{})
+                            (get ac :unknown-witnesses #{}))
+                    [])
+                  added-witnesses
+                  (if (= to :optimized)
+                    (remove (get ac :unknown-witnesses #{})
+                            (get bc :unknown-witnesses #{}))
+                    [])
+                  missing-unresolved
+                  (if (= from :plain)
+                    (remove (get bc :unresolved #{}) (get ac :unresolved #{}))
+                    [])
+                  added-unresolved
+                  (if (= to :optimized)
+                    (remove (get ac :unresolved #{}) (get bc :unresolved #{}))
+                    [])
                   sites-changed (and (= from :woven) (= to :optimized)
                                      (not= (get ac :aspect-sites)
                                            (get bc :aspect-sites)))
@@ -502,6 +610,22 @@
                                      :subject subject :missing (vec missing)})
                 (seq added) (conj {:rule :jolt.rule/optimization-adds-no-effect
                                    :subject subject :added (vec added)})
+                (seq missing-witnesses)
+                (conj {:rule :jolt.rule/plain-unknown-witness-preserved
+                       :subject subject
+                       :missing (vec (sort-by pr-str missing-witnesses))})
+                (seq added-witnesses)
+                (conj {:rule :jolt.rule/optimization-adds-no-unknown-witness
+                       :subject subject
+                       :added (vec (sort-by pr-str added-witnesses))})
+                (seq missing-unresolved)
+                (conj {:rule :jolt.rule/plain-unresolved-call-preserved
+                       :subject subject
+                       :missing (vec (sort-by pr-str missing-unresolved))})
+                (seq added-unresolved)
+                (conj {:rule :jolt.rule/optimization-adds-no-unresolved-call
+                       :subject subject
+                       :added (vec (sort-by pr-str added-unresolved))})
                 sites-changed (conj {:rule :jolt.rule/aspect-sites-preserved
                                      :subject subject
                                      :before (get ac :aspect-sites)
@@ -581,11 +705,13 @@
       :woven-to-optimized :may-refinement
       :effect-elimination-certificates? false}
      :declarations
-     (mapv (fn [[name declaration]]
-             {:fqn name
-              :effects (ordered-set (get declaration :effects #{}))
-              :unknown? (if (get declaration :unknown?) true false)})
-           (sort-by first @(:effect-declarations unit)))
+     (mapv (fn [[key declaration]]
+             (let [[name arity] (if (vector? key) key [key nil])]
+               (cond-> {:fqn name
+                        :effects (ordered-set (get declaration :effects #{}))
+                        :unknown? (if (get declaration :unknown?) true false)}
+                 arity (assoc :arity arity))))
+           (sort-by (comp pr-str first) @(:effect-declarations unit)))
      :phases (mapv (fn [phase]
                      (canonical-phase (phase-report unit phase)))
                    [:plain :woven :optimized])

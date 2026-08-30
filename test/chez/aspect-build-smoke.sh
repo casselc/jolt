@@ -80,6 +80,25 @@ run_build() {
   grep -q ':summaries \[{' "$effect_report"
   grep -q ':verification {:analysis "jolt.effects/verification-v1" :findings \[\]' \
     "$effect_report"
+  # Subject counts alone can be vacuous if every real operation collapses to
+  # unknown.  Require the typed blocking FFI binding to survive every phase as
+  # a precise, positive semantic effect.
+  (cd "$tmp" && env EFFECT_REPORT="$effect_report" JOLT_CACHE_DIR="$tmp/cache" \
+    "$jolt" -e '
+      (require (quote [clojure.edn :as edn]))
+      (let [report (edn/read-string (slurp (System/getenv "EFFECT_REPORT")))]
+        (doseq [phase (:phases report)]
+          (when-not
+            (some (fn [summary]
+                    (and (= "app.core/precise-native-effect"
+                            (get-in summary [:subject :fqn]))
+                         (= {:fixed 0} (get-in summary [:subject :arity]))
+                         (false? (get-in summary [:closure :unknown?]))
+                         (contains? (set (get-in summary [:closure :effects]))
+                                    :jolt.effect/native-block)))
+                  (:summaries phase))
+            (throw (ex-info "effect report has no precise native-block evidence"
+                            {:phase (:phase phase)})))))') >/dev/null
   if grep -q "$tmp" "$effect_report"; then
     echo "FAIL: effect report contains the checkout path" >&2
     exit 1

@@ -74,6 +74,70 @@
              (get-in (summary report "app/root") [:closure :effects])))
       (is (false? (get-in (summary report "app/root") [:closure :unknown?]))))))
 
+(deftest typed-ffi-calls-are-precise-native-effects
+  (let [u (unit)
+        binding (assoc (ir/def-node
+                         "app" "c-wait"
+                         {:op :ffi-fn
+                          :csym "usleep"
+                          :argtypes ["uint"]
+                          :rettype "int"
+                          :blocking true})
+                       :pos {:line 4 :column 1})]
+    (effects/record-phase! u :plain binding)
+    (let [s (summary (effects/finalize-phase! u :plain) "app/c-wait")]
+      (is (= {:fixed 1} (get-in s [:subject :arity])))
+      (is (= #{:jolt.effect/native-call :jolt.effect/native-block}
+             (get-in s [:direct :effects])))
+      (is (false? (get-in s [:closure :unknown?]))))))
+
+(deftest direct-typed-ffi-invocation-retains-argument-effects
+  (let [u (unit)
+        ffi {:op :ffi-fn :csym "work" :argtypes ["int"]
+             :rettype "int" :blocking false}
+        node (fixed-def "app/run" 0
+                        (ir/invoke ffi [(call "runtime/argument" [])]))]
+    (effects/configure-declarations!
+      u {"runtime/argument" {:effects #{:effect/argument}}})
+    (effects/record-phase! u :plain node)
+    (let [s (summary (effects/finalize-phase! u :plain) "app/run")]
+      (is (= #{:effect/argument :jolt.effect/native-call}
+             (get-in s [:closure :effects])))
+      (is (false? (get-in s [:closure :unknown?]))))))
+
+(deftest external-declarations-can-be-arity-aware
+  (let [u (unit)
+        one (fixed-def "app/one" 0 (call "runtime/op" [(ir/const 1)]))
+        two (fixed-def "app/two" 0
+                       (call "runtime/op" [(ir/const 1) (ir/const 2)]))
+        fallback (fixed-def "app/fallback" 0
+                            (call "runtime/any" [(ir/const 1)]))]
+    (effects/configure-declarations!
+      u {["runtime/op" {:fixed 1}] {:effects #{:effect/exact}}
+         ["runtime/op" {:variadic-min 2}] {:effects #{:effect/variadic}}
+         "runtime/any" {:effects #{:effect/fallback}}})
+    (doseq [node [one two fallback]]
+      (effects/record-phase! u :plain node))
+    (let [report (effects/finalize-phase! u :plain)]
+      (is (= #{:effect/exact}
+             (get-in (summary report "app/one") [:closure :effects])))
+      (is (= #{:effect/variadic}
+             (get-in (summary report "app/two") [:closure :effects])))
+      (is (= #{:effect/fallback}
+             (get-in (summary report "app/fallback") [:closure :effects]))))))
+
+(deftest malformed-effect-declarations-fail-before-analysis
+  (doseq [declarations
+          [{["runtime/op" {:fixed -1}] {:effects #{:effect/bad}}}
+           {["runtime/op" {:fixed 1 :variadic-min 0}]
+            {:effects #{:effect/bad}}}
+           {[:not-a-string {:fixed 1}] {:effects #{:effect/bad}}}
+           {"runtime/op" {:effects [:effect/not-a-set]}}
+           {"runtime/op" {:effects #{"not-a-keyword"}}}
+           {"runtime/op" {:unknown? :sometimes}}]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (effects/configure-declarations! (unit) declarations)))))
+
 (deftest dynamic-invocation-fails-closed-with-a-witness
   (let [u (unit)
         node (fixed-def "app/run" 1
@@ -337,6 +401,32 @@
     (effects/record-phase! u :woven unknown)
     (effects/record-phase! u :optimized known)
     (is (empty? (effects/verify-transition! u :woven :optimized)))))
+
+(deftest phase-verification-preserves-or-refines-unknown-provenance
+  (testing "weaving cannot erase a source unknown witness"
+    (let [u (unit)
+          plain (fixed-def "app/root" 0
+                           (assoc (ir/invoke (ir/local "f") [])
+                                  :pos {:line 7 :column 2}))
+          woven (fixed-def "app/root" 0 (ir/const nil))]
+      (effects/record-phase! u :plain plain)
+      (effects/record-phase! u :woven woven)
+      (is (contains? (set (map :rule
+                               (effects/verify-transition! u :plain :woven)))
+                     :jolt.rule/plain-unknown-witness-preserved))))
+  (testing "optimization may remove an unknown but cannot invent another"
+    (let [u (unit)
+          woven (fixed-def "app/root" 0
+                           (assoc (ir/invoke (ir/local "f") [])
+                                  :pos {:line 7 :column 2}))
+          optimized (fixed-def "app/root" 0
+                               (assoc (ir/invoke (ir/local "g") [])
+                                      :pos {:line 9 :column 4}))]
+      (effects/record-phase! u :woven woven)
+      (effects/record-phase! u :optimized optimized)
+      (is (contains? (set (map :rule
+                               (effects/verify-transition! u :woven :optimized)))
+                     :jolt.rule/optimization-adds-no-unknown-witness)))))
 
 (deftest recursive-call-graph-converges
   (let [u (unit)

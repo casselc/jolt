@@ -4,6 +4,14 @@
   (:require [app.target :as target]
             [jolt.aspects :as aspects]))
 
+;; A real compiler-visible primitive effect keeps the build evidence's positive
+;; semantic signal non-vacuous.  The binding is not invoked by the fixture; its
+;; typed callable contract alone must produce a precise :native-block summary.
+(def c-usleep (jolt.ffi/__cfn "usleep" [:uint] :int :blocking))
+
+(defn precise-native-effect []
+  (c-usleep 0))
+
 (defn evaluated-argument [x]
   (println "argument")
   x)
