@@ -206,6 +206,20 @@
           (effects/record-phase! u :plain
                                  (positioned (call "app/later" [])))))))
 
+(deftest structurally-equal-phase-observations-are-idempotent
+  (let [u (unit)
+        node (assoc (call "app/first" [])
+                    :fnsrc-ns "app"
+                    :pos {:file "/checkout/app.clj" :line 5 :column 2})
+        equal-copy (into {} node)]
+    (is (not (identical? node equal-copy)))
+    (effects/record-phase! u :woven node)
+    (effects/record-phase! u :woven equal-copy)
+    (let [report (effects/finalize-phase! u :woven)]
+      (is (= 1 (count (:summaries report))))
+      (is (= #{{:fqn "app/first" :argc 0}}
+             (get-in (first (:summaries report)) [:direct :callees]))))))
+
 (deftest distinct-source-files-cannot-collide-at-the-same-position
   (let [u (unit)
         positioned (fn [file target]
@@ -268,6 +282,22 @@
     (is (= #{:jolt.effect/user-dispatch}
            (get-in (summary (effects/finalize-phase! u :plain) "app/root")
                    [:closure :effects])))))
+
+(deftest exact-arity-wins-over-a-simultaneously-matching-variadic-target
+  (let [u (unit)
+        root (fixed-def "app/root" 0
+                        (call "app/collect" [(ir/const 1) (ir/const 2)]))
+        exact (fixed-def "app/collect" 2 (call "runtime/exact" []))
+        variadic (variadic-def "app/collect" 1
+                               (call "runtime/variadic" []))]
+    (effects/configure-declarations!
+      u {"runtime/exact" {:effects #{:effect/exact}}
+         "runtime/variadic" {:effects #{:effect/variadic}}})
+    (doseq [node [root variadic exact]]
+      (effects/record-phase! u :plain node))
+    (let [root-summary (summary (effects/finalize-phase! u :plain) "app/root")]
+      (is (= #{:effect/exact} (get-in root-summary [:closure :effects])))
+      (is (false? (get-in root-summary [:closure :unknown?]))))))
 
 (deftest unresolved-and-redefinable-targets-remain-unknown
   (testing "missing direct target"
