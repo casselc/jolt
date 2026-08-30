@@ -26,13 +26,12 @@
 ;; lookup) cache per call site and guard on that epoch, so a library required
 ;; after a site warmed up invalidates it — the same shape as jolt-proto-epoch.
 
-;; ext-operations-mu covers every MUTATION here: the declare's
-;; check-then-create, refine's read-modify-write of the fields/default,
-;; register's provider write, and the epoch bump.  It is an execution-context
-;; logical mutex, not a counted Chez mutex.  Parsing, equality, map operations,
-;; rendering, and errors can all reach user code or park; they therefore run
-;; with zero counted locks while the logical owner continues to serialize the
-;; complete semantic operation across threads and fibers.
+;; ext-operations-mu covers only leaf snapshots and commits: the declaration's
+;; check/create, refinement publication, provider write, and epoch bump. Parsing,
+;; equality, map operations, rendering, and errors can reach user code or park,
+;; so every one runs before the counted commit mutex is entered. A commit then
+;; rechecks the immutable point identity it prepared against and retries when a
+;; concurrent refinement won the race.
 ;;
 ;; Two things break without it, and they are the two the protocol registry and the
 ;; multimethod epoch broke in the same way. The declare is check-then-create, so
@@ -45,27 +44,54 @@
 ;; hashtables read single-key, which is safe for the reasons set out at var-table,
 ;; and jolt-extension-value is the hot path this whole epoch scheme exists to keep
 ;; cheap.
-(define ext-operations-mu (jolt-logical-mutex-new))
+(define ext-operations-mu (make-mutex))
 (define extension-epoch-n 0)
 ;; call with ext-operations-mu HELD
 (define (bump-extension-epoch!) (set! extension-epoch-n (fx+ extension-epoch-n 1)))
 
-;; Logical mutexes are deliberately reentrant: an equality implementation or
-;; renderer reached by an extension operation can call an extension mutation
-;; again on the same fiber/thread.  The nested operation is allowed to finish,
-;; but the outer operation must never publish a result prepared from the state
-;; that preceded it.  This is the same fail-fast policy Java's recursive-update
-;; guards use for map compute operations: a successful nested mutation remains,
-;; and the stale outer operation raises rather than overwriting it or repeating
-;; user dispatch.  An idempotent nested declaration does not bump the generation
-;; and is consequently harmless.
-(define (ext-assert-generation! who expected)
-  (unless (fx=? extension-epoch-n expected)
+;; A generic operation may synchronously reenter this registry. Each public
+;; mutation therefore carries an execution-context-owned token. A successful
+;; nested mutation invalidates only active ancestors owned by this same fiber or
+;; thread; a sibling fiber can inherit the dynamic stack without becoming
+;; synchronous reentry. The outer operation then fails before retrying or
+;; publishing, so the nested winner remains and its triggering dispatch runs
+;; exactly once. Idempotent no-ops and failed nested operations invalidate
+;; nothing.
+;;
+;; token = #(owner invalid? ancestors)
+(define ext-operation-tokens (make-parameter '()))
+(define (ext-with-operation thunk)
+  (let ((token (vector (jolt-execution-context-identity) #f
+                       (ext-operation-tokens))))
+    (parameterize ((ext-operation-tokens
+                     (cons token (ext-operation-tokens))))
+      (thunk token))))
+(define (ext-token-invalid? token) (vector-ref token 1))
+(define (ext-note-mutation! token)
+  (let ((me (jolt-execution-context-identity)))
+    ;; Only active same-owner ancestors prepared state that this commit can make
+    ;; stale. Keep that ancestry on the explicit token as well as the dynamic
+    ;; parameter so a commit after a fiber suspension cannot lose it.
+    (for-each (lambda (ancestor)
+                (when (eq? (vector-ref ancestor 0) me)
+                  (vector-set! ancestor 1 #t)))
+              (vector-ref token 2))))
+(define (ext-assert-token! who token)
+  (when (ext-token-invalid? token)
     (throw-jvm
       (quote IllegalStateException)
       (string-append who
                      ": reentrant extension mutation changed the registry; "
                      "the nested mutation was kept and the stale outer operation was rejected"))))
+
+;; Capture state-dependent preparation errors until the commit mutex has
+;; established whether the immutable point snapshot is still current. A stale
+;; error is retried against the new schema; an error following same-owner
+;; reentry is preserved as the earlier failure in evaluation order.
+;; #(success? value-or-condition)
+(define (ext-capture thunk)
+  (guard (e (#t (vector #f e)))
+    (vector #t (thunk))))
 
 (define extension-points-tbl (make-hashtable string-hash string=?))
 
@@ -178,10 +204,11 @@
        (jolt=2 (ext-point-default p) default)))
 
 (define (jolt-register-extension-point! id spec)
-  (jolt-with-logical-mutex ext-operations-mu
-    (lambda ()
-      (let* ((generation extension-epoch-n)
-             (idn (ext-id-str id)))
+  (ext-with-operation
+    (lambda (token)
+      ;; Every caller-controlled operation in declaration parsing runs once,
+      ;; outside the leaf commit mutex.
+      (let ((idn (ext-id-str id)))
         (unless (jolt-map? spec)
           (ext-bad! (string-append "extension point " (ext-show-id idn) " spec must be a map")))
         (let* ((key-kind (ext-kw-name (ext-kw spec "key")
@@ -216,24 +243,52 @@
             (unless (ext-key-kind-ok? key-kind root)
               (ext-bad! (string-append "extension point " (ext-show-id idn) " :root must be a "
                                        key-kind ", got " (jolt-pr-readable root)))))
-        ;; the probe and the create are ONE logical step: two threads declaring
-        ;; the same point must not each build a providers table, or a provider
-        ;; registered through one is invisible through the other.
-        (let ((prior (hashtable-ref extension-points-tbl idn #f)))
-          (if prior
-              (let ((same? (ext-same-declaration? prior key-kind root fallback hint fields default)))
-                (ext-assert-generation! "register-extension-point!" generation)
-                (if same?
-                    jolt-nil
-                    (ext-bad! (string-append "extension point " (ext-show-id idn)
-                                             " is already declared with a different contract"))))
-              (begin
-                (ext-assert-generation! "register-extension-point!" generation)
-                (hashtable-set! extension-points-tbl idn
-                  (make-ext-point idn key-kind root fallback hint fields default
-                                  (make-hashtable string-hash string=?)))
-                (bump-extension-epoch!)
-                jolt-nil))))))))
+          (let retry ()
+            (let ((prior (jolt-with-mutex ext-operations-mu
+                           (hashtable-ref extension-points-tbl idn #f))))
+              (if prior
+                  (let* ((comparison
+                           (ext-capture
+                             (lambda ()
+                               (ext-same-declaration?
+                                 prior key-kind root fallback hint fields default))))
+                         (decision
+                           (jolt-with-mutex ext-operations-mu
+                             (let ((current (hashtable-ref extension-points-tbl idn #f)))
+                               (cond
+                                 ;; Preserve an earlier comparison failure after
+                                 ;; synchronous reentry instead of replacing it.
+                                 ((and (not (vector-ref comparison 0))
+                                       (ext-token-invalid? token))
+                                  'raise)
+                                 ((ext-token-invalid? token) 'stale)
+                                 ((not (eq? current prior)) 'retry)
+                                 ((not (vector-ref comparison 0)) 'raise)
+                                 ((vector-ref comparison 1) 'same)
+                                 (else 'drift))))))
+                    (case decision
+                      ((retry) (retry))
+                      ((raise) (raise (vector-ref comparison 1)))
+                      ((stale) (ext-assert-token! "register-extension-point!" token))
+                      ((same) jolt-nil)
+                      (else
+                       (ext-bad! (string-append "extension point " (ext-show-id idn)
+                                                " is already declared with a different contract")))))
+                  (let ((decision
+                          (jolt-with-mutex ext-operations-mu
+                            (cond
+                              ((ext-token-invalid? token) 'stale)
+                              ((hashtable-ref extension-points-tbl idn #f) 'retry)
+                              (else
+                               (hashtable-set! extension-points-tbl idn
+                                 (make-ext-point idn key-kind root fallback hint fields default
+                                                 (make-hashtable string-hash string=?)))
+                               (bump-extension-epoch!)
+                               'created)))))
+                    (case decision
+                      ((retry) (retry))
+                      ((stale) (ext-assert-token! "register-extension-point!" token))
+                      (else (ext-note-mutation! token) jolt-nil)))))))))))
 
 (define (ext-point-of id who)
   (let* ((idn (ext-id-str id))
@@ -247,77 +302,146 @@
 ;; registered provider keeps validating, and gains the new field's default through
 ;; the merge — refinement of the type, not a breaking redeclaration.
 (define (jolt-refine-extension! id spec)
-  ;; The whole refinement is one logical critical section: it reads the point's
-  ;; fields and default, merges, and writes both back, so two concurrent refines
-  ;; cannot drop one another.  Generic work may park but holds no counted lock.
-  (jolt-with-logical-mutex ext-operations-mu
-    (lambda ()
-      (let* ((generation extension-epoch-n)
-             (p (ext-point-of id "refine-extension!"))
-             (idn (ext-point-id p)))
+  (ext-with-operation
+    (lambda (token)
+      (let* ((idn (ext-id-str id))
+             ;; Preserve the original API order: an undeclared point fails
+             ;; before caller-controlled spec predicates or traversal run.
+             (initial-p
+               (jolt-with-mutex ext-operations-mu
+                 (hashtable-ref extension-points-tbl idn #f))))
+        (unless initial-p
+          (ext-bad! (string-append "refine-extension!: no extension point "
+                                   (ext-show-id idn) " is declared")))
         (unless (jolt-map? spec)
           (ext-bad! (string-append "refine-extension! " (ext-show-id idn) " spec must be a map")))
+        ;; These depend only on caller input and therefore run once. The merge
+        ;; below may be retried only when a concurrent immutable point generation
+        ;; wins publication.
         (let ((new-fields (ext-parse-fields (ext-kw spec "fields") idn))
               (new-default (ext-kw spec "default")))
-          ;; A field already declared may be repeated only at the same type (an
-          ;; idempotent second load); at a different type it is drift.
-          (for-each (lambda (fld)
-                      (let ((old (assoc (car fld) (ext-point-fields p))))
-                        (when (and old (not (string=? (cdr old) (cdr fld))))
-                          (ext-bad! (string-append "refine-extension! " (ext-show-id idn) " field :"
-                                                   (car fld) " is already declared as :" (cdr old))))))
-                    new-fields)
-          (let ((merged-fields
-                  (append (ext-point-fields p)
-                          (filter (lambda (f) (not (assoc (car f) (ext-point-fields p))))
-                                  new-fields))))
-            (ext-check-value! idn merged-fields new-default #f ":default")
-            ;; the added fields must each carry a default, or the point's default stops
-            ;; being total and a partial provider could resolve to a missing field.
-            (for-each (lambda (fld)
-                        (unless (or (jolt-contains? (ext-point-default p) (keyword #f (car fld)))
-                                    (jolt-contains? new-default (keyword #f (car fld))))
-                          (ext-bad! (string-append "refine-extension! " (ext-show-id idn) " field :"
-                                                   (car fld) " needs a :default"))))
-                      new-fields)
-          (let ((merged-default
-                  (pmap-fold-fwd new-default (lambda (k v acc) (jolt-assoc1 acc k v))
-                                 (ext-point-default p))))
-            ;; No generic operation follows this check before the bounded leaf
-            ;; publication.  A nested mutation during preparation is retained,
-            ;; while this stale outer publication is rejected.
-            (ext-assert-generation! "refine-extension!" generation)
-            ;; Publish one immutable point instead of mutating fields/default in
-            ;; two writes.  Unlocked readers therefore observe either coherent
-            ;; schema generation, never new fields paired with an old default.
-            ;; The provider table is deliberately shared across generations.
-            (hashtable-set! extension-points-tbl idn
-              (make-ext-point idn
-                              (ext-point-key-kind p)
-                              (ext-point-root p)
-                              (ext-point-fallback p)
-                              (ext-point-hint p)
-                              merged-fields
-                              merged-default
-                              (ext-point-providers p)))
-            (bump-extension-epoch!)
-            jolt-nil)))))))
+          (let retry ((p initial-p))
+              (unless p
+                (ext-bad! (string-append "refine-extension!: no extension point "
+                                         (ext-show-id idn) " is declared")))
+              (let* ((prepared
+                       (ext-capture
+                         (lambda ()
+                           ;; A field already declared may be repeated only at
+                           ;; the same type; a different type is contract drift.
+                           (for-each (lambda (fld)
+                                       (let ((old (assoc (car fld) (ext-point-fields p))))
+                                         (when (and old (not (string=? (cdr old) (cdr fld))))
+                                           (ext-bad!
+                                             (string-append "refine-extension! "
+                                                            (ext-show-id idn) " field :"
+                                                            (car fld) " is already declared as :"
+                                                            (cdr old))))))
+                                     new-fields)
+                           (let ((merged-fields
+                                   (append
+                                     (ext-point-fields p)
+                                     (filter
+                                       (lambda (f)
+                                         (not (assoc (car f) (ext-point-fields p))))
+                                       new-fields))))
+                             (ext-check-value! idn merged-fields new-default #f ":default")
+                             ;; Every added field needs either an old or a new
+                             ;; default so the merged default remains total.
+                             (for-each
+                               (lambda (fld)
+                                 (unless
+                                   (or (jolt-contains? (ext-point-default p)
+                                                       (keyword #f (car fld)))
+                                       (jolt-contains? new-default
+                                                       (keyword #f (car fld))))
+                                   (ext-bad!
+                                     (string-append "refine-extension! "
+                                                    (ext-show-id idn) " field :"
+                                                    (car fld) " needs a :default"))))
+                               new-fields)
+                             (let ((merged-default
+                                     (pmap-fold-fwd
+                                       new-default
+                                       (lambda (k v acc) (jolt-assoc1 acc k v))
+                                       (ext-point-default p))))
+                               ;; Build the complete immutable generation before
+                               ;; entering the leaf publication mutex.
+                               (make-ext-point idn
+                                               (ext-point-key-kind p)
+                                               (ext-point-root p)
+                                               (ext-point-fallback p)
+                                               (ext-point-hint p)
+                                               merged-fields
+                                               merged-default
+                                               (ext-point-providers p)))))))
+                     (decision
+                       (jolt-with-mutex ext-operations-mu
+                         (let ((current (hashtable-ref extension-points-tbl idn #f)))
+                           (cond
+                             ((and (not (vector-ref prepared 0))
+                                   (ext-token-invalid? token))
+                              'raise)
+                             ((ext-token-invalid? token) 'stale)
+                             ((not (eq? current p)) 'retry)
+                             ((not (vector-ref prepared 0)) 'raise)
+                             (else
+                              (hashtable-set! extension-points-tbl idn
+                                              (vector-ref prepared 1))
+                              (bump-extension-epoch!)
+                              'published))))))
+                (case decision
+                  ((retry)
+                   (retry
+                     (jolt-with-mutex ext-operations-mu
+                       (hashtable-ref extension-points-tbl idn #f))))
+                  ((raise) (raise (vector-ref prepared 1)))
+                  ((stale) (ext-assert-token! "refine-extension!" token))
+                  (else (ext-note-mutation! token) jolt-nil)))))))))
 
 ;; ---- registration + lookup --------------------------------------------------
 (define (jolt-register-extension! id k value)
-  (jolt-with-logical-mutex ext-operations-mu
-    (lambda ()
-      (let* ((generation extension-epoch-n)
-             (p (ext-point-of id "register-extension!"))
-             (ks (ext-key->string p k)))
-        (ext-check-value! (ext-point-id p) (ext-point-fields p) value #f "provider")
-        ;; the provider write and the epoch bump together: a bump lost to a race
-        ;; is a call site that keeps serving the resolution it cached before this
-        ;; provider existed, with the stamp already saying current.
-        (ext-assert-generation! "register-extension!" generation)
-        (hashtable-set! (ext-point-providers p) ks value)
-        (bump-extension-epoch!)
-        jolt-nil))))
+  (ext-with-operation
+    (lambda (token)
+      (let ((idn (ext-id-str id)))
+        (let retry ()
+          (let ((p (jolt-with-mutex ext-operations-mu
+                     (hashtable-ref extension-points-tbl idn #f))))
+            (unless p
+              (ext-bad! (string-append "register-extension!: no extension point "
+                                       (ext-show-id idn) " is declared")))
+            (let* ((prepared
+                     (ext-capture
+                       (lambda ()
+                         (let ((ks (ext-key->string p k)))
+                           (ext-check-value! (ext-point-id p)
+                                             (ext-point-fields p)
+                                             value #f "provider")
+                           ks))))
+                   (decision
+                     (jolt-with-mutex ext-operations-mu
+                       (let ((current (hashtable-ref extension-points-tbl idn #f)))
+                         (cond
+                           ((and (not (vector-ref prepared 0))
+                                 (ext-token-invalid? token))
+                            'raise)
+                           ((ext-token-invalid? token) 'stale)
+                           ((not (eq? current p)) 'retry)
+                           ((not (vector-ref prepared 0)) 'raise)
+                           (else
+                            ;; Provider writes need no prior-value conflict
+                            ;; check: preparation depends only on the immutable
+                            ;; point schema, and writes linearize here in commit
+                            ;; order. Point identity detects concurrent refine.
+                            (hashtable-set! (ext-point-providers p)
+                                            (vector-ref prepared 1) value)
+                            (bump-extension-epoch!)
+                            'published))))))
+              (case decision
+                ((retry) (retry))
+                ((raise) (raise (vector-ref prepared 1)))
+                ((stale) (ext-assert-token! "register-extension!" token))
+                (else (ext-note-mutation! token) jolt-nil)))))))))
 
 (define (ext-merge default provider)
   (pmap-fold-fwd provider (lambda (k v acc) (jolt-assoc1 acc k v)) default))

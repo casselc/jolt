@@ -517,8 +517,12 @@
 (define (jolt-logical-mutex-new)
   (vector (make-mutex) (make-condition) #f 0 #f))
 
-(define (jolt-logical-mutex-self)
+(define (jolt-execution-context-identity)
   (or (jolt-current-fiber) (current-interrupt-box)))
+
+;; Compatibility name for the logical-mutex implementation. New policy-bearing
+;; primitives should use the execution-context seam directly.
+(define jolt-logical-mutex-self jolt-execution-context-identity)
 
 ;; A fiber may become terminal and clear jolt-current-fiber before its winders
 ;; run.  Permit only that fiber's own terminal unwind, on the carrier thread on

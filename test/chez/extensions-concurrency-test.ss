@@ -1,10 +1,10 @@
-;; extensions-concurrency-test.ss -- logical serialization for extension points.
+;; extensions-concurrency-test.ss -- optimistic extension-point publication.
 ;;
 ;; The registry calls generic equality, map, rendering, and error paths.  Those
-;; calls may run user code or park, so the semantic operation is protected by an
-;; execution-context logical mutex while every generic call observes zero
-;; counted locks.  The tests below pin that shape, concurrent union/epoch
-;; publication, and the fail-fast rule for a same-owner recursive mutation.
+;; calls may run user code or park, so preparation occurs outside the leaf commit
+;; mutex and immutable point identity supplies the recheck. The tests below pin
+;; that shape, concurrent union/epoch publication, stale-error retry, and the
+;; fail-fast rule for a same-owner recursive mutation.
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
@@ -87,6 +87,10 @@
 (define (raised thunk)
   (guard (e (#t e)) (thunk) #f))
 
+(define (mutex-unlocked? mu)
+  (and (mutex-acquire mu #f)
+       (begin (mutex-release mu) #t)))
+
 (define (illegal-state? e)
   (and e
        (let ((v (jolt-unwrap-throw e)))
@@ -142,6 +146,7 @@
 (define original-assoc jolt-assoc1)
 (define assoc-visited? #f)
 (define assoc-old-point (hashtable-ref extension-points-tbl "xc-get" #f))
+(define assoc-epoch extension-epoch-n)
 (set! jolt-assoc1
   (lambda (m k v)
     (unless assoc-visited?
@@ -155,13 +160,23 @@
       (jolt-refine-extension! (kw "xc-get")
                               (refine-spec "added" "long" 7)))))
 (sa-fiber-run-all)
-(ok "refinement may park while retaining logical ownership"
+(ok "refinement may park with the commit mutex released"
     (and assoc-visited?
          (eq? 'parked (jolt-fiber-state assoc-fiber))
-         (jolt-logical-mutex-locked? ext-operations-mu)))
+         (mutex-unlocked? ext-operations-mu)))
 (ok "parked preparation has not exposed a partial schema"
     (not (jolt-contains? (jolt-extension-value (kw "xc-get") "")
                          (kw "added"))))
+;; A different execution context may commit while preparation is parked. The
+;; parked operation must rebase on that immutable generation after resuming.
+(define assoc-concurrent
+  (thread-result
+    (lambda ()
+      (jolt-refine-extension! (kw "xc-get")
+                              (refine-spec "concurrent" "long" 8)))))
+(thread-result-await assoc-concurrent)
+(ok "another refinement commits while preparation is parked"
+    (= 8 (map-get (jolt-extension-value (kw "xc-get") "") "concurrent")))
 (sa-fiber-resume assoc-fiber)
 (let loop ((n 0))
   (when (and (< n 10) (not (memq (jolt-fiber-state assoc-fiber) '(done dead))))
@@ -171,7 +186,11 @@
 (ok "refinement finishes after assoc park/resume"
     (and assoc-visited? (eq? 'done (jolt-fiber-state assoc-fiber))))
 (ok "resumed refinement published its value"
-    (= 7 (map-get (jolt-extension-value (kw "xc-get") "") "added")))
+    (let ((v (jolt-extension-value (kw "xc-get") "")))
+      (and (= 7 (map-get v "added"))
+           (= 8 (map-get v "concurrent")))))
+(ok "parked and concurrent refinements each publish one epoch"
+    (= (+ assoc-epoch 2) extension-epoch-n))
 (define assoc-new-point (hashtable-ref extension-points-tbl "xc-get" #f))
 (ok "refinement publishes a fresh coherent point generation"
     (and (not (eq? assoc-old-point assoc-new-point))
@@ -203,7 +222,64 @@
     (and render-visited?
          (eq? 'done (jolt-fiber-state render-fiber))
          (eq? 'expected-error (jolt-fiber-result render-fiber))
-         (not (jolt-logical-mutex-locked? ext-operations-mu))))
+         (mutex-unlocked? ext-operations-mu)))
+
+;; Fiber creation can carry dynamic parameter state. Such a sibling is a
+;; concurrent execution context, not synchronous reentry, so its successful
+;; commit must not invalidate the spawning fiber's token.
+(define sibling-inherited? #f)
+(define sibling-owner-distinct? #f)
+(define parent-invalidated? #t)
+(define token-parent
+  (sa-fiber-spawn
+    (lambda ()
+      (ext-with-operation
+        (lambda (parent-token)
+          (sa-fiber-spawn
+            (lambda ()
+              ;; Model a scheduler that conveys this dynamic parameter. The
+              ;; current Scheme fiber seam does not, but the token contract must
+              ;; remain correct if that broader inheritance is adopted.
+              (parameterize ((ext-operation-tokens (list parent-token)))
+                (set! sibling-inherited?
+                      (and (memq parent-token (ext-operation-tokens)) #t))
+                (set! sibling-owner-distinct?
+                      (not (eq? (vector-ref parent-token 0)
+                                (jolt-execution-context-identity))))
+                (jolt-register-extension! (kw "xc-get") "sibling-token"
+                                          (default-map "base" "sibling-value")))))
+          (sa-fiber-yield)
+          (set! parent-invalidated? (ext-token-invalid? parent-token)))))))
+(sa-fiber-run-all)
+(ok "spawned sibling inherits the active operation metadata"
+    sibling-inherited?)
+(ok "spawned sibling has a distinct execution-context owner"
+    sibling-owner-distinct?)
+(ok "sibling commit does not look like synchronous reentry"
+    (and (eq? 'done (jolt-fiber-state token-parent))
+         (not parent-invalidated?)
+         (string=? "sibling-value"
+                   (map-get (jolt-extension-value (kw "xc-get") "sibling-token")
+                            "base"))))
+
+;; Preserve API evaluation order: a missing point is rejected before the
+;; caller-controlled spec is inspected.
+(define precedence-map-original jolt-map?)
+(define precedence-spec-touched? #f)
+(set! jolt-map?
+  (lambda (v)
+    (set! precedence-spec-touched? #t)
+    (precedence-map-original v)))
+(define precedence-error
+  (raised
+    (lambda ()
+      (jolt-refine-extension! (kw "xc-missing-precedence") "not-a-map"))))
+(set! jolt-map? precedence-map-original)
+(ok "missing refinement point wins before spec dispatch"
+    (and precedence-error
+         (not precedence-spec-touched?)
+         (string-has? (condition-message precedence-error)
+                      "no extension point :xc-missing-precedence")))
 
 (printf "\n== concurrent declarations and refinements are linearized ==\n")
 (define declare-id (kw "xc-declare"))
@@ -284,6 +360,60 @@
                                   "base"))
                (loop (+ i 1))))))
 
+;; Same-key provider writes do not need an optimistic prior-value check. Their
+;; preparation depends only on the immutable point schema, and both commits
+;; linearize under the leaf mutex.
+(define same-key-epoch extension-epoch-n)
+(define same-key-start (make-start-gate 2))
+(define same-key-a
+  (thread-result
+    (lambda ()
+      (same-key-start)
+      (jolt-register-extension! declare-id "same-key"
+                                (default-map "base" "same-a")))))
+(define same-key-b
+  (thread-result
+    (lambda ()
+      (same-key-start)
+      (jolt-register-extension! declare-id "same-key"
+                                (default-map "base" "same-b")))))
+(thread-result-await same-key-a)
+(thread-result-await same-key-b)
+(ok "concurrent same-key providers both linearize"
+    (= (+ same-key-epoch 2) extension-epoch-n))
+(ok "same-key final value is one valid commit-order winner"
+    (let ((v (map-get (jolt-extension-value declare-id "same-key") "base")))
+      (or (string=? v "same-a") (string=? v "same-b"))))
+
+;; A validation error prepared against an old schema is not authoritative. A
+;; concurrent refine adds the field before recheck, so registration retries and
+;; succeeds instead of surfacing the stale unknown-field error.
+(define stale-id (kw "xc-stale-error"))
+(jolt-register-extension-point! stale-id
+                                (declare-spec "base" "string" "stale-root"))
+(define stale-fold-original pmap-fold-fwd)
+(define stale-triggered? #f)
+(set! pmap-fold-fwd
+  (lambda (m f init)
+    (unless stale-triggered?
+      (set! stale-triggered? #t)
+      (thread-result-await
+        (thread-result
+          (lambda ()
+            (jolt-refine-extension! stale-id
+                                    (refine-spec "future" "long" 0))))))
+    (stale-fold-original m f init)))
+(jolt-register-extension! stale-id "provider"
+                          (jm (kw "base") "stale-provider"
+                              (kw "future") 9))
+(set! pmap-fold-fwd stale-fold-original)
+(ok "stale provider validation was forced by a concurrent refinement"
+    stale-triggered?)
+(ok "stale validation error retries against the published schema"
+    (let ((v (jolt-extension-value stale-id "provider")))
+      (and (string=? "stale-provider" (map-get v "base"))
+           (= 9 (map-get v "future")))))
+
 (printf "\n== reentrant mutation retains nested state and rejects stale outer publish ==\n")
 (define reentrant-id (kw "xc-reentrant"))
 (define reentrant-spec (declare-spec "base" "string" "root"))
@@ -304,11 +434,10 @@
 (ok "same-owner idempotent recursion is accepted"
     (and reentrant-idempotent? (= idempotent-epoch extension-epoch-n)))
 
-;; Declaration snapshots the generation before parsing.  A generic map lookup
-;; that recursively performs a real mutation must run once, keep that nested
-;; provider, and make the outer create fail before publication.  Bypassing the
-;; declaration site's ext-assert-generation! makes the named rejection assertion
-;; below fail because xc-decl-outer is silently created.
+;; Declaration parsing carries an operation token. A generic map lookup that
+;; recursively performs a real mutation must run once, keep that nested provider,
+;; and invalidate the outer create before publication. Bypassing the token check
+;; makes the named rejection below fail because xc-decl-outer is silently created.
 (define declaration-get-original jolt-get-dispatch)
 (define declaration-dispatch-count 0)
 (define declaration-triggered? #f)
@@ -328,7 +457,7 @@
 (set! jolt-get-dispatch declaration-get-original)
 (ok "declaration reentry invokes its nested user dispatch exactly once"
     (= 1 declaration-dispatch-count))
-(ok "outer declaration generation check rejects stale create"
+(ok "outer declaration token rejects stale create"
     (and (illegal-state? declaration-outer-error)
          (not (hashtable-ref extension-points-tbl "xc-decl-outer" #f))))
 (ok "outer declaration rejection retains nested provider state"
@@ -337,8 +466,8 @@
 
 ;; Provider validation folds a generic map.  Reenter by registering the SAME
 ;; provider key with a nested value.  The nested write linearizes and remains;
-;; the stale outer write must fail instead of overwriting it.  Bypassing the
-;; provider site's ext-assert-generation! kills both named assertions below.
+;; the stale outer write must fail instead of overwriting it. Bypassing the
+;; provider operation-token check kills both named assertions below.
 (define provider-fold-original pmap-fold-fwd)
 (define provider-dispatch-count 0)
 (define provider-triggered? #f)
@@ -358,15 +487,49 @@
 (set! pmap-fold-fwd provider-fold-original)
 (ok "provider reentry invokes its nested user dispatch exactly once"
     (= 1 provider-dispatch-count))
-(ok "outer provider generation check rejects stale overwrite"
+(ok "outer provider token rejects stale overwrite"
     (illegal-state? provider-outer-error))
 (ok "outer provider rejection retains nested same-key value"
     (string=? "nested-wins"
               (map-get (jolt-extension-value reentrant-id "provider-same-key") "base")))
 
+;; If preparation itself fails after a nested commit, preserve that earlier
+;; exception rather than replacing it with the stale-operation exception.
+(define sentinel-fold-original pmap-fold-fwd)
+(define sentinel-dispatch-count 0)
+(define sentinel-triggered? #f)
+(set! pmap-fold-fwd
+  (lambda (m f init)
+    (if sentinel-triggered?
+        (sentinel-fold-original m f init)
+        (begin
+          (set! sentinel-triggered? #t)
+          (set! sentinel-dispatch-count (+ sentinel-dispatch-count 1))
+          (jolt-register-extension! reentrant-id "sentinel-nested"
+                                    (default-map "base" "sentinel-kept"))
+          (error 'extension-sentinel "sentinel-after-nested")))))
+(define sentinel-outer-error
+  (raised
+    (lambda ()
+      (jolt-register-extension! reentrant-id "sentinel-outer"
+                                (default-map "base" "never-published")))))
+(set! pmap-fold-fwd sentinel-fold-original)
+(ok "preparation exception after nested mutation runs once and wins"
+    (and (= 1 sentinel-dispatch-count)
+         (string-has? (condition-message sentinel-outer-error)
+                      "sentinel-after-nested")))
+(ok "preparation exception retains the nested commit"
+    (and (string=? "sentinel-kept"
+                   (map-get (jolt-extension-value reentrant-id "sentinel-nested")
+                            "base"))
+         (not (hashtable-ref (ext-point-providers
+                               (hashtable-ref extension-points-tbl
+                                              "xc-reentrant" #f))
+                             "sentinel-outer" #f))))
+
 ;; A nested provider mutation during outer default construction bumps the
-;; generation.  The nested provider must remain, and the stale outer refinement
-;; must fail before changing fields/default.  Deleting ext-assert-generation!
+;; active operation token. The nested provider must remain, and the stale outer
+;; refinement must fail before changing fields/default. Deleting the token check
 ;; makes this test observe the forbidden silent outer publication.
 (define mutation-assoc-original jolt-assoc1)
 (define nested-mutation? #f)
@@ -392,11 +555,11 @@
               (map-get (jolt-extension-value reentrant-id "nested") "base")))
 (ok "rejected outer refinement publishes neither field nor default"
     (not (jolt-contains? reentrant-root (kw "outer"))))
-(ok "reentrant failure unwinds logical ownership"
-    (not (jolt-logical-mutex-locked? ext-operations-mu)))
+(ok "reentrant failure leaves the commit mutex unlocked"
+    (mutex-unlocked? ext-operations-mu))
 
 ;; A later operation from another OS thread proves exception unwind did not
-;; strand logical ownership on the throwing execution context.
+;; strand commit ownership on the throwing execution context.
 (define after-error
   (thread-result
     (lambda ()

@@ -1,22 +1,4 @@
 # Generic dispatch deliberately executed while a named logical mutex is held.
 # Every row is issue-backed and count-exact; decreases are stale debt that must
 # be reviewed, not silently retained. Safe named acquisition edges are computed
-# separately and are never debt. See chucklehead-dev/jolt-aspect-packs#33.
-host/chez/extensions.ss jolt-refine-extension! logical-dispatch ext-operations-mu->ext-check-value! 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! logical-dispatch ext-operations-mu->ext-kw 2 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! logical-dispatch ext-operations-mu->ext-parse-fields 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! logical-dispatch ext-operations-mu->ext-point-of 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! logical-dispatch ext-operations-mu->jolt-contains? 2 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! logical-dispatch ext-operations-mu->jolt-map? 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-refine-extension! logical-dispatch ext-operations-mu->pmap-fold-fwd 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension! logical-dispatch ext-operations-mu->ext-check-value! 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension! logical-dispatch ext-operations-mu->ext-key->string 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension! logical-dispatch ext-operations-mu->ext-point-of 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension-point! logical-dispatch ext-operations-mu->ext-check-value! 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension-point! logical-dispatch ext-operations-mu->ext-id-str 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension-point! logical-dispatch ext-operations-mu->ext-kw 6 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension-point! logical-dispatch ext-operations-mu->ext-kw-name 2 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension-point! logical-dispatch ext-operations-mu->ext-parse-fields 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension-point! logical-dispatch ext-operations-mu->ext-same-declaration? 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension-point! logical-dispatch ext-operations-mu->jolt-map? 1 issue=chucklehead-dev/jolt-aspect-packs#33
-host/chez/extensions.ss jolt-register-extension-point! logical-dispatch ext-operations-mu->jolt-pr-readable 1 issue=chucklehead-dev/jolt-aspect-packs#33
+# separately and are never debt. The reviewed debt set is currently empty.

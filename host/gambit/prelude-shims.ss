@@ -496,11 +496,13 @@ eturn)) (loop (- n 1)))
 (define (jolt-logical-mutex-new)
   (vector (make-mutex) #f 0))
 
-(define (jolt-logical-mutex-owner-identity)
+(define (jolt-execution-context-identity)
   ;; The owner is the logical execution context, not merely its SRFI-18
   ;; carrier.  Gambit's continuation fibers all run on one thread, so using
   ;; current-thread alone makes sibling fibers look reentrant.
   (or (jolt-current-fiber) (current-thread)))
+
+(define jolt-logical-mutex-owner-identity jolt-execution-context-identity)
 
 (define (jolt-logical-mutex-try-enter/owner! lm me)
   (cond
