@@ -156,6 +156,8 @@
 ;; :uuid         :source                          —
 ;; :bigdec       :source                          —
 ;; :the-ns       :name                            —
+;; :checkpoint-decl :id :dispositions             —  (consumed before weaving)
+;; :checkpoint   :id :dispositions                —  (controlled profile only)
 ;;
 ;;  * the positions map-ir-children / reduce-ir-children recurse. A `?` marks an
 ;;    optional position recursed only when present.
@@ -201,11 +203,13 @@
 ;;                           generated quoted join-point literal; recomputed
 ;;                           effect evidence uses it to prove optimization did
 ;;                           not erase instrumentation.
+;;   :effect-plain-recorded  build-cache provenance: the raw source root was
+;;                           already recorded before compiler-owned lowering.
 (def node-ops
   #{:const :local :var :the-var :host :host-static :host-new :if :do :invoke :def
     :let :loop :recur :fn :vector :map :set :quote :throw :coerce :try :host-call
     :set-var :set-field :defmacro :ffi-layout :ffi-fn :ffi-callable :regex :inst :uuid :bigdec
-    :the-ns})
+    :the-ns :checkpoint-decl :checkpoint})
 
 ;; op -> the keys a node of that op must carry. Optional keys (:init, annotations)
 ;; are not listed. Kept conservative for the leaf/host ops so a shape change
@@ -222,7 +226,9 @@
    :ffi-layout [:layout]
    :ffi-fn [:csym :argtypes :rettype] :ffi-callable [:fn :argtypes :rettype]
    :regex [:source] :inst [:source] :uuid [:source] :bigdec [:source]
-   :the-ns [:name]})
+   :the-ns [:name]
+   :checkpoint-decl [:id :dispositions]
+   :checkpoint [:id :dispositions]})
 
 ;; Problems with THIS node's shape (not its children): an unknown or missing :op,
 ;; or a missing required key. Returns a seq of message strings (empty when valid).

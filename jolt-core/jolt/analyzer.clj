@@ -14,7 +14,8 @@
   Definitions are ordered so only `analyze` (mutually recursive) is forward
   declared — the bootstrap compiles forward refs through var cells, but keeping
   them to one keeps the compiled namespace simple."
-  (:require [jolt.ir :refer [const local var-ref the-var host-ref if-node do-node invoke
+  (:require [jolt.checkpoints :as checkpoints]
+            [jolt.ir :refer [const local var-ref the-var host-ref if-node do-node invoke
                              coerce-node
                              def-node let-node fn-node vector-node map-node set-node
                              quote-node throw-node host-static host-new reduce-ir-children]]
@@ -1127,6 +1128,27 @@
       (throw "jolt.aspects/at cannot mark the same call more than once"))
     (assoc node :aspect-marker declaration)))
 
+(defn- analyze-checkpoint [items]
+  (when-not (= 3 (count items))
+    (throw "jolt.checkpoints/checkpoint! expects an ID and disposition set"))
+  (let [id (nth items 1)
+        disposition-form (nth items 2)]
+    (when-not (and (form-keyword? id) (some? (namespace id)))
+      (throw "jolt.checkpoints/checkpoint! ID must be a literal qualified keyword"))
+    (when-not (form-set? disposition-form)
+      (throw "jolt.checkpoints/checkpoint! dispositions must be a literal set"))
+    (let [dispositions (set (form-set-items disposition-form))
+          unsupported (seq (remove checkpoints/dispositions dispositions))]
+      (when (or (empty? dispositions)
+                (not (every? form-keyword? dispositions)))
+        (throw "jolt.checkpoints/checkpoint! dispositions must be literal keywords"))
+      (when unsupported
+        (throw (str "jolt.checkpoints/checkpoint! unsupported disposition: "
+                    (first unsupported))))
+      (when-not (contains? dispositions :continue)
+        (throw "jolt.checkpoints/checkpoint! dispositions must include :continue"))
+      {:op :checkpoint-decl :id id :dispositions dispositions})))
+
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
     (throw (str "jolt.ffi/foreign-fn expects "
@@ -1338,6 +1360,12 @@
 (defn- analyze-symbol [ctx form env]
   (let [nm (form-sym-name form) ns (form-sym-ns form)]
     (cond
+      ;; This name exists only as an exact compiler form in operator position.
+      ;; It deliberately has no Var; refusing value-position analysis here also
+      ;; closes permissive unresolved-var modes used by nREPL and gate contexts.
+      (and (= ns "jolt.checkpoints") (= nm "__checkpoint"))
+        (uncompilable
+          "jolt.checkpoints/__checkpoint is compiler syntax, not a callable value")
       (and (nil? ns) (local? env nm))
         (let [h (get (:hints env) nm)] (if h (assoc (local nm) :hint h) (local nm)))
       ;; Qualified instance method (Clojure 1.12) used as a value — not yet
@@ -1469,6 +1497,12 @@
           (and (form-sym? head) (= "jolt.aspects" (form-sym-ns head))
                (= "__at" (form-sym-name head)))
             (analyze-aspect-marker ctx items env)
+          ;; Checkpoint declarations are compiler-owned leaves.  Like aspect
+          ;; markers, the public macro always emits a qualified private form so
+          ;; aliases and local bindings cannot change this dispatch.
+          (and (form-sym? head) (= "jolt.checkpoints" (form-sym-ns head))
+               (= "__checkpoint" (form-sym-name head)))
+            (analyze-checkpoint items)
           ;; jolt.ffi/__cfn — the foreign-function special form (always emitted
           ;; fully-qualified by the jolt.ffi/foreign-fn macro, so aliases resolve).
           (and (form-sym? head) (= "jolt.ffi" (form-sym-ns head))

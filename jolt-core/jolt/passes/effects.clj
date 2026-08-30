@@ -48,7 +48,9 @@
    #{:jolt.effect/park
      :jolt.effect/native-block
      :jolt.effect/user-dispatch
-     :jolt.effect/schedule}
+     :jolt.effect/schedule
+     :jolt.effect/checkpoint
+     :jolt.effect/nonlocal-control}
    :jolt.rule/no-native-block-under-logical-monitor
    #{:jolt.effect/native-block}})
 
@@ -157,6 +159,7 @@
    :transfers #{}
    :transfer-bodies []
    :aspect-sites (if-let [site-id (get node :aspect-site-id)] #{site-id} #{})
+   :checkpoint-sites #{}
    :opaque-calls []})
 
 (defn- merge-direct [a b]
@@ -166,11 +169,13 @@
    :transfer-bodies (into (get a :transfer-bodies [])
                           (get b :transfer-bodies []))
    :aspect-sites (into (get a :aspect-sites #{}) (get b :aspect-sites #{}))
+   :checkpoint-sites (into (get a :checkpoint-sites #{})
+                           (get b :checkpoint-sites #{}))
    :opaque-calls (into (get a :opaque-calls []) (get b :opaque-calls []))})
 
 (def empty-direct
   {:effects #{} :callees #{} :transfers #{} :transfer-bodies []
-   :aspect-sites #{} :opaque-calls []})
+   :aspect-sites #{} :checkpoint-sites #{} :opaque-calls []})
 
 (declare summarize-eval)
 
@@ -213,6 +218,30 @@
   ;; caller.  A foreign-fn binding still has the one concrete arity described by
   ;; the remaining signature entries.
   {:fixed (count (remove #(= "varargs" %) (get ffi-node :argtypes)))})
+
+(defn- checkpoint-effects [dispositions]
+  ;; The site table is authoritative for controller capability.  These effects
+  ;; make that capability visible to compiler analyses without pretending that
+  ;; installing a controller can strengthen a continue-only site later.
+  (cond-> #{:jolt.effect/checkpoint}
+    (or (contains? dispositions :yield)
+        (contains? dispositions :barrier))
+    (conj :jolt.effect/schedule)
+    (contains? dispositions :barrier)
+    (conj :jolt.effect/park)
+    (or (contains? dispositions :fault)
+        (contains? dispositions :cancel))
+    (conj :jolt.effect/nonlocal-control)))
+
+(defn- checkpoint-evidence [node]
+  {:effects (checkpoint-effects (get node :dispositions))
+   :callees #{}
+   :transfers #{}
+   :transfer-bodies []
+   :aspect-sites #{}
+   :checkpoint-sites #{{:id (get node :id)
+                        :dispositions (get node :dispositions)}}
+   :opaque-calls []})
 
 (defn- transfer-origin-fqn [node]
   (or (some-> node :inline-chain first first)
@@ -328,6 +357,9 @@
   (cond
     (= :fn (get node :op)) empty-direct
     (= :ffi-callable (get node :op)) empty-direct
+    ;; :checkpoint-decl deliberately falls through as an effect-free leaf.  It
+    ;; is the source declaration recorded in :plain, before profile lowering.
+    (= :checkpoint (get node :op)) (checkpoint-evidence node)
     (= :invoke (get node :op)) (summarize-invoke node)
     (= :host-call (get node :op))
     (merge-direct (summarize-children node) (opaque-call node :host-call))
@@ -610,6 +642,7 @@
   (when-let [d (declared-effect declarations call)]
     {:closure {:effects (get d :effects #{})
                :aspect-sites #{}
+               :checkpoint-sites #{}
                :unresolved #{}
                :unknown-witnesses #{}
                :unknown? (if (get d :unknown?) true false)}}))
@@ -620,6 +653,7 @@
 (defn- close-one [summaries declarations summary]
   (let [start {:effects (get summary :effects #{})
                :aspect-sites (get summary :aspect-sites #{})
+               :checkpoint-sites (get summary :checkpoint-sites #{})
                :transfers (get summary :transfers #{})
                :unresolved #{}
                :unknown-witnesses (set (get summary :opaque-calls))
@@ -633,6 +667,7 @@
               closure (cond target (get target :closure)
                             external (get external :closure)
                             :else {:effects #{} :aspect-sites #{}
+                                   :checkpoint-sites #{}
                                    :unresolved #{} :unknown-witnesses #{}
                                    :unknown? true})
               missing-witness (when (and (not target) (not external))
@@ -640,6 +675,8 @@
           (cond-> {:effects (into (get acc :effects) (get closure :effects #{}))
                    :aspect-sites (into (get acc :aspect-sites)
                                        (get closure :aspect-sites #{}))
+                   :checkpoint-sites (into (get acc :checkpoint-sites)
+                                           (get closure :checkpoint-sites #{}))
                    :transfers (into (get acc :transfers #{})
                                     (get closure :transfers #{}))
                    :unresolved (into (get acc :unresolved #{})
@@ -662,6 +699,8 @@
 (defn- closure-grows? [before after]
   (and (set-grows? (get before :effects #{}) (get after :effects #{}))
        (set-grows? (get before :aspect-sites #{}) (get after :aspect-sites #{}))
+       (set-grows? (get before :checkpoint-sites #{})
+                   (get after :checkpoint-sites #{}))
        (set-grows? (get before :transfers #{}) (get after :transfers #{}))
        (set-grows? (get before :unresolved #{}) (get after :unresolved #{}))
        (set-grows? (get before :unknown-witnesses #{})
@@ -673,6 +712,8 @@
                              (assoc m k (assoc summary :closure
                                                {:effects (get summary :effects #{})
                                                 :aspect-sites (get summary :aspect-sites #{})
+                                                :checkpoint-sites
+                                                (get summary :checkpoint-sites #{})
                                                 :transfers (get summary :transfers #{})
                                                 :unresolved #{}
                                                 :unknown-witnesses
@@ -743,6 +784,7 @@
                                       :callees (get s :callees)
                                       :transfers (get s :transfers)
                                       :aspect-sites (get s :aspect-sites)
+                                      :checkpoint-sites (get s :checkpoint-sites)
                                       :opaque-calls (get s :opaque-calls)}
                              :closure closure}))
                         (sort-by (fn [s] (pr-str (get s :subject))) (vals closed)))
@@ -823,6 +865,10 @@
                   sites-changed (and (= from :woven) (= to :optimized)
                                      (not= (get ac :aspect-sites)
                                            (get bc :aspect-sites)))
+                  checkpoints-changed
+                  (and (= from :woven) (= to :optimized)
+                       (not= (get ac :checkpoint-sites)
+                             (get bc :checkpoint-sites)))
                   missing-transfers
                   (if (= from :plain)
                     (remove (get bc :transfers #{}) (get ac :transfers #{}))
@@ -867,6 +913,11 @@
                                      :subject subject
                                      :before (get ac :aspect-sites)
                                      :after (get bc :aspect-sites)})
+                checkpoints-changed
+                (conj {:rule :jolt.rule/checkpoint-sites-preserved
+                       :subject subject
+                       :before (get ac :checkpoint-sites)
+                       :after (get bc :checkpoint-sites)})
                 new-unknown (conj {:rule :jolt.rule/optimization-adds-no-unknown
                                    :subject subject}))))
           (subject-coverage-findings from to a b)
@@ -897,6 +948,12 @@
 (defn- ordered-set [xs]
   (vec (sort-by pr-str xs)))
 
+(defn- canonical-checkpoint-sites [sites]
+  (mapv (fn [site]
+          {:id (get site :id)
+           :dispositions (ordered-set (get site :dispositions))})
+        (sort-by (comp str :id) sites)))
+
 (defn- canonical-summary [summary]
   (let [direct (get summary :direct)
         closure (get summary :closure)]
@@ -906,10 +963,14 @@
                                      (get direct :callees)))
               :transfers (vec (sort-by pr-str (get direct :transfers)))
               :aspect-sites (vec (sort (get direct :aspect-sites)))
+              :checkpoint-sites
+              (canonical-checkpoint-sites (get direct :checkpoint-sites))
               :opaque-calls (vec (sort-by pr-str (get direct :opaque-calls)))}
      :closure
      (cond-> {:effects (ordered-set (get closure :effects))
               :aspect-sites (vec (sort (get closure :aspect-sites)))
+              :checkpoint-sites
+              (canonical-checkpoint-sites (get closure :checkpoint-sites))
               :transfers (vec (sort-by pr-str (get closure :transfers)))
               :unknown? (if (get closure :unknown?) true false)}
        (seq (get closure :unresolved))

@@ -15,6 +15,7 @@
   Portable Clojure: kernel-tier fns + seed primitives only."
   (:require [jolt.host :refer [inline-enabled? inference-enabled? record-shapes protocol-methods stash-inline! var-redefined?]]
             [jolt.aspects :as aspects]
+            [jolt.checkpoints :as checkpoints]
             [jolt.passes.effects :as effects]
             [jolt.passes.fold :refer [const-fold]]
             [jolt.passes.numeric :as numeric]
@@ -196,14 +197,16 @@
   ;; they must be the same object, or the record fold + inline fixpoint silently
   ;; degrade. build/emit-image and the gates all publish then pass the same unit.
   (when ir-validate? (report-ir! "analyze" node))
-  ;; A cached whole-program root has already been woven.  Otherwise retain the
-  ;; raw source-visible checkpoint before weaving changes the tree shape.
-  (when-not (get node :aspect-woven)
+  ;; A cached whole-program root records its raw source form in the build driver
+  ;; before checkpoint lowering and aspect weaving.  This provenance is separate
+  ;; from :aspect-woven: a zero-aspect controlled build still cached lowered IR.
+  (when-not (get node :effect-plain-recorded)
     (record-effect-phase! unit :plain node ctx))
   ;; A build configures its compilation unit before forms reach this pipeline.
   ;; Weave resolved calls before inference, inlining, direct linking, and tree
   ;; shaking. Plain builds and runtime compilation have no selected aspects.
-  (let [node (aspects/weave unit node)
+  (let [node (checkpoints/lower unit node)
+        node (aspects/weave unit node)
         _ (record-effect-phase! unit :woven node ctx)]
   ;; stash an inline-eligible defn so later call sites can splice it (closed-world
   ;; optimization only). Done before optimizing, from the analyzed node.

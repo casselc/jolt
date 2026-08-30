@@ -2448,6 +2448,17 @@
 
 (defn emit* [node]
   (case (:op node)
+    :checkpoint-decl
+    (throw (ex-info "emit: unlowered checkpoint declaration"
+                    {:id (:id node) :dispositions (:dispositions node)}))
+    ;; Controlled output is structural in this slice: the Scheme runtime entry
+    ;; is intentionally unresolved until the controller half lands.
+    :checkpoint
+    (let [id (:id node)
+          disposition-names (map name (sort-by name (:dispositions node)))]
+      (str "(jolt-checkpoint! "
+           (chez-str-lit (str (namespace id) "/" (name id)))
+           " '(" (str/join " " disposition-names) "))"))
     :const (emit-const (:val node))
     :local (munge-name (:name node))
     ;; late-bound var: read the cell's current root at use time. A value-position

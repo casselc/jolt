@@ -372,6 +372,7 @@
         (cons "jolt.canonical-edn" "jolt-core/jolt/canonical_edn.clj")
         (cons "jolt.aspect-contracts" "jolt-core/jolt/aspect_contracts.clj")
         (cons "jolt.aspects" "jolt-core/jolt/aspects.clj")
+        (cons "jolt.checkpoints" "jolt-core/jolt/checkpoints.clj")
         (cons "jolt.analyzer" "jolt-core/jolt/analyzer.clj")
         (cons "jolt.backend-scheme" "jolt-core/jolt/backend_scheme.clj")
         (cons "jolt.passes.fold" "jolt-core/jolt/passes/fold.clj")

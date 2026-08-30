@@ -507,6 +507,7 @@
 (define jolt-aspect-configure!       (var-deref "jolt.aspects" "configure-unit!"))
 (define jolt-aspect-provider-ns      (var-deref "jolt.aspects" "provider-namespaces"))
 (define jolt-aspect-weave            (var-deref "jolt.aspects" "weave"))
+(define jolt-checkpoint-lower        (var-deref "jolt.checkpoints" "lower"))
 (define jolt-aspect-prepare-report!  (var-deref "jolt.aspects" "prepare-build-report!"))
 (define jolt-aspect-publish-report!  (var-deref "jolt.aspects" "publish-build-report!"))
 (define jolt-aspect-identity         (var-deref "jolt.aspects" "build-identity"))
@@ -577,8 +578,15 @@
                                        ;; inference. The marked root is cached
                                        ;; positionally; run-passes does not apply
                                        ;; it twice.
-                                       (n (jolt-aspect-weave (ei-unit) raw)))
-                                  (list actx raw n)))))
+                                       (lowered (jolt-checkpoint-lower (ei-unit) raw))
+                                       (n (jolt-aspect-weave (ei-unit) lowered))
+                                       ;; Do not overload :aspect-woven: with no
+                                       ;; aspects it is intentionally absent, but
+                                       ;; raw :plain evidence was still recorded.
+                                       (cached (jolt-assoc n
+                                                 (keyword #f "effect-plain-recorded")
+                                                 #t)))
+                                  (list actx raw cached)))))
                         (if analyzed
                             (let ((actx (car analyzed))
                                   (raw (cadr analyzed))

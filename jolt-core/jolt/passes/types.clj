@@ -130,6 +130,10 @@
    :aspects (atom [])
    :aspect-build-identity (atom "plain")
    :aspect-matches (atom {})
+   ;; Compiler-owned checkpoints are erased unless a compilation unit is
+   ;; explicitly selected for controlled structural output.
+   :checkpoint-profile (atom :plain)
+   :checkpoint-profile-frozen? (atom false)
    ;; Compiler effect evidence is phase-scoped and compilation-unit local.  IR
    ;; annotations are not authoritative because optimizer rewrites may replace
    ;; nodes; jolt.passes.effects recomputes these registries at each checkpoint.
