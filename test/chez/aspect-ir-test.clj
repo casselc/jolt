@@ -178,6 +178,7 @@
     (is (= "__invoke-instrumentation-around" (get-in helper [:fn :name])))
     (is (= "plain" (:build-identity join-point)))
     (is (string? (:site-id join-point)))
+    (is (= (:site-id join-point) (get-in helper [:args 1 :aspect-site-id])))
     (is (= (get-in @(:aspect-matches unit) [:test/call 0])
            (:site join-point)))
     (is (= {:line 12 :column 7}

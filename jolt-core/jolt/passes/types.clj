@@ -129,7 +129,16 @@
    ;; from leaking aspects into a later plain build.
    :aspects (atom [])
    :aspect-build-identity (atom "plain")
-   :aspect-matches (atom {})})
+   :aspect-matches (atom {})
+   ;; Compiler effect evidence is phase-scoped and compilation-unit local.  IR
+   ;; annotations are not authoritative because optimizer rewrites may replace
+   ;; nodes; jolt.passes.effects recomputes these registries at each checkpoint.
+   :effect-phase-roots (atom {:plain {} :woven {} :optimized {}})
+   :effect-analysis-context (atom nil)
+   :effect-source-ids (atom {})
+   :effect-declarations (atom {})
+   :effect-reports (atom {})
+   :effect-findings (atom [])})
 
 ;; build a per-run env: a snapshot of the installed config plus this run's flags and
 ;; fresh accumulator/guard cells. escapes/user-sigs reference the unit's sweep-level
