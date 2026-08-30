@@ -165,7 +165,7 @@ CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirect
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
+  inline inline-body effects regions dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams futurehost \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions regexcache gosm asynctimer interruptnest taggedmethods threadsafety atomicnumeric
@@ -698,6 +698,11 @@ wp:
 # exercise the hooks compiled into jolt.passes.
 effects:
 	@bin/jolt test/chez/effect-summary-ir-test.clj
+
+# Logical monitor regions are a separate contextual analysis over the shared
+# effect graph. Parks are legal; known carrier-blocking native calls are not.
+regions:
+	@bin/jolt test/chez/region-ir-test.clj
 
 # Protocol-call devirtualization: a monomorphic call resolves its impl by the
 # inferred record tag (find-protocol-method) instead of routing through the

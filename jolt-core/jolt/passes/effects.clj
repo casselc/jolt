@@ -242,10 +242,14 @@
     (merge-direct (summarize-children node) (opaque-call node :host-new))
     :else (summarize-children node)))
 
-(defn- as-summary [direct subject closed-world?]
-  (assoc direct
-         :subject subject
-         :closed-world? (if closed-world? true false)))
+(defn- as-summary
+  ([direct subject closed-world?]
+   (as-summary direct subject closed-world? nil))
+  ([direct subject closed-world? analysis-node]
+   (cond-> (assoc direct
+                  :subject subject
+                  :closed-world? (if closed-world? true false))
+     analysis-node (assoc :analysis-node analysis-node))))
 
 (defn- definition-evaluation [node]
   ;; Def evaluation includes initializer construction/execution and evaluated
@@ -279,7 +283,8 @@
                         (initializer-subject identity-node source-id) true)]
            (map (fn [arity]
                   (as-summary (summarize-eval (get arity :body))
-                              (subject identity-node arity source-id) closed-world?))
+                              (subject identity-node arity source-id) closed-world?
+                              (get arity :body)))
                 (get-in node [:init :arities])))
 
      (and (= :def (get node :op)) (= :ffi-fn (get-in node [:init :op])))
@@ -307,7 +312,7 @@
 
      :else
      [(as-summary (summarize-eval node)
-                  (top-level-subject identity-node source-id) true)])))
+                  (top-level-subject identity-node source-id) true node)])))
 
 (defn record-phase!
   "Record node's direct summaries at phase. Repeated identical observation is
@@ -528,14 +533,41 @@
                           {:subjects (count roots)}))
           :else (recur (inc i) next))))))
 
+(defn closed-phase-summaries
+  "Return the authoritative, non-canonical closed summaries for phase, keyed by
+  subject. Compiler analyses may consume internal analysis nodes from this map;
+  build evidence continues to use finalize-phase!'s source-neutral schema."
+  [unit phase]
+  (when-not (contains? phases phase)
+    (throw (ex-info "unknown Jolt effect-analysis phase" {:phase phase})))
+  (close-fixpoint (get @(:effect-phase-roots unit) phase {})
+                  @(:effect-declarations unit)))
+
+(defn expression-closure-from
+  "Close node's immediate evaluation behavior against already-closed summaries
+  and external declarations. Contextual nanopasses use this form so one phase
+  fixpoint can serve every expression they inspect."
+  [summaries declarations node]
+  (let [direct (assoc (summarize-eval node) :closed-world? true)]
+    (close-one summaries declarations direct)))
+
+(defn expression-closure
+  "Close the immediate evaluation behavior of node against phase's unit call
+  graph and external declarations. This is the shared substrate for contextual
+  analyses such as logical lock regions; it preserves the effect pass's aspect
+  helper and opaque-call semantics instead of re-deriving them."
+  [unit phase node]
+  (expression-closure-from (closed-phase-summaries unit phase)
+                           @(:effect-declarations unit)
+                           node))
+
 (defn finalize-phase!
   "Compute and retain a deterministic closure report for phase. Missing direct
   callees and opaque calls remain unknown; declarations are the only escape."
   [unit phase]
   (when-not (contains? phases phase)
     (throw (ex-info "unknown Jolt effect-analysis phase" {:phase phase})))
-  (let [roots (get @(:effect-phase-roots unit) phase {})
-        closed (close-fixpoint roots @(:effect-declarations unit))
+  (let [closed (closed-phase-summaries unit phase)
         summaries (mapv (fn [s]
                           (let [closure (get s :closure)]
                             {:subject (get s :subject)

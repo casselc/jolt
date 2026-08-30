@@ -513,6 +513,8 @@
 (define jolt-effect-record-phase!    (var-deref "jolt.passes" "record-effect-phase!"))
 (define jolt-effect-prepare-report!  (var-deref "jolt.passes.effects" "prepare-build-report!"))
 (define jolt-effect-publish-report!  (var-deref "jolt.passes.effects" "publish-build-report!"))
+(define jolt-region-prepare-report!  (var-deref "jolt.passes.regions" "prepare-build-report!"))
+(define jolt-region-publish-report!  (var-deref "jolt.passes.regions" "publish-build-report!"))
 
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
@@ -1526,6 +1528,11 @@
              ;; only after the artifact succeeds.
              (effect-report (jolt-effect-prepare-report! (ei-unit)))
              (effect-report-path (string-append out-path ".build/effects.edn"))
+             ;; Region evidence consumes the same closed call/effect graph but
+             ;; owns a distinct schema and policy. Bare monitor halves remain
+             ;; explicit limitations until a CFG pass can pair them soundly.
+             (region-report (jolt-region-prepare-report! (ei-unit)))
+             (region-report-path (string-append out-path ".build/regions.edn"))
              (builddir (string-append out-path ".build"))
              (flat-ss  (string-append builddir "/flat.ss"))
              (flat-so  (string-append builddir "/flat.so"))
@@ -1732,7 +1739,8 @@
         ;; previous complete report or this complete report, never a partial one.
         (unless (jolt-nil? aspect-config)
           (jolt-aspect-publish-report! aspect-config aspect-report))
-        (jolt-effect-publish-report! effect-report-path effect-report)))))))
+        (jolt-effect-publish-report! effect-report-path effect-report)
+        (jolt-region-publish-report! region-report-path region-report)))))))
 
 ;; --- self-contained link (in-process compile + append the boot to the stub) ---
 ;; compile-file runs against the DEFAULT interaction environment, so the boot's

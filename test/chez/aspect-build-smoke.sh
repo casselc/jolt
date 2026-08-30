@@ -68,7 +68,9 @@ run_build() {
   (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" $extra_env \
     "$jolt" build -m app.core -o "target/$mode/app" "$@")
   effect_report="$tmp/target/$mode/app.build/effects.edn"
+  region_report="$tmp/target/$mode/app.build/regions.edn"
   test -s "$effect_report"
+  test -s "$region_report"
   grep -q ':analysis "jolt.effects/build-v1"' "$effect_report"
   grep -q ':phase :plain' "$effect_report"
   grep -q ':phase :woven' "$effect_report"
@@ -80,6 +82,9 @@ run_build() {
   grep -q ':summaries \[{' "$effect_report"
   grep -q ':verification {:analysis "jolt.effects/verification-v1" :findings \[\]' \
     "$effect_report"
+  grep -q ':analysis "jolt.regions/build-v1"' "$region_report"
+  grep -q ':verification {:analysis "jolt.regions/verification-v1" :findings \[\]' \
+    "$region_report"
   # Subject counts alone can be vacuous if every real operation collapses to
   # unknown.  Require the typed blocking FFI binding to survive every phase as
   # a precise, positive semantic effect.
