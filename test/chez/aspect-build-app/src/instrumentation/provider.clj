@@ -1,4 +1,9 @@
-(ns instrumentation.provider)
+(ns instrumentation.provider
+  ;; This lazy stdlib dependency is deliberately loaded while the compiler
+  ;; resolves the aspect provider, before build-binary loads the application.
+  ;; The standalone target must still emit it rather than confusing compiler
+  ;; process state with namespaces preloaded by the target runtime.
+  (:require [clojure.set :as set]))
 
 (def aspect-provider
   {:schema 1
@@ -29,6 +34,8 @@
            [(:build-identity join-point) site-id site])))
 
 (defn around [join-point evaluated-args proceed]
+  (when-not (= #{:provider} (set/union #{:provider} #{}))
+    (throw (ex-info "lazy provider dependency was not available" {})))
   (assert-runtime-site! join-point)
   (println (str "advice-before " (:id join-point)))
   (println (str "advice-args " (pr-str evaluated-args)))
