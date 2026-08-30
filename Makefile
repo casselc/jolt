@@ -669,11 +669,27 @@ threadsafety:
 taggedmethods:
 	@bin/jolt run test/chez/tagged-method-registration-test.clj
 
-# AtomicInteger/AtomicLong delta conversion must finish before their counted
-# state-transition mutex is entered; also pins typed failures and concurrent
-# leaf read/add/write serialization (jolt-aspect-packs#35).
+# AtomicInteger/AtomicLong conversion must finish before their counted
+# state-transition mutex is entered; typed values wrap at their Java primitive
+# widths.  The deterministic and pseudo-random transcript is also compared to
+# reference JVM Clojure when it is installed (#35, #36).
 atomicnumeric:
 	@$(CHEZ) --script test/chez/atomic-numeric-test.ss
+	@if command -v clojure >/dev/null 2>&1; then \
+	  mkdir -p target/atomic-numeric; \
+	  clojure -Srepro -M test/chez/atomic-numeric-oracle.clj \
+	    > target/atomic-numeric/jvm.edn; \
+	  ./bin/jolt test/chez/atomic-numeric-oracle.clj \
+	    > target/atomic-numeric/jolt.edn; \
+	  if cmp -s target/atomic-numeric/jvm.edn target/atomic-numeric/jolt.edn; then \
+	    echo "Atomic numeric JVM oracle: OK"; \
+	  else \
+	    diff -u target/atomic-numeric/jvm.edn target/atomic-numeric/jolt.edn; \
+	    exit 1; \
+	  fi; \
+	else \
+	  echo "Atomic numeric JVM oracle: SKIP (clojure not installed)"; \
+	fi
 
 # Native record field reads: a keyword lookup on a statically-known record reads
 # the field by its declared slot (jrec-field-at) instead of jolt-get; the value
