@@ -484,6 +484,69 @@ eturn)) (loop (- n 1)))
   (syntax-rules ()
     ((_ m e1 e2 ...) (jwm-call m (lambda () e1 e2 ...)))))
 
+;; Chez's logical mutex is fiber-owned so a parked fiber never monopolizes its
+;; carrier. Gambit currently has no Jolt fiber carriers, but shared host files
+;; (notably extensions.ss) still require the same reentrant, dynamically scoped
+;; mutex API. Model ownership by SRFI-18 thread and keep the depth explicitly;
+;; the backing mutex supplies blocking, wakeup, and publication semantics.
+(define logical-mutex-i-mutex 0)
+(define logical-mutex-i-owner 1)
+(define logical-mutex-i-depth 2)
+
+(define (jolt-logical-mutex-new)
+  (vector (make-mutex) #f 0))
+
+(define (jolt-logical-mutex-try-enter/owner! lm me)
+  (cond
+    ((eq? (vector-ref lm logical-mutex-i-owner) me)
+     (vector-set! lm logical-mutex-i-depth
+                  (+ 1 (vector-ref lm logical-mutex-i-depth)))
+     #t)
+    ((mutex-lock! (vector-ref lm logical-mutex-i-mutex) 0)
+     (vector-set! lm logical-mutex-i-owner me)
+     (vector-set! lm logical-mutex-i-depth 1)
+     #t)
+    (else #f)))
+
+(define (jolt-logical-mutex-try-enter! lm)
+  (jolt-logical-mutex-try-enter/owner! lm (current-thread)))
+
+(define (jolt-logical-mutex-enter! lm)
+  (let ((me (current-thread)))
+    (if (eq? (vector-ref lm logical-mutex-i-owner) me)
+        (vector-set! lm logical-mutex-i-depth
+                     (+ 1 (vector-ref lm logical-mutex-i-depth)))
+        (begin
+          (mutex-lock! (vector-ref lm logical-mutex-i-mutex))
+          (vector-set! lm logical-mutex-i-owner me)
+          (vector-set! lm logical-mutex-i-depth 1)))))
+
+(define (jolt-logical-mutex-exit! lm)
+  (unless (eq? (vector-ref lm logical-mutex-i-owner) (current-thread))
+    (error 'jolt-logical-mutex-exit! "not logical mutex owner"))
+  (let ((depth (- (vector-ref lm logical-mutex-i-depth) 1)))
+    (vector-set! lm logical-mutex-i-depth depth)
+    (when (= depth 0)
+      (vector-set! lm logical-mutex-i-owner #f)
+      (mutex-unlock! (vector-ref lm logical-mutex-i-mutex)))))
+
+(define (jolt-logical-mutex-held-by-self? lm)
+  (eq? (vector-ref lm logical-mutex-i-owner) (current-thread)))
+
+(define (jolt-logical-mutex-hold-count lm)
+  (if (jolt-logical-mutex-held-by-self? lm)
+      (vector-ref lm logical-mutex-i-depth)
+      0))
+
+(define (jolt-logical-mutex-locked? lm)
+  (and (vector-ref lm logical-mutex-i-owner) #t))
+
+(define (jolt-with-logical-mutex lm thunk)
+  (dynamic-wind
+    (lambda () (jolt-logical-mutex-enter! lm))
+    thunk
+    (lambda () (jolt-logical-mutex-exit! lm))))
+
 (define (make-thread-parameter init) (make-parameter init))
 
 ;; SRFI-18 spellings: make-condition-variable / condition-variable-signal! /
