@@ -102,14 +102,14 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate extensions \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  narrow numeric numwp oparity pic protoret printperf regexcache remint sbperf sci selfhost shakelocal \
   traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit javasiocreate niodirectories niotemp unitconcurrent unitcontext \
   taggedmethods threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
-        atomicnumeric coreasyncproof lazyonceproof logicalmutexproof extensions \
+        atomicnumeric coreasyncproof lazyonceproof logicalmutexproof extensions regexcache \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
@@ -168,7 +168,7 @@ CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirect
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions gosm asynctimer interruptnest taggedmethods threadsafety atomicnumeric
+  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions regexcache gosm asynctimer interruptnest taggedmethods threadsafety atomicnumeric
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -338,6 +338,13 @@ logicalmutexproof:
 extensions:
 	@$(CHEZ) --script test/chez/logical-mutex-test.ss
 	@$(CHEZ) --script test/chez/extensions-concurrency-test.ss
+
+# Regex parsing and engine construction are whole semantic cache operations.
+# Their procedure-valued dispatch may park or reenter, so this gate pins logical
+# ownership, same-key winner preservation, concurrent exclusion, and the
+# counted-lock mutation that the migration retires.
+regexcache:
+	@$(CHEZ) --script test/chez/regex-cache-concurrency-test.ss
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own
 # deadline however far away the pending ones are, and the thread is forked once.

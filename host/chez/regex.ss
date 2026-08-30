@@ -60,7 +60,12 @@
                               (or (walk (vector-ref x i)) (lp (+ i 1))))))
           (else #f))))
 (define regex-cache (make-hashtable string-hash string=?))
-(define regex-cache-mutex (make-mutex 'regex-cache))
+;; Parsing and engine construction are not leaf transitions.  The translator
+;; and irregex compiler contain procedure-valued dispatch, which can reach user
+;; code; that code may park a fiber or reenter regex construction.  Serialize
+;; the complete cache operation with execution-context ownership, while the
+;; logical mutex's private counted lock remains confined to bookkeeping.
+(define regex-cache-mutex (jolt-logical-mutex-new))
 
 ;; A pattern the engine will not compile is a PatternSyntaxException, the same
 ;; catchable thing the JVM throws — not the raw internal error, which surfaced as
@@ -87,23 +92,25 @@
                          (if (< i (vector-length x)) (lp (+ i 1) (walk (vector-ref x i) n)) n)))
           (else n))))
 
-;; Two cache stages per source, both under the mutex (dynamic-wind, not a bare
-;; release: a pattern that fails used to leave the mutex held, blocking every
-;; later compile). 'parsed holds the validated SRE; 'irx the built engine.
+;; Two monotonic cache stages per source, both under the logical mutex. 'parsed
+;; holds the validated SRE; 'irx the built engine.  Recheck after preparing a
+;; value: same-owner reentry may already have published this source, and the
+;; nested winner must not be replaced by a stale outer computation.
 (define (regex-parsed-entry source)
-  (jolt-lock! regex-cache-mutex)
-  (dynamic-wind
-    (lambda () #f)
+  (jolt-with-logical-mutex regex-cache-mutex
     (lambda ()
       (or (hashtable-ref regex-cache source #f)
-          (let ((entry (guard (e (#t (regex-syntax-error source e)))
-                         (let-values (((sre opts) (java-pattern->sre source)))
-                           (vector 'parsed sre opts
-                                   (or (sre-has-backref? sre)
-                                       (> (sre-count-submatches sre) 0)))))))
-            (hashtable-set! regex-cache source entry)
-            entry)))
-    (lambda () (jolt-unlock! regex-cache-mutex))))
+          (let ((prepared
+                  (let-values (((sre opts)
+                                (guard (e (#t (regex-syntax-error source e)))
+                                  (java-pattern->sre source))))
+                    (vector 'parsed sre opts
+                            (or (sre-has-backref? sre)
+                                (> (sre-count-submatches sre) 0))))))
+            (or (hashtable-ref regex-cache source #f)
+                (begin
+                  (hashtable-set! regex-cache source prepared)
+                  prepared)))))))
 
 ;; the built engine for source, compiling once on first demand. A capturing
 ;; pattern gets irregex's BACKTRACKING matcher (see the engine note above); a
@@ -113,22 +120,24 @@
   (let ((entry (regex-parsed-entry source)))
     (if (eq? (vector-ref entry 0) 'irx)
         (vector-ref entry 1)
-        (begin
-          (jolt-lock! regex-cache-mutex)
-          (dynamic-wind
-            (lambda () #f)
-            (lambda ()
-              (let ((entry (hashtable-ref regex-cache source #f)))
-                (if (and entry (eq? (vector-ref entry 0) 'irx))
-                    (vector-ref entry 1)
-                    (let* ((sre (vector-ref entry 1)) (opts (vector-ref entry 2))
-                           (irx (guard (e (#t (regex-syntax-error source e)))
-                                  (if (vector-ref entry 3)
-                                      (apply irregex sre 'backtrack opts)
-                                      (apply irregex sre opts)))))
-                      (hashtable-set! regex-cache source (vector 'irx irx))
-                      irx))))
-            (lambda () (jolt-unlock! regex-cache-mutex)))))))
+        (jolt-with-logical-mutex regex-cache-mutex
+          (lambda ()
+            (let ((current (hashtable-ref regex-cache source #f)))
+              (if (and current (eq? (vector-ref current 0) 'irx))
+                  (vector-ref current 1)
+                  (let* ((sre (vector-ref current 1))
+                         (opts (vector-ref current 2))
+                         (prepared
+                           (guard (e (#t (regex-syntax-error source e)))
+                             (if (vector-ref current 3)
+                                 (apply irregex sre 'backtrack opts)
+                                 (apply irregex sre opts))))
+                         (winner (hashtable-ref regex-cache source #f)))
+                    (if (and winner (eq? (vector-ref winner 0) 'irx))
+                        (vector-ref winner 1)
+                        (begin
+                          (hashtable-set! regex-cache source (vector 'irx prepared))
+                          prepared))))))))))
 
 (define (jolt-regex source)
   (regex-parsed-entry source)        ; eager syntax validation, no engine build
