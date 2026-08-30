@@ -67,6 +67,34 @@ check_override() {
 check_override CHEZ
 check_override CHEZSCHEME
 
+# Mirror chezscheme.mk's system-toolchain eligibility: Jolt needs both the full
+# and petite executables from one directory, at the pinned version. Merely
+# finding a `chez` command is not enough; in that case Makes correctly provisions
+# the complete pair and this smoke must not claim PATH selection was expected.
+find_system_chez() {
+  local name exe dir petite version identity
+  for name in chez chezscheme scheme; do
+    exe="$(command -v "$name" 2>/dev/null)" || continue
+    [ -x "$exe" ] || continue
+    dir="$(cd "$(dirname "$exe")" && pwd -P)" || continue
+    exe="$dir/$(basename "$exe")"
+    version="$("$exe" --version 2>/dev/null | tr -d '\r')"
+    [ "$version" = "10.4.1" ] || continue
+    identity="$(printf '(display (scheme-version)) (newline)\n' |
+      "$exe" -q 2>/dev/null | tr -d '\r')"
+    [ "$identity" = "Chez Scheme Version 10.4.1" ] || continue
+    petite="$dir/petite"
+    [ -x "$petite" ] || continue
+    version="$("$petite" --version 2>/dev/null | tr -d '\r')"
+    [ "$version" = "10.4.1" ] || continue
+    identity="$(printf '(display (scheme-version)) (newline)\n' |
+      "$petite" -q 2>/dev/null | tr -d '\r')"
+    [ "$identity" = "Petite Chez Scheme Version 10.4.1" ] || continue
+    printf '%s\n' "$exe"
+    return 0
+  done
+}
+
 # A Chez already on PATH is used as-is, with NOTHING set. This is the case the
 # release matrix depends on: every non-Linux row builds its own Chez and exposes
 # it as `chez` on PATH, then runs a bare `make jolt-release`. If that fell through
@@ -80,7 +108,7 @@ check_path_discovery() {
   # so this checkout can no longer answer the question. Legitimate state, and it
   # does not arise on a release runner: those are fresh clones that put their own
   # chez on PATH before any make runs, so nothing provisions.
-  if [ -d "$root/.cache/local" ]; then
+  if [ -x "$root/.cache/local/chezscheme-10.4.1/bin/scheme" ]; then
     echo "makefile smoke: SKIP PATH discovery (.cache/local is provisioned here)"
     return 0
   fi
@@ -88,9 +116,9 @@ check_path_discovery() {
   # Deliberately the REAL chez, not the stub used above: provisioning validates
   # what it finds on PATH and rejects a stub, so a fake would fall through and
   # provision — testing the opposite of the intended case.
-  real="$(command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null || true)"
+  real="$(find_system_chez || true)"
   if [ -z "$real" ]; then
-    echo "makefile smoke: SKIP PATH discovery (no Chez on PATH)"
+    echo "makefile smoke: SKIP PATH discovery (no complete Chez/Petite pair on PATH)"
     return 0
   fi
 
