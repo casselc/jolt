@@ -988,10 +988,13 @@
           (bld-walk-files root "" '()))))
     (bld-strs embed-dirs)))
 
-;; Namespaces already defined at boot in the BUILD process (snapshotted before
-;; step 1 loads anything) — the driver image's set. bld-require-closure still
-;; skips these as preloaded; only LAZY stdlib (not in the image) is emitted.
-(define bld-boot-loaded #f)
+;; Namespaces already defined when the build driver itself is loaded — the
+;; driver image's set.  Capture this here, before jolt.main resolves an aspect
+;; provider: provider validation may require lazy stdlib namespaces that the
+;; target application runtime does not preload.  Snapshotting later, inside
+;; build-binary, mistook those compiler-only loads for target-runtime state and
+;; emitted calls to unbound vars in the standalone binary.
+(define bld-boot-loaded (hashtable-copy loaded-ns #f))
 
 ;; --- the build --------------------------------------------------------------
 ;; entry-ns: the app's main namespace (a string). out-path: the binary to write.
@@ -1244,8 +1247,6 @@
          (aspect-providers (if (jolt-nil? aspect-config)
                                '()
                                (bld-strs (jolt-aspect-provider-ns aspect-config)))))
-     (set! bld-boot-loaded
-       (hashtable-copy loaded-ns #f))
      (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")
