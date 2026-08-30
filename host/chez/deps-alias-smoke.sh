@@ -331,10 +331,11 @@ esac
 # remain ordinary Maven dependencies. This needs the network for the two small
 # artifacts, so it is skipped when they cannot be fetched rather than failing.
 SPECPROJ="$root/test/chez/deps-alias/specproj"
-out="$(JOLT_PWD="$SPECPROJ" JOLT_QUIET=1 \
-      JOLT_MAVEN_REPOSITORY="$tmp/spec-m2" \
-      "$JOLT" run -m specapp 2>&1 | tail -1)"
-case "$out" in
+spec_out="$(JOLT_PWD="$SPECPROJ" JOLT_QUIET=1 \
+           JOLT_MAVEN_REPOSITORY="$tmp/spec-m2" \
+           "$JOLT" run -m specapp 2>&1)"
+out="$(printf '%s\n' "$spec_out" | tail -1)"
+case "$spec_out" in
   "spec: true false") check "explicit spec.alpha dependency loads" ok ok ;;
   *"Could not locate"*|*"could not"*|*"no such"*)
     echo "  SKIP: spec.alpha transitivity (spec artifacts not fetchable offline)" >&2 ;;
