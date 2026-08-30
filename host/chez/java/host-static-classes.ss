@@ -782,6 +782,33 @@
 (define (atomic-box self) (vector-ref (jhost-state self) 0))
 (define (atomic-lock self) (vector-ref (jhost-state self) 1))
 (define (atomic-kind self) (vector-ref (jhost-state self) 2))
+;; Convert a modeled Java method argument at the signature boundary.  Numeric
+;; atomic cells never contain an unbounded jolt integer: the constructor and
+;; every value-taking method accept exactly the primitive width named by their
+;; Java signature.  Keep this outside the mutex because conversion may throw.
+(define (atomic-convert self value)
+  (case (atomic-kind self)
+    ((integer) (jolt-int-cast value))
+    ((long) (jolt-long-cast value))
+    (else value)))
+;; Java's primitive atomic arithmetic is two's-complement arithmetic.  Its
+;; result wraps even though the corresponding checked Clojure cast at a method
+;; boundary rejects an out-of-range argument.  VALUE is an exact sum/difference
+;; of already-converted cell data, so this helper is leaf-only and cannot throw
+;; while the counted mutex is held.
+(define (atomic-wrap self value)
+  (case (atomic-kind self)
+    ((integer)
+     (let ((u (bitwise-and value #xFFFFFFFF)))
+       (if (>= u #x80000000) (- u #x100000000) u)))
+    ((long) (jolt-wrap64 value))
+    (else value)))
+(define (atomic-numeric-transition! self delta return-old?)
+  (jolt-with-mutex (atomic-lock self)
+    (let* ((old (unbox (atomic-box self)))
+           (next (atomic-wrap self (+ old delta))))
+      (set-box! (atomic-box self) next)
+      (if return-old? old next))))
 ;; CAS under the atomic's mutex. updateAndGet/getAndUpdate run the user fn
 ;; LOCK-FREE in a CAS retry loop (JVM parity), so the fn may re-enter the same
 ;; atomic; a mutex-held fn deadlocked on the non-recursive Chez mutex there
@@ -791,14 +818,8 @@
   ;; the modeled conversion before taking the counted lock as well: casts may
   ;; throw, while the critical section below must remain leaf-only.
   (let* ((kind (atomic-kind self))
-         (expected (case kind
-                     ((integer) (jolt-int-cast o))
-                     ((long) (jolt-long-cast o))
-                     (else o)))
-         (next (case kind
-                 ((integer) (jolt-int-cast n))
-                 ((long) (jolt-long-cast n))
-                 (else n))))
+         (expected (atomic-convert self o))
+         (next (atomic-convert self n)))
     (jolt-with-mutex (atomic-lock self)
       (let ((current (unbox (atomic-box self))))
         (if (case kind
@@ -808,8 +829,8 @@
               (else #f))
             (begin (set-box! (atomic-box self) next) #t) #f)))))
 (let ((ref-ctor (lambda args (make-atomic (if (pair? args) (car args) jolt-nil) 'reference)))
-      (int-ctor (lambda args (make-atomic (if (pair? args) (car args) 0) 'integer)))
-      (long-ctor (lambda args (make-atomic (if (pair? args) (car args) 0) 'long)))
+      (int-ctor (lambda args (make-atomic (jolt-int-cast (if (pair? args) (car args) 0)) 'integer)))
+      (long-ctor (lambda args (make-atomic (jolt-long-cast (if (pair? args) (car args) 0)) 'long)))
       (bool-ctor (lambda args (make-atomic (if (pair? args) (car args) #f) 'boolean))))
   (for-each (lambda (n) (register-class-ctor! n ref-ctor))
             '("AtomicReference" "java.util.concurrent.atomic.AtomicReference"))
@@ -821,42 +842,45 @@
             '("AtomicBoolean" "java.util.concurrent.atomic.AtomicBoolean")))
 (register-host-methods! "atomic"
   (list (cons "get" (lambda (self) (unbox (atomic-box self))))
-        (cons "set" (lambda (self v) (set-box! (atomic-box self) v) jolt-nil))
-        (cons "getAndSet" (lambda (self v) (jolt-with-mutex (atomic-lock self)
-                            (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) v) o))))
+        ;; #37 separately tracks serialization of set against locked RMWs.  The
+        ;; typed repair here preserves the current write boundary while ensuring
+        ;; conversion finishes before any state is changed.
+        (cons "set" (lambda (self v)
+          (let ((next (atomic-convert self v)))
+            (set-box! (atomic-box self) next)
+            jolt-nil)))
+        (cons "getAndSet" (lambda (self v)
+          (let ((next (atomic-convert self v)))
+            (jolt-with-mutex (atomic-lock self)
+              (let ((o (unbox (atomic-box self))))
+                (set-box! (atomic-box self) next)
+                o)))))
         (cons "compareAndSet" (lambda (self o n) (atomic-cas! self o n)))
         (cons "updateAndGet" (lambda (self f)
           (let loop ((v (unbox (atomic-box self))))
-            (let ((n (jolt-invoke f v)))
+            (let ((n (atomic-convert self (jolt-invoke f v))))
               (if (atomic-cas! self v n) n (loop (unbox (atomic-box self))))))))
         (cons "getAndUpdate" (lambda (self f)
           (let loop ((v (unbox (atomic-box self))))
-            (let ((n (jolt-invoke f v)))
+            (let ((n (atomic-convert self (jolt-invoke f v))))
               (if (atomic-cas! self v n) v (loop (unbox (atomic-box self))))))))
-        (cons "incrementAndGet" (lambda (self) (jolt-with-mutex (atomic-lock self)
-                                  (let ((n (+ (unbox (atomic-box self)) 1))) (set-box! (atomic-box self) n) n))))
-        (cons "decrementAndGet" (lambda (self) (jolt-with-mutex (atomic-lock self)
-                                  (let ((n (- (unbox (atomic-box self)) 1))) (set-box! (atomic-box self) n) n))))
-        (cons "getAndIncrement" (lambda (self) (jolt-with-mutex (atomic-lock self)
-                                  (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (+ o 1)) o))))
-        (cons "getAndDecrement" (lambda (self) (jolt-with-mutex (atomic-lock self)
-                                  (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (- o 1)) o))))
+        (cons "incrementAndGet" (lambda (self) (atomic-numeric-transition! self 1 #f)))
+        (cons "decrementAndGet" (lambda (self) (atomic-numeric-transition! self -1 #f)))
+        (cons "getAndIncrement" (lambda (self) (atomic-numeric-transition! self 1 #t)))
+        (cons "getAndDecrement" (lambda (self) (atomic-numeric-transition! self -1 #t)))
         ;; Java converts the caller's delta before entering the atomic state
         ;; transition. Keep conversion (and its typed failure construction)
         ;; outside the counted mutex; the region itself is only read/add/write.
         (cons "addAndGet" (lambda (self d)
-          (let ((delta (jnum->exact d)))
-            (jolt-with-mutex (atomic-lock self)
-              (let ((n (+ (unbox (atomic-box self)) delta)))
-                (set-box! (atomic-box self) n)
-                n)))))
+          (let ((delta (atomic-convert self d)))
+            (atomic-numeric-transition! self delta #f))))
         (cons "getAndAdd" (lambda (self d)
-          (let ((delta (jnum->exact d)))
-            (jolt-with-mutex (atomic-lock self)
-              (let ((o (unbox (atomic-box self))))
-                (set-box! (atomic-box self) (+ o delta))
-                o)))))
-        (cons "intValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
+          (let ((delta (atomic-convert self d)))
+            (atomic-numeric-transition! self delta #t))))
+        (cons "intValue" (lambda (self)
+          (if (eq? (atomic-kind self) 'long)
+              (jolt-unchecked-int (unbox (atomic-box self)))
+              (jnum->exact (unbox (atomic-box self))))))
         (cons "longValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
         (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self)))))))
 ;; java.util.Collections/synchronizedMap|List|Set wrap a collection for
