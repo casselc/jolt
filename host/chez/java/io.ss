@@ -430,16 +430,113 @@
          (bytevector-s64-set! tb 8 sec (native-endianness))
          (= (c-utime64 p tb) 0)))
       (else #f))))
-;; mkdir -p: create p and any missing parents. Returns #t if p ends up a dir.
+;; ---- atomic filesystem creation -------------------------------------------
+;; java.io.File loads before java.nio.file.Files, so the native creation seam
+;; lives here and both shims consume it. Callers receive created, exists,
+;; missing-parent, or error together with the captured native error code. The
+;; syscall result, never a pre-create existence probe, authorizes collision
+;; handling.
+(define fs-c-mkdir
+  (if (eq? (sa-os-family) 'windows)
+      (jolt-foreign-proc-native-error-safe __errno "_mkdir" '(string) 'int)
+      (jolt-foreign-proc-native-error-safe __errno "mkdir" '(string int) 'int)))
+(define fs-c-open-exclusive
+  (if (eq? (sa-os-family) 'windows)
+      (jolt-foreign-proc-native-error-safe __errno "_open" '(string int int) 'int)
+      (jolt-foreign-proc-native-error-safe
+        __errno ((__varargs_after 2)) "open" '(string int int) 'int)))
+(define fs-c-close
+  (if (eq? (sa-os-family) 'windows)
+      (jolt-foreign-proc-safe "_close" '(int) 'int)
+      (jolt-foreign-proc-safe "close" '(int) 'int)))
+(define (fs-native-exists-error-for-convention? convention code)
+  (if (eq? convention '__get_last_error)
+      (or (= code 80) (= code 183))
+      (= code 17)))
+(define (fs-native-exists-error? code)
+  (fs-native-exists-error-for-convention? '__errno code))
+(define (fs-native-missing-error? code) (= code 2))
+(define (fs-create-status native-error)
+  (cond ((fs-native-exists-error? native-error) 'exists)
+        ((fs-native-missing-error? native-error) 'missing-parent)
+        (else 'error)))
+(define (fs-mkdir-native-result fp mode)
+  (unless fs-c-mkdir
+    (throw-jvm (quote UnsupportedOperationException)
+               "atomic directory creation with native-error capture is unavailable"))
+  (if (eq? (sa-os-family) 'windows)
+      (fs-c-mkdir fp)
+      (fs-c-mkdir fp mode)))
+(define (fs-create-directory-result fp mode)
+  (let-values (((result native-error) (fs-mkdir-native-result fp mode)))
+    (if (= result 0)
+        (values 'created native-error)
+        (values (fs-create-status native-error) native-error))))
+(define (fs-open-exclusive-flags-for-family family)
+  (case family
+    ((macos) (bitwise-ior #x1 #x200 #x800))
+    ((windows) (bitwise-ior #x1 #x100 #x400 #x8000))
+    (else (bitwise-ior #x1 #x40 #x80))))
+(define fs-open-exclusive-flags
+  (fs-open-exclusive-flags-for-family (sa-os-family)))
+(define (fs-native-create-mode mode)
+  (if (eq? (sa-os-family) 'windows)
+      (bitwise-ior (if (> (bitwise-and mode #o444) 0) #x100 0)
+                   (if (> (bitwise-and mode #o222) 0) #x80 0))
+      mode))
+(define (fs-open-exclusive-native-result fp mode)
+  (unless (and fs-c-open-exclusive fs-c-close)
+    (throw-jvm (quote UnsupportedOperationException)
+               "atomic exclusive file creation with native-error capture is unavailable"))
+  (fs-c-open-exclusive fp fs-open-exclusive-flags (fs-native-create-mode mode)))
+(define (fs-create-file-exclusive-result fp mode)
+  (let-values (((fd native-error) (fs-open-exclusive-native-result fp mode)))
+    (if (>= fd 0)
+        (begin
+          ;; Retry-after-EINTR is unsafe if another thread has reused the fd.
+          (fs-c-close fd)
+          (values 'created native-error))
+        (values (fs-create-status native-error) native-error))))
+(define (fs-parent-path p)
+  (let loop ((i (- (string-length p) 1)))
+    (cond ((< i 0) "")
+          ((path-separator-char? (string-ref p i))
+           (cond ((= i 0) "/")
+                 ((and (eq? (sa-os-family) 'windows) (= i 2)
+                       (char=? (string-ref p 1) #\:))
+                  (substring p 0 3))
+                 (else (substring p 0 i))))
+          (else (loop (- i 1))))))
+
+;; Recursively create a directory chain from mkdir results alone. The returned
+;; status describes the target: created, exists (as a directory), or error.
+(define (fs-create-directories-result p mode)
+  (define (attempt path)
+    (if (or (= 0 (string-length path)) (string=? path "/"))
+        (values 'exists 17)
+        (let-values (((status native-error)
+                      (fs-create-directory-result path mode)))
+          (case status
+            ((created) (values 'created native-error))
+            ((exists)
+             (if (file-directory? path)
+                 (values 'exists native-error)
+                 (values 'error native-error)))
+            ((missing-parent)
+             (let ((parent (fs-parent-path path)))
+               (if (string=? parent path)
+                   (values 'error native-error)
+                   (let-values (((parent-status parent-error) (attempt parent)))
+                     (if (memq parent-status '(created exists))
+                         (attempt path)
+                         (values 'error parent-error))))))
+            (else (values 'error native-error))))))
+  (attempt p))
+
+;; File.mkdirs returns true only when it creates the target directory.
 (define (mkdirs! p)
-  (unless (or (= 0 (string-length p)) (file-exists? p))
-    (let loop ((i (- (string-length p) 1)))
-      (cond ((<= i 0) #f)
-            ((char=? (string-ref p i) #\/)
-             (let ((parent (substring p 0 i))) (unless (file-exists? parent) (mkdirs! parent))))
-            (else (loop (- i 1)))))
-    (guard (e (#t #f)) (mkdir p)))
-  (and (file-exists? p) (file-directory? p)))
+  (let-values (((status native-error) (fs-create-directories-result p #o777)))
+    (eq? status 'created)))
 ;; delete a file or an (empty) directory; #t on success.
 (define (delete-path! p)
   (guard (e (#t #f))
@@ -656,7 +753,10 @@
       ((string=? name "canExecute")     (list (file-accessible? fp access-x-ok)))
       ((string=? name "isHidden")       (list (let ((nm (path-last-segment p)))
                                                 (if (and (> (string-length nm) 0) (char=? (string-ref nm 0) #\.)) #t #f))))
-      ((string=? name "mkdir")          (list (guard (e (#t #f)) (and (not (file-exists? fp)) (begin (mkdir fp) #t)))))
+      ((string=? name "mkdir")
+       (list (let-values (((status native-error)
+                           (fs-create-directory-result fp #o777)))
+               (eq? status 'created))))
       ((string=? name "mkdirs")         (list (if (mkdirs! fp) #t #f)))
       ((string=? name "delete")         (list (if (delete-path! fp) #t #f)))
       ((string=? name "deleteOnExit")   (list jolt-nil))
@@ -664,8 +764,16 @@
        (list (guard (e (#t #f))
                (set-file-mtime-millis! fp (exact (floor (car args)))))))
       ((string=? name "createNewFile")
-       (list (if (file-exists? fp) #f
-                 (guard (e (#t #f)) (close-port (open-output-file fp 'truncate)) #t))))
+       (list (let-values (((status native-error)
+                           (fs-create-file-exclusive-result fp #o666)))
+               (case status
+                 ((created) #t)
+                 ((exists) #f)
+                 (else
+                  (throw-jvm (quote java.io.IOException)
+                             (string-append "unable to create " fp
+                                            " (native error "
+                                            (number->string native-error) ")")))))))
       ((string=? name "renameTo")
        (list (let ((dst (jfile-fs (car args)))) (guard (e (#t #f)) (rename-file fp dst) #t))))
       ((string=? name "getParentFile")
@@ -1480,6 +1588,9 @@
         (jolt-make-file a))))
 ;; File statics: the platform separators plus createTempFile / listRoots.
 (define temp-file-counter 0)
+(define (file-temp-path dir prefix suffix n)
+  (string-append dir "/" prefix (number->string (now-millis)) "-"
+                 (number->string n) suffix))
 (define (file-create-temp prefix suffix . dir)
   ;; the JVM rejects a prefix under three characters, so a caller that works here
   ;; works there too
@@ -1495,10 +1606,18 @@
               (set! temp-file-counter (+ temp-file-counter 1))
               temp-file-counter)))
     (let loop ((n n))
-      (let ((p (string-append d "/" (jolt-str-render-one prefix)
-                              (number->string (now-millis)) "-" (number->string n) sfx)))
-        (if (file-exists? p) (loop (+ n 1))
-            (begin (close-port (open-output-file p 'truncate)) (make-jfile p))))))))
+      (let* ((full (file-temp-path d (jolt-str-render-one prefix) sfx n))
+             (p (project-relative full)))
+        (let-values (((status native-error)
+                      (fs-create-file-exclusive-result p #o600)))
+          (case status
+            ((created) (make-jfile full))
+            ((exists) (loop (+ n 1)))
+            (else
+             (throw-jvm (quote java.io.IOException)
+                        (string-append "unable to create temporary file " p
+                                       " (native error "
+                                       (number->string native-error) ")"))))))))))
 (let ((statics (list (cons "separator" "/")
                      (cons "separatorChar" #\/)
                      (cons "pathSeparator" ":")

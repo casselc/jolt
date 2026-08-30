@@ -658,6 +658,8 @@
 ;; that step never ran, which never happens in a real build. A 1-byte placeholder
 ;; keeps the symbol non-degenerate when every candidate was skipped (empty index,
 ;; so nothing derefs it).
+;; check-then-create-allow: optional-blob-read-before-unrelated-output
+;; This probes an optional input. jb-main-c below is an unrelated output name.
 (when (and jb-stdlib-blob-path (file-exists? jb-stdlib-blob-path))
   (jb-c-array jb-stdlib-blob-path (string-append jb-build "/stdlib_fasls_data.h") "jolt_stdlib_fasls"))
 
