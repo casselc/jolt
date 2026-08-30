@@ -646,6 +646,9 @@ cts: testbin
 # copies back on normal, exceptional, and nonlocal exit. Same-array read-only
 # nesting is allowed; writable nesting and retired-continuation re-entry are
 # rejected. A callback that parks is cleaned up and rejected on resume.
+# The native-error gate includes a deterministic negative control: a scalar
+# call followed by a slot-clobber and delayed read observes the wrong code,
+# while atomic capture preserves the original result/error pair.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"

@@ -20,15 +20,25 @@
 (def ^:private AF-INET 2)
 (def ^:private SOCK-STREAM 1)
 
+;; connect/accept/recv/send all feed a failure into an errno-driven decision
+;; (EINPROGRESS/EAGAIN/EINTR vs. a real error) further down, so each is bound
+;; with {:capture-native-error true}: the pair [native-result error-code]
+;; comes back atomically from the SAME foreign-call return path the syscall
+;; used, closing the ambient-errno race a separate poller/errno read after the
+;; call is exposed to (jolt-9wt2 / #51 #52) — see host/chez/errno-check.sh.
 (ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
-(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int :blocking)
+(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-bind        "bind"        [:int :pointer :int] :int)
 (ffi/defcfn c-listen      "listen"      [:int :int] :int)
-(ffi/defcfn c-accept      "accept"      [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn c-accept      "accept"      [:int :pointer :pointer] :int
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-getsockname "getsockname" [:int :pointer :pointer] :int)
-(ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t :blocking)
-(ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t :blocking)
+(ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t
+  {:blocking true :capture-native-error true})
+(ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-close       "close"       [:int] :int)
 ;; ioctl is (int fd, unsigned long request, ...) — the :varargs marker puts the
 ;; third argument where the callee's va_list reads it. Binding it fixed-arity
@@ -162,6 +172,13 @@
     (str (or (jolt.host/ref-get h :address) (jolt.host/ref-get h :host)))
     (str h)))
 
+(defn- connect-result-kind [r e]
+  (cond
+    (zero? r) :connected
+    (poller/eintr? e) :retry
+    (poller/connect-pending? e) :wait
+    :else :error))
+
 (defn- connect-fd! [fd host port]
   ;; resolve + connect; frees the sockaddr either way. Returns the resolved ip.
   ;; The fd is O_NONBLOCK (fibers R8), so connect answers EINPROGRESS; wait for
@@ -170,19 +187,19 @@
   (let [ip (resolve-host host)
         sa (make-sockaddr ip port)
         r  (loop []
-             (let [r (c-connect fd sa 16)
-                   ;; captured before anything else runs, for the reason io-call
-                   ;; spells out above
-                   e (if (zero? r) 0 (poller/errno))]
-               (cond
-                 (zero? r) 0
-                 (poller/connect-pending? e)
+             ;; c-connect captures [result error-code] atomically at the syscall
+             ;; return, so e is never read separately (and never stale).
+             (let [[r e] (c-connect fd sa 16)]
+               (case (connect-result-kind r e)
+                 :connected 0
+                 :retry (recur)
+                 :wait
                  (do (poller/wait-ready fd :write)
                      (let [e (poller/so-error fd)]
                        (if (zero? e)
                          0
                          (if (poller/connect-pending? e) (recur) -1))))
-                 :else r)))]
+                 :error r)))]
     (ffi/free sa)
     (when (neg? r)
       (throw (java.io.IOException. (str "connect failed: " host ":" port))))
@@ -292,16 +309,17 @@
   ;; there is not — and retries; EINTR retries immediately; anything else is
   ;; the syscall's real answer, returned as-is (callers read errno semantics).
   (loop []
-    (let [r (op)
-          ;; ERRNO IS READ HERE AND NOWHERE ELSE. It survives only until the next
-          ;; thing that can set it, and that includes reading it: the accessor is
-          ;; a foreign call, and an allocation on the way can trip a collection
-          ;; whose mmap leaves ENOMEM behind. Asking twice -- once for EINTR, once
-          ;; for EAGAIN -- read recv's EAGAIN as ENOMEM often enough to matter: the
-          ;; retry was missed, the -1 fell through, and a socket read answered EOF
-          ;; on a live connection. The (neg? r) guard is a fixnum compare, which
-          ;; allocates nothing and so cannot collect.
-          e (if (neg? r) (poller/errno) 0)]
+    (let [;; op wraps a {:capture-native-error true} binding (c-recv/c-send/
+          ;; c-accept), so [r e] comes back as ONE atomic pair from the foreign-
+          ;; call return path -- e is never read separately. It used to be: call
+          ;; the syscall, then make a SECOND foreign call to poller's errno
+          ;; reader to read the ambient errno slot. That second call is itself
+          ;; a foreign call and can allocate on the way, and asking twice --
+          ;; once for EINTR, once for EAGAIN -- read recv's EAGAIN as ENOMEM
+          ;; often enough to matter under load: the retry was missed, the -1
+          ;; fell through, and a socket read answered EOF on a live connection
+          ;; (jolt-9wt2 / #51 #52; see host/chez/errno-check.sh).
+          [r e] (op)]
       (cond
         (and (neg? r) (poller/eintr? e)) (recur)
         (and (neg? r) (poller/eagain? e)) (do (poller/wait-ready fd wait-kind) (recur))

@@ -35,21 +35,20 @@
 ;; the kernel, where SIGCHLD=SIG_IGN can hold it indefinitely, and a plain foreign
 ;; call also keeps the thread "active" for the stop-the-world collector while it
 ;; waits. Polling sidesteps both.
-(define proc-waitpid (jolt-foreign-proc-safe "waitpid" '(int void* int) 'int))
+;; waitpid needs errno to tell a call that was merely interrupted (EINTR —
+;; retry) from one that can never succeed (ECHILD — the child is gone,
+;; retrying is an infinite loop). Bound with atomic native-error capture (the
+;; Scheme-level analogue of jolt.ffi's {:capture-native-error true}, jolt-9wt2
+;; / #51 #52): the pair comes back from the SAME foreign-call return path the
+;; syscall used, so a later host call can never overwrite it first. It used to
+;; be a separate __error/__errno_location foreign call after waitpid returned
+;; — see host/chez/errno-check.sh for why that shape is unsafe.
+(define proc-waitpid (jolt-foreign-proc-native-error-safe __errno "waitpid" '(int void* int) 'int))
 (define proc-kill    (jolt-foreign-proc-safe "kill"    '(int int)       'int))
 ;; libc signal(2). Named apart from the proc-signal recorder further down — this
 ;; file is load-ed at top level, so a second define of the same name silently wins
 ;; and the SIGCHLD restore below would reach the recorder instead.
 (define proc-libc-signal (jolt-foreign-proc-safe "signal" '(int void*) 'void*))
-;; errno, to tell a waitpid that was merely interrupted (EINTR — retry) from one
-;; that can never succeed (ECHILD — the child is gone, retrying is an infinite
-;; loop). Both spellings of the location accessor: Darwin/BSD, then glibc/musl.
-(define proc-errno-loc
-  (or (jolt-foreign-proc-safe "__error" '() 'void*)
-      (jolt-foreign-proc-safe "__errno_location" '() 'void*)))
-(define (proc-errno)
-  (if proc-errno-loc (guard (e (#t 0)) (sa-foreign-ref 'int (proc-errno-loc) 0)) 0))
-
 (define proc-WNOHANG 1)        ; macOS + Linux
 (define proc-SIGTERM 15)
 (define proc-SIGKILL 9)
@@ -87,17 +86,20 @@
 (define proc-F-SETFL 4)
 (define proc-O-NONBLOCK (if (eq? (sa-os-family) 'macos) #x4 #x800))
 
-;; Nothing here happens without a working fcntl and a readable errno: a pipe
-;; set non-blocking whose EAGAIN cannot be recognised reads as EOF instead
-;; (the (else 0) branch in proc-fd-input-port), which is worse than a blocking
-;; pipe. So the whole R8 extension is gated on the three bindings, and the
-;; degradation when one is missing is "no parking" — the pipes stay blocking
-;; and EAGAIN never arrives. Deliberately NOT folded into
+;; Nothing here happens without a working fcntl: a pipe set non-blocking whose
+;; EAGAIN cannot be recognised reads as EOF instead (the (else 0) branch in
+;; proc-fd-input-port), which is worse than a blocking pipe. errno itself needs
+;; no separate capability check any more — proc-c-read/proc-c-write capture it
+;; atomically via Chez's built-in __errno convention (jolt-foreign-proc-native-
+;; error-safe below), not a dlsym'd accessor that could fail to resolve. So the
+;; R8 extension is gated on the two fcntl bindings, and the degradation when
+;; one is missing is "no parking" — the pipes stay blocking and EAGAIN never
+;; arrives. Deliberately NOT folded into
 ;; proc-spawn-fd-ok?: that gate decides posix_spawn vs Chez's fork, and the
 ;; fork path leaves SIGINT at SIG_IGN in the child (see the comment above
 ;; proc-spawn-fd-mutex). Correct child signal dispositions are not worth
 ;; trading for O_NONBLOCK.
-(define proc-nonblock-ok? (and proc-fcntl-get proc-fcntl-set proc-errno-loc #t))
+(define proc-nonblock-ok? (and proc-fcntl-get proc-fcntl-set #t))
 
 (define (proc-set-nonblocking! fd)
   (when proc-nonblock-ok?
@@ -218,11 +220,15 @@
   (if (not proc-waitpid)
       (values -1 #f proc-ECHILD)
       (let ((buf (sa-foreign-alloc 4)))
-        (let* ((rc (proc-waitpid pid buf (if nohang? proc-WNOHANG 0)))
-               (err (if (< rc 0) (proc-errno) 0))
-               (raw (sa-foreign-ref 'int buf 0)))
-          (sa-foreign-free buf)
-          (values rc (and (= rc pid) (proc-decode-status raw)) err)))))
+        ;; rc and native-err come back as ONE atomic pair from proc-waitpid's
+        ;; foreign-call return -- no separate errno read after the call.
+        (call-with-values
+          (lambda () (proc-waitpid pid buf (if nohang? proc-WNOHANG 0)))
+          (lambda (rc native-err)
+            (let ((err (if (< rc 0) native-err 0))
+                  (raw (sa-foreign-ref 'int buf 0)))
+              (sa-foreign-free buf)
+              (values rc (and (= rc pid) (proc-decode-status raw)) err)))))))
 
 ;; The status to report for a child that can no longer be waited on (ECHILD:
 ;; something else reaped it). If we signalled it, Unix convention gives the answer
@@ -487,8 +493,12 @@
 (define proc-fa-close   (jolt-foreign-proc-safe "posix_spawn_file_actions_addclose" '(void* int) 'int))
 (define proc-fa-destroy (jolt-foreign-proc-safe "posix_spawn_file_actions_destroy"  '(void*) 'int))
 (define proc-c-spawn (jolt-foreign-proc-safe "posix_spawn" '(void* string void* void* void* void*) 'int))
-(define proc-c-read  (jolt-foreign-proc-blocking "read"  '(int void* size_t) 'ssize_t))
-(define proc-c-write (jolt-foreign-proc-blocking "write" '(int void* size_t) 'ssize_t))
+;; Blocking AND atomic-capture: __collect_safe composes with __errno the same
+;; way jolt.ffi's {:blocking true :capture-native-error true} does (see
+;; test/chez/ffi-native-error-test.ss's blocking+capture cases). The pipe pump
+;; loops below need EINTR/EAGAIN off the SAME return, not a later errno call.
+(define proc-c-read  (jolt-foreign-proc-native-error-safe __errno (__collect_safe) "read"  '(int void* size_t) 'ssize_t))
+(define proc-c-write (jolt-foreign-proc-native-error-safe __errno (__collect_safe) "write" '(int void* size_t) 'ssize_t))
 
 ;; What posix_spawn-with-pipes needs, and nothing more. The R8 fiber-parking
 ;; extension's own bindings (fcntl, errno) are gated separately by
@@ -606,24 +616,28 @@
             ;; closed fd's EBADF, reached without the syscall.
             (if (unbox closed?)
                 0
-                (let ((got (proc-c-read fd buf want)))
-                  (cond
-                    ((> got 0)
-                     (let loop ((i 0))
-                       (when (< i got)
-                         (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
-                         (loop (+ i 1))))
-                     got)
-                    ((= got 0) 0)
-                    ((= (proc-errno) proc-EINTR) (retry))
-                    ((= (proc-errno) proc-EAGAIN)
-                     (if (proc-poller-wait-ready fd (jolt-keyword "read"))
-                         (retry)
-                         (begin
-                           (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
-                             (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
-                           (retry))))
-                    (else 0)))))))
+                ;; got and err are one atomic pair off proc-c-read's own
+                ;; foreign-call return -- never a separate errno call after.
+                (call-with-values
+                  (lambda () (proc-c-read fd buf want))
+                  (lambda (got err)
+                    (cond
+                      ((> got 0)
+                       (let loop ((i 0))
+                         (when (< i got)
+                           (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
+                           (loop (+ i 1))))
+                       got)
+                      ((= got 0) 0)
+                      ((= err proc-EINTR) (retry))
+                      ((= err proc-EAGAIN)
+                       (if (proc-poller-wait-ready fd (jolt-keyword "read"))
+                           (retry)
+                           (begin
+                             (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                               (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                             (retry))))
+                      (else 0))))))))
       #f #f
       ;; closed? goes up BEFORE the free/close/forget below, so it is already #t
       ;; on the far side of the carrier-mutex handoff every woken fiber crosses.
@@ -649,18 +663,22 @@
             ;; the port under this write is not.
             (if (unbox closed?)
                 (error 'process "write to closed pipe" fd)
-                (let ((wrote (proc-c-write fd buf want)))
-                  (cond
-                    ((>= wrote 0) wrote)
-                    ((= (proc-errno) proc-EINTR) (retry))
-                    ((= (proc-errno) proc-EAGAIN)
-                     (if (proc-poller-wait-ready fd (jolt-keyword "write"))
-                         (retry)
-                         (begin
-                           (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
-                             (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
-                           (retry))))
-                    (else (error 'process "write to child failed" fd))))))))
+                ;; wrote and err are one atomic pair off proc-c-write's own
+                ;; foreign-call return -- never a separate errno call after.
+                (call-with-values
+                  (lambda () (proc-c-write fd buf want))
+                  (lambda (wrote err)
+                    (cond
+                      ((>= wrote 0) wrote)
+                      ((= err proc-EINTR) (retry))
+                      ((= err proc-EAGAIN)
+                       (if (proc-poller-wait-ready fd (jolt-keyword "write"))
+                           (retry)
+                           (begin
+                             (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                               (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                             (retry))))
+                      (else (error 'process "write to child failed" fd)))))))))
       #f #f
       ;; closed? goes up BEFORE the free/close/forget below, so it is already #t
       ;; on the far side of the carrier-mutex handoff every woken fiber crosses.

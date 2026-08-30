@@ -19,6 +19,29 @@
        (when-not (= g# w#)
          (swap! failures conj (str ~label ": want " (pr-str w#) " got " (pr-str g#)))))))
 
+;; The real loopback cases below exercise success and EINPROGRESS. Pin the
+;; branch table directly as well: connect(2) may return EINTR before it ever
+;; reaches the readiness path, and that result must retry rather than become a
+;; terminal IOException.
+(def connect-result-kind
+  (deref (ns-resolve 'jolt.socket 'connect-result-kind)))
+(def connect-interrupted
+  (deref (ns-resolve 'jolt.io-poller 'EINTR)))
+(def connect-in-progress
+  (deref (ns-resolve 'jolt.io-poller 'EINPROGRESS)))
+(def connect-already
+  (deref (ns-resolve 'jolt.io-poller 'EALREADY)))
+(check-eq "connect classifier accepts success"
+          (connect-result-kind 0 0) :connected)
+(check-eq "connect classifier retries EINTR"
+          (connect-result-kind -1 connect-interrupted) :retry)
+(check-eq "connect classifier waits for EINPROGRESS"
+          (connect-result-kind -1 connect-in-progress) :wait)
+(check-eq "connect classifier waits for EALREADY"
+          (connect-result-kind -1 connect-already) :wait)
+(check-eq "connect classifier rejects terminal errors"
+          (connect-result-kind -1 5) :error)
+
 ;; connect lands in the listen backlog, so single-threaded connect-then-accept
 ;; is safe; every helper closes what it opens.
 (defn with-pair [f]

@@ -220,8 +220,13 @@
 ;; must not mutate the already-returned pair. jolt_ne_clobber(7) sets the slot
 ;; to 7; the earlier (c-fail-err 42) pair must still read 42.
 (ev "(def c-clobber-scalar (jolt.ffi/__cfn \"jolt_ne_clobber\" [:int] :int))")
+(ev "(def c-read-ambient (jolt.ffi/__cfn \"jolt_ne_read_ambient\" [] :int))")
+(ok "negative control: delayed ambient read observes an intervening clobber"
+    (evb "(do (c-fail-scalar 41) (c-clobber-scalar 73) (= 73 (c-read-ambient)))"))
 (ok "captured pair survives a later slot-overwriting native call"
     (evb "(let [a (c-fail-err 42) _ (c-clobber-scalar 7)] (and (= (first a) -1) (= (second a) 42)))"))
+(ok "atomic pair preserves the failing code under the negative control's clobber"
+    (evb "(let [a (c-fail-err 41) _ (c-clobber-scalar 73)] (= [-1 41] a))"))
 
 ;; --- scalar preserved: omitted / empty / legacy :blocking / false -------------
 ;; Every non-capturing form must keep the existing scalar result. This is the

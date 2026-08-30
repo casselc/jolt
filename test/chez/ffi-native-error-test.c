@@ -29,11 +29,13 @@
 #include <windows.h>
 #define JOLT_NE_EXPORT   __declspec(dllexport)
 #define JOLT_NE_SET(code) SetLastError((DWORD)(code))
+#define JOLT_NE_GET() ((int)GetLastError())
 #else
 #include <errno.h>
 #include <time.h>
 #define JOLT_NE_EXPORT   __attribute__((visibility("default")))
 #define JOLT_NE_SET(code) (errno = (int)(code))
+#define JOLT_NE_GET() errno
 #endif
 
 /* Failure path: write `code` to the error slot, return a failure sentinel.
@@ -57,6 +59,14 @@ JOLT_NE_EXPORT int jolt_ne_ok(void) {
 JOLT_NE_EXPORT int jolt_ne_clobber(int code) {
   JOLT_NE_SET(code);
   return 0;
+}
+
+/* Read the same platform-default slot the helper writes. This exists only for
+ * the deterministic negative control: scalar fail -> clobber -> delayed read
+ * must observe the clobber, proving that a later accessor cannot recover the
+ * failing call's error. */
+JOLT_NE_EXPORT int jolt_ne_read_ambient(void) {
+  return JOLT_NE_GET();
 }
 
 /* Variadic path: return the first variadic int while publishing `code` in the
