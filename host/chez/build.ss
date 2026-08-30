@@ -488,6 +488,9 @@
 (define jolt-aspect-prepare-report!  (var-deref "jolt.aspects" "prepare-build-report!"))
 (define jolt-aspect-publish-report!  (var-deref "jolt.aspects" "publish-build-report!"))
 (define jolt-aspect-identity         (var-deref "jolt.aspects" "build-identity"))
+(define jolt-effect-record-phase!    (var-deref "jolt.passes" "record-effect-phase!"))
+(define jolt-effect-prepare-report!  (var-deref "jolt.passes.effects" "prepare-build-report!"))
+(define jolt-effect-publish-report!  (var-deref "jolt.passes.effects" "publish-build-report!"))
 
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
@@ -532,19 +535,37 @@
                       ;; whole-program type info (per-form emit still errors
                       ;; the build if it's truly broken) — but say so, or an
                       ;; optimized build silently loses inference for the ns.
-                      (guard (e (#t (display (string-append
-                                              "jolt build: note: whole-program inference skipped a form in "
-                                              (car nf) "\n")
-                                             (current-error-port))
-                                    (set! per-ns (cons #f per-ns))))
-                        (let* ((raw (ei-timed "wp: analyze"
-                                      (lambda () (jolt-ce-analyze (make-analyze-ctx (car nf)) f))))
-                               ;; Weaving belongs before whole-program inference.
-                               ;; The marked root is cached positionally; run-passes
-                               ;; sees :aspect-woven and does not apply it twice.
-                               (n (jolt-aspect-weave (ei-unit) raw)))
-                          (set! nodes (cons n nodes))
-                          (set! per-ns (cons n per-ns)))))))
+                      (let ((analyzed
+                              ;; Only analysis/weaving retain the historical
+                              ;; fallback to the per-form emit path. Effect
+                              ;; collection is a correctness gate and must stay
+                              ;; OUTSIDE this guard: swallowing its exception as
+                              ;; "no WP info" would silently disable the pass.
+                              (guard (e (#t (display (string-append
+                                                      "jolt build: note: whole-program inference skipped a form in "
+                                                      (car nf) "\n")
+                                                     (current-error-port))
+                                            #f))
+                                (let* ((actx (make-analyze-ctx (car nf)))
+                                       (raw (ei-timed "wp: analyze"
+                                              (lambda () (jolt-ce-analyze actx f))))
+                                       ;; Weaving belongs before whole-program
+                                       ;; inference. The marked root is cached
+                                       ;; positionally; run-passes does not apply
+                                       ;; it twice.
+                                       (n (jolt-aspect-weave (ei-unit) raw)))
+                                  (list actx raw n)))))
+                        (if analyzed
+                            (let ((actx (car analyzed))
+                                  (raw (cadr analyzed))
+                                  (n (caddr analyzed)))
+                              (jolt-effect-record-phase!
+                                (ei-unit) (keyword #f "plain") raw actx)
+                              (jolt-effect-record-phase!
+                                (ei-unit) (keyword #f "woven") n actx)
+                              (set! nodes (cons n nodes))
+                              (set! per-ns (cons n per-ns)))
+                            (set! per-ns (cons #f per-ns)))))))
               (ei-timed "wp: parse" (lambda () (ei-read-all src))))))
             jolt-ns-load-vars-pop!)
           (set! ns-nodes (cons (cons (car nf) (reverse per-ns)) ns-nodes))))
@@ -1477,6 +1498,12 @@
              (aspect-report (if (jolt-nil? aspect-config)
                                 jolt-nil
                                 (jolt-aspect-prepare-report! (ei-unit) aspect-config)))
+             ;; The optimized checkpoint is recorded by each run-passes call
+             ;; above. Effect evidence has its own schema and sidecar; preparing
+             ;; it validates all three phases before native compilation. Publish
+             ;; only after the artifact succeeds.
+             (effect-report (jolt-effect-prepare-report! (ei-unit)))
+             (effect-report-path (string-append out-path ".build/effects.edn"))
              (builddir (string-append out-path ".build"))
              (flat-ss  (string-append builddir "/flat.ss"))
              (flat-so  (string-append builddir "/flat.so"))
@@ -1682,7 +1709,8 @@
         ;; written successfully. `spit` itself is atomic, so readers observe the
         ;; previous complete report or this complete report, never a partial one.
         (unless (jolt-nil? aspect-config)
-          (jolt-aspect-publish-report! aspect-config aspect-report))))))))
+          (jolt-aspect-publish-report! aspect-config aspect-report))
+        (jolt-effect-publish-report! effect-report-path effect-report)))))))
 
 ;; --- self-contained link (in-process compile + append the boot to the stub) ---
 ;; compile-file runs against the DEFAULT interaction environment, so the boot's

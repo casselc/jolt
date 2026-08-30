@@ -15,6 +15,7 @@
   Portable Clojure: kernel-tier fns + seed primitives only."
   (:require [jolt.host :refer [inline-enabled? inference-enabled? record-shapes protocol-methods stash-inline! var-redefined?]]
             [jolt.aspects :as aspects]
+            [jolt.passes.effects :as effects]
             [jolt.passes.fold :refer [const-fold]]
             [jolt.passes.numeric :as numeric]
             [jolt.passes.inline :refer [inline-node flatten-lets scalar-replace direct-call-edges]]
@@ -111,6 +112,31 @@
         (assoc node :init (assoc f :arities [(assoc a :nhints (vec (concat (:nhints a) add)))])))
       node)))
 
+(defn record-effect-phase!
+  "Record a compiler effect checkpoint with the same closed-world decision used
+  by direct linking and inlining. Public because the whole-program build driver
+  owns the raw IR before run-passes sees its cached woven replacement."
+  ([unit phase node ctx]
+   (record-effect-phase! unit phase node ctx node))
+  ([unit phase node ctx identity-node]
+   (effects/configure-analysis-context!
+     unit {:inline-enabled? (if (inline-enabled? ctx) true false)
+           :inference-enabled? (if (inference-enabled? ctx) true false)})
+   (effects/record-phase!
+     unit phase node
+     (and (not (jolt.ir/closed-world-opt-out? (:meta identity-node)))
+          (not (and (= :def (:op identity-node))
+                    (var-redefined? ctx (:ns identity-node)
+                                    (:name identity-node)))))
+     identity-node)))
+
+(defn verify-effect-phases!
+  "Finalize raw, woven, and optimized summaries and hard-fail a compiler phase
+  transition that loses source behavior, introduces optimization-only behavior,
+  or drops selected aspect-site evidence."
+  [unit]
+  (effects/verify-phases! unit))
+
 ;; Dev IR validation. When JOLT_IR_VALIDATE is set, run-passes checks the node
 ;; entering and the node leaving the pass pipeline against the jolt.ir schema and
 ;; prints any problem (unknown :op, missing required key) — a fast way to catch a
@@ -170,10 +196,15 @@
   ;; they must be the same object, or the record fold + inline fixpoint silently
   ;; degrade. build/emit-image and the gates all publish then pass the same unit.
   (when ir-validate? (report-ir! "analyze" node))
+  ;; A cached whole-program root has already been woven.  Otherwise retain the
+  ;; raw source-visible checkpoint before weaving changes the tree shape.
+  (when-not (get node :aspect-woven)
+    (record-effect-phase! unit :plain node ctx))
   ;; A build configures its compilation unit before forms reach this pipeline.
   ;; Weave resolved calls before inference, inlining, direct linking, and tree
   ;; shaking. Plain builds and runtime compilation have no selected aspects.
-  (let [node (aspects/weave unit node)]
+  (let [node (aspects/weave unit node)
+        _ (record-effect-phase! unit :woven node ctx)]
   ;; stash an inline-eligible defn so later call sites can splice it (closed-world
   ;; optimization only). Done before optimizing, from the analyzed node.
   ;;
@@ -228,4 +259,8 @@
       :else
       (const-fold node)))]
     (when ir-validate? (report-ir! "passes" result))
+    ;; Optimizers may replace a bare top-level root with one of its children.
+    ;; Analyze the final tree's behavior under the woven root's stable source
+    ;; identity instead of requiring arbitrary root annotations to survive.
+    (record-effect-phase! unit :optimized result ctx node)
     result))))

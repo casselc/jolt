@@ -61,7 +61,7 @@ export LIBRARY_PATH := $(subst $(space),:,$(strip $(CHEZSCHEME-LIB-DIRS)))$(if $
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric futurehost buildlibsmoke buildsmoke \
+  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric effects futurehost buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
@@ -130,7 +130,7 @@ CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirect
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck irvalidate devbootsmoke \
+  inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams futurehost \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions regexcache gosm asynctimer interruptnest taggedmethods threadsafety atomicnumeric
@@ -657,6 +657,12 @@ infer:
 # bare-index field reads + protocol devirtualization build on.
 wp:
 	@$(CHEZ) --script host/chez/run-wp.ss
+
+# Compilation-unit effect summaries over raw, woven, and optimized Jolt IR.
+# The focused suite runs portably on the checked-in seed; whole-build gates also
+# exercise the hooks compiled into jolt.passes.
+effects:
+	@bin/jolt test/chez/effect-summary-ir-test.clj
 
 # Protocol-call devirtualization: a monomorphic call resolves its impl by the
 # inferred record tag (find-protocol-method) instead of routing through the
