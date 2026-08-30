@@ -105,7 +105,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit niodirectories niotemp unitconcurrent unitcontext \
-  threadsafety values wp ci
+  taggedmethods threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
@@ -113,7 +113,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
-        fibersresidue
+        fibersresidue taggedmethods
 
 default:: build
 
@@ -168,7 +168,7 @@ CI-GATES := submodules values corpus unit unitconcurrent niodirectories niotemp 
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
+  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest taggedmethods threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -680,6 +680,12 @@ gosm:
 # the same bug class through a core.async pipeline sweep.
 threadsafety:
 	@$(CHEZ) --script test/chez/thread-safety-test.ss
+
+# Tagged-table method registration: arbitrary tag rendering runs outside the
+# counted registry lock, may park/reenter safely, and concurrent same-tag batches
+# still publish into one inner method table without losing members.
+taggedmethods:
+	@bin/jolt run test/chez/tagged-method-registration-test.clj
 
 # Native record field reads: a keyword lookup on a statically-known record reads
 # the field by its declared slot (jrec-field-at) instead of jolt-get; the value
