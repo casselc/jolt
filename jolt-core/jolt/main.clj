@@ -746,8 +746,6 @@
             aspect-config (aspects/resolve-build-config
                             (:aspects build) aspect-report
                             (:allow-control-aspects build))]
-        (when (and target library?)
-          (throw (ex-info "cross build (--target) does not support --library yet" {})))
         (when (and target (nil? target-pack))
           (throw (ex-info "--target needs a target pack: --target-pack DIR (or $JOLT_TARGET_PACK)" {:target target})))
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
