@@ -2,13 +2,15 @@
 # park-lock-check.sh — wrapper for the park/lock discipline gate (POSIX sh).
 #
 # Runs host/chez/park-lock-check.ss under the build's Chez. The checker reads every
-# handwritten host .ss file as data, closes "can park" over the call graph from the
-# two switch points, and fails on a call to anything in that closure from inside a
-# jolt-with-mutex region — the shape that wedged a process three times (jolt-3a87,
-# jolt-dfuo, jolt-04ee). It also fails if a switch point stops calling
+# handwritten host .ss file as data, closes "can park" and "can dispatch generic
+# code" over the call graph, and checks both lexical and balanced manual counted
+# lock regions. It also fails if a switch point stops calling
 # jolt-locks-assert-none!, which is the runtime half of the same rule.
 #
 #   --regen   rewrite host/chez/park-lock-allowlist.txt from reality
+#   --self-test run the non-vacuous checker mutation controls
+# Generic dispatch findings are tracked separately in park-lock-known-debt.txt;
+# every row requires an exact chucklehead-dev/jolt-aspect-packs issue.
 #
 # Chez resolution mirrors host/chez/portability-check.sh: JOLT_CHEZ wins (the
 # Makefile hands down the interpreter it selected), then a PATH search.
