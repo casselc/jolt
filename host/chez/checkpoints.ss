@@ -21,8 +21,8 @@
   (nongenerative jolt-checkpoint-generation-v1))
 
 (define-record-type checkpoint-recorder
-  (fields actor mu hits (mutable trace-rev))
-  (nongenerative jolt-checkpoint-recorder-v1))
+  (fields actor mu hits (mutable trace-rev) (mutable sticky))
+  (nongenerative jolt-checkpoint-recorder-v2))
 
 (define-record-type checkpoint-binding
   (fields generation recorder)
@@ -39,6 +39,13 @@
 (define-record-type checkpoint-event
   (fields seq cut actor id hit action)
   (nongenerative jolt-checkpoint-event-v2))
+
+;; Commit returns one immutable decision that owns the already-published event.
+;; Dispatch is deliberately outside the recorder lock; :cancel retains that
+;; exact decision in its actor recorder until reset replaces the generation.
+(define-record-type checkpoint-decision
+  (fields action event generation)
+  (nongenerative jolt-checkpoint-decision-v1))
 
 (define (checkpoint-empty-config)
   (make-checkpoint-config (make-hashtable string-hash string=?)
@@ -183,9 +190,13 @@
 
 (define (checkpoint-action who action)
   (let ((name (checkpoint-name who action)))
-    (unless (string=? name "continue")
-      (checkpoint-bad who "only the continue checkpoint action is supported" action))
-    'continue))
+    (cond ((string=? name "continue") 'continue)
+          ((string=? name "yield") 'yield)
+          ((string=? name "fault") 'fault)
+          ((string=? name "cancel") 'cancel)
+          ;; Barrier/manifest/replay are deliberately a later ABI slice.
+          (else
+           (checkpoint-bad who "unsupported checkpoint action" action)))))
 
 (define (checkpoint-parse-plan plan)
   (unless (pmap? plan)
@@ -217,13 +228,15 @@
         (lambda (entry)
           (let* ((key (car entry))
                  (id (cadr key))
+                 (action (cdr entry))
                  (site (hashtable-ref sites id #f)))
             (unless site
               (checkpoint-bad 'checkpoint-install-plan!
                               "checkpoint plan names an unregistered site" id))
-            (unless (member "continue" site)
+            (unless (member (symbol->string action) site)
               (checkpoint-bad 'checkpoint-install-plan!
-                              "checkpoint site does not permit continue" id))))
+                              "checkpoint site does not permit selected action"
+                              id action))))
         entries)
       (let ((next (make-hashtable equal-hash equal?)))
         (for-each (lambda (entry) (hashtable-set! next (car entry) (cdr entry))) entries)
@@ -232,14 +245,14 @@
           (make-checkpoint-config sites next)))))
     jolt-nil))
 
-(define (checkpoint-mark-started! generation id)
+(define (checkpoint-mark-started! generation id . who)
   ;; Only the first reservation takes the controller. This serializes the
   ;; plan-freeze boundary with install-plan!; all established hits see #t and
   ;; stay on the actor-local/CAS path.
   (unless (unbox (checkpoint-generation-started generation))
     (jolt-with-mutex checkpoint-controller-mu
       (unless (eq? generation (checkpoint-current))
-        (checkpoint-bad 'jolt-checkpoint-continue!
+        (checkpoint-bad (if (null? who) 'jolt-checkpoint-continue! (car who))
                         "checkpoint actor binding is stale after reset" id))
       (unless (unbox (checkpoint-generation-started generation))
         (set-box! (checkpoint-generation-started generation) #t)))))
@@ -278,7 +291,7 @@
                    (let ((fresh
                            (make-checkpoint-recorder actor (make-mutex)
                                                     (make-hashtable equal-hash equal?)
-                                                    '())))
+                                                    '() #f)))
                      (hashtable-set! recorders actor fresh)
                      fresh)))
              (binding (make-checkpoint-binding generation recorder)))
@@ -309,41 +322,52 @@
     (checkpoint-current-binding-set! #f))
   jolt-nil)
 
-;; Exact per-actor reservation. The private seam accepts a normalized,
-;; runtime-owned id from the public entrypoint. The slow path registers a
-;; genuinely new site under the controller once; established sites never
-;; acquire that mutex.
-(define (checkpoint-record-reserve! id)
-  (let* ((binding (checkpoint-current-binding))
+;; Exact per-actor reservation. The optional normalized dispositions preserve
+;; the closed :continue fast path while the generic entrypoint registers and
+;; validates its complete declaration. A sticky cancellation is consulted
+;; before site registration, hit allocation, or clock allocation.
+(define (checkpoint-record-reserve! id . options)
+  (let* ((dispositions (if (null? options) '("continue") (car options)))
+         (who (if (or (null? options) (null? (cdr options)))
+                  'jolt-checkpoint-continue!
+                  (cadr options)))
+         (binding (checkpoint-current-binding))
          (generation (checkpoint-current)))
     (when (or (not binding)
               (not (eq? generation (checkpoint-binding-generation binding))))
-      (checkpoint-bad 'jolt-checkpoint-continue!
+      (checkpoint-bad who
                       "checkpoint execution requires an explicit actor binding" id))
-    (let ensure-site ()
-      (let* ((config (unbox (checkpoint-generation-config generation)))
-             (site (hashtable-ref (checkpoint-config-sites config) id #f)))
-        (cond
-          ((not site)
-           (jolt-with-mutex checkpoint-controller-mu
-             (unless (eq? generation (checkpoint-current))
-               (checkpoint-bad 'jolt-checkpoint-continue!
-                               "checkpoint actor binding is stale after reset" id))
-             (checkpoint-register-normalized!/generation
-               'jolt-checkpoint-continue! generation id '("continue")))
-           (ensure-site))
-          ((not (equal? site '("continue")))
-           (checkpoint-bad 'jolt-checkpoint-continue!
-                           "duplicate checkpoint id has different dispositions"
-                           id site '("continue")))
-          (else
-           (checkpoint-mark-started! generation id)
-           ;; Reservation deliberately consumes neither a hit nor a sequence.
-           ;; An abandoned token therefore cannot create a hole in either
-           ;; observational order. Commit owns the complete state transition.
-           (make-checkpoint-token binding
-                                  (jolt-execution-context-identity)
-                                  id 'reserved)))))))
+    (let ((sticky
+            (jolt-with-mutex (checkpoint-recorder-mu
+                               (checkpoint-binding-recorder binding))
+              (checkpoint-recorder-sticky
+                (checkpoint-binding-recorder binding)))))
+      (if sticky
+          sticky
+          (let ensure-site ()
+            (let* ((config (unbox (checkpoint-generation-config generation)))
+                   (site (hashtable-ref (checkpoint-config-sites config) id #f)))
+              (cond
+                ((not site)
+                 (jolt-with-mutex checkpoint-controller-mu
+                   (unless (eq? generation (checkpoint-current))
+                     (checkpoint-bad who
+                                     "checkpoint actor binding is stale after reset" id))
+                   (checkpoint-register-normalized!/generation
+                     who generation id dispositions))
+                 (ensure-site))
+                ((not (equal? site dispositions))
+                 (checkpoint-bad who
+                                 "duplicate checkpoint id has different dispositions"
+                                 id site dispositions))
+                (else
+                 (checkpoint-mark-started! generation id who)
+                 ;; Reservation deliberately consumes neither a hit nor a
+                 ;; sequence. An abandoned token therefore cannot create a
+                 ;; hole in either observational order.
+                 (make-checkpoint-token binding
+                                        (jolt-execution-context-identity)
+                                        id 'reserved)))))))))
 
 ;; Allocate one event identity and snapshot-cut membership with a single native
 ;; CAS, then publish only to the owning recorder. Snapshot advances the same
@@ -413,47 +437,96 @@
                 (begin
                   (checkpoint-token-phase-set! token 'stale)
                   checkpoint-stale)
-                (begin
+                (let* ((event
+                         (make-checkpoint-event
+                           seq cut
+                           (checkpoint-recorder-actor recorder)
+                           id hit action))
+                       (decision
+                         (make-checkpoint-decision
+                           action event (checkpoint-generation-id generation))))
                   (hashtable-set! (checkpoint-recorder-hits recorder) id hit)
                   (checkpoint-recorder-trace-rev-set!
                     recorder
-                    (cons
-                      (make-checkpoint-event
-                        seq cut
-                        (checkpoint-recorder-actor recorder)
-                        id hit action)
-                      (checkpoint-recorder-trace-rev recorder)))
+                    (cons event (checkpoint-recorder-trace-rev recorder)))
+                  ;; Stickiness is published under this same actor-local lock
+                  ;; as the event. A later reservation sees this immutable
+                  ;; decision before it can touch sites, hits, or the clock.
+                  (when (eq? action 'cancel)
+                    (checkpoint-recorder-sticky-set! recorder decision))
                   (checkpoint-token-phase-set! token 'committed)
-                  action)))))))
+                  decision)))))))
 
-;; Closed nonparking leaf for a continue-only site. It performs only
-;; runtime-owned normalization, exact reserve/commit publication, and inert
-;; action dispatch. No controller or user callback is invoked.
-(define (jolt-checkpoint-continue! id)
-  (let* ((id (checkpoint-qualified-id 'jolt-checkpoint-continue! id))
-         (selected
-           (checkpoint-record-commit! (checkpoint-record-reserve! id))))
-    (cond ((eq? selected checkpoint-unbound)
-           (checkpoint-bad 'jolt-checkpoint-continue!
-                           "checkpoint execution requires an explicit actor binding" id))
-          ((eq? selected checkpoint-stale)
-           (checkpoint-bad 'jolt-checkpoint-continue!
-                           "checkpoint actor binding is stale after reset" id))
-          ((not selected) jolt-nil)       ; record-only
-          ((eq? selected 'continue) jolt-nil)
+(define kw-checkpoint-error-type (keyword "jolt.checkpoint" "type"))
+(define kw-checkpoint-error-generation (keyword "jolt.checkpoint" "generation"))
+(define kw-checkpoint-error-seq (keyword "jolt.checkpoint" "seq"))
+(define kw-checkpoint-error-actor (keyword "jolt.checkpoint" "actor"))
+(define kw-checkpoint-error-id (keyword "jolt.checkpoint" "id"))
+(define kw-checkpoint-error-hit (keyword "jolt.checkpoint" "hit"))
+(define kw-checkpoint-fault (keyword #f "fault"))
+(define kw-checkpoint-cancel (keyword #f "cancel"))
+
+(define (checkpoint-action-error! type decision)
+  (let ((event (checkpoint-decision-event decision)))
+    (jolt-throw
+      (jolt-ex-info
+        (if (eq? type 'fault) "checkpoint fault" "checkpoint cancelled")
+        (jolt-hash-map
+          kw-checkpoint-error-type
+            (if (eq? type 'fault) kw-checkpoint-fault kw-checkpoint-cancel)
+          kw-checkpoint-error-generation (checkpoint-decision-generation decision)
+          kw-checkpoint-error-seq (checkpoint-event-seq event)
+          kw-checkpoint-error-actor (string-copy (checkpoint-event-actor event))
+          kw-checkpoint-error-id (string-copy (checkpoint-event-id event))
+          kw-checkpoint-error-hit (checkpoint-event-hit event))))))
+
+(define (checkpoint-dispatch! who decision)
+  ;; Always invoked after checkpoint-record-commit! has released the recorder
+  ;; mutex. A selected action therefore cannot park, yield, or throw while an
+  ;; actor-local publication lock is owned.
+  (let ((action (checkpoint-decision-action decision)))
+    (cond ((not action) jolt-nil)           ; record-only default
+          ((eq? action 'continue) jolt-nil)
+          ((eq? action 'yield)
+           (if (jolt-current-fiber)
+               (sa-fiber-yield)
+               (thread-yield!))
+           jolt-nil)
+          ((eq? action 'fault) (checkpoint-action-error! 'fault decision))
+          ((eq? action 'cancel) (checkpoint-action-error! 'cancel decision))
           (else
-           ;; Defensive fail-closed seam for later action implementations.
-           (checkpoint-bad 'jolt-checkpoint-continue!
-                           "unsupported checkpoint action" selected)))))
+           (checkpoint-bad who "unsupported checkpoint action" action)))))
 
-;; Reserved for action-bearing sites.  Their yield/barrier/fault/cancel
-;; semantics are deliberately absent in this slice, so executing one fails
-;; before registering, recording, or consulting a plan.
+(define (checkpoint-execute! who id dispositions)
+  (let* ((reserved (checkpoint-record-reserve! id dispositions who))
+         (decision
+           (if (checkpoint-decision? reserved)
+               reserved
+               (checkpoint-record-commit! reserved))))
+    (cond ((eq? decision checkpoint-stale)
+           (checkpoint-bad who "checkpoint actor binding is stale after reset" id))
+          ((checkpoint-decision? decision)
+           (checkpoint-dispatch! who decision))
+          (else
+           (checkpoint-bad who "invalid checkpoint runtime decision" decision)))))
+
+;; Closed nonparking leaf for a continue-only site. Its declaration remains
+;; exact, so a controlled action site cannot enter through this fast path.
+(define (jolt-checkpoint-continue! id)
+  (checkpoint-execute! 'jolt-checkpoint-continue!
+                       (checkpoint-qualified-id 'jolt-checkpoint-continue! id)
+                       '("continue")))
+
+;; Generic action-bearing entrypoint. Barrier, manifests, replay and minimizer
+;; state are deliberately absent from this ship-ready slice.
 (define (jolt-checkpoint! id dispositions)
-  (checkpoint-qualified-id 'jolt-checkpoint! id)
-  (checkpoint-normalize-dispositions 'jolt-checkpoint! dispositions)
-  (checkpoint-bad 'jolt-checkpoint!
-                  "action-bearing checkpoint execution is not implemented" id))
+  (let ((id (checkpoint-qualified-id 'jolt-checkpoint! id))
+        (dispositions
+          (checkpoint-normalize-dispositions 'jolt-checkpoint! dispositions)))
+    (when (member "barrier" dispositions)
+      (checkpoint-bad 'jolt-checkpoint!
+                      "barrier checkpoint execution is not implemented" id))
+    (checkpoint-execute! 'jolt-checkpoint! id dispositions)))
 
 (define kw-checkpoint-sites (keyword #f "sites"))
 (define kw-checkpoint-plan (keyword #f "plan"))
@@ -494,6 +567,11 @@
       '()
       (sort checkpoint-site-entry<? pairs))))
 
+(define (checkpoint-action-value action)
+  (if action
+      (keyword #f (symbol->string action))
+      jolt-nil))
+
 (define (checkpoint-plan-value pairs)
   (apply jolt-hash-map
     (fold-right
@@ -501,7 +579,7 @@
         (cons (jolt-vector (string-copy (caar entry))
                            (string-copy (cadar entry))
                            (caddar entry))
-              (cons kw-checkpoint-continue out)))
+              (cons (checkpoint-action-value (cdr entry)) out)))
       '()
       (sort checkpoint-plan-entry<? pairs))))
 
@@ -512,7 +590,7 @@
     kw-checkpoint-id (string-copy (checkpoint-event-id event))
     kw-checkpoint-hit (checkpoint-event-hit event)
     kw-checkpoint-action
-      (if (checkpoint-event-action event) kw-checkpoint-continue jolt-nil)))
+      (checkpoint-action-value (checkpoint-event-action event))))
 
 (define (checkpoint-clock-cut! clock)
   (let loop ((prior (unbox clock)))

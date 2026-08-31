@@ -14,7 +14,14 @@
 (define (attempt thunk)
   (guard (e (#t (cons 'error e)))
     (cons 'ok (thunk))))
+(define (attempt-unwrapped thunk)
+  (guard (e (#t (cons 'error (jolt-unwrap-throw e))))
+    (cons 'ok (thunk))))
 (define (error-result? result) (and (pair? result) (eq? 'error (car result))))
+(define (action-error-data result)
+  (and (error-result? result)
+       (jolt-ex-info-record? (cdr result))
+       (jolt-ex-info-record-data (cdr result))))
 (define (contains-text? text needle)
   (let ((text-length (string-length text))
         (needle-length (string-length needle)))
@@ -34,6 +41,16 @@
 (define kw-hit (keyword #f "hit"))
 (define kw-action (keyword #f "action"))
 (define kw-continue (keyword #f "continue"))
+(define kw-yield (keyword #f "yield"))
+(define kw-barrier (keyword #f "barrier"))
+(define kw-fault (keyword #f "fault"))
+(define kw-cancel (keyword #f "cancel"))
+(define kw-error-checkpoint-type (keyword "jolt.checkpoint" "type"))
+(define kw-error-checkpoint-generation (keyword "jolt.checkpoint" "generation"))
+(define kw-error-checkpoint-seq (keyword "jolt.checkpoint" "seq"))
+(define kw-error-checkpoint-actor (keyword "jolt.checkpoint" "actor"))
+(define kw-error-checkpoint-id (keyword "jolt.checkpoint" "id"))
+(define kw-error-checkpoint-hit (keyword "jolt.checkpoint" "hit"))
 
 (define site "test.runtime/continue")
 (define action-site "test.runtime/action")
@@ -196,17 +213,20 @@
                                  (range (+ n 1) (cons n out)))))
                    (actors (+ i 1))))))))
 
-;; The generic ABI is reserved for action-bearing sites and must fail before it
-;; registers or records anything in this continue-only runtime slice.
+;; With this still-bound main actor, an action-bearing declaration with no plan
+;; is an ordinary record-only decision. The dedicated unbound probes below
+;; cover both thread and fiber fail-closed behavior.
 (let ((before (snapshot)))
-  (ok "action-bearing execution fails closed"
-      (error-result?
-        (attempt (lambda () (jolt-checkpoint! action-site '(continue yield))))))
-  (let ((after (snapshot)))
-    (ok "failed action-bearing execution does not register a site"
-        (jolt-nil? (jolt-get (jolt-get after kw-sites) action-site)))
-    (ok "failed action-bearing execution does not append trace"
-        (= (pvec-count (snap-trace before)) (pvec-count (snap-trace after))))))
+  (ok "bound action-bearing execution records an unplanned decision"
+      (not (error-result?
+             (attempt (lambda () (jolt-checkpoint! action-site '(continue yield)))))))
+  (let* ((after (snapshot))
+         (event (trace-event (snap-trace after)
+                             (pvec-count (snap-trace before)))))
+    (ok "unplanned generic action appends one inert event"
+        (and (= (+ 1 (pvec-count (snap-trace before)))
+                (pvec-count (snap-trace after)))
+             (jolt-nil? (jolt-get event kw-action))))))
 
 (jolt-checkpoint-unbind-actor!)
 (ok "explicit unbind restores fail-closed execution"
@@ -409,10 +429,18 @@
     (and (contains-text? compiled-action "jolt-checkpoint!")
          (not (contains-text? compiled-action "jolt-checkpoint-continue!"))))
 (define compiled-before (snapshot))
-(ok "compiled action-bearing execution fails closed"
-    (error-result? (attempt (lambda () (execute-emitted compiled-action)))))
-(ok "compiled action-bearing failure leaves all controller state unchanged"
-    (jolt= compiled-before (snapshot)))
+(define compiled-action-result
+  (attempt (lambda () (execute-emitted compiled-action))))
+(let* ((after (snapshot))
+       (event (trace-event (snap-trace after) 1)))
+  (ok "compiled action-bearing execution records its unplanned decision"
+      (and (not (error-result? compiled-action-result))
+           (= (+ 1 (pvec-count (snap-trace compiled-before)))
+              (pvec-count (snap-trace after)))
+           (= 2 (jolt-get event kw-seq))
+           (string=? "compiled/a" (jolt-get event kw-actor))
+           (string=? "test.compiled/action" (jolt-get event kw-id))
+           (jolt-nil? (jolt-get event kw-action)))))
 
 ;; --- #54 generation-scoped per-actor recorder histories -------------------
 
@@ -741,6 +769,283 @@
           (checkpoint-record-reserve! "test.recorder/unbound")))))
 (ok "unbound reservation failure is controller-state-identical"
     (jolt= unbound-before (snapshot)))
+
+;; --- action-bearing replay contract ---------------------------------------
+;;
+;; This is intentionally a narrow compatibility characterization, not a new
+;; controller API: the existing public plan map remains [actor id hit] ->
+;; keyword. Fault and cancel expose only their reviewed namespaced ex-data.
+;; Every worker stores its own result, so an action failure cannot turn a
+;; scheduler fault into a silent hang or leave an unbounded history behind.
+
+(define (action-event-matches? event action actor id hit seq)
+  (and (eq? action (jolt-get event kw-action))
+       (string=? actor (jolt-get event kw-actor))
+       (string=? id (jolt-get event kw-id))
+       (= hit (jolt-get event kw-hit))
+       (= seq (jolt-get event kw-seq))))
+
+(define (canonical-action-error-matches? result type generation event)
+  (let ((data (action-error-data result)))
+    (and data
+         (eq? type (jolt-get data kw-error-checkpoint-type))
+         (= generation (jolt-get data kw-error-checkpoint-generation))
+         (string=? (jolt-get event kw-actor)
+                   (jolt-get data kw-error-checkpoint-actor))
+         (string=? (jolt-get event kw-id)
+                   (jolt-get data kw-error-checkpoint-id))
+         (= (jolt-get event kw-hit) (jolt-get data kw-error-checkpoint-hit))
+         (= (jolt-get event kw-seq) (jolt-get data kw-error-checkpoint-seq)))))
+
+(define (after-action-plan plan-result thunk)
+  ;; Keep a rejected setup as an ordinary worker result so this bounded suite
+  ;; can report the remaining independent action contracts too.
+  (if (error-result? plan-result)
+      plan-result
+      (attempt-unwrapped thunk)))
+
+;; No binding must fail closed on either scheduler context.  These workers are
+;; bounded one-shot probes; their captured errors also prove no inherited actor
+;; binding becomes observable merely by crossing a thread/fiber boundary.
+(jolt-checkpoint-reset!)
+(define unbound-action-thread-result #f)
+(define unbound-action-fiber-result #f)
+(thread-join
+  (fork-thread
+    (lambda ()
+      (set! unbound-action-thread-result
+            (attempt-unwrapped
+              (lambda ()
+                (jolt-checkpoint! "test.action/unbound" '(continue yield))))))))
+(sa-fiber-spawn
+  (lambda ()
+    (set! unbound-action-fiber-result
+          (attempt-unwrapped
+            (lambda ()
+              (jolt-checkpoint! "test.action/unbound" '(continue yield)))))))
+(sa-fiber-run-all)
+(ok "unbound action execution fails closed in OS threads and fibers"
+    (and (error-result? unbound-action-thread-result)
+         (error-result? unbound-action-fiber-result)
+         (= 0 (pvec-count (snap-trace (snapshot))))))
+
+;; The action parser accepts only actions declared by that site, and a generic
+;; execution turns its compatible plan choice into immutable recorded data
+;; before freezing replacement.  A disallowed action is a fail-closed parser
+;; control: it cannot publish a plan or begin a run.
+(jolt-checkpoint-reset!)
+(define decision-site "test.action/decision")
+(jolt-checkpoint-register-site! decision-site '(continue yield))
+(define disallowed-action-before (snapshot))
+(ok "action plan rejects a choice outside the site's declared capability"
+    (and (error-result?
+           (attempt
+             (lambda ()
+               (jolt-checkpoint-install-plan!
+                 (jolt-hash-map
+                   (jolt-vector "decision/a" decision-site 1) kw-fault)))))
+         (jolt= disallowed-action-before (snapshot))))
+(define selected-continue-plan-result
+  (attempt
+    (lambda ()
+      (jolt-checkpoint-install-plan!
+        (jolt-hash-map
+          (jolt-vector "decision/a" decision-site 1) kw-continue)))))
+(jolt-checkpoint-bind-actor! "decision/a")
+(define selected-continue-result
+  (after-action-plan selected-continue-plan-result
+    (lambda () (jolt-checkpoint! decision-site '(continue yield)))))
+(define selected-continue-snapshot (snapshot))
+(define selected-continue-trace (snap-trace selected-continue-snapshot))
+(define selected-continue-event
+  (and (= 1 (pvec-count selected-continue-trace))
+       (trace-event selected-continue-trace 0)))
+(ok "generic compatible action commits an immutable selected decision"
+    (and (not (error-result? selected-continue-result))
+         selected-continue-event
+         (action-event-matches?
+           selected-continue-event kw-continue "decision/a" decision-site 1 1)
+         (eq? kw-continue
+              (jolt-get (jolt-get selected-continue-snapshot kw-plan)
+                        (jolt-vector "decision/a" decision-site 1)))
+         (error-result?
+           (attempt
+             (lambda () (jolt-checkpoint-install-plan! (jolt-hash-map)))))))
+
+;; :yield records once before it invokes the applicable scheduler yield.  This
+;; characterizes deterministic selection/invocation, not a peer handoff order;
+;; the separate thread probe ensures the generic action does not call fiber
+;; yield off fiber.
+(jolt-checkpoint-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(define yield-site "test.action/yield")
+(define yield-fiber-result #f)
+(define yield-thread-result #f)
+(jolt-checkpoint-register-site! yield-site '(continue yield))
+(define yield-fiber-plan-result
+  (attempt
+    (lambda ()
+      (jolt-checkpoint-install-plan!
+        (jolt-hash-map (jolt-vector "yield/fiber" yield-site 1) kw-yield)))))
+(sa-fiber-spawn
+  (lambda ()
+    (jolt-checkpoint-bind-actor! "yield/fiber")
+    (set! yield-fiber-result
+          (after-action-plan yield-fiber-plan-result
+            (lambda () (jolt-checkpoint! yield-site '(continue yield)))))))
+(sa-fiber-run-all)
+(let* ((s (snapshot))
+       (trace (snap-trace s))
+       (event (and (= 1 (pvec-count trace)) (trace-event trace 0))))
+  (ok "selected fiber yield records once and invokes the fiber yield path"
+      (and (not (error-result? yield-fiber-result))
+           event
+           (eq? kw-yield
+                (jolt-get (jolt-get s kw-plan)
+                          (jolt-vector "yield/fiber" yield-site 1)))
+           (action-event-matches? event kw-yield "yield/fiber" yield-site 1 1))))
+
+(jolt-checkpoint-reset!)
+(jolt-checkpoint-register-site! yield-site '(continue yield))
+(define yield-thread-plan-result
+  (attempt
+    (lambda ()
+      (jolt-checkpoint-install-plan!
+        (jolt-hash-map (jolt-vector "yield/thread" yield-site 1) kw-yield)))))
+(thread-join
+  (fork-thread
+    (lambda ()
+      (jolt-checkpoint-bind-actor! "yield/thread")
+      (set! yield-thread-result
+            (after-action-plan yield-thread-plan-result
+              (lambda () (jolt-checkpoint! yield-site '(continue yield))))))))
+(let* ((trace (snap-trace (snapshot)))
+       (event (and (= 1 (pvec-count trace)) (trace-event trace 0))))
+  (ok "selected OS-thread yield records once without fiber-only failure"
+      (and (not (error-result? yield-thread-result))
+           event
+           (action-event-matches? event kw-yield "yield/thread" yield-site 1 1))))
+
+;; Barrier membership remains deliberately outside this gate.  Reviews disagree
+;; whether a round is inferred from [site-id hit] or carried by an inert,
+;; versioned descriptor that can rendezvous across selectors.  Do not freeze an
+;; implementation through tests until that ABI review resolves it; reset safety
+;; for the chosen waiter representation belongs in that subsequent slice.
+
+;; Fault and cancel are both commit-then-throw actions.  The error data shape is
+;; deliberately asserted by stable classification and the already-published
+;; event identity, not a message or a new public descriptor type.
+(jolt-checkpoint-reset!)
+(define fault-site "test.action/fault")
+(define fault-result #f)
+(jolt-checkpoint-register-site! fault-site '(continue fault))
+(define fault-plan-result
+  (attempt
+    (lambda ()
+      (jolt-checkpoint-install-plan!
+        (jolt-hash-map (jolt-vector "fault/a" fault-site 1) kw-fault)))))
+(jolt-checkpoint-bind-actor! "fault/a")
+(set! fault-result
+      (after-action-plan fault-plan-result
+        (lambda () (jolt-checkpoint! fault-site '(continue fault)))))
+(let* ((s (snapshot))
+       (trace (snap-trace s))
+       (event (and (= 1 (pvec-count trace)) (trace-event trace 0))))
+  (ok "fault records once then exposes canonical classified event data"
+      (and event
+           (action-event-matches? event kw-fault "fault/a" fault-site 1 1)
+           (canonical-action-error-matches?
+             fault-result kw-fault (jolt-get s kw-generation) event))))
+
+(jolt-checkpoint-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(define cancel-site "test.action/cancel")
+(define cancel-late-site "test.action/cancel-late")
+(define cancel-late-fast-site "test.action/cancel-late-fast")
+(define cancel-result #f)
+(define cancel-sticky-fast-path-result #f)
+(define cancel-sticky-same-binding-result #f)
+(define cancel-sticky-rebind-result #f)
+(define cancel-sibling-result #f)
+(define cancel-sibling-completed? #f)
+(jolt-checkpoint-register-site! cancel-site '(continue cancel))
+(define cancel-plan-result
+  (attempt
+    (lambda ()
+      (jolt-checkpoint-install-plan!
+        (jolt-hash-map (jolt-vector "cancel/a" cancel-site 1) kw-cancel)))))
+(sa-fiber-spawn
+  (lambda ()
+    (jolt-checkpoint-bind-actor! "cancel/a")
+    (set! cancel-result
+          (after-action-plan cancel-plan-result
+            (lambda () (jolt-checkpoint! cancel-site '(continue cancel)))))
+    (set! cancel-sticky-fast-path-result
+          (attempt-unwrapped
+            (lambda ()
+              (jolt-checkpoint-continue! cancel-late-fast-site))))
+    ;; Sticky cancellation is actor-recorder state, not binding state. Both
+    ;; probes use an unregistered later site so a wrong implementation is
+    ;; caught if it allocates a hit/seq or mutates the site table before it
+    ;; rethrows the original cancellation.
+    (set! cancel-sticky-same-binding-result
+          (attempt-unwrapped
+            (lambda ()
+              (jolt-checkpoint! cancel-late-site '(continue yield)))))
+    (jolt-checkpoint-unbind-actor!)
+    (jolt-checkpoint-bind-actor! "cancel/a")
+    (set! cancel-sticky-rebind-result
+          (attempt-unwrapped
+            (lambda ()
+              (jolt-checkpoint! cancel-late-site '(continue yield)))))))
+(sa-fiber-spawn
+  (lambda ()
+    (jolt-checkpoint-bind-actor! "cancel/sibling")
+    (set! cancel-sibling-result
+          (after-action-plan cancel-plan-result
+            (lambda () (jolt-checkpoint! cancel-site '(continue cancel)))))
+    (set! cancel-sibling-completed? (not (error-result? cancel-sibling-result)))))
+(sa-fiber-run-all)
+(let* ((s (snapshot))
+       (trace (snap-trace s))
+       (e0 (and (= 2 (pvec-count trace)) (trace-event trace 0)))
+       (e1 (and (= 2 (pvec-count trace)) (trace-event trace 1))))
+  (ok "cancel is cooperative and confined to the current actor"
+      (and e0 e1
+           (action-event-matches? e0 kw-cancel "cancel/a" cancel-site 1 1)
+           (canonical-action-error-matches?
+             cancel-result kw-cancel (jolt-get s kw-generation) e0)
+           (canonical-action-error-matches?
+             cancel-sticky-fast-path-result
+             kw-cancel (jolt-get s kw-generation) e0)
+           (canonical-action-error-matches?
+             cancel-sticky-same-binding-result
+             kw-cancel (jolt-get s kw-generation) e0)
+           (canonical-action-error-matches?
+             cancel-sticky-rebind-result
+             kw-cancel (jolt-get s kw-generation) e0)
+           cancel-sibling-completed?
+           (jolt-nil? (jolt-get (jolt-get s kw-sites) cancel-late-fast-site))
+           (jolt-nil? (jolt-get (jolt-get s kw-sites) cancel-late-site))
+           (action-event-matches? e1 jolt-nil "cancel/sibling" cancel-site 1 2))))
+
+(jolt-checkpoint-reset!)
+(define cancel-reset-site "test.action/cancel-reset")
+(jolt-checkpoint-register-site! cancel-reset-site '(continue))
+(jolt-checkpoint-install-plan!
+  (jolt-hash-map (jolt-vector "cancel/a" cancel-reset-site 1) kw-continue))
+(jolt-checkpoint-bind-actor! "cancel/a")
+(define cancel-reset-result
+  (attempt-unwrapped
+    (lambda () (jolt-checkpoint! cancel-reset-site '(continue)))))
+(let* ((s (snapshot))
+       (trace (snap-trace s))
+       (event (and (= 1 (pvec-count trace)) (trace-event trace 0))))
+  (ok "reset clears sticky cancel for a fresh generation"
+      (and (not (error-result? cancel-reset-result))
+           event
+           (action-event-matches?
+             event kw-continue "cancel/a" cancel-reset-site 1 1))))
 
 (if (= fails 0)
     (printf "checkpoint runtime: ~a checks passed\n" total)
