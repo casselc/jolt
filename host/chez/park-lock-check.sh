@@ -4,8 +4,10 @@
 # Runs host/chez/park-lock-check.ss under the build's Chez. The checker reads every
 # handwritten host .ss file as data, closes "can park" and "can dispatch generic
 # code" over the call graph, and checks both lexical and balanced manual counted
-# lock regions. It also fails if a switch point stops calling
-# jolt-locks-assert-none!, which is the runtime half of the same rule.
+# lock regions. Checkpoint controller/recorder mutexes have the stronger
+# terminal rule: no generic dispatch or secondary acquisition beneath them. It
+# also fails if a switch point stops calling jolt-locks-assert-none!, which is
+# the runtime half of the same rule.
 #
 #   --regen   rewrite host/chez/park-lock-allowlist.txt from reality
 #   --self-test run the non-vacuous checker mutation controls

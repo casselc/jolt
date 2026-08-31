@@ -31,6 +31,9 @@
 ;;      binding, report generic dispatch there as separate issue-backed debt,
 ;;      close named acquisitions through helpers, and reject unknown identities
 ;;      or a cycle in the resulting whole-program lock-order graph.
+;;   5. treat checkpoint-controller-mu and checkpoint-recorder-mu as terminal
+;;      counted locks: close synchronous dispatch and acquisitions through named
+;;      helpers, then reject generic dispatch or any secondary lock acquisition.
 ;;
 ;; Step 2 is the whole value: the lexical scan this replaces found NOTHING in the
 ;; pre-fix loader, because ldr-begin-load!'s region called ldr-wait-for-load! and
@@ -262,6 +265,46 @@
 (define logical-effects-enabled? (make-parameter #t))
 (define logical-acquire-emitter (make-parameter (lambda (held acquired) (void))))
 (define logical-hard-emitter (make-parameter (lambda (kind detail) (void))))
+
+;; Checkpoint controller and recorder locks are terminal counted locks: their
+;; critical sections may perform closed runtime-owned leaf work, but may not
+;; invoke generic/procedure-valued dispatch or acquire another lock.  The
+;; recorder accessor is named before the recorder exists so the checker gate is
+;; already live when that runtime slice lands.
+(define terminal-lock-identities
+  '(checkpoint-controller-mu checkpoint-recorder-mu))
+(define current-terminal-regions (make-parameter '()))
+(define terminal-effects-enabled? (make-parameter #t))
+(define lock-acquire-emitter (make-parameter (lambda (acquired) (void))))
+(define terminal-acquire-emitter
+  (make-parameter (lambda (held acquired) (void))))
+
+(define (lock-expression-identity x bound)
+  (cond
+    ((symbol? x)
+     (let ((resolved (resolve-bound-operator x bound)))
+       ;; A lexically supplied mutex is still a concrete secondary acquisition
+       ;; even though its runtime identity is opaque to this source checker.
+       (if (eq? resolved dynamic-call) x resolved)))
+    ;; Record accessors have the shape `(checkpoint-recorder-mu recorder)`.
+    ;; Preserve the accessor name; the record value itself is deliberately not
+    ;; treated as a stable global lock identity.
+    ((and (list? x) (pair? x) (symbol? (car x)))
+     (resolve-bound-operator (car x) bound))
+    (else unknown-lock)))
+
+(define (terminal-lock-identity x bound)
+  (let ((identity
+          (cond ((symbol? x) (resolve-bound-operator x bound))
+                ((and (list? x) (pair? x) (symbol? (car x)))
+                 (resolve-bound-operator (car x) bound))
+                (else #f))))
+    (and (memq identity terminal-lock-identities) identity)))
+
+(define (emit-lock-acquisition acquired)
+  (when (terminal-effects-enabled?)
+    ((lock-acquire-emitter) acquired)
+    ((terminal-acquire-emitter) (current-terminal-regions) acquired)))
 
 (define (logical-lock-identity x bound)
   (if (symbol? x)
@@ -645,7 +688,8 @@
 (define (walk-define d lexical-lock? manual-lock? bound emit)
   ;; (define (name . formals) body …) or (define name expr)
   (if (pair? (cadr d))
-      (parameterize ((logical-effects-enabled? #f))
+      (parameterize ((logical-effects-enabled? #f)
+                     (terminal-effects-enabled? #f))
         (walk-forms (cddr d) lexical-lock? manual-lock?
                     (append (formal-names (cdadr d)) bound) emit))
       (walk-forms (cddr d) lexical-lock? manual-lock? bound emit)))
@@ -830,10 +874,12 @@
          ;; Keep walking it for the general call graph, while excluding its body
          ;; from the enclosing unit's synchronous logical-region effects.
          ((lambda)
-          (parameterize ((logical-effects-enabled? #f))
+          (parameterize ((logical-effects-enabled? #f)
+                         (terminal-effects-enabled? #f))
             (walk-lambda-body x lexical-lock? manual-lock? bound emit)))
          ((case-lambda)
-          (parameterize ((logical-effects-enabled? #f))
+          (parameterize ((logical-effects-enabled? #f)
+                         (terminal-effects-enabled? #f))
             (walk-case-lambda x lexical-lock? manual-lock? bound emit)))
          ((define) (walk-define x lexical-lock? manual-lock? bound emit))
          ((define-syntax)
@@ -890,6 +936,7 @@
                    (unless (and (pair? thunk-expr)
                                 (eq? (car thunk-expr) 'lambda))
                      (walk thunk-expr lexical-lock? manual-lock? bound emit))
+                   (emit-lock-acquisition lock-id)
                    ((logical-acquire-emitter) (current-logical-regions) lock-id)
                    (parameterize
                      ((current-logical-regions
@@ -913,7 +960,16 @@
              (when (pair? (cdr x))
                (walk (cadr x) lexical-lock? manual-lock? bound emit))
              (when (pair? (cdr x))
-               (walk-forms (cddr x) #t manual-lock? bound emit)))
+               (let* ((lock-expr (cadr x))
+                      (lock-id (lock-expression-identity lock-expr bound))
+                      (terminal-id (terminal-lock-identity lock-expr bound)))
+                 (emit-lock-acquisition lock-id)
+                 (parameterize
+                   ((current-terminal-regions
+                      (if terminal-id
+                          (cons terminal-id (current-terminal-regions))
+                          (current-terminal-regions))))
+                   (walk-forms (cddr x) #t manual-lock? bound emit)))))
             (else
              (cond
                ;; In `(apply target ...)` the target appears in value position
@@ -967,7 +1023,8 @@
 ;; ---------------------------------------------------------------------------
 ;; A "unit" is one top-level definition:
 ;; (file name calls locked-calls raw-body logical-calls acquisitions edges
-;;  unknowns synchronous-calls value-symbols).
+;;  unknowns synchronous-calls value-symbols lock-acquires terminal-calls
+;;  terminal-acquires).
 ;; calls is every operator-position symbol in the body (the call graph edge set),
 ;; and locked-calls is its subset inside a counted-lock region. Top-level forms
 ;; that are not definitions use a file-unique name so file-scope locks are read.
@@ -983,6 +1040,9 @@
 (define (unit-logical-unknowns u) (if (> (length u) 8) (list-ref u 8) '()))
 (define (unit-logical-sync-calls u) (if (> (length u) 9) (list-ref u 9) '()))
 (define (unit-value-symbols u) (if (> (length u) 10) (list-ref u 10) '()))
+(define (unit-lock-acquires u) (if (> (length u) 11) (list-ref u 11) '()))
+(define (unit-terminal-calls u) (if (> (length u) 12) (list-ref u 12) '()))
+(define (unit-terminal-acquires u) (if (> (length u) 13) (list-ref u 13) '()))
 
 (define (definition-name d)
   (and (pair? d) (eq? 'define (car d)) (pair? (cdr d))
@@ -1050,9 +1110,21 @@
 (define (collect-unit file name forms bound)
   (let ((calls '()) (locked '()) (logical-calls '())
         (logical-acquires '()) (logical-edges '()) (logical-unknowns '())
-        (logical-sync-calls '()) (value-symbols '()))
+        (logical-sync-calls '()) (value-symbols '()) (lock-acquires '())
+        (terminal-calls '()) (terminal-acquires '()))
     (parameterize
       ((current-logical-regions '())
+       (current-terminal-regions '())
+       (lock-acquire-emitter
+         (lambda (acquired)
+           (set! lock-acquires (cons acquired lock-acquires))))
+       (terminal-acquire-emitter
+         (lambda (held acquired)
+           (for-each
+             (lambda (owner)
+               (set! terminal-acquires
+                 (cons (cons owner acquired) terminal-acquires)))
+             held)))
        (logical-acquire-emitter
          (lambda (held acquired)
            (when (logical-effects-enabled?)
@@ -1100,9 +1172,19 @@
             (for-each
               (lambda (owner)
                 (set! logical-calls (cons (cons owner sym) logical-calls)))
-              (current-logical-regions))))))
+              (current-logical-regions)))
+          (when (and operator? (terminal-effects-enabled?))
+            ;; Low-level acquisitions have no wrapper for emit-lock-acquisition.
+            (when (memq sym '(jolt-lock! jolt-chan-lock!
+                              jolt-logical-mutex-enter!))
+              (emit-lock-acquisition sym))
+            (for-each
+              (lambda (owner)
+                (set! terminal-calls (cons (cons owner sym) terminal-calls)))
+              (current-terminal-regions))))))
     (list file name calls locked forms logical-calls logical-acquires
-          logical-edges logical-unknowns logical-sync-calls value-symbols)))
+          logical-edges logical-unknowns logical-sync-calls value-symbols
+          lock-acquires terminal-calls terminal-acquires)))
 
 (define (collect-case-lambda-unit file name clauses)
   (let ((parts
@@ -1114,7 +1196,8 @@
       (fold-left (lambda (out u) (append (list-ref u i) out)) '() parts))
     (list file name (join-field 2) (join-field 3) clauses
           (join-field 5) (join-field 6) (join-field 7) (join-field 8)
-          (join-field 9) (join-field 10))))
+          (join-field 9) (join-field 10) (join-field 11) (join-field 12)
+          (join-field 13))))
 
 (define (collect-definition file d)
   (let ((nm (definition-name d)))
@@ -1251,6 +1334,36 @@
         (hashtable-set! acquires (unit-name u)
           (fold-left (lambda (xs x) (adjoinq x xs)) '()
                      (unit-logical-acquires u))))
+      units)
+    (let grow ()
+      (let ((changed #f))
+        (for-each
+          (lambda (u)
+            (let ((before (hashtable-ref acquires (unit-name u) '())))
+              (let ((after
+                      (fold-left
+                        (lambda (xs callee)
+                          (fold-left (lambda (ys lock) (adjoinq lock ys)) xs
+                                     (hashtable-ref acquires callee '())))
+                        before (unit-logical-sync-calls u))))
+                (unless (= (length before) (length after))
+                  (hashtable-set! acquires (unit-name u) after)
+                  (set! changed #t)))))
+          units)
+        (when changed (grow))))
+    acquires))
+
+;; All synchronously reached lock acquisitions, independent of lock family.
+;; This is the terminal-lock analogue of the logical order closure above, but
+;; it deliberately keeps no order graph: acquiring *any* second lock beneath a
+;; terminal checkpoint lock is forbidden, including re-entry of that lock.
+(define (build-lock-acquisitions units)
+  (let ((acquires (make-eq-hashtable)))
+    (for-each
+      (lambda (u)
+        (hashtable-set! acquires (unit-name u)
+          (fold-left (lambda (xs x) (adjoinq x xs)) '()
+                     (unit-lock-acquires u))))
       units)
     (let grow ()
       (let ((changed #f))
@@ -1438,6 +1551,58 @@
                   out)))
       '() units)
     (lambda (a b) (string<? (finding->line a) (finding->line b)))))
+
+(define (terminal-site-symbol owner effect)
+  (string->symbol
+    (string-append (symbol->string owner) "->" (symbol->string effect))))
+
+(define (terminal-dispatch-findings units dispatches)
+  (sort-list
+    (fold-left
+      (lambda (out u)
+        (let ((t (make-eq-hashtable)))
+          (for-each
+            (lambda (site)
+              (let ((callee (cdr site)))
+                (when (or (eq? callee dynamic-call)
+                          (hashtable-ref dispatches callee #f))
+                  (let ((key (terminal-site-symbol (car site) callee)))
+                    (hashtable-set! t key (+ 1 (hashtable-ref t key 0)))))))
+            (unit-terminal-calls u))
+          (append (tally->findings (unit-file u) (unit-name u)
+                                   'terminal-dispatch t)
+                  out)))
+      '() units)
+    (lambda (a b) (string<? (finding->line a) (finding->line b)))))
+
+(define (terminal-acquire-findings units acquisitions)
+  (sort-list
+    (fold-left
+      (lambda (out u)
+        (let ((t (make-eq-hashtable)))
+          (define (add! owner acquired)
+            (let ((key (terminal-site-symbol owner acquired)))
+              (hashtable-set! t key (+ 1 (hashtable-ref t key 0)))))
+          (for-each (lambda (site) (add! (car site) (cdr site)))
+                    (unit-terminal-acquires u))
+          (for-each
+            (lambda (site)
+              (for-each (lambda (acquired) (add! (car site) acquired))
+                        (hashtable-ref acquisitions (cdr site) '())))
+            (unit-terminal-calls u))
+          (append (tally->findings (unit-file u) (unit-name u)
+                                   'terminal-acquire t)
+                  out)))
+      '() units)
+    (lambda (a b) (string<? (finding->line a) (finding->line b)))))
+
+(define (terminal-region-count units identity)
+  (fold-left
+    (lambda (n u)
+      (+ n (fold-left (lambda (m acquired)
+                        (if (eq? acquired identity) (+ m 1) m))
+                      0 (unit-lock-acquires u))))
+    0 units))
 
 (define (finding->line f)
   (string-append (car f) " " (symbol->string (cadr f)) " " (symbol->string (caddr f))
@@ -2391,6 +2556,91 @@
                  (hashtable-ref (car identity-analysis) 'mu-a #f) #t)
           (= failures 0))))))
 
+;; Non-vacuity and mutation teeth for the checkpoint terminal-lock contract.
+;; Both the present controller variable and the future recorder accessor receive
+;; one safe baseline plus dispatch and secondary-acquisition mutations.  The
+;; transitive cases use the production closure rather than duplicating it here.
+(define (terminal-lock-self-test)
+  (let* ((leaf
+           (collect-unit "synthetic" 'terminal-leaf '((#3%fx+ x 1)) '(x)))
+         (dispatch-helper
+           (collect-unit "synthetic" 'terminal-dispatch-helper
+                         '((jolt-invoke f x)) '(f x)))
+         (acquire-helper
+           (collect-unit "synthetic" 'terminal-acquire-helper
+                         '((jolt-with-mutex other-mu (#3%fx+ x 1)))
+                         '(other-mu x)))
+         (safe-controller
+           (collect-unit "synthetic" 'safe-controller
+             '((jolt-with-mutex checkpoint-controller-mu
+                 (terminal-leaf 1))) '()))
+         (safe-recorder
+           (collect-unit "synthetic" 'safe-recorder
+             '((jolt-with-mutex (checkpoint-recorder-mu recorder)
+                 (terminal-leaf 1))) '(recorder)))
+         (controller-dynamic
+           (collect-unit "synthetic" 'controller-dynamic-mutation
+             '((jolt-with-mutex checkpoint-controller-mu (callback x)))
+             '(callback x)))
+         (controller-outward
+           (collect-unit "synthetic" 'controller-outward-mutation
+             '((jolt-with-mutex checkpoint-controller-mu
+                 (terminal-dispatch-helper f x))) '(f x)))
+         (recorder-dynamic
+           (collect-unit "synthetic" 'recorder-dynamic-mutation
+             '((jolt-with-mutex (checkpoint-recorder-mu recorder)
+                 (callback x))) '(recorder callback x)))
+         (recorder-outward
+           (collect-unit "synthetic" 'recorder-outward-mutation
+             '((jolt-with-mutex (checkpoint-recorder-mu recorder)
+                 (terminal-dispatch-helper f x))) '(recorder f x)))
+         (controller-secondary
+           (collect-unit "synthetic" 'controller-secondary-mutation
+             '((jolt-with-mutex checkpoint-controller-mu
+                 (jolt-with-mutex other-mu (#3%fx+ x 1))))
+             '(other-mu x)))
+         (recorder-secondary
+           (collect-unit "synthetic" 'recorder-secondary-mutation
+             '((jolt-with-mutex (checkpoint-recorder-mu recorder)
+                 (terminal-acquire-helper other-mu x)))
+             '(recorder other-mu x)))
+         (deferred-control
+           (collect-unit "synthetic" 'terminal-deferred-control
+             '((jolt-with-mutex checkpoint-controller-mu
+                 (lambda ()
+                   (jolt-with-mutex other-mu (jolt-invoke f x)))))
+             '(other-mu f x)))
+         (units (list leaf dispatch-helper acquire-helper safe-controller
+                      safe-recorder controller-dynamic controller-outward
+                      recorder-dynamic recorder-outward
+                      controller-secondary recorder-secondary deferred-control))
+         (dispatches (build-logical-dispatchers units))
+         (acquisitions (build-lock-acquisitions units)))
+    (let ((failures 0))
+      (define (exact label actual expected)
+        (unless (equal? actual expected)
+          (set! failures (+ failures 1))
+          (printf "terminal-lock self-test FAIL ~a\n  expected: ~s\n  actual:   ~s\n"
+                  label expected actual)))
+      (exact 'controller-baseline
+             (terminal-region-count (list safe-controller)
+                                    'checkpoint-controller-mu) 1)
+      (exact 'recorder-baseline
+             (terminal-region-count (list safe-recorder)
+                                    'checkpoint-recorder-mu) 1)
+      (exact 'dispatch-mutations
+        (map finding->line (terminal-dispatch-findings units dispatches))
+        '("synthetic controller-dynamic-mutation terminal-dispatch checkpoint-controller-mu->procedure-valued-dispatch 1"
+          "synthetic controller-outward-mutation terminal-dispatch checkpoint-controller-mu->terminal-dispatch-helper 1"
+          "synthetic recorder-dynamic-mutation terminal-dispatch checkpoint-recorder-mu->procedure-valued-dispatch 1"
+          "synthetic recorder-outward-mutation terminal-dispatch checkpoint-recorder-mu->terminal-dispatch-helper 1"))
+      (exact 'acquisition-mutations
+        (map finding->line
+             (terminal-acquire-findings units acquisitions))
+        '("synthetic controller-secondary-mutation terminal-acquire checkpoint-controller-mu->other-mu 1"
+          "synthetic recorder-secondary-mutation terminal-acquire checkpoint-recorder-mu->other-mu 1"))
+      (= failures 0))))
+
 (define (primitive-whitelist-self-test)
   (and (eq? (primitive-head-name '($primitive 3 fx+)) 'fx+)
        (eq? (primitive-head-name '($primitive fx+)) 'fx+)
@@ -2472,6 +2722,7 @@
            (checkpoint-hazards (build-checkpoint-hazards units))
            (logical-dispatchers (build-logical-dispatchers units))
            (logical-acquires (build-logical-acquisitions units))
+           (lock-acquires (build-lock-acquisitions units))
            (logical-edges (logical-order-edges units logical-acquires))
            (logical-cycle (logical-order-cycle logical-edges))
            (logical-unknowns (logical-unknown-findings units logical-acquires))
@@ -2488,6 +2739,14 @@
            (logical-dispatch-got
              (map finding->line
                   (logical-dispatch-findings units logical-dispatchers)))
+           (terminal-dispatch-got
+             (map finding->line
+                  (terminal-dispatch-findings units logical-dispatchers)))
+           (terminal-acquire-got
+             (map finding->line
+                  (terminal-acquire-findings units lock-acquires)))
+           (controller-region-count
+             (terminal-region-count units 'checkpoint-controller-mu))
            (debt
              (analysis-validate-debt-lines
                (analysis-read-data-lines debt-file) '("dispatch") issue-prefix))
@@ -2503,6 +2762,7 @@
                                (dispatch-self-test)
                                (checkpoint-disposition-self-test)
                                (logical-region-self-test)
+                               (terminal-lock-self-test)
                                (analysis-debt-self-test '("dispatch") issue-prefix)
                                (primitive-whitelist-self-test))))
       (cond
@@ -2521,7 +2781,7 @@
         ((and (pair? args) (string=? (car args) "--self-test"))
          (if (and self-test-ok? (null? missing))
              (begin
-               (printf "park/lock checker self-test: PASS (guard/receiver, counted and logical transitive dispatch, checkpoint literal/dynamic/direct/transitive/manual/after-unlock/value-alias/set!/define-values/define-syntax/local-syntax mutations, named/transitive logical acquisition, reentry/deferred controls, unknown identity and cycle mutations, manual/control/compound-expression/alias/apply mutations, primitive whitelist safe/unknown teeth, call-site trusted callbacks, issue-tagged debt mutations)\n")
+               (printf "park/lock checker self-test: PASS (guard/receiver, counted and logical transitive dispatch, checkpoint literal/dynamic/direct/transitive/manual/after-unlock/value-alias/set!/define-values/define-syntax/local-syntax mutations, named/transitive logical acquisition, checkpoint controller/recorder terminal dispatch and secondary-acquisition mutations, reentry/deferred controls, unknown identity and cycle mutations, manual/control/compound-expression/alias/apply mutations, primitive whitelist safe/unknown teeth, call-site trusted callbacks, issue-tagged debt mutations)\n")
                (exit 0))
              (begin
                (printf "park/lock checker self-test: FAILED\n")
@@ -2538,7 +2798,17 @@
            (define (add! s) (set! problems (cons s problems)))
            ;; the teeth first: without the runtime half this check is a lint
            (unless self-test-ok?
-             (add! "  CHECKER SELF-TEST FAILED: park, dispatch, checkpoint, or manual-lock mutation was not detected"))
+             (add! "  CHECKER SELF-TEST FAILED: park, dispatch, checkpoint, terminal-lock, or manual-lock mutation was not detected"))
+           (when (= controller-region-count 0)
+             (add! "  TERMINAL LOCK POLICY VACUOUS: checkpoint-controller-mu has no checked acquisition region"))
+           (for-each
+             (lambda (g)
+               (add! (string-append "  TERMINAL LOCK DISPATCH: " g)))
+             terminal-dispatch-got)
+           (for-each
+             (lambda (g)
+               (add! (string-append "  TERMINAL LOCK SECONDARY ACQUISITION: " g)))
+             terminal-acquire-got)
            (for-each
              (lambda (g)
                (add! (string-append "  CHECKPOINT UNDER COUNTED LOCK: " g)))
@@ -2595,13 +2865,13 @@
               (printf "park/lock check: FAILED\n")
               (exit 1))
              (else
-              (printf "park/lock check: passed (~a files, ~a definitions, ~a can park, ~a park allowlist, ~a checkpoint hazards, ~a stored checkpoint capabilities, ~a counted dispatch debts, ~a logical dispatch debts, ~a logical order edges)\n"
+              (printf "park/lock check: passed (~a files, ~a definitions, ~a can park, ~a park allowlist, ~a checkpoint hazards, ~a stored checkpoint capabilities, ~a counted dispatch debts, ~a logical dispatch debts, ~a logical order edges, ~a checkpoint controller terminal regions)\n"
                       (length files) (length units)
                       (vector-length (hashtable-keys parks)) (length park-got)
                       (length checkpoint-got)
                       (length checkpoint-value-got)
                       (length dispatch-got) (length logical-dispatch-got)
-                      (length logical-edges))
+                      (length logical-edges) controller-region-count)
               (exit 0)))))))))
 
 (main (cdr (command-line)))

@@ -1034,7 +1034,9 @@ analysisdebt:
 # It also fails if a switch point stops calling the runtime assertion, so the two
 # halves cannot be removed independently. Known generic-dispatch debt is exact-
 # count and issue-tagged in host/chez/park-lock-known-debt.txt; the park allowlist
-# stays empty.
+# stays empty. Checkpoint controller and recorder mutexes additionally remain
+# terminal: no generic dispatch or secondary lock acquisition may occur beneath
+# either identity.
 parkcheck:
 	@sh host/chez/park-lock-check.sh
 
