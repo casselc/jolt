@@ -10,11 +10,12 @@
 ; Input 1's reducer step parks across public close; a sibling progresses before
 ; it finishes.  Normal and reduced-first histories are both in the reference.
 ;
-; implementation 0 is reference.  1..11 are executable bad histories:
+; implementation 0 is reference.  1..12 are executable bad histories:
 ; concurrent reservation, close-dropped token, early completion, duplicate
 ; completion, stale-token mutation, stuck completed work, duplicate step,
 ; tail-before-head reservation/commit, step-after-reduced, compute under the
-; counted lock, and completion under the counted lock.
+; counted lock, completion under the counted lock, and a foreign claimant that
+; adopts another execution context's reserved token.
 ;
 ; Limits: these are fixed bounded event histories with a stuck internal-progress
 ; control, not a general scheduler or fairness model.  It abstracts values,
@@ -52,10 +53,11 @@
 (declare-const step1-lock-held Bool)
 (declare-const step2-lock-held Bool)
 (declare-const completion-lock-held Bool)
+(declare-const claimant-is-driver Bool)
 (declare-const overlap Bool)
 (declare-const lifecycle-violation Bool)
 
-(assert (! (and (<= 0 implementation) (<= implementation 11))
+(assert (! (and (<= 0 implementation) (<= implementation 12))
            :named implementation-domain))
 
 ; Machine-check the documented -1/0..12 event domain.
@@ -175,6 +177,8 @@
 (assert (! (= step2-lock-held false) :named step2-lock-state))
 (assert (! (= completion-lock-held (= implementation 11))
            :named completion-lock-state))
+(assert (! (= claimant-is-driver (not (= implementation 12)))
+           :named reservation-driver-identity))
 
 ; Invocation overlap is derived from the event intervals, not asserted as an
 ; independent semantic flag.  Intervals are closed while reducer code is live.
@@ -227,8 +231,9 @@
                 ; terminal tokens are inert and no reservation remains
                 (not (= stale-token-mutations 0))
                 (not (= active-final 0))
-                ; leaf-lock boundary
-                step1-lock-held step2-lock-held completion-lock-held))
+                ; leaf-lock and exact-driver boundaries
+                step1-lock-held step2-lock-held completion-lock-held
+                (not claimant-is-driver)))
            :named shared-lifecycle-violation))
 
 ; Reference counterexample: both normal and reduced-first histories are covered.
@@ -271,6 +276,9 @@
 (check-sat) (pop)
 (push) (assert (= implementation 11))
 (assert (! lifecycle-violation :named completion-under-lock-mutant-query))
+(check-sat) (pop)
+(push) (assert (= implementation 12))
+(assert (! lifecycle-violation :named foreign-token-claimant-mutant-query))
 (check-sat) (pop)
 
 ; Non-vacuity: normal FIFO, reduced-tail acceptance, and the parked step / close /

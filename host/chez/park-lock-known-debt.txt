@@ -6,27 +6,4 @@
 # New, increased, decreased, dropped, malformed, duplicate, or untagged findings fail.
 host/chez/atoms.ss jolt-add-watch dispatch jolt-watch-add 2 issue=chucklehead-dev/jolt-aspect-packs#24
 host/chez/atoms.ss jolt-remove-watch dispatch jolt=2 2 issue=chucklehead-dev/jolt-aspect-packs#24
-host/chez/java/async.ss ac-poll! dispatch ac-poll!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss ac-try-give! dispatch ac-try-give!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-close! dispatch ac-close! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-do-alts* dispatch ac-notify! 3 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-do-alts* dispatch ac-poll!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-do-alts* dispatch ac-try-give!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-give/registered dispatch ac-notify! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-give/registered dispatch ac-registration-visible! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-give/registered dispatch ac-try-give!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-put! dispatch ac-notify! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-put! dispatch ac-try-give!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-take! dispatch ac-notify! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-take! dispatch ac-poll!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-take/registered dispatch ac-take-head! 2 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/async.ss jolt-async-take/registered dispatch ac-take-wait 2 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/fibers-async.ss jolt-fiber-<! dispatch ac-notify! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/fibers-async.ss jolt-fiber-<! dispatch ac-poll!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/fibers-async.ss jolt-fiber->! dispatch ac-notify! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/fibers-async.ss jolt-fiber->! dispatch jolt-chan-locked-give! 1 issue=chucklehead-dev/jolt-aspect-packs#21
 host/chez/java/process.ss proc-spawn-fd-level dispatch jolt-with-empty-sigmask 1 issue=chucklehead-dev/jolt-aspect-packs#39
-host/chez/java/sm.ss jolt-sm-fiber-put dispatch ac-notify! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/sm.ss jolt-sm-fiber-put dispatch jolt-chan-locked-give! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/sm.ss jolt-sm-fiber-take dispatch ac-notify! 1 issue=chucklehead-dev/jolt-aspect-packs#21
-host/chez/java/sm.ss jolt-sm-fiber-take dispatch ac-poll!/locked 1 issue=chucklehead-dev/jolt-aspect-packs#21

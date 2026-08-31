@@ -31,7 +31,7 @@ check_spec test/formal/core-async-close-drain.smt2 \
   "P2 close drain / drop control / duplicate-completion control / boundary"
 
 check_spec test/formal/core-async-reducer-reservation.smt2 \
-  "unsat sat sat sat sat sat sat sat sat sat sat sat sat sat sat" \
+  "unsat sat sat sat sat sat sat sat sat sat sat sat sat sat sat sat" \
   "P4a fixed reducer reservation / close / completion histories and progress controls"
 
 check_spec test/formal/core-async-reducer-publication.smt2 \

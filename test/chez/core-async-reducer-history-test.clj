@@ -417,5 +417,132 @@
           (is (= [] (harness-events history))
               "the ex-handler parking failsafe never self-heals the history"))))))
 
+(deftest throwing-ex-handler-retires-transition
+  (testing "an escaping ex-handler cannot strand the active transition token"
+    (let [handler-events (atom [])
+          xf (map (fn [_] (throw (ex-info "step failed" {:where :xrf}))))
+          exh (fn [error]
+                (swap! handler-events conj
+                       {:message (ex-message error) :locks (locks-held)})
+                (throw (ex-info "handler failed" {:where :handler} error)))
+          ch (a/chan 1 xf exh)
+          failure (try
+                    (a/>!! ch :A)
+                    nil
+                    (catch Throwable error error))]
+      (is (= "handler failed" (ex-message failure))
+          "the escaping handler failure reaches the operation that drove it")
+      (is (= [{:message "step failed" :locks 0}] @handler-events)
+          "the handler ran once outside the counted lock")
+      (is (= false (a/offer! ch :after-failure))
+          "cleanup closes the poisoned channel instead of leaving live work")
+      (is (nil? (take-with-timeout ch))
+          "a retired failed token cannot defer EOF forever")
+      (is (nil? (a/close! ch))
+          "close remains idempotent after exceptional cleanup"))))
+
+(deftest same-channel-reentrant-park-fails-fast
+  (testing "a reducer cannot wait behind the transition it owns"
+    (let [seen (promise)
+          nonblocking (promise)
+          ch* (atom nil)
+          xf (map (fn [value]
+                    (deliver nonblocking
+                             [(a/offer! @ch* [:offered value])
+                              (a/alts!! [[@ch* [:alted value]]]
+                                        :default :fallback :priority true)])
+                    ;; This blocking put cannot make progress until the current
+                    ;; step commits.  The runtime must raise before registering
+                    ;; a waiter rather than deadlocking its own transition.
+                    (a/>!! @ch* [:nested value])
+                    value))
+          exh (fn [error]
+                (deliver seen {:message (ex-message error)
+                               :locks (locks-held)})
+                :recovered)
+          ch (a/chan 1 xf exh)]
+      (reset! ch* ch)
+      (is (= true (a/>!! ch :A)))
+      (is (= [nil [:fallback :default]] (await nonblocking))
+          "nonblocking same-channel probes remain ordinary not-ready results")
+      (is (= {:message (str "core.async blocking put: same-channel reentrant "
+                            "operation would park behind its own transducer transition")
+              :locks 0}
+             (await seen))
+          "same-owner detection uses execution context identity outside the lock")
+      (a/close! ch)
+      (is (= [:recovered nil] (drain-n ch 2))
+          "the ex-handler can recover and the transition still completes"))))
+
+(deftest reentrant-alts-fails-before-any-registration
+  (testing "a later same-owner would-park op cannot leak earlier alts entries"
+    (let [other (a/chan 1)
+          ch* (atom nil)
+          seen (promise)
+          xf (map (fn [value]
+                    (a/alts!! [other [@ch* [:nested value]]] :priority true)
+                    value))
+          exh (fn [error]
+                (deliver seen (ex-message error))
+                :recovered)
+          ch (a/chan 1 xf exh)]
+      (reset! ch* ch)
+      (is (= true (a/>!! ch :A)))
+      (is (= (str "core.async alts put: same-channel reentrant operation "
+                  "would park behind its own transducer transition")
+             (await seen)))
+      (is (= true (a/offer! other :probe)))
+      (is (= :probe (a/poll! other))
+          "traffic is not consumed by an earlier leaked alts registration")
+      (a/close! ch)
+      (is (= [:recovered nil] (drain-n ch 2))))))
+
+(deftest transformed-put-callback-honors-placement
+  (testing "on-caller? false stays off-caller after synchronous xrf commit"
+    (let [caller (Thread/currentThread)
+          callback-result (promise)
+          ch (a/chan 1 (map identity))]
+      (is (= true
+             (a/put! ch :A
+                     #(deliver callback-result
+                               {:ok % :thread (Thread/currentThread)})
+                     false)))
+      (let [{:keys [ok thread]} (deref callback-result drain-ms timed-out)]
+        (is (= true ok))
+        (is (not (identical? caller thread))
+            "the transformed immediate branch uses the async callback dispatcher"))
+      (a/close! ch)
+      (is (= [:A nil] (drain-n ch 2))))))
+
+(deftest pending-handler-failure-acks-and-retires-without-poisoning-taker
+  (testing "an incidental admitting take reports internally but keeps its value"
+    (let [xf (fn [rf]
+               (fn
+                 ([] (rf))
+                 ([result] result)
+                 ([result input]
+                  (if (= input :A)
+                    (do
+                      (rf result :partial)
+                      (throw (ex-info "pending step failed" {})))
+                    (rf result input)))))
+          exh (fn [_] (throw (ex-info "pending handler failed" {})))
+          ch (a/chan 1 xf exh)
+          ack-count (atom 0)
+          ack (promise)]
+      (is (= true (a/>!! ch :seed)))
+      (is (= true (a/put! ch :A #(do (swap! ack-count inc) (deliver ack %)))))
+      (let [take-result @(future
+                           (try {:value (a/<!! ch)}
+                                (catch Throwable error
+                                  {:error (ex-message error)})))]
+        (is (= {:value :seed} take-result)
+            "the pending handler failure does not escape through the admitting take"))
+      (is (= true (deref ack drain-ms timed-out)))
+      (is (= 1 @ack-count) "the admitted producer is acknowledged exactly once")
+      (is (nil? (take-with-timeout ch))
+          "the partial staged prefix is discarded and failed work cannot delay EOF")
+      (is (= false (a/offer! ch :after-failure))))))
+
 (let [result (run-tests 'core-async-reducer-history-test)]
   (System/exit (if (zero? (+ (:fail result) (:error result))) 0 1)))

@@ -178,5 +178,86 @@
         (and (null? (async-chan-alt-putters ch))
              (null? (async-chan-alt-takers ch))))))
 
+;; The private registered! hooks are the deterministic "the waiter is visible"
+;; seam used by race tests.  They are arbitrary caller code, so visibility must
+;; be committed under the channel mutex and the hook itself invoked after unlock,
+;; before the operation waits.
+(let ((ch (jolt-async-chan 1))
+      (registered-depth #f)
+      (put-result 'pending))
+  (jolt-async-give ch 'seed)
+  (fork-thread
+   (lambda ()
+     (set! put-result
+       (jolt-async-give/registered
+        ch 'tail (lambda () (set! registered-depth (jolt-locks-held)))))))
+  (ok "private put registered hook fires before the operation can finish"
+      (and (wait-until (lambda () registered-depth) 2.0)
+           (eq? put-result 'pending)))
+  (ok "private put registered hook runs outside the counted channel lock"
+      (eqv? registered-depth 0))
+  (ok "registered put remains live after its hook"
+      (and (eq? (jolt-async-take ch) 'seed)
+           (wait-until (lambda () (not (eq? put-result 'pending))) 2.0)
+           (eq? put-result #t)
+           (eq? (jolt-async-take ch) 'tail))))
+
+(let ((ch (jolt-async-chan 1))
+      (registered-depth #f)
+      (take-result 'pending))
+  (fork-thread
+   (lambda ()
+     (set! take-result
+       (jolt-async-take/registered
+        ch (lambda () (set! registered-depth (jolt-locks-held)))))))
+  (ok "private take registered hook fires before the operation can finish"
+      (and (wait-until (lambda () registered-depth) 2.0)
+           (eq? take-result 'pending)))
+  (ok "private take registered hook runs outside the counted channel lock"
+      (eqv? registered-depth 0))
+  (jolt-async-give ch 'wake)
+  (ok "registered take remains live after its hook"
+      (and (wait-until (lambda () (not (eq? take-result 'pending))) 2.0)
+           (eq? take-result 'wake))))
+
+;; A reservation belongs to the operation that made it.  Force that operation
+;; to pause after unlock but before drive, then let another execution context
+;; attempt a drive.  Channel-global scanning incorrectly lets the second context
+;; run the first operation's user code.
+(let ((ch (jolt-async-chan 1))
+      (original-drive ac-drive-xrf!)
+      (driver-id #f)
+      (driver-at-boundary? #f)
+      (release-driver? #f)
+      (xrf-owner #f)
+      (put-result 'pending))
+  (async-chan-xrf-set!
+   ch (lambda args
+        (when (pair? args)
+          (set! xrf-owner (jolt-execution-context-identity)))
+        ch))
+  (set! ac-drive-xrf!
+    (lambda (target work)
+      (if (and (eq? target ch)
+               (eq? driver-id (jolt-execution-context-identity)))
+          (begin
+            (set! driver-at-boundary? #t)
+            (wait-until (lambda () release-driver?) 2.0)
+            (original-drive target work))
+          (original-drive target work))))
+  (fork-thread
+   (lambda ()
+     (set! driver-id (jolt-execution-context-identity))
+     (set! put-result (jolt-async-give ch 'owned))))
+  (ok "reserving put reaches the forced post-unlock drive boundary"
+      (wait-until (lambda () driver-at-boundary?) 2.0))
+  ;; This is deliberately a different execution context.
+  (original-drive ch (async-chan-xrf-work ch))
+  (set! release-driver? #t)
+  (ok "only the reserving execution context invokes the reducer"
+      (and (wait-until (lambda () (not (eq? put-result 'pending))) 2.0)
+           (eq? xrf-owner driver-id)))
+  (set! ac-drive-xrf! original-drive))
+
 (printf "\nasync alts order: ~a assertions, ~a failures\n" total fails)
 (exit (if (= fails 0) 0 1))

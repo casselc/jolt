@@ -39,19 +39,6 @@
 ;; A waiter handler whose wake is fiber f — the fiber-wake strategy.
 (define (jolt-fiber-waiter f) (alt-handler-alloc f))
 
-;; ac-try-give!/locked can THROW — a nil value, or a transducer step raising — and
-;; this path holds the channel mutex BY HAND, because it has to be able to release
-;; it before parking and with-mutex cannot do that. A throw would otherwise escape
-;; with the mutex held and deadlock every later op on that channel.
-;; jolt-async-give is unaffected: its with-mutex releases on the unwind.
-;;
-;; The guard is CONDITIONAL because guard costs a call/cc per entry and this sits
-;; on every fiber put. Both callers run async-check-put! before taking the mutex
-;; (that hoist is what makes this safe — do not remove it), so with the nil check
-;; already done the only thrower left inside ac-try-give!/locked is the transducer
-;; step; the rest is a buffer push and a notify. A channel with no xform cannot
-;; raise here and does not pay for the frame. The redundant async-check-put! that
-;; ac-try-give!/locked still does is left alone: it guards the OTHER callers.
 ;; --- holding a channel mutex against preemption -----------------------------
 ;; async.ss states the R3 invariant: never yield while holding a channel mutex,
 ;; because a fiber that suspends holding it strands every later op on that
@@ -78,30 +65,32 @@
 (define (jolt-chan-unlock! ch) (jolt-unlock! (async-chan-mu ch)))
 
 (define (jolt-chan-locked-give! ch v)
-  (if (async-chan-xrf ch)
-      (guard (e (#t (jolt-chan-unlock! ch) (raise e)))
-        (ac-try-give!/locked ch v))
-      (ac-try-give!/locked ch v)))
+  (ac-try-give!/locked ch v))
 
 ;; (jolt-fiber-<! ch) -> value | nil (closed). Fiber-side take: a buffered
 ;; value, a waiting putter, or a closed channel complete immediately (no
 ;; capture); an empty open channel registers an alt-taker and parks.
 (define (jolt-fiber-<! ch)
   (jolt-chan-lock! ch)
-  (let ((r (ac-poll!/locked ch)))
+  (let* ((before (async-chan-xrf-work ch))
+         (r (ac-poll!/locked ch)))
     (if (eq? r ac-poll-empty)
         (let ((h (jolt-fiber-waiter (jolt-current-fiber))))
+          (when (ac-active-owner? ch)
+            (jolt-chan-unlock! ch)
+            (ac-reentrant-would-park! "core.async fiber take" ch))
           (async-chan-alt-takers-set! ch (append (async-chan-alt-takers ch) (list h)))
           (ac-notify! ch)
+          (let ((work (ac-new-work-since/locked ch before)))
+            (jolt-chan-unlock! ch)
+            (ac-drive-xrf! ch work))
           (if (vector-ref (alt-handler-mailbox h) 0)
-              (let ((v (vector-ref (alt-handler-mailbox h) 1)))
-                (jolt-chan-unlock! ch)
-                v)
-              (begin
-                (jolt-chan-unlock! ch)
-                (vector-ref (jolt-fiber-waiter-wait! h) 1))))
+              (vector-ref (alt-handler-mailbox h) 1)
+              (vector-ref (jolt-fiber-waiter-wait! h) 1)))
         (begin
-          (jolt-chan-unlock! ch)
+          (let ((work (ac-new-work-since/locked ch before)))
+            (jolt-chan-unlock! ch)
+            (ac-drive-xrf! ch work))
           r))))
 
 ;; (jolt-fiber->! ch v) -> #t | #f (closed). Fiber-side put: room or a waiting
@@ -110,22 +99,28 @@
 (define (jolt-fiber->! ch v)
   (async-check-put! v)                   ; throws — keep it outside the mutex
   (jolt-chan-lock! ch)
-  (let ((r (jolt-chan-locked-give! ch v)))
+  (let* ((before (async-chan-xrf-work ch))
+         (r (jolt-chan-locked-give! ch v)))
     (cond
-      ((eq? r 'ok) (jolt-chan-unlock! ch) #t)
+      ((or (eq? r 'ok) (eq? r 'xrf-work))
+       (let ((work (ac-new-work-since/locked ch before)))
+         (jolt-chan-unlock! ch) (ac-drive-xrf! ch work) #t))
       ((eq? r 'closed) (jolt-chan-unlock! ch) #f)
+      ((eq? r 'reentrant)
+       (jolt-chan-unlock! ch)
+       (ac-reentrant-would-park! "core.async fiber put" ch)
+       #f)
       (else
        (let ((h (jolt-fiber-waiter (jolt-current-fiber))))
          (async-chan-alt-putters-set! ch
            (append (async-chan-alt-putters ch) (list (cons h v))))
          (ac-notify! ch)
+         (let ((work (ac-new-work-since/locked ch before)))
+           (jolt-chan-unlock! ch)
+           (ac-drive-xrf! ch work))
            (if (vector-ref (alt-handler-mailbox h) 0)
-               (let ((ok (vector-ref (alt-handler-mailbox h) 1)))
-                 (jolt-chan-unlock! ch)
-                 ok)
-              (begin
-                (jolt-chan-unlock! ch)
-                (vector-ref (jolt-fiber-waiter-wait! h) 1))))))))
+               (vector-ref (alt-handler-mailbox h) 1)
+               (vector-ref (jolt-fiber-waiter-wait! h) 1)))))))
 
 ;; The fiber wakeup strategy — alt-deliver! dispatches through this hook so
 ;; async.ss (loaded before fibers.ss) never forward-references a fiber

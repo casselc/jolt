@@ -1434,7 +1434,7 @@
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [caller (Thread/currentThread) c (a/chan) taken (promise) _ (a/take! c #(deliver taken %) true) callback-thread (promise) _ (a/put! c :value (fn [_] (deliver callback-thread (Thread/currentThread))) true) observed (deref callback-thread 1000 :timed-out)] [(identical? caller observed) (deref taken 1000 :timed-out)]))" :expected "[true :value]"}
   ;; A parked unbuffered taker reserves exactly one rendezvous. A second fast
   ;; offer cannot leave a residual value buffered on a capacity-zero channel.
-  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a] '[jolt.scheme :as s]) (let [c (a/chan) taken (future (a/<!! c)) registered? (loop [n 100] (if (pos? (s/call \"async-chan-takew\" c)) true (if (zero? n) false (do (Thread/sleep 5) (recur (dec n)))))) offers [(a/offer! c :a) (a/offer! c :b)] value (deref taken 1000 :timed-out)] [registered? offers value (a/poll! c)]))" :expected "[true [true nil] :a nil]"}
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a] '[jolt.scheme :as s]) (let [c (a/chan) taken (future (a/<!! c)) registered? (loop [n 100] (if (s/call \"ac-active-taker?\" c) true (if (zero? n) false (do (Thread/sleep 5) (recur (dec n)))))) offers [(a/offer! c :a) (a/offer! c :b)] value (deref taken 1000 :timed-out)] [registered? offers value (a/poll! c)]))" :expected "[true [true nil] :a nil]"}
   ;; close is logically ordered after puts already admitted before it. A pending
   ;; fixed-buffer put must survive close, complete only after room is released,
   ;; and remain drainable before the channel yields nil.

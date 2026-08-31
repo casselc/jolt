@@ -250,21 +250,26 @@
 
 (define (jolt-sm-fiber-take f ch k)
   (jolt-chan-lock! ch)
-  (let ((r (ac-poll!/locked ch)))
+  (let* ((before (async-chan-xrf-work ch))
+         (r (ac-poll!/locked ch)))
     (if (eq? r ac-poll-empty)
         (let ((h (jolt-fiber-waiter f)))
+          (when (ac-active-owner? ch)
+            (jolt-chan-unlock! ch)
+            (ac-reentrant-would-park! "core.async state-machine take" ch))
           (async-chan-alt-takers-set! ch (append (async-chan-alt-takers ch) (list h)))
           (ac-notify! ch)
+          (let ((work (ac-new-work-since/locked ch before)))
+            (jolt-chan-unlock! ch)
+            (ac-drive-xrf! ch work))
           (if (vector-ref (alt-handler-mailbox h) 0)
-              (let ((v (vector-ref (alt-handler-mailbox h) 1)))
-                (jolt-chan-unlock! ch)
-                (jolt-invoke k v))
-              (begin
-                (jolt-chan-unlock! ch)
-                (jolt-sm-commit!
-                 f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))
+              (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1))
+              (jolt-sm-commit!
+               f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1))))))
         (begin
-          (jolt-chan-unlock! ch)
+          (let ((work (ac-new-work-since/locked ch before)))
+            (jolt-chan-unlock! ch)
+            (ac-drive-xrf! ch work))
           (jolt-invoke k r)))))
 
 (define (jolt-sm-put ch v k)
@@ -278,23 +283,30 @@
   ;; the nil check BEFORE the mutex: it throws, and this path releases by hand
   (async-check-put! v)
   (jolt-chan-lock! ch)
-  (let ((r (jolt-chan-locked-give! ch v)))
+  (let* ((before (async-chan-xrf-work ch))
+         (r (jolt-chan-locked-give! ch v)))
     (cond
-      ((eq? r 'ok) (jolt-chan-unlock! ch) (jolt-invoke k #t))
+      ((or (eq? r 'ok) (eq? r 'xrf-work))
+       (let ((work (ac-new-work-since/locked ch before)))
+         (jolt-chan-unlock! ch)
+         (ac-drive-xrf! ch work))
+       (jolt-invoke k #t))
       ((eq? r 'closed) (jolt-chan-unlock! ch) (jolt-invoke k #f))
+      ((eq? r 'reentrant)
+       (jolt-chan-unlock! ch)
+       (ac-reentrant-would-park! "core.async state-machine put" ch))
       (else
        (let ((h (jolt-fiber-waiter f)))
          (async-chan-alt-putters-set! ch
            (append (async-chan-alt-putters ch) (list (cons h v))))
          (ac-notify! ch)
+         (let ((work (ac-new-work-since/locked ch before)))
+           (jolt-chan-unlock! ch)
+           (ac-drive-xrf! ch work))
          (if (vector-ref (alt-handler-mailbox h) 0)
-             (let ((ok (vector-ref (alt-handler-mailbox h) 1)))
-               (jolt-chan-unlock! ch)
-               (jolt-invoke k ok))
-             (begin
-               (jolt-chan-unlock! ch)
-               (jolt-sm-commit!
-                f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))))))
+             (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1))
+             (jolt-sm-commit!
+              f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1))))))))))
 
 (cca-def! "__sm-spawn" jolt-sm-spawn)
 (cca-def! "__sm-take" jolt-sm-take)

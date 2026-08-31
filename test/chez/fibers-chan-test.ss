@@ -170,13 +170,16 @@
 (ok "4. putter completed" (eq? (jolt-fiber-result f4p) #t))
 
 ;; --- 5. a thread blocked on an empty channel wakes when a fiber puts ---------
-;; The thread's take is a takew waiter; the fiber's >! sees takew > 0 and
-;; completes immediately (no capture) via the rendezvous push + broadcast.
+;; The blocking thread and fiber use the same active alt-taker waiter protocol,
+;; so the fiber's >! completes immediately without capturing a continuation.
 (printf "\n== 5. thread blocked on empty, fiber puts ==\n")
 (define ch5 (jolt-async-chan))
 (define t5-val 'unset)
 (fork-thread (lambda () (set! t5-val (jolt-async-take ch5))))
-(wait-until (lambda () (> (async-chan-takew ch5) 0)) 5.0 "thread blocked in take")
+(wait-until (lambda ()
+              (jolt-with-mutex (async-chan-mu ch5)
+                (ac-active-taker?/locked ch5)))
+            5.0 "thread blocked in take")
 (define p5 (jolt-fiber-chan-parks))
 (define f5 (sa-fiber-spawn (lambda () (jolt-fiber->! ch5 44))))
 (sa-fiber-run-all)
@@ -230,7 +233,7 @@
 (ok "6a. no extra captures" (= (jolt-fiber-chan-parks) p6))
 
 ;; --- 6b. N fiber-putters, M thread-takers: exactly once -----------------------
-;; Threads block in take (takew); a fiber put either completes immediately
+;; Threads block as alt-takers; a fiber put either completes immediately
 ;; against a waiting taker or parks as an alt-putter that a take drains. Either
 ;; way every value lands in exactly one take.
 (printf "\n== 6b. N fiber-putters, M thread-takers: exactly once ==\n")
@@ -263,7 +266,10 @@
 (define ch7b (jolt-async-chan))
 (define t7-val 'unset)
 (fork-thread (lambda () (set! t7-val (jolt-async-take ch7b))))
-(wait-until (lambda () (> (async-chan-takew ch7b) 0)) 5.0 "thread blocked in take")
+(wait-until (lambda ()
+              (jolt-with-mutex (async-chan-mu ch7b)
+                (ac-active-taker?/locked ch7b)))
+            5.0 "thread blocked in take")
 (define f7b (sa-fiber-spawn (lambda () (jolt-async-close! ch7b) 'closed)))
 (sa-fiber-run-all)
 (wait-until (lambda () (not (eq? t7-val 'unset))) 5.0 "thread woke with nil")
