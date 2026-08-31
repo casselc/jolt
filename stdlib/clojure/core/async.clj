@@ -431,17 +431,10 @@
 
 ;; --- alts -------------------------------------------------------------------
 ;; do-alts uses a per-call handler registered on each channel (no poll loop).
-;; The __do-alts host primitive handles the fast pass, registration, wait, and
-;; unregistration atomically under per-channel locks.
-
-(defn- alt-attempt [port]
-  (if (vector? port)
-    (let [ch (nth port 0) v (nth port 1)]
-      (assert (some? v) "Can't put nil on channel")
-      (let [r (clojure.core.async/__offer! ch v)]
-        (when (some? r) [r ch])))
-    (let [r (clojure.core.async/__poll! port)]
-      (when (not= r ::none) [r port]))))
+;; The __do-alts host primitive owns the one fast pass, :default decision,
+;; registration, wait, and unregistration atomically under per-channel locks.
+;; Its 2-arg arity remains the blocking native compatibility seam; the 3-arg
+;; arity means that a default was supplied (including nil or false).
 
 (defn do-alts
   "Returns [val port] for the first ready op among ports. ports is a vector of
@@ -451,21 +444,15 @@
   (assert (pos? (count ports)) "alts must have at least one channel operation")
   (let [ports (vec ports)
         has-default (contains? opts :default)]
-    ;; one fast non-blocking scan for :default support
-    (let [n (count ports)
-          order (if (:priority opts)
-                  (vec (range n))
-                  (shuffle (range n)))
-          hit (loop [k 0]
-                (when (< k n)
-                  (let [i (nth order k)]
-                    (or (alt-attempt (nth ports i))
-                        (recur (inc k))))))]
-      (if hit
-        hit
-        (if has-default
-          [(:default opts) :default]
-          (clojure.core.async/__do-alts ports (boolean (:priority opts))))))))
+    ;; Validate the complete operation set before the native fast pass can
+    ;; consume from, or publish to, any earlier ready port. Validation during
+    ;; traversal makes failure order-dependent and can mutate before throwing.
+    (doseq [port ports]
+      (when (vector? port)
+        (assert (some? (nth port 1)) "Can't put nil on channel")))
+    (if has-default
+      (clojure.core.async/__do-alts ports (boolean (:priority opts)) (:default opts))
+      (clojure.core.async/__do-alts ports (boolean (:priority opts))))))
 
 (defn alts!!
   "Completes at most one of several channel operations. ports is a vector of take

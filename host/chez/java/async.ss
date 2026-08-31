@@ -938,9 +938,11 @@
 (def-var! "clojure.core.async" "go-monitor" jolt-go-monitor-chan)
 
 ;; --- alts! entry point -------------------------------------------------------
-;; (__do-alts ports priority?) — ports is a jolt vector of channels or [ch val]
-;; put specs. Returns a jolt vector [val port]. priority? is a boolean: #t
-;; scans in declared order; #f uses a fresh Fisher-Yates permutation.
+;; (__do-alts ports priority? [default]) — ports is a jolt vector of channels or
+;; [ch val] put specs. Returns a jolt vector [val port]. priority? is a boolean:
+;; #t scans in declared order; #f uses a fresh Fisher-Yates permutation. The
+;; optional third argument means a default was supplied; its value may itself be
+;; nil or false. The 2-arg form remains the blocking compatibility seam.
 ;; LOCK ORDER: channel mu → fmu → wmu. Never hold two channel mutexes at once.
 (define (alts-index-order n priority?)
   (let ((order (make-vector n)))
@@ -958,8 +960,25 @@
             (shuffle (fx- i 1))))))
     order))
 
-(define (jolt-async-do-alts ports priority?)
+;; Direct callers of the native compatibility seam do not pass through the
+;; overlay's public validation. Validate every put spec before the fast pass can
+;; mutate an earlier ready operation, so failure is independent of traversal
+;; order here as well.
+(define (alts-validate-ports! ports n)
+  (let loop ((i 0))
+    (when (fx<? i n)
+      (let ((port (pvec-nth-d ports i jolt-nil)))
+        (when (pvec? port)
+          (async-check-put! (pvec-nth-d port 1 jolt-nil))))
+      (loop (fx+ i 1)))))
+
+(define (jolt-async-do-alts* ports priority? has-default? default-value)
   (let* ((n (pvec-count ports))
+         (_nonempty
+          (when (fx=? n 0)
+            (throw-jvm (quote IllegalArgumentException)
+                       "alts must have at least one channel operation")))
+         (_ (alts-validate-ports! ports n))
          (order (alts-index-order n priority?))
          (idx-of (lambda (k) (vector-ref order k))))
     ;; FAST PASS: one non-blocking attempt per op, no handler. Consumption here IS
@@ -977,6 +996,10 @@
                   (if (eq? r ac-poll-empty)
                       (fast-loop (fx+ k 1))
                       (jolt-vector r port)))))
+          ;; A supplied default is decided here, after the sole fast pass and
+          ;; before allocating or registering a handler.
+          (if has-default?
+              (jolt-vector default-value (keyword #f "default"))
           ;; No fast hit — one shared handler across all ports. Per op, under the
           ;; channel mutex: compute readiness with NO side effects; if ready, CLAIM
           ;; FIRST, then consume (a failed claim means a deliverer on an earlier
@@ -1095,7 +1118,14 @@
                             (cond
                               ((eq? res 'registered) (reg-loop (fx+ j 1)))
                               ((eq? res 'lost) (await))
-                              (else (finish (car res) (cdr res)))))))))))))))
+                              (else (finish (car res) (cdr res))))))))))))))))
+
+(define jolt-async-do-alts
+  (case-lambda
+    ((ports priority?)
+     (jolt-async-do-alts* ports priority? #f jolt-nil))
+    ((ports priority? default-value)
+     (jolt-async-do-alts* ports priority? #t default-value))))
 
 ;; --- macros (expander fns over the reader forms) ----------------------------
 ;; go / go-loop are deliberately absent. They used to expand here, to a bare

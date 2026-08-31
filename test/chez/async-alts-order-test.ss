@@ -2,9 +2,10 @@
 ;;
 ;; The ordinary fairness test is necessarily satisfied by the fast pass. This
 ;; gate instruments pvec-nth-d in an isolated process, sends __do-alts through
-;; its empty-channel registration path, and records both traversals of the exact
-;; ports vector. It therefore rejects a sequential or random-cyclic registration
-;; pass even when the fast pass remains a full Fisher-Yates shuffle.
+;; its empty-channel registration path, and records all three traversals of the
+;; exact ports vector: declared-order validation, then the fast and registration
+;; passes in one shared Fisher-Yates order. It rejects a sequential, random-cyclic,
+;; or independently reshuffled registration pass.
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
 
@@ -54,6 +55,11 @@
 (define (contains-list? xss xs)
   (ormap (lambda (candidate) (equal? xs candidate)) xss))
 (define (cyclic? xs) (contains-list? cyclic-orders xs))
+(define (valid-traversals? validation-order fast-order registration-order)
+  (and (equal? validation-order expected-indices)
+       (permutation? fast-order)
+       (permutation? registration-order)
+       (equal? fast-order registration-order)))
 (define (distinct-count xss)
   (length
     (fold-left (lambda (seen xs)
@@ -76,16 +82,17 @@
       (lambda ()
         (*txn* #f)
         (set! result (jolt-async-do-alts ports #f))))
-    ;; Four fast-pass reads followed by four registration-pass reads occur before
-    ;; the worker parks. A timeout is a failure, never an unbounded gate hang.
-    (unless (wait-until (lambda () (>= (length (observations-snapshot)) 8)) 3.0)
+    ;; Four validation reads, four fast-pass reads, then four registration-pass
+    ;; reads occur before the worker parks. A timeout is a failure, never an
+    ;; unbounded gate hang.
+    (unless (wait-until (lambda () (>= (length (observations-snapshot)) 12)) 3.0)
       (set! trials-completed? #f))
     (let ((seen (observations-snapshot)))
-      (when (>= (length seen) 8)
-        (let ((fast-order (list-head seen 4))
-              (registration-order (list-head (list-tail seen 4) 4)))
-          (unless (and (permutation? fast-order)
-                       (permutation? registration-order))
+      (when (>= (length seen) 12)
+        (let ((validation-order (list-head seen 4))
+              (fast-order (list-head (list-tail seen 4) 4))
+              (registration-order (list-head (list-tail seen 8) 4)))
+          (unless (valid-traversals? validation-order fast-order registration-order)
             (set! traversals-valid? #f))
           (set! registration-orders
                 (cons registration-order registration-orders)))))
@@ -99,8 +106,10 @@
 
 (printf "\n== core.async alts registration order ==\n")
 (ok "all registration trials completed" trials-completed?)
-(ok "fast and registration traversals are complete permutations"
+(ok "validation is declared-order; fast and registration share one permutation"
     (and traversals-valid? (= (length registration-orders) 48)))
+(ok "independent-registration-order mutation is rejected"
+    (not (valid-traversals? '(0 1 2 3) '(2 0 3 1) '(0 2 1 3))))
 (ok "registration uses non-cyclic permutations"
     (ormap (lambda (xs) (not (cyclic? xs))) registration-orders))
 (ok "registration explores more than cyclic rotations"

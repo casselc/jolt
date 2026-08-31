@@ -24,8 +24,8 @@
 ;; deliberately stops at compile-eval.ss (no loader), so the overlay names
 ;; (alts!, poll!) are brought in explicitly: the gate loads
 ;; stdlib/clojure/core/async.clj via load-string ONCE, up front — the same
-;; host+overlay combination the production loader always has — because the
-;; :default shortcut exists only in the overlay's do-alts and has no host seam.
+;; host+overlay combination the production loader always has — including the
+;; public opts translation that selects __do-alts's native default-aware arity.
 ;; The overlay is additive (it wraps host seams, never redefines a host
 ;; binding), so loading it first changes nothing for the host-seam sections. It
 ;; is also where `go` and `go-loop` are DEFINED — the host provides go-spawn and
@@ -358,11 +358,10 @@
 (ok "7b. :priority true picks the first port"
     (jolt=2 (jv-nth r7b 0) (keyword #f "pa")))
 
-;; 7c. :default — the immediate-return shortcut lives only in the overlay's
-;; do-alts (the host seam has no default argument); the overlay is loaded up
-;; front (see top), so alts! here is the real production function. It must
-;; return [default :default] immediately and register nothing on either
-;; channel (checked via the waiter lists).
+;; 7c. :default — the overlay translates the public opts map into the native
+;; __do-alts default-aware arity. The native seam owns the sole readiness scan
+;; and default decision. The production function must return [default :default]
+;; immediately and register nothing on either channel (checked via waiter lists).
 (define r7c (ev "(let [a (chan) b (chan)
                      r (alts! [a b] :default :none)]
                   [r a b])"))

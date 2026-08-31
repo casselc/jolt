@@ -1348,6 +1348,15 @@
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) f (future (a/<!! c))] (Thread/sleep 50) (let [[v p] (a/alts!! [[c :y]])] (if (= p c) [v @f] :timeout))))" :expected "[true :y]"}
   ;; 5. :default returns immediately when nothing ready
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan)] (a/alts!! [c] :default :fallback)))" :expected "[:fallback :default]"}
+  ;; Native __do-alts owns both readiness and :default. Rebinding the old overlay
+  ;; scan primitives to throw gives this regression a red arm: the pre-fix
+  ;; do-alts calls one of them before it reaches the native seam.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [take-ch (a/chan 1) put-ch (a/chan 1) empty-ch (a/chan) empty-ch-2 (a/chan) _ (a/>!! take-ch :take) results (with-redefs [a/__poll! (fn [_] (throw (ex-info \"overlay poll scan\" {}))) a/__offer! (fn [_ _] (throw (ex-info \"overlay offer scan\" {})))] [(a/alts!! [take-ch] :default :fallback) (a/alts!! [[put-ch :put]] :default :fallback) (a/alts!! [empty-ch] :default false) (a/alts!! [empty-ch-2] :default nil)])] [[(first (results 0)) (= take-ch (second (results 0)))] [(first (results 1)) (= put-ch (second (results 1))) (a/<!! put-ch)] (results 2) (results 3)]))" :expected "[[:take true] [true true :put] [false :default] [nil :default]]"}
+  ;; Portable red/green reproducer for fail-before-mutation validation. On the
+  ;; old implementation the ready first take is consumed before the later nil
+  ;; put is visited, yielding [:no-throw nil]; JVM core.async and this repair
+  ;; throw while leaving :kept available.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [ready (a/chan 1) other (a/chan) _ (a/>!! ready :kept)] (try (a/alts!! [ready [other nil]] :priority true) [:no-throw (a/poll! ready)] (catch AssertionError _ [:threw (a/poll! ready)]))))" :expected "[:threw :kept]"}
   ;; 6. :priority true picks first ready port in declared order
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c1 (a/chan 1) c2 (a/chan 1)] (a/>!! c1 :a) (a/>!! c2 :b) (let [[v p] (a/alts!! [c1 c2] :priority true)] [v (if (= p c1) :c1 :c2)])))" :expected "[:a :c1]"}
   ;; 7. close! wakes parked alts take with nil
@@ -1363,9 +1372,8 @@
   ;; split). The broad bound rejects that algorithm without demanding flaky
   ;; perfect uniformity.
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [cs (vec (repeatedly 4 #(a/chan 1))) _ (a/>!! (cs 0) :a) _ (a/>!! (cs 1) :b) counts (loop [i 0 m {:a 0 :b 0}] (if (= i 2000) m (let [[v _] (a/alts!! cs)] (a/>!! (if (= v :a) (cs 0) (cs 1)) v) (recur (inc i) (update m v inc)))))] (and (< 700 (:a counts) 1300) (< 700 (:b counts) 1300))))" :expected "true"}
-  ;; Bypass the Clojure fast pass so the native __do-alts permutation has its
-  ;; own falsification control. Both ready ports must be selected uniformly even
-  ;; when followed by two empty ports.
+  ;; Directly exercise the 2-arg native compatibility seam. Both ready ports
+  ;; must be selected uniformly even when followed by two empty ports.
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [cs (vec (repeatedly 4 #(a/chan 1))) _ (a/>!! (cs 0) :a) _ (a/>!! (cs 1) :b) counts (loop [i 0 m {:a 0 :b 0}] (if (= i 2000) m (let [[v _] (a/__do-alts cs false)] (a/>!! (if (= v :a) (cs 0) (cs 1)) v) (recur (inc i) (update m v inc)))))] (and (< 700 (:a counts) 1300) (< 700 (:b counts) 1300))))" :expected "true"}
   ;; 10. mult/tap smoke — proves the dataflow layer still works
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) m (a/mult c) t1 (a/chan) t2 (a/chan)] (a/tap m t1) (a/tap m t2) (a/>!! c :x) [(a/<!! t1) (a/<!! t2)]))" :expected "[:x :x]"}

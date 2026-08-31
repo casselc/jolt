@@ -96,7 +96,7 @@ export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asynctimer atomicnumeric checkpoint-erasure checkpoint-runtime checkpoints effects futurehost buildlibsmoke buildsmoke \
+  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asyncaltsownership asynctimer atomicnumeric checkpoint-erasure checkpoint-runtime checkpoints effects futurehost buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
@@ -108,7 +108,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   spitatomic taggedmethods threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
+.PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke asyncaltsownership \
         atomicnumeric futurehost coreasyncproof lazyonceproof logicalmutexproof extensions regexcache spitatomic \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
@@ -314,6 +314,10 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 	@$(CHEZ) --script test/chez/async-alts-order-test.ss
+	@$(CHEZ) --script test/chez/async-alts-ownership-test.ss
+
+asyncaltsownership:
+	@$(CHEZ) --script test/chez/async-alts-ownership-test.ss
 
 # Bounded safety/progress proofs for the core.async waiter protocol. Each model
 # must reject its reference counterexample while accepting both a known-bad
