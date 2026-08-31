@@ -7,7 +7,7 @@ repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 chez=${CHEZ:?CHEZ must name the pinned Chez 10.4.1 executable}
 status=0
 
-for history in fiber threads membership duplicate rounds reset cancel-break; do
+for history in fiber threads membership unique-actor rounds controller-held fault reset cancel-break; do
   echo "== checkpoint barrier RED history: $history =="
   if timeout 10s "$chez" --script "$repo/test/chez/checkpoint-barrier-red-test.ss" "$history"; then
     :

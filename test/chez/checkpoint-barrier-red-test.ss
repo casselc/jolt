@@ -30,6 +30,7 @@
 (define kw-barriers (keyword "jolt.checkpoint" "barriers"))
 (define kw-trace (keyword #f "trace"))
 (define kw-next-seq (keyword #f "next-seq"))
+(define kw-generation (keyword #f "generation"))
 (define kw-seq (keyword #f "seq"))
 (define kw-actor (keyword #f "actor"))
 (define kw-id (keyword #f "id"))
@@ -38,6 +39,17 @@
 (define kw-barrier (keyword #f "barrier"))
 (define kw-continue (keyword #f "continue"))
 (define kw-cancel (keyword #f "cancel"))
+(define kw-fault (keyword #f "fault"))
+(define kw-reset (keyword #f "reset"))
+(define kw-barrier-broken (keyword #f "barrier-broken"))
+(define kw-error-type (keyword "jolt.checkpoint" "type"))
+(define kw-error-generation (keyword "jolt.checkpoint" "generation"))
+(define kw-error-seq (keyword "jolt.checkpoint" "seq"))
+(define kw-error-actor (keyword "jolt.checkpoint" "actor"))
+(define kw-error-id (keyword "jolt.checkpoint" "id"))
+(define kw-error-hit (keyword "jolt.checkpoint" "hit"))
+(define kw-error-barrier-id (keyword "jolt.checkpoint" "barrier-id"))
+(define kw-error-reason (keyword "jolt.checkpoint" "reason"))
 
 (define (snapshot) (jolt-checkpoint-snapshot))
 (define (trace-of s) (jolt-get s kw-trace))
@@ -48,10 +60,14 @@
   (jolt-vector actor site hit))
 
 ;; V1 keeps the occurrence plan flat and inert.  The separate barrier table
-;; maps one explicit barrier ID to its exact selector vector.  Consequently a
+;; maps one explicit barrier ID to its exact selector vector.  Installation
+;; must validate the complete table and preallocate every immutable,
+;; generation-owned round object while checkpoint-controller-mu is held.  A
 ;; round is [generation barrier-id], selectors may name distinct sites, every
 ;; :barrier selector has exactly one group, and membership cannot be inferred
-;; from timing or a site's local hit count.
+;; from timing or a site's local hit count.  Arrival and wait must use only the
+;; preallocated round mutex plus the actor recorder/clock; reset gathers the
+;; generation's preallocated round table while it owns the controller mutex.
 (define (manifest entries groups)
   (jolt-hash-map
     kw-version 1
@@ -80,6 +96,38 @@
        (string=? site (jolt-get event kw-id))
        (= hit (jolt-get event kw-hit))
        (= seq (jolt-get event kw-seq))))
+
+(define (event-matches? event action actor site hit)
+  (and (eq? action (jolt-get event kw-action))
+       (string=? actor (jolt-get event kw-actor))
+       (string=? site (jolt-get event kw-id))
+       (= hit (jolt-get event kw-hit))))
+
+(define (trace-contains? trace action actor site hit)
+  (let loop ((i 0))
+    (and (< i (pvec-count trace))
+         (or (event-matches? (event-at trace i) action actor site hit)
+             (loop (+ i 1))))))
+
+(define (error-data result)
+  (and (error-result? result)
+       (jolt-ex-info-record? (cdr result))
+       (jolt-ex-info-record-data (cdr result))))
+
+;; A broken wait reports the identity of the already-published arrival plus the
+;; generation-local round and terminal reason.  This is deliberately a data
+;; contract rather than a message assertion, and reset/cancel create no event.
+(define (barrier-broken-error? result generation barrier-id reason event)
+  (let ((data (error-data result)))
+    (and data
+         (eq? kw-barrier-broken (jolt-get data kw-error-type))
+         (= generation (jolt-get data kw-error-generation))
+         (string=? barrier-id (jolt-get data kw-error-barrier-id))
+         (eq? reason (jolt-get data kw-error-reason))
+         (= (jolt-get event kw-seq) (jolt-get data kw-error-seq))
+         (string=? (jolt-get event kw-actor) (jolt-get data kw-error-actor))
+         (string=? (jolt-get event kw-id) (jolt-get data kw-error-id))
+         (= (jolt-get event kw-hit) (jolt-get data kw-error-hit)))))
 
 (define (now-ms)
   (let ((t (current-time 'time-monotonic)))
@@ -133,6 +181,36 @@
       (lambda () (jolt-with-mutex mu n)))))
 (define (counter-inc! c) ((vector-ref c 0)))
 (define (counter-value c) ((vector-ref c 1)))
+
+;; A condition-backed signal is only a test-owned progress witness.  Histories
+;; use it to establish that setup completed or that a lock is held; no sleep is
+;; used as synchronization.
+(define (signal-cell)
+  (let ((mu (make-mutex))
+        (cv (make-condition))
+        (value #f))
+    (vector
+      (lambda () (jolt-with-mutex mu value))
+      (lambda (next)
+        (jolt-with-mutex mu
+          (set! value next)
+          (condition-broadcast cv)))
+      (lambda ()
+        (let ((deadline (+ (now-ms) 3000)))
+          (jolt-with-mutex mu
+            (let loop ()
+              (cond (value #t)
+                    ((>= (now-ms) deadline) #f)
+                    (else
+                     (jolt-condition-wait
+                       cv mu (jolt-millis->time deadline))
+                     (loop))))))))))
+(define (signal-cell-value c) ((vector-ref c 0)))
+(define (signal-cell-set! c value) ((vector-ref c 1) value))
+(define (signal-cell-await c) ((vector-ref c 2)))
+(define (thread-result-done? result)
+  (jolt-with-mutex (vector-ref result 0)
+    ((vector-ref result 2))))
 
 (define (install! entries groups)
   (attempt (lambda () (jolt-checkpoint-install-plan! (manifest entries groups)))))
@@ -211,6 +289,70 @@
                (equal? '(1 2)
                        (map (lambda (e) (jolt-get e kw-seq))
                             (vector->list (pvec-v trace)))))))))
+
+(define (history-controller-held-progress)
+  ;; Install and bind first.  The holder then owns the controller mutex while
+  ;; both established actors arrive.  Correct barrier arrival/release must
+  ;; complete during that interval; waiting for the holder to release before
+  ;; checking the results would make this history unable to distinguish a
+  ;; controller-locking implementation from a round-local one.
+  (jolt-checkpoint-reset!)
+  (let* ((site-a "test.barrier/controller-held-a")
+         (site-b "test.barrier/controller-held-b")
+         (actor-a "controller-held/a")
+         (actor-b "controller-held/b")
+         (bound-a (signal-cell))
+         (bound-b (signal-cell))
+         (go (signal-cell))
+         (held (signal-cell))
+         (release (signal-cell))
+         (released (counter)))
+    (register-barrier-site! site-a)
+    (register-barrier-site! site-b)
+    (let* ((setup
+             (install!
+               (list (entry actor-a site-a 1 kw-barrier)
+                     (entry actor-b site-b 1 kw-barrier))
+               (list
+                 (group "controller-held/shared"
+                        (list (selector actor-a site-a 1)
+                              (selector actor-b site-b 1))))))
+           (a
+             (thread-result
+               (lambda ()
+                 (jolt-checkpoint-bind-actor! actor-a)
+                 (signal-cell-set! bound-a #t)
+                 (signal-cell-await go)
+                 (barrier-hit site-a)
+                 (counter-inc! released))))
+           (b
+             (thread-result
+               (lambda ()
+                 (jolt-checkpoint-bind-actor! actor-b)
+                 (signal-cell-set! bound-b #t)
+                 (signal-cell-await go)
+                 (barrier-hit site-b)
+                 (counter-inc! released))))
+           (holder
+             (thread-result
+               (lambda ()
+                 (jolt-with-mutex checkpoint-controller-mu
+                   (signal-cell-set! held #t)
+                   (signal-cell-await release))))))
+      (ok "controller-held manifest installs" (ok-result? setup))
+      (ok "controller-held actors finish binding before the lock test"
+          (and (signal-cell-await bound-a) (signal-cell-await bound-b)))
+      (ok "a separate thread holds checkpoint-controller-mu"
+          (signal-cell-await held))
+      (signal-cell-set! go #t)
+      (let ((ar (thread-result-await a))
+            (br (thread-result-await b)))
+        (ok "established arrivals and release progress while controller is held"
+            (and (ok-result? ar) (ok-result? br)
+                 (= 2 (counter-value released))))
+        (signal-cell-set! release #t)
+        (ok "controller lock holder exits after the bounded progress check"
+            (ok-result? (thread-result-await holder)))))))
 
 (define (history-exact-membership)
   (jolt-checkpoint-reset!)
@@ -291,7 +433,7 @@
                                (selector "member/c" site-c 1))))))
             (jolt= before (snapshot)))))
     (let ((before (snapshot)))
-      (ok "duplicate actor membership is rejected without publication"
+      (ok "duplicate selector membership is rejected without publication"
           (and
             (error-result?
               (install!
@@ -316,7 +458,7 @@
                                (selector "member/a" site-a 1))))))
             (jolt= before (snapshot)))))))
 
-(define (history-duplicate-arrival)
+(define (history-unique-actor-control)
   (jolt-checkpoint-reset!)
   (let ((site-a1 "test.barrier/duplicate-a1")
         (site-a2 "test.barrier/duplicate-a2")
@@ -325,7 +467,7 @@
     (register-barrier-site! site-a2)
     (register-barrier-site! site-b)
     (let ((before (snapshot)))
-      (ok "one actor cannot own two arrivals in the same barrier round"
+      (ok "distinct selectors for one actor are rejected by the unique-actor control"
           (and
             (error-result?
               (install!
@@ -396,6 +538,71 @@
                          (map (lambda (e) (jolt-get e kw-seq))
                               (vector->list (pvec-v trace))))))))))
 
+(define (history-fault-does-not-break)
+  ;; The expected peer's fault is an earlier, separate occurrence.  Catching
+  ;; it must leave that actor able to reach its later barrier occurrence, and
+  ;; the other participant must remain pending until it does.
+  (jolt-checkpoint-reset!)
+  (let* ((site-a "test.barrier/fault-wait")
+         (site-fault "test.barrier/fault-earlier")
+         (site-b "test.barrier/fault-barrier")
+         (actor-a "fault/a")
+         (actor-b "fault/b")
+         (barrier-id "fault/shared"))
+    (register-barrier-site! site-a)
+    (jolt-checkpoint-register-site! site-fault '(continue fault))
+    (register-barrier-site! site-b)
+    (let* ((setup
+             (install!
+               (list
+                 (entry actor-a site-a 1 kw-barrier)
+                 (entry actor-b site-fault 1 kw-fault)
+                 (entry actor-b site-b 1 kw-barrier))
+               (list
+                 (group barrier-id
+                        (list (selector actor-a site-a 1)
+                              (selector actor-b site-b 1))))))
+           (waiter
+             (thread-result
+               (lambda ()
+                 (jolt-checkpoint-bind-actor! actor-a)
+                 (barrier-hit site-a)))))
+      (ok "fault-does-not-break manifest installs" (ok-result? setup))
+      (ok "fault history publishes the first participant arrival"
+          (await-trace-count 1))
+      (let* ((fault-seen (signal-cell))
+             (proceed (signal-cell))
+             (peer
+               (thread-result
+                 (lambda ()
+                   (jolt-checkpoint-bind-actor! actor-b)
+                   (let ((fault-result
+                           (attempt-unwrapped
+                             (lambda ()
+                               (jolt-checkpoint!
+                                 site-fault '(continue fault))))))
+                     (signal-cell-set! fault-seen fault-result)
+                     (signal-cell-await proceed)
+                     (barrier-hit site-b))))))
+        (ok "expected peer fault is catchable at its earlier occurrence"
+            (and (signal-cell-await fault-seen)
+                 (error-result? (signal-cell-value fault-seen))))
+        (let ((trace (trace-of (snapshot))))
+          (ok "caught fault leaves the barrier waiter pending"
+              (and (= 2 (pvec-count trace))
+                   (barrier-event? (event-at trace 0) actor-a site-a 1 1)
+                   (event-matches? (event-at trace 1) kw-fault
+                                   actor-b site-fault 1)
+                   (not (thread-result-done? waiter)))))
+        (signal-cell-set! proceed #t)
+        (let ((wr (thread-result-await waiter))
+              (pr (thread-result-await peer))
+              (trace (trace-of (snapshot))))
+          (ok "same actor reaches the later barrier and releases the waiter"
+              (and (ok-result? wr) (ok-result? pr)
+                   (= 3 (pvec-count trace))
+                   (barrier-event? (event-at trace 2) actor-b site-b 1 3))))))))
+
 (define (history-reset-wakes)
   (jolt-checkpoint-reset!)
   (let* ((site-a "test.barrier/reset-a")
@@ -422,8 +629,11 @@
         (jolt-checkpoint-reset!)
         (let ((wr (thread-result-await waiter))
               (fresh (snapshot)))
-          (ok "reset wakes a stale barrier waiter with failure"
-              (error-result? wr))
+          (ok "reset wakes a stale waiter with canonical barrier-broken data"
+              (and (= 1 (pvec-count (trace-of old)))
+                   (barrier-broken-error?
+                     wr (jolt-get old kw-generation) "reset/pending" kw-reset
+                     (event-at (trace-of old) 0))))
           (ok "reset wake consumes no extra old-generation event"
               (and (= 1 (pvec-count (trace-of old)))
                    (= 2 (jolt-get old kw-next-seq))))
@@ -431,56 +641,107 @@
               (and (= 0 (pvec-count (trace-of fresh)))
                    (= 1 (jolt-get fresh kw-next-seq)))))))))
 
-;; Cancellation breaks a pending barrier rather than silently shrinking its
-;; quorum. Fault remains a catchable, nonterminal action and is intentionally
-;; not treated as a barrier-break history here.
+;; Cancellation breaks every pending barrier group containing the cancelled
+;; actor rather than silently shrinking any quorum.  The cancel occurrence is
+;; separate from both expected barrier occurrences, so one sticky decision can
+;; be checked against two simultaneously parked groups without synthetic
+;; arrivals or releases.
 (define (history-cancel-break)
   (jolt-checkpoint-reset!)
   (let* ((site-a "test.barrier/cancel-wait")
-         (site-b "test.barrier/cancel-terminal")
-         (site-c "test.barrier/cancel-breaker")
-         (actor-a "cancel/waiter")
+         (site-b1 "test.barrier/cancel-peer-one")
+         (site-c "test.barrier/cancel-wait-two")
+         (site-b2 "test.barrier/cancel-peer-two")
+         (site-d "test.barrier/cancel-late-wait")
+         (site-b3 "test.barrier/cancel-peer-three")
+         (site-cancel "test.barrier/cancel-earlier")
+         (actor-a "cancel/waiter-one")
          (actor-b "cancel/peer")
-         (barrier-id "cancel/broken"))
+         (actor-c "cancel/waiter-two")
+         (actor-d "cancel/waiter-late")
+         (barrier-id-one "cancel/broken-one")
+         (barrier-id-two "cancel/broken-two")
+         (barrier-id-three "cancel/broken-three"))
     (register-barrier-site! site-a)
-    (register-barrier-site! site-b)
-    (jolt-checkpoint-register-site! site-c '(continue cancel))
+    (register-barrier-site! site-b1)
+    (register-barrier-site! site-c)
+    (register-barrier-site! site-b2)
+    (register-barrier-site! site-d)
+    (register-barrier-site! site-b3)
+    (jolt-checkpoint-register-site! site-cancel '(continue cancel))
     (let* ((setup
              (install!
                (list
                  (entry actor-a site-a 1 kw-barrier)
-                 (entry actor-b site-b 1 kw-barrier)
+                 (entry actor-b site-b1 1 kw-barrier)
+                 (entry actor-c site-c 1 kw-barrier)
+                 (entry actor-b site-b2 1 kw-barrier)
+                 (entry actor-d site-d 1 kw-barrier)
+                 (entry actor-b site-b3 1 kw-barrier)
                  ;; The expected peer cancels at an earlier, separate
-                 ;; occurrence instead of reaching its barrier selector. The
-                 ;; cancel selector is not itself a barrier member.
-                 (entry actor-b site-c 1 kw-cancel))
+                 ;; occurrence instead of reaching either barrier selector.
+                 (entry actor-b site-cancel 1 kw-cancel))
                (list
-                 (group barrier-id
+                 (group barrier-id-one
                         (list (selector actor-a site-a 1)
-                              (selector actor-b site-b 1))))))
-           (waiter
+                              (selector actor-b site-b1 1)))
+                 (group barrier-id-two
+                        (list (selector actor-c site-c 1)
+                              (selector actor-b site-b2 1)))
+                 (group barrier-id-three
+                        (list (selector actor-d site-d 1)
+                              (selector actor-b site-b3 1))))))
+           (waiter-one
              (thread-result
                (lambda ()
                  (jolt-checkpoint-bind-actor! actor-a)
-                 (barrier-hit site-a)))))
+                 (barrier-hit site-a))))
+           (waiter-two
+             (thread-result
+               (lambda ()
+                 (jolt-checkpoint-bind-actor! actor-c)
+                 (barrier-hit site-c)))))
       (ok "cancel-break manifest installs" (ok-result? setup))
-      (ok "cancel-break observes the pending exact quorum"
-          (await-trace-count 1))
+      (ok "cancel-break observes both pending exact quorums"
+          (await-trace-count 2))
       (jolt-checkpoint-bind-actor! actor-b)
       (let ((cancel-result
               (attempt-unwrapped
                 (lambda ()
-                  (jolt-checkpoint! site-c '(continue cancel)))))
-            (waiter-result (thread-result-await waiter))
-            (trace (trace-of (snapshot))))
+                  (jolt-checkpoint! site-cancel '(continue cancel)))))
+            (waiter-one-result (thread-result-await waiter-one))
+            (waiter-two-result (thread-result-await waiter-two)))
         (ok "cancel remains a terminal action"
             (error-result? cancel-result))
-        (ok "cancel breaks rather than shrinks the quorum"
-            (error-result? waiter-result))
-        (ok "cancel-break publishes no synthetic arrival/release event"
-            (and (= 2 (pvec-count trace))
-                 (eq? kw-barrier (jolt-get (event-at trace 0) kw-action))
-                 (eq? kw-cancel (jolt-get (event-at trace 1) kw-action))))))))
+        (let* ((before-late (snapshot))
+               (before-trace (trace-of before-late))
+               (generation (jolt-get before-late kw-generation))
+               (late
+                 (thread-result
+                   (lambda ()
+                     (jolt-checkpoint-bind-actor! actor-d)
+                     (barrier-hit site-d))))
+               (late-result (thread-result-await late))
+               (trace (trace-of (snapshot))))
+          (ok "one sticky cancel breaks and wakes both arrived groups"
+              (and (= 3 (pvec-count before-trace))
+                   (barrier-broken-error?
+                     waiter-one-result generation barrier-id-one kw-cancel
+                     (event-at before-trace 0))
+                   (barrier-broken-error?
+                     waiter-two-result generation barrier-id-two kw-cancel
+                     (event-at before-trace 1))))
+          (ok "an expected actor arriving after cancel observes the broken round"
+              (and (= 4 (pvec-count trace))
+                   (barrier-broken-error?
+                     late-result generation barrier-id-three kw-cancel
+                     (event-at trace 3))))
+          (ok "cancel-break publishes only two early arrivals, cancel, and late arrival"
+              (and (= 4 (pvec-count trace))
+                   (trace-contains? trace kw-barrier actor-a site-a 1)
+                   (trace-contains? trace kw-barrier actor-c site-c 1)
+                   (trace-contains? trace kw-cancel actor-b site-cancel 1)
+                   (trace-contains? trace kw-barrier actor-d site-d 1))))))))
 
 (define history
   (let ((args (command-line)))
@@ -490,8 +751,10 @@
   ((string=? history "fiber") (history-one-carrier-fibers))
   ((string=? history "threads") (history-os-threads))
   ((string=? history "membership") (history-exact-membership))
-  ((string=? history "duplicate") (history-duplicate-arrival))
+  ((string=? history "unique-actor") (history-unique-actor-control))
   ((string=? history "rounds") (history-round-isolation))
+  ((string=? history "controller-held") (history-controller-held-progress))
+  ((string=? history "fault") (history-fault-does-not-break))
   ((string=? history "reset") (history-reset-wakes))
   ((string=? history "cancel-break") (history-cancel-break))
   (else (error 'checkpoint-barrier-red-test "unknown history" history)))
