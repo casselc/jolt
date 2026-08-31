@@ -109,7 +109,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke asyncaltsownership coreasyncreducerhistory \
-        atomicnumeric futurehost coreasyncproof lazyonceproof logicalmutexproof extensions regexcache spitatomic \
+        atomicnumeric futurehost coreasyncproof checkpointrecorderproof lazyonceproof logicalmutexproof extensions regexcache spitatomic \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
@@ -330,6 +330,11 @@ coreasyncreducerhistory:
 # mutation and a non-vacuous boundary execution.
 coreasyncproof:
 	@sh test/formal/check-core-async.sh
+
+# Bounded generation/binding/snapshot proof for the record/continue checkpoint
+# controller, including caller-only reset and split-snapshot mutation controls.
+checkpointrecorderproof:
+	@sh test/formal/check-checkpoint-recorder.sh
 
 # Bounded ownership/publication proof for fiber-safe lazyseq and cseq
 # realization, including mutation controls and their distinct error policies.
