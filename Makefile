@@ -331,10 +331,12 @@ coreasyncreducerhistory:
 coreasyncproof:
 	@sh test/formal/check-core-async.sh
 
-# Bounded checkpoint controller proof: a six-operation control-plane model plus
-# a distinct reservation/publication machine with ownership mutation controls.
+# Bounded checkpoint controller proof: a six-operation control-plane model,
+# a distinct reservation/publication machine with ownership mutation controls,
+# and action selection/dispatch/sticky-cancellation semantics.
 checkpointrecorderproof:
 	@sh test/formal/check-checkpoint-recorder.sh
+	@sh test/formal/check-checkpoint-actions.sh
 
 # Bounded ownership/publication proof for fiber-safe lazyseq and cseq
 # realization, including mutation controls and their distinct error policies.
