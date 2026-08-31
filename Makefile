@@ -96,7 +96,7 @@ export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asyncaltsownership asynctimer atomicnumeric checkpoint-erasure checkpoint-runtime checkpoints effects futurehost buildlibsmoke buildsmoke \
+  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asyncaltsownership asynctimer atomicnumeric checkpoint-erasure checkpoint-runtime checkpoints coreasyncreducerhistory effects futurehost buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
@@ -108,7 +108,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   spitatomic taggedmethods threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke asyncaltsownership \
+.PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke asyncaltsownership coreasyncreducerhistory \
         atomicnumeric futurehost coreasyncproof lazyonceproof logicalmutexproof extensions regexcache spitatomic \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
@@ -318,6 +318,12 @@ fibers:
 
 asyncaltsownership:
 	@$(CHEZ) --script test/chez/async-alts-ownership-test.ss
+
+# RED until issue #21's reducer reservation/publication runtime slice lands.
+# The executable Clojure histories park user callbacks with explicit releases
+# and bound every observation, so the expected failure cannot hang a gate.
+coreasyncreducerhistory:
+	@bin/jolt run test/chez/core-async-reducer-history-test.clj
 
 # Bounded safety/progress proofs for the core.async waiter protocol. Each model
 # must reject its reference counterexample while accepting both a known-bad
