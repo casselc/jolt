@@ -21,7 +21,7 @@
               (ffi/with-byte-array-pointer
                 a :out
                 (fn [p _]
-                  (ffi/write p :uint8 0 202)
+                  (ffi/write p :uint8 202)
                   (fib/yield)
                   (reset! resumed? true))))))
         :did-not-throw

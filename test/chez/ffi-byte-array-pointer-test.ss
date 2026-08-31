@@ -255,7 +255,7 @@
                 (try
                   (jolt.ffi/with-byte-array-pointer
                     a :out (fn [p n]
-                             (jolt.ffi/write p :uint8 0 204)
+                             (jolt.ffi/write p :uint8 204)
                              (throw (Exception. \"out loan boom\"))))
                   false
                   (catch Exception e (= \"out loan boom\" (.getMessage e))))
