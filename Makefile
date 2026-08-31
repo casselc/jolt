@@ -730,6 +730,13 @@ checkpoints:
 checkpoint-runtime:
 	@$(CHEZ) --script test/chez/checkpoint-runtime-test.ss
 
+# RED-only next-slice histories for exact-actor barriers.  Each runtime case is
+# subprocess-bounded, while parkcheck requires any implementation to keep
+# recorder/controller counted locks out of the wait path.  Deliberately not a
+# dependency of default/ci until the versioned barrier manifest lands.
+checkpoint-barrier-red: parkcheck
+	@sh test/chez/checkpoint-barrier-red-test.sh
+
 # Optimized whole-program erasure: emitted app/effect/region artifacts are
 # identical to checkpoint-free source, contain no checkpoint residue, and the
 # residue scanner rejects deliberately injected artifact/report mutations.
