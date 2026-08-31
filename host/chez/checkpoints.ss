@@ -7,18 +7,22 @@
 ;; controller callback.
 
 (define checkpoint-controller-mu (make-mutex))
+;; Public resets serialize through the execution-context-aware mutex for their
+;; complete close/publish/break transaction.  A later overlapping reset may not
+;; return while an earlier generation's wake sweep is still in progress.
+(define checkpoint-reset-mu (jolt-logical-mutex-new))
 
 (define checkpoint-bindings (make-weak-eq-hashtable))
 (define checkpoint-unbound (list 'checkpoint-unbound))
 (define checkpoint-stale (list 'checkpoint-stale))
 
 (define-record-type checkpoint-config
-  (fields sites plan)
-  (nongenerative jolt-checkpoint-config-v1))
+  (fields sites plan version barriers selector-rounds actor-rounds)
+  (nongenerative jolt-checkpoint-config-v2))
 
 (define-record-type checkpoint-generation
-  (fields id config recorders clock started)
-  (nongenerative jolt-checkpoint-generation-v1))
+  (fields id config recorders clock terminal-mu started)
+  (nongenerative jolt-checkpoint-generation-v2))
 
 (define-record-type checkpoint-recorder
   (fields actor mu hits (mutable trace-rev) (mutable sticky))
@@ -44,12 +48,28 @@
 ;; Dispatch is deliberately outside the recorder lock; :cancel retains that
 ;; exact decision in its actor recorder until reset replaces the generation.
 (define-record-type checkpoint-decision
-  (fields action event generation)
-  (nongenerative jolt-checkpoint-decision-v1))
+  (fields action event generation barrier-round cancel-rounds)
+  (nongenerative jolt-checkpoint-decision-v2))
+
+;; A barrier round is allocated once, while its versioned manifest is installed,
+;; and belongs to exactly one generation.  Only its own mutex protects arrival
+;; and terminal state; established arrivals never consult the controller.
+(define-record-type checkpoint-round
+  (fields generation clock terminal-mu id selectors actors mu cv arrived
+          (mutable state) (mutable reason))
+  (nongenerative jolt-checkpoint-round-v2))
+
+(define (checkpoint-empty-table hash equiv)
+  (make-hashtable hash equiv))
 
 (define (checkpoint-empty-config)
-  (make-checkpoint-config (make-hashtable string-hash string=?)
-                          (make-hashtable equal-hash equal?)))
+  (make-checkpoint-config
+    (checkpoint-empty-table string-hash string=?)
+    (checkpoint-empty-table equal-hash equal?)
+    0
+    (checkpoint-empty-table string-hash string=?)
+    (checkpoint-empty-table equal-hash equal?)
+    (checkpoint-empty-table string-hash string=?)))
 
 (define checkpoint-next-generation-id 0)
 
@@ -62,6 +82,10 @@
     ;; Event allocation, snapshot cuts, and reset closure share one exact
     ;; nonparking CAS linearization point.
     (box (make-checkpoint-clock-state #t 0 1))
+    ;; Clock closure and a barrier's arrival transition arbitrate here.  The
+    ;; mutex is never retained across a barrier wait: it orders only the leaf
+    ;; state transition that decides whether arrival or reset wins.
+    (make-mutex)
     (box #f)))
 
 (define checkpoint-current-generation (box (checkpoint-new-generation)))
@@ -160,7 +184,13 @@
              (hashtable-set! next-sites id dispositions)
              (checkpoint-box-publish!
                (checkpoint-generation-config generation)
-               (make-checkpoint-config next-sites (checkpoint-config-plan config)))))
+               (make-checkpoint-config
+                 next-sites
+                 (checkpoint-config-plan config)
+                 (checkpoint-config-version config)
+                 (checkpoint-config-barriers config)
+                 (checkpoint-config-selector-rounds config)
+                 (checkpoint-config-actor-rounds config)))))
           ((not (equal? prior dispositions))
            (checkpoint-bad who "duplicate checkpoint id has different dispositions"
                            id prior dispositions)))))
@@ -188,17 +218,19 @@
       (checkpoint-bad who "checkpoint hit must be a positive integer" hit))
     (list actor id (if (exact? hit) hit (exact hit)))))
 
-(define (checkpoint-action who action)
+(define (checkpoint-action who action . allow-barrier?)
   (let ((name (checkpoint-name who action)))
     (cond ((string=? name "continue") 'continue)
           ((string=? name "yield") 'yield)
           ((string=? name "fault") 'fault)
           ((string=? name "cancel") 'cancel)
-          ;; Barrier/manifest/replay are deliberately a later ABI slice.
+          ((and (pair? allow-barrier?) (car allow-barrier?)
+                (string=? name "barrier"))
+           'barrier)
           (else
            (checkpoint-bad who "unsupported checkpoint action" action)))))
 
-(define (checkpoint-parse-plan plan)
+(define (checkpoint-parse-plan plan . allow-barrier?)
   (unless (pmap? plan)
     (checkpoint-bad 'checkpoint-install-plan! "checkpoint plan must be a map" plan))
   ;; Parsing persistent data does not touch controller state and happens before
@@ -207,14 +239,159 @@
     plan
     (lambda (key action entries)
       (let ((key (checkpoint-plan-key 'checkpoint-install-plan! key))
-            (action (checkpoint-action 'checkpoint-install-plan! action)))
+            (action
+              (checkpoint-action 'checkpoint-install-plan! action
+                                 (and (pair? allow-barrier?)
+                                      (car allow-barrier?)))))
         (when (assoc key entries)
           (checkpoint-bad 'checkpoint-install-plan! "duplicate checkpoint plan key" key))
         (cons (cons key action) entries)))
     '()))
 
-(define (jolt-checkpoint-install-plan! plan)
-  (let ((entries (checkpoint-parse-plan plan)))
+(define checkpoint-manifest-version-key
+  (keyword "jolt.checkpoint" "version"))
+(define checkpoint-manifest-plan-key
+  (keyword "jolt.checkpoint" "plan"))
+(define checkpoint-manifest-barriers-key
+  (keyword "jolt.checkpoint" "barriers"))
+
+(define (checkpoint-selector<? a b)
+  (or (string<? (car a) (car b))
+      (and (string=? (car a) (car b))
+           (or (string<? (cadr a) (cadr b))
+               (and (string=? (cadr a) (cadr b))
+                    (< (caddr a) (caddr b)))))))
+
+(define (checkpoint-parse-barrier-selectors barrier-id value)
+  (unless (and (pvec? value) (> (pvec-count value) 0))
+    (checkpoint-bad 'checkpoint-install-plan!
+                    "checkpoint barrier group must be a nonempty vector"
+                    barrier-id value))
+  (let loop ((rest (vector->list (pvec-v value)))
+             (prior #f)
+             (actors '())
+             (out '()))
+    (if (null? rest)
+        (reverse out)
+        (let* ((selector
+                 (checkpoint-plan-key 'checkpoint-install-plan! (car rest)))
+               (actor (car selector)))
+          (when (and prior (not (checkpoint-selector<? prior selector)))
+            (checkpoint-bad 'checkpoint-install-plan!
+                            "checkpoint barrier selectors must be in strict canonical order"
+                            barrier-id prior selector))
+          (when (exists (lambda (known) (string=? actor known)) actors)
+            (checkpoint-bad 'checkpoint-install-plan!
+                            "checkpoint barrier actor may appear only once"
+                            barrier-id actor))
+          (loop (cdr rest) selector (cons actor actors) (cons selector out))))))
+
+(define (checkpoint-parse-barriers value entries)
+  (unless (pmap? value)
+    (checkpoint-bad 'checkpoint-install-plan!
+                    "checkpoint barriers must be a map" value))
+  (let* ((groups
+           (pmap-fold
+             value
+             (lambda (id selectors out)
+               (let ((id (checkpoint-qualified-id 'checkpoint-install-plan! id)))
+                 (cons
+                   (cons id (checkpoint-parse-barrier-selectors id selectors))
+                   out)))
+             '()))
+         (groups (sort (lambda (a b) (string<? (car a) (car b))) groups))
+         (seen '()))
+    (for-each
+      (lambda (group)
+        (for-each
+          (lambda (selector)
+            (when (assoc selector seen)
+              (checkpoint-bad 'checkpoint-install-plan!
+                              "checkpoint barrier selector belongs to multiple groups"
+                              selector))
+            (let ((entry (assoc selector entries)))
+              (unless entry
+                (checkpoint-bad 'checkpoint-install-plan!
+                                "checkpoint barrier selector is absent from the plan"
+                                selector))
+              (unless (eq? 'barrier (cdr entry))
+                (checkpoint-bad 'checkpoint-install-plan!
+                                "checkpoint barrier selector must select barrier"
+                                selector)))
+            (set! seen (cons (cons selector #t) seen)))
+          (cdr group)))
+      groups)
+    (for-each
+      (lambda (entry)
+        (when (and (eq? 'barrier (cdr entry))
+                   (not (assoc (car entry) seen)))
+          (checkpoint-bad 'checkpoint-install-plan!
+                          "checkpoint barrier plan selector has no group"
+                          (car entry))))
+      entries)
+    groups))
+
+;; Return #(version parsed-plan parsed-groups). Legacy flat plans remain ABI
+;; compatible and may not select :barrier. A versioned manifest is exact: its
+;; three namespaced keys are the complete accepted schema.
+(define (checkpoint-parse-install-value value)
+  (if (and (pmap? value)
+           (pmap-contains? value checkpoint-manifest-version-key))
+      (begin
+        (unless (and (= 3 (pmap-cnt value))
+                     (pmap-contains? value checkpoint-manifest-plan-key)
+                     (pmap-contains? value checkpoint-manifest-barriers-key))
+          (checkpoint-bad 'checkpoint-install-plan!
+                          "checkpoint manifest requires exactly version, plan, and barriers"
+                          value))
+        (let ((version (jolt-get value checkpoint-manifest-version-key)))
+          (unless (and (integer? version) (= version 1))
+            (checkpoint-bad 'checkpoint-install-plan!
+                            "unsupported checkpoint manifest version" version))
+          (let* ((entries
+                   (checkpoint-parse-plan
+                     (jolt-get value checkpoint-manifest-plan-key) #t))
+                 (groups
+                   (checkpoint-parse-barriers
+                     (jolt-get value checkpoint-manifest-barriers-key) entries)))
+            (vector 1 entries groups))))
+      (vector 0 (checkpoint-parse-plan value #f) '())))
+
+(define (checkpoint-preallocate-rounds generation groups)
+  (let ((barriers (checkpoint-empty-table string-hash string=?))
+        (selector-rounds (checkpoint-empty-table equal-hash equal?))
+        (actor-rounds (checkpoint-empty-table string-hash string=?)))
+    (for-each
+      (lambda (group)
+        (let* ((id (car group))
+               (selectors (cdr group))
+               (actors (map car selectors))
+               (round
+                 (make-checkpoint-round
+                   (checkpoint-generation-id generation)
+                   (checkpoint-generation-clock generation)
+                   (checkpoint-generation-terminal-mu generation)
+                   id selectors actors (make-mutex) (make-condition)
+                   (checkpoint-empty-table string-hash string=?)
+                   'pending #f)))
+          (hashtable-set! barriers id round)
+          (for-each
+            (lambda (selector)
+              (hashtable-set! selector-rounds selector round)
+              (let* ((actor (car selector))
+                     (prior (hashtable-ref actor-rounds actor '())))
+                ;; Groups are sorted by ID, so appending produces one stable
+                ;; multi-round cancellation order without a later controller.
+                (hashtable-set! actor-rounds actor (append prior (list round)))))
+            selectors)))
+      groups)
+    (vector barriers selector-rounds actor-rounds)))
+
+(define (jolt-checkpoint-install-plan! value)
+  (let* ((parsed (checkpoint-parse-install-value value))
+         (version (vector-ref parsed 0))
+         (entries (vector-ref parsed 1))
+         (groups (vector-ref parsed 2)))
     (jolt-with-mutex checkpoint-controller-mu
       (let* ((generation (checkpoint-current))
              (config (unbox (checkpoint-generation-config generation)))
@@ -238,11 +415,21 @@
                               "checkpoint site does not permit selected action"
                               id action))))
         entries)
-      (let ((next (make-hashtable equal-hash equal?)))
+      (let ((next (make-hashtable equal-hash equal?))
+            (round-tables (checkpoint-preallocate-rounds generation groups)))
         (for-each (lambda (entry) (hashtable-set! next (car entry) (cdr entry))) entries)
         (checkpoint-box-publish!
           (checkpoint-generation-config generation)
-          (make-checkpoint-config sites next)))))
+          (make-checkpoint-config
+            sites next version
+            (vector-ref round-tables 0)
+            (vector-ref round-tables 1)
+            (vector-ref round-tables 2)))
+        ;; A versioned manifest is a complete generation contract. Freezing at
+        ;; publication lets its first established arrival avoid the controller
+        ;; just like every later arrival.
+        (when (= version 1)
+          (set-box! (checkpoint-generation-started generation) #t)))))
     jolt-nil))
 
 (define (checkpoint-mark-started! generation id . who)
@@ -306,21 +493,71 @@
       (checkpoint-current-binding-set! #f)))
   jolt-nil)
 
+(define (checkpoint-round-break! round reason)
+  ;; Idempotent terminal transition.  Wake both thread and fiber waiters while
+  ;; the round mutex is held; each waiter retakes its decision after release.
+  (jolt-with-mutex (checkpoint-round-mu round)
+    (when (eq? 'pending (checkpoint-round-state round))
+      (checkpoint-round-state-set! round 'broken)
+      (checkpoint-round-reason-set! round reason)
+      (jolt-cv-wake! (checkpoint-round-cv round)))))
+
+(define (checkpoint-reset-close!)
+  ;; This is reset's exact phase-one linearization path, split into a helper so
+  ;; the executable history can deterministically pause after clock closure and
+  ;; before the wake sweep. It is intentionally runtime-private.
+  (let retry ()
+    (let* ((generation (checkpoint-current))
+           (result
+             ;; Barrier arrival uses this same generation arbiter for its
+             ;; complete leaf terminal transition.  Taking it first orders that
+             ;; transition against clock closure.  The controller is then the
+             ;; publication arbiter: while both are held no snapshot can observe
+             ;; the old closed generation, and no second reset can publish from
+             ;; the same generation.
+             (jolt-with-mutex (checkpoint-generation-terminal-mu generation)
+               (jolt-with-mutex checkpoint-controller-mu
+                 (if (not (eq? generation (checkpoint-current)))
+                     checkpoint-stale
+                     (begin
+                       ;; A commit allocation that won the clock CAS remains
+                       ;; ordered before reset; one that loses retires stale
+                       ;; without consuming a hit.
+                       (checkpoint-clock-close!
+                         (checkpoint-generation-clock generation))
+                       (let* ((config
+                                (unbox
+                                  (checkpoint-generation-config generation)))
+                              (rounds
+                                (map cdr
+                                     (sort checkpoint-site-entry<?
+                                           (checkpoint-table-pairs
+                                             (checkpoint-config-barriers
+                                               config))))))
+                         ;; Replacing the central context table invalidates
+                         ;; bindings in every live thread and fiber at once.
+                         (set! checkpoint-bindings (make-weak-eq-hashtable))
+                         (checkpoint-box-publish!
+                           checkpoint-current-generation
+                           (checkpoint-new-generation))
+                         (checkpoint-current-binding-set! #f)
+                         rounds)))))))
+      ;; Two reset calls may initially retain the same generation.  The loser
+      ;; must retry against the published replacement so every public reset has
+      ;; its historical, observable one-generation advance.
+      (if (eq? result checkpoint-stale) (retry) result))))
+
+(define (checkpoint-reset-break-rounds! rounds)
+  ;; Phase two owns no controller or generation-terminal lock. Every
+  ;; preallocated old round becomes terminal and every waiter is signaled.
+  (for-each (lambda (round) (checkpoint-round-break! round 'reset)) rounds))
+
 (define (jolt-checkpoint-reset!)
-  (jolt-with-mutex checkpoint-controller-mu
-    ;; Close the old generation before publishing its replacement. A commit
-    ;; allocation that wins the CAS is ordered before reset; one that loses can
-    ;; no longer allocate and retires stale without consuming a hit.
-    (checkpoint-clock-close!
-      (checkpoint-generation-clock (checkpoint-current)))
-    ;; Replacing the central context table invalidates bindings in every live
-    ;; thread and fiber at once. Context-local copies carry the old generation
-    ;; and fail closed even though another live context cannot be mutated here.
-    (set! checkpoint-bindings (make-weak-eq-hashtable))
-    (checkpoint-box-publish! checkpoint-current-generation
-                             (checkpoint-new-generation))
-    (checkpoint-current-binding-set! #f))
-  jolt-nil)
+  (jolt-with-logical-mutex
+    checkpoint-reset-mu
+    (lambda ()
+      (checkpoint-reset-break-rounds! (checkpoint-reset-close!))
+      jolt-nil)))
 
 ;; Exact per-actor reservation. The optional normalized dispositions preserve
 ;; the closed :continue fast path while the generic entrypoint registers and
@@ -428,6 +665,17 @@
                    (list (checkpoint-recorder-actor recorder) id hit))
                  (action
                    (hashtable-ref (checkpoint-config-plan config) plan-key #f))
+                 (barrier-round
+                   (and (eq? action 'barrier)
+                        (hashtable-ref
+                          (checkpoint-config-selector-rounds config)
+                          plan-key #f)))
+                 (cancel-rounds
+                   (if (eq? action 'cancel)
+                       (hashtable-ref
+                         (checkpoint-config-actor-rounds config)
+                         (checkpoint-recorder-actor recorder) '())
+                       '()))
                  (stamp
                    (checkpoint-clock-allocate!
                      (checkpoint-generation-clock generation)))
@@ -444,7 +692,8 @@
                            id hit action))
                        (decision
                          (make-checkpoint-decision
-                           action event (checkpoint-generation-id generation))))
+                           action event (checkpoint-generation-id generation)
+                           barrier-round cancel-rounds)))
                   (hashtable-set! (checkpoint-recorder-hits recorder) id hit)
                   (checkpoint-recorder-trace-rev-set!
                     recorder
@@ -463,8 +712,12 @@
 (define kw-checkpoint-error-actor (keyword "jolt.checkpoint" "actor"))
 (define kw-checkpoint-error-id (keyword "jolt.checkpoint" "id"))
 (define kw-checkpoint-error-hit (keyword "jolt.checkpoint" "hit"))
+(define kw-checkpoint-error-barrier-id (keyword "jolt.checkpoint" "barrier-id"))
+(define kw-checkpoint-error-reason (keyword "jolt.checkpoint" "reason"))
 (define kw-checkpoint-fault (keyword #f "fault"))
 (define kw-checkpoint-cancel (keyword #f "cancel"))
+(define kw-checkpoint-reset (keyword #f "reset"))
+(define kw-checkpoint-barrier-broken (keyword #f "barrier-broken"))
 
 (define (checkpoint-action-error! type decision)
   (let ((event (checkpoint-decision-event decision)))
@@ -480,6 +733,89 @@
           kw-checkpoint-error-id (string-copy (checkpoint-event-id event))
           kw-checkpoint-error-hit (checkpoint-event-hit event))))))
 
+(define (checkpoint-barrier-error! decision round reason)
+  (let ((event (checkpoint-decision-event decision)))
+    (jolt-throw
+      (jolt-ex-info
+        "checkpoint barrier broken"
+        (jolt-hash-map
+          kw-checkpoint-error-type kw-checkpoint-barrier-broken
+          kw-checkpoint-error-generation (checkpoint-decision-generation decision)
+          kw-checkpoint-error-barrier-id (string-copy (checkpoint-round-id round))
+          kw-checkpoint-error-reason
+            (if (eq? reason 'reset) kw-checkpoint-reset kw-checkpoint-cancel)
+          kw-checkpoint-error-seq (checkpoint-event-seq event)
+          kw-checkpoint-error-actor (string-copy (checkpoint-event-actor event))
+          kw-checkpoint-error-id (string-copy (checkpoint-event-id event))
+          kw-checkpoint-error-hit (checkpoint-event-hit event))))))
+
+(define (checkpoint-round-arrive! round actor)
+  ;; Reset clock closure and arrival's complete terminal transition share the
+  ;; generation arbiter.  This section never waits on a condition: an arrival
+  ;; releases the arbiter before it can park, and reset owns no controller lock
+  ;; while performing its later per-round wake sweep.
+  (jolt-with-mutex (checkpoint-round-terminal-mu round)
+    (jolt-with-mutex (checkpoint-round-mu round)
+      (let ((state (checkpoint-round-state round)))
+        (cond
+          ((eq? state 'released) 'released)
+          ((eq? state 'broken)
+           (cons 'broken (checkpoint-round-reason round)))
+          ((not
+             (checkpoint-clock-state-open?
+               (unbox (checkpoint-round-clock round))))
+           ;; Clock closure is reset's linearization point.  Marking this
+           ;; pending round here makes the outcome independent of whether the
+           ;; phase-two reset sweep or this late dispatch takes its mutex first.
+           (checkpoint-round-state-set! round 'broken)
+           (checkpoint-round-reason-set! round 'reset)
+           (jolt-cv-wake! (checkpoint-round-cv round))
+           (cons 'broken 'reset))
+          (else
+           ;; Retaken decisions are idempotent for this actor.
+           (unless (hashtable-ref (checkpoint-round-arrived round) actor #f)
+             (hashtable-set! (checkpoint-round-arrived round) actor #t))
+           (if (= (hashtable-size (checkpoint-round-arrived round))
+                  (length (checkpoint-round-actors round)))
+               (begin
+                 (checkpoint-round-state-set! round 'released)
+                 (jolt-cv-wake! (checkpoint-round-cv round))
+                 'released)
+               'pending)))))))
+
+(define (checkpoint-round-await! who decision)
+  (let* ((round (checkpoint-decision-barrier-round decision))
+         (event (checkpoint-decision-event decision)))
+    (unless (checkpoint-round? round)
+      (checkpoint-bad who "barrier decision has no preallocated round" event))
+    (let* ((arrival
+             (checkpoint-round-arrive!
+               round (checkpoint-event-actor event)))
+           (outcome
+             (if (eq? arrival 'pending)
+                 (jolt-cv-wait
+                   (checkpoint-round-mu round)
+                   (checkpoint-round-cv round)
+                   #f
+                   (lambda (timed-out?)
+                     (let ((state (checkpoint-round-state round)))
+                       (cond
+                         ((eq? state 'released) 'released)
+                         ((eq? state 'broken)
+                          (cons 'broken (checkpoint-round-reason round)))
+                         (else jolt-cv-again)))))
+                 arrival)))
+      (when (and (pair? outcome) (eq? 'broken (car outcome)))
+        (checkpoint-barrier-error! decision round (cdr outcome)))
+      jolt-nil)))
+
+(define (checkpoint-cancel-rounds! decision)
+  ;; The list was constructed in stable barrier-ID order at manifest install.
+  ;; Process one independent round mutex at a time, after recorder publication.
+  (for-each
+    (lambda (round) (checkpoint-round-break! round 'cancel))
+    (checkpoint-decision-cancel-rounds decision)))
+
 (define (checkpoint-dispatch! who decision)
   ;; Always invoked after checkpoint-record-commit! has released the recorder
   ;; mutex. A selected action therefore cannot park, yield, or throw while an
@@ -493,7 +829,10 @@
                (thread-yield!))
            jolt-nil)
           ((eq? action 'fault) (checkpoint-action-error! 'fault decision))
-          ((eq? action 'cancel) (checkpoint-action-error! 'cancel decision))
+          ((eq? action 'cancel)
+           (checkpoint-cancel-rounds! decision)
+           (checkpoint-action-error! 'cancel decision))
+          ((eq? action 'barrier) (checkpoint-round-await! who decision))
           (else
            (checkpoint-bad who "unsupported checkpoint action" action)))))
 
@@ -517,19 +856,18 @@
                        (checkpoint-qualified-id 'jolt-checkpoint-continue! id)
                        '("continue")))
 
-;; Generic action-bearing entrypoint. Barrier, manifests, replay and minimizer
-;; state are deliberately absent from this ship-ready slice.
+;; Generic action-bearing entrypoint. A barrier is legal only when the installed
+;; versioned manifest selected an exact preallocated round for this occurrence.
 (define (jolt-checkpoint! id dispositions)
   (let ((id (checkpoint-qualified-id 'jolt-checkpoint! id))
         (dispositions
           (checkpoint-normalize-dispositions 'jolt-checkpoint! dispositions)))
-    (when (member "barrier" dispositions)
-      (checkpoint-bad 'jolt-checkpoint!
-                      "barrier checkpoint execution is not implemented" id))
     (checkpoint-execute! 'jolt-checkpoint! id dispositions)))
 
 (define kw-checkpoint-sites (keyword #f "sites"))
 (define kw-checkpoint-plan (keyword #f "plan"))
+(define kw-checkpoint-version (keyword #f "version"))
+(define kw-checkpoint-barriers (keyword #f "barriers"))
 (define kw-checkpoint-trace (keyword #f "trace"))
 (define kw-checkpoint-next-seq (keyword #f "next-seq"))
 (define kw-checkpoint-generation (keyword #f "generation"))
@@ -583,6 +921,24 @@
       '()
       (sort checkpoint-plan-entry<? pairs))))
 
+(define (checkpoint-barriers-value pairs)
+  (apply jolt-hash-map
+    (fold-right
+      (lambda (entry out)
+        (let ((round (cdr entry)))
+          (cons
+            (string-copy (car entry))
+            (cons
+              (apply jolt-vector
+                     (map (lambda (selector)
+                            (jolt-vector (string-copy (car selector))
+                                         (string-copy (cadr selector))
+                                         (caddr selector)))
+                          (checkpoint-round-selectors round)))
+              out))))
+      '()
+      (sort checkpoint-site-entry<? pairs))))
+
 (define (checkpoint-event-value event)
   (jolt-hash-map
     kw-checkpoint-seq (checkpoint-event-seq event)
@@ -627,6 +983,8 @@
                  (checkpoint-generation-id generation)
                  (checkpoint-table-pairs (checkpoint-config-sites config))
                  (checkpoint-table-pairs (checkpoint-config-plan config))
+                 (checkpoint-config-version config)
+                 (checkpoint-table-pairs (checkpoint-config-barriers config))
                  (map cdr
                       (checkpoint-table-pairs
                         (checkpoint-generation-recorders generation)))
@@ -635,9 +993,11 @@
          (generation-id (vector-ref raw 0))
          (sites (vector-ref raw 1))
          (plan (vector-ref raw 2))
-         (recorders (vector-ref raw 3))
-         (cut (vector-ref raw 4))
-         (next-seq (vector-ref raw 5))
+         (version (vector-ref raw 3))
+         (barriers (vector-ref raw 4))
+         (recorders (vector-ref raw 5))
+         (cut (vector-ref raw 6))
+         (next-seq (vector-ref raw 7))
          (trace
            (sort
              (lambda (a b) (< (checkpoint-event-seq a) (checkpoint-event-seq b)))
@@ -646,12 +1006,18 @@
                  (append (checkpoint-recorder-prefix recorder cut) events))
                '()
                recorders))))
-    (jolt-hash-map
-      kw-checkpoint-generation generation-id
-      kw-checkpoint-sites (checkpoint-sites-value sites)
-      kw-checkpoint-plan (checkpoint-plan-value plan)
-      kw-checkpoint-trace (apply jolt-vector (map checkpoint-event-value trace))
-      kw-checkpoint-next-seq next-seq)))
+    (let ((base
+            (jolt-hash-map
+              kw-checkpoint-generation generation-id
+              kw-checkpoint-sites (checkpoint-sites-value sites)
+              kw-checkpoint-plan (checkpoint-plan-value plan)
+              kw-checkpoint-trace (apply jolt-vector (map checkpoint-event-value trace))
+              kw-checkpoint-next-seq next-seq)))
+      (if (= version 1)
+          (jolt-assoc1
+            (jolt-assoc1 base kw-checkpoint-version version)
+            kw-checkpoint-barriers (checkpoint-barriers-value barriers))
+          base))))
 
 (def-var! "jolt.host" "checkpoint-register-site!" jolt-checkpoint-register-site!)
 (def-var! "jolt.host" "checkpoint-install-plan!" jolt-checkpoint-install-plan!)

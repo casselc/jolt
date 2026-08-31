@@ -96,7 +96,7 @@ export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asyncaltsownership asynctimer atomicnumeric checkpoint-erasure checkpoint-runtime checkpoints coreasyncreducerhistory effects futurehost buildlibsmoke buildsmoke \
+  analysisdebt aotcacheperf aotcachesmoke aotfingerprint asyncaltsownership asynctimer atomicnumeric checkpoint-barrier checkpoint-erasure checkpoint-runtime checkpoints coreasyncreducerhistory effects futurehost buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
@@ -165,7 +165,7 @@ CI-GATES := submodules values corpus unit unitconcurrent javasiocreate niodirect
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body checkpoints checkpoint-runtime checkpoint-erasure effects regions dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
+  inline inline-body checkpoints checkpoint-runtime checkpoint-barrier checkpoint-erasure effects regions dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck analysisdebt parkcheck checkthencreate shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams futurehost \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers extensions regexcache gosm asynctimer interruptnest taggedmethods threadsafety atomicnumeric
@@ -337,6 +337,7 @@ coreasyncproof:
 checkpointrecorderproof:
 	@sh test/formal/check-checkpoint-recorder.sh
 	@sh test/formal/check-checkpoint-actions.sh
+	@sh test/formal/check-checkpoint-barriers.sh
 
 # Bounded ownership/publication proof for fiber-safe lazyseq and cseq
 # realization, including mutation controls and their distinct error policies.
@@ -730,12 +731,10 @@ checkpoints:
 checkpoint-runtime:
 	@$(CHEZ) --script test/chez/checkpoint-runtime-test.ss
 
-# RED-only next-slice histories for exact-actor barriers.  Each runtime case is
-# subprocess-bounded, while parkcheck requires any implementation to keep
-# recorder/controller counted locks out of the wait path.  Deliberately not a
-# dependency of default/ci until the versioned barrier manifest lands.
-checkpoint-barrier-red: parkcheck
-	@sh test/chez/checkpoint-barrier-red-test.sh
+# Exact-actor barrier histories. Each runtime case is subprocess-bounded, while
+# parkcheck keeps recorder/controller counted locks out of the wait path.
+checkpoint-barrier: parkcheck
+	@sh test/chez/checkpoint-barrier-test.sh
 
 # Optimized whole-program erasure: emitted app/effect/region artifacts are
 # identical to checkpoint-free source, contain no checkpoint residue, and the

@@ -1,11 +1,9 @@
-;; RED-only executable histories for the exact-actor checkpoint barrier ABI.
+;; Executable histories for the exact-actor checkpoint barrier ABI.
 ;;
 ;; Run each named history in its own bounded subprocess through
-;; checkpoint-barrier-red-test.sh.  The current runtime deliberately rejects
-;; the versioned manifest below, so this suite stays outside the default/CI
-;; gate until the barrier slice is implemented.  Do not weaken these histories
-;; into sleeps-as-synchronization: event publication and test-owned conditions
-;; are the only progress signals; the subprocess deadline is only a watchdog.
+;; checkpoint-barrier-test.sh. Do not weaken these histories into
+;; sleeps-as-synchronization: event publication and test-owned conditions are
+;; the only progress signals; the subprocess deadline is only a watchdog.
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
 
@@ -28,6 +26,8 @@
 (define kw-version (keyword "jolt.checkpoint" "version"))
 (define kw-plan (keyword "jolt.checkpoint" "plan"))
 (define kw-barriers (keyword "jolt.checkpoint" "barriers"))
+(define kw-snapshot-version (keyword #f "version"))
+(define kw-snapshot-barriers (keyword #f "barriers"))
 (define kw-trace (keyword #f "trace"))
 (define kw-next-seq (keyword #f "next-seq"))
 (define kw-generation (keyword #f "generation"))
@@ -109,6 +109,13 @@
          (or (event-matches? (event-at trace i) action actor site hit)
              (loop (+ i 1))))))
 
+(define (trace-find trace action actor site hit)
+  (let loop ((i 0))
+    (cond ((= i (pvec-count trace)) #f)
+          ((event-matches? (event-at trace i) action actor site hit)
+           (event-at trace i))
+          (else (loop (+ i 1))))))
+
 (define (error-data result)
   (and (error-result? result)
        (jolt-ex-info-record? (cdr result))
@@ -130,7 +137,11 @@
          (= (jolt-get event kw-hit) (jolt-get data kw-error-hit)))))
 
 (define (now-ms)
-  (let ((t (current-time 'time-monotonic)))
+  ;; jolt-millis->time constructs an absolute UTC condition-wait deadline, so
+  ;; the source clock must share that domain.  A monotonic timestamp here makes
+  ;; every condition wait immediately expire and turns the bound into a busy
+  ;; loop that can starve the worker whose completion it is observing.
+  (let ((t (current-time 'time-utc)))
     (+ (* 1000 (time-second t))
        (quotient (time-nanosecond t) 1000000))))
 
@@ -376,10 +387,47 @@
                        (list (selector "member/a" site-a 1)
                              (selector "member/b" site-b 1)))))))
       (ok "one canonical exact-membership contract installs" (ok-result? valid)))
+    (let* ((s (snapshot))
+           (barriers (jolt-get s kw-snapshot-barriers))
+           (selectors (jolt-get barriers "members/exact")))
+      (ok "snapshot preserves the versioned barrier manifest"
+          (and (= 1 (jolt-get s kw-snapshot-version))
+               (pvec? selectors)
+               (= 2 (pvec-count selectors))
+               (jolt= (selector "member/a" site-a 1) (pvec-nth! selectors 0))
+               (jolt= (selector "member/b" site-b 1) (pvec-nth! selectors 1))
+               (eq? kw-barrier
+                    (jolt-get (jolt-get s (keyword #f "plan"))
+                              (selector "member/a" site-a 1))))))
     (jolt-checkpoint-reset!)
     (register-barrier-site! site-a)
     (register-barrier-site! site-b)
     (register-barrier-site! site-c)
+    (let ((before (snapshot)))
+      (ok "unsupported manifest version is rejected without publication"
+          (and
+            (error-result?
+              (attempt
+                (lambda ()
+                  (jolt-checkpoint-install-plan!
+                    (jolt-hash-map
+                      kw-version 2
+                      kw-plan (jolt-hash-map)
+                      kw-barriers (jolt-hash-map))))))
+            (jolt= before (snapshot)))))
+    (let ((before (snapshot)))
+      (ok "unknown manifest key is rejected without publication"
+          (and
+            (error-result?
+              (attempt
+                (lambda ()
+                  (jolt-checkpoint-install-plan!
+                    (jolt-hash-map
+                      kw-version 1
+                      kw-plan (jolt-hash-map)
+                      kw-barriers (jolt-hash-map)
+                      (keyword "jolt.checkpoint" "extra") #t)))))
+            (jolt= before (snapshot)))))
     (let ((before (snapshot)))
       (ok "an action selector outside the declared membership is rejected"
           (and
@@ -492,6 +540,7 @@
          (b1 "test.barrier/round-b1")
          (a2 "test.barrier/round-a2")
          (b2 "test.barrier/round-b2")
+         (allow-a-round2 (signal-cell))
          (b-round2-returned (counter)))
     (for-each register-barrier-site! (list a1 b1 a2 b2))
     (let* ((setup
@@ -513,11 +562,8 @@
                   (jolt-checkpoint-bind-actor! "round/a")
                   (barrier-hit a1)
                   ;; Hold A out of the second explicit barrier ID until main
-                  ;; has observed B parked.
-                  (let loop ()
-                    (when (< (trace-count) 3)
-                      (sleep (make-time 'time-duration 1000000 0))
-                      (loop)))
+                  ;; has observed B's committed arrival and asserted isolation.
+                  (signal-cell-await allow-a-round2)
                   (barrier-hit a2))))
            (b (thread-result
                 (lambda ()
@@ -530,9 +576,10 @@
       (ok "second-round first arrival becomes observable" (await-trace-count 3))
       (ok "the first barrier ID cannot release the second one"
           (= 0 (counter-value b-round2-returned)))
-      (let ((ar (thread-result-await a))
-            (br (thread-result-await b))
-            (trace (trace-of (snapshot))))
+      (signal-cell-set! allow-a-round2 #t)
+      (let* ((ar (thread-result-await a))
+             (br (thread-result-await b))
+             (trace (trace-of (snapshot))))
         (ok "matching round-2 arrival releases both actors"
             (and (ok-result? ar) (ok-result? br)
                  (= 1 (counter-value b-round2-returned))))
@@ -599,9 +646,9 @@
                                    actor-b site-fault 1)
                    (not (thread-result-done? waiter)))))
         (signal-cell-set! proceed #t)
-        (let ((wr (thread-result-await waiter))
-              (pr (thread-result-await peer))
-              (trace (trace-of (snapshot))))
+        (let* ((wr (thread-result-await waiter))
+               (pr (thread-result-await peer))
+               (trace (trace-of (snapshot))))
           (ok "same actor reaches the later barrier and releases the waiter"
               (and (ok-result? wr) (ok-result? pr)
                    (= 3 (pvec-count trace))
@@ -645,6 +692,173 @@
               (and (= 0 (pvec-count (trace-of fresh)))
                    (= 1 (jolt-get fresh kw-next-seq)))))))))
 
+;; A committed decision retains its old-generation round between publication
+;; and dispatch. Exercise reset's actual phase-one helper, pause before its
+;; phase-two wake sweep, then dispatch the final quorum member. Clock closure
+;; must win: neither old participant may observe a release.
+(define (history-reset-before-delayed-arrival)
+  (jolt-checkpoint-reset!)
+  (let* ((site-a "test.barrier/reset-race-a")
+         (site-b "test.barrier/reset-race-b")
+         (actor-a "reset-race/a")
+         (actor-b "reset-race/b")
+         (barrier-id "reset-race/pending"))
+    (register-barrier-site! site-a)
+    (register-barrier-site! site-b)
+    (let* ((setup
+             (install!
+               (list
+                 (entry actor-a site-a 1 kw-barrier)
+                 (entry actor-b site-b 1 kw-barrier))
+               (list
+                 (group barrier-id
+                        (list (selector actor-a site-a 1)
+                              (selector actor-b site-b 1))))))
+           (waiter
+             (thread-result
+               (lambda ()
+                 (jolt-checkpoint-bind-actor! actor-a)
+                 (barrier-hit site-a)))))
+      (ok "delayed-arrival reset manifest installs" (ok-result? setup))
+      (ok "first member commits and waits before final decision"
+          (await-trace-count 1))
+      (jolt-checkpoint-bind-actor! actor-b)
+      (let* ((token
+               (checkpoint-record-reserve!
+                 site-b '("barrier" "continue") 'jolt-checkpoint!))
+             (decision (checkpoint-record-commit! token))
+             (old (snapshot))
+             (old-trace (trace-of old))
+             ;; This is the exact first phase used by jolt-checkpoint-reset!:
+             ;; it closes the clock and publishes the fresh generation, but
+             ;; deliberately leaves the wake sweep pending for this history.
+             (old-rounds (checkpoint-reset-close!))
+             (late-result
+               (attempt-unwrapped
+                 (lambda ()
+                   (checkpoint-dispatch! 'jolt-checkpoint! decision)))))
+        (checkpoint-reset-break-rounds! old-rounds)
+        (let ((waiter-result (thread-result-await waiter))
+              (fresh (snapshot)))
+          (ok "final barrier decision is committed before reset closure"
+              (and (checkpoint-decision? decision)
+                   (= 2 (pvec-count old-trace))
+                   (barrier-event? (event-at old-trace 1)
+                                   actor-b site-b 1 2)))
+          (ok "arrival dispatched after closure reports canonical reset break"
+              (barrier-broken-error?
+                late-result (jolt-get old kw-generation) barrier-id kw-reset
+                (event-at old-trace 1)))
+          (ok "pre-closure waiter also observes reset rather than old release"
+              (barrier-broken-error?
+                waiter-result (jolt-get old kw-generation) barrier-id kw-reset
+                (event-at old-trace 0)))
+          (ok "close-before-arrival creates no synthetic old event or release"
+              (and (= 2 (pvec-count old-trace))
+                   (= 3 (jolt-get old kw-next-seq))))
+          (ok "delayed old decision cannot mutate the fresh generation"
+              (and (= 0 (pvec-count (trace-of fresh)))
+                   (= 1 (jolt-get fresh kw-next-seq)))))))))
+
+;; Public reset closes and publishes while it excludes controller readers.  A
+;; test wrapper pauses at the exact post-close point: if reset ever releases or
+;; has not yet acquired the controller there, a snapshot can observe the closed
+;; current generation.  The nonblocking mutex witness makes that phase check
+;; deterministic; the real concurrent snapshot must then return from the fresh
+;; generation rather than throw.
+(define (history-snapshot-during-reset)
+  (jolt-checkpoint-reset!)
+  (let* ((before-generation (jolt-get (snapshot) kw-generation))
+         (closed (signal-cell))
+         (resume (signal-cell))
+         (snapshot-started (signal-cell))
+         (original-close checkpoint-clock-close!))
+    (set! checkpoint-clock-close!
+      (lambda (clock)
+        (let ((prior (original-close clock)))
+          (signal-cell-set! closed #t)
+          (signal-cell-await resume)
+          prior)))
+    (let ((resetter (thread-result (lambda () (jolt-checkpoint-reset!)))))
+      (ok "reset reaches the deterministic post-close publication phase"
+          (signal-cell-await closed))
+      (let ((controller-acquired?
+              (mutex-acquire checkpoint-controller-mu #f)))
+        (when controller-acquired? (mutex-release checkpoint-controller-mu))
+        (ok "closed current generation remains excluded from snapshot readers"
+            (not controller-acquired?)))
+      (let ((reader
+              (thread-result
+                (lambda ()
+                  (signal-cell-set! snapshot-started #t)
+                  (snapshot)))))
+        (ok "concurrent snapshot starts while reset is paused after closure"
+            (signal-cell-await snapshot-started))
+        (ok "snapshot cannot return through the closed-generation phase"
+            (not (thread-result-done? reader)))
+        (signal-cell-set! resume #t)
+        (let ((reset-result (thread-result-await resetter))
+              (snapshot-result (thread-result-await reader)))
+          (set! checkpoint-clock-close! original-close)
+          (ok "public reset completes after publishing the fresh generation"
+              (ok-result? reset-result))
+          (ok "concurrent snapshot returns the fresh open generation"
+              (and (ok-result? snapshot-result)
+                   (= (+ before-generation 1)
+                      (jolt-get (cdr snapshot-result) kw-generation)))))))))
+
+;; Pause the first public reset after fresh publication but before its old-round
+;; wake sweep.  A genuinely overlapping second reset may neither coalesce nor
+;; return early: it waits on the complete public reset transaction, then performs
+;; its own observable one-generation advance.
+(define (history-overlapping-resets)
+  (jolt-checkpoint-reset!)
+  (let* ((before-generation (jolt-get (snapshot) kw-generation))
+         (phase-two (signal-cell))
+         (resume (signal-cell))
+         (second-entered (signal-cell))
+         (original-break-rounds checkpoint-reset-break-rounds!)
+         (original-logical-enter jolt-logical-mutex-enter!)
+         (first-break? #t))
+    (set! checkpoint-reset-break-rounds!
+      (lambda (rounds)
+        (when first-break?
+          (set! first-break? #f)
+          (signal-cell-set! phase-two #t)
+          (signal-cell-await resume))
+        (original-break-rounds rounds)))
+    (let ((first (thread-result (lambda () (jolt-checkpoint-reset!)))))
+      (ok "first reset reaches phase two after publishing its generation"
+          (signal-cell-await phase-two))
+      ;; The first reset already owns the logical mutex.  Instrument the entry
+      ;; seam only now, so the signal proves the second public invocation has
+      ;; reached its actual contended acquisition rather than merely that its
+      ;; worker thread was scheduled.
+      (set! jolt-logical-mutex-enter!
+        (lambda (lm)
+          (signal-cell-set! second-entered #t)
+          (original-logical-enter lm)))
+      (let ((second
+              (thread-result
+                (lambda ()
+                  (jolt-checkpoint-reset!)))))
+        (ok "second public reset contends while the first wake sweep is pending"
+            (signal-cell-await second-entered))
+        (ok "overlapping reset cannot return before the earlier wake sweep"
+            (and (jolt-logical-mutex-locked? checkpoint-reset-mu)
+                 (not (thread-result-done? first))
+                 (not (thread-result-done? second))))
+        (signal-cell-set! resume #t)
+        (let ((first-result (thread-result-await first))
+              (second-result (thread-result-await second)))
+          (set! checkpoint-reset-break-rounds! original-break-rounds)
+          (set! jolt-logical-mutex-enter! original-logical-enter)
+          (let ((after-generation (jolt-get (snapshot) kw-generation)))
+            (ok "both deliberately overlapping public resets complete"
+                (and (ok-result? first-result) (ok-result? second-result)))
+            (ok "each overlapping reset performs its own observable generation advance"
+                (= (+ before-generation 2) after-generation))))))))
+
 ;; Cancellation breaks every pending barrier group containing the cancelled
 ;; actor rather than silently shrinking any quorum.  The cancel occurrence is
 ;; separate from both expected barrier occurrences, so one sticky decision can
@@ -687,14 +901,14 @@
                  (entry actor-b site-cancel 1 kw-cancel))
                (list
                  (group barrier-id-one
-                        (list (selector actor-a site-a 1)
-                              (selector actor-b site-b1 1)))
+                        (list (selector actor-b site-b1 1)
+                              (selector actor-a site-a 1)))
                  (group barrier-id-two
-                        (list (selector actor-c site-c 1)
-                              (selector actor-b site-b2 1)))
+                        (list (selector actor-b site-b2 1)
+                              (selector actor-c site-c 1)))
                  (group barrier-id-three
-                        (list (selector actor-d site-d 1)
-                              (selector actor-b site-b3 1))))))
+                        (list (selector actor-b site-b3 1)
+                              (selector actor-d site-d 1))))))
            (waiter-one
              (thread-result
                (lambda ()
@@ -709,12 +923,14 @@
       (ok "cancel-break observes both pending exact quorums"
           (await-trace-count 2))
       (jolt-checkpoint-bind-actor! actor-b)
-      (let ((cancel-result
-              (attempt-unwrapped
-                (lambda ()
-                  (jolt-checkpoint! site-cancel '(continue cancel)))))
-            (waiter-one-result (thread-result-await waiter-one))
-            (waiter-two-result (thread-result-await waiter-two)))
+      (let* ((cancel-result
+               (attempt-unwrapped
+                 (lambda ()
+                   (jolt-checkpoint! site-cancel '(continue cancel)))))
+             ;; Sequential bindings are part of the history: cancellation must
+             ;; occur before either bounded waiter observation begins.
+             (waiter-one-result (thread-result-await waiter-one))
+             (waiter-two-result (thread-result-await waiter-two)))
         (ok "cancel remains a terminal action"
             (error-result? cancel-result))
         (let* ((before-late (snapshot))
@@ -728,13 +944,18 @@
                (late-result (thread-result-await late))
                (trace (trace-of (snapshot))))
           (ok "one sticky cancel breaks and wakes both arrived groups"
-              (and (= 3 (pvec-count before-trace))
+              (let ((event-one
+                      (trace-find before-trace kw-barrier actor-a site-a 1))
+                    (event-two
+                      (trace-find before-trace kw-barrier actor-c site-c 1)))
+                (and (= 3 (pvec-count before-trace))
+                   event-one event-two
                    (barrier-broken-error?
                      waiter-one-result generation barrier-id-one kw-cancel
-                     (event-at before-trace 0))
+                     event-one)
                    (barrier-broken-error?
                      waiter-two-result generation barrier-id-two kw-cancel
-                     (event-at before-trace 1))))
+                     event-two))))
           (ok "an expected actor arriving after cancel observes the broken round"
               (and (= 4 (pvec-count trace))
                    (barrier-broken-error?
@@ -760,8 +981,12 @@
   ((string=? history "controller-held") (history-controller-held-progress))
   ((string=? history "fault") (history-fault-does-not-break))
   ((string=? history "reset") (history-reset-wakes))
+  ((string=? history "reset-delayed-arrival")
+   (history-reset-before-delayed-arrival))
+  ((string=? history "reset-snapshot") (history-snapshot-during-reset))
+  ((string=? history "reset-overlap") (history-overlapping-resets))
   ((string=? history "cancel-break") (history-cancel-break))
-  (else (error 'checkpoint-barrier-red-test "unknown history" history)))
+  (else (error 'checkpoint-barrier-test "unknown history" history)))
 
 (if (= fails 0)
     (printf "checkpoint barrier ~a: ~a checks passed\n" history total)
