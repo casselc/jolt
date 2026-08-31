@@ -3,9 +3,10 @@
 ; The model isolates the current recorder data plane from the controller's
 ; public-call model. A reserved token carries its designated driver, site id,
 ; exact binding instance and epoch, reset generation, and recorder owner. The
-; driver commits the token once under the recorder lock: exact current binding
-; and generation are revalidated, then hit/action assignment, CAS allocation
-; on immutable generation state (open?,cut,next-seq), hit update, and append
+; driver identity is checked against the immutable token immediately before
+; taking the recorder lock. Under that lock the exact current binding and
+; generation are revalidated, then hit/action assignment, CAS allocation on
+; immutable generation state (open?,cut,next-seq), hit update, and append
 ; publication occur atomically. Reset CAS-closes the old generation before it
 ; publishes a new one; a later old-generation allocation therefore returns
 ; stale, while an allocation winner is ordered before reset. Snapshot CAS

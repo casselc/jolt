@@ -78,8 +78,9 @@
           carrier
           (mutable sm)
           (mutable monitors)
-          (mutable sic))
-  (nongenerative jolt-fiber-v4))
+          (mutable sic)
+          (mutable checkpoint-binding))
+  (nongenerative jolt-fiber-v5))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -670,7 +671,7 @@
               (make-jolt-dslice (jolt-slice-stack-param)
                                 (jolt-slice-ns-param)
                                 #f)
-              c #f '() 0)))
+              c #f '() 0 #f)))
       (jolt-fiber-enqueue! c f)
       f)))
 

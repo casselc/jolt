@@ -2747,6 +2747,8 @@
                   (terminal-acquire-findings units lock-acquires)))
            (controller-region-count
              (terminal-region-count units 'checkpoint-controller-mu))
+           (recorder-region-count
+             (terminal-region-count units 'checkpoint-recorder-mu))
            (debt
              (analysis-validate-debt-lines
                (analysis-read-data-lines debt-file) '("dispatch") issue-prefix))
@@ -2801,6 +2803,8 @@
              (add! "  CHECKER SELF-TEST FAILED: park, dispatch, checkpoint, terminal-lock, or manual-lock mutation was not detected"))
            (when (= controller-region-count 0)
              (add! "  TERMINAL LOCK POLICY VACUOUS: checkpoint-controller-mu has no checked acquisition region"))
+           (when (= recorder-region-count 0)
+             (add! "  TERMINAL LOCK POLICY VACUOUS: checkpoint-recorder-mu has no checked acquisition region"))
            (for-each
              (lambda (g)
                (add! (string-append "  TERMINAL LOCK DISPATCH: " g)))
@@ -2865,13 +2869,14 @@
               (printf "park/lock check: FAILED\n")
               (exit 1))
              (else
-              (printf "park/lock check: passed (~a files, ~a definitions, ~a can park, ~a park allowlist, ~a checkpoint hazards, ~a stored checkpoint capabilities, ~a counted dispatch debts, ~a logical dispatch debts, ~a logical order edges, ~a checkpoint controller terminal regions)\n"
+              (printf "park/lock check: passed (~a files, ~a definitions, ~a can park, ~a park allowlist, ~a checkpoint hazards, ~a stored checkpoint capabilities, ~a counted dispatch debts, ~a logical dispatch debts, ~a logical order edges, ~a checkpoint controller terminal regions, ~a checkpoint recorder terminal regions)\n"
                       (length files) (length units)
                       (vector-length (hashtable-keys parks)) (length park-got)
                       (length checkpoint-got)
                       (length checkpoint-value-got)
                       (length dispatch-got) (length logical-dispatch-got)
-                      (length logical-edges) controller-region-count)
+                      (length logical-edges) controller-region-count
+                      recorder-region-count)
               (exit 0)))))))))
 
 (main (cdr (command-line)))

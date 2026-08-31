@@ -27,6 +27,7 @@
 (define kw-plan (keyword #f "plan"))
 (define kw-trace (keyword #f "trace"))
 (define kw-next-seq (keyword #f "next-seq"))
+(define kw-generation (keyword #f "generation"))
 (define kw-seq (keyword #f "seq"))
 (define kw-actor (keyword #f "actor"))
 (define kw-id (keyword #f "id"))
@@ -141,6 +142,16 @@
   (ok "prior trace snapshot remains immutable" (= 4 (pvec-count trace)))
   (ok "new snapshot observes later publication"
       (= 5 (pvec-count (snap-trace (snapshot))))))
+
+(let ((before (snapshot)))
+  (ok "plan freezes after the first reservation"
+      (error-result?
+        (attempt
+          (lambda ()
+            (jolt-checkpoint-install-plan! (jolt-hash-map))))))
+  (ok "rejected late plan replacement leaves snapshot plan unchanged"
+      (jolt= (jolt-get before kw-plan)
+             (jolt-get (snapshot) kw-plan))))
 
 ;; Concurrent publishers linearize on one contiguous sequence while each
 ;; explicitly bound actor owns an independent hit counter.
@@ -402,6 +413,334 @@
     (error-result? (attempt (lambda () (execute-emitted compiled-action)))))
 (ok "compiled action-bearing failure leaves all controller state unchanged"
     (jolt= compiled-before (snapshot)))
+
+;; --- #54 generation-scoped per-actor recorder histories -------------------
+
+(jolt-checkpoint-reset!)
+(define recorder-generation (jolt-get (snapshot) kw-generation))
+(ok "checkpoint snapshot exposes a positive generation"
+    (and (integer? recorder-generation) (> recorder-generation 0)))
+
+;; Hold actor A's actual recorder mutex after exact reservation and release A
+;; into commit. Actor B must still reserve and commit. A global-recorder-lock
+;; mutant blocks B here, while the same-recorder A commit remains blocked as a
+;; non-vacuous control.
+(define recorder-gate-mu (make-mutex))
+(define recorder-gate-cv (make-condition))
+(define recorder-a-token #f)
+(define recorder-a-release #f)
+(define recorder-a-committed #f)
+(define recorder-b-go #f)
+(define recorder-b-committed #f)
+(define recorder-a-thread
+  (fork-thread
+    (lambda ()
+      (jolt-checkpoint-bind-actor! "recorder/a")
+      (let ((token
+              (checkpoint-record-reserve! "test.recorder/independent")))
+        (with-mutex recorder-gate-mu
+          (set! recorder-a-token token)
+          (condition-broadcast recorder-gate-cv)
+          (let wait ()
+            (unless recorder-a-release
+              (condition-wait recorder-gate-cv recorder-gate-mu)
+              (wait))))
+        (checkpoint-record-commit! token)
+        (with-mutex recorder-gate-mu
+          (set! recorder-a-committed #t)
+          (condition-broadcast recorder-gate-cv))))))
+(define recorder-b-thread
+  (fork-thread
+    (lambda ()
+      (with-mutex recorder-gate-mu
+        (let wait ()
+          (unless recorder-b-go
+            (condition-wait recorder-gate-cv recorder-gate-mu)
+            (wait))))
+      (jolt-checkpoint-bind-actor! "recorder/b")
+      (checkpoint-record-commit!
+        (checkpoint-record-reserve! "test.recorder/independent"))
+      (with-mutex recorder-gate-mu
+        (set! recorder-b-committed #t)
+        (condition-broadcast recorder-gate-cv)))))
+(with-mutex recorder-gate-mu
+  (let wait ()
+    (unless recorder-a-token
+      (condition-wait recorder-gate-cv recorder-gate-mu)
+      (wait))))
+(define recorder-a-mu
+  (checkpoint-recorder-mu
+    (checkpoint-binding-recorder
+      (checkpoint-token-binding recorder-a-token))))
+(mutex-acquire recorder-a-mu)
+(with-mutex recorder-gate-mu
+  (set! recorder-a-release #t)
+  (set! recorder-b-go #t)
+  (condition-broadcast recorder-gate-cv)
+  (let wait ()
+    (unless recorder-b-committed
+      (condition-wait recorder-gate-cv recorder-gate-mu)
+      (wait))))
+(ok "actor-local recorder lock does not block another actor commit"
+    (and recorder-b-committed (not recorder-a-committed)))
+(mutex-release recorder-a-mu)
+(thread-join recorder-a-thread)
+(thread-join recorder-b-thread)
+(let* ((trace (snap-trace (snapshot)))
+       (b (trace-event trace 0))
+       (a (trace-event trace 1)))
+  (ok "same-recorder commit resumes and extends contiguous order"
+      (and recorder-a-committed
+           (= 2 (pvec-count trace))
+           (= 1 (jolt-get b kw-seq))
+           (string=? "recorder/b" (jolt-get b kw-actor))
+           (= 2 (jolt-get a kw-seq))
+           (string=? "recorder/a" (jolt-get a kw-actor)))))
+
+;; A reservation token is affine to its execution context. Passing it to a
+;; sibling thread must fail before clock allocation or trace publication; the
+;; original driver can still commit that exact token afterwards.
+(jolt-checkpoint-reset!)
+(define driver-mu (make-mutex))
+(define driver-cv (make-condition))
+(define driver-token #f)
+(define driver-release #f)
+(define driver-thread
+  (fork-thread
+    (lambda ()
+      (jolt-checkpoint-bind-actor! "driver/a")
+      (let ((token (checkpoint-record-reserve! "test.recorder/driver")))
+        (with-mutex driver-mu
+          (set! driver-token token)
+          (condition-broadcast driver-cv)
+          (let wait ()
+            (unless driver-release
+              (condition-wait driver-cv driver-mu)
+              (wait))))
+        (checkpoint-record-commit! token)))))
+(with-mutex driver-mu
+  (let wait ()
+    (unless driver-token
+      (condition-wait driver-cv driver-mu)
+      (wait))))
+(ok "foreign execution context cannot commit another actor token"
+    (error-result?
+      (attempt (lambda () (checkpoint-record-commit! driver-token)))))
+(ok "foreign token rejection publishes no event"
+    (= 0 (pvec-count (snap-trace (snapshot)))))
+(with-mutex driver-mu
+  (set! driver-release #t)
+  (condition-broadcast driver-cv))
+(thread-join driver-thread)
+(ok "original token driver remains able to commit exactly once"
+    (= 1 (pvec-count (snap-trace (snapshot)))))
+
+(jolt-checkpoint-reset!)
+(jolt-checkpoint-bind-actor! "driver/once")
+(define once-token
+  (checkpoint-record-reserve! "test.recorder/driver-once"))
+(checkpoint-record-commit! once-token)
+(ok "same execution context cannot commit one token twice"
+    (error-result?
+      (attempt (lambda () (checkpoint-record-commit! once-token)))))
+(ok "duplicate token commit appends no second event"
+    (= 1 (pvec-count (snap-trace (snapshot)))))
+
+;; A token belongs to one exact binding instance, not merely to its actor,
+;; recorder, generation, or OS thread. Unbinding or rebinding retires an
+;; outstanding reservation without consuming the actor's next hit.
+(jolt-checkpoint-reset!)
+(jolt-checkpoint-bind-actor! "binding/exact")
+(define unbound-token
+  (checkpoint-record-reserve! "test.recorder/exact-binding"))
+(jolt-checkpoint-unbind-actor!)
+(ok "unbind makes an outstanding token stale"
+    (eq? checkpoint-stale (checkpoint-record-commit! unbound-token)))
+(ok "stale unbound token consumes neither event nor hit"
+    (= 0 (pvec-count (snap-trace (snapshot)))))
+
+(jolt-checkpoint-bind-actor! "binding/exact")
+(define rebound-token
+  (checkpoint-record-reserve! "test.recorder/exact-binding"))
+;; Rebinding the same actor on the same execution context deliberately creates
+;; a fresh capability even though it reuses the actor's recorder.
+(jolt-checkpoint-bind-actor! "binding/exact")
+(ok "same-actor rebind makes the prior binding token stale"
+    (eq? checkpoint-stale (checkpoint-record-commit! rebound-token)))
+(jolt-checkpoint-continue! "test.recorder/exact-binding")
+(let* ((trace (snap-trace (snapshot)))
+       (event (trace-event trace 0)))
+  (ok "abandoned bindings leave the next committed hit contiguous"
+      (and (= 1 (pvec-count trace))
+           (= 1 (jolt-get event kw-seq))
+           (= 1 (jolt-get event kw-hit)))))
+
+;; Exercise a deterministic concurrent cut while one exact token is reserved
+;; but uncommitted and three independent actors publish. The first snapshot
+;; must exclude the reservation; after release, the final snapshot must extend
+;; that exact prefix. Worker failures are captured and always release waiters.
+(jolt-checkpoint-reset!)
+(define snapshot-race-actors 4)
+(define snapshot-race-hits 40)
+(define snapshot-race-mu (make-mutex))
+(define snapshot-race-cv (make-condition))
+(define snapshot-race-ready 0)
+(define snapshot-race-go #f)
+(define snapshot-race-paused #f)
+(define snapshot-race-release #f)
+(define snapshot-race-done 0)
+(define snapshot-race-errors (make-vector snapshot-race-actors #f))
+(define snapshot-race-threads
+  (let loop ((i 0) (out '()))
+    (if (= i snapshot-race-actors) out
+        (loop
+          (+ i 1)
+          (cons
+            (fork-thread
+              (lambda ()
+                (guard
+                  (e (#t
+                      (with-mutex snapshot-race-mu
+                        (vector-set! snapshot-race-errors i e)
+                        (when (= i 0) (set! snapshot-race-paused #t))
+                        (set! snapshot-race-done (+ snapshot-race-done 1))
+                        (condition-broadcast snapshot-race-cv))))
+                  (with-mutex snapshot-race-mu
+                    (set! snapshot-race-ready (+ snapshot-race-ready 1))
+                    (condition-broadcast snapshot-race-cv)
+                    (let wait ()
+                      (unless snapshot-race-go
+                        (condition-wait snapshot-race-cv snapshot-race-mu)
+                        (wait))))
+                  (jolt-checkpoint-bind-actor!
+                    (string-append "snapshot/" (number->string i)))
+                  (if (= i 0)
+                      (let ((token
+                              (checkpoint-record-reserve!
+                                "test.recorder/snapshot-race")))
+                        (with-mutex snapshot-race-mu
+                          (set! snapshot-race-paused #t)
+                          (condition-broadcast snapshot-race-cv)
+                          (let wait ()
+                            (unless snapshot-race-release
+                              (condition-wait snapshot-race-cv snapshot-race-mu)
+                              (wait))))
+                        (checkpoint-record-commit! token)
+                        (let hits ((n 1))
+                          (when (< n snapshot-race-hits)
+                            (jolt-checkpoint-continue!
+                              "test.recorder/snapshot-race")
+                            (hits (+ n 1)))))
+                      (let hits ((n 0))
+                        (when (< n snapshot-race-hits)
+                          (jolt-checkpoint-continue!
+                            "test.recorder/snapshot-race")
+                          (hits (+ n 1)))))
+                  (with-mutex snapshot-race-mu
+                    (set! snapshot-race-done (+ snapshot-race-done 1))
+                    (condition-broadcast snapshot-race-cv)))))
+            out)))))
+(define (snapshot-event-key event)
+  (list (jolt-get event kw-seq)
+        (jolt-get event kw-actor)
+        (jolt-get event kw-id)
+        (jolt-get event kw-hit)))
+(define (list-prefix? prefix xs)
+  (cond ((null? prefix) #t)
+        ((null? xs) #f)
+        (else (and (equal? (car prefix) (car xs))
+                   (list-prefix? (cdr prefix) (cdr xs))))))
+(define (snapshot-contiguous? s)
+  (let* ((trace (vector->list (pvec-v (snap-trace s))))
+         (seqs (map (lambda (event) (jolt-get event kw-seq)) trace)))
+    (and (= (jolt-get s kw-next-seq) (+ 1 (length trace)))
+         (equal? seqs
+                 (let range ((n 1) (out '()))
+                   (if (> n (length trace)) (reverse out)
+                       (range (+ n 1) (cons n out))))))))
+(with-mutex snapshot-race-mu
+  (let wait ()
+    (unless (= snapshot-race-ready snapshot-race-actors)
+      (condition-wait snapshot-race-cv snapshot-race-mu)
+      (wait)))
+  (set! snapshot-race-go #t)
+  (condition-broadcast snapshot-race-cv)
+  (let wait ()
+    (unless snapshot-race-paused
+      (condition-wait snapshot-race-cv snapshot-race-mu)
+      (wait))))
+(define pending-snapshot (snapshot))
+(define pending-keys
+  (map snapshot-event-key
+       (vector->list (pvec-v (snap-trace pending-snapshot)))))
+(ok "snapshot excludes a reserved but uncommitted token"
+    (and (snapshot-contiguous? pending-snapshot)
+         (< (length pending-keys)
+            (* snapshot-race-actors snapshot-race-hits))))
+(with-mutex snapshot-race-mu
+  (set! snapshot-race-release #t)
+  (condition-broadcast snapshot-race-cv))
+(for-each thread-join snapshot-race-threads)
+(let ((final (snapshot)))
+  (ok "concurrent commits and snapshot cuts preserve exact prefixes"
+      (and (let errors ((i 0))
+             (or (= i snapshot-race-actors)
+                 (and (not (vector-ref snapshot-race-errors i))
+                      (errors (+ i 1)))))
+           (= snapshot-race-done snapshot-race-actors)
+           (snapshot-contiguous? final)
+           (list-prefix?
+             pending-keys
+             (map snapshot-event-key
+                  (vector->list (pvec-v (snap-trace final)))))
+           (> (pvec-count (snap-trace final)) (length pending-keys))
+           (= (* snapshot-race-actors snapshot-race-hits)
+              (pvec-count (snap-trace final)))
+           (= (+ 1 (* snapshot-race-actors snapshot-race-hits))
+              (jolt-get final kw-next-seq)))))
+
+;; Reset is a generation fence. A token reserved in the prior generation may
+;; retire only as stale; it cannot allocate a sequence or publish into the new
+;; run. Fresh recording restarts sequence and hit at one.
+(jolt-checkpoint-reset!)
+(jolt-checkpoint-bind-actor! "generation/stale")
+(define stale-generation (jolt-get (snapshot) kw-generation))
+(define stale-token
+  (checkpoint-record-reserve! "test.recorder/generation"))
+(define stale-clock
+  (checkpoint-generation-clock
+    (checkpoint-binding-generation
+      (checkpoint-token-binding stale-token))))
+(jolt-checkpoint-reset!)
+(define fresh-generation (jolt-get (snapshot) kw-generation))
+(ok "reset advances the checkpoint generation"
+    (= fresh-generation (+ stale-generation 1)))
+(ok "stale reserved token is rejected without publication"
+    (and (eq? checkpoint-stale (checkpoint-record-commit! stale-token))
+         (= 0 (pvec-count (snap-trace (snapshot))))))
+(ok "reset seals the prior generation against late allocation"
+    (not (checkpoint-clock-allocate! stale-clock)))
+(jolt-checkpoint-bind-actor! "generation/fresh")
+(jolt-checkpoint-continue! "test.recorder/generation")
+(let* ((s (snapshot))
+       (trace (snap-trace s))
+       (event (trace-event trace 0)))
+  (ok "fresh post-reset recording restarts sequence and hit at one"
+      (and (= 1 (pvec-count trace))
+           (= 1 (jolt-get event kw-seq))
+           (= 1 (jolt-get event kw-hit)))))
+
+;; Binding failure occurs before reservation/config publication and leaves the
+;; complete public controller snapshot unchanged.
+(jolt-checkpoint-reset!)
+(define unbound-before (snapshot))
+(ok "unbound exact reservation fails closed"
+    (error-result?
+      (attempt
+        (lambda ()
+          (checkpoint-record-reserve! "test.recorder/unbound")))))
+(ok "unbound reservation failure is controller-state-identical"
+    (jolt= unbound-before (snapshot)))
 
 (if (= fails 0)
     (printf "checkpoint runtime: ~a checks passed\n" total)

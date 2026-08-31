@@ -421,7 +421,7 @@
 ;; ~2.4ns vs ~3.3ns, a smaller but free win.
 ;;
 ;; Virtual registers are a fixed global resource: (virtual-register-count) slots for
-;; the whole process (16 on every platform jolt targets). jolt claims 0-9, listed
+;; the whole process (16 on every platform jolt targets). jolt claims 0-10, listed
 ;; here so the assignment is in one place; nothing else in the runtime uses them.
 ;; A freshly forked thread starts every slot at fixnum 0, NOT #f, so "unset" means
 ;; fixnum 0 (the site slots hold a site pair or 0). Slot 0 was claimed by R1's
@@ -430,8 +430,11 @@
 ;; the 3.4M switches/sec design point (R0(c)); the fibers define re-defines the
 ;; value in fibers.ss so the standalone gate can load it without rt.ss. Slot 1
 ;; was freed by R3 (jolt-230w), which moved the R1 ring/mark vregs onto the
-;; continuation, and re-claimed by fibers.ss for park-unwinding; the next free
-;; slot is 10. The surviving slots keep their R2 numbers.
+;; continuation, and re-claimed by fibers.ss for park-unwinding. Slot 10 holds
+;; the checkpoint actor binding for an ordinary OS/native-callback thread;
+;; fibers keep the same state on their fiber record so siblings on one carrier
+;; cannot inherit it. The next free slot is 11. The surviving slots keep their
+;; R2 numbers.
 (define jolt-vreg-site 2)        ; ('ns/fn' . line) of the innermost live call site
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
@@ -450,6 +453,8 @@
 ;;   owning thread's id and be re-checked on every read; a vreg starts at
 ;;   fixnum 0 in a fresh thread, which is the property that workaround was
 ;;   buying.
+;; slot 10: checkpoints.ss jolt-vreg-checkpoint-binding — the generation-scoped
+;;   actor/recorder binding for an ordinary thread, or fixnum 0 when unbound.
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
