@@ -331,8 +331,8 @@ coreasyncreducerhistory:
 coreasyncproof:
 	@sh test/formal/check-core-async.sh
 
-# Bounded generation/binding/snapshot proof for the record/continue checkpoint
-# controller, including caller-only reset and split-snapshot mutation controls.
+# Bounded checkpoint controller proof: a six-operation control-plane model plus
+# a distinct reservation/publication machine with ownership mutation controls.
 checkpointrecorderproof:
 	@sh test/formal/check-checkpoint-recorder.sh
 

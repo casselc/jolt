@@ -1,8 +1,14 @@
-; Bounded generation/binding/snapshot model for checkpoint recorder issue #54.
+; Bounded control-plane model for checkpoint recorder issue #54.
 ;
 ; Source facts at 0626dede: bindings are execution-context keyed; reset clears
 ; all bindings and recorder roots atomically; a bound hit increments one actor
 ; hit plus global trace/sequence; snapshot copies all roots under one mutex.
+;
+; Scope: public controller call sequencing, the generation-tagged binding
+; table, and coarse snapshot arithmetic only.  This model does not claim to
+; cover the current recorder's reserve/claim/commit token protocol, exact
+; binding-instance ownership, or append publication; those are checked by the
+; separate reservation/publication machine model.
 ;
 ; Domain: contexts {0,1}, actors {0,1}, six operation slots. Values, sites,
 ; plans, strings, fairness, and longer histories remain runtime obligations.
