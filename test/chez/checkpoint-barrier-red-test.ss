@@ -332,27 +332,31 @@
                  (signal-cell-set! bound-b #t)
                  (signal-cell-await go)
                  (barrier-hit site-b)
-                 (counter-inc! released))))
-           (holder
-             (thread-result
-               (lambda ()
-                 (jolt-with-mutex checkpoint-controller-mu
-                   (signal-cell-set! held #t)
-                   (signal-cell-await release))))))
+                 (counter-inc! released)))))
       (ok "controller-held manifest installs" (ok-result? setup))
       (ok "controller-held actors finish binding before the lock test"
           (and (signal-cell-await bound-a) (signal-cell-await bound-b)))
-      (ok "a separate thread holds checkpoint-controller-mu"
-          (signal-cell-await held))
-      (signal-cell-set! go #t)
-      (let ((ar (thread-result-await a))
-            (br (thread-result-await b)))
-        (ok "established arrivals and release progress while controller is held"
-            (and (ok-result? ar) (ok-result? br)
-                 (= 2 (counter-value released))))
-        (signal-cell-set! release #t)
-        (ok "controller lock holder exits after the bounded progress check"
-            (ok-result? (thread-result-await holder)))))))
+      ;; Create the holder only after both bind completions are observed.  If it
+      ;; were forked alongside the actors, it could legitimately win the
+      ;; controller mutex before their binds and create a scheduler-dependent
+      ;; false failure unrelated to established-arrival progress.
+      (let ((holder
+              (thread-result
+                (lambda ()
+                  (jolt-with-mutex checkpoint-controller-mu
+                    (signal-cell-set! held #t)
+                    (signal-cell-await release))))))
+        (ok "a separate thread holds checkpoint-controller-mu"
+            (signal-cell-await held))
+        (signal-cell-set! go #t)
+        (let ((ar (thread-result-await a))
+              (br (thread-result-await b)))
+          (ok "established arrivals and release progress while controller is held"
+              (and (ok-result? ar) (ok-result? br)
+                   (= 2 (counter-value released))))
+          (signal-cell-set! release #t)
+          (ok "controller lock holder exits after the bounded progress check"
+              (ok-result? (thread-result-await holder))))))))
 
 (define (history-exact-membership)
   (jolt-checkpoint-reset!)
