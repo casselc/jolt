@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `jolt build` can select instrumentation aspect manifests and one or more
+  ordered providers. The compiler wraps exact resolved call sites and
+  fixed-arity function entries before optimization. Each provider can observe
+  evaluated arguments or explicitly replace them while the compiler still
+  guarantees one application execution, fail-open instrumentation, and
+  preservation of application results and exceptions. Provider order is part
+  of the deterministic build identity and match report. The report publishes
+  only after the output artifact succeeds, and builds without an aspect
+  selection remain unchanged.
+
 ## [0.8.3] - 2026-09-06
 
 A primitive array holds its elements unboxed, and a type hint costs nothing it
@@ -672,7 +686,6 @@ since the `ffi/write` argument order changed in 0.8.0.
   prompt that said `user`, and `-main` under `run -m` ran in `jolt.main`.
   `clojure.main` starts every entry in `user`; jolt does too now, and the REPL
   prompt names whatever namespace is current, as `clojure.main`'s does.
-
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the
@@ -1274,7 +1287,6 @@ are what typedclojure's runtime asks of a host.
   and an unregistered alias now says `Unknown auto-resolved namespace alias`
   rather than `Invalid token`, so the message matches the JVM's for every
   spelling that names a namespace.
-
 ## [0.8.0] - 2026-08-31
 
 The build keeps one toolchain end to end now. When make provisions the pinned
@@ -1296,14 +1308,6 @@ layout is now `[:array element-type count]`, which does raise at compile time
 when transposed.
 
 ### Added
-
-- `jolt build` can select instrumentation aspect manifests and providers. The
-  compiler wraps exact resolved call sites and fixed-arity function entries
-  before optimization. Advice can observe evaluated arguments or explicitly
-  replace them while the compiler still guarantees one application execution,
-  fail-open instrumentation, and preservation of application results and
-  exceptions. The build publishes a deterministic match report only after the
-  output artifact succeeds. Builds without an aspect selection remain unchanged.
 
 - **`jolt.ffi` arenas: a group of allocations with one lifetime (#799).** Every
   foreign allocation used to be released one pointer at a time — `ffi/free` per

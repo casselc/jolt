@@ -14,12 +14,21 @@
 (defn around [join-point evaluated-args proceed]
   (println (str "audit-before " (:id join-point)))
   (println (str "audit-args " (pr-str evaluated-args)))
-  (let [original (first evaluated-args)
-        value (proceed [(if (= "ok-woven" original)
-                          "ok-woven-inner"
-                          original)])]
-    (println (str "audit-after " value))
-    :ignored-audit-result))
+  (let [original (first evaluated-args)]
+    (cond
+      (= "skip-middle" original)
+      (println "audit-skip")
+
+      (= "throw-middle" original)
+      (do (println "audit-throw")
+          (throw (Exception. "middle advice failure")))
+
+      :else
+      (let [value (proceed [(if (= "ok-woven" original)
+                              "ok-woven-inner"
+                              original)])]
+        (println (str "audit-after " value))
+        :ignored-audit-result))))
 
 (defn entry-around [join-point evaluated-args proceed]
   (println (str "entry-audit-before " (:id join-point)))
