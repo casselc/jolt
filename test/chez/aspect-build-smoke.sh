@@ -206,6 +206,20 @@ test "$(grep -o 'instrumentation.audit-provider/aspect-provider' \
 grep -q ':roles \[:test/around\]' "$tmp/target/aspects.edn"
 grep -q ':selection-ordinal 2' "$tmp/target/aspects.edn"
 
+# An unknown role fails through the real build path before producing an
+# artifact; role filters are not an open-ended provider-specific namespace.
+sed -i 's/:test\/around/:test\/missing/' "$tmp/deps.edn"
+if (cd "$tmp" && JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" build -m app.core -o target/unknown-role/app) \
+  >"$tmp/target/unknown-role.log" 2>&1; then
+  echo "FAIL: unknown consumer role unexpectedly built" >&2
+  exit 1
+fi
+grep -q 'selection consumer names roles absent from the manifest' \
+  "$tmp/target/unknown-role.log"
+test ! -e "$tmp/target/unknown-role/app"
+cp "$tmp/deps.filtered.edn" "$tmp/deps.edn"
+
 # Expanding a filter changes the artifact identity and report even though the
 # same provider source and order remain selected.
 cp "$tmp/deps.filtered-more.edn" "$tmp/deps.edn"
