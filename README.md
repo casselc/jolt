@@ -389,6 +389,59 @@ The resource schema is intentionally narrow in v1:
    :expect {:matches 1}}]}
 ```
 
+Library authors can generate that same ABI from cooperative compiler annotations
+instead of assembling it by hand. Configure the library identity and published
+resource path once:
+
+```clojure
+;; library deps.edn
+{:paths ["src"]
+ :jolt/aspects
+ {:library {:id my/db :version "exact-revision"}
+  :namespaces [my.db.api my.db.impl]
+  :manifest "src/META-INF/jolt/aspects/db.edn"}}
+```
+
+Annotate fixed-arity function entries with ordinary definition metadata. A
+single-arity definition derives its arity; a multi-arity definition requires an
+explicit `:jolt.aspects/arity` selecting exactly one clause:
+
+```clojure
+(defn ^{:jolt.aspects/id :db/result-callback
+        :jolt.aspects/role :db/result}
+  consume-result [result]
+  ...)
+```
+
+Use `jolt.aspects/at` inside a function definition for an individual qualified
+or namespace-aliased call:
+
+```clojure
+(ns my.db.impl
+  (:require [jolt.aspects :as aspects]
+            [my.db.driver :as driver]))
+
+(defn execute [connection query]
+  (aspects/at {:id :db/execute :role :db/client}
+    (driver/execute connection query)))
+```
+
+`at` is a compiler marker, not an instrumentation wrapper. In a plain build it
+evaluates the original call directly and adds no runtime boundary. Generated
+call selectors retain the resolved target plus a marker refinement, so two
+otherwise identical calls in one namespace remain independently selectable.
+
+```bash
+jolt aspects manifest          # write the configured resource
+jolt aspects manifest --check  # fail if compiler annotations and EDN drift
+```
+
+Commit and publish the generated manifest with the library. Applications and
+providers consume it through the ordinary `:jolt/build :aspects` selection
+shown above; source annotations do not create a second provider or weaving
+protocol. External manifests remain the supported path for libraries that do
+not participate.
+
 The selected namespace exposes `aspect-provider` (or `:provider` may name a
 qualified provider var):
 
@@ -398,8 +451,35 @@ qualified provider var):
    :libraries {'my/db "exact-revision"}
    :roles {:db/client 'my.otel.db/around-execute
            :db/result {:fn 'my.otel.db/around-result
-                       :contract :args-v1}}})
+           :contract :args-v1}}})
 ```
+
+Instrumentation packages can publish named, inert preset resources so an
+application does not have to copy the library-resource/provider wiring. A
+preset expands into the same ordinary selections before validation:
+
+```clojure
+;; deps.edn
+{:jolt/build
+ {:aspects
+  [{:preset
+    "META-INF/jolt/instrumentation/http-server/basic.edn"}]}}
+
+;; package resource
+{:schema 1
+ :id :otel.http-server/basic
+ :selections
+ [{:resource "META-INF/jolt/aspects/http-server.edn"
+   :provider
+   otel.instrumentation.http-server/basic-aspect-provider}]}
+```
+
+Preset resources may contain multiple selections but cannot recursively select
+other presets. Their identity and resource name contribute to the artifact
+identity and appear in `jolt aspects plan`; their source bytes do not. The
+instrumented library still owns its provider-neutral join-point manifest, while
+the instrumentation package owns the provider and any basic/detailed/debug
+policy variants.
 
 Use ordered `:providers` when independent consumers need the same semantic
 join points—for example, OpenTelemetry plus a bounded event journal:
@@ -462,6 +542,23 @@ configuration deliberately moves both identities. Checkout-absolute paths are
 excluded. Providers and offline tools can therefore correlate independent
 consumers at one site without reimplementing compiler-private hashing, and
 reject histories recorded by a different woven artifact.
+
+Inspect selection before compiling with `jolt aspects plan`. Its deterministic
+EDN contains the static identity, manifests, matches, and ordered consumers, but
+never source bytes, the configured report path, or checkout-local paths.
+`jolt aspects explain [REPORT]` renders the same selection for humans and, when
+given a report, adds observed sites only after validating its schema, weaver,
+build identity, control mode, aspect set, match counts, and site shapes. An
+explicitly missing or stale report is an error; omitting `REPORT` uses an
+existing configured `:aspect-report` when available and otherwise explains only
+the static plan.
+
+Planning installs dependency source roots so the selected provider vars can be
+resolved, but it does not load the project's declared `:jolt/native` objects.
+Provider namespaces are trusted executable configuration in v1: resolving a
+provider var evaluates that namespace's top-level forms. Keep provider
+namespaces declarative and side-effect-free. A future inert provider artifact
+can remove that remaining resolution-time execution.
 
 An advice function receives `[join-point proceed]`. Jolt preserves argument
 evaluation order, the operation's result, application exception identity, and

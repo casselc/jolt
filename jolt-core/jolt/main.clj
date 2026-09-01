@@ -5,6 +5,8 @@
   before the launcher cd'd to the jolt repo)."
   (:require [jolt.deps :as deps]
             [jolt.aspects :as aspects]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]))
 
 (defn- project-dir [] (or (jolt.host/getenv "JOLT_PWD") "."))
@@ -82,13 +84,18 @@
   (doseq [[install-ns lib & classes] provides]
     (jolt.host/register-class-provider! install-ns lib (vec classes))))
 
-;; Apply a resolved project's roots on top of the current (jolt-core) roots so app
-;; namespaces resolve while jolt.* stays loadable, then register its declared host
-;; class providers and load its native deps.
+;; Apply only a resolved project's source roots. Introspection commands need
+;; provider namespaces to resolve, but must not load project native libraries or
+;; run their constructors merely to describe a build.
+(defn- apply-project-roots! [{:keys [roots]}]
+  (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots))))))
+
+;; Runtime/build commands additionally register declared host-class providers
+;; and load the resolved native dependencies.
 (defn- apply-project!
   ([resolved] (apply-project! resolved true))
-  ([{:keys [roots natives provides project-dir]} strict?]
-   (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
+  ([{:keys [natives provides project-dir] :as resolved} strict?]
+   (apply-project-roots! resolved)
    ;; Providers go in BEFORE anything of the project compiles (RFC 0014): the
    ;; table has to be complete before the first class reference can miss, which
    ;; is the whole reason the mapping is declared rather than registered by the
@@ -599,6 +606,88 @@
                                      cands (if (string? c) [c] (vec c))]
                                  (into [(if (:optional spec) "opt" "req")] cands))))))))
 
+(defn- project-path [path]
+  (when path
+    (let [file (io/file path)]
+      (str (if (.isAbsolute file) file (io/file (project-dir) path))))))
+
+(defn- cmd-aspects [more]
+  (let [[subcommand report-arg & extra] more]
+    (when (nil? subcommand)
+      (throw (ex-info
+              (str "usage: jolt aspects plan | jolt aspects explain [REPORT] | "
+                   "jolt aspects manifest [--check]")
+              {:args (vec more)})))
+    (if (= "manifest" subcommand)
+      (do
+        (when (or (seq extra)
+                  (and report-arg (not= "--check" report-arg)))
+          (throw (ex-info "usage: jolt aspects manifest [--check]"
+                          {:args (vec more)})))
+        (let [{:keys [aspect-authoring] :as resolved}
+              (resolve-current)
+              _ (apply-project-roots! resolved)
+              configured-path (:manifest aspect-authoring)
+              _ (when-not (string? configured-path)
+                  (throw (ex-info
+                          "jolt aspects manifest needs :jolt/aspects :manifest path"
+                          {:jolt/aspects aspect-authoring})))
+              path (project-path configured-path)
+              file (io/file path)
+              temp-dir (java.nio.file.Files/createTempDirectory
+                        "jolt-aspects-"
+                        (into-array java.nio.file.attribute.FileAttribute []))]
+          (try
+            (let [rendered
+                  (binding [*compile-path* (str temp-dir)]
+                    (aspects/render-manifest
+                     (aspects/collect-manifest aspect-authoring compile)))]
+              (if (= "--check" report-arg)
+                (if (and (.isFile file) (= rendered (slurp file)))
+                  (println (str "aspect manifest is current: " configured-path))
+                  (throw (ex-info (str "generated aspect manifest is stale: "
+                                       configured-path)
+                                  {:manifest configured-path})))
+                (do
+                  (when-some [parent (.getParentFile file)]
+                    (.mkdirs parent))
+                  (spit file rendered)
+                  (println (str "wrote aspect manifest: " configured-path)))))
+            (finally
+              (jolt.host/delete-tree! (str temp-dir))))))
+      (do
+        (when (or (seq extra)
+                  (and (= "plan" subcommand) report-arg)
+                  (not (contains? #{"plan" "explain"} subcommand)))
+          (throw (ex-info
+                  (str "usage: jolt aspects plan | jolt aspects explain [REPORT] | "
+                       "jolt aspects manifest [--check]")
+                  {:args (vec more)})))
+        (let [{:keys [build] :as resolved} (resolve-current)
+              _ (apply-project-roots! resolved)
+              configured-report (project-path (:aspect-report build))
+              config (aspects/resolve-build-config
+                      (:aspects build) configured-report
+                      (:allow-control-aspects build))
+              plan (aspects/plan-data config)]
+          (case subcommand
+            "plan" (prn plan)
+            "explain"
+            (let [explicit? (some? report-arg)
+                  report-path (or (project-path report-arg) configured-report)
+                  report-file (some-> report-path io/file)
+                  _ (when (and explicit? (not (.isFile report-file)))
+                      (throw (ex-info (str "aspect report not found: " report-arg)
+                                      {:report report-arg})))
+                  report (when (and report-file (.isFile report-file))
+                           (edn/read-string (slurp report-file)))
+                  label (when report
+                          (if explicit? report-arg
+                              (or (:aspect-report build)
+                                  "configured build report")))]
+              (run! println
+                    (aspects/explain-lines plan report label)))))))))
+
 (defn- cmd-build [more]
   (let [{:keys [project-paths embed-dirs build] :as resolved}
         (resolve-current)]
@@ -735,6 +824,10 @@
   (println "                         jolt_library_init + jolt_lookup; --target")
   (println "                         cross-compiles either one for another Chez machine")
   (println "                         (see tools/cross-compile)")
+  (println "  aspects plan           resolve and print selected manifests and consumers")
+  (println "  aspects explain [FILE] explain selection and optional observed build report")
+  (println "  aspects manifest       compile cooperative annotations into EDN")
+  (println "  aspects manifest --check  fail when the generated manifest is stale")
   (println "  path                   print the resolved source roots")
   (println "  tasks                  list the project's bb.edn/deps.edn :tasks")
   (println "  <task> [args]          run a task (`run <task>` and `run --parallel")
@@ -844,7 +937,7 @@
       ;; (babashka's :override-builtin). Checked here, after the two commands
       ;; that read no project at all, so it costs nothing a command doesn't
       ;; already pay: everything below resolves the project anyway.
-      (and (#{"run" "repl" "nrepl-server" "path" "build" "tasks"} cmd)
+      (and (#{"run" "repl" "nrepl-server" "path" "build" "aspects" "tasks"} cmd)
            (builtin-overridden? cmd))
       (run-task cmd more false)
 
@@ -853,6 +946,7 @@
       (= cmd "nrepl-server")             (nrepl more)
       (= cmd "path")                     (cmd-path)
       (= cmd "tasks")                    (cmd-tasks)
+      (= cmd "aspects")                  (cmd-aspects more)
       ;; -Sdeps '<edn>' — an extra deps.edn map merged last into the chain,
       ;; bound around the re-dispatch of the remaining argv.
       (= cmd "-Sdeps")
