@@ -120,8 +120,8 @@
    ;; per-emit-session scratch that emit-with-cells swaps in and out, and sharing one
    ;; of those across threads corrupts both threads' output.
    :gensym-counter (atom 0)
-   ;; jolt.passes.inline scratch: the fixpoint dirty flag run-passes reads/resets and
-   ;; the alpha-rename counter for inlined binders.
+   ;; Compiler-rewrite scratch: the fixpoint dirty flag run-passes reads/resets and
+   ;; one counter for globally fresh inline binders and aspect-weaving locals.
    :dirty (atom false)
    :fresh-counter (atom 0)
    ;; Build-selected instrumentation is compilation-unit state too. Keeping the
