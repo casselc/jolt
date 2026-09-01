@@ -14,13 +14,22 @@
 (defn around [join-point evaluated-args proceed]
   (println (str "advice-before " (:id join-point)))
   (println (str "advice-args " (pr-str evaluated-args)))
-  (let [original (first evaluated-args)
-        value (proceed [(if (= "ok" original)
-                          "ok-woven"
-                          original)])]
-    (println (str "advice-after " value))
-    ;; The compiler-owned invoke-around contract preserves the app value.
-    :ignored-provider-result))
+  (let [original (first evaluated-args)]
+    (cond
+      (= "skip-outer" original)
+      (println "advice-skip")
+
+      (= "throw-outer" original)
+      (do (println "advice-throw")
+          (throw (Exception. "outer advice failure")))
+
+      :else
+      (let [value (proceed [(if (= "ok" original)
+                              "ok-woven"
+                              original)])]
+        (println (str "advice-after " value))
+        ;; The compiler-owned invoke-around contract preserves the app value.
+        :ignored-provider-result))))
 
 (defn unrelated-advice [_ _]
   (throw (Exception. "tree shaking should remove this")))

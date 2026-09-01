@@ -91,6 +91,30 @@ numeric-entry-after 43
 result 43'
 test "$entry_number_output" = "$expected_entry_number"
 
+# A consumer that skips or throws before proceed fails open to the complete
+# downstream chain. A middle consumer does the same for the target nested
+# beneath it. In every case the selected operation still executes exactly once.
+for mode in skip-outer throw-outer; do
+  fail_open_output=$("$tmp/target/release/app" "$mode")
+  test "$(printf '%s\n' "$fail_open_output" | grep -c "^operation $mode$")" -eq 1
+  test "$(printf '%s\n' "$fail_open_output" | grep -c '^audit-before :test/target-call$')" -eq 1
+  test "$(printf '%s\n' "$fail_open_output" | grep -c '^audit-after ')" -eq 1
+  if printf '%s\n' "$fail_open_output" | grep -q '^advice-after '; then
+    echo "FAIL: outer fail-open advice observed a downstream return" >&2
+    exit 1
+  fi
+done
+for mode in skip-middle throw-middle; do
+  fail_open_output=$("$tmp/target/release/app" "$mode")
+  test "$(printf '%s\n' "$fail_open_output" | grep -c "^operation $mode$")" -eq 1
+  test "$(printf '%s\n' "$fail_open_output" | grep -c '^advice-before :test/target-call$')" -eq 1
+  test "$(printf '%s\n' "$fail_open_output" | grep -c '^advice-after ')" -eq 1
+  if printf '%s\n' "$fail_open_output" | grep -q '^audit-after '; then
+    echo "FAIL: middle fail-open advice observed a target return" >&2
+    exit 1
+  fi
+done
+
 entry_throw_output=$("$tmp/target/release/app" entry-throw)
 printf '%s\n' "$entry_throw_output" | grep -q '^entry-before :test/callback-entry$'
 printf '%s\n' "$entry_throw_output" | grep -q '^callback throw$'
