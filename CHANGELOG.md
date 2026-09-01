@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advice call's dynamic extent; builds must opt in with
   `:allow-control-aspects true`.
 
+### Fixed
+
+- Runtime FASL cache entries are published by atomic rename, so parallel cold
+  builds cannot read a partially written or interleaved cache artifact.
+
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the
