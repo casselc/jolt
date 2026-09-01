@@ -1,8 +1,9 @@
 (ns jolt.mvn-http
   "Minimal cert-verifying HTTPS GET-to-file for dependency download. A plain
-  TCP socket (getaddrinfo/socket/connect) carries ciphertext; TLS runs against
-  in-memory BIOs over the system OpenSSL via jolt.ffi, so no raw fd reaches
-  OpenSSL. libcrypto then libssl lazy-load on first use (candidate lists —
+  TCP socket (getaddrinfo/socket/connect) carries ciphertext, either directly
+  or through an HTTP CONNECT proxy selected from HTTPS_PROXY/https_proxy; TLS
+  runs against in-memory BIOs over the system OpenSSL via jolt.ffi, so no raw
+  fd reaches OpenSSL. libcrypto then libssl lazy-load on first use (candidate lists —
   a JOLT_OPENSSL_LIBDIR directory first when set, then Homebrew paths on
   macOS / bare sonames elsewhere). fetch returns true on a 2xx, false on any failure,
   so jolt.deps falls through to the next repo. HTTPS only; the server
@@ -16,6 +17,30 @@
   (str/lower-case (or (System/getProperty "os.name") "")))
 (def ^:private macos? (str/includes? os-name "mac"))
 (def ^:private windows? (str/includes? os-name "windows"))
+
+(defn- jolt-version []
+  (or (System/getProperty "jolt.version") "jolt"))
+
+;; A CR, LF, or NUL in a URL or proxy authority would let an environment value,
+;; crafted :mvn/version, or redirect inject a second request line / header.
+(defn- ctl-free? [s]
+  (not-any? (fn [c] (or (= c \return) (= c \newline) (= c (char 0)))) s))
+
+;; Index just after the first \r\n\r\n in a byte-array, else nil.
+(defn- header-end [ba]
+  (let [n (alength ba)]
+    (loop [i 0]
+      (if (> i (- n 4))
+        nil
+        (if (and (= (aget ba i) 13) (= (aget ba (inc i)) 10)
+                 (= (aget ba (+ i 2)) 13) (= (aget ba (+ i 3)) 10))
+          (+ i 4)
+          (recur (inc i)))))))
+
+(defn- subbytes [ba start end]
+  (let [out (byte-array (- end start))]
+    (dotimes [i (- end start)] (aset out i (aget ba (+ start i))))
+    out))
 
 ;; libcrypto loads first (libssl links it). On macOS the system /usr/lib
 ;; libcrypto is a protected Apple image and *aborts the process* if dlopen'd
@@ -59,6 +84,112 @@
   (if (and libdir (not (str/blank? libdir)))
     (into (mapv #(str libdir "/" %) names) fallbacks)
     fallbacks))
+
+;; Proxy selection follows the widely deployed HTTP client convention. The
+;; lowercase spelling wins when both are present, matching Go's
+;; ProxyFromEnvironment; ALL_PROXY is only a fallback. The resolver currently
+;; implements an HTTP/1.1 CONNECT transport, so other proxy schemes fail closed.
+(defn- first-env [env lower upper]
+  (let [l (get env lower)
+        u (get env upper)]
+    (cond
+      (and l (not (str/blank? l))) l
+      (and u (not (str/blank? u))) u
+      :else nil)))
+
+(defn- parse-proxy-port [s]
+  (let [p (when-not (str/blank? s) (parse-long s))]
+    (when-not (and p (<= 1 p 65535))
+      (throw (ex-info "jolt.mvn-http: invalid proxy port" {})))
+    p))
+
+(defn- parse-proxy
+  "Parse an HTTP proxy URL or host[:port]. Credentials and non-HTTP proxy
+  transports are rejected without echoing the potentially secret value."
+  [spec]
+  (let [raw (str/trim (str spec))
+        s (if (str/includes? raw "://") raw (str "http://" raw))]
+    (when-not (str/starts-with? (str/lower-case s) "http://")
+      (throw (ex-info "jolt.mvn-http: only HTTP CONNECT proxies are supported" {})))
+    (let [after (subs s 7)
+          slash (str/index-of after "/")
+          authority (if slash (subs after 0 slash) after)
+          suffix (if slash (subs after slash) "")]
+      (when (or (str/blank? authority)
+                (not (or (str/blank? suffix) (= suffix "/")))
+                (str/includes? authority "@")
+                (str/includes? authority "?")
+                (str/includes? authority "#")
+                (not (ctl-free? authority)))
+        (throw (ex-info "jolt.mvn-http: invalid or authenticated proxy URL" {})))
+      (let [bracketed? (str/starts-with? authority "[")
+            close-bracket (when bracketed? (str/index-of authority "]"))
+            colon (when-not bracketed? (str/last-index-of authority ":"))
+            ipv6-check (when (and (not bracketed?) colon
+                                  (not= colon (str/index-of authority ":")))
+                         (throw (ex-info "jolt.mvn-http: IPv6 proxy hosts must use brackets" {})))
+            tail (when close-bracket (subs authority (inc close-bracket)))
+            bracket-check (when (and bracketed?
+                                     (or (nil? close-bracket)
+                                         (not (or (str/blank? tail) (str/starts-with? tail ":")))))
+                            (throw (ex-info "jolt.mvn-http: invalid bracketed proxy host" {})))
+            host (cond bracketed? (subs authority 1 close-bracket)
+                       colon (subs authority 0 colon)
+                       :else authority)
+            port (cond
+                   (and bracketed? (not (str/blank? tail)))
+                   (parse-proxy-port (subs tail 1))
+                   colon (parse-proxy-port (subs authority (inc colon)))
+                   :else 80)]
+        (when (str/blank? host)
+          (throw (ex-info "jolt.mvn-http: invalid proxy host" {})))
+        {:host host :port port}))))
+
+(defn- no-proxy-entry-matches? [host port raw-entry]
+  (let [entry (str/lower-case (str/trim raw-entry))]
+    (if (str/blank? entry)
+      false
+      (let [colon (str/last-index-of entry ":")
+            port-text (when colon (subs entry (inc colon)))
+            entry-port (when (and port-text (not (str/blank? port-text)))
+                         (parse-long port-text))
+            name (if entry-port (subs entry 0 colon) entry)
+            leading-dot? (str/starts-with? name ".")
+            domain (if leading-dot? (subs name 1) name)
+            host (str/lower-case host)
+            domain-match? (or (= host domain)
+                              (str/ends-with? host (str "." domain)))]
+        (and (or (nil? entry-port) (= entry-port port))
+             (cond
+               (= name "*") true
+               (str/blank? domain) false
+               leading-dot? (and (not= host domain) domain-match?)
+               :else domain-match?))))))
+
+(defn- no-proxy? [host port spec]
+  (boolean
+    (or (= "localhost" (str/lower-case host))
+        (= "127.0.0.1" host)
+        (= "::1" host)
+        (and spec
+             (some #(no-proxy-entry-matches? host port %)
+                   (str/split spec #","))))))
+
+(defn- proxy-for
+  ([target]
+   (proxy-for target
+              {"https_proxy" (System/getenv "https_proxy")
+               "HTTPS_PROXY" (System/getenv "HTTPS_PROXY")
+               "all_proxy" (System/getenv "all_proxy")
+               "ALL_PROXY" (System/getenv "ALL_PROXY")
+               "no_proxy" (System/getenv "no_proxy")
+               "NO_PROXY" (System/getenv "NO_PROXY")}))
+  ([{:keys [host port]} env]
+   (let [bypass (first-env env "no_proxy" "NO_PROXY")
+         proxy-spec (or (first-env env "https_proxy" "HTTPS_PROXY")
+                        (first-env env "all_proxy" "ALL_PROXY"))]
+     (when (and proxy-spec (not (no-proxy? host port bypass)))
+       (parse-proxy proxy-spec)))))
 
 (def ^:private native-ready? (volatile! false))
 
@@ -206,6 +337,65 @@
 
 (defn- close-sock [fd] (if windows? (c-closesocket fd) (c-close fd)) nil)
 
+;; --- HTTP CONNECT proxy ------------------------------------------------------
+(def ^:private max-proxy-header-bytes 65536)
+
+(defn- authority [host port]
+  (str host ":" port))
+
+(defn- build-connect-request [host port]
+  (let [target (authority host port)]
+    (str "CONNECT " target " HTTP/1.1\r\n"
+         "Host: " target "\r\n"
+         "User-Agent: jolt/" (jolt-version) "\r\n"
+         "Connection: keep-alive\r\n\r\n")))
+
+(defn- recv-connect-response
+  "Read a bounded CONNECT response header. Any bytes following its terminator
+  are the beginning of the origin TLS stream and must not be discarded."
+  [fd]
+  (loop [chunks [] total 0]
+    (let [raw (byte-array (mapcat seq chunks))
+          he (header-end raw)]
+      (cond
+        he
+        (do
+          (when (> he max-proxy-header-bytes)
+            (throw (ex-info "jolt.mvn-http: proxy response header too large" {})))
+          (let [head (String. (subbytes raw 0 (- he 4)) "ISO-8859-1")
+                line (first (str/split head #"\r\n"))
+                parts (str/split line #" ")
+                status (parse-long (nth parts 1 ""))]
+            (when-not status
+              (throw (ex-info "jolt.mvn-http: malformed proxy response" {})))
+            {:status status :initial (subbytes raw he (alength raw))}))
+
+        (>= total max-proxy-header-bytes)
+        (throw (ex-info "jolt.mvn-http: proxy response header too large" {}))
+
+        :else
+        (if-let [data (recv-bytes fd)]
+          (recur (conj chunks data) (+ total (alength data)))
+          (throw (ex-info "jolt.mvn-http: proxy closed before CONNECT response" {})))))))
+
+(defn- open-transport
+  "Open either a direct origin socket or an HTTP CONNECT tunnel. Returns the
+  socket plus ciphertext the proxy may have sent after its response header."
+  [host port proxy]
+  (if-not proxy
+    {:sock (connect host port) :initial (byte-array 0)}
+    (let [sock (connect (:host proxy) (:port proxy))]
+      (try
+        (send-bytes sock (.getBytes (build-connect-request host port) "ISO-8859-1"))
+        (let [{:keys [status initial]} (recv-connect-response sock)]
+          (when-not (<= 200 status 299)
+            (throw (ex-info (str "jolt.mvn-http: proxy CONNECT failed with status " status)
+                            {:status status})))
+          {:sock sock :initial initial})
+        (catch :default e
+          (close-sock sock)
+          (throw e))))))
+
 ;; --- OpenSSL TLS client (memory-BIO) ---
 (def ^:private WANT-READ 2)
 (def ^:private WANT-WRITE 3)
@@ -244,6 +434,16 @@
 
 (defn- bio-pending [bio] (c-BIO-ctrl bio BIO-PENDING 0 ffi/null))
 
+(defn- bio-write-bytes! [bio data]
+  (let [n (alength data)]
+    (when (pos? n)
+      (let [buf (ffi/alloc n)]
+        (try
+          (ffi/write-array buf data)
+          (when-not (= n (c-BIO-write bio buf n))
+            (throw (ex-info "BIO_write failed" {})))
+          (finally (ffi/free buf)))))))
+
 ;; A TLS stream is a plain map {:sock fd :ssl :ctx :rbio :wbio}.
 ;; Drain ciphertext OpenSSL produced into wbio out to the socket.
 (defn- flush-out [st]
@@ -259,10 +459,7 @@
 (defn- feed-in [st]
   (let [data (recv-bytes (:sock st))]
     (if (and data (pos? (alength data)))
-      (let [n (alength data) buf (ffi/alloc n)]
-        (ffi/write-array buf data)
-        (c-BIO-write (:rbio st) buf n)
-        (ffi/free buf) true)
+      (do (bio-write-bytes! (:rbio st) data) true)
       false)))
 
 (defn- handshake! [st]
@@ -316,11 +513,12 @@
   nil)
 
 (defn- tls-connect
-  "Open a verified TLS client connection to host:port."
-  [host port]
+  "Open a verified TLS client connection to host:port, directly or through an
+  HTTP CONNECT proxy. SNI and certificate verification always name the origin."
+  [host port proxy]
   ;; Open the socket FIRST: connect throws on DNS/refused (the common failure),
   ;; and doing it before any OpenSSL allocation means that path leaks nothing.
-  (let [sock (connect host port)
+  (let [{:keys [sock initial]} (open-transport host port proxy)
         ctx  (c-SSL-CTX-new (c-TLS-client-method))]
     (when (ffi/null? ctx)
       (close-sock sock)
@@ -336,6 +534,9 @@
         ;; so tls-close in the catch below reclaims everything.
         (c-SSL-set-bio ssl rbio wbio)
         (try
+          ;; A proxy may coalesce its 2xx response and the origin's first TLS
+          ;; record. Seed rbio before SSL_connect so those bytes are preserved.
+          (bio-write-bytes! rbio initial)
           (when (zero? (c-SSL-CTX-default-verify ctx))
             (throw (ex-info "no CA trust store (SSL_CTX_set_default_verify_paths)" {})))
           (c-SSL-CTX-set-verify ctx VERIFY-PEER ffi/null)
@@ -352,13 +553,6 @@
           (catch :default e (tls-close st) (throw e)))))))
 
 ;; --- HTTP/1.1 request/response ---
-(defn- jolt-version []
-  (or (System/getProperty "jolt.version") "jolt"))
-
-;; A CR, LF, or NUL in a URL would let a crafted :mvn/version or a server
-;; redirect Location inject a second request line / header (request smuggling).
-(defn- ctl-free? [s]
-  (not-any? (fn [c] (or (= c \return) (= c \newline) (= c (char 0)))) s))
 
 (defn- parse-url
   "https://host[:port]/path[?query] -> {:host :port :path}. HTTPS only."
@@ -391,22 +585,6 @@
     (if-let [b (tls-read st)]
       (recur (conj chunks b))
       (byte-array (mapcat seq chunks)))))
-
-;; Index of the first \r\n\r\n in the byte-array (the body start), else nil.
-(defn- header-end [ba]
-  (let [n (alength ba)]
-    (loop [i 0]
-      (if (> i (- n 4))
-        nil
-        (if (and (= (aget ba i) 13) (= (aget ba (inc i)) 10)
-                 (= (aget ba (+ i 2)) 13) (= (aget ba (+ i 3)) 10))
-          (+ i 4)
-          (recur (inc i)))))))
-
-(defn- subbytes [ba start end]
-  (let [out (byte-array (- end start))]
-    (dotimes [i (- end start)] (aset out i (aget ba (+ start i))))
-    out))
 
 (defn- header-ci [pairs name]
   (let [low (str/lower-case name)]
@@ -539,8 +717,8 @@
             (recur (inc n)))))))
 
 (defn- fetch-once [url out-path]
-  (let [{:keys [host port path]} (parse-url url)
-        st (tls-connect host port)]
+  (let [{:keys [host port path] :as target} (parse-url url)
+        st (tls-connect host port (proxy-for target))]
     (try
       (tls-write st (.getBytes (build-request host port path) "UTF-8"))
       (let [{:keys [status header-pairs body content-length]} (parse-response (recv-all st))
