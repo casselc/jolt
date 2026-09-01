@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arguments. `proceed` is limited to its owner thread and fiber and to the
   advice call's dynamic extent; builds must opt in with
   `:allow-control-aspects true`.
+- Aspect packages can publish named preset resources that expand to ordinary
+  manifest and provider selections. `jolt aspects plan` prints the deterministic
+  static selection, and `jolt aspects explain` can add a validated build report
+  without accepting stale identities or unbounded report data.
+- Libraries can derive their provider-neutral manifest from compiler
+  annotations. Definition metadata declares fixed-arity entry join points, and
+  `jolt.aspects/at` marks one resolved call without adding a runtime wrapper to
+  plain builds. `jolt aspects manifest --check` detects drift between source
+  annotations and the published EDN resource.
 
 ### Fixed
 

@@ -13,6 +13,51 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 cp -R "$fixture" "$tmp"
 cp "$tmp/deps.edn" "$tmp/deps.instrumented.edn"
 
+# Cooperative compiler metadata and call markers generate the exact published manifest
+# consumed by the ordinary resource/provider build path.
+manifest="$tmp/resources/META-INF/jolt/aspects/probe.edn"
+cp "$manifest" "$tmp/expected-generated-manifest.edn"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects manifest --check)
+# Namespace order is authoring-only. A root may compile an annotated dependency
+# transitively before that dependency's explicit turn; recompilation must not
+# duplicate its physical declarations.
+sed -i 's/:namespaces \[app.target app.core\]/:namespaces [app.core app.target]/' \
+  "$tmp/deps.edn"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache-reversed" \
+  "$jolt" aspects manifest --check)
+cp "$tmp/deps.instrumented.edn" "$tmp/deps.edn"
+printf '\n' >>"$manifest"
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+    "$jolt" aspects manifest --check) >"$tmp/stale-manifest.log" 2>&1; then
+  echo "FAIL: stale cooperative manifest passed --check" >&2
+  exit 1
+fi
+grep -q 'generated aspect manifest is stale' "$tmp/stale-manifest.log"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects manifest)
+cmp "$tmp/expected-generated-manifest.edn" "$manifest"
+
+# The analyzer rejects entry annotations on declarations and non-functions;
+# these source fixtures cover the metadata frontend before it becomes IR.
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache-invalid-decl" \
+    "$jolt" -e "(require 'app.invalid-decl)") \
+    >"$tmp/invalid-decl.log" 2>&1; then
+  echo "FAIL: annotated declare compiled" >&2
+  exit 1
+fi
+grep -q 'jolt aspect entry metadata requires an initialized function definition' \
+  "$tmp/invalid-decl.log"
+
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache-invalid-value" \
+    "$jolt" -e "(require 'app.invalid-value)") \
+    >"$tmp/invalid-value.log" 2>&1; then
+  echo "FAIL: annotated non-function compiled" >&2
+  exit 1
+fi
+grep -q 'jolt aspect entry metadata requires a function definition' \
+  "$tmp/invalid-value.log"
+
 run_build() {
   mode=$1
   shift
@@ -49,6 +94,57 @@ result ok-woven-inner!?'
 "$jolt" "$repo/test/chez/aspect-ir-test.clj"
 run_build release
 cp "$tmp/target/aspects.edn" "$tmp/target/release-aspects.edn"
+
+# The actual CLI, not merely the source-loaded unit namespace, must expose a
+# deterministic source-free plan and accept only a report for this exact build.
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects plan) >"$tmp/target/aspects-plan.edn"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects plan) >"$tmp/target/aspects-plan-again.edn"
+cmp "$tmp/target/aspects-plan.edn" "$tmp/target/aspects-plan-again.edn"
+grep -q ':status :instrumented' "$tmp/target/aspects-plan.edn"
+grep -q ':identity "v1-' "$tmp/target/aspects-plan.edn"
+if grep -q ':report\|target/aspects.edn\|'"$tmp" "$tmp/target/aspects-plan.edn"; then
+  echo "FAIL: aspect plan contains a report or machine-specific path" >&2
+  exit 1
+fi
+
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects explain target/aspects.edn) >"$tmp/target/aspects-explain.txt"
+grep -q '^observed report: target/aspects.edn$' "$tmp/target/aspects-explain.txt"
+grep -q '^  observed sites: 1$' "$tmp/target/aspects-explain.txt"
+
+cp "$tmp/target/aspects.edn" "$tmp/target/aspects-stale.edn"
+sed -i 's/:identity "[^"]*"/:identity "stale"/' "$tmp/target/aspects-stale.edn"
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+    "$jolt" aspects explain target/aspects-stale.edn) \
+    >"$tmp/target/aspects-stale.log" 2>&1; then
+  echo "FAIL: stale aspect report was presented as an observation" >&2
+  exit 1
+fi
+grep -q 'build report does not match the selected build' \
+  "$tmp/target/aspects-stale.log"
+
+if (cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+    "$jolt" aspects explain target/does-not-exist.edn) \
+    >"$tmp/target/aspects-missing.log" 2>&1; then
+  echo "FAIL: explicit missing aspect report was silently ignored" >&2
+  exit 1
+fi
+grep -q 'aspect report not found: target/does-not-exist.edn' \
+  "$tmp/target/aspects-missing.log"
+
+# Planning resolves provider source but must not load unrelated native objects.
+cp "$tmp/deps.edn" "$tmp/deps.before-native-plan.edn"
+sed -i '/ :jolt\/build/i\ :jolt/native [{:name "must-not-load"\
+  :linux ["libjolt_aspects_introspection_missing.so"]\
+  :darwin ["libjolt_aspects_introspection_missing.dylib"]\
+  :windows ["jolt_aspects_introspection_missing.dll"]}]' "$tmp/deps.edn"
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects plan) >"$tmp/target/aspects-native-free-plan.edn"
+cmp "$tmp/target/aspects-plan.edn" "$tmp/target/aspects-native-free-plan.edn"
+cp "$tmp/deps.before-native-plan.edn" "$tmp/deps.edn"
+
 run_build dev --dev
 cmp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
 run_build release-open --no-direct-link
@@ -139,6 +235,7 @@ grep -q ':provider instrumentation.audit-provider/aspect-provider' "$tmp/target/
 grep -q ':contract :replace-args-v1' "$tmp/target/aspects.edn"
 grep -q ':entry app.target/callback' "$tmp/target/aspects.edn"
 grep -q ':entry app.target/numeric-callback' "$tmp/target/aspects.edn"
+grep -q ':marker :test/target-call' "$tmp/target/aspects.edn"
 grep -q ':contract :args-v1' "$tmp/target/aspects.edn"
 grep -q ':ordinal 1' "$tmp/target/aspects.edn"
 grep -q ':ordinal 2' "$tmp/target/aspects.edn"
@@ -159,6 +256,23 @@ test -n "$ordered_identity"
 test -n "$reversed_identity"
 test "$ordered_identity" != "$reversed_identity"
 grep -q ':consumers \[{:advice instrumentation.audit-provider/' "$tmp/target/aspects.edn"
+cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
+cp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
+
+# A package-owned preset expands to the same join-point/provider selection,
+# remains visible in plan/explain output, and contributes provenance to the
+# artifact identity without changing application behavior.
+cp "$tmp/deps.preset.edn" "$tmp/deps.edn"
+run_build preset
+(cd "$tmp" && env JOLT_PWD="$tmp" JOLT_CACHE_DIR="$tmp/cache" \
+  "$jolt" aspects plan) >"$tmp/target/aspects-preset-plan.edn"
+grep -q ':presets \[{:id :test/standard, :resource "META-INF/jolt/instrumentation/test/standard.edn"}\]' \
+  "$tmp/target/aspects-preset-plan.edn"
+preset_identity=$(sed -n 's/.*:identity "\([^"]*\)".*/\1/p' \
+  "$tmp/target/aspects.edn")
+test -n "$preset_identity"
+test "$preset_identity" != "$ordered_identity"
+
 cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
 cp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
 
