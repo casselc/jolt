@@ -182,13 +182,19 @@ test "$("$tmp/target/control/app" control-return)" = 'argument
 callback injected
 result injected?'
 test "$("$tmp/target/control/app" control-replace)" = 'argument
+advice-before :test/target-call
+advice-args ["replaced"]
 operation replaced
+advice-after replaced!
 callback replaced!
 result replaced!?'
 test "$("$tmp/target/control/app" control-throw)" = 'argument
 caught injected failure :injected'
 grep -q ':control-enabled? true' "$tmp/target/aspects.edn"
 grep -q ':contract :control-v1' "$tmp/target/aspects.edn"
+grep -q ':provider instrumentation.provider/aspect-provider' \
+  "$tmp/target/aspects.edn"
+grep -q ':ordinal 2' "$tmp/target/aspects.edn"
 
 cp "$tmp/deps.ordered.edn" "$tmp/deps.edn"
 cp "$tmp/target/release-aspects.edn" "$tmp/target/aspects.edn"
