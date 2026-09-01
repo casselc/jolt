@@ -503,6 +503,34 @@ replacement fails open to the original arguments before the target runs. After
 the target starts, it is never retried: its result or original exception wins,
 including when advice throws or calls `proceed` again.
 
+Tests that deliberately inject failures, suppress work, or replace outcomes may
+use the separate `:control-v1` contract. It is inert unless the application
+explicitly sets `:allow-control-aspects true` in `:jolt/build`; both dependency
+resolution and the compiler boundary reject a selected control consumer without
+that opt-in:
+
+```clojure
+{:jolt/build
+ {:allow-control-aspects true
+  :aspects
+  [{:resource "META-INF/jolt/aspects/http.edn"
+    :consumers [{:provider my.fault-injection.http :roles [:http/client]}]}]}}
+
+(def aspect-provider
+  {:schema 1
+   :libraries {'my/http "exact-revision"}
+   :roles {:http/client {:fn 'my.fault-injection.http/control
+                         :contract :control-v1}}})
+```
+
+Control advice receives `[join-point evaluated-args proceed]`. Its return or
+exception becomes the application's outcome, so omitting `proceed` intentionally
+skips every downstream consumer and the target. `proceed` is an at-most-once,
+dynamic-extent capability owned by the current thread and fiber. It accepts the
+original arguments or one exact-arity replacement vector; escaped, repeated,
+wrong-context, and malformed uses fail closed. This explicit build switch is an
+activation guard, not a security sandbox: only select trusted control providers.
+
 Call matching uses analyzed, resolved vars and entry matching uses qualified
 function definitions—not source lines. Both run before inference, inlining,
 direct linking, and tree shaking. Unsupported keys,

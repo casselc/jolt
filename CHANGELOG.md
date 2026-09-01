@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selection remain unchanged. Runtime join points include a deterministic,
   build-scoped site identity and the corresponding report-compatible site
   descriptor so independent consumers can correlate the same woven operation.
+- An explicitly enabled, test-only `:control-v1` aspect contract can replace an
+  operation's return or exception, skip it, or invoke it once with replacement
+  arguments. `proceed` is limited to its owner thread and fiber and to the
+  advice call's dynamic extent; builds must opt in with
+  `:allow-control-aspects true`.
 
 ## [0.8.0] - 2026-08-31
 
