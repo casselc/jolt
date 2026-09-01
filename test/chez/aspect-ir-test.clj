@@ -20,6 +20,39 @@
 (def replace-args-config
   (assoc-in config [:aspects 0 :contract] :replace-args-v1))
 
+(def manifest-fixture
+  {:schema 1
+   :library {:id 'test/lib :version "v1"}
+   :aspects [{:id :test/call
+              :match {:ns 'app.core :call 'dep.lib/work :arity 2}
+              :advice-role :test/around
+              :expect {:matches 1}}]})
+
+(def provider-fixture
+  {:schema 1
+   :libraries {'test/lib "v1"}
+   :roles {:test/around {:fn 'provider.core/around
+                         :contract :args-v1}}})
+
+(defn resolve-build-config-with [manifests provider selections]
+  (with-redefs-fn
+    {(ns-resolve 'jolt.aspects 'resource-text)
+     (fn [resource] (pr-str (get manifests resource)))
+     (ns-resolve 'jolt.aspects 'provider-source)
+     (fn [_] "provider-source")
+     (ns-resolve 'clojure.core 'requiring-resolve)
+     (fn [provider-var]
+       (when (= 'provider.core/aspect-provider provider-var)
+         (atom provider)))}
+    #(aspects/resolve-build-config selections nil)))
+
+(defn resolve-error [manifests provider selections]
+  (try
+    (resolve-build-config-with manifests provider selections)
+    nil
+    (catch Exception e
+      {:message (ex-message e) :data (ex-data e)})))
+
 (def entry-config
   {:aspects
    [{:id :test/entry
@@ -137,6 +170,8 @@
            (get-in @(:aspect-matches unit) [:test/entry 0 :position])))
     (is (= 'app.core/callback
            (get-in @(:aspect-matches unit) [:test/entry 0 :entry])))
+    (is (= "app.core"
+           (get-in @(:aspect-matches unit) [:test/entry 0 :within])))
     (is (empty? (ir/tree-problems woven)))))
 
 (deftest replace-args-function-entry-weaving
@@ -178,6 +213,33 @@
                   (catch Exception e (ex-message e)))]
     (is (= "jolt aspects: multiple selected aspects match the same function entry"
            message))))
+
+(deftest multi-arity-function-entry-weaving
+  (let [base (first (:aspects entry-config))
+        selected {:aspects
+                  [(assoc base :id :test/entry-one
+                               :match {:entry 'app.core/multi :arity 1})
+                   (assoc base :id :test/entry-two
+                               :match {:entry 'app.core/multi :arity 2})]}
+        node (assoc
+               (ir/def-node
+                 "app.core" "multi"
+                 (ir/fn-node "multi"
+                             [{:params ["x"] :body (ir/local "x")}
+                              {:params ["x" "y"] :body (ir/local "y")}]))
+               :pos {:file "/private/checkout/core.clj" :line 40 :column 1})
+        unit (types/new-unit)
+        _ (aspects/configure-unit! unit selected)
+        woven (aspects/weave unit node)
+        arities (get-in woven [:init :arities])]
+    (is (= [:test/entry-one :test/entry-two]
+           (mapv #(get-in % [:body :args 1 :form :id]) arities)))
+    (is (= [1 2] (mapv #(count (:params %)) arities))
+        "entry selectors preserve and distinguish public arities")
+    (is (= {:test/entry-one [1] :test/entry-two [1]}
+           (into {} (map (fn [[id sites]] [id (mapv :ordinal sites)]))
+                 @(:aspect-matches unit))))
+    (is (empty? (ir/tree-problems woven)))))
 
 (deftest manifest-selector-schema
   (let [validate-manifest (ns-resolve 'jolt.aspects 'validate-manifest)
@@ -395,6 +457,45 @@
                         nil
                         (catch Exception e (ex-message e)))]
           (is (= expected message)))))))
+
+(deftest build-config-cross-validation
+  (let [selection {:resource "one.edn"
+                   :provider 'provider.core/aspect-provider}]
+    (testing "the harness resolves a compatible manifest and provider"
+      (is (= [:test/call]
+             (mapv :id
+                   (:aspects
+                     (resolve-build-config-with
+                       {"one.edn" manifest-fixture}
+                       provider-fixture
+                       [selection]))))))
+    (testing "manifest and provider library revisions must agree"
+      (let [{:keys [message data]}
+            (resolve-error
+              {"one.edn" manifest-fixture}
+              (assoc-in provider-fixture [:libraries 'test/lib] "v2")
+              [selection])]
+        (is (= "jolt aspects: provider is incompatible with the manifest library revision"
+               message))
+        (is (= {:manifest-version "v1" :provider-version "v2"}
+               (select-keys data [:manifest-version :provider-version])))))
+    (testing "every selected advice role must be implemented"
+      (let [{:keys [message data]}
+            (resolve-error {"one.edn" manifest-fixture}
+                           (assoc provider-fixture :roles {})
+                           [selection])]
+        (is (= "jolt aspects: provider does not implement selected advice role"
+               message))
+        (is (= {:aspect :test/call :role :test/around}
+               (select-keys data [:aspect :role])))))
+    (testing "aspect ids are globally unique across selected manifests"
+      (let [{:keys [message data]}
+            (resolve-error
+              {"one.edn" manifest-fixture "two.edn" manifest-fixture}
+              provider-fixture
+              [selection (assoc selection :resource "two.edn")])]
+        (is (= "jolt aspects: selected aspect ids must be unique" message))
+        (is (= [:test/call :test/call] (:ids data)))))))
 
 (deftest report-publication-follows-explicit-prepare
   (let [file (java.io.File/createTempFile "jolt-aspects" ".edn")

@@ -404,6 +404,10 @@
                           {:site (entry-site node (first matches) arity 0)
                            :aspects (mapv :id matches)}))
                   (if-let [aspect (first matches)]
+                    ;; Build form weaving is sequential. This read followed by
+                    ;; swap! therefore yields deterministic per-aspect ordinals;
+                    ;; parallel form weaving would need one atomic record-site
+                    ;; operation instead of preserving this assumption.
                     (let [ordinal (inc (count (get @(:aspect-matches unit)
                                                    (:id aspect))))]
                       (swap! (:aspect-matches unit) update (:id aspect)
@@ -438,6 +442,8 @@
                           {:site (call-site owner-ns (first matches) node 0)
                            :aspects (mapv :id matches)}))
                   (if-let [aspect (first matches)]
+                    ;; See weave-entry-def: ordinals rely on the build's
+                    ;; sequential form walk, while swap! owns publication.
                     (let [ordinal (inc (count (get @(:aspect-matches unit) (:id aspect))))]
                       (swap! (:aspect-matches unit) update (:id aspect)
                              (fnil conj []) (call-site owner-ns aspect node ordinal))
