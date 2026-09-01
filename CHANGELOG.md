@@ -27,6 +27,12 @@ when transposed.
 
 ### Added
 
+- `jolt build` can select instrumentation aspect manifests and providers. The
+  compiler wraps exact resolved call sites before optimization, preserves
+  ordinary argument evaluation and application results, and publishes a
+  deterministic match report only after the output artifact succeeds. Builds
+  without an aspect selection remain unchanged.
+
 - **`jolt.ffi` arenas: a group of allocations with one lifetime (#799).** Every
   foreign allocation used to be released one pointer at a time — `ffi/free` per
   block, `free-callable` per callback, a `try`/`finally` per scope — so a
