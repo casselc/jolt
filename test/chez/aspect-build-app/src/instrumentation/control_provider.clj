@@ -1,4 +1,5 @@
-(ns instrumentation.control-provider)
+(ns instrumentation.control-provider
+  (:require [instrumentation.provider :as provider]))
 
 (def aspect-provider
   {:schema 1
@@ -6,7 +7,9 @@
    :roles {:test/around {:fn 'instrumentation.control-provider/control
                          :contract :control-v1}}})
 
-(defn control [_join-point evaluated-args proceed]
+(defn control [join-point evaluated-args proceed]
+  ;; The downstream fixture consumer checks this exact build/site tuple again.
+  (provider/assert-runtime-site! join-point)
   (case (first evaluated-args)
     "control-return" "injected"
     "control-throw" (throw (ex-info "injected failure" {:kind :injected}))
