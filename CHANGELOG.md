@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Runtime FASL cache entries are published by atomic rename, so parallel cold
+  builds cannot read a partially written or interleaved cache artifact. Writers
+  create private files exclusively, and pruning retires abandoned publication
+  files after a conservative grace period.
+
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the

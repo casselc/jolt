@@ -106,6 +106,15 @@
 (define (sa-real-time-ms)
   (real-time))
 
+;; (sa-wall-time-ms) -> exact integer
+;; Epoch milliseconds, suitable for comparison with filesystem mtimes.  Keep
+;; this separate from sa-real-time-ms: elapsed-time measurement needs a
+;; monotonic clock, while file age calculations must stay in the filesystem's
+;; wall-clock domain.
+(define (sa-wall-time-ms)
+  (let ((t (current-time 'time-utc)))
+    (+ (* (time-second t) 1000) (div (time-nanosecond t) 1000000))))
+
 ;; ---- R5: io remainder (mtime) + the last GC hook -----------------------------
 
 ;; (sa-file-mtime-ms path) -> exact integer

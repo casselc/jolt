@@ -1832,12 +1832,38 @@
 ;; Keep the newest few entries. One accumulates per jolt build × mode, so a
 ;; developer re-minting often would otherwise grow this without bound.
 (define bld-runtime-cache-keep 8)
+(define bld-runtime-cache-temp-max-age-default-ms (* 24 60 60 1000))
+(define (bld-runtime-cache-temp-max-age-ms)
+  (let* ((raw (getenv "JOLT_TEST_RUNTIME_CACHE_TEMP_MAX_AGE_MS"))
+         (n (and (string? raw) (string->number raw))))
+    (if (and (integer? n) (>= n 0))
+        n
+        bld-runtime-cache-temp-max-age-default-ms)))
+(define (bld-runtime-cache-temp-name? f)
+  (and (bld-prefix? f "runtime-")
+       (bld-find-substring f ".so.tmp-" 0)))
 (define (bld-prune-runtime-cache!)
   (guard (e (#t #f))
     (let* ((dir (bld-runtime-cache-dir))
+           ;; File mtimes are epoch based; the monotonic elapsed-time clock is
+           ;; a different domain and would make every age negative.
+           (now (sa-wall-time-ms))
+           (entries (directory-list dir))
+           (temps (filter bld-runtime-cache-temp-name? entries))
            (fs (map (lambda (f) (let ((p (string-append dir "/" f)))
                                    (cons p (sa-file-mtime-ms p))))
-                     (filter (lambda (f) (bld-suffix? f ".so")) (directory-list dir)))))
+                     (filter (lambda (f) (bld-suffix? f ".so")) entries))))
+      ;; A killed writer can strand its unpublished private file. Never touch a
+      ;; recent temp that may still belong to a live build; retire only entries
+      ;; older than the conservative default (the smoke overrides it to zero).
+      (for-each
+       (lambda (f)
+         (let ((p (string-append dir "/" f)))
+           (guard (e (#t #f))
+             (when (>= (- now (sa-file-mtime-ms p))
+                       (bld-runtime-cache-temp-max-age-ms))
+               (delete-file p)))))
+       temps)
       (when (> (length fs) bld-runtime-cache-keep)
         (for-each (lambda (p) (guard (e (#t #f)) (delete-file (car p))))
                   (list-tail (sort (lambda (a b) (> (cdr a) (cdr b))) fs)
@@ -1862,13 +1888,102 @@
       (put-bytevector out bs)
       (close-port out))))
 
+;; The default file options create a new file and fail if it already exists.
+;; Publication temps use this rather than truncating a name another writer may
+;; own (including a same-PID writer on a shared cache directory).
+(define (bld-copy-file-new! from to)
+  (let ((bs (read-file-bytes from)))
+    (let ((out (open-file-output-port to (file-options))))
+      (put-bytevector out bs)
+      (close-port out))))
+
+;; A cache hit is advisory. Pruning or another process may retire the entry
+;; between the existence check and the open; fall back to compiling instead of
+;; turning that ordinary cache race into a failed build.
+(define (bld-runtime-cache-hit! cache so)
+  (guard (e (#t #f))
+    (and (file-exists? cache)
+         (begin (bld-copy-file! cache so) #t))))
+
+;; Deterministic test seam for the publication invariant. A writer with this
+;; variable pauses only AFTER its private temp is complete and BEFORE the final
+;; cache path exists. The smoke starts a second build in that interval. Keeping
+;; the seam at the ownership boundary makes the test independent of compiler
+;; timing and file size.
+(define (bld-runtime-cache-test-before-publish!)
+  (let ((barrier (getenv "JOLT_TEST_RUNTIME_CACHE_PUBLISH_BARRIER")))
+    (when (and (string? barrier) (fx>? (string-length barrier) 0))
+      (let ((ready (string-append barrier ".ready"))
+            (go (string-append barrier ".go")))
+        (let ((out (open-output-file ready 'replace)))
+          (put-string out "ready\n")
+          (close-output-port out))
+        (let loop ()
+          (unless (file-exists? go)
+            (sleep (make-time 'time-duration 10000000 0)) ; 10ms
+            (loop)))))))
+
+;; Publish a complete cache entry in one namespace operation. Directly copying
+;; to `cache` let another process's file-exists? + read observe a truncated FASL;
+;; two cold writers could also interleave distinct valid Chez encodings of the
+;; same source. A same-directory temp plus rename makes the final path
+;; complete-or-absent. If a concurrent complete winner is already visible, keep
+;; it and discard our temp. On POSIX two simultaneous absent-path renames may
+;; still replace one complete winner with another complete winner, which is
+;; safe; platforms that refuse replacement take the guarded winner path.
+(define bld-runtime-cache-temp-counter 0)
+(define bld-runtime-cache-temp-mutex (make-mutex))
+(define (bld-runtime-cache-temp-owner)
+  (let ((test-owner (getenv "JOLT_TEST_RUNTIME_CACHE_TEMP_OWNER")))
+    (if (and (string? test-owner) (fx>? (string-length test-owner) 0))
+        test-owner
+        (number->string (get-process-id)))))
+(define (bld-runtime-cache-write-temp! so cache)
+  (let loop ()
+    (let* ((n (jolt-with-mutex bld-runtime-cache-temp-mutex
+                (set! bld-runtime-cache-temp-counter
+                      (+ bld-runtime-cache-temp-counter 1))
+                bld-runtime-cache-temp-counter))
+           (tmp (string-append cache ".tmp-"
+                               (bld-runtime-cache-temp-owner) "-"
+                               (number->string n))))
+      (guard (e (#t (if (file-exists? tmp) (loop) (raise e))))
+        (bld-copy-file-new! so tmp)
+        tmp))))
+
+(define (bld-runtime-cache-publish! so cache)
+  (let ((tmp #f))
+    (guard (e (#t
+               ;; Cleanup is best-effort too. In particular, Windows may deny
+               ;; deletion while an antivirus or failed copy still holds the
+               ;; file; that must not turn an optional cache into a build error.
+               (guard (cleanup-e (#t #f))
+                 (when (and tmp (file-exists? tmp)) (delete-file tmp)))
+               #f))                 ; an unwritable cache must not fail the build
+      (bld-mkdir-p (bld-runtime-cache-dir))
+      (set! tmp (bld-runtime-cache-write-temp! so cache))
+      (bld-runtime-cache-test-before-publish!)
+      (if (file-exists? cache)
+          (delete-file tmp)
+          (guard (e (#t
+                     ;; A Windows rename may refuse to replace the winner that
+                     ;; appeared after our check. That is success, not damage.
+                     (if (file-exists? cache)
+                         (begin
+                           (guard (cleanup-e (#t #f))
+                             (when (file-exists? tmp) (delete-file tmp)))
+                           #t)
+                         (raise e))))
+            (rename-file tmp cache)))
+      (bld-prune-runtime-cache!)
+      #t)))
+
 ;; Compile the runtime half, reusing a cached fasl when one matches.
 (define (bld-compile-runtime! mode src so)
   (let* ((body (read-file-string src))
          (cache (and (bld-runtime-cache-enabled?) (bld-runtime-cache-path body mode))))
-    (if (and cache (file-exists? cache))
+    (if (and cache (bld-runtime-cache-hit! cache so))
         (begin
-          (bld-copy-file! cache so)
           (ei-mark! "runtime fasl (cached)"))
         (begin
           (bld-prepend-prologue! src)
@@ -1876,10 +1991,7 @@
           (bld-chez-compile-file mode src so)
           (ei-mark! "compile runtime half")
           (when cache
-            (guard (e (#t #f))          ; an unwritable cache must not fail the build
-              (bld-mkdir-p (bld-runtime-cache-dir))
-              (bld-copy-file! so cache)
-              (bld-prune-runtime-cache!)))))))
+            (bld-runtime-cache-publish! so cache))))))
 
 ;; units: a list of (src so kind) compiled in order and loaded into the boot in
 ;; that order, so the runtime half's defines precede the app half's reads.

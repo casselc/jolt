@@ -37,7 +37,37 @@ export JOLT_CHEZ_CSV="$csv"
 
 app="$root/test/chez/build-app"
 out="$(mktemp -d)/app-bin"
-trap 'rm -rf "$(dirname "$out")"' EXIT
+cache_writer_pid=
+cache_barrier=
+cache_writer_at_barrier=
+cleanup() {
+  # Never strand the deterministic cache writer if an assertion below fails.
+  # A writer known to be at our test barrier can be released normally. If it
+  # failed to reach that barrier, terminate it; in both cases bound the wait so
+  # the smoke's own timeout cannot turn into an unbounded EXIT-trap wait.
+  if [ -n "$cache_writer_pid" ]; then
+    if [ -n "$cache_writer_at_barrier" ] && [ -n "$cache_barrier" ]; then
+      : > "$cache_barrier.go"
+    else
+      kill "$cache_writer_pid" 2>/dev/null || true
+    fi
+    cleanup_i=0
+    while kill -0 "$cache_writer_pid" 2>/dev/null && [ "$cleanup_i" -lt 100 ]; do
+      cleanup_i=$((cleanup_i + 1))
+      sleep 0.05
+    done
+    if kill -0 "$cache_writer_pid" 2>/dev/null; then
+      kill -KILL "$cache_writer_pid" 2>/dev/null || true
+      # Do not wait on a process that ignored the bounded graceful interval;
+      # shell exit will reap it without extending this cleanup deadline.
+    else
+      wait "$cache_writer_pid" 2>/dev/null || true
+    fi
+  fi
+  rm -rf "$(dirname "$out")"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 echo "build smoke: compiling app.core -> $out"
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" >/dev/null 2>&1; then
@@ -1016,4 +1046,140 @@ if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nospli
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache)"
+# --- atomic runtime-cache publication under two cold writers -----------------
+# Pause writer A after its private cache temp is complete but before publication.
+# Writer B must see the final name as absent, compile independently, and publish
+# a complete entry. Releasing A must leave one usable entry and no private temp.
+echo "build smoke: atomic runtime fasl cache publication"
+atomic_cache="$(dirname "$out")/rtcache-atomic"
+cache_barrier="$(dirname "$out")/rtcache-publish"
+atomic_a="$(dirname "$out")/atomic-a"
+atomic_b="$(dirname "$out")/atomic-b"
+atomic_prune="$(dirname "$out")/atomic-prune"
+atomic_warm="$(dirname "$out")/atomic-warm"
+atomic_a_log="$(dirname "$out")/atomic-a.log"
+atomic_b_log="$(dirname "$out")/atomic-b.log"
+atomic_prune_log="$(dirname "$out")/atomic-prune.log"
+atomic_warm_log="$(dirname "$out")/atomic-warm.log"
+
+JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$atomic_cache" \
+  JOLT_TEST_RUNTIME_CACHE_TEMP_OWNER=collision \
+  JOLT_TEST_RUNTIME_CACHE_PUBLISH_BARRIER="$cache_barrier" \
+  "$joltabs" build -m app.core -o "$atomic_a" --opt >"$atomic_a_log" 2>&1 &
+cache_writer_pid=$!
+
+i=0
+while [ ! -f "$cache_barrier.ready" ]; do
+  if ! kill -0 "$cache_writer_pid" 2>/dev/null; then
+    wait "$cache_writer_pid" || true
+    cache_writer_pid=
+    echo "  FAIL: first cold writer exited before the publication barrier"
+    sed -n '1,160p' "$atomic_a_log"
+    exit 1
+  fi
+  i=$((i + 1))
+  if [ "$i" -ge 600 ]; then
+    echo "  FAIL: timed out waiting for the first cold writer"
+    exit 1
+  fi
+  sleep 0.05
+done
+cache_writer_at_barrier=1
+
+collision_temps=0
+for f in "$atomic_cache"/*.so.tmp-collision-1; do
+  if [ -e "$f" ]; then collision_temps=$((collision_temps + 1)); fi
+done
+if [ "$collision_temps" != "1" ]; then
+  echo "  FAIL: first writer did not own the expected exclusive collision temp"
+  ls -la "$atomic_cache"
+  exit 1
+fi
+
+for f in "$atomic_cache"/runtime-*.so; do
+  if [ -e "$f" ]; then
+    echo "  FAIL: final cache entry became visible before publication"
+    exit 1
+  fi
+done
+
+if ! JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$atomic_cache" \
+  JOLT_TEST_RUNTIME_CACHE_TEMP_OWNER=collision \
+  "$joltabs" build -m app.core -o "$atomic_b" --opt >"$atomic_b_log" 2>&1; then
+  echo "  FAIL: second cold writer exited non-zero"
+  sed -n '1,160p' "$atomic_b_log"
+  exit 1
+fi
+
+: > "$cache_barrier.go"
+if ! wait "$cache_writer_pid"; then
+  cache_writer_pid=
+  echo "  FAIL: first cold writer exited non-zero after release"
+  sed -n '1,160p' "$atomic_a_log"
+  exit 1
+fi
+cache_writer_pid=
+cache_barrier=
+cache_writer_at_barrier=
+
+for f in "$atomic_cache"/*.tmp-*; do
+  if [ -e "$f" ]; then
+    echo "  FAIL: private cache publication temp was left behind: $f"
+    exit 1
+  fi
+done
+atomic_entries=0
+for f in "$atomic_cache"/runtime-*.so; do
+  if [ -e "$f" ]; then atomic_entries=$((atomic_entries + 1)); fi
+done
+if [ "$atomic_entries" != "1" ]; then
+  echo "  FAIL: concurrent cold writers did not leave exactly one cache entry"
+  ls -la "$atomic_cache"
+  exit 1
+fi
+
+# A process killed before rename can leave its exclusive temp behind. Force a
+# different-mode cold publication and lower the test-only age threshold to zero;
+# publication pruning must retire the abandoned temp without touching a live one.
+stale_temp="$atomic_cache/runtime-stale.so.tmp-dead-1"
+: > "$stale_temp"
+if ! JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$atomic_cache" \
+  JOLT_TEST_RUNTIME_CACHE_TEMP_MAX_AGE_MS=0 \
+  "$joltabs" build -m app.core -o "$atomic_prune" >"$atomic_prune_log" 2>&1; then
+  echo "  FAIL: stale-temp pruning cold build exited non-zero"
+  sed -n '1,160p' "$atomic_prune_log"
+  exit 1
+fi
+if [ -e "$stale_temp" ]; then
+  echo "  FAIL: abandoned private cache temp was not pruned"
+  exit 1
+fi
+
+if ! JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$atomic_cache" JOLT_BUILD_PROFILE=1 \
+  "$joltabs" build -m app.core -o "$atomic_warm" --opt >"$atomic_warm_log" 2>&1; then
+  echo "  FAIL: warm build after concurrent publication exited non-zero"
+  sed -n '1,160p' "$atomic_warm_log"
+  exit 1
+fi
+if ! grep -q 'runtime fasl (cached)' "$atomic_warm_log"; then
+  echo "  FAIL: warm build did not reuse the concurrently published cache entry"
+  sed -n 's/^jolt build: \[profile\]/    /p' "$atomic_warm_log"
+  exit 1
+fi
+
+got_atomic_a="$(cd / && "$atomic_a" alpha bb ccc 2>&1)"
+got_atomic_b="$(cd / && "$atomic_b" alpha bb ccc 2>&1)"
+got_atomic_prune="$(cd / && "$atomic_prune" alpha bb ccc 2>&1)"
+got_atomic_warm="$(cd / && "$atomic_warm" alpha bb ccc 2>&1)"
+if [ "$got_atomic_a" != "$want" ] || [ "$got_atomic_b" != "$want" ] || \
+   [ "$got_atomic_prune" != "$want" ] || [ "$got_atomic_warm" != "$want" ]; then
+  echo "  FAIL: binaries from concurrent/warm cache paths disagree with the reference"
+  echo "--- want ---";        echo "$want"
+  echo "--- writer A ---";    echo "$got_atomic_a"
+  echo "--- writer B ---";    echo "$got_atomic_b"
+  echo "--- stale prune ---"; echo "$got_atomic_prune"
+  echo "--- warm hit ---";    echo "$got_atomic_warm"
+  exit 1
+fi
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + atomic-runtime-cache)"
