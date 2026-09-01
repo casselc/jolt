@@ -1257,8 +1257,6 @@
          (aspect-providers (if (jolt-nil? aspect-config)
                                '()
                                (bld-strs (jolt-aspect-provider-ns aspect-config)))))
-     (set! bld-boot-loaded
-       (hashtable-copy loaded-ns #f))
      (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")
