@@ -109,6 +109,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the memory is released reads freed memory, the same rule babashka.ffi
   states for its own.
 
+### Fixed
+
+- Runtime FASL cache entries are published by atomic rename, so parallel cold
+  builds cannot read a partially written or interleaved cache artifact.
+
 ## [0.8.0] - 2026-08-31
 
 The build keeps one toolchain end to end now. When make provisions the pinned

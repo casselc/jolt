@@ -1862,13 +1862,73 @@
       (put-bytevector out bs)
       (close-port out))))
 
+;; A cache hit is advisory. Pruning or another process may retire the entry
+;; between the existence check and the open; fall back to compiling instead of
+;; turning that ordinary cache race into a failed build.
+(define (bld-runtime-cache-hit! cache so)
+  (guard (e (#t #f))
+    (and (file-exists? cache)
+         (begin (bld-copy-file! cache so) #t))))
+
+;; Deterministic test seam for the publication invariant. A writer with this
+;; variable pauses only AFTER its private temp is complete and BEFORE the final
+;; cache path exists. The smoke starts a second build in that interval. Keeping
+;; the seam at the ownership boundary makes the test independent of compiler
+;; timing and file size.
+(define (bld-runtime-cache-test-before-publish!)
+  (let ((barrier (getenv "JOLT_TEST_RUNTIME_CACHE_PUBLISH_BARRIER")))
+    (when (and (string? barrier) (fx>? (string-length barrier) 0))
+      (let ((ready (string-append barrier ".ready"))
+            (go (string-append barrier ".go")))
+        (let ((out (open-output-file ready 'replace)))
+          (put-string out "ready\n")
+          (close-output-port out))
+        (let loop ()
+          (unless (file-exists? go)
+            (sleep (make-time 'time-duration 10000000 0)) ; 10ms
+            (loop)))))))
+
+;; Publish a complete cache entry in one namespace operation. Directly copying
+;; to `cache` let another process's file-exists? + read observe a truncated FASL;
+;; two cold writers could also interleave distinct valid Chez encodings of the
+;; same source. A same-directory temp plus rename makes the final path
+;; complete-or-absent. If a concurrent complete winner is already visible, keep
+;; it and discard our temp. On POSIX two simultaneous absent-path renames may
+;; still replace one complete winner with another complete winner, which is
+;; safe; platforms that refuse replacement take the guarded winner path.
+(define (bld-runtime-cache-publish! so cache)
+  (let ((tmp (string-append cache ".tmp-" (number->string (get-process-id)))))
+    (guard (e (#t
+               ;; Cleanup is best-effort too. In particular, Windows may deny
+               ;; deletion while an antivirus or failed copy still holds the
+               ;; file; that must not turn an optional cache into a build error.
+               (guard (cleanup-e (#t #f))
+                 (when (file-exists? tmp) (delete-file tmp)))
+               #f))                 ; an unwritable cache must not fail the build
+      (bld-mkdir-p (bld-runtime-cache-dir))
+      (bld-copy-file! so tmp)
+      (bld-runtime-cache-test-before-publish!)
+      (if (file-exists? cache)
+          (delete-file tmp)
+          (guard (e (#t
+                     ;; A Windows rename may refuse to replace the winner that
+                     ;; appeared after our check. That is success, not damage.
+                     (if (file-exists? cache)
+                         (begin
+                           (guard (cleanup-e (#t #f))
+                             (when (file-exists? tmp) (delete-file tmp)))
+                           #t)
+                         (raise e))))
+            (rename-file tmp cache)))
+      (bld-prune-runtime-cache!)
+      #t)))
+
 ;; Compile the runtime half, reusing a cached fasl when one matches.
 (define (bld-compile-runtime! mode src so)
   (let* ((body (read-file-string src))
          (cache (and (bld-runtime-cache-enabled?) (bld-runtime-cache-path body mode))))
-    (if (and cache (file-exists? cache))
+    (if (and cache (bld-runtime-cache-hit! cache so))
         (begin
-          (bld-copy-file! cache so)
           (ei-mark! "runtime fasl (cached)"))
         (begin
           (bld-prepend-prologue! src)
@@ -1876,10 +1936,7 @@
           (bld-chez-compile-file mode src so)
           (ei-mark! "compile runtime half")
           (when cache
-            (guard (e (#t #f))          ; an unwritable cache must not fail the build
-              (bld-mkdir-p (bld-runtime-cache-dir))
-              (bld-copy-file! so cache)
-              (bld-prune-runtime-cache!)))))))
+            (bld-runtime-cache-publish! so cache))))))
 
 ;; units: a list of (src so kind) compiled in order and loaded into the boot in
 ;; that order, so the runtime half's defines precede the app half's reads.
