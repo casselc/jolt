@@ -398,6 +398,8 @@ An advice function receives `[join-point proceed]`. Jolt preserves argument
 evaluation order, the operation's result, application exception identity, and
 exactly-once execution. Advice that throws, omits `proceed`, invokes it twice,
 or returns a replacement value fails open around the application operation.
+This first layer intentionally has only that result-preserving advice shape;
+argument replacement and outcome-controlling advice are separate extensions.
 
 Matching uses analyzed, resolved var calls—not source lines—and runs before
 inference, inlining, direct linking, and tree shaking. Unsupported keys,
