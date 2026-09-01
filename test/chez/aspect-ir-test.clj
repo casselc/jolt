@@ -694,6 +694,8 @@
               "jolt aspects: selection :consumers must be a non-empty vector"]
              [{:resource "a.edn" :consumers ['provider.one]}
               "jolt aspects: each selection consumer must be a map"]
+             [{:resource "a.edn" :consumers [{:roles :all}]}
+              "jolt aspects: selection consumer needs :provider"]
              [{:resource "a.edn"
                :consumers [{:provider 'provider.one}]}
               "jolt aspects: selection consumer needs explicit :roles"]
