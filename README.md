@@ -267,6 +267,13 @@ dependencies, `JOLT_GITLIBS_DIR` takes precedence over
 `GRENADINE_GITLIBS_DIR`, then `GITLIBS`; source lives under `gist/` or `github/`
 in that effective root.
 
+Maven HTTPS downloads honor `https_proxy` / `HTTPS_PROXY`, falling back to
+`all_proxy` / `ALL_PROXY`, and bypass matching hosts from `no_proxy` /
+`NO_PROXY`. Lowercase spellings take precedence. The proxy may be an
+`http://host[:port]` URL or bare `host[:port]`; Jolt establishes an HTTP CONNECT
+tunnel and still verifies TLS against the Maven repository host. Authenticated,
+HTTPS, and SOCKS proxy URLs are not yet supported and fail closed.
+
 ## Diagnostics
 
 - **"Did you mean?"** — when a bare symbol doesn't resolve, the compile error

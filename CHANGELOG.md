@@ -131,6 +131,11 @@ when transposed.
 
 ### Added
 
+- **Maven downloads honor standard HTTPS proxy environment variables.**
+  `https_proxy` / `HTTPS_PROXY` (then `all_proxy` / `ALL_PROXY`) select an HTTP
+  CONNECT proxy, while `no_proxy` / `NO_PROXY` bypass matching hosts. TLS and
+  hostname verification remain end to end against the Maven repository.
+
 - **`jolt.ffi` arenas: a group of allocations with one lifetime (#799).** Every
   foreign allocation used to be released one pointer at a time — `ffi/free` per
   block, `free-callable` per callback, a `try`/`finally` per scope — so a

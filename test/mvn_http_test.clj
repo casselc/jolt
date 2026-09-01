@@ -17,6 +17,12 @@
 (def classify-status  (var jolt.mvn-http/classify-status))
 (def with-retries     (var jolt.mvn-http/with-retries))
 (def lib-candidates   (var jolt.mvn-http/lib-candidates))
+(def parse-proxy      (var jolt.mvn-http/parse-proxy))
+(def no-proxy?        (var jolt.mvn-http/no-proxy?))
+(def proxy-for        (var jolt.mvn-http/proxy-for))
+(def build-connect-request (var jolt.mvn-http/build-connect-request))
+(def recv-connect-response (var jolt.mvn-http/recv-connect-response))
+(def open-transport   (var jolt.mvn-http/open-transport))
 (def max-attempts     @(var jolt.mvn-http/max-attempts))
 
 (def ^:private fails (atom []))
@@ -50,6 +56,85 @@
   (ok= true  (ctl-free? "abc/def") "ctl-free plain")
   (ok= false (ctl-free? "a\rb")    "ctl-free CR")
   (ok= false (ctl-free? "a\nb")    "ctl-free LF")
+
+  ;; HTTPS proxy selection. Lowercase env names win when both spellings are
+  ;; present; NO_PROXY is host-boundary-aware and can narrow a rule by port.
+  (ok= {:host "proxy.example" :port 80}
+       (parse-proxy "proxy.example") "parse-proxy bare host")
+  (ok= {:host "127.0.0.1" :port 8080}
+       (parse-proxy "http://127.0.0.1:8080/") "parse-proxy URL and port")
+  (ok= {:host "::1" :port 8080}
+       (parse-proxy "http://[::1]:8080") "parse-proxy bracketed IPv6")
+  (throws #(parse-proxy "http://::1:8080") "parse-proxy rejects unbracketed IPv6")
+  (throws #(parse-proxy "socks5h://proxy:1080") "parse-proxy rejects unsupported scheme")
+  (throws #(parse-proxy "http://user:secret@proxy:8080") "parse-proxy rejects credentials")
+  (throws #(parse-proxy "http://proxy:") "parse-proxy rejects an empty explicit port")
+  (throws #(parse-proxy "http://proxy:70000") "parse-proxy rejects invalid port")
+  (throws #(parse-proxy "http://proxy?mode=x") "parse-proxy rejects query text")
+
+  (ok= true  (no-proxy? "repo.example.com" 443 "example.com") "no-proxy domain includes subdomains")
+  (ok= false (no-proxy? "notexample.com" 443 "example.com") "no-proxy observes label boundary")
+  (ok= false (no-proxy? "example.com" 443 ".example.com") "no-proxy leading dot is subdomains only")
+  (ok= true  (no-proxy? "repo.example.com" 443 ".example.com") "no-proxy leading dot subdomain")
+  (ok= false (no-proxy? "repo.example.com" 443 "repo.example.com:8443") "no-proxy port mismatch")
+  (ok= true  (no-proxy? "repo.example.com" 443 "repo.example.com:443") "no-proxy port match")
+  (ok= true  (no-proxy? "anything.example" 443 "*") "no-proxy wildcard")
+  (ok= true  (no-proxy? "localhost" 443 nil) "no-proxy localhost implicit")
+
+  (let [target {:host "repo.example.com" :port 443}]
+    (ok= {:host "lower" :port 81}
+         (proxy-for target {"https_proxy" "http://lower:81"
+                            "HTTPS_PROXY" "http://upper:82"})
+         "proxy-for lowercase wins")
+    (ok= {:host "fallback" :port 83}
+         (proxy-for target {"ALL_PROXY" "http://fallback:83"})
+         "proxy-for ALL_PROXY fallback")
+    (ok= nil
+         (proxy-for target {"HTTPS_PROXY" "http://proxy:80"
+                            "NO_PROXY" "repo.example.com"})
+         "proxy-for NO_PROXY bypass"))
+
+  (ok= (str "CONNECT repo.example.com:443 HTTP/1.1\r\n"
+            "Host: repo.example.com:443\r\n"
+            "User-Agent: jolt/" (or (System/getProperty "jolt.version") "jolt") "\r\n"
+            "Connection: keep-alive\r\n\r\n")
+       (build-connect-request "repo.example.com" 443)
+       "CONNECT uses authority-form with mandatory port")
+
+  ;; A proxy is allowed to coalesce its 2xx response and the first bytes from
+  ;; the origin. Those bytes must survive and seed the TLS memory BIO.
+  (let [chunks (atom [(bytes-of "HTTP/1.1 200 Connection established\r\nX-P: y\r\n\r\nABC")])
+        got (with-redefs-fn
+              {(var jolt.mvn-http/recv-bytes)
+               (fn [_] (let [x (first @chunks)] (swap! chunks rest) x))}
+              #(recv-connect-response 9))]
+    (ok= 200 (:status got) "CONNECT response status")
+    (ok= [65 66 67] (vec (:initial got)) "CONNECT preserves initial TLS bytes"))
+
+  (let [sent (atom nil)
+        got (with-redefs-fn
+              {(var jolt.mvn-http/connect) (fn [host port] [host port])
+               (var jolt.mvn-http/send-bytes) (fn [_ data] (reset! sent data))
+               (var jolt.mvn-http/recv-connect-response)
+               (fn [_] {:status 200 :initial (byte-array [1 2 3])})}
+              #(open-transport "repo.example.com" 443 {:host "proxy" :port 8080}))]
+    (ok= ["proxy" 8080] (:sock got) "CONNECT opens the proxy endpoint")
+    (ok= [1 2 3] (vec (:initial got)) "CONNECT returns tunneled initial bytes")
+    (ok= true
+         (str/starts-with? (String. ^bytes @sent "ISO-8859-1")
+                           "CONNECT repo.example.com:443 HTTP/1.1\r\n")
+         "CONNECT sends the origin authority"))
+
+  (let [closed (atom [])]
+    (throws
+      #(with-redefs-fn
+         {(var jolt.mvn-http/connect) (fn [_ _] 42)
+          (var jolt.mvn-http/send-bytes) (fn [_ _] nil)
+          (var jolt.mvn-http/recv-connect-response) (fn [_] {:status 407 :initial (byte-array 0)})
+          (var jolt.mvn-http/close-sock) (fn [fd] (swap! closed conj fd))}
+         #(open-transport "repo.example.com" 443 {:host "proxy" :port 8080}))
+      "CONNECT rejects a non-2xx response")
+    (ok= [42] @closed "CONNECT failure closes the proxy socket"))
 
   ;; header-end
   (ok= 6   (header-end (bytes-of "AB\r\n\r\nCD")) "header-end offset")
