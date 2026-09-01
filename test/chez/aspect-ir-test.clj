@@ -1,7 +1,8 @@
 (ns aspect-ir-test
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.test :refer [deftest is testing run-tests]]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is testing run-tests thrown-with-msg?]]
             [jolt.aspects :as aspects]
             [jolt.fibers :as fibers]
             [jolt.ir :as ir]
@@ -18,6 +19,11 @@
 
 (def args-config
   (assoc-in config [:aspects 0 :contract] :args-v1))
+
+(def marker-config
+  (-> config
+      (assoc-in [:aspects 0 :match :marker] :test/call)
+      (assoc-in [:aspects 0 :advice-role] :test/around)))
 
 (def replace-args-config
   (assoc-in config [:aspects 0 :contract] :replace-args-v1))
@@ -54,6 +60,9 @@
     nil
     (catch Exception e
       {:message (ex-message e) :data (ex-data e)})))
+
+(defn report-site-id [build-identity site]
+  ((ns-resolve 'jolt.aspects 'site-identity) build-identity site))
 
 (def control-config
   (-> config
@@ -151,6 +160,24 @@
        (finally
          (.delete file))))))
 
+(defn resolve-preset-fixture [preset]
+  (let [manifest-file (java.io.File/createTempFile "jolt-aspect-manifest" ".edn")
+        preset-file (java.io.File/createTempFile "jolt-aspect-preset" ".edn")
+        preset-resource "test/aspect-standard-preset.edn"]
+    (try
+      (spit manifest-file (pr-str aspect-fixture-manifest))
+      (spit preset-file (pr-str preset))
+      (with-redefs [io/resource
+                    (fn [resource]
+                      (cond
+                        (= aspect-fixture-resource resource) manifest-file
+                        (= preset-resource resource) preset-file
+                        :else nil))]
+        (aspects/resolve-build-config [{:preset preset-resource}] "/tmp/unused"))
+      (finally
+        (.delete manifest-file)
+        (.delete preset-file)))))
+
 (defn entry-node []
   (assoc
     (ir/def-node
@@ -193,6 +220,31 @@
            (get-in @(:aspect-matches unit) [:test/call 0 :position])))
     (is (empty? (ir/tree-problems woven)))
     (is (= woven (aspects/weave unit woven)))))
+
+(deftest cooperative-call-marker-refines-an-ordinary-call-selector
+  (let [unit (types/new-unit)
+        _ (aspects/configure-unit! unit marker-config)
+        marked (assoc (invoke-node)
+                      :aspect-marker {:id :test/call :role :test/around})
+        woven (aspects/weave unit (ir/def-node "app.core" "run" marked))
+        join-point (get-in woven [:init :body :args 1 :form])]
+    (is (= :test/call (get-in join-point [:match :marker])))
+    (is (= :test/call (get-in join-point [:site :marker])))
+    (is (= (:site-id join-point)
+           (report-site-id (:build-identity join-point)
+                           (dissoc (:site join-point) :site-id)))
+        "the cooperative marker participates in the physical site identity")
+    (is (= :test/call
+           (get-in @(:aspect-matches unit) [:test/call 0 :marker])))
+    (is (empty? (ir/tree-problems woven))))
+  (doseq [marker [nil {:id :test/other :role :test/around}
+                       {:id :test/call :role :test/wrong-role}]]
+    (let [unit (types/new-unit)
+          _ (aspects/configure-unit! unit marker-config)
+          call (cond-> (invoke-node) marker (assoc :aspect-marker marker))
+          woven (aspects/weave unit (ir/def-node "app.core" "run" call))]
+      (is (= :invoke (get-in woven [:init :op])))
+      (is (empty? @(:aspect-matches unit))))))
 
 (deftest args-contract-weaving
   (let [unit (types/new-unit)
@@ -1032,7 +1084,137 @@
                (try
                  (resolve-aspect-fixture bad-selection)
                  nil
-                 (catch Exception e (ex-message e)))))))))
+               (catch Exception e (ex-message e)))))))))
+
+(deftest package-owned-preset-resolution
+  (let [selection {:resource aspect-fixture-resource
+                   :providers ['aspect-ir-test/filtered-complete-provider
+                               'aspect-ir-test/filtered-second-provider]}
+        preset {:schema 1
+                :id :test/standard
+                :selections [selection]}
+        direct (resolve-aspect-fixture selection)
+        configured (resolve-preset-fixture preset)
+        plan (aspects/plan-data configured)]
+    (is (= [{:id :test/standard
+             :resource "test/aspect-standard-preset.edn"}]
+           (:presets configured)))
+    (is (= (:presets configured) (:presets plan)))
+    (is (= (:aspects direct) (:aspects configured))
+        "a preset expands through the ordinary selection pipeline")
+    (is (not= (aspects/build-identity direct)
+              (aspects/build-identity configured))
+        "preset provenance participates in artifact identity")
+    (is (not (.contains (pr-str plan) ":preset-bytes"))
+        "the printable plan omits preset source bytes")
+    (is (some #(= (str "preset :test/standard from "
+                       "test/aspect-standard-preset.edn") %)
+              (aspects/explain-lines plan))))
+  (doseq [[preset expected]
+          [[{:schema 2 :id :test/bad :selections [{}]}
+            "jolt aspects: unsupported preset schema"]
+           [{:schema 1 :id 'test/bad :selections [{}]}
+            "jolt aspects: preset :id must be a keyword"]
+           [{:schema 1 :id :test/bad :selections []}
+            "jolt aspects: preset :selections must be a non-empty vector"]
+           [{:schema 1 :id :test/bad
+             :selections [{:preset "nested.edn"}]}
+            "jolt aspects: preset selection contains unsupported keys"]
+           [{:schema 1 :id :test/bad :selections [{}]}
+            "jolt aspects: preset selection needs :resource"]]]
+    (is (= expected
+           (try
+             (resolve-preset-fixture preset)
+             nil
+             (catch Exception e (ex-message e)))))))
+
+(deftest aspect-plan-is-source-free-and-explainable-before-or-after-build
+  (let [selection {:resource aspect-fixture-resource
+                   :consumers
+                   [{:provider 'aspect-ir-test/filtered-complete-provider
+                     :roles :all}
+                    {:provider 'aspect-ir-test/filtered-second-provider
+                     :roles [:test/around]}]}
+        configured (resolve-aspect-fixture selection)
+        plan (aspects/plan-data configured)
+        call (first (filter #(= :test/target-call (:id %)) (:aspects plan)))
+        site-for (fn [aspect]
+                   (let [match (:match aspect)
+                         call? (contains? match :call)
+                         target (if call? (:call match) (:entry match))
+                         site {:aspect (:id aspect)
+                               :within (if call? (str (:ns match)) (namespace target))
+                               (if call? :call :entry) target
+                               :arity (:arity match)
+                               :ordinal 1
+                               :position {:line 12 :column 7}}]
+                     (assoc site :site-id
+                            (report-site-id (:identity plan) site))))
+        report {:schema (:schema plan)
+                :weaver (:weaver plan)
+                :identity (:identity plan)
+                :control-enabled? (:control-enabled? plan)
+                :aspects (mapv (fn [aspect]
+                                 {:id (:id aspect) :sites [(site-for aspect)]})
+                               (:aspects plan))}
+        static-lines (aspects/explain-lines plan)
+        observed-lines (aspects/explain-lines plan report "fixture.edn")]
+    (is (= :instrumented (:status plan)))
+    (is (= (:identity configured) (:identity plan)))
+    (is (= [1 2] (mapv :ordinal (:consumers call))))
+    (is (not-any? #(contains? % :provider-bytes) (:consumers call)))
+    (is (not (.contains (pr-str plan) "manifest-bytes")))
+    (is (not (contains? plan :report)))
+    (is (some #(.startsWith % "aspect :test/target-call") static-lines))
+    (is (not-any? #(.startsWith % "  observed sites:") static-lines))
+    (is (some #(= "observed report: fixture.edn" %) observed-lines))
+    (is (some #(= "  observed sites: 1" %) observed-lines))
+    (is (some #(.contains % ":within \"app.core\"") observed-lines)))
+  (is (= {:schema 1 :weaver "jolt.aspect-ir/v1" :status :plain
+          :identity "plain" :control-enabled? false
+          :presets [] :providers [] :aspects []}
+         (aspects/plan-data nil))))
+
+(deftest aspect-explain-rejects-stale-or-unbounded-reports
+  (let [configured (resolve-aspect-fixture
+                    {:resource aspect-fixture-resource
+                     :provider 'aspect-ir-test/filtered-complete-provider})
+        plan (aspects/plan-data configured)
+        site-for (fn [aspect]
+                   (let [match (:match aspect)
+                         call? (contains? match :call)
+                         target (if call? (:call match) (:entry match))
+                         site {:aspect (:id aspect)
+                               :within (if call? (str (:ns match)) (namespace target))
+                               (if call? :call :entry) target
+                               :arity (:arity match)
+                               :ordinal 1
+                               :position {:line 1 :column 1}}]
+                     (assoc site :site-id
+                            (report-site-id (:identity plan) site))))
+        report {:schema (:schema plan)
+                :weaver (:weaver plan)
+                :identity (:identity plan)
+                :control-enabled? (:control-enabled? plan)
+                :aspects (mapv (fn [aspect]
+                                 {:id (:id aspect) :sites [(site-for aspect)]})
+                               (:aspects plan))}
+        message (fn [candidate]
+                  (try
+                    (aspects/explain-lines plan candidate)
+                    nil
+                    (catch Exception e (ex-message e))))]
+    (is (= "jolt aspects: build report does not match the selected build"
+           (message (assoc report :identity "stale"))))
+    (is (= "jolt aspects: build report contains unsupported keys"
+           (message (assoc report :unexpected "not rendered"))))
+    (is (= "jolt aspects: build report site contains unsupported keys"
+           (message (assoc-in report [:aspects 0 :sites 0 :secret] "not rendered"))))
+    (is (= "jolt aspects: build report site does not match selected aspect"
+           (message (assoc-in report [:aspects 0 :sites 0 :site-id]
+                              "v1-tampered"))))
+    (is (= "jolt aspects: build report aspects do not match the selected build"
+           (message (assoc-in report [:aspects 0 :id] :other/aspect))))))
 
 (deftest report-publication-follows-explicit-prepare
   (let [file (java.io.File/createTempFile "jolt-aspects" ".edn")
@@ -1076,6 +1258,139 @@
       (is (= (:site-id runtime-join-point) (:site-id report-site)))
       (is (= (:site runtime-join-point) report-site)
           "runtime consumers and offline readers share one exact site record"))))
+
+(deftest cooperative-compiler-declarations-generate-the-canonical-manifest
+  (let [library {:id 'demo/library :version "source-v1"}
+        nodes
+        {'demo.alpha
+         [(assoc (ir/def-node
+                  "demo.alpha" "handle"
+                  (ir/fn-node "handle" [{:params ["request"] :body (ir/const nil)}]))
+                 :pos {:file "alpha.clj" :line 2 :column 1}
+                 :aspect-entry {:id :demo/handle :role :http/server})]
+         'demo.beta
+         [(assoc (ir/def-node
+                  "demo.beta" "choose"
+                  (ir/fn-node "choose" [{:params ["x"] :body (ir/const nil)}
+                                         {:params ["x" "y"] :body (ir/const nil)}]))
+                 :pos {:file "beta.clj" :line 2 :column 1}
+                 :aspect-entry
+                 {:id :demo/choose-two :role :db/client :arity 2})]
+         'demo.operations
+         [(assoc
+           (ir/def-node
+            "demo.operations" "execute"
+            (ir/fn-node
+             "execute"
+             [{:params []
+               :body
+               (assoc (ir/invoke (ir/var-ref "driver.api" "execute")
+                                 [(ir/const nil) (ir/const "select 1")])
+                      :aspect-marker {:id :demo/db-execute
+                                      :role :db/client})}]))
+           :pos {:file "operations.clj" :line 2 :column 1})]}
+        authoring {:library library :manifest "unused.edn"
+                   :namespaces ['demo.alpha 'demo.beta 'demo.operations]}
+        compile! (fn [ns-name]
+                   (doseq [node (get nodes ns-name)]
+                     (aspects/weave (types/new-unit) node)))
+        expected
+        {:schema 1
+         :library library
+         :aspects
+         [{:id :demo/choose-two
+           :match {:entry 'demo.beta/choose :arity 2}
+           :advice-role :db/client
+           :expect {:matches 1}}
+          {:id :demo/db-execute
+           :match {:ns 'demo.operations
+                   :call 'driver.api/execute
+                   :arity 2
+                   :marker :demo/db-execute}
+           :advice-role :db/client
+           :expect {:matches 1}}
+          {:id :demo/handle
+           :match {:entry 'demo.alpha/handle :arity 1}
+           :advice-role :http/server
+           :expect {:matches 1}}]}]
+    (is (= expected (aspects/collect-manifest authoring compile!)))
+    (is (= expected (edn/read-string (aspects/render-manifest expected))))
+    (is (str/ends-with? (aspects/render-manifest expected) "\n"))))
+
+(deftest cooperative-entry-metadata-fails-closed-on-ambiguous-ir
+  (let [library {:id 'demo/library :version "source-v1"}
+        authoring {:library library :manifest "unused.edn"
+                   :namespaces ['demo.core]}
+        collect (fn [nodes]
+                  (aspects/collect-manifest
+                   authoring
+                   (fn [_]
+                     (doseq [node nodes]
+                       (aspects/weave (types/new-unit) node)))))
+        annotated (fn [name arities declaration]
+                    (assoc (ir/def-node "demo.core" name
+                                        (ir/fn-node name arities))
+                           :pos {:file "core.clj"
+                                 :line (if (= name "b") 3 2)
+                                 :column 1}
+                           :aspect-entry declaration))]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"multi-arity annotated entry"
+         (collect [(annotated "run"
+                              [{:params ["x"] :body (ir/const nil)}
+                               {:params ["x" "y"] :body (ir/const nil)}]
+                              {:id :demo/run :role :demo/around})])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"fixed arity"
+         (collect [(annotated "run"
+                              [{:params ["x"] :rest "more" :body (ir/const nil)}]
+                              {:id :demo/run :role :demo/around})])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"ids must be unique"
+         (collect [(annotated "a" [{:params [] :body (ir/const nil)}]
+                              {:id :demo/same :role :demo/around})
+                   (annotated "b" [{:params [] :body (ir/const nil)}]
+                              {:id :demo/same :role :demo/around})])))))
+
+(deftest cooperative-compiler-site-identity-fails-closed
+  (let [authoring {:library {:id 'demo/library :version "source-v1"}
+                   :manifest "unused.edn"
+                   :namespaces ['demo.core]}
+        marked (fn [id]
+                 (assoc (ir/invoke (ir/var-ref "driver.api" "execute")
+                                   [(ir/const nil)])
+                        :aspect-marker {:id id :role :db/client}))
+        root (fn [body]
+               (assoc (ir/def-node
+                       "demo.core" "run"
+                       (ir/fn-node "run" [{:params [] :body body}]))
+                      :pos {:file "core.clj" :line 2 :column 1}))]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"changed while compiling"
+         (aspects/collect-manifest
+          authoring
+          (fn [_]
+            (aspects/weave (types/new-unit) (root (marked :demo/first)))
+            (aspects/weave (types/new-unit) (root (marked :demo/later)))))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"ids must be unique"
+         (aspects/collect-manifest
+          authoring
+          (fn [_]
+            (aspects/weave
+             (types/new-unit)
+             (root (ir/do-node [(marked :demo/same)]
+                               (marked :demo/same))))))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"inside a function definition"
+         (aspects/collect-manifest
+          authoring
+          (fn [_]
+            (aspects/weave
+             (types/new-unit)
+             (assoc (marked :demo/top-level)
+                    :fnsrc-ns "demo.core"
+                    :pos {:file "core.clj" :line 2 :column 1}))))))))
 
 (let [{:keys [fail error]} (run-tests)]
   (when (pos? (+ fail error)) (System/exit 1)))

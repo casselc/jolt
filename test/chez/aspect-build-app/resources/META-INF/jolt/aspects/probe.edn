@@ -1,15 +1,15 @@
 {:schema 1
  :library {:id test/aspect-target :version "fixture-v1"}
  :aspects
- [{:id :test/target-call
-   :match {:ns app.core :call app.target/operation :arity 1}
-   :advice-role :test/around
-   :expect {:matches 1}}
-  {:id :test/callback-entry
-   :match {:entry app.target/callback :arity 1}
+ [{:id :test/callback-entry
+   :match {:arity 1 :entry app.target/callback}
    :advice-role :test/entry-around
    :expect {:matches 1}}
   {:id :test/numeric-callback-entry
-   :match {:entry app.target/numeric-callback :arity 1}
+   :match {:arity 1 :entry app.target/numeric-callback}
    :advice-role :test/numeric-entry-around
+   :expect {:matches 1}}
+  {:id :test/target-call
+   :match {:arity 1 :call app.target/operation :marker :test/target-call :ns app.core}
+   :advice-role :test/around
    :expect {:matches 1}}]}

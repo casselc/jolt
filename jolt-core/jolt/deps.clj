@@ -1487,6 +1487,10 @@
       :project-paths (vec project-paths)
       :project-roots (vec project-roots)
       :build (:jolt/build edn)
+      ;; Cooperative aspect declarations are a library-authoring concern. The
+      ;; CLI reads this root-project configuration to generate/check the same
+      ;; schema-1 manifest consumed by ordinary build selections.
+      :aspect-authoring (:jolt/aspects edn)
       :embed-dirs (mapv #(abspath project-dir %) (:embed (:jolt/build edn)))
       ;; :tasks from both files, bb.edn last — a name in both is babashka's.
       ;; (When bb.edn IS the project config the second merge is a no-op.)

@@ -631,6 +631,25 @@
         node))
     (if pos (assoc node :pos pos) node)))
 
+(def ^:private aspect-entry-meta-keys
+  #{:jolt.aspects/id :jolt.aspects/role :jolt.aspects/arity})
+
+(defn- aspect-entry-from-meta [m]
+  (let [present (select-keys m aspect-entry-meta-keys)]
+    (when (seq present)
+      (let [id (:jolt.aspects/id present)
+            role (:jolt.aspects/role present)
+            arity (:jolt.aspects/arity present)]
+        (when-not (keyword? id)
+          (throw ":jolt.aspects/id metadata must be a keyword"))
+        (when-not (keyword? role)
+          (throw ":jolt.aspects/role metadata must be a keyword"))
+        (when (and (some? arity)
+                   (not (and (int? arity) (not (neg? arity)))))
+          (throw ":jolt.aspects/arity metadata must be a non-negative integer"))
+        (cond-> {:id id :role role}
+          (some? arity) (assoc :arity arity))))))
+
 (defn- analyze-def [ctx items env]
   (let [name-sym (nth items 1)]
     ;; ^{:map} metadata reads as (def (with-meta name m) v): the metadata is a
@@ -640,12 +659,16 @@
     (if (< (count items) 3)
       ;; (def name) with no init (declare): intern + reserve the cell so a forward
       ;; reference resolves; the back end keys on :no-init.
-      (let [nm (form-sym-name name-sym) cur (compile-ns ctx)]
+      (let [nm (form-sym-name name-sym)
+            cur (compile-ns ctx)
+            declared-meta (or (form-sym-meta name-sym) {})]
+        (when (aspect-entry-from-meta declared-meta)
+          (throw "jolt aspect entry metadata requires an initialized function definition"))
         (host-intern! ctx cur nm)
         ;; keep the reader meta: (def ^:dynamic *x*) must be bindable before
         ;; its root is set (the backend emits set-var-meta! beside declare-var!).
         {:op :def :ns cur :name nm :no-init true
-         :meta (or (form-sym-meta name-sym) {})})
+         :meta declared-meta})
       ;; (def name docstring value): docstring is form 2, value form 3 — matching
       ;; the interpreter, else the docstring is taken as the value.
       (let [nm (form-sym-name name-sym)
@@ -665,10 +688,17 @@
                         (let [c (resolve-class-hint tag-name)]
                           (if c (assoc base0 :tag c) base0))
                         base0)
-            node-meta (if has-doc (assoc base-meta :doc (nth items 2)) base-meta)]
+            aspect-entry (aspect-entry-from-meta base-meta)
+            runtime-meta (apply dissoc base-meta aspect-entry-meta-keys)
+            node-meta (if has-doc (assoc runtime-meta :doc (nth items 2)) runtime-meta)]
         (host-intern! ctx cur nm)
         ;; a ^double/^long return hint on the name applies to all arities of the fn.
-        (let [node (def-node cur nm (with-ret-nhint (analyze ctx val-form env) (tag->nkind tag)) node-meta)
+        (let [init (with-ret-nhint (analyze ctx val-form env) (tag->nkind tag))
+              _ (when (and aspect-entry (not= :fn (:op init)))
+                  (throw "jolt aspect entry metadata requires a function definition"))
+              node (cond->
+                    (def-node cur nm init node-meta)
+                     aspect-entry (assoc :aspect-entry aspect-entry))
               me (def-meta-expr ctx node-meta env)]
           (if me (assoc node :meta-expr me) node))))))
 
@@ -1080,6 +1110,36 @@
      :else
      (throw (str "jolt.ffi: option must be :blocking or an options map, got: " opt)))))
 
+(defn- aspect-marker-declaration [form]
+  (when-not (form-map? form)
+    (throw "jolt.aspects/at declaration must be a literal map"))
+  (let [declaration
+        (reduce
+         (fn [result pair]
+           (let [k (first pair) v (second pair)]
+             (when-not (and (form-keyword? k)
+                            (contains? #{:id :role} k))
+               (throw (str "jolt.aspects/at unsupported declaration key: " k)))
+             (when-not (form-keyword? v)
+               (throw (str "jolt.aspects/at " k " must be a literal keyword")))
+             (assoc result k v)))
+         {}
+         (form-map-pairs form))]
+    (when-not (= #{:id :role} (set (keys declaration)))
+      (throw "jolt.aspects/at declaration needs exactly :id and :role"))
+    declaration))
+
+(defn- analyze-aspect-marker [ctx items env]
+  (when-not (= 3 (count items))
+    (throw "jolt.aspects/at expects a declaration and one call expression"))
+  (let [declaration (aspect-marker-declaration (nth items 1))
+        node (analyze ctx (nth items 2) env)]
+    (when-not (= :invoke (:op node))
+      (throw "jolt.aspects/at expression must analyze to a function call"))
+    (when (:aspect-marker node)
+      (throw "jolt.aspects/at cannot mark the same call more than once"))
+    (assoc node :aspect-marker declaration)))
+
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
     (throw (str "jolt.ffi/foreign-fn expects "
@@ -1416,6 +1476,12 @@
             (let [node (analyze ctx (form-expand-1 ctx form (amp-env-map env)) env)
                   p (form-position form)]
               (if (and p (= :def (:op node))) (stamp-def-pos ctx env node p) node))
+          ;; Cooperative expression marker. `jolt.aspects/at` macroexpands to
+          ;; this qualified form; the annotation is compiler-only and back ends
+          ;; never emit the fallback wrapper in an ordinary unwoven build.
+          (and (form-sym? head) (= "jolt.aspects" (form-sym-ns head))
+               (= "__at" (form-sym-name head)))
+            (analyze-aspect-marker ctx items env)
           ;; jolt.ffi/__cfn — the foreign-function special form (always emitted
           ;; fully-qualified by the jolt.ffi/foreign-fn macro, so aliases resolve).
           (and (form-sym? head) (= "jolt.ffi" (form-sym-ns head))
