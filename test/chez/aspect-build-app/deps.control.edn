@@ -1,0 +1,9 @@
+{:paths ["src" "resources"]
+ :jolt/build
+ {:allow-control-aspects true
+  :aspects
+  [{:resource "META-INF/jolt/aspects/probe.edn"
+    :consumers
+    [{:provider instrumentation.control-provider :roles [:test/around]}
+     {:provider instrumentation.provider :roles [:test/around]}]}]
+  :aspect-report "target/aspects.edn"}}

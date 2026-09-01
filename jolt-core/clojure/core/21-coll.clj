@@ -221,6 +221,127 @@
 (defn ex-cause [e]
   (let [e (ex-unwrap e)] (if (ex-info-val? e) (get e :cause) nil)))
 
+;; Compiler-generated synchronous instrumentation uses this runtime primitive.
+;; It is deliberately in clojure.core rather than the compiler-only
+;; jolt.aspects namespace so tree-shaken binaries can retain it as an ordinary
+;; reached core def while dropping the rest of the compiler image.
+(defn __invoke-instrumentation-around
+  ([advice join-point operation]
+   (__invoke-instrumentation-around advice join-point nil operation false))
+  ([advice join-point evaluated-args operation]
+   (__invoke-instrumentation-around advice join-point evaluated-args operation true))
+  ([advice join-point evaluated-args operation args-contract?]
+   (let [state (atom {:called false})
+         proceed (fn []
+                   (when (:called @state)
+                     (throw (ex-info "instrumentation advice invoked proceed more than once"
+                                     {:join-point (:id join-point)})))
+                   (swap! state assoc :called true)
+                   (try
+                     (let [value (operation)]
+                       (swap! state assoc :completed true :value value)
+                       value)
+                     (catch :default e
+                       (swap! state assoc :completed true :error e)
+                       (throw e))))]
+     (try
+       (if args-contract?
+         (advice join-point evaluated-args proceed)
+         (advice join-point proceed))
+       (let [{:keys [called error value]} @state]
+         (if called
+           (if error (throw error) value)
+           (proceed)))
+       (catch :default advice-error
+         (let [{:keys [called error value]} @state]
+           (cond
+             error (throw error)
+             called value
+             :else (proceed))))))))
+
+(defn __invoke-instrumentation-around-replace-args
+  "Compiler runtime for the explicit `:replace-args-v1` contract.
+
+  Advice receives `[join-point evaluated-args proceed]`. Calling `proceed`
+  with no arguments invokes the target with the original evaluated arguments;
+  calling it with one vector invokes the target with that replacement vector.
+  A non-vector or wrong-arity replacement is an advice failure and therefore
+  fails open to the original arguments before the target has run. The target
+  still runs exactly once, and its result or exception identity wins over all
+  advice behavior."
+  [advice join-point evaluated-args operation]
+  (let [state (atom {:called false})
+        expected (count evaluated-args)
+        run-operation
+        (fn [call-args]
+          (when (:called @state)
+            (throw (ex-info "instrumentation advice invoked proceed more than once"
+                            {:join-point (:id join-point)})))
+          (when-not (and (vector? call-args) (= expected (count call-args)))
+            (throw (ex-info "instrumentation advice supplied invalid replacement arguments"
+                            {:join-point (:id join-point)
+                             :expected-arity expected})))
+          (swap! state assoc :called true)
+          (try
+            (let [value (apply operation call-args)]
+              (swap! state assoc :completed true :value value)
+              value)
+            (catch :default e
+              (swap! state assoc :completed true :error e)
+              (throw e))))
+        proceed (fn
+                  ([] (run-operation evaluated-args))
+                  ([replacement-args] (run-operation replacement-args)))]
+    (try
+      (advice join-point evaluated-args proceed)
+      (let [{:keys [called error value]} @state]
+        (if called
+          (if error (throw error) value)
+          (proceed)))
+      (catch :default advice-error
+        (let [{:keys [called error value]} @state]
+          (cond
+            error (throw error)
+            called value
+            :else (proceed)))))))
+
+(defn __invoke-instrumentation-control
+  "Compiler runtime for the explicitly enabled test-only `:control-v1`
+  contract. Advice receives `[join-point evaluated-args proceed]`; its return
+  or throw becomes the application's return or throw. `proceed` may run the
+  target at most once, only during the advice call and on its owner thread,
+  using either the original arguments or one exact-arity replacement vector."
+  [advice join-point evaluated-args operation]
+  (let [active (atom true)
+        called (atom false)
+        owner (Thread/currentThread)
+        owner-fiber (jolt.host/current-fiber)
+        expected (count evaluated-args)
+        run-operation
+        (fn [call-args]
+          (when-not @active
+            (throw (ex-info "control advice invoked proceed outside its dynamic extent"
+                            {:join-point (:id join-point)})))
+          (when-not (and (identical? owner (Thread/currentThread))
+                         (identical? owner-fiber (jolt.host/current-fiber)))
+            (throw (ex-info "control advice invoked proceed from a non-owner execution context"
+                            {:join-point (:id join-point)})))
+          (when-not (compare-and-set! called false true)
+            (throw (ex-info "control advice invoked proceed more than once"
+                            {:join-point (:id join-point)})))
+          (when-not (and (vector? call-args) (= expected (count call-args)))
+            (throw (ex-info "control advice supplied invalid replacement arguments"
+                            {:join-point (:id join-point)
+                             :expected-arity expected})))
+          (apply operation call-args))
+        proceed (fn
+                  ([] (run-operation evaluated-args))
+                  ([replacement-args] (run-operation replacement-args)))]
+    (try
+      (advice join-point evaluated-args proceed)
+      (finally
+        (reset! active false)))))
+
 ;; Throwable->map: the reference data rendering of a throwable. :via chains
 ;; through ex-cause the way the reference walks getCause; :cause/:data come
 ;; from the root cause. Throwables carry no stack-trace elements here, so
@@ -414,4 +535,3 @@
   [v]
   (let [t (:test (meta v))]
     (if t (do (t) :ok) :no-test)))
-

@@ -109,6 +109,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the memory is released reads freed memory, the same rule babashka.ffi
   states for its own.
 
+- **Maven downloads honor standard HTTPS proxy environment variables.**
+  `https_proxy` / `HTTPS_PROXY` (then `all_proxy` / `ALL_PROXY`) select an HTTP
+  CONNECT proxy, while `no_proxy` / `NO_PROXY` bypass matching hosts. TLS and
+  hostname verification remain end to end against the Maven repository.
+
+- `jolt build` can select instrumentation aspect manifests and one or more
+  ordered providers, including explicit per-provider role filters when
+  consumers intentionally cover different parts of one manifest. The compiler
+  wraps exact resolved call sites and fixed-arity function entries before
+  optimization. Each provider can observe evaluated arguments or explicitly
+  replace them while the compiler still guarantees one application execution,
+  fail-open instrumentation, and preservation of application results and
+  exceptions. Provider order is part of the deterministic build identity and
+  match report. The report publishes only after the output artifact succeeds,
+  and builds without an aspect selection remain unchanged. Runtime join points
+  include a deterministic, build-scoped site identity and the corresponding
+  report-compatible site descriptor so independent consumers can correlate the
+  same woven operation.
+- An explicitly enabled, test-only `:control-v1` aspect contract can replace an
+  operation's return or exception, skip it, or invoke it once with replacement
+  arguments. `proceed` is limited to its owner thread and fiber and to the
+  advice call's dynamic extent; builds must opt in with
+  `:allow-control-aspects true`.
+- Aspect packages can publish named preset resources that expand to ordinary
+  manifest and provider selections. `jolt aspects plan` prints the deterministic
+  static selection, and `jolt aspects explain` can add a validated build report
+  without accepting stale identities or unbounded report data.
+- Libraries can derive their provider-neutral manifest from compiler
+  annotations. Definition metadata declares fixed-arity entry join points, and
+  `jolt.aspects/at` marks one resolved call without adding a runtime wrapper to
+  plain builds. `jolt aspects manifest --check` detects drift between source
+  annotations and the published EDN resource.
+
+### Fixed
+
+- Runtime FASL cache entries are published by atomic rename, so parallel cold
+  builds cannot read a partially written or interleaved cache artifact.
+
 ## [0.8.0] - 2026-08-31
 
 The build keeps one toolchain end to end now. When make provisions the pinned
@@ -130,11 +168,6 @@ layout is now `[:array element-type count]`, which does raise at compile time
 when transposed.
 
 ### Added
-
-- **Maven downloads honor standard HTTPS proxy environment variables.**
-  `https_proxy` / `HTTPS_PROXY` (then `all_proxy` / `ALL_PROXY`) select an HTTP
-  CONNECT proxy, while `no_proxy` / `NO_PROXY` bypass matching hosts. TLS and
-  hostname verification remain end to end against the Maven repository.
 
 - **`jolt.ffi` arenas: a group of allocations with one lifetime (#799).** Every
   foreign allocation used to be released one pointer at a time — `ffi/free` per

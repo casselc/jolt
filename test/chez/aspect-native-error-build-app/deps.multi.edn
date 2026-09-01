@@ -1,0 +1,10 @@
+{:paths ["src" "resources"]
+ :jolt/native
+ [{:name "native-error-helper"
+   :static {:archive "native/libnative-error-helper.a"}}]
+ :jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/native-error.edn"
+    :providers [instrumentation.native-error-provider
+                instrumentation.native-error-audit-provider]}]
+  :aspect-report "target/native-error-aspects.edn"}}

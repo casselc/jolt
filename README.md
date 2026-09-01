@@ -363,6 +363,317 @@ collection counts, reclaimed bytes, and heap size on stderr, marked at the
 native boot loader, the runtime files, each application namespace, and `-main`.
 Normal launches leave it disabled and silent.
 
+### Build-selected instrumentation aspects
+
+`jolt build` can add synchronous instrumentation without changing a library's
+source or dependency graph. A library ships an inert EDN join-point manifest;
+one or more separately selected consumers map its semantic roles to runtime
+advice. Nothing activates merely because it is on the classpath.
+
+```clojure
+;; deps.edn
+{:jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/db.edn"
+    :provider my.otel.db}]
+  :aspect-report "target/db-weave.edn"}}
+```
+
+The resource schema is intentionally narrow in v1:
+
+```clojure
+{:schema 1
+ :library {:id my/db :version "exact-revision"}
+ :aspects
+ [{:id :db/execute
+   :match {:ns my.db.impl :call my.db.driver/execute :arity 2}
+   :advice-role :db/client
+   :expect {:matches 1}}
+  {:id :db/result-callback
+   :match {:entry my.db.impl/consume-result :arity 1}
+   :advice-role :db/result
+   :expect {:matches 1}}]}
+```
+
+Library authors can generate that same ABI from cooperative compiler annotations
+instead of assembling it by hand. Configure the library identity and published
+resource path once:
+
+```clojure
+;; library deps.edn
+{:paths ["src"]
+ :jolt/aspects
+ {:library {:id my/db :version "exact-revision"}
+  :namespaces [my.db.api my.db.impl]
+  :manifest "src/META-INF/jolt/aspects/db.edn"}}
+```
+
+Annotate fixed-arity function entries with ordinary definition metadata. A
+single-arity definition derives its arity; a multi-arity definition requires an
+explicit `:jolt.aspects/arity` selecting exactly one clause:
+
+```clojure
+(defn ^{:jolt.aspects/id :db/result-callback
+        :jolt.aspects/role :db/result}
+  consume-result [result]
+  ...)
+```
+
+Use `jolt.aspects/at` inside a function definition for an individual qualified
+or namespace-aliased call:
+
+```clojure
+(ns my.db.impl
+  (:require [jolt.aspects :as aspects]
+            [my.db.driver :as driver]))
+
+(defn execute [connection query]
+  (aspects/at {:id :db/execute :role :db/client}
+    (driver/execute connection query)))
+```
+
+`at` is a compiler marker, not an instrumentation wrapper. In a plain build it
+evaluates the original call directly and adds no runtime boundary. Generated
+call selectors retain the resolved target plus a marker refinement, so two
+otherwise identical calls in one namespace remain independently selectable.
+
+```bash
+jolt aspects manifest          # write the configured resource
+jolt aspects manifest --check  # fail if compiler annotations and EDN drift
+```
+
+Commit and publish the generated manifest with the library. Applications and
+providers consume it through the ordinary `:jolt/build :aspects` selection
+shown above; source annotations do not create a second provider or weaving
+protocol. External manifests remain the supported path for libraries that do
+not participate.
+
+The selected namespace exposes `aspect-provider` (or `:provider` may name a
+qualified provider var):
+
+```clojure
+(def aspect-provider
+  {:schema 1
+   :libraries {'my/db "exact-revision"}
+   :roles {:db/client 'my.otel.db/around-execute
+           :db/result {:fn 'my.otel.db/around-result
+           :contract :args-v1}}})
+```
+
+Instrumentation packages can publish named, inert preset resources so an
+application does not have to copy the library-resource/provider wiring. A
+preset expands into the same ordinary selections before validation:
+
+```clojure
+;; deps.edn
+{:jolt/build
+ {:aspects
+  [{:preset
+    "META-INF/jolt/instrumentation/http-server/basic.edn"}]}}
+
+;; package resource
+{:schema 1
+ :id :otel.http-server/basic
+ :selections
+ [{:resource "META-INF/jolt/aspects/http-server.edn"
+   :provider
+   otel.instrumentation.http-server/basic-aspect-provider}]}
+```
+
+Preset resources may contain multiple selections but cannot recursively select
+other presets. Their identity and resource name contribute to the artifact
+identity and appear in `jolt aspects plan`; their source bytes do not. The
+instrumented library still owns its provider-neutral join-point manifest, while
+the instrumentation package owns the provider and any basic/detailed/debug
+policy variants.
+
+Use ordered `:providers` when independent consumers need the same semantic
+join points—for example, OpenTelemetry plus a bounded event journal:
+
+```clojure
+{:jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/db.edn"
+    :providers [my.audit.db my.otel.db]}]}}
+```
+
+The legacy `:provider` and `:providers` forms are mutually exclusive. The
+`:providers` vector must be non-empty and may not repeat a provider. Every
+selected provider must support the manifest's exact library revision and
+implement every selected role, so a partially instrumented build cannot
+silently succeed. The first provider is the outermost advice. Replacement
+arguments flow in order to downstream consumers and finally to the application;
+original argument expressions are still evaluated exactly once outside the
+whole chain.
+
+When consumers intentionally cover different parts of one library manifest,
+use the explicit ordered `:consumers` form instead of installing transparent
+placeholder advice:
+
+```clojure
+{:jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/agent.edn"
+    :consumers
+    [{:provider my.event-journal
+      :roles [:agent/model :agent/run :agent/tool :agent/turn]}
+     {:provider my.otel.agent
+      :roles :all}]}]}}
+```
+
+Each consumer entry requires exactly `:provider` and `:roles`. Roles are either
+`:all` or a non-empty vector of unique keywords; vector order is normalized
+because it is a filter, not advice order. A filtered role must exist in the
+manifest, and its provider must implement it at the manifest's exact library
+revision. Manifest roles not selected by any consumer are intentionally not
+woven or match-count validated. Missing selected roles still fail the build;
+the compiler never treats a provider's omissions as an implicit filter.
+`:provider`, `:providers`, and `:consumers` are mutually exclusive, with the
+legacy forms retaining their all-role behavior.
+
+The weave report records the physical join point once and adds its ordered
+`:consumers`, including provider var, advice var, contract, site ordinal,
+selection ordinal, and normalized role filter. The
+legacy top-level `:advice` and `:contract` fields continue to identify the first
+consumer for schema-v1 report readers. Provider order and the source bytes of
+every provider contribute to the artifact identity, as do explicit role
+filters.
+
+At runtime every consumer receives the same physical-site provenance in its
+join-point map: `:site` is the exact site record published in the build report,
+`:site-id` is its deterministic compact identity, and `:build-identity` names the exact
+selected manifest/provider configuration. A site ID reproduces for the same
+build identity and site descriptor; changing the selected instrumentation
+configuration deliberately moves both identities. Checkout-absolute paths are
+excluded. Providers and offline tools can therefore correlate independent
+consumers at one site without reimplementing compiler-private hashing, and
+reject histories recorded by a different woven artifact.
+
+Inspect selection before compiling with `jolt aspects plan`. Its deterministic
+EDN contains the static identity, manifests, matches, and ordered consumers, but
+never source bytes, the configured report path, or checkout-local paths.
+`jolt aspects explain [REPORT]` renders the same selection for humans and, when
+given a report, adds observed sites only after validating its schema, weaver,
+build identity, control mode, aspect set, match counts, and site shapes. An
+explicitly missing or stale report is an error; omitting `REPORT` uses an
+existing configured `:aspect-report` when available and otherwise explains only
+the static plan.
+
+Planning installs dependency source roots so the selected provider vars can be
+resolved, but it does not load the project's declared `:jolt/native` objects.
+Provider namespaces are trusted executable configuration in v1: resolving a
+provider var evaluates that namespace's top-level forms. Keep provider
+namespaces declarative and side-effect-free. A future inert provider artifact
+can remove that remaining resolution-time execution.
+
+An advice function receives `[join-point proceed]`. Jolt preserves argument
+evaluation order, the operation's result, application exception identity, and
+exactly-once execution. Advice that throws, omits `proceed`, invokes it twice,
+or returns a replacement value fails open around the application operation.
+This first layer intentionally has only that result-preserving advice shape;
+argument replacement and outcome-controlling advice are separate extensions.
+
+Providers that need the already-evaluated call arguments can opt into the
+explicit `:args-v1` contract per role:
+
+```clojure
+(def aspect-provider
+  {:schema 1
+   :libraries {'my/db "exact-revision"}
+   :roles {:db/client {:fn 'my.otel.db/around-execute
+                       :contract :args-v1}}})
+
+(defn around-execute [join-point evaluated-args proceed]
+  ;; evaluated-args is a vector in the call's ordinary left-to-right order.
+  (proceed))
+```
+
+The argument vector is observational: advice still cannot replace arguments,
+the application result, or the application exception. A plain qualified symbol
+keeps the original two-argument `:proceed-v1` contract.
+
+For join points such as outbound HTTP calls that must pass a copied argument
+with propagated context, use `:replace-args-v1`. Its three-argument advice may
+call `(proceed)` with the original evaluated arguments or
+`(proceed replacement-vector)` with a vector of exactly the target arity:
+
+```clojure
+(defn around-http [join-point [url request] proceed]
+  (proceed [url (assoc-in request [:headers "traceparent"] "...")]))
+```
+
+Arguments are still evaluated once before advice. A non-vector or wrong-arity
+replacement fails open to the original arguments before the target runs. After
+the target starts, it is never retried: its result or original exception wins,
+including when advice throws or calls `proceed` again.
+
+Tests that deliberately inject failures, suppress work, or replace outcomes may
+use the separate `:control-v1` contract. It is inert unless the application
+explicitly sets `:allow-control-aspects true` in `:jolt/build`; both dependency
+resolution and the compiler boundary reject a selected control consumer without
+that opt-in:
+
+```clojure
+{:jolt/build
+ {:allow-control-aspects true
+  :aspects
+  [{:resource "META-INF/jolt/aspects/http.edn"
+    :consumers [{:provider my.fault-injection.http :roles [:http/client]}]}]}}
+
+(def aspect-provider
+  {:schema 1
+   :libraries {'my/http "exact-revision"}
+   :roles {:http/client {:fn 'my.fault-injection.http/control
+                         :contract :control-v1}}})
+```
+
+Control advice receives `[join-point evaluated-args proceed]`. Its return or
+exception becomes the application's outcome, so omitting `proceed` intentionally
+skips every downstream consumer and the target. `proceed` is an at-most-once,
+dynamic-extent capability owned by the current thread and fiber. It accepts the
+original arguments or one exact-arity replacement vector; escaped, repeated,
+wrong-context, and malformed uses fail closed. This explicit build switch is an
+activation guard, not a security sandbox: only select trusted control providers.
+
+Call matching uses analyzed, resolved vars and entry matching uses qualified
+function definitions—not source lines. Both run before inference, inlining,
+direct linking, and tree shaking. Unsupported keys,
+revision mismatches, missing roles, overlapping selectors, and exact match-count
+drift fail the build. The deterministic report omits absolute checkout paths,
+and the selected manifest/provider material contributes a stable identity to
+the compiled artifact. Jolt validates its exact match counts before native
+compilation and atomically publishes the report only after the output artifact
+succeeds, so a failed rebuild preserves the last valid executable/report pair.
+
+An `:entry` selector names one qualified function definition and one fixed
+arity. It is the stable seam for a higher-order callback whose invocation is
+through a local rather than a resolved var call. Entry advice receives the
+already-bound parameter vector and uses the same contracts and fail-open
+semantics as call advice. The compiler keeps `recur` inside the original
+function operation, so a recur does not create another advice lifecycle;
+ordinary named recursive calls are new function invocations and are advised.
+Variadic entry selectors are not part of v1 and therefore fail exact-match
+validation rather than guessing whether `:arity` means fixed slots or runtime
+arguments.
+
+V1 deliberately covers only synchronous resolved calls and qualified fixed
+function entries. Validation against real libraries established the practical
+boundary:
+
+- ordinary protocol invocations that remain resolved calls work (Duratom load,
+  clear, and close);
+- generated `defrecord` method bodies need a future containing-definition or
+  generated-method selector before their internal calls can be named reliably;
+- higher-order callbacks can select a stable qualified handler definition, but
+  anonymous handlers still need an owned named seam;
+- immediate-mode GUI calls inside a frame loop are technically matchable but
+  are usually the wrong semantic level and can create prohibitive event volume;
+- async completion, host calls, and cross-thread context are also future
+  contracts, not behavior inferred by v1.
+
+These limits are why manifests should name stable semantic operations and pin
+exact revisions, rather than enumerate incidental low-level calls.
+
 Linking a binary needs Chez's kernel development files (`libkernel.a`,
 `scheme.h`) and a C compiler. They come with a from-source Chez install and with
 the prebuilt jolt binary; a distro `chezscheme` package ships only the runtime,

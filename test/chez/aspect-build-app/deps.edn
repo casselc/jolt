@@ -1,0 +1,10 @@
+{:paths ["src" "resources"]
+ :jolt/aspects
+ {:library {:id test/aspect-target :version "fixture-v1"}
+  :namespaces [app.target app.core]
+  :manifest "resources/META-INF/jolt/aspects/probe.edn"}
+ :jolt/build
+ {:aspects
+  [{:resource "META-INF/jolt/aspects/probe.edn"
+    :providers [instrumentation.provider instrumentation.audit-provider]}]
+  :aspect-report "target/aspects.edn"}}

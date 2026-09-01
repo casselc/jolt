@@ -503,6 +503,12 @@
 (define jolt-contagion-prepass!      (var-deref "jolt.backend-scheme" "contagion-prepass!"))
 (define jolt-contagion-prepass-done! (var-deref "jolt.backend-scheme" "contagion-prepass-done!"))
 (define jolt-reset-clone-prepass!    (var-deref "jolt.backend-scheme" "reset-clone-prepass!"))
+(define jolt-aspect-configure!       (var-deref "jolt.aspects" "configure-unit!"))
+(define jolt-aspect-provider-ns      (var-deref "jolt.aspects" "provider-namespaces"))
+(define jolt-aspect-weave            (var-deref "jolt.aspects" "weave"))
+(define jolt-aspect-prepare-report!  (var-deref "jolt.aspects" "prepare-build-report!"))
+(define jolt-aspect-publish-report!  (var-deref "jolt.aspects" "publish-build-report!"))
+(define jolt-aspect-identity         (var-deref "jolt.aspects" "build-identity"))
 
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
@@ -552,8 +558,12 @@
                                               (car nf) "\n")
                                              (current-error-port))
                                     (set! per-ns (cons #f per-ns))))
-                        (let ((n (ei-timed "wp: analyze"
-                                   (lambda () (jolt-ce-analyze (make-analyze-ctx (car nf)) f)))))
+                        (let* ((raw (ei-timed "wp: analyze"
+                                      (lambda () (jolt-ce-analyze (make-analyze-ctx (car nf)) f))))
+                               ;; Weaving belongs before whole-program inference.
+                               ;; The marked root is cached positionally; run-passes
+                               ;; sees :aspect-woven and does not apply it twice.
+                               (n (jolt-aspect-weave (ei-unit) raw)))
                           (set! nodes (cons n nodes))
                           (set! per-ns (cons n per-ns)))))))
               (ei-timed "wp: parse" (lambda () (ei-read-all src))))))
@@ -1209,7 +1219,7 @@
           (for-each (lambda (p) (put-string out (string-append "\n    " (car p) " " (cdr p)))) pairs)
           (put-string out "))\n"))))))
 
-(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? library?)
+(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? library? aspect-config)
   (ei-profile-init!)
   ;; Windows executables carry .exe; normalize here so the append-payload and
   ;; cc paths agree and the shell can run the result. A library keeps its own
@@ -1243,18 +1253,24 @@
     (bld-mkdir-p (string-append out-path ".build"))
     (bld-preload-static-natives! natives (string-append out-path ".build")))
    ;; 1. record app namespaces in dependency order as they finish loading.
-   (let ((app-order '()))
+   (let ((app-order '())
+         (aspect-providers (if (jolt-nil? aspect-config)
+                               '()
+                               (bld-strs (jolt-aspect-provider-ns aspect-config)))))
      (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")
     (parameterize ((ldr-source-only? #t))    ; emit from source, never a compiled artifact
+      ;; Generated advice vars must be part of the same closed world as the app,
+      ;; including when the app source never explicitly requires the provider.
+      (for-each load-namespace aspect-providers)
       (load-namespace entry-ns))
     (set-ns-loaded-hook! (lambda (name file) #f))
     (ei-mark! "load app from source")
     ;; Build ordered ns list from the require graph (static scan of source files)
     ;; merged with the hook's load order. The graph gives post-order deps; the
     ;; hook captures dynamic requires the static scan can't see.
-    (let* ((graph (bld-require-closure (list entry-ns)))
+    (let* ((graph (bld-require-closure (append aspect-providers (list entry-ns))))
            (_prof-graph (ei-mark! "require-graph DFS"))
            (walked (reverse app-order))
            ;; graph without the entry-ns pair (it goes last)
@@ -1333,6 +1349,7 @@
                 ;; The build emits app + core forms that reference clojure.core, which
                 ;; must lower to var-deref, so prelude mode is on for the whole build.
                 (ei-fresh-unit!)
+                (jolt-aspect-configure! (ei-unit) aspect-config)
                 ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
                 ;; The passes run for every mode but dev. "release" and
                 ;; "optimized" differ only in the Chez compile parameters
@@ -1486,7 +1503,13 @@
         (when drop-compiler? (display "jolt build: dropping compiler image (no runtime eval)\n"))
       (ei-mark! "emit app namespaces")
       (ei-acc-report!)
-      (let* ((builddir (string-append out-path ".build"))
+      (let* (;; Exact cardinality is a build invariant, not a warning. Validate
+             ;; it before compiling or replacing the output artifact, but keep
+             ;; the report in memory until that artifact succeeds.
+             (aspect-report (if (jolt-nil? aspect-config)
+                                jolt-nil
+                                (jolt-aspect-prepare-report! (ei-unit) aspect-config)))
+             (builddir (string-append out-path ".build"))
              (flat-ss  (string-append builddir "/flat.ss"))
              (flat-so  (string-append builddir "/flat.so"))
              (rt-ss    (string-append builddir "/runtime.ss"))
@@ -1520,6 +1543,13 @@
           (if split?
               (put-string out ";; app half — the runtime half is compiled separately (runtime.ss)\n")
               (bld-emit-runtime out drop-compiler? core-strs))
+          (unless (jolt-nil? aspect-config)
+            ;; Make plain and instrumented artifacts distinct even if a future
+            ;; optimizer happens to erase all observable advice machinery.
+            (put-string out (string-append
+                              "(define jolt-aspect-build-identity "
+                              (ei-str-lit (jolt-str-render-one (jolt-aspect-identity aspect-config)))
+                              ")\n")))
           ;; Load native libs, bake embedded resources, and point source roots at
           ;; the build-time app roots — all BEFORE the app forms. The app's
           ;; top-level forms run at binary startup (Sbuild_heap), and they include
@@ -1679,7 +1709,12 @@
           (else
            (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c
                           (bld-native-link-flags natives)
-                          (and drop-compiler? (not bld-nt?)))))))))))
+                          (and drop-compiler? (not bld-nt?)))))
+        ;; All build paths above return only after the output artifact has been
+        ;; written successfully. `spit` itself is atomic, so readers observe the
+        ;; previous complete report or this complete report, never a partial one.
+        (unless (jolt-nil? aspect-config)
+          (jolt-aspect-publish-report! aspect-config aspect-report))))))))
 
 ;; --- self-contained link (in-process compile + append the boot to the stub) ---
 ;; compile-file runs against the DEFAULT interaction environment, so the boot's
@@ -1862,13 +1897,73 @@
       (put-bytevector out bs)
       (close-port out))))
 
+;; A cache hit is advisory. Pruning or another process may retire the entry
+;; between the existence check and the open; fall back to compiling instead of
+;; turning that ordinary cache race into a failed build.
+(define (bld-runtime-cache-hit! cache so)
+  (guard (e (#t #f))
+    (and (file-exists? cache)
+         (begin (bld-copy-file! cache so) #t))))
+
+;; Deterministic test seam for the publication invariant. A writer with this
+;; variable pauses only AFTER its private temp is complete and BEFORE the final
+;; cache path exists. The smoke starts a second build in that interval. Keeping
+;; the seam at the ownership boundary makes the test independent of compiler
+;; timing and file size.
+(define (bld-runtime-cache-test-before-publish!)
+  (let ((barrier (getenv "JOLT_TEST_RUNTIME_CACHE_PUBLISH_BARRIER")))
+    (when (and (string? barrier) (fx>? (string-length barrier) 0))
+      (let ((ready (string-append barrier ".ready"))
+            (go (string-append barrier ".go")))
+        (let ((out (open-output-file ready 'replace)))
+          (put-string out "ready\n")
+          (close-output-port out))
+        (let loop ()
+          (unless (file-exists? go)
+            (sleep (make-time 'time-duration 10000000 0)) ; 10ms
+            (loop)))))))
+
+;; Publish a complete cache entry in one namespace operation. Directly copying
+;; to `cache` let another process's file-exists? + read observe a truncated FASL;
+;; two cold writers could also interleave distinct valid Chez encodings of the
+;; same source. A same-directory temp plus rename makes the final path
+;; complete-or-absent. If a concurrent complete winner is already visible, keep
+;; it and discard our temp. On POSIX two simultaneous absent-path renames may
+;; still replace one complete winner with another complete winner, which is
+;; safe; platforms that refuse replacement take the guarded winner path.
+(define (bld-runtime-cache-publish! so cache)
+  (let ((tmp (string-append cache ".tmp-" (number->string (get-process-id)))))
+    (guard (e (#t
+               ;; Cleanup is best-effort too. In particular, Windows may deny
+               ;; deletion while an antivirus or failed copy still holds the
+               ;; file; that must not turn an optional cache into a build error.
+               (guard (cleanup-e (#t #f))
+                 (when (file-exists? tmp) (delete-file tmp)))
+               #f))                 ; an unwritable cache must not fail the build
+      (bld-mkdir-p (bld-runtime-cache-dir))
+      (bld-copy-file! so tmp)
+      (bld-runtime-cache-test-before-publish!)
+      (if (file-exists? cache)
+          (delete-file tmp)
+          (guard (e (#t
+                     ;; A Windows rename may refuse to replace the winner that
+                     ;; appeared after our check. That is success, not damage.
+                     (if (file-exists? cache)
+                         (begin
+                           (guard (cleanup-e (#t #f))
+                             (when (file-exists? tmp) (delete-file tmp)))
+                           #t)
+                         (raise e))))
+            (rename-file tmp cache)))
+      (bld-prune-runtime-cache!)
+      #t)))
+
 ;; Compile the runtime half, reusing a cached fasl when one matches.
 (define (bld-compile-runtime! mode src so)
   (let* ((body (read-file-string src))
          (cache (and (bld-runtime-cache-enabled?) (bld-runtime-cache-path body mode))))
-    (if (and cache (file-exists? cache))
+    (if (and cache (bld-runtime-cache-hit! cache so))
         (begin
-          (bld-copy-file! cache so)
           (ei-mark! "runtime fasl (cached)"))
         (begin
           (bld-prepend-prologue! src)
@@ -1876,10 +1971,7 @@
           (bld-chez-compile-file mode src so)
           (ei-mark! "compile runtime half")
           (when cache
-            (guard (e (#t #f))          ; an unwritable cache must not fail the build
-              (bld-mkdir-p (bld-runtime-cache-dir))
-              (bld-copy-file! so cache)
-              (bld-prune-runtime-cache!)))))))
+            (bld-runtime-cache-publish! so cache))))))
 
 ;; units: a list of (src so kind) compiled in order and loaded into the boot in
 ;; that order, so the runtime half's defines precede the app half's reads.
@@ -2104,7 +2196,10 @@
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
-                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #f))
+                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #f
+                    (if (or (null? opt) (null? (cdr opt)) (null? (cddr opt)))
+                        jolt-nil
+                        (caddr opt))))
     jolt-nil))
 (def-var! "jolt.host" "build-library"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
@@ -2112,5 +2207,8 @@
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
-                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t))
+                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t
+                    (if (or (null? opt) (null? (cdr opt)) (null? (cddr opt)))
+                        jolt-nil
+                        (caddr opt))))
     jolt-nil))
