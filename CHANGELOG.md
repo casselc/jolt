@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The timeout hot-path scaling gate no longer depends on the millisecond clock
+  floor.** It now measures a larger workload with monotonic nanoseconds and
+  verifies that the same gate rejects the former quadratic sorted-list insertion
+  shape.
+
 - Runtime FASL cache entries are published by atomic rename, so parallel cold
   builds cannot read a partially written or interleaved cache artifact.
 

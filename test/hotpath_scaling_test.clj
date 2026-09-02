@@ -2,8 +2,8 @@
 ;; StringTokenizer, ns-publics/refer, and set/intersection must not scale
 ;; worse than linearly (or must be independent of a dimension they used to
 ;; scale with). One file, one boot: each section is the same in-process
-;; judgment as read_scaling_test.clj — best-of-3, only ratios, sized so a
-;; REGRESSED implementation still finishes and fails rather than hanging.
+;; judgment as read_scaling_test.clj — ratio-based, sized so a REGRESSED
+;; implementation still finishes and fails rather than hanging.
 ;;
 ;; What each section pins (all were real, found in the 2026-08 structural
 ;; sweep):
@@ -30,6 +30,11 @@
         v (f)]
     [(- (System/currentTimeMillis) t) v]))
 
+(defn- timed-ns [f]
+  (let [t (System/nanoTime)
+        v (f)]
+    [(- (System/nanoTime) t) v]))
+
 (defn- best-of [k f]
   (reduce min (map first (repeatedly k #(timed f)))))
 
@@ -44,6 +49,14 @@
       (println (str "FAIL hotpath " label ": " detail))
       (swap! failures inc))))
 
+(defn- judge-ns [label t1 t4 ceiling detail]
+  (let [ratio (double (/ t4 t1))]
+    (println (format "hotpath %-9s %8.3fms vs %8.3fms, ratio %6.2f (ceiling %.1f)"
+                     label (/ t1 1e6) (/ t4 1e6) ratio (double ceiling)))
+    (when (> ratio ceiling)
+      (println (str "FAIL hotpath " label ": " detail))
+      (swap! failures inc))))
+
 ;; --- split with a positive limit ---------------------------------------------
 (defn- split-drain [n]
   (let [s (str/join "," (range n))]
@@ -53,6 +66,25 @@
 (defn- arm-timeouts [k base-ms]
   (dotimes [i k] (async/timeout (+ base-ms i)))
   k)
+
+;; Negative control for the implementation this gate guards against. The old
+;; timeout queue was a sorted mutable list. A burst of increasing deadlines
+;; scanned every existing entry before appending the next one, so the total
+;; work was 0 + 1 + ... + (k-1). An object array keeps this witness bounded and
+;; isolates the relevant operation — linear scan followed by constant-time
+;; append — from LinkedList iterator overhead.
+(defn- linear-scan-insert-burst [k]
+  (let [pending (object-array k)]
+    (loop [i 0 seen 0]
+      (if (= i k)
+        seen
+        (let [seen' (loop [j 0 seen seen]
+                      (if (= j i)
+                        seen
+                        (recur (inc j)
+                               (if (nil? (aget pending j)) seen (inc seen)))))]
+          (aset pending i i)
+          (recur (inc i) seen'))))))
 
 ;; --- deque drain -------------------------------------------------------------
 (defn- deque-drain [n]
@@ -90,15 +122,32 @@
     (judge "tokenizer" (best-of 3 #(dotimes [_ 4] (tok-drain n1))) (best-of 3 #(dotimes [_ 4] (tok-drain (* 4 n1)))) 8.0
            "StringTokenizer is scanning its token list per token again (host-static-classes.ss)"))
 
-  ;; timeout arming: single measurement per size (arming is not idempotent —
-  ;; a second best-of run would arm into a heap pre-loaded by the first, which
-  ;; is fine for a heap but distorts the pre/post comparison), far-future
-  ;; deadlines so nothing fires mid-measure.
-  (let [k 2000
-        [t1 _] (timed #(arm-timeouts k 3600000))
-        [t4 _] (timed #(arm-timeouts (* 4 k) 7200000))]
-    (judge "timeout" t1 t4 8.0
-           "timeout-insert! is walking the pending list per arm again (async.ss)"))
+  ;; Timeout arming is not idempotent: a best-of retry would measure a heap
+  ;; pre-loaded by the prior sample. Use one measurement per size, far-future
+  ;; deadlines so nothing fires mid-measure, and enough work to clear the old
+  ;; millisecond clock floor. Keep raw monotonic nanoseconds through the ratio;
+  ;; the former 1ms clamp made 1ms vs 18ms and 3ms vs 10ms alternate between
+  ;; failure and success for the same binary.
+  (let [k 8000
+        [t1 _] (timed-ns #(arm-timeouts k 3600000))
+        [t4 _] (timed-ns #(arm-timeouts (* 4 k) 7200000))]
+    (judge-ns "timeout" t1 t4 8.0
+              "timeout-insert! is walking the pending list per arm again (async.ss)"))
+
+  ;; Prove that the selected sizes and ceiling still reject the old algorithmic
+  ;; shape. This is deliberately separate from the live global timeout heap.
+  (linear-scan-insert-burst 100)
+  (let [k 1000
+        [t1 c1] (timed-ns #(linear-scan-insert-burst k))
+        [t4 c4] (timed-ns #(linear-scan-insert-burst (* 4 k)))
+        ratio (double (/ t4 t1))]
+    (println (format "control timeout-list %8.3fms vs %8.3fms, ratio %6.2f (floor 8.0)"
+                     (/ t1 1e6) (/ t4 1e6) ratio))
+    (when-not (and (= c1 (/ (* k (dec k)) 2))
+                   (= c4 (/ (* 4 k (dec (* 4 k))) 2))
+                   (> ratio 8.0))
+      (println "FAIL hotpath timeout-list control: gate no longer distinguishes the former quadratic insertion path")
+      (swap! failures inc)))
 
   ;; ns-publics shape independence: a tiny namespace's ns-publics must not get
   ;; slower because unrelated vars exist. R repetitions beat the clock floor.
