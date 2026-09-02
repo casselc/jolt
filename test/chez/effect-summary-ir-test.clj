@@ -91,6 +91,28 @@
              (get-in s [:direct :effects])))
       (is (false? (get-in s [:closure :unknown?]))))))
 
+(deftest preferred-ffi-varargs-marker-does-not-inflate-callable-arity
+  (let [u (unit)
+        binding (ir/def-node
+                  "app" "c-fcntl"
+                  {:op :ffi-fn
+                   :csym "fcntl"
+                   :argtypes ["int" "int" "&" "int"]
+                   :rettype "int"
+                   :blocking false})
+        caller (fixed-def "app/run" 0
+                          (call "app/c-fcntl"
+                                [(ir/const 1) (ir/const 2) (ir/const 3)]))]
+    (effects/record-phase! u :plain binding)
+    (effects/record-phase! u :plain caller)
+    (let [report (effects/finalize-phase! u :plain)
+          binding-summary (summary report "app/c-fcntl")
+          caller-summary (summary report "app/run")]
+      (is (= {:fixed 3} (get-in binding-summary [:subject :arity])))
+      (is (= #{:jolt.effect/native-call}
+             (get-in caller-summary [:closure :effects])))
+      (is (false? (get-in caller-summary [:closure :unknown?]))))))
+
 (deftest direct-typed-ffi-invocation-retains-argument-effects
   (let [u (unit)
         ffi {:op :ffi-fn :csym "work" :argtypes ["int"]
