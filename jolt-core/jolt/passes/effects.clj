@@ -152,10 +152,10 @@
    :opaque-calls []})
 
 (defn- ffi-arity-shape [ffi-node]
-  ;; :varargs is an ABI boundary marker, not an argument supplied by the Jolt
-  ;; caller.  A foreign-fn binding still has the one concrete arity described by
-  ;; the remaining signature entries.
-  {:fixed (count (remove #(= "varargs" %) (get ffi-node :argtypes)))})
+  ;; :& and the legacy :varargs spelling are ABI boundary markers, not
+  ;; arguments supplied by the Jolt caller.  Mirror the backend's accepted
+  ;; spellings so evidence lookup uses the binding's actual callable arity.
+  {:fixed (count (remove #{"&" "varargs"} (get ffi-node :argtypes)))})
 
 (defn- summarize-invoke [node]
   (let [target (get node :fn)
