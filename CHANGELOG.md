@@ -195,6 +195,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The timeout hot-path scaling gate no longer depends on the millisecond clock
+  floor.** It now measures a larger workload with monotonic nanoseconds and
+  verifies that the same gate rejects the former quadratic sorted-list insertion
+  shape.
+
 - **`Executors/newCachedThreadPool` grows on demand (#819).** It was a fixed pool
   of 32 workers. A burst of more than 32 concurrent tasks queued behind the ones
   already running — invisible while tasks are short, and a deadlock when they are
