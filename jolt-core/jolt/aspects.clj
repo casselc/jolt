@@ -616,8 +616,8 @@
 
 (defn- site-identity [build-identity site]
   (stable-identity
-    (canonical-str {:build-identity build-identity
-                    :site site})))
+    (canonical/canonical-str {:build-identity build-identity
+                              :site site})))
 
 (defn- validate-observed-site [plan aspect site]
   (when-not (map? site)
