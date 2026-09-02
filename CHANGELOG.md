@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Runtime FASL cache entries are published by atomic rename, so parallel cold
   builds cannot read a partially written or interleaved cache artifact. Writers
-  create private files exclusively, and pruning retires abandoned publication
-  files after a conservative grace period.
+  create private files exclusively, and cold cache publication attempts prune
+  abandoned publication files after a conservative grace period.
 
 ## [0.8.1] - 2026-09-02
 
