@@ -41,6 +41,9 @@ and on a stale entry.
 - [test/conformance/known-divergences.edn](test/conformance/known-divergences.edn):
   every tracked jolt-vs-JVM divergence, with a `:legend` explaining each category.
 - [CHANGELOG.md](CHANGELOG.md): release history.
+- [docs/aspect-compiler-integration.md](docs/aspect-compiler-integration.md):
+  fork-only canonical aspect branch, provenance, upstream synchronization, and
+  cleanup rules.
 
 ## Repository layout
 
@@ -86,10 +89,10 @@ and on a stale entry.
   source; `make gambitgencheck` gates the drift.
 - **A new `jolt.host` `def-var!` needs a `jolt-host-manifest.txt` line.** Run
   `make manifestcheck` after touching that seam.
-- **Documentation does not live in this repo.** Only `README.md`,
-  `CONTRIBUTING.md`, `CHANGELOG.md`, and this file. User-facing pages go to the
-  site repo (`jolt-lang/jolt-lang.github.io`, `resources/md/` plus a row in
-  `resources/docpages.edn`).
+- **User-facing documentation does not live in this repo.** General Jolt pages
+  go to the site repo (`jolt-lang/jolt-lang.github.io`, `resources/md/` plus a
+  row in `resources/docpages.edn`). Fork-maintainer policy for the aspect
+  compiler is the narrow exception under `docs/` here.
 
 ## Optional
 
