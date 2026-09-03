@@ -165,7 +165,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   protoret pic narrow directlink directcall arraymap unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke aspectintegrationcheck \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
@@ -959,6 +959,9 @@ makefilesmoke:
 # dev-g<sha>, which no :jolt/min-version floor can misread as a version.
 versionsmoke:
 	@bash test/version-smoke.sh
+
+aspectintegrationcheck:
+	@bash test/aspect-integration-provenance-smoke.sh
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
 certify:

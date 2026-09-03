@@ -1,0 +1,29 @@
+name: aspect integration provenance
+
+on:
+  push:
+    branches: [integration/aspects]
+  pull_request:
+    branches: [integration/aspects]
+
+permissions:
+  contents: read
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ASPECT_INTEGRATION_REQUIRE: "1"
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_ASKPASS: ""
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify recorded ancestry and trees
+        run: bash test/aspect-integration-provenance-smoke.sh
+
+      - name: Verify live upstream release identity
+        run: bash test/aspect-integration-provenance-smoke.sh --check-upstream

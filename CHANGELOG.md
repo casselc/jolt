@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plain builds. `jolt aspects manifest --check` detects drift between source
   annotations and the published EDN resource.
 
+### Changed
+
+- The maintained aspect compiler now has a documented canonical integration
+  branch, a machine-readable upstream provenance lock, and offline plus live
+  release-identity verification in CI.
+
 ### Fixed
 
 - **The timeout hot-path scaling gate no longer depends on the millisecond clock
