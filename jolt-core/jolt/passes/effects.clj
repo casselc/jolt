@@ -391,45 +391,67 @@
   (reset! (:effect-reports unit) {})
   unit)
 
-(defn- matching-subject [summaries call]
+(defn- subject-index [summaries]
+  (reduce-kv
+    (fn [index subject-key summary]
+      (let [subject (get summary :subject)
+            arity (get subject :arity)]
+        (if (and (= :var-arity (get subject :kind))
+                 (get summary :closed-world?))
+          (cond
+            (some? (get arity :fixed))
+            (update-in index [:fixed [(get subject :fqn) (get arity :fixed)]]
+                       (fnil conj []) subject-key)
+
+            (some? (get arity :variadic-min))
+            (update-in index [:variadic (get subject :fqn)]
+                       (fnil conj []) [(get arity :variadic-min) subject-key])
+
+            :else index)
+          index)))
+    {:fixed {} :variadic {}}
+    summaries))
+
+(defn- matching-subject-key [index call]
   (let [f (get call :fqn)
         argc (get call :argc)
-        candidates (filter (fn [s]
-                             (and (= :var-arity (get-in s [:subject :kind]))
-                                  (get s :closed-world?)
-                                  (= f (get-in s [:subject :fqn]))))
-                           (vals summaries))
-        fixed (filterv #(= argc (get-in % [:subject :arity :fixed])) candidates)
-        variadic (filterv (fn [s]
-                            (let [n (get-in s [:subject :arity :variadic-min])]
-                              (and n (>= argc n))))
-                          candidates)
+        fixed (get-in index [:fixed [f argc]] [])
+        variadic (keep (fn [[minimum subject-key]]
+                         (when (>= argc minimum) subject-key))
+                       (get-in index [:variadic f] []))
         matches (if (seq fixed) fixed variadic)]
     ;; Multiple closed-world definitions for one callable shape are not a
     ;; closed world. Fail conservatively instead of selecting map iteration
     ;; order and attributing another definition's behavior to the call.
     (when (= 1 (count matches)) (first matches))))
 
-(defn- declared-effect [declarations call]
+(defn- declaration-index [declarations]
+  (let [unsorted
+        (reduce-kv
+          (fn [index key declaration]
+            (let [shape (when (vector? key) (nth key 1 nil))
+                  minimum (when (map? shape) (get shape :variadic-min))]
+              (if (integer? minimum)
+                (update index (nth key 0) (fnil conj []) [minimum declaration])
+                index)))
+          {}
+          declarations)]
+    (reduce-kv (fn [index name entries]
+                 (assoc index name (vec (sort-by first > entries))))
+               {}
+               unsorted)))
+
+(defn- declared-effect [declarations variadic-index call]
   (let [name (get call :fqn)
         argc (get call :argc)
         exact (get declarations [name {:fixed argc}])
-        variadic
-        (->> declarations
-             (keep (fn [[key declaration]]
-                     (when (and (vector? key)
-                                (= name (nth key 0 nil))
-                                (map? (nth key 1 nil))
-                                (integer? (get (nth key 1) :variadic-min))
-                                (>= argc (get (nth key 1) :variadic-min)))
-                       [(get (nth key 1) :variadic-min) declaration])))
-             (sort-by first >)
-             first
-             second)]
+        variadic (some (fn [[minimum declaration]]
+                         (when (>= argc minimum) declaration))
+                       (get variadic-index name))]
     (or exact variadic (get declarations name))))
 
-(defn- declared-summary [declarations call]
-  (when-let [d (declared-effect declarations call)]
+(defn- declared-summary [declarations variadic-index call]
+  (when-let [d (declared-effect declarations variadic-index call)]
     {:closure {:effects (get d :effects #{})
                :aspect-sites #{}
                :unresolved #{}
@@ -439,7 +461,7 @@
 (defn- unresolved-witness [call]
   {:kind :unresolved-var :fqn (get call :fqn) :argc (get call :argc)})
 
-(defn- close-one [summaries declarations summary]
+(defn- close-one [summaries subjects declarations variadic-declarations summary]
   (let [start {:effects (get summary :effects #{})
                :aspect-sites (get summary :aspect-sites #{})
                :unresolved #{}
@@ -449,8 +471,10 @@
                                (seq (get summary :opaque-calls))))}]
     (reduce
       (fn [acc call]
-        (let [target (matching-subject summaries call)
-              external (when-not target (declared-summary declarations call))
+        (let [target-key (matching-subject-key subjects call)
+              target (when target-key (get summaries target-key))
+              external (when-not target
+                         (declared-summary declarations variadic-declarations call))
               closure (cond target (get target :closure)
                             external (get external :closure)
                             :else {:effects #{} :aspect-sites #{}
@@ -498,11 +522,14 @@
                                                             (or (not (get summary :closed-world?))
                                                                 (seq (get summary :opaque-calls))))})))
                            {} roots)
+        subjects (subject-index initial)
+        variadic-declarations (declaration-index declarations)
         cap (+ 1 (count roots))]
     (loop [i 0 summaries initial]
       (let [next (reduce-kv (fn [m k summary]
                               (assoc m k (assoc summary :closure
-                                                (close-one summaries declarations summary))))
+                                                (close-one summaries subjects declarations
+                                                           variadic-declarations summary))))
                             {} summaries)]
         (doseq [[k before] summaries]
           (when-not (closure-grows? (get before :closure)

@@ -148,6 +148,19 @@
       (is (= #{:effect/fallback}
              (get-in (summary report "app/fallback") [:closure :effects]))))))
 
+(deftest external-declarations-prefer-the-most-specific-variadic-minimum
+  (let [u (unit)
+        node (fixed-def "app/run" 0
+                        (call "runtime/op"
+                              [(ir/const 1) (ir/const 2) (ir/const 3)]))]
+    (effects/configure-declarations!
+      u {["runtime/op" {:variadic-min 1}] {:effects #{:effect/general}}
+         ["runtime/op" {:variadic-min 3}] {:effects #{:effect/specific}}})
+    (effects/record-phase! u :plain node)
+    (is (= #{:effect/specific}
+           (get-in (summary (effects/finalize-phase! u :plain) "app/run")
+                   [:closure :effects])))))
+
 (deftest malformed-effect-declarations-fail-before-analysis
   (doseq [declarations
           [{["runtime/op" {:fixed -1}] {:effects #{:effect/bad}}}
@@ -291,6 +304,20 @@
            (get-in (summary (effects/finalize-phase! u :plain) "app/root")
                    [:closure :effects])))))
 
+(deftest fixed-target-wins-over-an-eligible-variadic-target
+  (let [u (unit)
+        root (fixed-def "app/root" 0 (call "app/dispatch" [(ir/const 1)]))
+        fixed (fixed-def "app/dispatch" 1 (call "runtime/fixed" []))
+        variadic (variadic-def "app/dispatch" 1 (call "runtime/variadic" []))]
+    (effects/configure-declarations!
+      u {"runtime/fixed" {:effects #{:effect/fixed}}
+         "runtime/variadic" {:effects #{:effect/variadic}}})
+    (doseq [node [root fixed variadic]]
+      (effects/record-phase! u :plain node))
+    (is (= #{:effect/fixed}
+           (get-in (summary (effects/finalize-phase! u :plain) "app/root")
+                   [:closure :effects])))))
+
 (deftest unresolved-and-redefinable-targets-remain-unknown
   (testing "missing direct target"
     (let [u (unit)]
@@ -370,6 +397,24 @@
       u {"runtime/first" {:effects #{:effect/first}}
          "runtime/second" {:effects #{:effect/second}}})
     (doseq [node [root first-def second-def]]
+      (effects/record-phase! u :plain node))
+    (let [closure (get-in (summary (effects/finalize-phase! u :plain) "app/root")
+                          [:closure])]
+      (is (true? (:unknown? closure)))
+      (is (empty? (:effects closure))))))
+
+(deftest ambiguous-variadic-definitions-remain-unknown
+  (let [u (unit)
+        root (fixed-def "app/root" 0
+                        (call "app/dup" [(ir/const 1) (ir/const 2)]))
+        one (assoc (variadic-def "app/dup" 1 (call "runtime/one" []))
+                   :pos {:file "/a/dup.clj" :line 1 :column 1})
+        two (assoc (variadic-def "app/dup" 2 (call "runtime/two" []))
+                   :pos {:file "/b/dup.clj" :line 1 :column 1})]
+    (effects/configure-declarations!
+      u {"runtime/one" {:effects #{:effect/one}}
+         "runtime/two" {:effects #{:effect/two}}})
+    (doseq [node [root one two]]
       (effects/record-phase! u :plain node))
     (let [closure (get-in (summary (effects/finalize-phase! u :plain) "app/root")
                           [:closure])]
@@ -463,6 +508,35 @@
       (is (= #{:jolt.effect/user-dispatch}
              (get-in (summary report "app/a") [:closure :effects])))
       (is (false? (get-in (summary report "app/a") [:closure :unknown?]))))))
+
+(deftest wide-call-graph-closes-without-whole-unit-edge-scans
+  ;; A resolver that scans every subject for every edge is quadratic even when
+  ;; the graph is shallow. Keep many independent two-hop paths here so the
+  ;; lookup regression is visible without making the indexed fixpoint deep.
+  (let [u (unit)
+        width 768
+        target-name #(str "app/target-" %)
+        caller-name #(str "app/caller-" %)
+        targets (mapv (fn [i]
+                        (fixed-def (target-name i) 0
+                                   (call "runtime/terminal" [])))
+                      (range width))
+        callers (mapv (fn [i]
+                        (fixed-def (caller-name i) 0
+                                   (call (target-name i) [])))
+                      (range width))]
+    (effects/configure-declarations!
+      u {"runtime/terminal" {:effects #{:effect/terminal}}})
+    (doseq [node (into callers targets)]
+      (effects/record-phase! u :plain node))
+    (let [started (System/currentTimeMillis)
+          report (effects/finalize-phase! u :plain)
+          elapsed (- (System/currentTimeMillis) started)]
+      (is (= #{:effect/terminal}
+             (get-in (summary report (caller-name (dec width)))
+                     [:closure :effects])))
+      (is (< elapsed 5000)
+          (str "1,536-subject effect closure took " elapsed "ms")))))
 
 (deftest opaque-witnesses-propagate-through-callers
   (let [u (unit)
