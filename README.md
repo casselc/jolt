@@ -359,6 +359,12 @@ Normal launches leave it disabled and silent.
 
 ### Build-selected instrumentation aspects
 
+Fork maintainers coordinate this compiler surface on the canonical
+`casselc/jolt:integration/aspects` branch. It is the only aspect integration
+branch permitted to advance. See the
+[integration-line policy](docs/aspect-compiler-integration.md) for provenance,
+upstream synchronization, review, and consumer-pin rules.
+
 `jolt build` can add synchronous instrumentation without changing a library's
 source or dependency graph. A library ships an inert EDN join-point manifest;
 one or more separately selected consumers map its semantic roles to runtime

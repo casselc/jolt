@@ -1,0 +1,12 @@
+# The canonical line descends from the formerly published v0.8.1 history.
+# Upstream later moved the tag to upstream_release_commit without changing
+# upstream_tree.
+schema=1
+canonical_branch=integration/aspects
+upstream_repository=https://github.com/jolt-lang/jolt.git
+upstream_release=v0.8.1
+upstream_base_commit=9b7683953b444ece2a2e783e8fa46d31177bb476
+upstream_release_commit=51f10a0239096f804a6017f850b7b235ebe40168
+upstream_tree=1179a2730c7098b1cc65ec6becdc36309d87d55e
+aspect_root_commit=b89f801aed85d572225474504011a340d0e39a2b
+verified_ancestor=88821cf18b32a11b9b9c934b909ff187bf56e043
