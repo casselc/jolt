@@ -29,6 +29,17 @@ proves that the live upstream release tag still resolves to the recorded commit
 and tree. A tag move therefore fails visibly even when its files happen to be
 unchanged.
 
+`tools/version.sh` also consumes the lock when `HEAD` descends from the recorded
+aspect root. It reports the locked upstream release plus the commit distance
+and current SHA, producing the same identity that restoring the historical tag
+would produce without moving any local ref. This keeps local builds,
+`jolt --version`, dependency minimum-version checks, and hosted builds aligned
+even after an upstream tag rewrite. Revisions outside the aspect lineage retain
+the ordinary nearest-release-tag behavior. A shallow checkout which cannot
+resolve the recorded aspect root also falls back to that generic behavior; the
+dedicated canonical workflow remains full-history and fails closed through the
+provenance verifier.
+
 `ASPECT_INTEGRATION_REVISION` selects the commit to check and defaults to
 `HEAD`. `ASPECT_INTEGRATION_REQUIRE` defaults to `0`, which lets repository-wide
 CI skip a revision outside the aspect lineage; the dedicated canonical workflow

@@ -58,7 +58,78 @@ mkdir -p "$tmp/plain"
 got="$("$script" "$tmp/plain")"
 [ "$got" = "dev" ] || fail "outside git: got '$got', want 'dev'"
 
-# (f) every consumer goes through the script; none re-derives it inline
+# (f) the aspect line names itself from its provenance lock when a rewritten
+#     upstream release tag is not reachable from the preserved history.
+aspect_repo="$tmp/aspect-repo"
+mkdir -p "$aspect_repo"
+ag() { git -C "$aspect_repo" -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@"; }
+ag init -q
+echo foundation > "$aspect_repo/f"
+ag add f
+ag commit -q -m foundation
+aspect_grandparent="$(ag rev-parse HEAD)"
+echo base > "$aspect_repo/f"
+ag commit -q -am base
+aspect_base="$(ag rev-parse HEAD)"
+ag tag v0.7.0
+echo aspect > "$aspect_repo/f"
+ag commit -q -am aspect-root
+aspect_root="$(ag rev-parse HEAD)"
+mkdir -p "$aspect_repo/config"
+cat > "$aspect_repo/config/aspect-integration.lock" <<EOF
+schema=1
+upstream_release=v0.8.1
+upstream_base_commit=$aspect_base
+aspect_root_commit=$aspect_root
+EOF
+ag add config/aspect-integration.lock
+ag commit -q -m lock
+cp "$aspect_repo/config/aspect-integration.lock" "$tmp/valid-aspect.lock"
+aspect_sha="$(ag rev-parse --short HEAD)"
+got="$("$script" "$aspect_repo")"
+[ "$got" = "v0.8.1-2-g$aspect_sha" ] ||
+  fail "locked aspect line: got '$got', want 'v0.8.1-2-g$aspect_sha'"
+echo dirty >> "$aspect_repo/f"
+got="$("$script" "$aspect_repo")"
+[ "$got" = "v0.8.1-2-g$aspect_sha-dirty" ] ||
+  fail "dirty locked aspect line: got '$got', want 'v0.8.1-2-g$aspect_sha-dirty'"
+ag checkout -q -- f
+echo schema=1 >> "$aspect_repo/config/aspect-integration.lock"
+if "$script" "$aspect_repo" >"$tmp/duplicate.out" 2>"$tmp/duplicate.err"; then
+  fail "duplicate aspect lock key unexpectedly succeeded"
+fi
+grep -q 'invalid aspect integration lock key: schema' "$tmp/duplicate.err" ||
+  fail "duplicate aspect lock key did not fail at the named key"
+ag checkout -q -- config/aspect-integration.lock
+sed -i "s/^upstream_base_commit=.*/upstream_base_commit=$aspect_grandparent/" \
+  "$aspect_repo/config/aspect-integration.lock"
+if "$script" "$aspect_repo" >"$tmp/parent.out" 2>"$tmp/parent.err"; then
+  fail "non-parent aspect base unexpectedly succeeded"
+fi
+grep -q 'locked upstream base is not the aspect root parent' "$tmp/parent.err" ||
+  fail "non-parent aspect base did not fail at the exact-parent check"
+ag checkout -q -- config/aspect-integration.lock
+
+# A checkout with the lock but outside the recorded lineage, including one
+# whose historical root object is unavailable, retains generic tag behavior.
+ag checkout -q -b outside "$aspect_base"
+mkdir -p "$aspect_repo/config"
+cp "$tmp/valid-aspect.lock" "$aspect_repo/config/aspect-integration.lock"
+ag add config/aspect-integration.lock
+ag commit -q -m outside-lock
+outside_sha="$(ag rev-parse --short HEAD)"
+got="$("$script" "$aspect_repo")"
+[ "$got" = "v0.7.0-1-g$outside_sha" ] ||
+  fail "off-lineage lock: got '$got', want 'v0.7.0-1-g$outside_sha'"
+sed -i 's/^aspect_root_commit=.*/aspect_root_commit=0000000000000000000000000000000000000000/' \
+  "$aspect_repo/config/aspect-integration.lock"
+ag commit -q -am missing-root
+missing_sha="$(ag rev-parse --short HEAD)"
+got="$("$script" "$aspect_repo")"
+[ "$got" = "v0.7.0-2-g$missing_sha" ] ||
+  fail "missing-root lock: got '$got', want 'v0.7.0-2-g$missing_sha'"
+
+# (g) every consumer goes through the script; none re-derives it inline
 for f in bin/jolt host/chez/build-jolt.ss .github/workflows/release.yml; do
   grep -q 'tools/version.sh' "$root/$f" || fail "$f does not use tools/version.sh"
   if grep -n 'describe --' "$root/$f"; then
@@ -66,4 +137,4 @@ for f in bin/jolt host/chez/build-jolt.ss .github/workflows/release.yml; do
   fi
 done
 
-echo "version-smoke: ok (release tags only; vnightly at HEAD reads v0.1.0-1-g$sha)"
+echo "version-smoke: ok (release tags only; locked aspect ancestry names its release)"
