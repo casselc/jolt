@@ -246,6 +246,10 @@
 (define chez-deftype-ctor-tag-mu (make-mutex))
 (define (deftype-ctor-tag p) (hashtable-ref (unbox chez-deftype-ctor-tag-box) p #f))
 (define (deftype-ctor-tag-set! ctor tag)
+  ;; The token is = to its Class (host-static-classes.ss), so pin its identity
+  ;; hash to the class NAME's hash before anything can ask — =/hash have to agree
+  ;; or a map keyed by one spelling answers nil for the other.
+  (jolt-identity-hasheq-seed! ctor (jolt-hash tag))
   (jolt-with-mutex chez-deftype-ctor-tag-mu
     (let ((t (hashtable-copy (unbox chez-deftype-ctor-tag-box) #t)))  ; copy is weak too
       (hashtable-set! t ctor tag)
@@ -319,10 +323,18 @@
 (define chez-record-dbl-tbl (make-hashtable string-hash string=?))
 (define (chez-double-tag? t) (and (string? t) (string=? t "double")))
 
+;; type-tag "ns.Name" -> the declared field keywords, in order. The shapes table
+;; above is keyed by ctor-key, which the reflection surface does not have: it is
+;; handed a class and has to answer what that class declares.
+(define chez-record-fields-tbl (make-hashtable string-hash string=?))
+(define (chez-record-field-kws type-tag)
+  (or (hashtable-ref chez-record-fields-tbl type-tag #f) '()))
+
 (define (register-record-shape! ctor-key field-kws field-tags type-tag)
   (jolt-with-mutex rec-tbl-mu
     (hashtable-set! chez-record-shapes-tbl ctor-key
                     (vector field-kws field-tags type-tag))
+    (hashtable-set! chez-record-fields-tbl type-tag field-kws)
     (hashtable-set! chez-record-dbl-tbl type-tag
                     (list->vector (map chez-double-tag? field-tags)))))
 
@@ -378,15 +390,22 @@
             (hashtable-set! by-name type-tag k)
             (hashtable-set! by-name (chez-shape-simple-name type-tag) k)))
         ks vs)
+      ;; A type that owns its lookup is left OUT: the passes read this map to
+      ;; decide that (:field x) is a slot read — the (:k (->T …)) fold and the
+      ;; proven-struct guard drop both do — and for such a type it is not one.
+      ;; Omitting the entry, rather than flagging it, is what keeps a consumer
+      ;; from forgetting to ask: an absent ctor-key already means "not a shape I
+      ;; know", which every reader handles (a nested field tag reads :any).
       (vector-for-each
         (lambda (k v)
           (let* ((fields (vector-ref v 0)) (tags (vector-ref v 1)) (type-tag (vector-ref v 2))
                  (owner-ns (chez-ctor-key-ns k))
                  (rtags (map (lambda (t) (chez-resolve-field-tag t by-name owner-ns)) tags)))
-            (set! out (jolt-assoc out k
-                                  (jolt-hash-map kw-fields (apply jolt-vector fields)
-                                                 kw-tags   (apply jolt-vector rtags)
-                                                 kw-type   type-tag)))))
+            (unless (chez-type-owns-lookup? type-tag)
+              (set! out (jolt-assoc out k
+                                    (jolt-hash-map kw-fields (apply jolt-vector fields)
+                                                   kw-tags   (apply jolt-vector rtags)
+                                                   kw-type   type-tag))))))
         ks vs))
     out))
 
@@ -416,8 +435,48 @@
         ks vs))
     out))
 
+;; A type that declares its own clojure.lang.ILookup has its fields MASKED from
+;; the get path: on the JVM a bare deftype has no key lookup but the one it
+;; declares, so its valAt answers for a field-named key too, and reading the slot
+;; first handed back whatever the slot held where valAt was there to transform it.
+;; The slot stays in the index, biased negative, because every OTHER read still
+;; wants it — .-field, the deftype macro's own field bindings, (set! (.-f x) v).
+;; Encoding the mask in the value the get path already reads is what keeps
+;; (:field r) on a defrecord at exactly the cost it had: a per-type flag
+;; consulted ahead of the index measured 1.27x on that path.
+;;
 ;; index of a declared field key, or #f (only an interned keyword can be one).
-(define (jrec-field-index r k) (hashtable-ref (jrdesc-index (jrec-desc r)) k #f))
+(define (jrec-field-index r k)
+  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
+    (and i (if (fx<? i 0) (fx- -1 i) i))))
+;; the slot the GET path may read — #f for a masked type, so get falls through to
+;; the valAt that type declares.
+(define (jrec-get-index r k)
+  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
+    (and i (fx>=? i 0) i)))
+;; #t when TAG answers every key through a valAt IT declares — a bare deftype
+;; implementing clojure.lang.ILookup. Such a type has no field-first lookup at
+;; all, so three things have to agree about it: the get path (which reads the
+;; masked index below), the mask itself, and the record-shapes registry the
+;; optimizing passes read. One predicate is what makes them agree — the passes
+;; used to see such a type as an ordinary record shape and fold (:field (->T …))
+;; straight to the ctor argument in a built binary, past the valAt (jolt-fpp3.1).
+;; A defrecord is never one: its generated field-first lookup stands, and the JVM
+;; will not compile one declaring another valAt.
+(define (chez-type-owns-lookup? tag)
+  (and (find-method-any-protocol tag "valAt")
+       (not (hashtable-ref chez-record-type-tbl tag #f))
+       #t))
+;; Bias every field of DESC negative. Driven by register-protocol-method the
+;; moment a non-record type registers a valAt; fkeys is walked (not the table's
+;; keys) so nothing scans a hashtable another thread may be writing.
+(define (jrdesc-mask-fields! desc)
+  (let ((idx (jrdesc-index desc)))
+    (vector-for-each
+      (lambda (k)
+        (let ((i (hashtable-ref idx k #f)))
+          (when (and i (fx>=? i 0)) (hashtable-set! idx k (fx- -1 i)))))
+      (jrdesc-fkeys desc))))
 ;; a vector-copy that doesn't depend on the optional rnrs vector-copy being present.
 (define (jrec-vec-copy v)
   (let* ((n (vector-length v)) (out (make-vector n)))
@@ -447,25 +506,77 @@
            (let ((ext (jrec-ext r)))
              (and (not (jolt-nil? ext))
                   (not (eq? jrec-absent (jolt-get ext k jrec-absent))))))))
-;; The get path: like jrec-lookup, but a deftype's ILookup valAt runs when a key
-;; is genuinely missing from both the fields and the extension map.
+;; The get path. A bare deftype that DECLARES clojure.lang.ILookup answers every
+;; key through its own valAt, field-named keys included: the JVM gives such a
+;; type no key lookup at all, so a declared valAt is the only lookup there is and
+;; cannot lose to a slot. Reading the slot first handed back whatever the slot
+;; held where valAt was there to transform it — typed.clojure keeps a lazy thunk
+;; in one and forces it in valAt, so (:variances tfn) came back as the raw thunk.
+;; A defrecord is unaffected (its generated field-first lookup stands; the JVM
+;; will not compile one declaring another valAt), and so is a deftype with no
+;; valAt — for both, slot 6 of the per-type cache is #f and this costs the
+;; vector-ref that cache already answers the other flags with.
+;;
+;; Which arity: the JVM's RT.get calls valAt(k) for (get x k) and valAt(k, nf)
+;; for (get x k nf), but jolt's get seam hands 2-arg get a nil default and cannot
+;; tell the two apart. A nil default picks the 2-arity when the type declares
+;; one, which is right for every (get x k) and for (:k x); only an explicit
+;; (get x k nil) reaches the 3-arity where the JVM would have called the 2-arity,
+;; and a valAt pair that answers those two differently for a nil not-found is
+;; answering the same question twice.
+;;
+;; jrec-lookup, NOT this, is the declared-slot read: it is what .-field and the
+;; deftype macro's own field bindings go through, so a valAt body reading its
+;; fields does not re-enter itself.
+(define (jrec-declared-valat r) (vector-ref (jrdesc-ifc-of r) 6))
+;; Which arity: the JVM's RT.get calls valAt(k) for (get x k) and valAt(k, nf)
+;; for (get x k nf), but jolt's get seam hands 2-arg get a nil default and cannot
+;; tell the two apart. A nil default picks the 2-arity when the type declares one,
+;; which is right for every (get x k) and for (:k x); only an explicit
+;; (get x k nil) reaches the 3-arity where the JVM would have called the 2-arity,
+;; and a valAt pair answering those two differently for a nil not-found is
+;; answering the same question twice.
+(define (jrec-call-valat va coll k d)
+  (let ((m3 (car va)) (m2 (cdr va)))
+    (if (and m2 (jolt-nil? d))
+        (jolt-invoke m2 coll k)
+        (if m3 (jolt-invoke m3 coll k d) (jolt-invoke m2 coll k)))))
 (define (jrec-ref coll k d)
   (if (eq? k jolt-deftype-kw)
       (jrec-tag coll)
-      (let ((i (jrec-field-index coll k)))
-        (if i (jrec-field-ref coll i)
-            (let* ((ext (jrec-ext coll))
-                   (v (if (jolt-nil? ext) jrec-absent (jolt-get ext k jrec-absent))))
-              (if (eq? v jrec-absent)
-                  (cond ((find-method-any-protocol (jrec-tag coll) "valAt")
-                          => (lambda (m) (jolt-invoke m coll k d)))
-                        ;; a deftype implementing clojure.lang.IPersistentSet.get
-                        ;; (get returns the element when present, else nil) — a
-                        ;; membership lookup, so (get an-ordered-set k) works.
-                        ((find-method-any-protocol (jrec-tag coll) "get")
-                          => (lambda (m) (let ((r (jolt-invoke m coll k))) (if (jolt-nil? r) d r))))
-                         (else d))
-                   v))))))
+      (let ((i (jrec-get-index coll k)))
+        (if i (jrec-field-ref coll i) (jrec-ref-slow coll k d)))))
+;; Everything the field slots did not answer: the extension map, then the type's
+;; own lookup. A masked type arrives here for its OWN field keys too, which is
+;; the point.
+(define (jrec-ref-slow coll k d)
+  (let* ((ext (jrec-ext coll))
+         (v (if (jolt-nil? ext) jrec-absent (jolt-get ext k jrec-absent))))
+    (if (eq? v jrec-absent)
+        (cond ((jrec-declared-valat coll)
+                => (lambda (va) (jrec-call-valat va coll k d)))
+              ;; a defrecord that declares a valAt anyway (the JVM refuses to
+              ;; compile one, but jolt has always allowed it): its fields are not
+              ;; masked, so this only answers keys they miss.
+              ((find-method-any-protocol (jrec-tag coll) "valAt")
+                => (lambda (m) (jolt-invoke m coll k d)))
+              ;; a deftype implementing clojure.lang.IPersistentSet.get
+              ;; (get returns the element when present, else nil) — a
+              ;; membership lookup, so (get an-ordered-set k) works.
+              ((find-method-any-protocol (jrec-tag coll) "get")
+                => (lambda (m) (let ((r (jolt-invoke m coll k))) (if (jolt-nil? r) d r))))
+              (else d))
+        v)))
+
+;; The declared-slot read the deftype macro binds each immutable field with, and
+;; the clojure.core/__deftype-field op the backend lowers that to. It is
+;; jrec-lookup, i.e. deliberately NOT the get path: a method body reading its own
+;; fields must not go through a valAt the same type declares, or every method
+;; entry re-enters that valAt and allocates without bound. Reaching the slot
+;; directly is also cheaper than the (get inst :field) it replaces, which walked
+;; jolt-get's type cascade to arrive at the same place.
+(define (jrec-field r k) (jrec-lookup r k jolt-nil))
+(def-var! "clojure.core" "__deftype-field" jrec-field)
 
 ;; mutate a deftype's mutable field in place: fields are mutable slots, so
 ;; jrec-field-set! updates the field. (set! field v) inside a method lowers to
@@ -613,4 +724,7 @@
                       (cons (string-append (jolt-pr-readable (vector-ref fkeys i)) " "
                                            (jolt-pr-readable (jrec-field-ref r i)))
                             acc))))))
-    (string-append "#" (jrec-tag r) "{" (jolt-str-join-comma entry-strs) "}")))
+    ;; the JVM spelling of the tag (my_app.core.Foo for a type in my-app.core):
+    ;; what the JVM's reader resolves a record literal by, and what its own
+    ;; printer writes. jolt's reader takes either spelling (reader.ss).
+    (string-append "#" (jch-munge-segments (jrec-tag r)) "{" (jolt-str-join-comma entry-strs) "}")))

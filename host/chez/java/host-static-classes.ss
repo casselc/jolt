@@ -24,6 +24,13 @@
 (define (al-head self) (vector-ref (jhost-state self) 2))
 (define (al-head! self h) (vector-set! (jhost-state self) 2 h))
 (define (al-ref self i) (vector-ref (al-vec self) (fx+ (al-head self) i)))
+;; get/set past the end is an IndexOutOfBoundsException, never the buffer's
+;; spare slot.
+(define (al-check-index! self i)
+  (unless (and (fixnum? i) (fx>=? i 0) (fx<? i (al-cnt self)))
+    (throw-jvm 'IndexOutOfBoundsException
+               (string-append "Index " (number->string i) " out of bounds for length "
+                              (number->string (al-cnt self))))))
 (define (al-set! self i x) (vector-set! (al-vec self) (fx+ (al-head self) i) x))
 (define (make-arraylist xs)               ; xs: a Scheme list of initial elements
   (let* ((n (length xs)) (cap (fxmax al-min-cap n)) (v (make-vector cap jolt-nil)))
@@ -98,9 +105,9 @@
                        (let loop ((xs (seq->list (jolt-seq coll))) (k i))
                          (if (null? xs) (pair? (seq->list (jolt-seq coll)))
                              (begin (al-insert-at! self k (car xs)) (loop (cdr xs) (fx+ k 1))))))))
-    (cons "get" (lambda (self i) (al-ref self (jnum->exact i))))
+    (cons "get" (lambda (self i) (let ((idx (jnum->exact i))) (al-check-index! self idx) (al-ref self idx))))
     (cons "set" (lambda (self i x)
-                  (let* ((idx (jnum->exact i)) (old (al-ref self idx)))
+                  (let* ((idx (jnum->exact i)) (_ (al-check-index! self idx)) (old (al-ref self idx)))
                     (al-set! self idx x) old)))
     (cons "size" (lambda (self) (->num (al-cnt self))))
     (cons "isEmpty" (lambda (self) (fx=? 0 (al-cnt self))))
@@ -112,22 +119,32 @@
     (cons "toArray" (lambda (self . _) (apply jolt-vector (al->list self))))
     (cons "iterator" (lambda (self) (make-jiterator (list->cseq (al->list self)))))
     (cons "toString" (lambda (self) (jolt-pr-str (list->cseq (al->list self)))))))
-(register-host-methods! "arraylist" arraylist-methods)
+;; java.util.SequencedCollection (JDK 21): List and Deque both have it, so the
+;; first/last accessors and mutators sit on the shared ArrayList table and
+;; LinkedList / ArrayDeque inherit them. On an empty list the accessors raise
+;; NoSuchElementException, as on the JVM. reversed() — a live reverse-order VIEW
+;; of a mutable list — is not modeled: a copy would silently detach from the
+;; list it claims to view.
+(define (al-first self)
+  (if (fx=? 0 (al-cnt self)) (throw-jvm 'NoSuchElementException "") (al-ref self 0)))
+(define (al-last self)
+  (if (fx=? 0 (al-cnt self)) (throw-jvm 'NoSuchElementException "") (al-ref self (fx- (al-cnt self) 1))))
+(define sequenced-list-methods
+  (list
+    (cons "addFirst" (lambda (self x) (al-insert-at! self 0 x) jolt-nil))
+    (cons "addLast" (lambda (self x) (al-push! self x) jolt-nil))
+    (cons "removeFirst" (lambda (self) (let ((o (al-first self))) (al-remove-at! self 0) o)))
+    (cons "removeLast" (lambda (self) (let ((o (al-last self))) (al-remove-at! self (fx- (al-cnt self) 1)) o)))
+    (cons "getFirst" al-first) (cons "getLast" al-last)))
+(register-host-methods! "arraylist" (append arraylist-methods sequenced-list-methods))
 
 ;; java.util.LinkedList: the ArrayList backing plus the Deque surface
-;; (addFirst/addLast/removeFirst/removeLast/getFirst/getLast/peek/push/pop).
+;; (offer/peek/poll/push/pop over the sequenced methods above).
 ;; tools.reader holds pending splice forms in one and (seq)s / .remove(0)s it.
-(define (al-first self) (al-ref self 0))
-(define (al-last self) (al-ref self (fx- (al-cnt self) 1)))
 (define linkedlist-methods
-  (append arraylist-methods
+  (append arraylist-methods sequenced-list-methods
     (list
-      (cons "addFirst" (lambda (self x) (al-insert-at! self 0 x) jolt-nil))
-      (cons "addLast" (lambda (self x) (al-push! self x) jolt-nil))
       (cons "offer" (lambda (self x) (al-push! self x) #t))
-      (cons "removeFirst" (lambda (self) (let ((o (al-first self))) (al-remove-at! self 0) o)))
-      (cons "removeLast" (lambda (self) (let ((o (al-last self))) (al-remove-at! self (fx- (al-cnt self) 1)) o)))
-      (cons "getFirst" al-first) (cons "getLast" al-last)
       (cons "peek" (lambda (self) (if (fx=? 0 (al-cnt self)) jolt-nil (al-first self))))
       (cons "poll" (lambda (self) (if (fx=? 0 (al-cnt self)) jolt-nil (let ((o (al-first self))) (al-remove-at! self 0) o))))
       (cons "push" (lambda (self x) (al-insert-at! self 0 x) jolt-nil))
@@ -178,8 +195,12 @@
 
 (register-class-ctor! "StringBuilder"
   (lambda args (make-jhost "string-builder"
-    ;; a numeric first arg is a CAPACITY hint, not content.
-    (vector (if (and (pair? args) (not (number? (car args)))) (render-piece (car args)) "")
+    ;; a numeric first arg is a CAPACITY hint, not content; nil is the
+    ;; NullPointerException the JVM's String ctor raises.
+    (vector (cond ((null? args) "")
+                  ((jolt-nil? (car args)) (throw-jvm 'NullPointerException "str"))
+                  ((number? (car args)) "")
+                  (else (render-piece (car args))))
             '() 0))))
 (register-host-methods! "string-builder"
   (list (cons "append" (lambda (self x . rest) (sb-append! self (append-text x rest)) self))
@@ -773,55 +794,115 @@
 ;; java.util.concurrent.atomic.Atomic{Reference,Integer,Long,Boolean}: a
 ;; thread-safe mutable cell (mutex-guarded, shared heap). One "atomic" jhost
 ;; serves all four; the numeric ops are meaningful only on Integer/Long.
-(define (make-atomic init)
-  (make-jhost "atomic" (vector (box init) (make-mutex))))
+;; AtomicReference CAS compares object identity, while the primitive wrappers
+;; compare their unboxed values. Keep that closed distinction in the cell
+;; instead of making the shared CAS path guess from the values it contains (or
+;; calling a stored, potentially generic comparator while the mutex is held).
+(define (make-atomic init kind)
+  (make-jhost "atomic" (vector (box init) (make-mutex) kind)))
 (define (atomic-box self) (vector-ref (jhost-state self) 0))
 (define (atomic-lock self) (vector-ref (jhost-state self) 1))
+(define (atomic-kind self) (vector-ref (jhost-state self) 2))
+;; Convert a modeled Java method argument at the signature boundary. Numeric
+;; atomic cells never contain an unbounded jolt integer: the constructor and
+;; every value-taking method accept exactly the primitive width named by their
+;; Java signature. Keep this outside the mutex because conversion may throw.
+(define (atomic-convert self value)
+  (case (atomic-kind self)
+    ((integer) (jolt-int-cast value))
+    ((long) (jolt-long-cast value))
+    (else value)))
+;; Java's primitive atomic arithmetic is two's-complement arithmetic. Its
+;; result wraps even though a checked cast at a method boundary rejects an
+;; out-of-range argument. VALUE is an exact sum or difference of already
+;; converted cell data, so this helper is leaf-only inside the counted mutex.
+(define (atomic-wrap self value)
+  (case (atomic-kind self)
+    ((integer) (jolt-unchecked-int value))
+    ((long) (jolt-wrap64 value))
+    (else value)))
+(define (atomic-numeric-transition! self delta return-old?)
+  (jolt-with-mutex (atomic-lock self)
+    (let* ((old (unbox (atomic-box self)))
+           (next (atomic-wrap self (+ old delta))))
+      (set-box! (atomic-box self) next)
+      (if return-old? old next))))
 ;; CAS under the atomic's mutex. updateAndGet/getAndUpdate run the user fn
 ;; LOCK-FREE in a CAS retry loop (JVM parity), so the fn may re-enter the same
 ;; atomic; a mutex-held fn deadlocked on the non-recursive Chez mutex there
 ;; (PSL R4 cluster 4).
 (define (atomic-cas! self o n)
-  (jolt-with-mutex (atomic-lock self)
-    (if (jolt=2 (unbox (atomic-box self)) o)
-        (begin (set-box! (atomic-box self) n) #t) #f)))
-(let ((ref-ctor (lambda args (make-atomic (if (pair? args) (car args) jolt-nil))))
-      (num-ctor (lambda args (make-atomic (if (pair? args) (car args) 0))))
-      (bool-ctor (lambda args (make-atomic (if (pair? args) (car args) #f)))))
+  (let* ((kind (atomic-kind self))
+         (expected (atomic-convert self o))
+         (next (atomic-convert self n)))
+    (jolt-with-mutex (atomic-lock self)
+      (let ((current (unbox (atomic-box self))))
+        (if (case kind
+              ((reference boolean) (eq? current expected))
+              ((integer long) (= current expected))
+              (else #f))
+            (begin (set-box! (atomic-box self) next) #t)
+            #f)))))
+(let ((ref-ctor (lambda args
+                  (make-atomic (if (pair? args) (car args) jolt-nil) 'reference)))
+      (int-ctor (lambda args
+                  (make-atomic (jolt-int-cast (if (pair? args) (car args) 0)) 'integer)))
+      (long-ctor (lambda args
+                   (make-atomic (jolt-long-cast (if (pair? args) (car args) 0)) 'long)))
+      (bool-ctor (lambda args
+                   (make-atomic (if (pair? args) (car args) #f) 'boolean))))
   (for-each (lambda (n) (register-class-ctor! n ref-ctor))
             '("AtomicReference" "java.util.concurrent.atomic.AtomicReference"))
-  (for-each (lambda (n) (register-class-ctor! n num-ctor))
-            '("AtomicInteger" "java.util.concurrent.atomic.AtomicInteger"
-              "AtomicLong" "java.util.concurrent.atomic.AtomicLong"))
+  (for-each (lambda (n) (register-class-ctor! n int-ctor))
+            '("AtomicInteger" "java.util.concurrent.atomic.AtomicInteger"))
+  (for-each (lambda (n) (register-class-ctor! n long-ctor))
+            '("AtomicLong" "java.util.concurrent.atomic.AtomicLong"))
   (for-each (lambda (n) (register-class-ctor! n bool-ctor))
             '("AtomicBoolean" "java.util.concurrent.atomic.AtomicBoolean")))
 (register-host-methods! "atomic"
   (list (cons "get" (lambda (self) (unbox (atomic-box self))))
-        (cons "set" (lambda (self v) (set-box! (atomic-box self) v) jolt-nil))
-        (cons "getAndSet" (lambda (self v) (jolt-with-mutex (atomic-lock self)
-                            (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) v) o))))
+        ;; Serialization of the plain set method against read-modify-write
+        ;; methods is a separate concern. Preserve its current write boundary
+        ;; here while ensuring conversion completes before state changes.
+        (cons "set" (lambda (self v)
+          (let ((next (atomic-convert self v)))
+            (set-box! (atomic-box self) next)
+            jolt-nil)))
+        (cons "getAndSet" (lambda (self v)
+          (let ((next (atomic-convert self v)))
+            (jolt-with-mutex (atomic-lock self)
+              (let ((o (unbox (atomic-box self))))
+                (set-box! (atomic-box self) next)
+                o)))))
         (cons "compareAndSet" (lambda (self o n) (atomic-cas! self o n)))
         (cons "updateAndGet" (lambda (self f)
           (let loop ((v (unbox (atomic-box self))))
-            (let ((n (jolt-invoke f v)))
+            ;; atomic-cas! deliberately re-normalizes V and N. This keeps every
+            ;; CAS caller behind one typed boundary; conversion is idempotent.
+            (let ((n (atomic-convert self (jolt-invoke f v))))
               (if (atomic-cas! self v n) n (loop (unbox (atomic-box self))))))))
         (cons "getAndUpdate" (lambda (self f)
           (let loop ((v (unbox (atomic-box self))))
-            (let ((n (jolt-invoke f v)))
+            (let ((n (atomic-convert self (jolt-invoke f v))))
               (if (atomic-cas! self v n) v (loop (unbox (atomic-box self))))))))
-        (cons "incrementAndGet" (lambda (self) (jolt-with-mutex (atomic-lock self)
-                                  (let ((n (+ (unbox (atomic-box self)) 1))) (set-box! (atomic-box self) n) n))))
-        (cons "decrementAndGet" (lambda (self) (jolt-with-mutex (atomic-lock self)
-                                  (let ((n (- (unbox (atomic-box self)) 1))) (set-box! (atomic-box self) n) n))))
-        (cons "getAndIncrement" (lambda (self) (jolt-with-mutex (atomic-lock self)
-                                  (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (+ o 1)) o))))
-        (cons "getAndDecrement" (lambda (self) (jolt-with-mutex (atomic-lock self)
-                                  (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (- o 1)) o))))
-        (cons "addAndGet" (lambda (self d) (jolt-with-mutex (atomic-lock self)
-                            (let ((n (+ (unbox (atomic-box self)) (jnum->exact d)))) (set-box! (atomic-box self) n) n))))
-        (cons "getAndAdd" (lambda (self d) (jolt-with-mutex (atomic-lock self)
-                            (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (+ o (jnum->exact d))) o))))
-        (cons "intValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
+        (cons "incrementAndGet"
+          (lambda (self) (atomic-numeric-transition! self 1 #f)))
+        (cons "decrementAndGet"
+          (lambda (self) (atomic-numeric-transition! self -1 #f)))
+        (cons "getAndIncrement"
+          (lambda (self) (atomic-numeric-transition! self 1 #t)))
+        (cons "getAndDecrement"
+          (lambda (self) (atomic-numeric-transition! self -1 #t)))
+        (cons "addAndGet" (lambda (self d)
+          (let ((delta (atomic-convert self d)))
+            (atomic-numeric-transition! self delta #f))))
+        (cons "getAndAdd" (lambda (self d)
+          (let ((delta (atomic-convert self d)))
+            (atomic-numeric-transition! self delta #t))))
+        (cons "intValue" (lambda (self)
+          (if (eq? (atomic-kind self) 'long)
+              (jolt-unchecked-int (unbox (atomic-box self)))
+              (jnum->exact (unbox (atomic-box self))))))
         (cons "longValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
         (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self)))))))
 ;; java.util.Collections/synchronizedMap|List|Set wrap a collection for
@@ -901,22 +982,35 @@
     (let ((l (vector-ref st 1)))
       (if (null? l) jolt-nil (begin (vector-set! st 1 (cdr l)) (car l))))))
 (define (a-ref-queue? x) (and (jhost? x) (string=? (jhost-tag x) "ref-queue")))
-(define (make-reference v rest)
+;; Each reference class has its own tag (class-hierarchy.ss maps the tag to the
+;; class), sharing one method table: the two differ only in the class they
+;; report, and a WeakReference used to report as a SoftReference.
+(define (make-reference tag v rest)
   (let* ((rq (if (pair? rest) (car rest) jolt-nil))
-         (ref (make-jhost "weak-ref" (vector (weak-cons v #f) rq #f))))
+         (ref (make-jhost tag (vector (weak-cons v #f) rq #f))))
     (when (a-ref-queue? rq) ((rq-guardian-of rq) v ref))   ; fire on the referent's collection
     ref))
-(for-each (lambda (nm) (register-class-ctor! nm (lambda (v . rest) (make-reference v rest))))
-          '("SoftReference" "java.lang.ref.SoftReference" "WeakReference" "java.lang.ref.WeakReference"))
+(for-each (lambda (nm) (register-class-ctor! nm (lambda (v . rest) (make-reference "soft-ref" v rest))))
+          '("SoftReference" "java.lang.ref.SoftReference"))
+(for-each (lambda (nm) (register-class-ctor! nm (lambda (v . rest) (make-reference "weak-ref" v rest))))
+          '("WeakReference" "java.lang.ref.WeakReference"))
+;; the referent, or nil once cleared — by the program or by the collector
+(define (reference-referent self)
+  (let ((r (car (vector-ref (jhost-state self) 0))))
+    (if (bwp-object? r) jolt-nil r)))
 (register-host-methods! "weak-ref"
-  (list (cons "get" (lambda (self) (let ((r (car (vector-ref (jhost-state self) 0))))
-                                     (if (bwp-object? r) jolt-nil r))))
+  (list (cons "get" reference-referent)
         (cons "clear" (lambda (self) (set-car! (vector-ref (jhost-state self) 0) jolt-nil) jolt-nil))
+        ;; Reference.refersTo(obj): identity against the referent, so a cleared
+        ;; reference refers to null — the JDK 16 spelling of "is it still x"
+        ;; that avoids strengthening the referent the way get() does.
+        (cons "refersTo" (lambda (self x) (eq? (reference-referent self) x)))
         (cons "isEnqueued" (lambda (self) (vector-ref (jhost-state self) 2)))
         (cons "enqueue" (lambda (self)
           (let* ((st (jhost-state self)) (rq (vector-ref st 1)))
             (if (vector-ref st 2) #f
                 (begin (vector-set! st 2 #t) (when (a-ref-queue? rq) (rq-add! rq self)) #t)))))))
+(alias-host-methods! "soft-ref" "weak-ref")
 (for-each (lambda (nm) (register-class-ctor! nm (lambda _ (make-jhost "ref-queue" (vector (make-guardian) '() '())))))
           '("ReferenceQueue" "java.lang.ref.ReferenceQueue"))
 (register-host-methods! "ref-queue"
@@ -1191,6 +1285,19 @@
 (register-class-ctor! "BigInteger" bigint-ctor)
 (register-class-ctor! "java.math.BigInteger" bigint-ctor)
 (register-class-ctor! "MapEntry" (lambda (k v) (make-map-entry k v)))
+;; clojure.lang.APersistentVector$RSeq: the reverse seq of an Indexed value from
+;; index i down to 0, as an IPersistentVector deftype's rseq builds it
+;; (clojure.core.Vec). The same lazy cells a native vector's rseq uses, so the
+;; class answer and the walk match.
+(define lz-indexed-rseq
+  (register-lazy-src! 'indexed-rseq (lambda (v i) (indexed->rseq v i))))
+(define (indexed->rseq v i)
+  (if (fx<? i 0)
+      jolt-nil
+      (cseq-lazy/k (jolt-nth v i) (make-lazy-src lz-indexed-rseq v (fx- i 1)) sk-rseq)))
+(let ((rseq-ctor (lambda (v i) (indexed->rseq v (jnum->exact i)))))
+  (register-class-ctor! "APersistentVector$RSeq" rseq-ctor)
+  (register-class-ctor! "clojure.lang.APersistentVector$RSeq" rseq-ctor))
 ;; clojure.lang.MapEntry/create — the static factory clojure.walk and kin use
 ;; when rebuilding map entries.
 (register-class-statics! "MapEntry" (list (cons "create" (lambda (k v) (make-map-entry k v)))))
@@ -1442,7 +1549,7 @@
                ;; ones it opens with; read those. Callers use it to decide whether a
                ;; pattern is one they can handle (test.chuck's string-from-regex).
                ((string=? method-name "flags") (rx-inline-flags (regex-t-source obj)))
-               (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method-name " for java.util.regex.Pattern")))))
+               (else (dispatch-miss obj method-name rest))))
         ;; java.util.regex.Matcher: .matches (anchored whole-region), .find
         ;; (next match), .group [n], .groupCount.
         ((jolt-matcher? obj)
@@ -1460,7 +1567,7 @@
                 (let ((mm (matcher-t-last obj)))
                   (if mm (irregex-match-end-index mm (if (pair? rest) (jnum->exact (car rest)) 0))
                       (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "No match available")))))
-               (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method-name " for java.util.regex.Matcher")))))
+               (else (dispatch-miss obj method-name rest))))
         (else 'pass)))))
 
 ;; ---- def-var! the registry entry points so emit can also reach them ---------
@@ -1527,20 +1634,111 @@
 (def-var! "clojure.core" "__register-class-methods!"
   (lambda (tag members) (register-tagged-methods! tag (jmap->static-alist members)) jolt-nil))
 
-;; java.lang.ThreadLocal via a Chez thread-parameter: real per-thread storage with
-;; a lazy initialValue (the proxy macro lowers (proxy [ThreadLocal] …) to this).
-;; .get returns the thread's value, computing initialValue once; .set / .remove.
+;; java.lang.ThreadLocal / java.lang.InheritableThreadLocal.
+;;
+;; The two classes differ in exactly one thing — what a FORKED thread sees — and
+;; that one thing is the contract, so each gets the storage that expresses it:
+;;
+;;   ThreadLocal             a per-thread table in a virtual register. A freshly
+;;                           forked thread starts every vreg at fixnum 0, so it
+;;                           builds its own table and re-runs initialValue: the
+;;                           JVM's "each thread has its own, independently
+;;                           initialized copy".
+;;   InheritableThreadLocal  one thread parameter per instance. Chez hands a
+;;                           forked thread the creating thread's parameter
+;;                           values, which IS childValue(parentValue) — including
+;;                           the case where the parent never read it, since the
+;;                           parameter then still holds tl-unset and the child
+;;                           runs its own initialValue like the JVM.
+;;
+;; A thread parameter for BOTH is what this was, which made the plain class the
+;; inheritable one and left jolt unable to tell them apart at all (the proxy macro
+;; lowered both to one call). It is not a cosmetic divergence: three workers
+;; sharing a ThreadLocal<Process> each got the parent's already-drained subprocess
+;; instead of spawning one, and test.check's per-thread RNG handed a forked thread
+;; the parent's generator (jolt-uecg). CONTRACT.txt recorded it as accepted; it
+;; isn't — "each thread has its own" is the entire content of the class.
+;;
+;; The table holds its entries for the life of the THREAD, where the JVM's
+;; ThreadLocalMap holds weak keys and drops an unreachable ThreadLocal early. The
+;; usual shape (a top-level defonce) is live for the process either way, and
+;; .remove — the JVM's own answer for releasing a value — deletes the entry here
+;; too. A weak table would cost every collection a scan of entries whose keys are
+;; long-lived by construction (the per-thread-cache reasoning in hasheq.ss).
 (define tl-unset (list 'tl-unset))
-(define (jolt-make-thread-local init-thunk)
-  (make-jhost "threadlocal" (vector (make-thread-parameter tl-unset) init-thunk)))
+
+;; slot 10: see the vreg registry in rt.ss. Per-thread, and NOT a thread
+;; parameter, for the same reason as slot 9's interrupt box: a parameter is
+;; inherited by a forked thread and this table must not be — a shared table would
+;; also be two threads mutating one hashtable, which faults inside the collector.
+(define jolt-vreg-threadlocals 10)
+(define (tl-table)
+  (let ((t (virtual-register jolt-vreg-threadlocals)))
+    (if (eq? t 0)
+        (let ((nt (make-eq-hashtable)))
+          (set-virtual-register! jolt-vreg-threadlocals nt)
+          nt)
+        t)))
+
+;; state: #(param init) — param is the instance's thread parameter for an
+;; InheritableThreadLocal and #f for a plain one, which is also the discriminator
+;; the three accessors branch on. init is the initialValue source: a thunk (the
+;; proxy lowering), a java.util.function.Supplier (withInitial), or nil (the bare
+;; constructor, whose initialValue returns null).
+(define (tl-param self) (vector-ref (jhost-state self) 0))
+(define (tl-initial self)
+  (let ((f (vector-ref (jhost-state self) 1)))
+    (cond ((jolt-nil? f) jolt-nil)
+          ;; a reified Supplier, the argument withInitial takes on the JVM. A
+          ;; plain fn is accepted too: jolt has no functional-interface coercion,
+          ;; so requiring the reify would only make the shim harder to call than
+          ;; the class it models.
+          ((iface-method f "get" 1) (record-method-dispatch f "get" jolt-nil))
+          (else (jolt-invoke f)))))
+(define (tl-ref self)
+  (let ((p (tl-param self)))
+    (if p (p) (hashtable-ref (tl-table) self tl-unset))))
+(define (tl-set! self v)
+  (let ((p (tl-param self)))
+    (if p (p v) (hashtable-set! (tl-table) self v))))
+(define (tl-clear! self)
+  (let ((p (tl-param self)))
+    (if p (p tl-unset) (hashtable-delete! (tl-table) self))))
+
+;; init: a thunk / Supplier / nil. inheritable?: build the InheritableThreadLocal.
+(define jolt-make-thread-local
+  (case-lambda
+    ;; the one-argument shape the pre-jolt-uecg seed's proxy lowering calls, kept
+    ;; so a bootstrap pass driven by an older seed still mints (it means the plain
+    ;; class, which is what that lowering produced for `proxy [ThreadLocal]`).
+    ((init) (jolt-make-thread-local init jolt-nil))
+    ((init inheritable?)
+     (if (jolt-truthy? inheritable?)
+         (make-jhost "inheritable-threadlocal" (vector (make-thread-parameter tl-unset) init))
+         (make-jhost "threadlocal" (vector #f init))))))
+
+;; .get computes initialValue on the first read and REMEMBERS it, so a fn with a
+;; side effect (test.check's split, a spawned process) runs once per thread and
+;; not once per read.
 (register-host-methods! "threadlocal"
   (list (cons "get" (lambda (self)
-                      (let* ((st (jhost-state self)) (tp (vector-ref st 0)) (v (tp)))
+                      (let ((v (tl-ref self)))
                         (if (eq? v tl-unset)
-                            (let ((nv (jolt-invoke (vector-ref st 1)))) (tp nv) nv)
+                            (let ((nv (tl-initial self))) (tl-set! self nv) nv)
                             v))))
-        (cons "set" (lambda (self v) ((vector-ref (jhost-state self) 0) v) jolt-nil))
-        (cons "remove" (lambda (self) ((vector-ref (jhost-state self) 0) tl-unset) jolt-nil))))
+        (cons "set" (lambda (self v) (tl-set! self v) jolt-nil))
+        (cons "remove" (lambda (self) (tl-clear! self) jolt-nil))))
+;; ALIAS, not a second registration: the two tags differ only in the class they
+;; report and in the storage the state vector selects, so they must never grow
+;; separate method tables that can drift.
+(alias-host-methods! "inheritable-threadlocal" "threadlocal")
+
+(for-each (lambda (nm) (register-class-ctor! nm (lambda args (jolt-make-thread-local jolt-nil jolt-nil))))
+          '("ThreadLocal" "java.lang.ThreadLocal"))
+(for-each (lambda (nm) (register-class-ctor! nm (lambda args (jolt-make-thread-local jolt-nil #t))))
+          '("InheritableThreadLocal" "java.lang.InheritableThreadLocal"))
+(register-class-statics! "java.lang.ThreadLocal"
+  (list (cons "withInitial" (lambda (supplier) (jolt-make-thread-local supplier jolt-nil)))))
 (def-var! "jolt.host" "make-thread-local" jolt-make-thread-local)
 
 ;; Pluggable instance? — a library registers (fn [class-name-string val] -> true
@@ -1624,6 +1822,32 @@
     (cond ((< i 0) s)
           ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s)))
           (else (loop (- i 1))))))
+;; Where a class name's nesting boundary is, or #f if it names a top-level class.
+;; The JVM reads nesting off the class file's enclosing-class attribute, never off
+;; the name, so a `$` does not by itself mean nested: java.util.Map$Entry is Map's
+;; member class, while clojure.core$inc is a TOP-LEVEL class whose name merely
+;; contains one — which is why the JVM answers "Entry" for the first and
+;; "core$inc", not "inc", for the second. Derive that from the class model: a `$`
+;; is a nesting boundary only when the name before it is itself a class jolt
+;; knows. Scanning stops at the last dot, since a `$` can only appear in the
+;; final segment.
+(define (hsc-nesting-dollar cn)
+  (let loop ((i (- (string-length cn) 1)))
+    (cond ((fx<? i 0) #f)
+          ((char=? (string-ref cn i) #\.) #f)
+          ((and (char=? (string-ref cn i) #\$) (jch-known? (substring cn 0 i))) i)
+          (else (loop (fx- i 1))))))
+;; Class.getSimpleName drops the package and, for a nested class, the enclosing
+;; class too. Class.getCanonicalName spells nesting with a dot instead of a `$`.
+(define (hsc-simple-name cn)
+  (let ((i (hsc-nesting-dollar cn)))
+    (if i (substring cn (fx+ i 1) (string-length cn)) (hsc-last-segment cn))))
+(define (hsc-canonical-name cn)
+  (let ((i (hsc-nesting-dollar cn)))
+    (if i
+        (string-append (hsc-canonical-name (substring cn 0 i))
+                       "." (substring cn (fx+ i 1) (string-length cn)))
+        cn)))
 ;; values that carry metadata (mirrors jolt-with-meta's set in natives-meta.ss).
 (define (hsc-imeta? x)
   (or (pvec? x) (pmap? x) (pset? x) (cseq? x) (empty-list-t? x)
@@ -1682,6 +1906,13 @@
 (define (make-class-obj name) (make-jhost "class" (vector name)))
 (define (jclass? x) (and (jhost? x) (string=? (jhost-tag x) "class")))
 (define (jclass-name x) (vector-ref (jhost-state x) 0))
+;; The name a class token PRESENTS — .getName, toString, print: the JVM spelling.
+;; A deftype's registered name is its namespace as written (rf.def-two.R3); the
+;; JVM munges the dash (rf.def_two.R3), and that is the spelling a record literal
+;; must print in for the JVM's reader to find the class. Every other name is
+;; already its JVM spelling (jch-munge-segments is the identity on it). Lookups
+;; keep asking jclass-name: the registered name is the identity.
+(define (jclass-jvm-name x) (jch-munge-segments (jclass-name x)))
 
 ;; Global interner: class tokens resolve to the same eq? object per name, so
 ;; identity, =, and defmethod table keys are stable. Called by the analyzer for
@@ -1699,10 +1930,52 @@
   (or (hashtable-ref jolt-class-for-tbl name #f)
       (jolt-with-mutex hsc-mu
         (or (hashtable-ref jolt-class-for-tbl name #f)
-            (let ((obj (make-class-obj name)))
+            ;; First sight of a name asks the class graph for its registered
+            ;; spelling, so the JVM spelling of a deftype in a dashed namespace
+            ;; (rf.def_two.R3 for rf.def-two.R3 — what resolve, :import, a class
+            ;; symbol in code and Class/forName all arrive with) interns to the
+            ;; ONE token the type's values report; = on tokens compares names.
+            ;; A name the graph does not know is its own token: the syntactic
+            ;; class model, unchanged.
+            (let* ((reg (jch-registered-name name))
+                   (canon (if (and reg (not (string=? reg name))) reg name))
+                   (obj (or (hashtable-ref jolt-class-for-tbl canon #f)
+                            (let ((o (make-class-obj canon)))
+                              (hashtable-set! jolt-class-for-tbl canon o)
+                              o))))
               (hashtable-set! jolt-class-for-tbl name obj)
               obj)))))
 (def-var! "jolt.host" "jolt-class-for" jolt-class-for)
+
+;; Long/TYPE and its eight siblings are the primitive CLASSES, not their names.
+;; They are declared beside the rest of each wrapper's statics
+;; (host-static-methods.ss), which loads before the interner exists, so they are
+;; registered as the primitive's name and promoted here in one pass — one
+;; declaration site, one place that knows the interner is now available.
+;; Promoting them is what lets a Class method reach them at all: .isPrimitive on
+;; a bare string is a field miss, and typedclojure's symbol->Class asserts its
+;; result is a class?.
+(for-each
+  (lambda (cls)
+    (let ((h (hashtable-ref class-statics-tbl cls #f)))
+      (when h
+        (let ((v (hashtable-ref h "TYPE" #f)))
+          (when (string? v) (hashtable-set! h "TYPE" (jolt-class-for v)))))))
+  '("Long" "Integer" "Short" "Byte" "Character" "Boolean" "Double" "Float" "Void"))
+;; A deftype registered AFTER its JVM spelling was interned — an :import or a
+;; class symbol compiled ahead of the defining namespace, which the JVM rejects
+;; but jolt's syntactic model lets through — left a token under that spelling
+;; that is not the type's. Drop it, so the next lookup re-interns through the
+;; graph. Runs outside the graph's mutex (class-hierarchy.ss), so the
+;; hsc-mu -> jch-cache-mutex order jolt-class-for takes is never inverted.
+(set! jch-class-registered-hook
+  (lambda (name)
+    (let ((m (jch-munge-segments name)))
+      (unless (string=? m name)
+        (jolt-with-mutex hsc-mu
+          (let ((tok (hashtable-ref jolt-class-for-tbl m #f)))
+            (when (and tok (not (string=? (jclass-name tok) name)))
+              (hashtable-delete! jolt-class-for-tbl m))))))))
 
 (define (class-key x)
   (cond ((jclass? x) (jclass-name x))
@@ -1716,19 +1989,50 @@
 (register-eq-arm! (lambda (a b) (and (jclass? a) (jclass? b)))
                   (lambda (a b) (let ((ka (class-key a)) (kb (class-key b)))
                                   (and ka kb (string=? ka kb) #t))))
+;; A deftype/defrecord TYPE TOKEN and (class inst) are the same Class object on
+;; the JVM — identical?, not merely =. jolt spells them differently (the token is
+;; the ctor procedure, so it stays callable) and they compared unequal, so
+;; (= Rec (class (->Rec 1))) was false and the two spellings were distinct keys in
+;; the same map. =/hash stay in step: the token's identity hash is seeded from its
+;; class name at registration (records.ss deftype-ctor-tag-set!), which costs the
+;; procedure-hash fast path nothing. Half of this pair alone would be worse than
+;; neither — that is the shape that makes a hash container answer nil for a key it
+;; contains.
+(register-eq-arm! (lambda (a b)
+                    (or (and (jclass? a) (procedure? b) (deftype-ctor-tag b) #t)
+                        (and (jclass? b) (procedure? a) (deftype-ctor-tag a) #t)))
+                  (lambda (a b) (let ((ka (class-key a)) (kb (class-key b)))
+                                  (and ka kb (string=? ka kb) #t))))
 (register-hash-arm! jclass? (lambda (x) (jolt-hash (jclass-name x))))
-(register-str-render! jclass? (lambda (x) (string-append "class " (jclass-name x))))
-(register-pr-arm! jclass? (lambda (x) (jclass-name x)))
+;; The nine primitive classes. jolt names them exactly as the JVM does — the
+;; class `long` is spelled "long" — and they are in no class graph row, so this
+;; literal set is what tells them from a reference class.
+(define jclass-primitive-names
+  '("boolean" "byte" "char" "short" "int" "long" "float" "double" "void"))
+(define (jclass-primitive? x)
+  (and (member (jclass-name x) jclass-primitive-names) #t))
+
+;; Class.toString says which kind it is: "interface java.util.List",
+;; "class java.lang.String" — and a primitive, alone, is just its own name
+;; ("long"). ONE renderer, so (str c) and (.toString c) cannot drift: they used
+;; to, with str reading the graph for the interface case and the method always
+;; saying "class".
+(define (jclass-tostring x)
+  (cond ((jclass-primitive? x) (jclass-jvm-name x))
+        ((jch-interface? (jclass-name x)) (string-append "interface " (jclass-jvm-name x)))
+        (else (string-append "class " (jclass-jvm-name x)))))
+(register-str-render! jclass? jclass-tostring)
+(register-pr-arm! jclass? (lambda (x) (jclass-jvm-name x)))
 ;; print/println of a Class prints the bare name (getName), like pr — the JVM's
 ;; print-method for Class ignores *print-readably*. Only str is "class <name>".
 (let ((prev (var-deref "clojure.core" "__print1")))
   (def-var! "clojure.core" "__print1"
-    (lambda (x) (if (jclass? x) (jclass-name x) (jolt-invoke1 prev x)))))
+    (lambda (x) (if (jclass? x) (jclass-jvm-name x) (jolt-invoke1 prev x)))))
 (register-host-methods! "class"
-  (list (cons "getName" (lambda (self) (jclass-name self)))
-        (cons "getCanonicalName" (lambda (self) (jclass-name self)))
-        (cons "getSimpleName" (lambda (self) (hsc-last-segment (jclass-name self))))
-        (cons "toString" (lambda (self) (string-append "class " (jclass-name self))))
+  (list (cons "getName" (lambda (self) (jclass-jvm-name self)))
+        (cons "getCanonicalName" (lambda (self) (hsc-canonical-name (jclass-jvm-name self))))
+        (cons "getSimpleName" (lambda (self) (hsc-simple-name (jclass-jvm-name self))))
+        (cons "toString" jclass-tostring)
         (cons "isArray" (lambda (self) (let ((n (jclass-name self)))
                                          (and (fx>? (string-length n) 0) (char=? (string-ref n 0) #\[)))))
         ;; Class.getComponentType: for an array class returns the element class;
@@ -1767,6 +2071,7 @@
                                       (filter jch-interface?
                                               (jch-direct-supers (jclass-name self)))))))
         (cons "isInterface" (lambda (self) (if (jch-interface? (jclass-name self)) #t #f)))
+        (cons "isPrimitive" (lambda (self) (jclass-primitive? self)))
         ;; isAssignableFrom: the graph's isa?, JVM argument order — self is the
         ;; wanted supertype. class-key so a deftype ctor or a name string on
         ;; either side answers too.
@@ -1775,7 +2080,50 @@
                                      (if (and ka kb (jch-isa? kb ka)) #t #f))))
         (cons "getConstructors" (lambda (self) (class-constructors self)))
         (cons "getDeclaredConstructors" (lambda (self) (class-constructors self)))
-        (cons "getClass" (lambda (self) (make-class-obj "java.lang.Class")))))
+        ;; getModifiers: the JVM bitmask, derived from the class graph (jolt has
+        ;; no bytecode to read one out of). Modifier's predicates read it.
+        (cons "getModifiers" (lambda (self) (->num (jch-modifiers (jclass-name self)))))
+        ;; interned like every other Class token, so (identical? (.getClass String) Class)
+        (cons "getClass" (lambda (self) (jolt-class-for "java.lang.Class")))))
+
+;; ---- java.lang.reflect.Modifier ---------------------------------------------
+;; The bit constants and their predicates, the JVM's values, over whatever int a
+;; caller has — Class.getModifiers here, and a member's modifiers read the same.
+(define (mod-bit? m bit) (if (fx=? 0 (fxand (jnum->exact m) bit)) #f #t))
+;; Modifier.toString's rendering, as a procedure rather than only as a registered
+;; static: the reflective member objects (java/natives-array.ss) spell their own
+;; toString the way the JVM does — "public static final java.lang.Object Foo.BAR" —
+;; and must name the modifiers with the very words Modifier/toString would.
+(define (jmod-string m)
+  (let loop ((ps (list (cons 1 "public") (cons 4 "protected") (cons 2 "private")
+                       (cons 1024 "abstract") (cons 8 "static") (cons 16 "final")
+                       (cons 32 "synchronized") (cons 256 "native") (cons 2048 "strictfp")
+                       (cons 128 "transient") (cons 64 "volatile") (cons 512 "interface")))
+             (acc '()))
+    (if (null? ps)
+        (let ((names (reverse acc)))
+          (if (null? names) ""
+              (fold-left (lambda (a b) (string-append a " " b)) (car names) (cdr names))))
+        (loop (cdr ps) (if (mod-bit? m (caar ps)) (cons (cdar ps) acc) acc)))))
+(register-class-statics! "java.lang.reflect.Modifier"
+  (list (cons "PUBLIC" (->num 1)) (cons "PRIVATE" (->num 2)) (cons "PROTECTED" (->num 4))
+        (cons "STATIC" (->num 8)) (cons "FINAL" (->num 16)) (cons "SYNCHRONIZED" (->num 32))
+        (cons "VOLATILE" (->num 64)) (cons "TRANSIENT" (->num 128)) (cons "NATIVE" (->num 256))
+        (cons "INTERFACE" (->num 512)) (cons "ABSTRACT" (->num 1024)) (cons "STRICT" (->num 2048))
+        (cons "isPublic" (lambda (m) (mod-bit? m 1)))
+        (cons "isPrivate" (lambda (m) (mod-bit? m 2)))
+        (cons "isProtected" (lambda (m) (mod-bit? m 4)))
+        (cons "isStatic" (lambda (m) (mod-bit? m 8)))
+        (cons "isFinal" (lambda (m) (mod-bit? m 16)))
+        (cons "isSynchronized" (lambda (m) (mod-bit? m 32)))
+        (cons "isVolatile" (lambda (m) (mod-bit? m 64)))
+        (cons "isTransient" (lambda (m) (mod-bit? m 128)))
+        (cons "isNative" (lambda (m) (mod-bit? m 256)))
+        (cons "isInterface" (lambda (m) (mod-bit? m 512)))
+        (cons "isAbstract" (lambda (m) (mod-bit? m 1024)))
+        (cons "isStrict" (lambda (m) (mod-bit? m 2048)))
+        ;; Modifier.toString lists the set bits in the JLS's canonical order.
+        (cons "toString" jmod-string)))
 
 ;; ---- constructors as values -------------------------------------------------
 ;; Enough of java.lang.reflect.Constructor to pick a constructor by arity and call
@@ -1807,6 +2155,14 @@
                      (map (lambda (k) (ctor-obj cls k))
                           (filter (lambda (k) (bitwise-bit-set? mask k)) ctor-arity-probe))))))
       (else (jolt-vector)))))
+;; "java.lang.Object, java.lang.Object" — the parameter list a member's toString
+;; prints between its parens. jolt carries no signatures, so every parameter is an
+;; Object; the COUNT is the part that is real, and it is the part a caller reading
+;; the string is looking for.
+(define (jreflect-param-str n)
+  (if (fx=? n 0) ""
+      (let loop ((k (fx- n 1)) (acc "java.lang.Object"))
+        (if (fx=? k 0) acc (loop (fx- k 1) (string-append acc ", java.lang.Object"))))))
 (register-host-methods! "class-ctor"
   (list (cons "getParameterCount" (lambda (self) (->num (vector-ref (jhost-state self) 1))))
         (cons "getParameterTypes"
@@ -1814,8 +2170,22 @@
                 (apply jolt-vector
                        (make-list (vector-ref (jhost-state self) 1) (jolt-class-for "java.lang.Object")))))
         (cons "getDeclaringClass" (lambda (self) (vector-ref (jhost-state self) 0)))
+        ;; Constructor.getName is the DECLARING CLASS's fully qualified name on
+        ;; the JVM, not a member name of its own.
+        (cons "getName" (lambda (self) (jclass-name (vector-ref (jhost-state self) 0))))
+        (cons "getModifiers" (lambda (self) (->num 1)))
+        (cons "getExceptionTypes" (lambda (self) (make-jolt-array (vector) 'objects)))
+        (cons "setAccessible" (lambda (self v) jolt-nil))
         (cons "newInstance" (lambda (self . args) (apply reflect-construct (vector-ref (jhost-state self) 0) args)))
-        (cons "toString" (lambda (self) (jclass-name (vector-ref (jhost-state self) 0))))))
+        ;; the JVM's shape — "public user.Foo(java.lang.Object, java.lang.Object)".
+        ;; It used to print the bare class name, which is also what getName answers,
+        ;; so two constructors of different arity were indistinguishable in output.
+        (cons "toString"
+              (lambda (self)
+                (string-append "public " (jclass-name (vector-ref (jhost-state self) 0))
+                               "(" (jreflect-param-str (vector-ref (jhost-state self) 1)) ")")))))
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "class-ctor")))
+                      (lambda (x) (record-method-dispatch x "toString" jolt-nil)))
 
 ;; ---- clojure.lang.Reflector -------------------------------------------------
 ;; The reflective entry points Clojure code reaches for by name. Each is the
@@ -1824,6 +2194,45 @@
 (define (reflect-args a) (if (jolt-nil? a) '() (seq->list (jolt-seq a))))
 (define (reflect-construct cls . args)
   (apply host-new (if (jclass? cls) (jclass-name cls) (jolt-str-render-one cls)) args))
+;; clojure.lang.Var / Symbol / Keyword statics — all four used to raise "No
+;; dependency provides", and typedclojure gensyms every fresh type variable
+;; through Symbol/intern. Var.find is find-var plus the JVM's missing-namespace
+;; error (find-var answers nil for any missing cell); Var.intern is spelled out
+;; below, where it parts ways with clojure.core/intern. Symbol.intern / create are `symbol` (the first slash
+;; splits the namespace); Keyword.intern is `keyword`; Keyword.find answers only
+;; a keyword the intern table already holds, nil otherwise, as on the JVM.
+(register-class-statics! "clojure.lang.Var"
+  (list (cons "find" (lambda (sym)
+          (let ((sns (symbol-t-ns sym)))
+            (if (and (string? sns) (not (hashtable-ref ns-registry sns #f)))
+                (throw-jvm (quote IllegalArgumentException) (string-append "No such namespace: " sns))
+                (jolt-find-var sym)))))
+        ;; Var.intern is NOT clojure.core/intern: the two-argument overload takes a
+        ;; symbol and findOrCreates the namespace, where clojure.core/intern raises
+        ;; on a missing one; and only the Namespace overload takes a root, so a
+        ;; symbol with one is the JVM's ClassCastException.
+        (cons "intern" (lambda (ns sym . root)
+          (when (and (pair? root) (not (jns? ns)))
+            (throw-jvm (quote ClassCastException)
+                       "class clojure.lang.Symbol cannot be cast to class clojure.lang.Namespace"))
+          (unless (jns? ns) (jolt-create-ns ns))
+          (apply jolt-intern ns sym root)))))
+(register-class-statics! "clojure.lang.Symbol"
+  (list (cons "intern" (lambda args (apply jolt-symbol-new args)))
+        (cons "create" (lambda args (apply jolt-symbol-new args)))))
+(define (keyword-find . args)
+  (let-values (((ns name)
+                (if (= (length args) 2)
+                    (values (let ((n (car args))) (if (jolt-nil? n) #f n)) (jolt-need-string (cadr args)))
+                    (let ((s (jolt-symbol-new (car args))))   ; a symbol, or a string split at its first slash
+                      (values (symbol-t-ns s) (symbol-t-name s))))))
+    (or (if ns
+            (hashtable-ref keyword-table (keyword-intern-key ns name) #f)
+            (hashtable-ref keyword-table-bare name #f))
+        jolt-nil)))
+(register-class-statics! "clojure.lang.Keyword"
+  (list (cons "intern" (lambda args (apply jolt-keyword args)))
+        (cons "find" keyword-find)))
 (register-class-statics! "clojure.lang.Reflector"
   (list (cons "invokeConstructor"
               (lambda (cls args) (apply reflect-construct cls (reflect-args args))))
@@ -1835,6 +2244,17 @@
               (lambda (target method args)
                 (record-method-dispatch target (jolt-str-render-one method)
                                         (list->cseq (reflect-args args)))))))
+;; A deftype/defrecord type token answers every java.lang.Class method, through
+;; the SAME table (class inst) uses — records-dispatch.ss owns the token arm and
+;; loads before this file, so it calls back through here. Returns a one-element
+;; list holding the result (so a nil/#f answer is still a hit) or #f for "no such
+;; method", which is what lets that arm fall through to its own error.
+(set-rd-class-method-hook!
+  (lambda (tag method-name args)
+    (let* ((h (hashtable-ref host-methods-tbl "class" #f))
+           (f (and h (hashtable-ref h method-name #f))))
+      (and f (list (apply f (jolt-class-for tag) args))))))
+
 ;; (class x) on a jclass value returns java.lang.Class, so (instance? Class
 ;; (class y)) and class-based dispatch see the correct JVM class.
 (register-class-arm! jclass? (lambda (x) "java.lang.Class"))
@@ -2158,20 +2578,29 @@
           (let ((as (jch-ancestors-rooted name)))
             (if (null? as) jolt-nil (list->cseq (map jolt-class-for as))))
           jolt-nil))))
-(def-var! "jolt.host" "class-bases"
-  (lambda (x)
-    (let ((name (class-key x)))
-      (if name
-          (let* ((ds (jch-direct-supers name))
-                 ;; a concrete class's bases include its superclass — Object when
-                 ;; nothing more specific is modeled (interfaces have none).
-                 (ds (if (or (string=? name "java.lang.Object")
-                             (jch-interface? name)
-                             (member "java.lang.Object" ds))
-                         ds
-                         (append ds '("java.lang.Object")))))
-            (if (null? ds) jolt-nil (list->cseq (map jolt-class-for ds))))
-          jolt-nil))))
+;; The direct bases of a class as Class objects, superclass first the way the
+;; JVM's `bases` orders them: a concrete class whose row names no concrete super
+;; extends Object, so Object leads its list (interfaces have no superclass and
+;; Object itself none at all). This is clojure.core/bases too — it answered name
+;; STRINGS where supers answered Class objects, so (.getName (first (bases c)))
+;; failed on every class, and typed.clojure's RClass ancestry (Class->symbol
+;; over (bases cls)) with it.
+(define (jolt-class-bases x)
+  (let ((name (class-key x)))
+    (if name
+        (let* ((ds (jch-direct-supers name))
+               ;; jch-superclass is "java.lang.Object" exactly for a known
+               ;; concrete class with no modeled concrete super; #f for Object,
+               ;; an interface, or a name the graph does not model (a fn class
+               ;; keeps its AFunction row and nothing else, as on the JVM).
+               (ds (if (and (equal? (jch-superclass name) "java.lang.Object")
+                            (not (member "java.lang.Object" ds)))
+                       (cons "java.lang.Object" ds)
+                       ds)))
+          (if (null? ds) jolt-nil (list->cseq (map jolt-class-for ds))))
+        jolt-nil)))
+(def-var! "jolt.host" "class-bases" jolt-class-bases)
+(def-var! "clojure.core" "bases" jolt-class-bases)
 ;; is X a class value — a jclass, a deftype ctor, or a name string the host
 ;; graph models?
 (def-var! "jolt.host" "class-value?"
@@ -2191,6 +2620,13 @@
 (register-class-arm!
   (lambda (x) (and (jhost? x) (jhost-fqn (jhost-tag x)) #t))
   (lambda (x) (jhost-fqn (jhost-tag x))))
+;; An iterator is a seq walked by hasNext/next, which is what
+;; clojure.lang.SeqIterator is; the JVM's per-collection inner classes
+;; (PersistentVector$2) have no counterpart in jolt's single representation.
+;; Without a row here (class it) leaked the :object taxonomy keyword and
+;; (instance? java.util.Iterator it) was false — value-host-tags reads the
+;; class arms, so this one row answers class, instance? and protocol dispatch.
+(register-class-arm! jiterator? (lambda (x) "clojure.lang.SeqIterator"))
 ;; sorted collections and transients report their JVM classes. jolt's one
 ;; transient-map representation reports TransientHashMap (the JVM also has
 ;; PersistentArrayMap$TransientArrayMap for small maps).
@@ -2202,7 +2638,7 @@
     (case (jolt-transient-kind x)
       ((vec) "clojure.lang.PersistentVector$TransientVector")
       ;; a transient over an array-mode map carries its insertion order
-      ((map) (if (jolt-transient-ord x)
+      ((map) (if (jolt-transient-array-map? x)
                  "clojure.lang.PersistentArrayMap$TransientArrayMap"
                  "clojure.lang.PersistentHashMap$TransientHashMap"))
       ((set) "clojure.lang.PersistentHashSet$TransientHashSet")
@@ -2281,7 +2717,13 @@
 (register-class-arm! (lambda (x) (jolt-multifn? x)) (lambda (x) "clojure.lang.MultiFn"))
 ;; exact-own-class fallback: (instance? C x) is true when C names x's own class —
 ;; covers checks against a captured (class y) value (transient classes, MultiFn)
-;; that no interface arm models. Widening only.
+;; that no interface arm models. Widening only. The class's ANCESTRY needs no
+;; arm of its own: the interface arm above reads value-host-tags, which derives
+;; from the class graph for every value whose class arm names a modeled class,
+;; so a multimethod is an AFn and a transient is Counted the moment the graph
+;; says so. (An ancestry walk here, ahead of the base, was measured at 1.26x on
+;; an (instance? IPersistentMap a-vector) miss — the value's class name is the
+;; expensive part, and this arm already pays it once.)
 (register-instance-check-arm!
   (lambda (type-sym val)
     (if (symbol-t? type-sym)
@@ -2459,6 +2901,16 @@
 (for-each
   (lambda (nm) (def-var! "clojure.core" nm (jolt-class-for nm)))
   class-fqn-list)
+;; ...and the 96 auto-imports get theirs pinned to the canonical name, last, so
+;; the mapping every namespace has cannot be decided by which class the graph
+;; happened to enumerate first: class-token-alist is first-simple-name-wins over
+;; an unordered hashtable walk, so a same-named class anywhere else in the graph
+;; could otherwise take `Process` or `Package` from java.lang.
+(for-each
+  (lambda (n)
+    (let ((fqn (jolt-default-import-canonical n)))
+      (when (jch-known? fqn) (def-var! "clojure.core" n (jolt-class-for fqn)))))
+  jolt-default-import-names)
 
 ;; --- resolve/ns-resolve return the Class for a class mapping ------------------
 ;; A JVM ns mapping is a var or a Class, and resolve hands back whichever the
@@ -2470,49 +2922,129 @@
 ;;     merely holds a class ((def MyCls String)) keeps resolving to the var,
 ;;     which is what the JVM's def would produce. The name must match the class
 ;;     (FQN or simple), so ->Rec ctor vars stay vars.
-;;   - an unresolved symbol classifies exactly as the analyzer's
-;;     hc-resolve-global :class branches do, through the same jolt-class-for
-;;     interner, so (= (resolve 'X) X) holds for every class form: dotted names
-;;     (java.util.Map), registered short names (an :import), deftype simple names.
+;;   - an unresolved symbol classifies as a class the same way, through the same
+;;     jolt-class-for interner, so (= (resolve 'X) X) holds for every class form
+;;     the asking namespace maps: dotted names (java.util.Map) and the java.lang
+;;     auto-imports.
+;;
+;; Both layers answer the JVM's question, which is per-NAMESPACE: "does this ns
+;; map this name to a class", not "does this class exist". The distinction is not
+;; academic — jolt keeps a class-token var in clojure.core for EVERY class it
+;; models (above) so a bare `Pattern` self-evaluates, and reading those as
+;; mappings made (resolve 'Path) answer in a namespace that never imported
+;; java.nio.file.Path. typedclojure's (u/def-object Path ...) guards on exactly
+;; that resolve before emitting its deftype, so the guard fired, the deftype was
+;; skipped, and the Path-maker it also emits never existed (jolt-17w2).
+(define (rsv-registration-class-name c)
+  (let ((root (var-cell-root c)))
+    (cond ((jclass? root) (jclass-name root))
+          ;; a deftype/defrecord NAME var holds its ctor, which carries the tag
+          ((procedure? root) (deftype-ctor-tag root))
+          (else #f))))
 (define (rsv-registration-class c)
-  (let* ((root (var-cell-root c))
-         (cn (cond ((jclass? root) (jclass-name root))
-                   ((procedure? root) (deftype-ctor-tag root))
-                   (else #f))))
+  (let ((cn (rsv-registration-class-name c)))
     (and cn
          (let ((nm (var-cell-name c)))
            (and (or (string=? nm cn) (string=? nm (hsc-last-segment cn)))
-                root)))))
+                (var-cell-root c))))))
+;; Is that registration a mapping the asking namespace HAS? jolt holds a ns's own
+;; class mappings as cells in that ns — (:import ...) binds the short name there
+;; (natives-str.ss), deftype/defrecord binds its own name there (protocols.ss) —
+;; so a cell found in the asking ns is one by construction. Beyond that only the
+;; two kinds the JVM makes visible everywhere answer: a fully-qualified name, and
+;; the java.lang auto-imports. The clojure.core class tokens for everything else
+;; are the class MODEL and stay invisible to resolve.
+(define (rsv-mapping-visible? c ns)
+  (let ((nm (var-cell-name c)))
+    (or (string=? (var-cell-ns c) ns)
+        (hc-fq-class-name? nm)
+        (and (jolt-default-import-fqn nm) #t))))
 (define (rsv-class-for-name nm)
-  ;; only classes the host actually MODELS answer — the class graph, a
-  ;; statics/ctor registration, or a deftype. The syntactic dotted-name shape
-  ;; is deliberately not enough: resolve is how tooling feature-detects a class
-  ;; (compliment gates its JDK9 module scanner on resolving
+  ;; Only a class the host actually MODELS answers, and the syntactic dotted-name
+  ;; shape is deliberately not enough: resolve is how tooling feature-detects a
+  ;; class (compliment gates its JDK9 module scanner on resolving
   ;; java.lang.module.ModuleFinder), and a token for a class jolt cannot back
-  ;; sends such code down paths that then die on the missing pieces. A symbol
-  ;; in code keeps the syntactic model (hc-resolve-global); resolve answers
-  ;; the narrower "does this class exist here".
-  (cond ((and (hc-fq-class-name? nm)
-              (or (jch-known? nm) (host-class-registered? nm)))
-         (jolt-class-for nm))
-        ((and (fx>? (string-length nm) 0) (char-upper-case? (string-ref nm 0)))
-         (cond ((host-class-has-statics? nm) (jolt-class-for nm))
-               ((chez-deftype-simple->tag nm) => jolt-class-for)
-               (else #f)))
-        (else #f)))
-(define (rsv-through v sym)
+  ;; sends such code down paths that then die on the missing pieces — the
+  ;; instance? macro reads a class answer here as "the symbol evaluates to that
+  ;; class" and emits it unquoted, so answering for an unbacked java.lang name
+  ;; (ExceptionInInitializerError, which nothing registers) turns fipp's
+  ;; (catch ExceptionInInitializerError _) into an unresolved symbol.
+  ;; A symbol in CODE keeps the wider syntactic model (hc-resolve-global).
+  ;; A bare name needs no arm here: every one a namespace maps and jolt models is
+  ;; a cell — an :import, a deftype, or the clojure.core token the class model
+  ;; registers for each auto-import it knows — so jolt-resolve already found it.
+  ;; jch-known-exact?, not jch-known?: the latter falls back to the last dotted
+  ;; segment, so fake.pkg.String answered java.lang.String's registration and
+  ;; resolve handed back a token for a class that exists nowhere — the opposite
+  ;; of the feature-detection answer this is here to give.
+  (and (hc-fq-class-name? nm)
+       (let ((c (if (or (jch-known-exact? nm) (host-class-registered? nm))
+                    nm
+                    ;; the JVM spelling of a deftype in a dashed namespace
+                    ;; (rf.def_two.R3), what a library builds from
+                    ;; (namespace-munge *ns*) — the same class, one token
+                    (jch-registered-name nm))))
+         (and c (jolt-class-for c)))))
+(define (rsv-through v sym ns)
   (cond ((jolt-nil? v)
          (or (and (symbol-t? sym) (not (string? (symbol-t-ns sym)))
                   (rsv-class-for-name (symbol-t-name sym)))
              jolt-nil))
-        ((rsv-registration-class v))
+        ;; a class registration the ns does not map is NOT the var either — the
+        ;; JVM has no such var to hand back, so the answer is nil.
+        ((rsv-registration-class v)
+         => (lambda (root) (if (rsv-mapping-visible? v ns) root jolt-nil)))
         (else v)))
 (def-var! "clojure.core" "resolve"
   (case-lambda
-    ((sym) (rsv-through (jolt-resolve sym) sym))
+    ((sym) (rsv-through (jolt-resolve sym) sym (chez-current-ns)))
     ;; the &env arity: a local named sym answers nil, never a class
     ((env sym) (if (and (pmap? env) (pmap-contains? env sym))
                    jolt-nil
-                   (rsv-through (jolt-resolve env sym) sym)))))
+                   (rsv-through (jolt-resolve env sym) sym (chez-current-ns))))))
 (def-var! "clojure.core" "ns-resolve"
-  (lambda (ns-desig sym) (rsv-through (jolt-ns-resolve ns-desig sym) sym)))
+  (case-lambda
+    ((ns-desig sym)
+     (rsv-through (jolt-ns-resolve ns-desig sym) sym
+                  (jns-name (jolt-the-ns ns-desig))))
+    ;; the &env arity, as on resolve: a local named sym answers nil
+    ((ns-desig env sym)
+     (if (and (pmap? env) (pmap-contains? env sym))
+         jolt-nil
+         (rsv-through (jolt-ns-resolve ns-desig sym) sym
+                      (jns-name (jolt-the-ns ns-desig)))))))
+
+;; --- ns-imports reports the namespace's own class mappings --------------------
+;; A JVM namespace maps class names as well as vars: the java.lang auto-imports
+;; everywhere, an (:import ...) into the ns that asked for it, a deftype/defrecord
+;; into the ns that defines it. ns.ss returns the auto-imports alone because the
+;; class model does not exist yet where it is defined; this reads the other two
+;; back off the namespace itself rather than keeping a second table that could
+;; drift out of step with the cells resolve answers from.
+(define hsc-default-imports
+  (pmap-fold jolt-default-imports
+             (lambda (k v acc) (jolt-assoc acc k (jolt-class-for v)))
+             (jolt-hash-map)))
+(define (hsc-ns-import-class c)
+  ;; the cell is the ns's mapping FOR a class only when it is bound under that
+  ;; class's own simple name, so Foo counts and ->Foo / map->Foo do not.
+  (and (var-cell-defined? c)
+       (let ((cn (rsv-registration-class-name c)))
+         (and cn (string=? (var-cell-name c) (hsc-last-segment cn))
+              (jolt-class-for cn)))))
+(define (hsc-ns-imports . desig)
+  (let ((cns (if (pair? desig) (ns-desig->name (car desig)) (chez-current-ns))))
+    (fold-left (lambda (m c)
+                 (let ((cls (hsc-ns-import-class c)))
+                   (if cls (jolt-assoc m (jolt-symbol #f (var-cell-name c)) cls) m)))
+               hsc-default-imports
+               (ns-cells-list cns))))
+(set! jolt-ns-imports hsc-ns-imports)   ; so ns-map (ns.ss) sees them too
+(def-var! "clojure.core" "ns-imports" hsc-ns-imports)
+;; ...and the other half of that: a cell that IS a class mapping is an import, so
+;; ns-interns / ns-publics / the refers built from clojure.core's publics must not
+;; report it as a var. Without this the class tokens above are public vars of
+;; clojure.core, every namespace refers them, and the refer shadows the very
+;; ns-imports entry this section just built ((ns-map 'user) answered the token var
+;; for String where the JVM answers the class).
+(set! ns-cell-class-mapping? (lambda (c) (and (hsc-ns-import-class c) #t)))

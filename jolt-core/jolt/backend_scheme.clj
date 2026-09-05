@@ -8,7 +8,7 @@
   portable jolt.host form-* contract, the same seam the analyzer uses, so the
   emitter never touches a concrete host representation directly."
   (:require [clojure.string :as str]
-            [jolt.host :refer [form-sym? form-sym-name form-sym-ns form-sym-meta
+            [jolt.host :refer [form-sym? form-sym-name form-sym-ns form-sym-meta seed-callable?
                                form-list? form-vec? form-map? form-set? form-char?
                                form-literal? form-elements form-vec-items
                                form-map-pairs form-set-items form-char-code
@@ -305,9 +305,30 @@
 ;; A pair now survives its chain's return, so the reporter validates the splice
 ;; against the compile-time callsite table (*callsites* / jolt-register-callsite!)
 ;; before accepting it (source-registry.ss jolt-site-splice?).
+;; A node the inline pass copied out of another fn carries :inline-chain — the
+;; logical frames between it and the physical fn it ended up in, innermost first
+;; (jolt.passes.inline stamp-inline). The marker carries the whole chain, so the
+;; reporter can name a spliced site after the fn it came from and still show every
+;; call site above it: a spliced callee has no procedure at runtime, so without
+;; this its frame is named after whatever it was spliced into and located at a
+;; line that fn does not contain.
+(defn- marker-safe-fqn? [q]
+  (and (string? q)
+       (not (or (str/includes? q "|") (str/includes? q "#") (str/includes? q "@")))))
+
+;; "@<fqn>@<line>" per chain entry, innermost first — or nil when the chain is
+;; absent or holds an fqn with one of the marker's own delimiters in it. A var
+;; name may contain almost anything, and a `|`, `#` or `@` would either close the
+;; block comment early (breaking the emitted Scheme) or split a field, so such a
+;; site emits the plain marker: unattributed, exactly as before, never malformed.
+(defn- inline-chain-suffix [node]
+  (let [ch (get node :inline-chain)]
+    (when (and (seq ch) (every? (fn [e] (marker-safe-fqn? (nth e 0))) ch))
+      (apply str (map (fn [e] (str "@" (nth e 0) "@" (nth e 1))) ch)))))
+
 (defn- with-site [node s]
   (if-let [l (and (trace-frames?) (node-line node))]
-    (str "#|L" l "|# " s)
+    (str "#|L" l (or (inline-chain-suffix node) "") "|# " s)
     s))
 
 ;; Source-map registration for a fn def: one hashtable insert at definition time,
@@ -339,6 +360,15 @@
 ;; recursion auto-restores them (no manual save/restore, no throw-leak).
 (def ^:dynamic *recur-target* nil)
 (def ^:dynamic *known-procs* #{})
+;; munged local name -> the Scheme name holding its backing flvector, for the
+;; ^doubles PARAMS of the arities being emitted. emit-arity-clause binds one per
+;; such param at entry ((_av$N (jolt-array-vec-of a))), and a proven aget/aset
+;; on that local indexes it directly instead of re-reading the checked record
+;; accessor per access — bench/arrays 225 -> 145 ms in a Chez probe of the
+;; emitted loop. Every binding form that can SHADOW the param (let, loop, a
+;; nested arity's params, a catch binding) drops the name for its scope, so an
+;; inner `a` bound to some other array never reads the outer one's vector.
+(def ^:dynamic *array-vecs* {})
 ;; When set (in the :def emit path), fns are emitted with a qualified letrec
 ;; binding (ns/name) so Chez reports a unique per-var frame name — no collisions
 ;; across namespaces. Nested/anonymous fns ignore it (they never register).
@@ -366,15 +396,21 @@
 (def ^:dynamic *fnsrc-counter* nil)
 (def ^:dynamic *fnsrc-regs* nil)
 (def ^:dynamic *fnsrc-def-init?* false)
-;; Same split as image-system-ns? in host/chez/state-image.ss: a namespace the
-;; language owns (clojure.core or a clojure.* / jolt.* prefix) keeps its old
-;; emission — the seed mint and the core overlay must stay byte-identical. nil
-;; (no per-form context) counts as system so a bare emit never changes.
-(defn- fnsrc-system-ns? [ns]
-  (or (nil? ns)
-      (= ns "clojure.core")
-      (str/starts-with? ns "clojure.")
-      (str/starts-with? ns "jolt.")))
+;; A fn literal registers its source unless there is no per-form context to name
+;; it by — that is the whole rule now.
+;;
+;; It used to exclude every namespace the language owns (clojure.core and any
+;; clojure.* / jolt.* prefix), to keep the seed mint and the core overlay
+;; byte-identical. The consequence was that a closure clojure.core made could not
+;; be written to a state image at all: `partial`, `comp`, `memoize` and every
+;; lazy seq from an overlay fn refused, and RFC 0009 documented that as a limit
+;; of the format. It is not a limit of the format, it was a limit of the build —
+;; and an image feature that cannot carry core's own closures is not carrying
+;; program state, it is carrying the part of it the compiler found convenient.
+;;
+;; So core's literals register too. The seed prelude grows by their source forms;
+;; that is the price, and it is paid once at mint rather than by every program.
+(defn- fnsrc-system-ns? [ns] (nil? ns))
 ;; True while emitting a node in TAIL position. Only used, in trace mode, to mark a
 ;; tail call so the runtime routes its callee into the current history rib instead
 ;; of a new one (rt.ss). It never affects semantics — a wrong value only mislabels
@@ -484,6 +520,15 @@
 ;; The gensym counter deliberately stays shared on the unit: swap! is atomic, and one
 ;; counter per process is what keeps a registered anon-fn name globally unique.
 (def ^:dynamic *cache-cells* nil)
+
+;; The source names a letrec* group is CURRENTLY initialising (letfn, and the
+;; state-machine loops core.async's CPS transform builds out of it). A literal in
+;; one of those inits may reference a sibling — or itself — and letrec* makes
+;; that legal because the reference is not read until the closure RUNS. Passing
+;; such a name to a maker as an ARGUMENT reads it immediately, while the binding
+;; is still uninitialised, which Chez reports as "variable lp__2 is not bound".
+;; So a literal whose free names meet this set gets no maker. See fnsrc-maker-site.
+(def ^:dynamic *letrec-binders* #{})
 (def ^:dynamic *const-pool* nil)
 
 ;; Emit a def's init (via the supplied thunk) under a fresh cache-cell collector,
@@ -649,7 +694,7 @@
 ;; not use; nothing reads the cells that is not also emitted by the same pass. A
 ;; quoted {:op :recur} still answers true, through the :quote node rather than
 ;; through :src-form — pre-existing, equally harmless, and left alone.
-(def ^:private node-payload-keys #{:src-form :free-names})
+(def ^:private node-payload-keys #{:src-form :free-names :live-names})
 
 (defn- node-tree-any?
   "Does any node in this tree satisfy pred? Walks map values and sequential
@@ -766,12 +811,23 @@
                   "hashtable-ref"
                   ;; top-level def / forward-declare / ns-value splice
                   ;; (emit-def-cached, :forward-decl, :the-ns).
-                  "define" "def-var!" "def-var-with-meta!"
+                  "define" "def-var!" "def-var-plain!" "def-var-with-meta!"
                   "declare-var!" "intern-ns!"
                   ;; ffi lowering (emit-ffi-fn/emit-ffi-callable: the sa-* adapter
                   ;; syntaxes a Chez foreign-procedure/callable expands to).
                   "sa-foreign-procedure" "sa-foreign-procedure-blocking"
-                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"}]
+                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"
+                  "jolt-ffi-native-error-procedure" "call-with-values"
+                  ;; bare :& lowering (emit-ffi-bare-varargs-fn): the dispatcher
+                  ;; spreads the inferred tail with Scheme's own apply, keeping
+                  ;; the fixed arguments as arguments rather than appending them.
+                  "apply"
+                  ;; layout lowering (emit-ffi-layout): the ftype heads the
+                  ;; struct/array metadata is computed with. A local named
+                  ;; ftype-pointer-address answered ITS value as the layout's
+                  ;; :alignment; the other four broke the compile.
+                  "define-ftype" "make-ftype-pointer" "ftype-sizeof"
+                  "ftype-&ref" "ftype-pointer-address"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is
@@ -817,8 +873,11 @@
 ;; way a stray true can't leak into, say, a call sitting in a vector literal.
 ;; :throw is tail-transparent so the :throw emit case still sees *tail?* — a
 ;; TAIL throw must store the site-vreg pair (sited-tail-call) or its TCO-erased
-;; frame has no name at report time (app.tailstale's thrower).
-(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw})
+;; frame has no name at report time (app.tailstale's thrower). :host-call for
+;; the same reason: a (.concat s nil) in tail position raises from inside the
+;; host, and without the site the fn it sat in is the one frame the report
+;; cannot recover.
+(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw :host-call})
 (defn emit [node]
   (let [s (if (and *tail?* (not (tail-transparent-ops (:op node))))
             (binding [*tail?* false] (emit* node))
@@ -858,6 +917,33 @@
 
 (defn- chez-str-lit [s]
   (str "\"" (apply str (map (fn [c] (char-escape (int c))) s)) "\""))
+
+;; Hoist the VAR CELL a late-bound reference reads through, so the name lookup
+;; (string-append + string-hash + a hashtable probe, measured at ~102ns) runs once
+;; per def instead of once per access. Rides the same interning pool as the keyword
+;; literals above, and for the same reason: jolt-var INTERNS, so it already returns
+;; one stable object per ns/name and sharing it across sites changes nothing. Ten
+;; references to clojure.core/str in one def therefore bind one cell, not ten.
+;;
+;; Eager (the pool binds at the top of the def) rather than the lazy
+;; (or cell (set! cell …)) shape this replaces. Three reasons:
+;;   - a cell has no resolution to defer that an (or …) branch could save; the
+;;     lookup is the same lookup whenever it runs,
+;;   - the eager form is an IMMUTABLE binding, so the def's closure needs no
+;;     assignable frame slot, and
+;;   - the emitted text is a quarter the size, which is what kept the seed and
+;;     every built binary from growing.
+;; Interning a cell early is not observable: jolt-var creates an UNBOUND cell, and
+;; ns-publics / ns-interns / ns-map / resolve all filter on var-cell-defined?
+;; (ns.ss ns-vars-pmap-when), so a hoisted reference to a var nothing ever defines
+;; stays invisible exactly as it does today.
+(defn- hoist-var-cell [ns nm]
+  (str "(var-cell-deref " (hoist-const (str "(jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) ")")) ")"))
+;; A direct-linked SEED var: the def binds the var's root procedure once, at
+;; load (jolt-seed-root checks it is one), and the site calls it like any Scheme
+;; procedure. Only where jolt.host/seed-callable? said so — see emit-invoke.
+(defn- hoist-seed-root [ns nm]
+  (hoist-const (str "(jolt-seed-root (jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) "))")))
 
 (defn- emit-const [v]
   (cond
@@ -1101,9 +1187,30 @@
 ;; Scheme `letrec*` binds them so each sees its siblings. A plain let uses let*.
 (defn- emit-let [node]
   (let [kw (if (:letrec node) "letrec*" "let*")
+        bs (:bindings node)
+        names (map #(munge-name (nth % 0)) bs)
+        ;; a binding that reuses a hoisted ^doubles param's name shadows its
+        ;; flvector from there on (*array-vecs*). let* binds sequentially, so
+        ;; each init is emitted under the names bound BEFORE it; letrec* binds
+        ;; every name up front.
+        av-body (apply dissoc *array-vecs* names)
         ;; bindings are non-tail; the body inherits the let's tail position
-        binds (binding [*tail?* false] (str/join " " (mapv emit-binding (:bindings node))))]
-    (str "(" kw " (" binds ") " (emit (:body node)) ")")))
+        binds (binding [*tail?* false
+                        *letrec-binders* (if (:letrec node)
+                                           (into *letrec-binders*
+                                                 (map #(nth % 0) bs))
+                                           *letrec-binders*)]
+                (cond
+                  (empty? *array-vecs*) (str/join " " (mapv emit-binding bs))
+                  (:letrec node) (binding [*array-vecs* av-body]
+                                   (str/join " " (mapv emit-binding bs)))
+                  :else (loop [bs bs av *array-vecs* acc []]
+                          (if (empty? bs)
+                            (str/join " " acc)
+                            (let [b (first bs)
+                                  s (binding [*array-vecs* av] (emit-binding b))]
+                              (recur (rest bs) (dissoc av (munge-name (nth b 0))) (conj acc s)))))))]
+    (str "(" kw " (" binds ") " (binding [*array-vecs* av-body] (emit (:body node))) ")")))
 
 (defn- emit-loop [node]
   (let [label (fresh-label "loop")
@@ -1111,11 +1218,24 @@
         names (map #(munge-name (nth % 0)) pairs)
         ;; inits evaluate in the OUTER scope (recur-target unchanged) and, like
         ;; Clojure loop/let, SEQUENTIALLY — wrap a let* around the named let.
-        inits (binding [*tail?* false] (mapv #(emit (nth % 1)) pairs))
+        ;; sequential, so a loop var reusing a hoisted ^doubles param's name
+        ;; shadows its flvector for the inits after it and for the body
+        ;; (*array-vecs*).
+        inits (binding [*tail?* false]
+                (if (empty? *array-vecs*)
+                  (mapv #(emit (nth % 1)) pairs)
+                  (loop [ps pairs av *array-vecs* acc []]
+                    (if (empty? ps)
+                      acc
+                      (let [p (first ps)
+                            s (binding [*array-vecs* av] (emit (nth p 1)))]
+                        (recur (rest ps) (dissoc av (munge-name (nth p 0))) (conj acc s)))))))
         seq-bs (str/join " " (map (fn [n i] (str "(" n " " i ")")) names inits))
         rebinds (str/join " " (map (fn [n] (str "(" n " " n ")")) names))
         ;; the loop body inherits the loop's tail position
-        body (binding [*recur-target* label] (emit (:body node)))]
+        body (binding [*recur-target* label
+                       *array-vecs* (apply dissoc *array-vecs* names)]
+               (emit (:body node)))]
     (str "(let* (" seq-bs ") (let " label " (" rebinds ") " body "))")))
 
 ;; jolt.ffi/__cfn -> a Chez foreign-procedure (jolt-ffi). The C symbol + types are
@@ -1135,23 +1255,60 @@
    "int64" "integer-64" "uint64" "unsigned-64" "size_t" "size_t" "ssize_t" "ssize_t"
    "iptr" "iptr" "uptr" "uptr" "double" "double" "float" "float"
    "pointer" "void*" "void*" "void*" "string" "string" "void" "void"
-   "uint8" "unsigned-8" "u8" "unsigned-8" "byte" "unsigned-8" "char" "char"})
+   "uint8" "unsigned-8" "u8" "unsigned-8" "byte" "unsigned-8" "char" "char"
+   ;; :bool is a ONE-BYTE C boolean (C99 _Bool / stdbool.h), so it travels as
+   ;; unsigned-8 and the value is converted at the boundary — Chez's own
+   ;; `boolean` foreign type is int-sized, which is the wrong width for _Bool
+   ;; and would read three bytes of whatever sat next to it on a return.
+   "bool" "unsigned-8"})
 (defn- ffi-type->chez [t]
   (or (ffi-types t) (throw (ex-info (str "jolt.ffi: unknown foreign type :" t) {}))))
 
-(defn- emit-ffi-layout-ftype [layout]
-  (str "(struct "
-       (str/join
-        " "
-        (map-indexed
-         (fn [i field]
-           (str "[f" i " "
-                (if (string? (:type field))
-                  (ffi-type->chez (:type field))
-                  (emit-ffi-layout-ftype (:type field)))
-                "]"))
-         (:fields layout)))
-       ")"))
+(defn- emit-ffi-layout-ftype [type]
+  (cond
+    (string? type) (ffi-type->chez type)
+    ;; A union is the same member list under Chez's other aggregate ftype, so it
+    ;; gets its size, alignment and (all-equal) member offsets from ftype-sizeof
+    ;; and ftype-&ref exactly as a struct does — no layout arithmetic here.
+    (or (= :struct (:ffi-kind type)) (= :union (:ffi-kind type)))
+    (str "(" (if (= :union (:ffi-kind type)) "union" "struct") " "
+         (str/join
+          " "
+          (map-indexed
+           (fn [i field]
+             (str "[f" i " " (emit-ffi-layout-ftype (:type field)) "]"))
+           (:fields type)))
+         ")")
+    (= :array (:ffi-kind type))
+    (str "(array " (:count type) " " (emit-ffi-layout-ftype (:type type)) ")")
+    :else
+    (throw (ex-info "jolt.ffi: invalid analyzed layout type" {:type type}))))
+
+(declare ffi-layout-descendant-entries)
+
+(def ^:private ffi-layout-index-marker ::ffi-layout-index)
+
+(defn- ffi-layout-entry [type public-path emitted-path]
+  (cons {:path public-path :emitted-path emitted-path :type type}
+        (ffi-layout-descendant-entries type public-path emitted-path)))
+
+(defn- ffi-layout-descendant-entries [type public-path emitted-path]
+  (cond
+    (string? type) []
+    (or (= :struct (:ffi-kind type)) (= :union (:ffi-kind type)))
+    (mapcat
+     (fn [i field]
+       (ffi-layout-entry (:type field)
+                         (conj public-path (:name field))
+                         (conj emitted-path (str "f" i))))
+     (range (count (:fields type)))
+     (:fields type))
+    (= :array (:ffi-kind type))
+    (ffi-layout-entry (:type type)
+                      (conj public-path ffi-layout-index-marker)
+                      (conj emitted-path 0))
+    :else
+    (throw (ex-info "jolt.ffi: invalid analyzed layout type" {:type type}))))
 
 (defn- ffi-layout-entries
   ([layout] (ffi-layout-entries layout [] []))
@@ -1159,37 +1316,68 @@
    (mapcat
     (fn [i field]
       (let [pp (conj public-path (:name field))
-            ep (conj emitted-path (str "f" i))
-            entry {:path pp :emitted-path ep :type (:type field)}]
-        (if (string? (:type field))
-          [entry]
-          (cons entry (ffi-layout-entries (:type field) pp ep)))))
+            ep (conj emitted-path (str "f" i))]
+        (ffi-layout-entry (:type field) pp ep)))
     (range (count (:fields layout)))
     (:fields layout))))
 
 (defn- emit-layout-path [path]
   (str "(jolt-vector "
-       (str/join " " (map (fn [n] (str "(keyword #f " (chez-str-lit n) ")")) path))
+       (str/join " "
+                 (map (fn [part]
+                        (cond
+                          (= part ffi-layout-index-marker)
+                          "(keyword \"jolt.ffi\" \"index\")"
+                          (string? part)
+                          (str "(keyword #f " (chez-str-lit part) ")")
+                          :else part))
+                      path))
        ")"))
 
-(defn- emit-layout-descriptor [layout]
-  (str "(jolt-vector (keyword #f \"struct\") (jolt-vector "
-       (str/join
-        " "
-        (map (fn [field]
-               (str "(jolt-vector (keyword #f " (chez-str-lit (:name field)) ") "
-                    (if (string? (:type field))
-                      (str "(keyword #f " (chez-str-lit (:type field)) ")")
-                      (emit-layout-descriptor (:type field)))
-                    ")"))
-             (:fields layout)))
-       "))"))
+(defn- ffi-layout-array-entries
+  ([layout] (ffi-layout-array-entries layout []))
+  ([type public-path]
+   (cond
+     (string? type) []
+     (or (= :struct (:ffi-kind type)) (= :union (:ffi-kind type)))
+     (mapcat (fn [field]
+               (ffi-layout-array-entries
+                (:type field) (conj public-path (:name field))))
+             (:fields type))
+     (= :array (:ffi-kind type))
+     (cons {:path public-path :count (:count type) :element-type (:type type)}
+           (ffi-layout-array-entries
+            (:type type) (conj public-path ffi-layout-index-marker)))
+     :else
+     (throw (ex-info "jolt.ffi: invalid analyzed layout type" {:type type})))))
+
+(defn- emit-layout-descriptor [type]
+  (cond
+    (string? type) (str "(keyword #f " (chez-str-lit type) ")")
+    (or (= :struct (:ffi-kind type)) (= :union (:ffi-kind type)))
+    (str "(jolt-vector (keyword #f "
+         (chez-str-lit (if (= :union (:ffi-kind type)) "union" "struct"))
+         ") (jolt-vector "
+         (str/join
+          " "
+          (map (fn [field]
+                 (str "(jolt-vector (keyword #f " (chez-str-lit (:name field)) ") "
+                      (emit-layout-descriptor (:type field)) ")"))
+               (:fields type)))
+         "))")
+    (= :array (:ffi-kind type))
+    (str "(jolt-vector (keyword #f \"array\") "
+         (emit-layout-descriptor (:type type)) " " (:count type) ")")
+    :else
+    (throw (ex-info "jolt.ffi: invalid analyzed layout type" {:type type}))))
 
 (defn- emit-ffi-layout [node]
   (let [layout (:layout node)
         type-name (fresh-label "jolt_ffi_layout")
         align-name (fresh-label "jolt_ffi_layout_align")
         entries (vec (ffi-layout-entries layout))
+        arrays (mapv #(assoc % :element-name (fresh-label "jolt_ffi_layout_element"))
+                     (ffi-layout-array-entries layout))
         base (str "(make-ftype-pointer " type-name " 0)")
         offsets
         (str "(jolt-hash-map "
@@ -1210,10 +1398,34 @@
                         (str (emit-layout-path (:path entry)) " "
                              "(keyword #f " (chez-str-lit (:type entry)) ")")))
                     entries))
+             ")")
+        array-counts
+        (str "(jolt-hash-map "
+             (str/join
+              " "
+              (map (fn [entry]
+                     (str (emit-layout-path (:path entry)) " " (:count entry)))
+                   arrays))
+             ")")
+        array-strides
+        (str "(jolt-hash-map "
+             (str/join
+              " "
+              (map (fn [entry]
+                     (str (emit-layout-path (:path entry))
+                          " (ftype-sizeof " (:element-name entry) ")"))
+                   arrays))
              ")")]
     (str "(let () "
          "(define-ftype " type-name " " (emit-ffi-layout-ftype layout) ") "
          "(define-ftype " align-name " (struct [prefix unsigned-8] [value " type-name "])) "
+         (str/join
+          " "
+          (map (fn [entry]
+                 (str "(define-ftype " (:element-name entry) " "
+                      (emit-ffi-layout-ftype (:element-type entry)) ")"))
+               arrays))
+         (when (seq arrays) " ")
          "(jolt-hash-map "
          "(keyword \"jolt.ffi\" \"layout\") #t "
          "(keyword #f \"descriptor\") " (emit-layout-descriptor layout) " "
@@ -1222,10 +1434,84 @@
          "(ftype-pointer-address (ftype-&ref " align-name " (value) "
          "(make-ftype-pointer " align-name " 0))) "
          "(keyword \"jolt.ffi\" \"offsets\") " offsets " "
+         "(keyword \"jolt.ffi\" \"array-counts\") " array-counts " "
+         "(keyword \"jolt.ffi\" \"array-strides\") " array-strides " "
          "(keyword \"jolt.ffi\" \"types\") " types "))")))
 
 (defn- ffi-by-value? [type]
   (and (map? type) (= :by-value (:ffi-kind type))))
+
+;; The BARE marker — [:string :int :&], babashka.ffi's form where no types follow
+;; and each call's tail is inferred from the values it is given. A
+;; foreign-procedure's types are fixed when it is compiled, so this cannot be one
+;; procedure: it lowers to a variadic lambda over a per-binding cache, which
+;; compiles one foreign-procedure per observed tail shape on first sight and
+;; reuses it after (jolt-ffi-varargs-* in host/chez/java/ffi.ss, where the carrier
+;; table and the costs are written down).
+;;
+;; SHAPE OF THE EMITTED BINDING. A rest-argument lambda would make Chez allocate
+;; a list for the tail on every call, and the dispatcher would then walk it twice
+;; (once to key the shape, once to marshal) and spread it back with `apply` —
+;; about 18ns per tail value, which is most of what a bare marker costs. A tail
+;; of nought to three values is the whole of real usage, so those arities get
+;; their own case-lambda arms that carry the tail as ARGUMENTS: no list is built,
+;; nothing is walked, and the foreign procedure is called directly. Longer tails
+;; fall through to a rest arm that still works the general way.
+;;
+;; The arms and the general path agree on the cache key by construction — the
+;; arity-specialized lookups are the same base-3 fold, unrolled.
+(defn- emit-ffi-bare-varargs-fn [node vi]
+  (let [at (:argtypes node)
+        fixed (subvec at 0 vi)
+        n (count fixed)
+        params (mapv (fn [i] (str "a" i)) (range n))
+        rettype (:rettype node)
+        capture (:capture-native-error node)
+        cache-name (fresh-label "jolt_ffi_varargs")
+        tail-name (fresh-label "jolt_ffi_tail")
+        ;; The fixed arguments convert exactly as they do in a declared-tail
+        ;; binding; only the tail is inferred.
+        native-args
+        (mapv (fn [i param]
+                (cond
+                  (= "string" (nth fixed i)) (str "(jolt-ffi-string->c " param ")")
+                  (= "bool" (nth fixed i)) (str "(jolt-ffi-bool->c " param ")")
+                  :else param))
+              (range n) params)
+        fixed-args (if (seq native-args) (str " " (str/join " " native-args)) "")
+        cache (str "(jolt-ffi-varargs-cache " (chez-str-lit (:csym node))
+                   " (quote (" (str/join " " (map ffi-type->chez fixed)) ")) "
+                   "(quote " (ffi-type->chez rettype) ") " n " "
+                   (if capture "#t" "#f") ")")
+        convert (fn [expr]
+                  (cond
+                    (= "string" rettype) (str "(jolt-ffi-c->string " expr ")")
+                    (= "bool" rettype) (str "(jolt-ffi-c->bool " expr ")")
+                    :else expr))
+        wrap (fn [call]
+               (if capture
+                 (str "(call-with-values (lambda () " call ")"
+                      " (lambda (result native-error)"
+                      " (jolt-vector " (convert "result") " native-error)))")
+                 (convert call)))
+        ;; tail names t1..tk for the specialized arms
+        tvars (fn [k] (mapv (fn [i] (str tail-name "_" (inc i))) (range k)))
+        arm (fn [k]
+              (let [ts (tvars k)]
+                (str "((" (str/join " " (concat params ts)) ") "
+                     (wrap (str "((jolt-ffi-varargs-proc" k " " cache-name
+                                (when (seq ts) (str " " (str/join " " ts))) ")"
+                                fixed-args
+                                (str/join "" (map (fn [t] (str " (jolt-ffi-varargs-arg " t ")")) ts))
+                                ")"))
+                     ")")))
+        rest-arm (str "((" (str/join " " params) " . " tail-name ") "
+                      (wrap (str "(apply (jolt-ffi-varargs-procedure " cache-name " " tail-name ")"
+                                 fixed-args
+                                 " (jolt-ffi-varargs-tail " tail-name "))"))
+                      ")")]
+    (str "(let ((" cache-name " " cache ")) "
+         "(case-lambda " (str/join " " (map arm (range 4))) " " rest-arm "))")))
 
 (defn- emit-ffi-fn [node]
   ;; A "varargs" marker in the argtype vector declares the binding variadic and
@@ -1236,130 +1522,225 @@
   ;; arguments travel where the callee's va_list reads them — Apple arm64
   ;; passes variadic args on the stack, and a fixed-arity binding silently
   ;; corrupts them (fcntl, ioctl, open). C requires a named parameter before
-  ;; the ellipsis, and a trailing marker would declare nothing variadic, so
-  ;; both malformed shapes are rejected. Only supported on the non-blocking
-  ;; path: __collect_safe cannot combine with a varargs convention.
+  ;; the ellipsis, so a leading marker is rejected. Only supported on the
+  ;; non-blocking path: __collect_safe cannot combine with a varargs convention.
+  ;;
+  ;; :& is babashka.ffi's spelling of the same marker and means the same thing
+  ;; here, so a signature written for either FFI declares the same call. The one
+  ;; half of that convention jolt does not have is the BARE marker — babashka's
+  ;; [:string :int :&], where each call infers its own tail from the values —
+  ;; because a foreign-procedure's types are fixed when it is compiled, and there
+  ;; is nothing to compile a new one from at the call. That shape is rejected by
+  ;; name rather than through "unknown foreign type", see below.
   (let [at (:argtypes node)
-        vi (first (keep-indexed (fn [i type] (when (= type "varargs") i)) at))
+        varargs-marker? (fn [type] (or (= type "varargs") (= type "&")))
+        vi (first (keep-indexed (fn [i type] (when (varargs-marker? type) i)) at))
+        marker (when vi (str ":" (nth at vi)))
+        ;; No types after the marker: babashka.ffi's bare form, which infers each
+        ;; call's tail rather than declaring one.
+        bare? (and vi (= vi (dec (count at))))
         ret-aggregate? (ffi-by-value? (:rettype node))]
     (when (and vi (zero? vi))
-      (throw (ex-info "jolt.ffi: :varargs needs at least one fixed argtype before it"
+      (throw (ex-info (str "jolt.ffi: " marker " needs at least one fixed argtype before it")
                       {:argtypes at})))
-    (when (and vi (= vi (dec (count at))))
-      (throw (ex-info "jolt.ffi: :varargs marks the boundary — the variadic argtypes follow it"
+    (when (and bare? (some ffi-by-value? (subvec at 0 vi)))
+      (throw (ex-info (str "jolt.ffi: a fixed by-value aggregate cannot combine with a bare "
+                           marker " — the tail is compiled at the call, and an aggregate"
+                           " argument needs an ftype the binding declared. Declare the tail"
+                           " after the marker.")
                       {:argtypes at})))
     (when (and vi (:blocking node))
-      (throw (ex-info "jolt.ffi: :varargs cannot combine with :blocking" {:argtypes at})))
+      (throw (ex-info (str "jolt.ffi: " marker " cannot combine with :blocking")
+                      {:argtypes at})))
     (when (and vi ret-aggregate?)
-      (throw (ex-info "jolt.ffi: aggregate returns cannot combine with :varargs"
+      (throw (ex-info (str "jolt.ffi: aggregate returns cannot combine with " marker)
                       {:argtypes at})))
     (when (and vi (some ffi-by-value? (subvec at (inc vi))))
       (throw (ex-info "jolt.ffi: aggregate variadic arguments are not supported"
                       {:argtypes at})))
-    (let [types (if vi (vec (concat (subvec at 0 vi) (subvec at (inc vi)))) at)
-          n (count types)
-          params (mapv (fn [i] (str "a" i)) (range n))
-          return-param (when ret-aggregate? "destination")
-          wrapper-params (if return-param (cons return-param params) params)
-          aggregates
-          (->> types
-               (map-indexed (fn [i type]
-                              (when (ffi-by-value? type)
-                                {:index i :name (fresh-label "jolt_ffi_arg")
-                                 :type (:type type)})))
-               (remove nil?)
-               vec)
-          aggregate-by-index (into {} (map (fn [entry] [(:index entry) entry]) aggregates))
-          return-name (when ret-aggregate? (fresh-label "jolt_ffi_return"))
-          emitted-types
-          (mapv (fn [i type]
-                  (if-let [entry (get aggregate-by-index i)]
-                    (str "(& " (:name entry) ")")
-                    (ffi-type->chez type)))
-                (range n) types)
-          emitted-return (if ret-aggregate?
-                           (str "(& " return-name ")")
-                           (ffi-type->chez (:rettype node)))
-          pointer-check
-          (fn [param type-name role]
-            (str "(let ((address (jnum->exact " param "))) "
-                 "(if (= address 0) "
-                 "(throw-jvm 'NullPointerException "
-                 (chez-str-lit (str "jolt.ffi: null by-value " role " pointer")) ") "
-                 "(make-ftype-pointer " type-name " address)))"))
-          ;; A :string argument is wrapped so jolt's nil reaches C as a null
-          ;; char*. Chez's `string` type already accepts #f for that; it just
-          ;; does not know jolt's nil, and raised "invalid foreign-procedure
-          ;; argument" on the sentinel. Plenty of C treats NULL as a real
-          ;; argument (setlocale queries, rlLoadShaderCode's default vertex
-          ;; shader), and binding those as :pointer to get NULL through loses
-          ;; the string marshaling on that parameter.
-          native-args
-          (mapv (fn [i param]
-                  (cond
-                    (get aggregate-by-index i)
-                    (pointer-check param (:name (get aggregate-by-index i)) "aggregate")
+    (if bare?
+      (emit-ffi-bare-varargs-fn node vi)
+      (let [types (if vi (vec (concat (subvec at 0 vi) (subvec at (inc vi)))) at)
+            n (count types)
+            params (mapv (fn [i] (str "a" i)) (range n))
+            return-param (when ret-aggregate? "destination")
+            wrapper-params (if return-param (cons return-param params) params)
+            aggregates
+            (->> types
+                 (map-indexed (fn [i type]
+                                (when (ffi-by-value? type)
+                                  {:index i :name (fresh-label "jolt_ffi_arg")
+                                   :type (:type type)})))
+                 (remove nil?)
+                 vec)
+            aggregate-by-index (into {} (map (fn [entry] [(:index entry) entry]) aggregates))
+            return-name (when ret-aggregate? (fresh-label "jolt_ffi_return"))
+            emitted-types
+            (mapv (fn [i type]
+                    (if-let [entry (get aggregate-by-index i)]
+                      (str "(& " (:name entry) ")")
+                      (ffi-type->chez type)))
+                  (range n) types)
+            emitted-return (if ret-aggregate?
+                             (str "(& " return-name ")")
+                             (ffi-type->chez (:rettype node)))
+            pointer-check
+            (fn [param type-name role]
+              (str "(let ((address (jnum->exact " param "))) "
+                   "(if (= address 0) "
+                   "(throw-jvm 'NullPointerException "
+                   (chez-str-lit (str "jolt.ffi: null by-value " role " pointer")) ") "
+                   "(make-ftype-pointer " type-name " address)))"))
+            ;; A :string argument is wrapped so jolt's nil reaches C as a null
+            ;; char*. Chez's `string` type already accepts #f for that; it just
+            ;; does not know jolt's nil, and raised "invalid foreign-procedure
+            ;; argument" on the sentinel. Plenty of C treats NULL as a real
+            ;; argument (setlocale queries, rlLoadShaderCode's default vertex
+            ;; shader), and binding those as :pointer to get NULL through loses
+            ;; the string marshaling on that parameter.
+            native-args
+            (mapv (fn [i param]
+                    (cond
+                      (get aggregate-by-index i)
+                      (pointer-check param (:name (get aggregate-by-index i)) "aggregate")
 
-                    (= "string" (nth types i))
-                    (str "(jolt-ffi-string-arg " param ")")
+                      (= "string" (nth types i))
+                      (str "(jolt-ffi-string->c " param ")")
 
-                    :else param))
-                (range n) params)
-          native-destination (when ret-aggregate?
-                               (pointer-check return-param return-name "return destination"))
-          conv (if vi (str " (__varargs_after " vi ")") "")
-          signature (str " (" (str/join " " emitted-types) ") " emitted-return)
-          fp (str "(" (if (:blocking node) "sa-foreign-procedure-blocking " "sa-foreign-procedure ")
-                  conv " " (chez-str-lit (:csym node)) signature ")")
-          ;; Preserve the historical global-only path for scalar varargs. A
-          ;; fixed aggregate before :varargs needs scoped lookup because it can
-          ;; only come from a named native library; that address+convention form
-          ;; is covered by the aggregate C witness on each target ABI.
-          scoped (if (and vi (empty? aggregates))
-                   "#f"
-                   (str "(let ((a (jolt-ffi-dlsym-native " (chez-str-lit (:csym node)) "))) "
-                        "(and a (foreign-procedure"
-                        (when (:blocking node) " __collect_safe")
-                        (when vi conv)
-                        " a" signature ")))"))
-          proc (str "(or p (begin (set! p (or " scoped " " fp ")) p))")
-          call-args (if ret-aggregate? (into [native-destination] native-args) native-args)
-          call (str "(" proc
-                    (when (seq call-args) (str " " (str/join " " call-args))) ")")
-          ;; The return direction is the same boundary: Chez hands back #f for a
-          ;; NULL char*, which is Scheme's false, not jolt's nil. getenv of an
-          ;; unset name returned false to Clojure before this.
-          body (cond
-                 ret-aggregate? (str "(begin " call " " return-param ")")
-                 (= "string" (:rettype node)) (str "(jolt-ffi-string-ret " call ")")
-                 :else call)
-          binding (str "(let ((p #f)) (lambda (" (str/join " " wrapper-params) ") " body "))")]
-      (if (or (seq aggregates) ret-aggregate?)
-        (str "(let () "
-             (str/join " "
-                       (concat
-                        (map (fn [entry]
-                               (str "(define-ftype " (:name entry) " "
-                                    (emit-ffi-layout-ftype (:type entry)) ")"))
-                             aggregates)
-                        (when ret-aggregate?
-                          [(str "(define-ftype " return-name " "
-                                (emit-ffi-layout-ftype (:type (:rettype node))) ")")])))
-             " " binding ")")
-        binding))))
+                      ;; :bool is one byte on the wire; jolt truthiness decides it,
+                      ;; so nil and false send 0 and everything else sends 1.
+                      (= "bool" (nth types i))
+                      (str "(jolt-ffi-bool->c " param ")")
+
+                      :else param))
+                  (range n) params)
+            native-destination (when ret-aggregate?
+                                 (pointer-check return-param return-name "return destination"))
+            conv (if vi (str " (__varargs_after " vi ")") "")
+            signature (str " (" (str/join " " emitted-types) ") " emitted-return)
+            csym (chez-str-lit (:csym node))
+            capture (:capture-native-error node)
+            capture-conv (cond
+                           (:blocking node) "__collect_safe"
+                           ;; The outer wrapper already adds one list. A compound
+                           ;; convention needs one more so the adapter receives
+                           ;; (__varargs_after n) as one datum rather than two
+                           ;; flat convention arguments.
+                           vi (str "(__varargs_after " vi ")")
+                           :else "")
+            fp (if capture
+                 (str "(jolt-ffi-native-error-procedure (" capture-conv ") "
+                      csym signature ")")
+                 (str "(" (if (:blocking node)
+                             "sa-foreign-procedure-blocking "
+                             "sa-foreign-procedure ")
+                      conv " " csym signature ")"))
+            ;; Resolution order is the same for every binding, variadic or not:
+            ;; a declared :jolt/native's own dlopen handle first, the
+            ;; process-global table second. A scalar-varargs binding used to skip
+            ;; the scoped branch, which meant a variadic symbol in a library
+            ;; loaded with load-library could not be bound AT ALL -- RTLD_LOCAL
+            ;; keeps it out of the global table, so the name found nothing and
+            ;; the call raised "no entry". curl_easy_setopt is that case. The
+            ;; address+convention form this emits is the one the aggregate C
+            ;; witness already covers on each target ABI.
+            scoped (str "(let ((a (jolt-ffi-dlsym-native " csym "))) "
+                        "(and a "
+                        (if capture
+                          (str "(jolt-ffi-native-error-procedure (" capture-conv ") a"
+                               signature ")")
+                          (str "(foreign-procedure"
+                               (when (:blocking node) " __collect_safe")
+                               (when vi conv)
+                               " a" signature ")"))
+                        "))")
+            proc (str "(or p (begin (set! p (or " scoped " " fp ")) p))")
+            call-args (if ret-aggregate? (into [native-destination] native-args) native-args)
+            call (str "(" proc
+                      (when (seq call-args) (str " " (str/join " " call-args))) ")")
+            ;; The return direction is the same boundary: Chez hands back #f for a
+            ;; NULL char*, which is Scheme's false, not jolt's nil. getenv of an
+            ;; unset name returned false to Clojure before this.
+            body (cond
+                   capture
+                   (str "(call-with-values (lambda () " call ")"
+                        " (lambda (result native-error)"
+                        " (jolt-vector "
+                        (cond
+                          (= "string" (:rettype node)) "(jolt-ffi-c->string result)"
+                          (= "bool" (:rettype node)) "(jolt-ffi-c->bool result)"
+                          :else "result")
+                        " native-error)))")
+
+                   ret-aggregate? (str "(begin " call " " return-param ")")
+                   (= "string" (:rettype node)) (str "(jolt-ffi-c->string " call ")")
+                   (= "bool" (:rettype node)) (str "(jolt-ffi-c->bool " call ")")
+                   :else call)
+            binding (str "(let ((p #f)) (lambda (" (str/join " " wrapper-params) ") " body "))")]
+        (if (or (seq aggregates) ret-aggregate?)
+          (str "(let () "
+               (str/join " "
+                         (concat
+                          (map (fn [entry]
+                                 (str "(define-ftype " (:name entry) " "
+                                      (emit-ffi-layout-ftype (:type entry)) ")"))
+                               aggregates)
+                          (when ret-aggregate?
+                            [(str "(define-ftype " return-name " "
+                                  (emit-ffi-layout-ftype (:type (:rettype node))) ")")])))
+               " " binding ")")
+          binding)))))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the
 ;; collector neither moves nor reclaims it while C may still call through it. The
 ;; expression evaluates to the entry-point address — a jolt pointer the caller
 ;; hands to C. :collect-safe emits the convention that reactivates the thread on
-;; entry, for callbacks invoked while it is parked in a :blocking foreign call.
+;; entry, for a callback arriving on an inactive thread (see jolt/ffi.clj).
+;;
+;; A :string position on a callback needs the same NULL translation a foreign-fn
+;; gets, with the two directions swapped: C is the CALLER here, so a :string
+;; argument converts c->jolt (a null char* arrived as #f, which is jolt false,
+;; not nil) and a :string result converts jolt->c (returning nil raised "invalid
+;; return value" instead of handing C a null char*). Callbacks are where a C API
+;; hands back an optional string — a null path, name or error is ordinary — so
+;; the callback could not model the argument at all, and could not decline to
+;; answer one.
+;;
+;; The wrapper lambda is emitted only when the signature actually mentions
+;; :string; every other callable reaches sa-foreign-callable exactly as before.
 (defn- emit-ffi-callable [node]
-  (str "(jolt-ffi-register-callable! ("
-       (if (:collect-safe node) "sa-foreign-callable-collect-safe " "sa-foreign-callable ")
-       (emit (:fn node))
-       " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
-       (ffi-type->chez (:rettype node)) "))"))
+  (let [argtypes (:argtypes node)
+        rettype (:rettype node)
+        converted? #{"string" "bool"}
+        converted-position? (or (converted? rettype) (some converted? argtypes))
+        target
+        (if-not converted-position?
+          (emit (:fn node))
+          ;; The fn is bound to a fresh name rather than inlined into the lambda
+          ;; body so it is evaluated once, at callable-construction time, not on
+          ;; every call C makes through the entry point.
+          (let [fname (fresh-label "jolt_ffi_cb")
+                params (mapv (fn [i] (str "a" i)) (range (count argtypes)))
+                args (mapv (fn [param type]
+                             (cond
+                               (= "string" type) (str "(jolt-ffi-c->string " param ")")
+                               (= "bool" type) (str "(jolt-ffi-c->bool " param ")")
+                               :else param))
+                           params argtypes)
+                invoke (str "(" fname (when (seq args) (str " " (str/join " " args))) ")")]
+            (str "(let ((" fname " " (emit (:fn node)) ")) "
+                 "(lambda (" (str/join " " params) ") "
+                 (cond
+                   (= "string" rettype) (str "(jolt-ffi-string->c " invoke ")")
+                   (= "bool" rettype) (str "(jolt-ffi-bool->c " invoke ")")
+                   :else invoke)
+                 "))")))]
+    (str "(jolt-ffi-register-callable! ("
+         (if (:collect-safe node) "sa-foreign-callable-collect-safe " "sa-foreign-callable ")
+         target
+         " (" (str/join " " (map ffi-type->chez argtypes)) ") "
+         (ffi-type->chez rettype) "))")))
 
 (defn- emit-recur [node]
   (when-not *recur-target* (throw (ex-info "emit: recur outside a loop/fn target" {})))
@@ -1413,10 +1794,24 @@
         restp (when-let [r (:rest a)] (munge-name r))
         label (fresh-label "fnrec")
         ret (:ret-nhint a)
+        ;; a ^doubles param's backing flvector, bound once per entry — inside the
+        ;; named let, so a fn-level recur that passes a DIFFERENT array rebinds
+        ;; it — and every proven aget/aset on that param indexes it directly
+        ;; (*array-vecs*). The params themselves shadow any outer hoist.
+        ah (into {} (:ahints a))
+        avecs (into {} (keep (fn [o] (when (= :doubles (get ah o))
+                                       [(munge-name o) (fresh-label "_av$")]))
+                             orig))
+        av (merge (apply dissoc *array-vecs* (concat params (when restp [restp]))) avecs)
         ;; the body is the fn's tail position — UNLESS a ^double/^long return hint
         ;; wraps it in a coercion below, which puts the body back in non-tail.
         body-tail? (not (or (= ret :double) (= ret :long)))
-        body (binding [*recur-target* label *tail?* body-tail?] (emit (:body a)))
+        body (binding [*recur-target* label *tail?* body-tail? *array-vecs* av]
+               (emit (:body a)))
+        body (if (seq avecs)
+               (str "(let (" (str/join " " (map (fn [[p v]] (str "(" v " (jolt-array-vec-of " p "))")) avecs))
+                    ") " body ")")
+               body)
         paramlist (cond
                     (and restp (empty? params)) restp
                     restp (str "(" (str/join " " params) " . " restp ")")
@@ -1462,6 +1857,43 @@
 ;; A row that throws leaves whatever it interned before throwing in the pool, so
 ;; the let* can carry a binding nothing references. Dead, valid, and confined to a
 ;; path that is already best-effort.
+;; The per-site makers, as top-level defines. Emitted AHEAD of the registrations
+;; that name them and of the form itself, so a form whose own evaluation creates
+;; one of these closures finds the maker already defined.
+;; A site's MAKER: (lambda (free…) <the literal>), which the site then calls.
+;;
+;; Writing a closure to an image needs its captured values, and Chez hands those
+;; back by POSITION. The NAMES that say which is which are inspector information,
+;; which a release build does not generate — it costs +117% on the compiled
+;; prelude, a debugging model of every procedure, to name the captures of a few
+;; hundred. So `jolt run` refused every closure clojure.core makes (cycle,
+;; repeat, partial, comp) while a default app build, which does generate it,
+;; wrote them fine. The position order is not the source order and is not ours to
+;; predict.
+;;
+;; A maker settles it: every instance of a site comes from one code object, so
+;; the capture layout is a property of the CODE and identical across instances.
+;; The image calls the maker once with distinct sentinels, sees which slot each
+;; landed in, and reads every later instance through that permutation.
+;;
+;; The maker is built HERE, in the site's own scope, and not hoisted to the top of
+;; the form. Hoisting looked cheaper — one maker per form rather than one per
+;; closure — but the emitted body can reference bindings this scope has and that
+;; one does not: a cache cell, and, as core.async's CPS transform showed, the
+;; gensym a `letfn*` binds around a loop. Hoisted, those are unbound at runtime.
+;; Only the FIRST maker is registered (the cell guards it), because all it is used
+;; for is the layout, and every instance shares the code object that decides it.
+(defn- fnsrc-maker-site [nm frees inner]
+  (let [c (fresh-label "_mkc$")
+        v (fresh-label "_mk$")
+        ps (map munge-name frees)
+        args (apply str (map #(str " " %) ps))]
+    (swap! *cache-cells* conj c)
+    (str "(let ((" v " (lambda (" (str/join " " ps) ") " inner "))) "
+         "(if (not " c ") (begin (set! " c " #t) "
+         "(image-fn-form-maker! " (chez-str-lit nm) " " v "))) "
+         "(" v args "))")))
+
 (defn- fnsrc-flush []
   (if (or (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
     ""
@@ -1479,12 +1911,19 @@
                 (reduce
                  (fn [acc row]
                    (let [nm (nth row 0) form (nth row 1) ns (nth row 2) frees (nth row 3)
+                         ;; the optional 5th argument, emitted only when the copy's
+                         ;; captures differ from the source names — so every
+                         ;; un-spliced registration stays byte-identical.
+                         lives (nth row 4)
+                         lives (when (and lives (not= lives frees)) lives)
                          q (try
                              (binding [*quote-shared* (:shared acc)]
                                (let [f (emit-quoted form)]
                                  [f (str "(image-register-fn-form! " (chez-str-lit nm) " "
                                          f " " (chez-str-lit ns) " "
-                                         (emit-quoted frees) ")")]))
+                                         (emit-quoted frees)
+                                         (if lives (str " " (emit-quoted lives)) "")
+                                         ")")]))
                              (catch Exception _ nil))]
                      (if (nil? q)
                        acc
@@ -1522,12 +1961,42 @@
         ;; the unique name is allocated BEFORE the arity bodies emit, so an
         ;; enclosing literal numbers ahead of the literals nested inside it
         ;; (document order — jfn$ns$def$0 is the outermost)
-        fnsrc-nm (when (and (nil? (:name node)) (not def-init?)
-                            (not (fnsrc-system-ns? *fnsrc-ns*)) (:src-form node))
-                   (fnsrc-name))
+        ;; The namespace the literal's SOURCE was written in: this one, or the
+        ;; callee's when the inline pass copied it here. Both are checked against
+        ;; the system split, so a core literal spliced into user code stays
+        ;; unregistered exactly as it is when core runs un-spliced — the language
+        ;; owns those namespaces, and a copy of one is still one of theirs.
+        fnsrc-src-ns (or (:src-ns node) *fnsrc-ns*)
+        ;; A literal registers whether or not it has a NAME. It used to have to be
+        ;; anonymous, because the registry is keyed on the name Chez reports and a
+        ;; named fn is bound under its own munged name, which is not unique -- two
+        ;; `mapi`s in two fns would collide. So a named one is bound under
+        ;; <name>$jf<n> instead and its short name aliases that: unique for the
+        ;; registry, still readable in a backtrace (source-registry strips the
+        ;; suffix, as it already does for the splicer's __ilN).
+        ;;
+        ;; This is what map-indexed, distinct, dedupe, partition-by and tree-seq
+        ;; needed: each closes a lazy-seq thunk over a letfn-bound fn, and that
+        ;; captured fn had no source to rebuild from however well the thunk itself
+        ;; travelled.
+        fnsrc-nm (when (and (not def-init?)
+                            (not (fnsrc-system-ns? *fnsrc-ns*))
+                            (not (fnsrc-system-ns? fnsrc-src-ns))
+                            (:src-form node))
+                   (if (:name node)
+                     (str (munge-name (:name node)) "$jf" (let [n @*fnsrc-counter*]
+                                                            (swap! *fnsrc-counter* inc) n))
+                     (fnsrc-name)))
         clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
                           *trace-site* (or qname self)
                           *trace-self* (cond-> #{} self (conj self) qname (conj qname))
+                          ;; An enclosing letrec's bindings are initialised by the
+                          ;; time anything in THIS body runs, so a literal nested
+                          ;; here may name one — map-indexed's lazy-seq thunk
+                          ;; referencing the letfn-bound mapi is the ordinary case.
+                          ;; The constraint applies only to a literal created
+                          ;; DURING the initialisation, which is this fn itself.
+                          *letrec-binders* #{}
                           *fnsrc-def-init?* false]
                   (mapv emit-arity-clause arities))
         lambda (if (= 1 (count clauses))
@@ -1571,8 +2040,30 @@
         ;; the letrec BODY is where a variadic fn registers, so the binding still
         ;; holds the bare lambda and Chez keeps the frame name.
         (let [ret (if reg-here? (str "(jolt-register-variadic! " variadic-fixed " " m ")") m)]
-          (if qname
+          (cond
+            qname
             (str "(letrec* ((" qname " " lambda ") (" m " " qname ")) " ret ")")
+            ;; a registered inner literal: the lambda sits in the UNIQUE binding
+            ;; (that is what names the procedure), the short name aliases it
+            fnsrc-nm
+            (let [inner (str "(letrec* ((" fnsrc-nm " " lambda ") (" m " " fnsrc-nm ")) "
+                             ret ")")]
+              ;; the same maker treatment as an anonymous literal below, and for
+              ;; the same reason — a letfn-bound fn that a lazy-seq thunk closes
+              ;; over is exactly what map-indexed, distinct and tree-seq capture
+              (if (or (:live-names node) (nil? *cache-cells*)
+                    ;; nothing captured, nothing to recover: the restore wrapper
+                    ;; binds no free names, so this closure never needs a layout
+                    (empty? (:free-names node))
+                    (some *letrec-binders* (:free-names node)))
+                (do (swap! *fnsrc-regs* conj
+                           [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node)
+                            (:live-names node)])
+                    inner)
+                (do (swap! *fnsrc-regs* conj
+                           [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node) nil])
+                    (fnsrc-maker-site fnsrc-nm (:free-names node) inner))))
+            :else
             (str "(letrec ((" m " " lambda ")) " ret ")"))))
       (if (not fnsrc-nm)
         ;; system namespaces, a def's direct init, and ad-hoc fns (contagion
@@ -1589,14 +2080,59 @@
         ;; image. The variadic registration stays in the letrec BODY so the
         ;; binding holds the bare lambda and the name survives (same constraint
         ;; as the named path above).
+        ;; The ns is the one the FORM was written in. For a literal the analyzer
+        ;; produced that is the namespace being compiled; for one the inline pass
+        ;; copied here it is the callee's (:src-ns), and compiling the callee's
+        ;; text in this namespace would resolve its private and aliased names
+        ;; against the wrong map. :live-names says what each source free name
+        ;; became in this copy (a renamed local, or a constant with no capture
+        ;; left) — absent for a literal that was not spliced.
         (let [nm fnsrc-nm
               form (:src-form node)
-              frees (:free-names node)]
-          (swap! *fnsrc-regs* conj [nm form *fnsrc-ns* frees])
-          (if variadic-fixed
-            (str "(letrec ((" nm " " lambda ")) "
-                 "(jolt-register-variadic! " variadic-fixed " " nm "))")
-            (str "(letrec ((" nm " " lambda ")) " nm ")")))))))
+              frees (:free-names node)
+              lives (:live-names node)
+              inner (if variadic-fixed
+                      (str "(letrec ((" nm " " lambda ")) "
+                           "(jolt-register-variadic! " variadic-fixed " " nm "))")
+                      (str "(letrec ((" nm " " lambda ")) " nm ")"))]
+          ;; A MAKER, for every literal that was not spliced: one top-level
+          ;; (lambda (free…) <the literal>) that this site then calls, so the
+          ;; closure comes from a code object the image can reach.
+          ;;
+          ;; Why: writing a closure to an image needs its captured values, and
+          ;; those are read out of the live closure. Chez hands them back by
+          ;; POSITION; the NAMES that say which is which live in inspector
+          ;; information, which a release build does not generate — it costs
+          ;; +117% on the compiled prelude, for a debugging model of every
+          ;; procedure, to name the captures of a few hundred. So `jolt run`
+          ;; refused every closure clojure.core makes (cycle, repeat, partial,
+          ;; comp) while a default app build, which does generate it, wrote them
+          ;; fine. The position order is not the source order and is not ours to
+          ;; predict.
+          ;;
+          ;; A maker settles it without inspector information: every instance of
+          ;; a site shares one code object, so the layout is a property of the
+          ;; code and identical across instances. The image calls the maker once
+          ;; with distinct sentinels, sees which position each landed in, and
+          ;; reads every later instance through that permutation. The cost is one
+          ;; closure per site at first dump and one call per closure creation.
+          ;;
+          ;; A SPLICED copy keeps the old emission: its captures no longer stand
+          ;; in one-to-one correspondence with the source's free names (a binder
+          ;; was renamed, an argument was folded to a constant), which is what
+          ;; :live-names records, so there is no honest parameter list to give a
+          ;; maker. Those still need inspector information, which the builds that
+          ;; splice (an app build, not the seed) generate by default.
+          (if (or lives (nil? *cache-cells*)
+                  (empty? frees)
+                  (some *letrec-binders* frees))
+            ;; no maker: a spliced copy (see above), or a literal emitted outside
+            ;; any cache-cell scope — there would be nowhere to bind one, and a
+            ;; site calling an unbound maker is worse than a closure that refuses.
+            (do (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees lives])
+                inner)
+            (do (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees nil])
+                (fnsrc-maker-site nm frees inner))))))))
 
 ;; If fnode is a clojure.core (or host) ref to a native-op primitive, return the
 ;; Scheme op string — only at an arity where the Scheme op and the jolt fn agree.
@@ -1662,6 +2198,12 @@
     (and (= kind :long) (= nm "dec")) (str "(jolt-l-dec " (first args) ")")
     (and (= kind :long) (= nm "unchecked-inc")) (str "(jolt-uncinc " (first args) ")")
     (and (= kind :long) (= nm "unchecked-dec")) (str "(jolt-uncdec " (first args) ")")
+    (and (= kind :long) (= nm "unchecked-negate")) (str "(jolt-uncneg " (first args) ")")
+    ;; on a proven flonum the unchecked forms are the plain flonum ops: they
+    ;; wrap only longs (jolt-uncinc on 1.5 is 2.5, exactly what fl+ says).
+    (and (= kind :double) (= nm "unchecked-inc")) (str "(" (unsafe-prefix) "fl+ " (first args) " 1.0)")
+    (and (= kind :double) (= nm "unchecked-dec")) (str "(" (unsafe-prefix) "fl- " (first args) " 1.0)")
+    (and (= kind :double) (= nm "unchecked-negate")) (str "(" (unsafe-prefix) "fl- " (first args) ")")
     :else
     (let [op (case kind :double (dbl-ops nm) :long (lng-ops nm) :bigdec (bd-ops nm))
           op (if (= kind :double) (str (unsafe-prefix) op) op)]
@@ -1698,9 +2240,13 @@
         (first args)
         ;; unchecked-subtract at one operand negates, matching both `-` and jolt's
         ;; own overlay ((apply unchecked-subtract [x]) => -x). jolt-uncsub2 has no
-        ;; unary form, so subtract from zero — which wraps identically.
+        ;; unary form, so subtract from zero — which wraps identically. On a
+        ;; proven flonum it is fl-'s own unary negation (a fixnum 0 is not a
+        ;; flonum, and negating keeps -0.0 where 0.0 - x would not).
         (and (= 1 (count args)) (= "unchecked-subtract" nm))
-        (order-args (fn [as] (str "(" op " 0 " (first as) ")")))
+        (order-args (fn [as] (if (= kind :double)
+                               (str "(" op " " (first as) ")")
+                               (str "(" op " 0 " (first as) ")"))))
         :else
         (order-args (fn [as] (str "(" op " " (str/join " " as) ")")))))))
 
@@ -1731,22 +2277,46 @@
 ;; chains at runtime and ballooned the heap on delegation-heavy code — every
 ;; mark op allocated; see rt.ss.) Self-tail calls never reach here (emit-call
 ;; elides them), so a tight self-loop stores once, not per iteration.
-(defn- sited-tail-call [site-qname line callee operand-strs]
+;; The static site pair literal: the cdr is the line, or #(line callee-fqn
+;; call-site-line) when this site is code the inline pass copied out of another
+;; fn — the same shape a trace marker carries, read back by the same accessors
+;; (source-registry jolt-marker-entry-*). Without it a tail site inside a
+;; spliced body reports the fn it was spliced INTO, at a line that fn does not
+;; contain: this is the path the continuation walk cannot cover, because the
+;; tail call erased the frame.
+(defn- site-literal [site-qname line inl-chain]
+  (str "'(" (chez-str-lit site-qname) " . "
+       (if (seq inl-chain)
+         (str "#(" line " ("
+              (str/join " " (map (fn [e] (str "(" (chez-str-lit (nth e 0))
+                                              " . " (nth e 1) ")")) inl-chain))
+              "))")
+         (str line))
+       ")"))
+;; The inline chain a node carries, when every fn in it can be named by a marker.
+(defn- node-inline-chain [node]
+  (let [c (get node :inline-chain)]
+    (when (and (seq c) (every? (fn [e] (marker-safe-fqn? (nth e 0))) c)) c)))
+(defn- sited-tail-call
+  ([site-qname line callee operand-strs] (sited-tail-call site-qname line callee operand-strs nil))
+  ([site-qname line callee operand-strs inl-chain]
   (let [tts (mapv (fn [_] (fresh-label "_tt$")) operand-strs)
         binds (str/join " " (map (fn [t a] (str "(" t " " a ")")) tts operand-strs))
-        site (str "'(" (chez-str-lit site-qname) " . " line ")")]
+        site (site-literal site-qname line inl-chain)]
     (if (seq binds)
       (str "(let* (" binds ") (jolt-site! " site ") " (plain-call callee tts) ")")
-      (str "(begin (jolt-site! " site ") " (plain-call callee operand-strs) ")"))))
+      (str "(begin (jolt-site! " site ") " (plain-call callee operand-strs) ")")))))
 ;; Emit a call. In tail position with tracing on, a call to a DIFFERENT fn than
 ;; the enclosing one stores its site pair (sited-tail-call). Everything else —
 ;; non-tail calls, JOLT_TRACE=0, direct self-tail-calls — is a plain
 ;; application, byte-identical to untraced code.
-(defn- emit-call [tail? callee operand-strs line]
-  (if (and (trace-frames?) tail? *trace-site*
-           (not (contains? *trace-self* callee)))
-    (sited-tail-call *trace-site* line callee operand-strs)
-    (plain-call callee operand-strs)))
+(defn- emit-call
+  ([tail? callee operand-strs line] (emit-call tail? callee operand-strs line nil))
+  ([tail? callee operand-strs line inl-chain]
+   (if (and (trace-frames?) tail? *trace-site*
+            (not (contains? *trace-self* callee)))
+     (sited-tail-call *trace-site* line callee operand-strs inl-chain)
+     (plain-call callee operand-strs))))
 
 (defn- emit-invoke [node]
   (let [tail? *tail?*]           ; capture: children below emit non-tail
@@ -1755,6 +2325,10 @@
         arg-nodes (:args node)
         args (mapv emit arg-nodes)
         tl (or (node-line node) 0)
+        ;; the same stamp with-site folds into the marker; a TAIL site needs it in
+        ;; the site pair instead, because the call erases the frame the marker
+        ;; would have been read against (source-registry jolt-site-frame*)
+        ich (node-inline-chain node)
         ;; R2: record this site's static callee for the callsite table. Runs after
         ;; the args are emitted, so when a line carries both a call and its
         ;; operand's call the OUTER (later-emitted) callee wins — the tail call's.
@@ -1774,7 +2348,7 @@
                                 (str "jolt-invoke" (count args))
                                 "jolt-invoke")]
                    (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
-                                 (fn [operands] (emit-call tail? callee operands tl)))))]
+                                 (fn [operands] (emit-call tail? callee operands tl ich)))))]
     (cond
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
@@ -1863,24 +2437,31 @@
       ;; at a jolt-flaget procedure boundary. An unproven index keeps (jolt-flaget A I),
       ;; which owns the fixnum?/na-idx coercion; the inline flvector-ref's own range
       ;; check is the bounds contract on the hot path (a pre-check regresses ~11%).
+      ;; A ^doubles PARAM (the local is in *array-vecs*) reads the flvector its
+      ;; arity bound at entry; any other proven array re-reads the accessor.
       (:fl-aget node)
-      (order-args
-       (fn [as]
-         (if (:fl-idx-long node)
-           (str "(flvector-ref (jolt-array-vec " (first as) ") " (second as) ")")
-           (str "(jolt-flaget " (str/join " " as) ")"))))
+      (let [an (first arg-nodes)
+            hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))]
+        (order-args
+         (fn [as]
+           (if (:fl-idx-long node)
+             (str "(flvector-ref " (or hv (str "(jolt-array-vec " (first as) ")")) " " (second as) ")")
+             (str "(jolt-flaget " (str/join " " as) ")")))))
       ;; (aset ^doubles a i v): proven index AND :double value (:fl-idx-long +
       ;; :fl-val-double) store inline — (let ((v V)) (flvector-set! (jolt-array-vec A)
       ;; I v) v) — and return the stored value (JVM contract; the let evaluates V once).
       ;; Otherwise keep (jolt-flaset A I V), which owns exact->inexact for a non-double.
       (:fl-aset node)
-      (order-args
-       (fn [as]
-         (if (and (:fl-idx-long node) (:fl-val-double node))
-           (let [v (fresh-label "_v$")]
-             (str "(let ((" v " " (nth as 2) ")) (flvector-set! (jolt-array-vec "
-                  (first as) ") " (second as) " " v ") " v ")"))
-           (str "(jolt-flaset " (str/join " " as) ")"))))
+      (let [an (first arg-nodes)
+            hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))]
+        (order-args
+         (fn [as]
+           (if (and (:fl-idx-long node) (:fl-val-double node))
+             (let [v (fresh-label "_v$")]
+               (str "(let ((" v " " (nth as 2) ")) (flvector-set! "
+                    (or hv (str "(jolt-array-vec " (first as) ")"))
+                    " " (second as) " " v ") " v ")"))
+             (str "(jolt-flaset " (str/join " " as) ")")))))
       (:fl-op node) (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")")))
       ;; hint-directed fast arithmetic: jolt.passes.numeric proved every operand a
       ;; flonum (^double) or fixnum (^long), so emit the Chez fl*/fx* op.
@@ -1938,9 +2519,9 @@
             test (if (= 1 (count tmps)) tests (str "(and " tests ")"))]
         (str "(let* (" binds ") (if " test
              " (" fxop " " (str/join " " tmps) ")"
-             " " (emit-call tail? nop tmps tl) "))"))
+             " " (emit-call tail? nop tmps tl ich) "))"))
       ;; a generic native op.
-      nop (order-args (fn [as] (emit-call tail? nop as tl)))
+      nop (order-args (fn [as] (emit-call tail? nop as tl ich)))
       ;; (:k coll [default]) -> (jolt-get coll :k [default]) — the key (fnode) is a
       ;; const, so only the coll/default args carry order. When the inference typed
       ;; the receiver as a record whose declared fields include :k (it carries the
@@ -1985,7 +2566,7 @@
       ;; holds an arbitrary IFn -> dynamic dispatch.
       (= :local (:op fnode))
       (if (*known-procs* (munge-name (:name fnode)))
-        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as tl)))
+        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as tl ich)))
         (invoke))
       ;; closed-world direct call: the callee var is an app fn def already emitted
       ;; with a Scheme binding — apply it directly, no var lookup, no jolt-invoke.
@@ -1994,7 +2575,21 @@
       ;; below (which still uses the direct binding as the invoke target).
       (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
            (direct-link-fn? (:ns fnode) (:name fnode)))
-      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl)))
+      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl ich)))
+      ;; closed-world direct call to a SEED var — clojure.core and the other
+      ;; namespaces the runtime image boots with. Such a var is preloaded ahead
+      ;; of every app def and never emitted by this build, so the def binds its
+      ;; root procedure once at load and the site applies it directly: no
+      ;; var-cell-deref (7 ns), no jolt-invokeN (5 ns) — true? went 16 -> 4 ns.
+      ;; jolt.host/seed-callable? applies the same closed-world rule an app def
+      ;; gets (not ^:dynamic/^:redef, not redefined by the app) plus "root is a
+      ;; procedure whose arity mask admits this arity", so a keyword/map/multi-
+      ;; method-valued var and a wrong-arity call keep jolt-invoke below. A later
+      ;; alter-var-root / with-redefs of such a var is invisible to this site,
+      ;; exactly as under the JVM's direct linking; `jolt run` never direct-links.
+      (and (= :var (:op fnode)) (direct-link?)
+           (seed-callable? nil (:ns fnode) (:name fnode) (count args)))
+      (order-args (fn [as] (emit-call tail? (hoist-seed-root (:ns fnode) (:name fnode)) as tl ich)))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
@@ -2081,7 +2676,8 @@
                      cl (when (trace-frames?) (fresh-label "_cl$"))
                      body (str "(guard (" raw " (else (let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
                                (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
-                               "(let ((r " (emit (:catch-body node)) ")) "
+                               "(let ((r " (binding [*array-vecs* (dissoc *array-vecs* (munge-name cs) raw)]
+                                            (emit (:catch-body node))) ")) "
                                (if cl (str "(jolt-catch-leave! " cl ") ") "")
                                "(jolt-catch-complete!) r)"
                                (if cl ")" "")
@@ -2177,6 +2773,56 @@
         (str "(begin " c " " base ")")
         base))))
 
+;; (.method target arg*) as a Scheme form. A node carrying :sited-target /
+;; :sited-args (the tail-site emission in emit*) uses those already-bound temps
+;; instead of emitting the receiver and args itself.
+(defn- host-call-emit [node]
+  (let [m (:method node)
+        chez? (not= :gambit (target))
+        t (or (:sited-target node) (emit (:target node)))
+        args (or (:sited-args node) (map emit (:args node)))
+        direct (when chez?
+                 (or (when (= :str (:target-type node))
+                       (string-direct-emit m (count args) t args))
+                     (when (= :kw (:target-type node))
+                       (keyword-direct-emit m (count args) t args))
+                     (when (= :sb (:target-type node))
+                       (sb-direct-emit m (count args) t args))))]
+    (cond
+      direct direct
+      (supported-host-methods m)
+      (str "(jolt-host-call " (chez-str-lit m) " " t
+           (if (empty? args) "" (str " " (str/join " " args))) ")")
+      ;; An UNPROVEN receiver whose method has a string or keyword
+      ;; direct form: test the receiver's type at the site and take
+      ;; that form, with the generic dispatch as the slow arm — the
+      ;; same open-code-the-fast-case shape the bit ops use. Strings
+      ;; and keywords are what library code calls .length/.charAt/
+      ;; .getName on without a hint, and the generic walk cost
+      ;; 60-135 ns per call against 3-11 for the direct form. The
+      ;; receiver and args are bound once, in order, so nothing is
+      ;; evaluated twice and the direct forms may splice `t` freely.
+      ;; A receiver of any other type behaves exactly as before.
+      chez?
+      (let [tt (fresh-label "_ht$")
+            as (mapv (fn [_] (fresh-label "_ha$")) args)
+            sd (string-direct-emit m (count as) tt as)
+            kd (keyword-direct-emit m (count as) tt as)
+            generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
+                         " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
+        (if (or sd kd)
+          (str "(let* ((" tt " " t ")"
+               (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
+               ") (cond"
+               (when sd (str " ((string? " tt ") " sd ")"))
+               (when kd (str " ((keyword-t? " tt ") " kd ")"))
+               " (else " generic ")))")
+          (str "(record-method-dispatch " t " " (chez-str-lit m)
+               " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
+      :else
+      (str "(record-method-dispatch " t " " (chez-str-lit m)
+           " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
+
 (defn emit* [node]
   (case (:op node)
     :const (emit-const (:val node))
@@ -2201,13 +2847,9 @@
              ;; jolt-var-get throws on a forward-declared var). Outside a def,
              ;; resolve per access.
              :else
-             (let [cells *cache-cells*
-                   nslit (chez-str-lit (:ns node)) nmlit (chez-str-lit (:name node))]
-               (if (and (var-cache?) cells)
-                 (let [c (fresh-label "_vc$")]
-                   (swap! cells conj c)
-                   (str "(var-cell-deref (or " c " (let ((_v (jolt-var " nslit " " nmlit "))) (set! " c " _v) _v)))"))
-                 (str "(var-deref " nslit " " nmlit ")")))))
+             (if (and (var-cache?) *const-pool*)
+               (hoist-var-cell (:ns node) (:name node))
+               (str "(var-deref " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) ")"))))
     :the-var (str "(jolt-var " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) ")")
     ;; (set! *var* val) -> set the var's innermost thread binding; throws if none.
     :set-var (str "(jolt-set-var! " (emit (:the-var node)) " " (emit (:val node)) ")")
@@ -2276,11 +2918,33 @@
     ;; operand's own with-site store carries the line. The analyzer stamps :pos
     ;; on call forms, not on throw special forms, so the site line falls back to
     ;; the thrown expression's — (throw (ex-info …)) sits on one line.
+    ;; The chain comes from the same two places the line does — a :throw the
+    ;; inline pass copied carries it, and so does the expression it throws when
+    ;; the throw form itself was not stamped.
     :throw (let [line (or (node-line node) (node-line (:expr node)))
+                 ch (let [c (or (get node :inline-chain) (get (:expr node) :inline-chain))]
+                      (when (and (seq c) (every? (fn [x] (marker-safe-fqn? (nth x 0))) c)) c))
                  e (binding [*tail?* false] (emit (:expr node)))
-                 call (emit-call *tail?* "jolt-throw" [e] (or line 0))]
-             (if (and (trace-frames?) line)
-               (str "#|L" line "|# " call)
+                 call (emit-call *tail?* "jolt-throw" [e] (or line 0) ch)]
+             ;; A macro-built throw has no :pos — `assert` expands to one, and the
+             ;; app.util fixture reaches it through a user macro besides — so a
+             ;; site with a chain but no line still emits a marker, with line 0.
+             ;; 0 is not a line: srcreg-entry-frames drops it and the renderer
+             ;; falls back to the callee's DEFINING line. That is close to, but
+             ;; not always identical to, what the un-inlined build reports — there
+             ;; the frame is located by the nearest marker inside the callee's own
+             ;; compiled body, which for the app.util fixture is the macro's line
+             ;; (64) rather than the defn's (66). The frame is named correctly
+             ;; either way; only a macro-generated site whose neighbours were
+             ;; const-folded away can differ, and it differs by pointing at the fn
+             ;; instead of into the macro that wrote it.
+             ;;
+             ;; Without a chain the lineless case still emits nothing, because
+             ;; there the nearest enclosing marker is a better answer than 0.
+             (if (and (trace-frames?) (or line ch))
+               (str "#|L" (or line 0)
+                    (if ch (apply str (map (fn [x] (str "@" (nth x 0) "@" (nth x 1))) ch)) "")
+                    "|# " call)
                call))
      ;; numeric coercion. A :cast-fn (from a user (double x)/(long x)/… cast)
      ;; emits the checked runtime helper — clojure.core's full JVM semantics —
@@ -2288,7 +2952,15 @@
      ;; The 2-arg :coerce (inlined ^double/^long param or return) has no :cast-fn
      ;; and keeps the hint coercion.
      :coerce (let [e (emit (:expr node))]
-               (cond (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
+               (cond
+                 ;; (long x) and (unchecked-long x) both hand a fixnum back
+                 ;; unchanged, and a fixnum is what a loop counter or a char code
+                 ;; point is: test it here so the common case is a type check,
+                 ;; not a call. The helper still owns every other operand.
+                 (contains? #{"jolt-long-cast" "jolt-unchecked-long"} (:cast-fn node))
+                 (let [t (fresh-label "_lc$")]
+                   (str "(let ((" t " " e ")) (if (fixnum? " t ") " t " (" (:cast-fn node) " " t ")))"))
+                 (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
                      (= :double (:kind node)) (emit-nhint-coerce :double e)
                      (= :long (:kind node)) (emit-nhint-coerce :long e)
                      :else e))
@@ -2302,29 +2974,47 @@
     :bigdec (str "(jolt-bigdec-from-string " (chez-str-lit (:source node)) ")")
     ;; a namespace value spliced into a form (~*ns*) -> reconstruct by name.
     :the-ns (str "(intern-ns! " (chez-str-lit (:name node)) ")")
+     ;; A :target-type direct emit skips record-method-dispatch entirely, so the
+     ;; classes it fires for are the classes a library CANNOT override at runtime
+     ;; (jolt.host/extend-class! rejects them, listed in class-ext-no-override,
+     ;; java/class-extensions.ss). Adding a fourth :target-type here means adding
+     ;; its class there, or an override on it applies at some call sites and not
+     ;; others.
      ;; (.method target arg*) -> jolt-host-call for an rt-shimmed method, else
      ;; record-method-dispatch (a reify/record protocol method). A target PROVEN
      ;; a string (:target-type :str) or a keyword (:kw) on the Chez target emits
      ;; that native directly — no dispatch walk, no rest-args vector. The emitted
      ;; target is bound as `t` rather than `target` so the host predicate
      ;; `(target)` stays reachable in this scope.
-     :host-call (let [m (:method node)
-                      chez? (not= :gambit (target))
-                      t (emit (:target node))
-                      args (map emit (:args node))
-                      direct (when chez?
-                               (or (when (= :str (:target-type node))
-                                     (string-direct-emit m (count args) t args))
-                                   (when (= :kw (:target-type node))
-                                     (keyword-direct-emit m (count args) t args))
-                                   (when (= :sb (:target-type node))
-                                     (sb-direct-emit m (count args) t args))))]
-                  (if direct direct
-                      (if (supported-host-methods m)
-                        (str "(jolt-host-call " (chez-str-lit m) " " t
-                             (if (empty? args) "" (str " " (str/join " " args))) ")")
-                        (str "(record-method-dispatch " t " " (chez-str-lit m)
-                             " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
+     ;; In tail position with tracing on, the receiver and args are bound first
+     ;; and the site pair stored before the call (the same shape as
+     ;; sited-tail-call, for the same reason: a callee's own tail sites must not
+     ;; stomp the slot). The host raising from inside that call — string-append
+     ;; on nil — is then reported at this fn and line, TCO having erased the
+     ;; frame. Untraced and non-tail emission is byte-identical to before.
+     :host-call (let [tail? *tail?*
+                      sited? (and (trace-frames?) tail? *trace-site*)]
+                 (binding [*tail?* false]
+                  (if sited?
+                    ;; A bare local or a constant runs no tail site, so it is
+                    ;; spliced as it is; only an operand that can call is bound
+                    ;; to a temp. (Keeps a proven-keyword (.sym k) at the exact
+                    ;; inline shape the build smoke pins.)
+                    (let [trivial? (fn [n] (contains? #{:local :const} (:op n)))
+                          bind (fn [n] (let [e (emit n)]
+                                         (if (trivial? n) [nil e] [(fresh-label "_hs$") e])))
+                          [tt t] (bind (:target node))
+                          bs (mapv bind (:args node))
+                          as (mapv (fn [[l e]] (or l e)) bs)
+                          binds (str/join " " (keep (fn [[l e]] (when l (str "(" l " " e ")")))
+                                                    (cons [tt t] bs)))
+                          site (site-literal *trace-site* (or (node-line node) 0)
+                                             (node-inline-chain node))
+                          call (host-call-emit (assoc node :sited-target (or tt t) :sited-args as))]
+                      (if (seq binds)
+                        (str "(let* (" binds ") (jolt-site! " site ") " call ")")
+                        (str "(begin (jolt-site! " site ") " call ")")))
+                    (host-call-emit node))))
     :let (emit-let node)
     :loop (emit-loop node)
     :recur (emit-recur node)
@@ -2363,7 +3053,7 @@
                      (str "(def-var-with-meta! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
                           (emit-with-cells #(emit (:init node))) " " (emit-def-meta node) ")")
                      :else
-                     (str "(def-var! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
+                     (str "(def-var-plain! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
                           (emit-with-cells #(emit (:init node))) ")"))
                    creg (trace-callsite-reg)
                    freg (fnsrc-flush)]
@@ -2382,7 +3072,7 @@
 
 ;; ^:dynamic / ^:redef on a def opts it out of direct-linking: it stays redefinable,
 ;; so callers must go through the var cell. m is a def's :meta (a jolt map value).
-(defn- dl-opt-out? [m] (or (get m :dynamic) (get m :redef)))
+(defn- dl-opt-out? [m] (jolt.ir/closed-world-opt-out? m))
 
 ;; Per-form entry used by the image/build emitter. In direct-link mode a TOP-LEVEL
 ;; def (form root, or spliced from a top-level do) without an opt-out also binds
@@ -2452,7 +3142,7 @@
         (str "(begin" freg " (define " b " " init ") (def-var-with-meta! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b " " (emit-def-meta node) ")"
              (or reg "") (or vreg "") creg ")")
-        (str "(begin" freg " (define " b " " init ") (def-var! "
+        (str "(begin" freg " (define " b " " init ") (def-var-plain! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") creg ")"))
       (jmeta-nonempty? (:meta node))
       (if (= (str creg freg) "")
@@ -2462,9 +3152,9 @@
           (str "(begin" freg " (let ((" v " (def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")))" creg " " v "))")))
       :else
       (if (= (str creg freg) "")
-        (str "(def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")")
+        (str "(def-var-plain! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")")
         (let [v (fresh-label "_dv$")]
-          (str "(begin" freg " (let ((" v " (def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
+          (str "(begin" freg " (let ((" v " (def-var-plain! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
 
 (defn emit-top-form [node]
   (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node))
@@ -2487,9 +3177,10 @@
                 (emit-def-cached node)
                 :else (emit-top-cells node #(emit node)))
           freg (fnsrc-flush)]
-      (if (= freg "") scm
+      (cond
+        (= freg "") scm
           ;; registrations run BEFORE the form: they are static data with no
           ;; dependency on the form's evaluation, and the form itself may dump a
           ;; closure it just created — the registration must already be there.
           ;; begin keeps the form's value as the result.
-          (str "(begin" freg " " scm ")")))))
+        :else (str "(begin" freg " " scm ")")))))

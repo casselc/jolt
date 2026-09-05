@@ -104,6 +104,23 @@
 ;; drop every type a case defined; pruning the tree alone would leave this index
 ;; answering for types that no longer exist, so the two are pruned through one
 ;; entry point rather than by remembering to do both.
+;; Forget everything registered against ONE type tag: its protocols, its methods,
+;; the by-method index, the class-answer memo and any devirt clone. A deftype
+;; redefinition is a new class on the JVM — neither the previous definition's
+;; own methods nor an extend-type made against it carries over — and jolt kept
+;; them, so a method the new definition does not declare still answered
+;; (jolt-lnwq). make-deftype-ctor calls this when a fresh descriptor replaces an
+;; existing one, before the new definition's registrations run.
+;; The epoch bump is what retires the per-site inline caches that resolved an
+;; impl this drops.
+(define (forget-type-methods! type-tag)
+  (jolt-with-mutex rec-tbl-mu
+    (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+    (hashtable-delete! type-registry type-tag)
+    (hashtable-delete! type-method-index type-tag)
+    (hashtable-delete! type-class-memo type-tag)
+    (hashtable-delete! clone-registry type-tag)))
+
 (define (prune-type-registry! keep?)
   (vector-for-each
     (lambda (k)
@@ -170,7 +187,14 @@
         (jolt-with-mutex rec-tbl-mu
           (let ((pt (or (jrdesc-ptable desc)
                         (let ((h (make-eq-hashtable))) (jrdesc-ptable-set! desc h) h))))
-            (hashtable-set! pt k fn))))))
+            (hashtable-set! pt k fn))))
+      ;; A type declaring its own clojure.lang.ILookup masks its fields from the
+      ;; get path (records.ss jrdesc-mask-fields!) — that valAt is the only key
+      ;; lookup the JVM gives a bare deftype, so it answers for a field-named key
+      ;; too. A defrecord keeps its generated field-first lookup, and its
+      ;; register-record-type! has already run by the time its methods register.
+      (when (and (string=? method "valAt") (chez-type-owns-lookup? type-tag))
+        (jrdesc-mask-fields! desc))))
   ;; a (re)registration of this impl invalidates any contagion clone built for it —
   ;; the clone captured the prior body. Keyed exactly (type/proto/method) so a
   ;; sibling type's clone survives; devirt-resolve-fl then falls back to devirt-resolve.
@@ -293,12 +317,30 @@
                      (let ((t (car ts)))
                        (if (or (string=? t "Object") (member t acc)) acc (cons t acc)))))))))
 
+;; A class's tags with jolt's EXTRA spellings for the same representation spliced
+;; in behind the class's own two: one Chez flonum answers for Double and Float,
+;; one exact integer for Long and Integer. jch-tags is (fqn simple ancestors…
+;; "Object"), so keeping the first two ahead of the extras leaves the concrete
+;; class outranking both the supersets and the ancestry in dispatch order.
+(define (jch-tags-plus name extra)
+  (let ((ts (jch-tags name)))
+    (if (or (null? ts) (null? (cdr ts)))
+        (append ts extra)
+        (cons (car ts) (cons (cadr ts) (append extra (cddr ts)))))))
+
 ;; host type-tag candidates for a non-record value (extend-protocol on builtins).
 (define (value-host-tags obj)
   ;; numbers dispatch by actual type (a Double is NOT a Long): flonum -> Double,
   ;; exact ratio -> Ratio, exact integer -> Long.
-  (cond ((flonum? obj) '("Double" "Float" "Number" "Object"))
-        ((and (number? obj) (exact? obj) (not (integer? obj))) '("Ratio" "Number" "Object"))
+  ;;
+  ;; Every arm reads the class graph, so a scalar carries the SAME ancestry
+  ;; isa?/supers report for its class and instance? (which answers from this
+  ;; list) cannot disagree with them. These arms used to carry hand-written tag
+  ;; lists that stopped at Number / CharSequence, so (instance? Comparable 1) was
+  ;; false while (isa? Long Comparable) was true — and a protocol extended to an
+  ;; interface a number implements never reached one.
+  (cond ((flonum? obj) (jch-tags-plus "java.lang.Double" '("java.lang.Float" "Float")))
+        ((and (number? obj) (exact? obj) (not (integer? obj))) (jch-tags "clojure.lang.Ratio"))
         ;; exact integers split at the LONG RANGE (issue #627), the same
         ;; boundary the printer's N suffix uses — NOT the fixnum range: Chez
         ;; fixnums are 61-bit, so Long/MAX_VALUE is a Chez bignum that must
@@ -309,11 +351,11 @@
         ;; superset. (instance? BigInt 21) is false on the JVM and now here.
         ((and (number? obj) (exact? obj) (integer? obj))
          (if (jolt-bigint-print? obj)
-             '("BigInt" "BigInteger" "Number" "Object")
-             '("Long" "Integer" "Number" "Object")))
-        ((number? obj) '("Number" "Object"))
-        ((string? obj) '("String" "CharSequence" "Object"))
-        ((boolean? obj) '("Boolean" "Object"))
+             (jch-tags-plus "clojure.lang.BigInt" '("java.math.BigInteger" "BigInteger"))
+             (jch-tags-plus "java.lang.Long" '("java.lang.Integer" "Integer"))))
+        ((number? obj) (jch-tags "java.lang.Number"))
+        ((string? obj) (jch-tags "java.lang.String"))
+        ((boolean? obj) (jch-tags "java.lang.Boolean"))
         ((char? obj) (jch-tags "java.lang.Character"))
         ((keyword? obj) (jch-tags "clojure.lang.Keyword"))
         ((jolt-symbol? obj) (jch-tags "clojure.lang.Symbol"))
@@ -326,7 +368,7 @@
         ;; on the concrete PersistentVector does NOT catch it (issue #629)
         ((jolt-subvec-view? obj) (jch-tags "clojure.lang.APersistentVector$SubVector"))
         ((pvec? obj) (jch-tags "clojure.lang.PersistentVector"))
-        ((pmap? obj) (if (pmap-order obj)
+        ((pmap? obj) (if (pmap-array? obj)
                         (jch-tags "clojure.lang.PersistentArrayMap")
                         (jch-tags "clojure.lang.PersistentHashMap")))
         ((pset? obj) (jch-tags "clojure.lang.PersistentHashSet"))
@@ -353,14 +395,17 @@
         ((and (procedure? obj) (deftype-ctor-tag obj))
          '("Class" "java.lang.Class" "Object"))
         ;; a named fn reports its own JVM-style class "ns$munged-name" (the same
-        ;; (class the-fn) yields) ahead of the generic IFn tags, so a protocol
-        ;; extended to a SPECIFIC fn's class dispatches on it — schema keys its
-        ;; primitive schemas by (class @(resolve 'double)) and friends.
+        ;; (class the-fn) yields) ahead of AFunction's ancestry from the class
+        ;; graph, so a protocol extended to a SPECIFIC fn's class dispatches on
+        ;; it — schema keys its primitive schemas by (class @(resolve 'double))
+        ;; and friends. The ancestry is the same list an anonymous fn reports
+        ;; below; a hand-copied list here had no Comparator, Runnable or
+        ;; Callable, so (instance? java.util.Comparator inc) was false while
+        ;; (instance? java.util.Comparator (fn [a b] 0)) was true.
         ((and (procedure? obj) (hashtable-ref proc-name-tbl obj #f))
          => (lambda (p)
-              (list (string-append (class-munge-name (car p)) "$" (class-munge-name (cdr p)))
-                    "AFunction" "clojure.lang.AFunction" "AFn" "clojure.lang.AFn"
-                    "IFn" "clojure.lang.IFn" "Fn" "clojure.lang.Fn" "Object")))
+              (cons (string-append (class-munge-name (car p)) "$" (class-munge-name (cdr p)))
+                    (jch-tags "clojure.lang.AFunction"))))
         ;; a value-layer shim value (java.time.*, URI, ByteBuffer, java.io reader/
         ;; writer, ArrayList/HashMap, …) reports its class's whole ancestry from the
         ;; single jhost-tag->fqn registry (class-hierarchy.ss). So (extend-protocol
@@ -429,8 +474,28 @@
         ;; a namespace value is clojure.lang.Namespace — (class *ns*) already says
         ;; so, and clojure.datafy extends Datafiable to it.
         ((jns? obj) (jch-tags "clojure.lang.Namespace"))
+        ;; anything else that reports a modeled class — an agent, a volatile, a
+        ;; delay, a future, a promise, a reduced box, a chunk buffer, a ref —
+        ;; dispatches as that class and its ancestry: the class arms name it
+        ;; (host-class.ss) and the graph carries its supers, so an extension on
+        ;; clojure.lang.Volatile, or on IDeref for any of them, reaches the
+        ;; value. The same class instance? reads. A value naming no modeled
+        ;; class stays a plain Object; this is the last arm, so only values
+        ;; every arm above declined pay for the lookup. jolt-class-name is the
+        ;; java host layer's (host-class.ss, loaded after this file); the Gambit
+        ;; runtime shares this file and shims it to answer no class (rt-core.ss).
+        ((let ((n (jolt-class-name obj))) (and (string? n) (jch-known-exact? n) n))
+         => jch-tags)
         (else '("Object"))))
 
+
+;; assoc every entry of a map onto a record — the __extmap of the record
+;; class's full constructor, carried as extension fields.
+(define (jrec-assoc-entries r ext)
+  (let loop ((s (jolt-seq ext)) (r r))
+    (if (jolt-nil? s) r
+        (let ((e (seq-first s)))
+          (loop (jolt-seq (seq-more s)) (jolt-assoc r (jolt-nth e 0) (jolt-nth e 1)))))))
 
 ;; ---- the native that handles the analyzer/overlay call ----------------------
 ;; make-deftype-ctor: (name-sym field-kws field-tags field-muts) -> ctor closure.
@@ -453,29 +518,51 @@
           ;; the same tag can install its desc between this read and this write
           ;; and have its ptable invalidated by us right after, leaving the live
           ;; desc permanently on the slow path.
+          ;; a redefinition drops what the previous definition registered, so the
+          ;; new one starts from nothing — see forget-type-methods!
+          (_ (when (hashtable-ref chez-tag-desc tag #f) (forget-type-methods! tag)))
           (_ (jolt-with-mutex rec-tbl-mu
                (let ((old-desc (hashtable-ref chez-tag-desc tag #f)))
                  (when old-desc (jrdesc-ptable-set! old-desc #f)))
                (hashtable-set! chez-tag-desc tag desc)))
+          ;; A redefinition, or an extend-type that named this tag before the
+          ;; type existed, may already have registered a valAt for it: the fresh
+          ;; descriptor has to arrive masked, since register-protocol-method's
+          ;; mask ran against the descriptor that is now gone.
+          (_ (when (chez-type-owns-lookup? tag) (jrdesc-mask-fields! desc)))
          (nf (length kws))
          ;; the ctor var's name, baked at definition (the JVM ArityException
          ;; names the positional ctor: "… passed to: ns/->Name").
          (ctor-name (string-append (chez-current-ns) "/->" (symbol-t-name name-sym)))
+           (build (lambda (args)
+                    (let ((v (make-vector nf jolt-nil)))
+                      (let loop ((as args) (i 0))
+                        (if (or (null? as) (fx=? i nf)) (make-jrec desc v jolt-nil)
+                            (let ((a (car as)))
+                             (vector-set! v i
+                                          (if (and (fx< i ndbl) (vector-ref dbl-flags i)
+                                                   (number? a) (not (flonum? a)))
+                                              (exact->inexact a) a))
+                             (loop (cdr as) (+ i 1))))))))
            (ctor (lambda args
-                   ;; validate arg count — must match declared field count exactly
-                   (when (not (= (length args) nf))
-                     (throw-jvm (quote ArityException)
-                       (string-append "Wrong number of args (" (number->string (length args))
-                                      ") passed to: " ctor-name)))
-                   (let ((v (make-vector nf jolt-nil)))
-                     (let loop ((as args) (i 0))
-                       (if (null? as) (make-jrec desc v jolt-nil)
-                           (let ((a (car as)))
-                            (vector-set! v i
-                                         (if (and (fx< i ndbl) (vector-ref dbl-flags i)
-                                                  (number? a) (not (flonum? a)))
-                                             (exact->inexact a) a))
-                            (loop (cdr as) (+ i 1)))))))))
+                   (let ((n (length args)))
+                     (cond
+                       ((= n nf) (build args))
+                       ;; A record class has a second constructor on the JVM:
+                       ;; the fields, then __meta and __extmap. (R. f1 .. fn m
+                       ;; ext) is what a macro building records without the
+                       ;; positional factory emits (typed.clojure's create-expr
+                       ;; expands to `new` with all eight).
+                       ((and (= n (+ nf 2)) (hashtable-ref chez-record-type-tbl tag #f))
+                        (let* ((r (build args))
+                               (m (list-ref args nf))
+                               (ext (list-ref args (+ nf 1)))
+                               (r (if (jolt-nil? ext) r (jrec-assoc-entries r ext))))
+                          (if (jolt-nil? m) r (jolt-with-meta r m))))
+                       (else
+                        (throw-jvm (quote ArityException)
+                          (string-append "Wrong number of args (" (number->string n)
+                                         ") passed to: " ctor-name))))))))
     ;; Register the ctor under its fully-qualified tag ("ns.Name") — a bare
     ;; (Name. …) in the DEFINING ns is qualified to this by the analyzer, so a
     ;; deftype whose simple name collides with a built-in host class (tools.reader's
@@ -619,12 +706,36 @@
     (let ((ti (hashtable-ref type-registry tag #f)))
       (when ti (let ((pi (hashtable-ref ti proto-name #f)))
                  (when pi (hashtable-set! pi extend-mark #t)))))))
+;; A deftype named by its JVM spelling — the namespace munged, rf.def_two.R3 for
+;; the tag rf.def-two.R3 — is what a library computes from (namespace-munge *ns*)
+;; and how typedclojure's subtype table spells every type-rep class. The tag.
+(define (deftype-tag-for-jvm-name type-name)
+  (and (not (hashtable-ref chez-deftype-tag-set type-name #f))
+       (let ((c (jch-registered-name type-name)))
+         (and c (not (string=? c type-name))
+              (hashtable-ref chez-deftype-tag-set c #f)
+              c))))
+;; The class the extending namespace MAPS type-name to: an :import binds the short
+;; name to the class token (natives-str.ss chez-runtime-import), and its registered
+;; name is the tag. This is the JVM's first question for a bare name
+;; (Compiler.maybeClass reads the ns mapping before trying Class.forName). A var
+;; holding a class answers too — a superset: the JVM reads only a class mapping
+;; here and rejects the var.
+(define (ns-mapped-class-tag type-name)
+  (let ((cell (var-cell-lookup (chez-current-ns) type-name)))
+    (and cell
+         (let ((v (var-cell-root cell)))
+           (and (jclass? v) (jclass-name v))))))
 (define (register-method type-name proto-name method-name fn)
-  (let* ((host (canonical-host-tag type-name))
+  (let* ((type-name (or (deftype-tag-for-jvm-name type-name) type-name))
+         (host (canonical-host-tag type-name))
          (local (string-append (chez-current-ns) "." type-name))
          ;; a host class -> its canonical tag; a deftype defined in THIS ns -> the
-         ;; local tag; an :import-ed deftype from another ns -> its real tag via the
-         ;; simple-name index; otherwise the local tag (a forward extend).
+         ;; local tag; a deftype the ns imported -> the class it maps; a deftype
+         ;; from another ns by simple name -> its tag via the simple-name index.
+         ;; Anything else is "Unable to resolve classname", as the JVM raises at
+         ;; load time — never a registration under a tag no value carries, which
+         ;; surfaced as "No method" at the first dispatch instead.
          (tag (cond (host host)
                     ((hashtable-ref chez-deftype-tag-set local #f) local)
                     ;; a deftype named by its FULLY-QUALIFIED name — the tag
@@ -634,8 +745,10 @@
                     ;; prefixed with the EXTENDING ns and the impl is filed under
                     ;; a tag no value carries.
                     ((hashtable-ref chez-deftype-tag-set type-name #f) type-name)
+                    ((ns-mapped-class-tag type-name))
                     ((hashtable-ref chez-simple-name-tag type-name #f))
-                    (else local))))
+                    (else (throw-jvm 'IllegalArgumentException
+                            (string-append "Unable to resolve classname: " type-name))))))
     (register-protocol-method tag proto-name method-name fn)
     (mark-extend! tag proto-name)
     jolt-nil))
@@ -814,3 +927,23 @@
 (define (devirt-resolve-fl type-tag proto-name method-name obj)
   (or (find-clone type-tag proto-name method-name)
       (devirt-resolve type-tag proto-name method-name obj)))
+
+
+;; ---- compare over a declared Comparable ------------------------------------
+;; clojure.core/compare calls compareTo on anything that implements Comparable
+;; (Util.compare's ((Comparable) o1).compareTo(o2)), and a deftype/defrecord that
+;; declares the interface is exactly that. Without this arm the type's own
+;; compareTo was reachable as (.compareTo a b) but invisible to compare — so
+;; sort, sorted-set and sorted-map-by all raised "cannot be compared to" on
+;; values that carry an ordering, and (into (sorted-set) types) — how
+;; typedclojure builds every union — could not be evaluated at all.
+;;
+;; Registered here rather than in converters.ss because it needs the protocol
+;; registry, and it goes through find-method-any-protocol so a compareTo declared
+;; under any interface the type implements answers, the same lookup
+;; record-method-dispatch performs for the direct call.
+(define (jrec-comparable-method v)
+  (and (jrec? v) (find-method-any-protocol (jrec-tag v) "compareTo")))
+(register-compare-arm!
+  (lambda (a b) (and (jrec-comparable-method a) #t))
+  (lambda (a b) (jnum->exact (jolt-invoke (jrec-comparable-method a) a b))))

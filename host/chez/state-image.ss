@@ -32,10 +32,14 @@
 ;; nil to every lookup in the restoring process. A version-3 reader refuses
 ;; these images by the header check instead of restoring the record inert.
 ;;
-;; This build still READS versions 2 and 3: everything they can contain
+;; Version 7: a map's record is chez-pmap-v5 — an array-mode map is a flat k/v
+;; slot vector, where formats 6 and older carried a trie root plus an order
+;; list (chez-pmap-v4). Those restore through image-legacy-pmap? below.
+;;
+;; This build still READS versions 2 to 6: everything they can contain
 ;; (including raw jolt-ref-v1 records) restores here via the legacy arms.
-(define jolt-image-format-version 5)
-(define jolt-image-read-versions '(2 3 4 5))
+(define jolt-image-format-version 7)
+(define jolt-image-read-versions '(2 3 4 5 6 7))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -61,7 +65,13 @@
       (keyword? x)
       (and (hashtable? x) (not (image-eq-hashtable? x)))
       (port? x)
-      (thread? x)))
+      (thread? x)
+      ;; A var-rooted multimethod or reify: code, like a named fn, and written the
+      ;; same way -- as the var's name through the fn-ref descriptor. code-value?
+      ;; is a two-predicate check and runs before the table lookup, so this costs
+      ;; a walked value nothing it did not already pay (jolt-2cny).
+      (jns? x)
+      (and (code-value? x) (proc-name-of x) #t)))
 
 ;; A record's fields for image purposes: its own AND every parent's, root first —
 ;; the order record-constructor takes them in. record-type-field-names reports only
@@ -119,9 +129,36 @@
         (loop (cdr p)
               (if (string=? acc "") (car p) (string-append acc " -> " (car p)))))))
 
+;; Why an unregistered PROCEDURE cannot be written, and what to do instead. A fn
+;; is writable only through its recorded source (:src-form + :free-names, emitted
+;; by the back end's fnsrc registration); an unregistered one has nothing to
+;; rebuild from.
+;;
+;; A fn literal the compiler SPLICED is registered like any other (the copy
+;; carries its own capture list — see image-recover-free-values), so inlining is
+;; no longer a way to land here. What is: a fn the language itself built rather
+;; than analyzed from a literal, one whose namespace is not registered at all
+;; (the core tier), and one whose source form holds a value the back end could
+;; not render, which drops the registration at emit.
+;; Empty for a non-procedure, whose refusal has nothing to do with any of this.
+(define (image-unregistered-fn-hint x)
+  (if (procedure? x)
+      (string-append
+        ": this fn has no recorded source, so there is nothing to rebuild it from."
+        " Anonymous fns written in your own namespaces travel; ones the runtime"
+        " built for you do not. Store a top-level fn, or the data to rebuild one.")
+      ""))
+
 (define (image-describe-obj x)
   (cond
     ((procedure? x) "#<procedure>")
+    ;; Never PRINT a seq to describe it. Printing forces it, and an unrealized
+    ;; one can be infinite -- (image-scan (repeat :z)) would hang instead of
+    ;; reporting. A description exists to identify the object, and this does.
+    ;; Reachable since an unwritable lazy cell is refused as ITSELF rather than
+    ;; as the anonymous procedure inside it (jolt-zr91).
+    ((jolt-lazyseq? x) "#<lazy-seq>")
+    ((cseq? x) "#<seq>")
     ((port? x) "#<port>")
     ((thread? x) "#<thread>")
     ((hashtable? x) "#<hashtable>")
@@ -229,10 +266,17 @@
     (cond
       (h (list 'handler (jolt-invoke (cadr h) x)))
       ((keyword? x) (list 'kw (keyword-t-ns x) (keyword-t-name x)))
-      ((procedure? x)
+      ;; a namespace is interned by name, exactly like a keyword: a fasl copy
+      ;; would be a SECOND `user` that merely = the live one, where find-ns is
+      ;; identity-stable and a var round-trips to the identical var (jolt-ji1h)
+      ((jns? x) (list 'ns (jns-name x)))
+      ;; A named fn travels as its var's name. So does any other CODE value some
+      ;; var roots -- a multimethod, a reify -- which is not a procedure but is
+      ;; equally something the restoring build already has (rt.ss code-value?).
+      ;; A bare closure has no stable identity to write, so it is refused here
+      ;; and reported with its path.
+      ((or (procedure? x) (proc-name-of x))
        (let ((p (proc-name-of x)))
-         ;; A named fn travels as its var's name. A bare closure has no stable
-         ;; identity to write, so it is refused here and reported with its path.
          (and p (list 'fn-ref (car p) (cdr p)))))
       ;; A non-eq hashtable is refused rather than described. Its contents would
       ;; have to ride in the descriptor stream, which is written WITHOUT an
@@ -246,6 +290,7 @@
   (case (car d)
     ;; back through the intern table, so the restored keyword IS the live one
     ((kw) (keyword (cadr d) (caddr d)))
+    ((ns) (intern-ns! (cadr d)))
     ((fn-ref)
      (let ((c (var-cell-lookup (cadr d) (caddr d))))
        (if (and c (not (jolt-var-unbound? (var-cell-root c))))
@@ -253,17 +298,17 @@
            (jolt-throw (jolt-ex-info
                          (string-append "image: no var " (cadr d) "/" (caddr d)
                                         " in this build to restore a function reference")
-                         jolt-nil)))))
+                         empty-pmap)))))
     ((handler)
      (let loop ((hs image-handlers))
        (if (null? hs)
-           (jolt-throw (jolt-ex-info "image: no handler registered to restore a resource" jolt-nil))
+           (jolt-throw (jolt-ex-info "image: no handler registered to restore a resource" empty-pmap))
            ;; restore fns are tried in registration order; the first that accepts wins
            (let ((r (call/cc (lambda (k)
                       (with-exception-handler (lambda (e) (k 'image-no))
                         (lambda () (jolt-invoke (caddr (car hs)) (cadr d))))))))
              (if (eq? r 'image-no) (loop (cdr hs)) r)))))
-    (else (jolt-throw (jolt-ex-info "image: unknown external descriptor" jolt-nil)))))
+    (else (jolt-throw (jolt-ex-info "image: unknown external descriptor" empty-pmap)))))
 
 ;; --- R2: substitution pre-pass --------------------------------------------------
 ;; A var root a handler claimed, replaced by the handler's plain-data payload.
@@ -326,6 +371,23 @@
   (fields (mutable val))
   (nongenerative image-ref-v1))
 
+;; A mutex or condition variable, standing in for one in the written graph. Chez
+;; fasls a mutex without complaint and the copy is NOT a live primitive -- but an
+;; uncontended acquire on the copy SUCCEEDS, so nothing goes wrong until
+;; something actually waits, and then it is "mutex-acquire: failed: Invalid
+;; argument" from whichever thread reached it first, with no path and no name.
+;;
+;; kind is 'mutex or 'condition; restore mints a fresh live one. Substituting at
+;; the WALK rather than through a walker arm per bearing type makes it total:
+;; jolt-promise, jolt-future, jolt-agent, the per-node lock on a lazy cell and on
+;; a seq, async channels, the tap queue and the fibers queues all carry one, and
+;; a record added later carries it correctly without anyone reading this file.
+;; jolt-atom and jolt-ref rebuild through their own constructors and so were
+;; always right; they are the shape this generalizes (jolt-ojoh).
+(define-record-type image-sync
+  (fields kind)
+  (nongenerative image-sync-v1))
+
 ;; A raw jolt-ref record in a format-2 image (v0.6.5/v0.6.6). The live runtime
 ;; type is jolt-ref-v2, so the fasl's nongenerative jolt-ref-v1 rtd (fields:
 ;; val lock) materializes from the image without conflict and its instances
@@ -352,6 +414,36 @@
                      (string=? (substring n 0 9) "chez-jrec")))))))
 (define (legacy-ref-val x)
   ((record-accessor (record-rtd x) 0) x))
+;; A map from an image written before the flat array-mode representation
+;; (format <= 6): chez-pmap-v4's layout is (root cnt order hasheq all-kw), where
+;; root is a trie in BOTH modes and `order`, for an array-mode map, the
+;; (key . value) pairs in reverse insertion order (#f in hash mode). The tag
+;; bumped, so the fasl materializes the old rtd and its instances answer #f to
+;; pmap?. Detected by uid prefix like a legacy jrec and rebuilt through the
+;; old rtd's accessors: an array-mode map's pairs become its slot vector, a
+;; hash-mode root is kept as is — hnode/hcoll are unchanged, so it IS a
+;; current trie.
+(define (image-legacy-pmap? x)
+  (and (record? x) (not (pmap? x))
+       (let ((uid (record-type-uid (record-rtd x))))
+         (and (symbol? uid)
+              (let ((n (symbol->string uid)))
+                (and (fx>=? (string-length n) 9)
+                     (string=? (substring n 0 9) "chez-pmap")))))))
+(define (legacy-pmap->pmap x)
+  (let* ((rtd (record-rtd x))
+         (root ((record-accessor rtd 0) x))
+         (cnt ((record-accessor rtd 1) x))
+         (ord ((record-accessor rtd 2) x)))
+    (if (or (pair? ord) (null? ord))
+        (let* ((ps (reverse ord)) (n (length ps)) (arr (make-vector (fx* 2 n))))
+          (let loop ((ps ps) (i 0))
+            (unless (null? ps)
+              (vector-set! arr i (caar ps))
+              (vector-set! arr (fx+ i 1) (cdar ps))
+              (loop (cdr ps) (fx+ i 2))))
+          (make-pmap arr n))
+        (make-pmap root cnt))))
 
 ;; A resource the dump could not write (port, thread, non-eq hashtable,
 ;; unregistered closure) that stub mode substitutes in place of a refusal. id
@@ -475,8 +567,10 @@
   (guard (e (#t #f))
     (let* ((info (sa-procedure-info x))
            (nm (and info (car info))))
+      ;; No prefix test: an anonymous literal is bound under jfn$..., a NAMED one
+      ;; under <name>$jf<n>, and the registry lookup is the real question either
+      ;; way -- a name nothing registered simply misses.
       (and (string? nm)
-           (image-string-prefix? nm "jfn$")
            (let ((reg (image-fn-form-lookup nm)))
              (and reg (cons nm reg)))))))
 
@@ -499,24 +593,90 @@
 ;; failure returns 'image-no (the caller refuses) — never a crash, never a
 ;; silent partial; the free-value walk itself is unguarded so a refusal on a
 ;; nested free value keeps its own, more specific path.
-(define (image-recover-free-values x frees walk path)
+;; Which closure SLOT holds each of a site's free names, as a list index-aligned
+;; with free-names. Derived once per site and cached on the registration.
+;;
+;; Chez hands a closure's captures back by position; the names that say which is
+;; which are inspector information, which a release build does not generate (it
+;; costs +117% on the compiled prelude to name a few hundred captures out of
+;; every procedure in core). So `jolt run` could not write any closure
+;; clojure.core makes — cycle, repeat, partial, comp — while a default app build,
+;; which does generate it, wrote them fine.
+;;
+;; The maker settles it. Every instance of a site comes from one code object, so
+;; the capture layout is a property of the CODE and identical across instances:
+;; call the maker once with distinct sentinels, see which slot each landed in,
+;; and read every later instance through that permutation. 'none when there is no
+;; maker, when the probe cannot be read, or when a sentinel does not appear at
+;; all — Chez dropped a capture the body never uses, and guessing which of the
+;; remaining slots is which is exactly the wrong answer to give a restore.
+(define (image-fnsrc-layout reg)
+  (let ((cached (image-fn-form-layout reg)))
+    (if cached
+        cached
+        (let ((mk (image-fn-form-maker reg)))
+          (let ((v (if (not mk)
+                       'none
+                       (guard (e (#t 'none))
+                         (let* ((frees (vector-ref reg 2))
+                                (n (let loop ((f (jolt-seq frees)) (k 0))
+                                     (if (jolt-nil? f) k (loop (jolt-next f) (fx+ k 1)))))
+                                (sent (let loop ((i 0) (acc '()))
+                                        (if (fx=? i n)
+                                            (reverse acc)
+                                            (loop (fx+ i 1) (cons (list 'jolt-fnsrc-probe i) acc)))))
+                                (slots (sa-procedure-free-values (apply mk sent))))
+                           (if (not slots)
+                               'none
+                               (let ((perm (map (lambda (s)
+                                                  (let loop ((l slots) (i 0))
+                                                    (cond ((null? l) #f)
+                                                          ((eq? (car l) s) i)
+                                                          (else (loop (cdr l) (fx+ i 1))))))
+                                                sent)))
+                                 (if (memq #f perm) 'none perm))))))))
+            (image-fn-form-layout-set! reg v)
+            v)))))
+
+(define (image-recover-free-values x reg frees lives walk path)
   (call/cc
     (lambda (refuse)
       (define (refuse-on-fail thunk)
         (guard (e (#t (refuse 'image-no))) (thunk)))
-      (let* ((info (refuse-on-fail (lambda () (sa-procedure-info x))))
-             (tbl (begin (unless info (refuse 'image-no))
+      (let* ((layout (and reg (let ((l (image-fnsrc-layout reg))) (and (pair? l) l))))
+             (slots  (and layout (sa-procedure-free-values x)))
+             (info (refuse-on-fail (lambda () (sa-procedure-info x))))
+             ;; No inspector information at all is fatal only when there is no
+             ;; layout to read positions through.
+             (tbl (begin (unless (or info layout) (refuse 'image-no))
                          (let ((h (make-hashtable string-hash string=?)))
-                           (for-each (lambda (p) (hashtable-set! h (car p) (cdr p)))
-                                     (cdr info))
+                           (when info
+                             (for-each (lambda (p) (hashtable-set! h (car p) (cdr p)))
+                                       (cdr info)))
                            h))))
-        (let loop ((s (jolt-seq frees)) (acc '()))
-          (if (jolt-nil? s)
+        ;; frees and lives run in lockstep: frees names the wrapper parameter (and
+        ;; the error message), lives says where this one's value comes from — a
+        ;; variable in the live closure, or, for a spliced copy whose constant
+        ;; argument left no capture, a one-element vector holding the value.
+        (let loop ((fs (jolt-seq frees)) (ls (jolt-seq lives)) (k 0) (acc '()))
+          (if (jolt-nil? fs)
               (list->vector (reverse acc))
-              (let* ((orig (jolt-first s))
-                     (val (hashtable-ref tbl
-                                         (refuse-on-fail (lambda () (image-munge orig)))
-                                         'image-missing)))
+              (let* ((orig (jolt-first fs))
+                     (live (if (jolt-nil? ls) orig (jolt-first ls)))
+                     (val (if (string? live)
+                              (let ((byname (hashtable-ref
+                                              tbl
+                                              (refuse-on-fail (lambda () (image-munge live)))
+                                              'image-missing)))
+                                ;; the name table first (it is exact when present),
+                                ;; the site's learned layout when it has nothing
+                                (if (and (eq? byname 'image-missing) layout slots)
+                                    (let ((idx (list-ref layout k)))
+                                      (if (and idx (fx<? idx (length slots)))
+                                          (list-ref slots idx)
+                                          'image-missing))
+                                    byname))
+                              (refuse-on-fail (lambda () (jolt-nth live 0))))))
                 ;; A name the source references but the compiled closure does not
                 ;; carry: const-folding baked its value into the code (a let-bound
                 ;; constant, a provably-dead branch), so the value is UNRECOVERABLE
@@ -525,7 +685,7 @@
                 ;; naming the capture, so the failure is at dump time and actionable.
                 (if (eq? val 'image-missing)
                     (refuse (cons 'image-folded orig))
-                    (loop (jolt-next s)
+                    (loop (jolt-next fs) (if (jolt-nil? ls) ls (jolt-next ls)) (fx+ k 1)
                           (cons (walk val (cons (string-append "free:" orig) path))
                                 acc))))))))))
 
@@ -537,7 +697,8 @@
                              (vector-ref (cdr reg) 1) (vector-ref (cdr reg) 2)
                              (vector))))
     (hashtable-set! memo x r)
-    (let ((fvs (image-recover-free-values x (vector-ref (cdr reg) 2) walk path)))
+    (let ((fvs (image-recover-free-values x (cdr reg) (vector-ref (cdr reg) 2)
+                                          (vector-ref (cdr reg) 3) walk path)))
       (cond
         ((vector? fvs)
          (image-fnsrc-free-values-set! r fvs)
@@ -559,12 +720,12 @@
                                           "' was optimized into the compiled code, so its value"
                                           " cannot be recovered from the live closure —"
                                           " store a named fn, or the data to rebuild one")
-                           jolt-nil))))
+                           empty-pmap))))
         (else
          (jolt-throw (jolt-ex-info
                        (string-append "image: cannot write " (image-describe-obj x)
                                       " at " (image-path->string path))
-                       jolt-nil)))))))
+                       empty-pmap)))))))
 
 ;; A condition's human text, best effort — jolt ex-info and raw Chez
 ;; conditions both pass through here on the restore failure path.
@@ -596,7 +757,7 @@
                                    (image-fnsrc-name x) " from source"
                                    " (a tree-shaken build that dropped the compiler"
                                    " cannot restore images holding anonymous fns)")
-                    jolt-nil)))
+                    empty-pmap)))
     (let* ((frees (image-fnsrc-free-names x))
            (params (let loop ((s (jolt-seq frees)) (acc '()))
                      (if (jolt-nil? s)
@@ -610,7 +771,7 @@
                                                            (image-fnsrc-name x) " in ns "
                                                            (image-fnsrc-ns x) ": "
                                                            (image-condition-text e))
-                                            jolt-nil))))
+                                            empty-pmap))))
                   (ce wrapper (image-fnsrc-ns x)))))
       (apply jolt-invoke wfn tfvs))))
 
@@ -619,7 +780,7 @@
 (define (image-restore-handler payload)
   (let loop ((hs image-handlers))
     (if (null? hs)
-        (jolt-throw (jolt-ex-info "image: no handler registered to restore a resource" jolt-nil))
+        (jolt-throw (jolt-ex-info "image: no handler registered to restore a resource" empty-pmap))
         (let ((r (call/cc (lambda (k)
                    (with-exception-handler (lambda (e) (k 'image-no))
                      (lambda () (jolt-invoke (caddr (car hs)) payload)))))))
@@ -712,12 +873,20 @@
                      ;; a ref descriptor re-mints a live ref; a raw jolt-ref-v1
                      ;; record from a format-2 image re-mints through the
                      ;; legacy arm (same construction, val read via its own rtd)
+                     ((and (eq? mode 'restore) (image-sync? x))
+                      (if (eq? (image-sync-kind x) 'condition) (make-condition) (make-mutex)))
                      ((and (eq? mode 'restore) (image-ref? x))
                       (walk-ref-restore (image-ref-val x) x path))
                      ((and (eq? mode 'restore) (image-legacy-ref? x))
                       (walk-ref-restore (legacy-ref-val x) x path))
                      ((and (eq? mode 'restore) (image-legacy-jrec? x))
                       (walk-legacy-jrec x path))
+                     ;; a pre-format-7 map, or a set over one, re-minted into
+                     ;; the current representation and then walked like any map
+                     ((and (eq? mode 'restore) (image-legacy-pmap? x))
+                      (walk-legacy-pmap x path))
+                     ((and (eq? mode 'restore) (pset? x) (image-legacy-pmap? (pset-m x)))
+                      (walk-legacy-pmap x path))
                      ;; a stub with a matching resolver becomes the live value it
                      ;; stands for; without one it stays the inert record — the
                      ;; per-restore table (populated by restore-world!) lists it
@@ -729,7 +898,7 @@
                                                        (number->string (image-stub-id x))
                                                        " (" (image-stub-kind x) "): "
                                                        (image-condition-text e))
-                                        jolt-nil))))
+                                        empty-pmap))))
                                        (jolt-invoke r (image-stub-info x)))))
                               (hashtable-set! memo x v)
                               v)
@@ -763,8 +932,9 @@
                               (jolt-throw
                                 (jolt-ex-info
                                   (string-append "image: cannot write " (image-describe-obj x)
-                                                 " at " (image-path->string path))
-                                  jolt-nil)))
+                                                 " at " (image-path->string path)
+                                                 (image-unregistered-fn-hint x))
+                                  empty-pmap)))
                              (else
                               (hashtable-set! memo x #t)
                               (report! x path (image-report-disposition mode)))))
@@ -775,9 +945,16 @@
                            (if (image-rebuild-mode? mode)
                                (image-fnsrc-build x v walk memo path
                                                   (if (eq? mode 'rebuild-stub) make-stub #f))
+                               ;; the REAL walk, not a stub: a captured value can
+                               ;; itself be unwritable (a letfn fn a lazy-seq
+                               ;; thunk closes over), and passing (lambda (fv p) #t)
+                               ;; meant scan never looked -- it reported a value
+                               ;; clean that dump then refused, which is exactly
+                               ;; the scan/dump disagreement the shared verdict
+                               ;; above exists to prevent.
                                (let ((probe (image-recover-free-values
-                                              x (vector-ref (cdr v) 2)
-                                              (lambda (fv p) #t) path)))
+                                              x (cdr v) (vector-ref (cdr v) 2)
+                                              (vector-ref (cdr v) 3) walk path)))
                                  (hashtable-set! memo x #t)
                                  (if (vector? probe)
                                      #t
@@ -814,6 +991,191 @@
                              ((vector? x) (walk-vector x path))
                              ((and (hashtable? x) (hashtable-mutable? x))
                               (walk-hashtable x path))
+                             ;; A mutex or condition variable is per-process
+                             ;; kernel state. fasl copies one happily and the
+                             ;; copy is NOT a live primitive -- but an
+                             ;; uncontended acquire on it succeeds, so nothing
+                             ;; goes wrong until something actually waits, and
+                             ;; then it is "mutex-acquire: failed: Invalid
+                             ;; argument" from whichever thread got there first.
+                             ;;
+                             ;; Handled here rather than by a walker arm per
+                             ;; bearing type, so it is TOTAL: jolt-promise,
+                             ;; jolt-future, jolt-agent, the per-node locks on a
+                             ;; lazy cell and a seq, async channels, the tap
+                             ;; queue and the fibers queues all carry one, and a
+                             ;; record added later carries it correctly without
+                             ;; anyone remembering this file. jolt-atom and
+                             ;; jolt-ref predate it and rebuild through their own
+                             ;; constructors, which is why they were already
+                             ;; right. A FRESH primitive, not #f: a lock field
+                             ;; that is created on demand tolerates one either
+                             ;; way, and a promise's mu is dereferenced
+                             ;; unconditionally (jolt-ojoh).
+                             ;; Execution does not travel, and these two are the
+                             ;; cases where a record's own state says so.
+                             ;;
+                             ;; A future that has not completed is waiting on a
+                             ;; thread the image cannot carry: restored, nothing
+                             ;; will ever finish it, so `deref` hangs forever.
+                             ;; Refuse it, the way any other unwritable object is
+                             ;; refused -- naming it, and stubbing under stub
+                             ;; mode. A completed one is just its value and
+                             ;; travels.
+                             ((and (jolt-future? x) (not (jolt-future-done? x)))
+                              (cond
+                                ((eq? mode 'rebuild-stub)
+                                 (let ((st (make-stub x path "a future that has not completed")))
+                                   (hashtable-set! memo x st) st))
+                                ((image-rebuild-mode? mode)
+                                 (jolt-throw
+                                   (jolt-ex-info
+                                     (string-append
+                                       "image: cannot write a running future at "
+                                       (image-path->string path)
+                                       ": it is waiting on a thread, and a state image"
+                                       " carries state, not execution. Deref it first,"
+                                       " or store what it computes.")
+                                     empty-pmap)))
+                                (else (hashtable-set! memo x #t)
+                                      (report! x path (image-report-disposition mode)))))
+                             ;; An agent's QUEUE is pending execution too. Its
+                             ;; state travels; the actions behind it do not, and
+                             ;; carrying `running?` across would leave the
+                             ;; restored agent believing a worker it does not
+                             ;; have is mid-action, so every later send would
+                             ;; queue behind nothing and never run -- silently
+                             ;; wedged, which is worse than dropping them.
+                             ((jolt-agent? x)
+                              (if (image-rebuild-mode? mode)
+                                  ;; mu/cv go through the walk like any other
+                                  ;; field, so the marker/mint rule below covers
+                                  ;; this arm in both directions rather than
+                                  ;; being restated here (they are immutable
+                                  ;; fields, hence walked before construction).
+                                  (let ((nx (make-jolt-agent jolt-nil jolt-nil jolt-nil
+                                                             (vector '() '()) #f
+                                                             (walk (jolt-agent-mu x) (cons "@mu" path))
+                                                             (walk (jolt-agent-cv x) (cons "@cv" path))
+                                                             (jolt-agent-err-mode x) jolt-nil)))
+                                    (hashtable-set! memo x nx)
+                                    (image-meta-copy! x nx)
+                                    (jolt-agent-state-set! nx (walk (jolt-agent-state x) (cons "@" path)))
+                                    (jolt-agent-err-set! nx (walk (jolt-agent-err x) (cons "@err" path)))
+                                    (jolt-agent-validator-set! nx
+                                      (walk (jolt-agent-validator x) (cons "@validator" path)))
+                                    (jolt-agent-err-handler-set! nx
+                                      (walk (jolt-agent-err-handler x) (cons "@error-handler" path)))
+                                    nx)
+                                  (begin
+                                    (hashtable-set! memo x #t)
+                                    (walk (jolt-agent-state x) (cons "@" path))
+                                    (walk (jolt-agent-err x) (cons "@err" path))
+                                    (walk (jolt-agent-validator x) (cons "@validator" path))
+                                    (walk (jolt-agent-err-handler x) (cons "@error-handler" path))
+                                    #t)))
+;; An unrealized lazy cell whose thunk is a closure the image cannot record.
+                             ;; clojure.core's NATIVE producers carry a descriptor
+                             ;; and travel (below); its overlay ones -- cycle,
+                             ;; repeatedly, map-indexed and the rest -- are fn
+                             ;; literals in clojure.core, and the language's own
+                             ;; namespaces are not registered, which is the same
+                             ;; limit that stops a partial/comp closure travelling.
+                             ;; Refuse by NAME rather than let the generic
+                             ;; procedure refusal report an anonymous #<procedure>
+                             ;; at a path ending in "thunk" (jolt-zr91).
+                             ((and (jolt-lazyseq? x)
+                                   (not (jolt-lazyseq-realized? x))
+                                   (procedure? (jolt-lazyseq-thunk x))
+                                   (not (image-fnsrc-probe (jolt-lazyseq-thunk x))))
+                              (cond
+                                ((eq? mode 'rebuild-stub)
+                                 (let ((st (make-stub x path "an unrealized lazy sequence")))
+                                   (hashtable-set! memo x st) st))
+                                ((image-rebuild-mode? mode)
+                                 (jolt-throw
+                                   (jolt-ex-info
+                                     (string-append
+                                       "image: cannot write an unrealized lazy sequence at "
+                                       (image-path->string path)
+                                       ": it was produced by a clojure.core fn whose body the"
+                                       " image cannot record, the same reason a partial or comp"
+                                       " closure cannot travel. Realize it first (doall), or"
+                                       " store the data it produces.")
+                                     empty-pmap)))
+                                (else (hashtable-set! memo x #t)
+                                      (report! x path (image-report-disposition mode)))))
+                             ;; A clojure.core lazy producer, recorded as its
+                             ;; arguments plus a forcer (seq.ss lazy-src). The
+                             ;; forcer is a procedure and cannot travel, so the
+                             ;; image carries the producer's NAME in its place
+                             ;; and the restore puts the live one back. The
+                             ;; arguments are ordinary values and walk as data,
+                             ;; so a producer over another lazy seq nests and a
+                             ;; self-referential one closes on the memo.
+                             ;;
+                             ;; Restoring a seq this way, rather than forcing it
+                             ;; at dump, is the whole point: an infinite seq
+                             ;; keeps generating and a side effect still has not
+                             ;; run (jolt-a6k2).
+                             ((and (lazy-src? x)
+                                   (if (eq? mode 'restore)
+                                       (lazy-src-proc-of (lazy-src-fn x))
+                                       (lazy-src-name-of (lazy-src-fn x))))
+                              => (lambda (swapped)
+                                   (if (image-rebuild-mode? mode)
+                                       (let ((nx (make-lazy-src swapped #f #f)))
+                                         (hashtable-set! memo x nx)
+                                         (image-meta-copy! x nx)
+                                         (lazy-src-a-set! nx (walk (lazy-src-a x) (cons "lazy-arg" path)))
+                                         (lazy-src-b-set! nx (walk (lazy-src-b x) (cons "lazy-arg" path)))
+                                         nx)
+                                       (begin
+                                         (hashtable-set! memo x #t)
+                                         (walk (lazy-src-a x) (cons "lazy-arg" path))
+                                         (walk (lazy-src-b x) (cons "lazy-arg" path))
+                                         #t))))
+                             ;; a var-rooted multimethod or reify: code the
+                             ;; restoring build already has, so it travels as the
+                             ;; var's NAME through the same fn-ref external a
+                             ;; named fn uses. Without this the walk descended
+                             ;; into a multifn's dispatch tables and refused at a
+                             ;; raw hashtable the user could do nothing about
+                             ;; (jolt-2cny).
+                             ;; A transient is thread-owned mutable state whose
+                             ;; owning thread is gone by definition after a
+                             ;; restore, and half of them could not travel anyway
+                             ;; -- a transient vector wrote silently while a
+                             ;; transient map refused on its backing hashtable.
+                             ;; Refuse both, saying what to do (jolt-ji1h).
+                             ((jolt-transient? x)
+                              (cond
+                                ((eq? mode 'rebuild-stub)
+                                 (let ((st (make-stub x path "a transient")))
+                                   (hashtable-set! memo x st) st))
+                                ((image-rebuild-mode? mode)
+                                 (jolt-throw
+                                   (jolt-ex-info
+                                     (string-append
+                                       "image: cannot write a transient at "
+                                       (image-path->string path)
+                                       ": it belongs to the thread that made it, which"
+                                       " a restore does not have. Call persistent! on it"
+                                       " first.")
+                                     empty-pmap)))
+                                (else (hashtable-set! memo x #t)
+                                      (report! x path (image-report-disposition mode)))))
+                             ((and (not (procedure? x)) (proc-name-of x))
+                              (hashtable-set! memo x x)
+                              x)
+                             ((mutex? x)
+                              (cond ((eq? mode 'restore) (make-mutex))
+                                    ((image-rebuild-mode? mode) (make-image-sync 'mutex))
+                                    (else #t)))
+                             ((thread-condition? x)
+                              (cond ((eq? mode 'restore) (make-condition))
+                                    ((image-rebuild-mode? mode) (make-image-sync 'condition))
+                                    (else #t)))
                              ((and (record? x) (record-rtd x))
                               (walk-record x path))
                              (else (if (image-rebuild-mode? mode) x #t)))))))))))
@@ -999,7 +1361,8 @@
                       ;; read path, never break it.
                       (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
                                                jolt-nil (var-cell-defined? x)
-                                               #f (var-cell-macro? x) #f)))
+                                               #f (var-cell-macro? x) #f
+                                               (var-cell-dynamic? x))))
                         (hashtable-set! memo x nx)
                         (var-cell-root-set! nx (walk (var-cell-root x) (cons vp path)))
                         (var-cell-meta-set! nx (and m (walk m mp)))
@@ -1163,6 +1526,15 @@
                         (hashtable-set! memo x nx)
                         (image-meta-copy! x nx)
                         nx)))))
+             (walk-legacy-pmap
+              (lambda (x path)
+                (or (hashtable-ref memo x #f)
+                    (let ((nx (if (pset? x)
+                                  (walk-pset (make-pset (legacy-pmap->pmap (pset-m x))) path)
+                                  (walk-pmap (legacy-pmap->pmap x) path))))
+                      (hashtable-set! memo x nx)
+                      (image-meta-copy! x nx)
+                      nx))))
              (walk-record
               (lambda (x path)
                 (let* ((rtd (record-rtd x))
@@ -1223,7 +1595,7 @@
                                                  (image-fnsrc-name x) ": " (number->string n)
                                                  " free values for " (number->string (pvec-count frees))
                                                  " free names")
-                                  jolt-nil)))
+                                  empty-pmap)))
                   (let ((tfvs (map (lambda (v)
                                      (walk v (cons (string-append "free:" (image-fnsrc-name x)) path)))
                                    (vector->list fvs))))
@@ -1335,12 +1707,12 @@
 
 (define (image-check-header! h path)
   (unless (and (vector? h) (fx=? (vector-length h) 4) (eq? (vector-ref h 0) 'jolt-image))
-    (jolt-throw (jolt-ex-info (string-append "image: " path " is not a jolt image") jolt-nil)))
+    (jolt-throw (jolt-ex-info (string-append "image: " path " is not a jolt image") empty-pmap)))
   (unless (member (vector-ref h 1) jolt-image-read-versions)
     (jolt-throw (jolt-ex-info
                   (string-append "image: " path " has format version "
-                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 to 5")
-                  jolt-nil)))
+                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 to 7")
+                  empty-pmap)))
   ;; The fasl version moves with Chez, and a mismatch otherwise surfaces as an
   ;; opaque fasl-read error, so name it here instead.
   (unless (equal? (vector-ref h 2) (jolt-image-runtime-version))
@@ -1348,7 +1720,7 @@
                   (string-append "image: " path " was written by runtime "
                                  (jolt-str-one (vector-ref h 2)) ", this is "
                                  (jolt-image-runtime-version))
-                  jolt-nil)))
+                  empty-pmap)))
   #t)
 
 ;; Runtime identity an image is pinned to. The fasl format moves with the Chez
@@ -1458,7 +1830,7 @@
                                               (string-append "image: cannot write "
                                                              (image-describe-obj x)
                                                              " at " where)
-                                              jolt-nil)))))
+                                              empty-pmap)))))
                         externals)))
         ;; Descriptors are written WITHOUT an externals-pred, so a handler that
         ;; returns something non-data would fail here with a raw Chez error.
@@ -1470,7 +1842,7 @@
                     (lambda (e)
                       (k (jolt-throw (jolt-ex-info
                                        "image: a resource handler returned a value that is not plain data"
-                                       jolt-nil))))
+                                       empty-pmap))))
                     (lambda () (call-with-bytevector-output-port
                                  (lambda (p) (sa-fasl-write descs p)))))))))
           (let ((port (open-file-output-port path (file-options no-fail))))
@@ -1485,7 +1857,7 @@
 
 (define (jolt-image-read path)
   (unless (file-exists? path)
-    (jolt-throw (jolt-ex-info (string-append "image: no such file: " path) jolt-nil)))
+    (jolt-throw (jolt-ex-info (string-append "image: no such file: " path) empty-pmap)))
   (let ((port (open-file-input-port path)))
     (let* ((h (sa-fasl-read port))
            (_ (image-check-header! h path))
@@ -1494,7 +1866,7 @@
            (b (sa-fasl-read port 'load exts)))
       (close-port port)
       (unless (and (vector? b) (fx=? (vector-length b) 2))
-        (jolt-throw (jolt-ex-info (string-append "image: malformed body in " path) jolt-nil)))
+        (jolt-throw (jolt-ex-info (string-append "image: malformed body in " path) empty-pmap)))
       (image-reattach-meta! (vector-ref b 1))
       ;; R3: rebuild what the write side substituted — fn source records become
       ;; live closures, handler payloads go back through their restore fns.
@@ -1598,7 +1970,7 @@
       (jolt-throw (jolt-ex-info
                     (string-append "image: " path
                                    " is a value image, not a world image — read it with read-image")
-                    jolt-nil)))
+                    empty-pmap)))
     (let ((n 0))
       (for-each
         (lambda (p)
@@ -1735,7 +2107,7 @@
       (jolt-throw (jolt-ex-info
                     (string-append "image: no unresolved stub #"
                                    (jolt-str-one id) " from the last world restore")
-                    jolt-nil)))
+                    empty-pmap)))
     (let* ((k (cdr e))
            (slash (let scan ((i 0))
                     (cond ((fx>=? i (string-length k)) #f)

@@ -13,7 +13,50 @@
 ;; natives-meta.ss / records.ss / printing.ss (jolt-type / instance-check /
 ;; jolt-str-render-one, which it extends).
 
-(define-record-type jfile (fields path) (nongenerative jolt-jfile-v1))
+;; FileSystem.normalize(): runs of "/" collapse to one and a trailing "/" is
+;; dropped. "." and ".." are left alone -- the JVM's constructor does not resolve
+;; those, and neither does this. new File("/a/b//c").getPath() is "/a/b/c".
+;;
+;; Every path the ONE-argument constructor produces is normalized, and so is
+;; every path built by as-file, the file: URL coercion, createTempFile,
+;; getParentFile and listRoots -- nine construction sites of which only one is
+;; the constructor entry point. So make-jfile normalizes and they all go through
+;; it, rather than the invariant being restated nine times.
+;;
+;; The two-argument constructor normalizes each ARGUMENT and then resolves them.
+;; That result is normal too, on every JDK from 21. See jolt-file-join.
+(define (path-has-double-sep? p n)
+  (let loop ((i 1))
+    (and (fx<? i n)
+         (or (and (char=? (string-ref p i) #\/) (char=? (string-ref p (fx- i 1)) #\/))
+             (loop (fx+ i 1))))))
+
+(define (jolt-path-normalize p)
+  (let ((n (string-length p)))
+    (cond
+      ;; an already-normal path is the overwhelmingly common case, and a jfile is
+      ;; built per entry on every directory listing: look before copying, so the
+      ;; answer is p itself and nothing is allocated
+      ((not (path-has-double-sep? p n))
+       ;; a trailing separator goes, but "/" is a path, not an empty one
+       (if (and (fx>? n 1) (char=? (string-ref p (fx- n 1)) #\/))
+           (substring p 0 (fx- n 1))
+           p))
+      (else
+       (let ((out (make-string n)))
+         (let loop ((i 0) (j 0) (prev-slash? #f))
+           (if (fx=? i n)
+               (let ((j (if (and (fx>? j 1) (char=? (string-ref out (fx- j 1)) #\/))
+                            (fx- j 1)
+                            j)))
+                 (substring out 0 j))
+               (let ((c (string-ref p i)))
+                 (cond ((and (char=? c #\/) prev-slash?) (loop (fx+ i 1) j #t))
+                       (else (string-set! out j c)
+                             (loop (fx+ i 1) (fx+ j 1) (char=? c #\/))))))))))))
+
+(define-record-type jfile (fields path) (nongenerative jolt-jfile-v1)
+  (protocol (lambda (new) (lambda (p) (new (jolt-path-normalize p))))))
 (define (jolt-file? x) (jfile? x))
 
 ;; path string of any value: a jfile -> its path, else its str rendering.
@@ -201,13 +244,78 @@
 ;; the launcher cd'd to the jolt repo root — matching the JVM, where io/file is
 ;; cwd-relative. (io/resource builds jfiles from the source roots directly, so it
 ;; isn't routed through here.)
+(define (path-separator-char? c)
+  (or (char=? c #\/) (char=? c #\\)))
+
+(define (ascii-drive-letter? c)
+  (or (and (char>=? c #\A) (char<=? c #\Z))
+      (and (char>=? c #\a) (char<=? c #\z))))
+
+(define (windows-drive-prefix? p)
+  (and (>= (string-length p) 2)
+       (ascii-drive-letter? (string-ref p 0))
+       (char=? (string-ref p 1) #\:)))
+
+(define (windows-root-relative? p)
+  (and (eq? (sa-os-family) 'windows)
+       (> (string-length p) 0)
+       (path-separator-char? (string-ref p 0))
+       (or (= (string-length p) 1)
+           (not (path-separator-char? (string-ref p 1))))))
+
+(define (trim-trailing-path-separator p)
+  (let ((n (string-length p)))
+    (if (and (> n 2) (path-separator-char? (string-ref p (- n 1))))
+        (substring p 0 (- n 1))
+        p)))
+
+;; java.io.File.isAbsolute is host-platform-specific. POSIX has one absolute
+;; prefix (/). Windows has drive-rooted paths (C:\x or C:/x) and UNC paths
+;; (\\server\share); drive-relative C:x and current-drive-rooted \x are not
+;; absolute in the JVM sense. Drive-rooted and UNC recognition is shared by
+;; filesystem resolution, getAbsolutePath, and isAbsolute. The rooted-but-
+;; relative case is resolved separately by project-relative below. `C:child`
+;; still depends on Windows' process-local current directory for that drive and
+;; remains an older File-shim compatibility gap.
+(define (jfile-path-absolute? p)
+  (let ((n (string-length p)))
+    (if (eq? (sa-os-family) 'windows)
+        (or (and (>= n 3)
+                 (windows-drive-prefix? p)
+                 (path-separator-char? (string-ref p 2)))
+            (and (>= n 2)
+                 (path-separator-char? (string-ref p 0))
+                 (path-separator-char? (string-ref p 1))))
+        (and (> n 0) (char=? (string-ref p 0) #\/)))))
+
 (define (project-relative p)
-  (if (or (= (string-length p) 0) (char=? (string-ref p 0) #\/))
-      p
-      (let ((base (jolt-user-dir)))
-        ;; "." adds nothing the OS won't do itself when it resolves a relative
-        ;; path — leave it alone rather than prefixing "./".
-        (if (string=? base ".") p (string-append base "/" p)))))
+  (cond
+    ((or (= (string-length p) 0) (jfile-path-absolute? p)) p)
+    ;; A single leading separator is rooted on the current drive but is not an
+    ;; absolute File pathname on Windows. The JVM resolves it against user.dir's
+    ;; drive; the process cwd is Jolt's source tree, so leaving it to the OS can
+    ;; select the wrong drive after the launcher changes directory.
+    ((windows-root-relative? p)
+     (let ((base (jolt-user-dir)))
+       (cond
+         ;; The base names a drive, so the current-drive-rooted path takes it.
+         ((windows-drive-prefix? base) (string-append (substring base 0 2) p))
+         ;; A UNC base has no drive letter; its \\server\share IS the root.
+         ((jfile-path-absolute? base)
+          (string-append (trim-trailing-path-separator base) p))
+         ;; Nothing to root against: JOLT_PWD is unset, so jolt-user-dir is ".".
+         ;; Prefixing that turns a ROOTED path into a relative one, which is
+         ;; strictly worse than leaving the OS to resolve it against the process
+         ;; drive — the drive is at least a plausible answer, "./\x" is not.
+         ;; jolt.deps/root-relative-for keeps the same arm for the same reason,
+         ;; and its (absolute true "." "\project") case pins it; without this
+         ;; the two classifiers disagree on the one input neither can resolve.
+         (else p))))
+    (else
+     (let ((base (jolt-user-dir)))
+       ;; "." adds nothing the OS won't do itself when it resolves a relative
+       ;; path — leave it alone rather than prefixing "./".
+       (if (string=? base ".") p (string-append base "/" p))))))
 
 ;; (io/file path) / (io/file parent child) — join children with "/". The File
 ;; keeps the path AS GIVEN (like the JVM: new File("rel").getPath() is "rel");
@@ -254,10 +362,11 @@
 ;; (current-directory) here instead reported paths under the jolt repo root the
 ;; launcher cd'd into, diverging from the JVM where io/file and getAbsolutePath
 ;; are user.dir-relative.
+;; project-relative answers an absolute path with itself, so asking it twice —
+;; once here to decide, once inside — only pays the host-specific classification
+;; twice per call. The empty path is the one case it does not cover.
 (define (jfile-abs p)
-  (cond ((= (string-length p) 0) (jolt-user-dir))
-        ((char=? (string-ref p 0) #\/) p)
-        (else (project-relative p))))
+  (if (= (string-length p) 0) (jolt-user-dir) (project-relative p)))
 
 ;; --- canonical paths --------------------------------------------------------
 ;; getCanonicalPath is realpath(3), not "make it absolute": it resolves
@@ -350,6 +459,31 @@
 ;; last-modified as epoch milliseconds (0 if the file is absent).
 (define (file-mtime-millis p)
   (if (file-exists? p) (sa-file-mtime-ms p) 0))
+
+;; access(2): may the EFFECTIVE user read / write / execute this path? This is
+;; the question File.canRead/canWrite/canExecute and Files.isReadable/isWritable/
+;; isExecutable ask on the JVM. All six used to answer (file-exists? p) instead,
+;; which reports a read-only file as writable and every regular file as
+;; executable — so a caller testing writability before a write took the wrong
+;; branch and found out at the open, and babashka.fs/writable? (which routes to
+;; Files/isWritable) inherited it. ONE predicate for all six: two hand-kept
+;; copies is how java.io and java.nio.file start disagreeing about a path.
+;;
+;; Resolved through jolt-foreign-proc-safe like utimes above — a literal
+;; foreign-procedure is a fasl relocation that aborts the boot where the symbol
+;; is absent. Windows' CRT spells it _access and has no X_OK: mode 1 is EINVAL
+;; there, so an execute test falls back to existence.
+(define c-access (or (jolt-foreign-proc-safe "access" '(string int) 'int)
+                     (jolt-foreign-proc-safe "_access" '(string int) 'int)))
+(define access-r-ok 4)
+(define access-w-ok 2)
+(define access-x-ok 1)
+(define (file-accessible? p mode)
+  (if (and c-access
+           (not (and (fx=? mode access-x-ok) (eq? (sa-os-family) 'windows))))
+      (= (c-access p mode) 0)
+      ;; no access(2) to ask (or X_OK on Windows): the old answer, existence.
+      (if (file-exists? p) #t #f)))
 ;; set atime+mtime from epoch milliseconds via utimes(2). struct timeval is
 ;; sec + usec, 16 bytes each on the 64-bit platforms Chez targets; usec fits
 ;; its field (< 1e6) so a signed 64-bit native-endian write covers the layout.
@@ -427,6 +561,19 @@
                 ((char=? (string-ref rest j) #\/) (substring rest j (string-length rest)))
                 (else (loop (+ j 1)))))
         rest)))
+;; The filesystem path a URL names for WRITING. Reading a URL is broad — a stream
+;; handler decides, and url-content knows several protocols — but there is nowhere
+;; to write anything except a file: one, so every other protocol is the JVM's
+;; IllegalArgumentException. Without this a URL reached the path coercions as its
+;; SPEC, and (spit (.toURL f) …) created a file literally named "file:/…/f" under
+;; the working directory instead of writing f.
+(define (url-write-path u)
+  (let ((spec (url-spec u)))
+    (if (string=? (url-protocol spec) "file")
+        (url-strip-scheme spec)
+        (throw-jvm (quote IllegalArgumentException)
+                   (string-append "Can not write to non-file URL <" spec ">")))))
+
 (define (url-authority spec)
   (let* ((i (let loop ((j 0)) (cond ((>= j (string-length spec)) #f)
                                     ((char=? (string-ref spec j) #\:) j)
@@ -533,12 +680,26 @@
         ;; protocol has no local backing and raises (the JVM would connect or read
         ;; the jar), never empty content.
         (cons "openConnection" (lambda (self . _) (url-open-connection self)))
-        (cons "openStream"     (lambda (self)
-                                 (let ((h (url-handler self)))
-                                   (if h
-                                       (record-method-dispatch (url-open-connection self)
-                                                               "getInputStream" jolt-nil)
-                                       (host-new "StringReader" (url-content self))))))))
+        (cons "openStream"     (lambda (self) (url-open-stream self)))))
+;; openStream hands back an InputStream, like the JVM (a file: URL there is a
+;; FileInputStream behind a BufferedInputStream). It used to answer a StringReader
+;; -- content-correct, but the wrong half of the io hierarchy, so the documented
+;; composition (InputStreamReader. (.openStream u)) could not work: an ISR drives
+;; its argument's read(byte[],int,int), and a Reader answers that by writing
+;; CHARACTERS into the byte array. typedclojure reads its config through exactly
+;; that chain and the failure surfaced from tools.reader as "#\{ is not a number".
+(define (url-open-stream u)
+  (let ((spec (url-spec u)))
+    (cond
+      ;; a stream handler decides what this URL means, whatever its protocol
+      ((url-handler u)
+       (record-method-dispatch (url-open-connection u) "getInputStream" jolt-nil))
+      ;; FileInputStream resolves a relative path against user.dir and raises
+      ;; java.io.FileNotFoundException for a missing one, both like the JVM.
+      ((string=? (url-protocol spec) "file")
+       (host-new "FileInputStream" (url-strip-scheme spec)))
+      (else (throw-jvm (quote java.io.IOException)
+                       (string-append "protocol doesn't support input: " spec))))))
 ;; The handler's own openConnection. Without one there is nothing to connect
 ;; through — say so rather than returning something that reads as empty.
 (define (url-open-connection u)
@@ -557,6 +718,35 @@
           (or (and (jhost? val) (string=? (jhost-tag val) "url")) (embedded-res? val))
           'pass))))
 
+;; File.getParent()/getParentFile(): the prefix up to the last separator, or nil
+;; when the path names no parent. The JVM's no-parent set is wider than "no
+;; separator in the path" -- the root is its own longest prefix, so "/" answers
+;; null there while the scan below finds "/" and hands the path straight back.
+;; Comparing the result against the input is what turns that into nil, and it
+;; costs one string=? to cover the case without naming "/" anywhere: any path
+;; whose parent would be itself has no parent, whatever normalization does next.
+;; The loop never terminating is the visible failure -- (.getParentFile d) in a
+;; walk-to-root recur is a tail call, so a parent that answers itself spins with
+;; no stack growth and no exception.
+(define (jfile-parent-path p)        ; -> the parent path, or #f when there is none
+  (let loop ((i (- (string-length p) 1)))
+    (cond ((< i 0) #f)
+          ((char=? (string-ref p i) #\/)
+           (let ((parent (if (= i 0) "/" (substring p 0 i))))
+             (and (not (string=? parent p)) parent)))
+          (else (loop (- i 1))))))
+
+;; File.list()/File.listFiles(): the JVM answers null -- not an empty array, and
+;; not a throw -- for a path that is not a readable directory, so the ordinary
+;; (map str (.listFiles f)) over a missing path or a plain file yields () rather
+;; than dying. file-directory? covers both of those; the guard covers a directory
+;; the process may not read, which is an I/O error and null on the JVM too. Both
+;; spellings go through here so they cannot drift apart again.
+(define (jfile-listing fp produce)   ; -> the listing, or jolt-nil
+  (if (file-directory? fp)
+      (guard (e (#t jolt-nil)) (produce))
+      jolt-nil))
+
 ;; --- File method surface (record-method-dispatch arm) -----------------------
 (define (jfile-method f name args)        ; -> boxed result, or #f to fall through
   (let ((p (jfile-path f))               ; the path as given (display methods)
@@ -573,20 +763,19 @@
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
-      ((string=? name "isAbsolute")     (list (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/)) #t #f)))
+      ((string=? name "isAbsolute")     (list (if (jfile-path-absolute? p) #t #f)))
       ;; listFiles builds each child from the path AS GIVEN (new File(this, name)
       ;; on the JVM), so a File made from a relative path lists relative children.
-      ((string=? name "listFiles")      (list (list->cseq (map make-jfile (jolt-list-dir p)))))
-      ;; .list -> the child NAMES (a String[]), nil if not a directory.
+      ((string=? name "listFiles")
+       (list (jfile-listing fp (lambda () (list->cseq (map make-jfile (jolt-list-dir p)))))))
+      ;; .list -> the child NAMES (a String[]), nil if not a readable directory.
       ((string=? name "list")
-       (list (if (file-directory? fp)
-                 (apply jolt-vector (sort string<? (directory-list fp)))
-                 jolt-nil)))
+       (list (jfile-listing fp (lambda () (apply jolt-vector (sort string<? (directory-list fp)))))))
       ((string=? name "length")         (list (->num (file-byte-size fp))))
       ((string=? name "lastModified")   (list (->num (file-mtime-millis fp))))
-      ((string=? name "canRead")        (list (if (file-exists? fp) #t #f)))
-      ((string=? name "canWrite")       (list (if (file-exists? fp) #t #f)))
-      ((string=? name "canExecute")     (list (if (file-exists? fp) #t #f)))
+      ((string=? name "canRead")        (list (file-accessible? fp access-r-ok)))
+      ((string=? name "canWrite")       (list (file-accessible? fp access-w-ok)))
+      ((string=? name "canExecute")     (list (file-accessible? fp access-x-ok)))
       ((string=? name "isHidden")       (list (let ((nm (path-last-segment p)))
                                                 (if (and (> (string-length nm) 0) (char=? (string-ref nm 0) #\.)) #t #f))))
       ((string=? name "mkdir")          (list (guard (e (#t #f)) (and (not (file-exists? fp)) (begin (mkdir fp) #t)))))
@@ -602,10 +791,8 @@
       ((string=? name "renameTo")
        (list (let ((dst (jfile-fs (car args)))) (guard (e (#t #f)) (rename-file fp dst) #t))))
       ((string=? name "getParentFile")
-       (let loop ((i (- (string-length p) 1)))
-         (cond ((< i 0) (list jolt-nil))
-               ((char=? (string-ref p i) #\/) (list (make-jfile (if (= i 0) "/" (substring p 0 i)))))
-               (else (loop (- i 1))))))
+       (list (let ((parent (jfile-parent-path p)))
+               (if parent (make-jfile parent) jolt-nil))))
       ((string=? name "toPath")           (list (make-nio-path p)))  ; -> java.nio.file.Path (nio-file.ss)
       ((string=? name "getAbsoluteFile")  (list (make-jfile (jfile-abs fp))))
       ((string=? name "getCanonicalFile") (list (make-jfile (jfile-canonical fp))))
@@ -614,10 +801,7 @@
       ((string=? name "equals")         (list (and (jfile? (car args)) (string=? p (jfile-path (car args))))))
       ((string=? name "hashCode")       (list (->num (string-hash p))))
       ((string=? name "getParent")
-       (let loop ((i (- (string-length p) 1)))
-         (cond ((< i 0) (list jolt-nil))
-               ((char=? (string-ref p i) #\/) (list (if (= i 0) "/" (substring p 0 i))))
-               (else (loop (- i 1))))))
+       (list (or (jfile-parent-path p) jolt-nil)))
       (else #f))))
 
 (register-method-arm! arm-priority-file
@@ -625,7 +809,7 @@
     (if (jfile? obj)
         (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
                (r (jfile-method obj method-name rest)))
-          (if r (car r) (throw-jvm (quote IllegalArgumentException) (string-append "No matching method for File: " method-name))))
+          (if r (car r) (dispatch-miss obj method-name rest)))
         'pass)))
 ;; An embedded resource shares the tier: io/resource returns one of these where a
 ;; source root would have yielded a jfile, so it has to answer the same methods.
@@ -634,24 +818,26 @@
     (if (embedded-res? obj)
         (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
                (r (embedded-res-method obj method-name rest)))
-          (if r (car r)
-              (throw-jvm (quote IllegalArgumentException)
-                         (string-append "No matching method for an embedded resource: " method-name))))
+          (if r (car r) (dispatch-miss obj method-name rest)))
         'pass)))
 (register-class-arm! embedded-res? (lambda (x) "java.net.URL"))
 ;; (str resource) is the resource name, like URL.toString — which also gives the
 ;; printer's #object[…] fallback its content.
 (register-str-render! embedded-res? (lambda (x) (embedded-res-name x)))
 
-;; File methods emitted via jolt-host-call (rt.ss) need jfile dispatch,
-;; not the string-path shims in the base jolt-host-call. Route through
-;; the jfile-method table so all File methods share one dispatch point.
+;; File methods emitted via jolt-host-call (rt.ss) need jfile dispatch, not the
+;; string-path shims in the base jolt-host-call. Route through
+;; record-method-dispatch — the same entry point every other (.method file)
+;; call takes — so the two spellings cannot answer differently. Calling
+;; jfile-method here directly was that second answer: it skipped the arm chain,
+;; so a library override of File/isDirectory registered through
+;; jolt.host/extend-class! applied everywhere EXCEPT the file-seq call sites the
+;; backend lowers to jolt-host-call.
 (define %io-host-call jolt-host-call)
 (set! jolt-host-call
   (lambda (method target . args)
     (if (jfile? target)
-        (let ((r (jfile-method target method args)))
-          (if r (car r) (apply %io-host-call method target args)))
+        (record-method-dispatch target method (apply jolt-vector args))
         (apply %io-host-call method target args))))
 
 ;; --- the files a load READ ---------------------------------------------------
@@ -860,7 +1046,11 @@
       ((url-handler u)
        (drain-any-stream (record-method-dispatch (url-open-connection u)
                                                  "getInputStream" jolt-nil)))
-      ((string=? (url-protocol spec) "file") (slurp-path (url-strip-scheme spec)))
+      ;; project-relative: a relative file: URL resolves against user.dir on the
+      ;; JVM, where a bare path here would resolve against the process cwd -- the
+      ;; jolt repo root under the launcher, not the project the user is in.
+      ((string=? (url-protocol spec) "file")
+       (slurp-path (project-relative (url-strip-scheme spec))))
       (else (throw-jvm (quote java.io.IOException)
                        (string-append "protocol doesn't support input: " spec))))))
 ;; Whatever the handler handed back: a byte stream, a reader, or a value that
@@ -871,6 +1061,21 @@
          (utf8->string (na-bytearray->bv
                         (record-method-dispatch s "readAllBytes" jolt-nil))))
         (else (jolt-str-render-one s))))
+;; slurp over a clojure.core/IReader (what *in* and with-in-str hand out). The
+;; protocol is line-based — -read-line, -read-form, -read+string, no char read —
+;; and -read-line drops the delimiter, so whether the input ended with a newline
+;; is not recoverable here: "a\nb" and "a\nb\n" both drain to "a\nb". Reading
+;; source text off a pipe, which is what this is for, does not care.
+(define (drain-ireader src)
+  (let ((out (open-output-string)))
+    (let loop ((first? #t))
+      (let ((line (record-method-dispatch src "-read-line" jolt-nil)))
+        (if (jolt-nil? line)
+            (get-output-string out)
+            (begin
+              (unless first? (put-char out #\newline))
+              (put-string out line)
+              (loop #f)))))))
 (define (jolt-slurp src . opts)
   (cond
     ((jfile? src) (slurp-path (jfile-fs src)))
@@ -878,6 +1083,9 @@
      (let ((c (embedded-res-content src)))
        (if (bytevector? c) (utf8->string c) c)))
     ((reader-jhost? src) (drain-reader src))
+    ((and (reified-methods src)
+          (hashtable-ref (reified-methods src) "-read-line" #f))
+     (drain-ireader src))
     ;; a file: URL reads its target (jar:/http:/… raise in url-content).
     ((and (jhost? src) (string=? (jhost-tag src) "url")) (url-content src))
     ;; bytes (a bytevector or a jolt byte-array): decode with :encoding (UTF-8
@@ -905,7 +1113,13 @@
   ;; target truncated. The non-append write goes to a temp file in the same
   ;; directory and renames over the target, so a mid-write failure (disk full)
   ;; never destroys the original. Append keeps writing in place.
-  (let* ((p (project-relative (file-path-of path)))
+  ;; Only a path, a File or a host stream names a target; anything else is the
+  ;; coercion error io/writer raises. nil used to render as "" and write a temp
+  ;; file into the working directory before failing to rename it.
+  (unless (or (string? path) (jfile? path) (jhost? path))
+    (throw-jvm (quote IllegalArgumentException)
+               (string-append "Cannot open <" (jolt-pr-str path) "> as a Writer.")))
+  (let* ((p (project-relative (if (url-jhost? path) (url-write-path path) (file-path-of path))))
          (text (jolt-str-render-one content)))
     (if (spit-append? opts)
         (with-port (open-output-file p 'append)
@@ -1040,11 +1254,45 @@
     ((and (jhost? x) (string=? (jhost-tag x) "writer")) x)
     ((and (jhost? x) (string=? (jhost-tag x) "file-writer")) x)
     ((jfile? x) (make-jhost "file-writer" (vector (jfile-path x) "")))
+    ((url-jhost? x) (make-jhost "file-writer" (vector (url-write-path x) "")))
     ((string? x) (make-jhost "file-writer" (vector x "")))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as a Writer.")))))
 
 ;; --- clojure.java.io ns -----------------------------------------------------
-(def-var! "clojure.java.io" "file" jolt-make-file)
+;; io/file is NOT the File constructor. It puts every child through
+;; as-relative-path, which throws on an absolute one, so (io/file "/a/b" "/c")
+;; raises where (File. "/a/b" "/c") happily answers "/a/b/c" -- both checked
+;; against the JVM. jolt registered io/file as jolt-make-file, which has no
+;; notion of a child, so the absolute one was silently joined.
+;;
+;; Normalization alone would have HIDDEN this rather than fixed it: joining
+;; "/a/b" and "/c" produces "/a/b//c", which now collapses to "/a/b/c" and looks
+;; like a correct answer to a call the JVM rejects.
+;; as-relative-path is Clojure's own coercion, and on the JVM it goes through
+;; as-file FIRST: normalize(child) is what .isAbsolute sees, so the thrown
+;; message names the normalized path -- (io/file "/a/b" "//c") says
+;; "/c is not a relative path", not "//c". io-file-relative-child checked the
+;; raw string, so the accept/reject set was right but the message diverged.
+;; Registered as io/as-relative-path too: public API in clojure.java.io on
+;; the JVM, and missing here entirely before.
+(define (jolt-as-relative-path x)
+  ;; as-file first, so nil coerces to nil and .isAbsolute raises on it rather
+  ;; than the child being read as ""
+  (when (jolt-nil? x)
+    (throw-jvm (quote NullPointerException)
+               "Cannot invoke \"java.io.File.isAbsolute()\" because \"f\" is null"))
+  (let ((p (jfile-path (make-jfile (file-path-of x)))))
+    (when (and (fx>? (string-length p) 0) (char=? (string-ref p 0) #\/))
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append p " is not a relative path")))
+    p))
+(def-var! "clojure.java.io" "as-relative-path" jolt-as-relative-path)
+(define (jolt-io-file a . rest)
+  (cond ((pair? rest) (apply jolt-make-file a (map jolt-as-relative-path rest)))
+        ;; one-arg io/file IS as-file, and as-file of nil is nil
+        ((jolt-nil? a) a)
+        (else (jolt-make-file a))))
+(def-var! "clojure.java.io" "file" jolt-io-file)
 ;; io/as-file of a file: URL yields the file it points at (JVM: new
 ;; File(url.toURI())); a URL with any other protocol has no filesystem path —
 ;; IllegalArgumentException, as the JVM's File(URI) throws.
@@ -1053,7 +1301,11 @@
       (make-jfile (url-strip-scheme (url-spec u)))
       (throw-jvm 'IllegalArgumentException (string-append "Not a file: " (url-spec u)))))
 (def-var! "clojure.java.io" "as-file"
-  (lambda (x) (cond ((jfile? x) x)
+  ;; Clojure extends Coercions to nil, so (io/as-file nil) is nil -- NOT a File
+  ;; whose path is "". The difference is load-bearing one call downstream, where
+  ;; the JVM raises on the nil and jolt was quietly reading the process's cwd.
+  (lambda (x) (cond ((jolt-nil? x) x)
+                    ((jfile? x) x)
                     ((and (jhost? x) (string=? (jhost-tag x) "url")) (url-file-coercion x))
                     (else (make-jfile (file-path-of x))))))
 ;; "reader" is bound by natives-array.ss (loaded later) so a char[] argument is
@@ -1084,6 +1336,29 @@
                   rel)))
     (make-url (string-append "file:" (jfile-abs rel)))))
 
+;; The name argument, or an NPE. The JVM throws NullPointerException for a null
+;; resource name from ClassLoader.getResource / getResources /
+;; getResourceAsStream and Class.getResource alike (probed directly), and
+;; clojure.java.io/resource is a bare .getResource, so it throws too. jolt sent
+;; the name through jolt-str-render-one, the `str` coercion, which renders nil as
+;; "" — and "" is a DIFFERENT question with a real answer, since the empty name is
+;; the classpath root. (io/resource nil) therefore handed back a URL for the first
+;; source root: a caller whose name came from a missing config key or an absent
+;; optional path got a directory, and only found out when something far away tried
+;; to read it. "" itself keeps answering the root, which is what the JVM does with
+;; it — verified, not assumed.
+(define (resource-name-arg name)
+  (if (jolt-nil? name)
+      (throw-jvm (quote NullPointerException) "resource name is nil")
+      (jolt-str-render-one name)))
+
+;; This is THE resource resolver: clojure.java.io/resource and every ClassLoader
+;; method in the java.lang.ClassLoader section below (getResource / getResources /
+;; getResourceAsStream, on the loader and on a Class) answer through it, so all of
+;; them see the embedded branch and announce the same candidates. They used to
+;; walk the roots themselves, which silently made the loader the weaker resolver;
+;; cl-get-resource carries what that cost.
+;;
 ;; Every candidate probed is announced to the AOT cache (io-note-file-read!),
 ;; not just the one that answered — including the ones that were not there. Which
 ;; root wins is part of the answer, so a file appearing at an EARLIER root has to
@@ -1091,8 +1366,8 @@
 ;; resource is finally added (a new migration is exactly that). An embedded
 ;; resource is baked into the binary and covered by the runtime fingerprint, so it
 ;; contributes nothing here.
-(define (jolt-io-resource name)
-  (let* ((nm (jolt-str-render-one name))
+(define (resolve-resource name)
+  (let* ((nm (resource-name-arg name))
          (emb (hashtable-ref embedded-resources nm #f)))
     (if emb (make-embedded-res nm emb)
         (let loop ((roots (get-source-roots)))
@@ -1103,6 +1378,21 @@
                 (if (file-exists? cand)
                     (resource-file-url (car roots) nm)
                     (loop (cdr roots)))))))))
+
+;; (resource n) and (resource n loader). The JVM's 2-arity resolves against the
+;; ClassLoader it is handed; jolt has a single "classloader" that resolves through
+;; resolve-resource just as this does (see the java.lang.ClassLoader section
+;; below), so every loader resolves the same resources and the argument is
+;; accepted and ignored. Libraries pass it to pin resolution to one loader
+;; across threads — cognitect aws-api's `cognitect.aws.resources/resource` is
+;; (io/resource n (RT/baseLoader)) — and without the arity they fail to load at
+;; all rather than degrading. case-lambda rather than a rest argument so the JVM's
+;; two arities are the only two: (resource n loader extra) is an arity error there
+;; and has to stay one here.
+(define jolt-io-resource
+  (case-lambda
+    ((name) (resolve-resource name))
+    ((name _loader) (resolve-resource name))))
 (def-var! "clojure.java.io" "resource" jolt-io-resource)
 ;; as-url honors a library-registered URL class (e.g. jolt-lang/http-client's full
 ;; java.net.URL shim) so io/as-url and (URL. spec) agree; else the file-only jhost.
@@ -1123,23 +1413,45 @@
 ;; back this loader. Libraries that probe the classpath (e.g. migratus's migration-
 ;; dir discovery) then fall back to the filesystem when a resource isn't a root.
 (define the-classloader (make-jhost "classloader" (vector)))
-(define (cl-get-resource self name)
-  (let ((nm (jolt-str-render-one name)))
-    (let loop ((roots (get-source-roots)))
-      (cond ((null? roots) jolt-nil)
-            ((file-exists? (string-append (car roots) "/" nm))
-             (resource-file-url (car roots) nm))
-            (else (loop (cdr roots)))))))
+;; Straight through to io/resource's resolver. This walked the roots itself until
+;; it was found to be resolving LESS than io/resource did, in two ways that both
+;; only bite where they are hardest to see:
+;;
+;;   - it never consulted embedded-resources, so in a `jolt build` binary with
+;;     :jolt/build :embed a baked-in resource answered nil here while
+;;     (io/resource n) served it. Every classpath-probing library that goes
+;;     through a loader rather than io/resource — .getResourceAsStream on
+;;     RT/baseLoader is the common spelling — therefore saw nothing in the built
+;;     artifact and everything in the source tree it was developed against.
+;;   - it announced no candidate to the AOT cache, so a compile-time lookup
+;;     through a loader was not part of the cache key: exactly the staleness
+;;     jolt#576 fixed for io/resource, still live on this path.
+(define (cl-get-resource self name) (resolve-resource name))
 ;; getResources: every source root that holds the named resource, as file: URLs
 ;; (enumeration-seq just calls seq, so a list serves). ring's static-resource
 ;; symlink check enumerates these to confirm a served file sits under a root.
+;; An embedded hit leads, matching the precedence the singular resolver gives it,
+;; and every candidate is announced for the reason resolve-resource announces.
 (define (cl-get-resources self name)
-  (let ((nm (jolt-str-render-one name)))
-    (let loop ((roots (get-source-roots)) (acc '()))
+  (let* ((nm (resource-name-arg name))
+         (emb (hashtable-ref embedded-resources nm #f)))
+    (let loop ((roots (get-source-roots))
+               (acc (if emb (list (make-embedded-res nm emb)) '())))
       (cond ((null? roots) (list->cseq (reverse acc)))
-            ((file-exists? (string-append (car roots) "/" nm))
-             (loop (cdr roots) (cons (resource-file-url (car roots) nm) acc)))
-            (else (loop (cdr roots) acc))))))
+            (else
+             (let ((cand (string-append (car roots) "/" nm)))
+               (io-note-file-read! cand)
+               (if (file-exists? cand)
+                   (loop (cdr roots) (cons (resource-file-url (car roots) nm) acc))
+                   (loop (cdr roots) acc))))))))
+;; The stream for whatever the resolver answered. Both branches of a resolved
+;; resource are java.net.URLs with an openStream — a file: URL reads its target,
+;; an embedded-res hands back its baked content — so dispatching the method is
+;; what makes an embedded hit readable. Stripping the scheme and slurping the
+;; path, which is what this did, only ever worked for the file: branch.
+(define (cl-resource-stream self name)
+  (let ((u (cl-get-resource self name)))
+    (if (jolt-nil? u) jolt-nil (record-method-dispatch u "openStream" jolt-nil))))
 (register-host-methods! "classloader"
   (list (cons "getResource" cl-get-resource)
         (cons "getResources" cl-get-resources)
@@ -1147,10 +1459,7 @@
         ;; JVM's bootstrap loader gives, which terminates the usual
         ;; (take-while identity (iterate #(.getParent %) loader)) walk.
         (cons "getParent" (lambda (self) jolt-nil))
-        (cons "getResourceAsStream"
-              (lambda (self name)
-                (let ((u (cl-get-resource self name)))
-                  (if (jolt-nil? u) jolt-nil (host-new "StringReader" (jolt-slurp (url-strip-scheme (url-spec u))))))))))
+        (cons "getResourceAsStream" cl-resource-stream)))
 (register-class-statics! "java.lang.ClassLoader" (list (cons "getSystemClassLoader" (lambda () the-classloader))))
 ;; clojure.lang.RT/baseLoader — the resource-resolving class loader (RT/baseLoader
 ;; is how libraries reach Clojure's base loader, e.g. aws-api's resources ns).
@@ -1174,12 +1483,11 @@
         (cons "getResource"
               (lambda (self name)
                 (cl-get-resource the-classloader
-                                 (class-resource-name (jclass-name self) (jolt-str-render-one name)))))
+                                 (class-resource-name (jclass-name self) (resource-name-arg name)))))
         (cons "getResourceAsStream"
               (lambda (self name)
-                (let ((u (cl-get-resource the-classloader
-                                          (class-resource-name (jclass-name self) (jolt-str-render-one name)))))
-                  (if (jolt-nil? u) jolt-nil (host-new "StringReader" (jolt-slurp (url-strip-scheme (url-spec u))))))))))
+                (cl-resource-stream the-classloader
+                                    (class-resource-name (jclass-name self) (resource-name-arg name)))))))
 ;; clojure.lang.RT/nextID — process-unique increasing id (AtomicInteger(1)
 ;; getAndIncrement), used by id generators such as core.logic's lvar.
 (define rt-next-id-counter 1)
@@ -1209,19 +1517,52 @@
 ;; any thread sets the target thread's flag and .isInterrupted reads it without
 ;; clearing (instance semantics; the static Thread/interrupted reads-and-clears).
 ;; getContextClassLoader hands back the loader.
+;; A handle STANDS FOR one thread, and every question asked through it is about
+;; that thread — including when some other thread is holding it, which is the
+;; only shape Thread/getAllStackTraces hands back. So the id travels IN the
+;; handle: reading (get-thread-id) here answered about whoever was asking, so
+;; every entry in that map reported the caller's id and its name was the constant
+;; "main". State is (interrupt-box . thread-id).
+(define (thread-handle-box h) (car (jhost-state h)))
+(define (thread-handle-id h) (cdr (jhost-state h)))
+;; Names live in an id-keyed table for the same reason, under the handle mutex:
+;; a thread parameter is only readable by its own thread. A thread nobody named
+;; answers the JVM's default shape — the boot thread is "main", anything else
+;; "Thread-<id>".
+(define thread-names-by-id (make-eqv-hashtable))
+(define (jolt-thread-name-set! id nm)
+  (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-names-by-id id nm)))
+(define (jolt-thread-name id)
+  (or (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-names-by-id id #f))
+      (if (eqv? id jolt-boot-thread-id)
+          "main"
+          (string-append "Thread-" (number->string id)))))
 (register-host-methods! "thread"
   (list (cons "getContextClassLoader" (lambda (self) the-classloader))
-        (cons "getName" (lambda (self) "main"))
+        (cons "getName" (lambda (self) (jolt-thread-name (thread-handle-id self))))
+        (cons "setName" (lambda (self nm)
+                          (jolt-thread-name-set! (thread-handle-id self) (jolt-final-str nm))
+                          jolt-nil))
+        (cons "getId" (lambda (self) (thread-handle-id self)))
         ;; no reified call stack (jolt does TCO, so caller frames are erased) — an
         ;; empty StackTraceElement[]. clojure.spec.test.alpha's instrument reads it
         ;; to name the caller var; it degrades to no ::caller, the conform error
         ;; (the ExceptionInfo) is still thrown.
         (cons "getStackTrace" (lambda (self) (jolt-vector)))
+        ;; The flag first, then the poke: a waiter woken by the poke reads the
+        ;; flag, so a wake that arrives before it is set says nothing. Waking is
+        ;; what turns .interrupt from "the target will notice next time it looks"
+        ;; into the JVM's "the target is thrown out of its wait now"
+        ;; (jolt-cv-wait-interruptibly, host/chez/locks.ss).
         (cons "interrupt" (lambda (self)
-                            (when (box? (jhost-state self)) (set-box! (jhost-state self) #t))
+                            (let ((b (thread-handle-box self)))
+                              (when (box? b)
+                                (set-box! b #t)
+                                (jolt-interrupt-wake-waits! b)))
                             jolt-nil))
         (cons "isInterrupted" (lambda (self)
-                                (and (box? (jhost-state self)) (unbox (jhost-state self)) #t)))))
+                                (let ((b (thread-handle-box self)))
+                                  (and (box? b) (unbox b) #t))))))
 ;; ONE handle per thread, cached in a thread parameter. The JVM's
 ;; Thread/currentThread is identity-stable, and code relies on it: keying a map by
 ;; the current thread, or comparing two calls with identical?/=. Allocating a fresh
@@ -1241,7 +1582,7 @@
         (id (get-thread-id)))
     (if (and (pair? c) (eqv? (car c) id))
         (cdr c)
-        (let ((h (make-jhost "thread" (current-interrupt-box))))
+        (let ((h (make-jhost "thread" (cons (current-interrupt-box) id))))
           (thread-handle-cell (cons id h))
           (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
           h))))
@@ -1252,7 +1593,7 @@
   (if (eqv? id (get-thread-id))
       (current-thread-handle)              ; the caller must find ITSELF in the map
       (or (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))
-          (let ((h (make-jhost "thread" (box #f))))
+          (let ((h (make-jhost "thread" (cons (box #f) id))))
             (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
             h))))
 ;; Thread/getAllStackTraces: the live threads mapped to EMPTY stack traces. jolt
@@ -1274,30 +1615,51 @@
   (register-class-statics! "java.lang.Thread" statics))
 
 ;; --- java.io.File / java.util.UUID constructors -----------------------------
-;; (java.io.File. parent child) joins with exactly ONE separator: File(parent,
-;; child) normalizes, so a parent that already ends in "/" does not produce a
-;; doubled slash (ring's resource middleware builds "assets/" + "index.html").
-;; A child that starts with a separator is joined the same way, and an empty
-;; child yields the parent's path alone -- all four checked against the JVM.
+;; (java.io.File. parent child) answers resolve(normalize(parent),
+;; normalize(child)) -- it normalizes each ARGUMENT, and then:
+;;
+;;   resolve(p, c) = p              when c is "" or "/"
+;;                 = c              when c is absolute and p is "/"
+;;                 = p + c          when c is absolute
+;;                 = p + c          when p is "/"
+;;                 = p + "/" + c    otherwise
+;;
+;; So a parent that already ends in "/" does not produce a doubled slash (ring's
+;; resource middleware builds "assets/" + "index.html"), a duplicate INSIDE
+;; either argument collapses, and a separator-only child yields the parent alone.
+;;
+;; A null parent is the child by itself. An EMPTY parent is not: it resolves
+;; against getDefaultParent(), which is "/" -- new File("", "c") is "/c", not
+;; "c", and new File("", "") is "/", not "". Both measured against the JVM.
+;;
+;; Worth knowing before measuring this yourself: resolve grew its c == "/" case
+;; in JDK 21. Through JDK 20, new File("/a/b", "/") answered "/a/b/" -- a path
+;; carrying a trailing separator no one-argument constructor can produce, whose
+;; .getName() was "". From 21 on it is "/a/b", which is what this matches.
+;;
+;; A null CHILD is not a null parent: the constructor null-checks it up front and
+;; throws, message and all -- new File("/a", null) raises NPE rather than
+;; answering "/a". jolt read it as "" and quietly answered the parent, the same
+;; silently-wrong-file shape as the nil coercions above.
 (define (jolt-file-join parent child)
-  (let* ((p (file-path-of parent))
-         (c (file-path-of child))
-         (p (if (and (> (string-length p) 1)
-                     (char=? (string-ref p (- (string-length p) 1)) #\/))
-                (substring p 0 (- (string-length p) 1))
-                p))
-         (c (let strip ((i 0))
-              (cond ((= i (string-length c)) c)
-                    ((char=? (string-ref c i) #\/) (strip (+ i 1)))
-                    (else (substring c i (string-length c)))))))
-    (cond ((string=? c "") p)
-          ((string=? p "/") (string-append "/" c))
-          (else (string-append p "/" c)))))
-(register-class-ctor! "File"
-  (lambda (a . rest)
-    (if (pair? rest)
-        (jolt-make-file (jolt-file-join a (car rest)))
-        (jolt-make-file a))))
+  (when (jolt-nil? child) (throw-jvm (quote NullPointerException) jolt-nil))
+  (let ((c (jolt-path-normalize (file-path-of child))))
+    (if (jolt-nil? parent)
+        c
+        (let* ((p (jolt-path-normalize (file-path-of parent)))
+               (p (if (string=? p "") "/" p)))
+          (cond ((or (string=? c "") (string=? c "/")) p)
+                ((char=? (string-ref c 0) #\/)
+                 (if (string=? p "/") c (string-append p c)))
+                ((string=? p "/") (string-append p c))
+                (else (string-append p "/" c)))))))
+;; new File((String)null) throws too, with a null message of its own. Only the
+;; two-arg form takes a null parent, and there it means "the child alone".
+(define (jolt-file-ctor a . rest)
+  (cond ((pair? rest) (jolt-make-file (jolt-file-join a (car rest))))
+        ((jolt-nil? a) (throw-jvm (quote NullPointerException) jolt-nil))
+        (else (jolt-make-file a))))
+(register-class-ctor! "File" jolt-file-ctor)
 ;; File statics: the platform separators plus createTempFile / listRoots.
 (define temp-file-counter 0)
 (define (file-create-temp prefix suffix . dir)
@@ -1327,11 +1689,7 @@
                      (cons "listRoots" (lambda () (jolt-vector (make-jfile "/")))))))
   (register-class-statics! "File" statics)
   (register-class-statics! "java.io.File" statics))
-(register-class-ctor! "java.io.File"
-  (lambda (a . rest)
-    (if (pair? rest)
-        (jolt-make-file (jolt-file-join a (car rest)))
-        (jolt-make-file a))))
+(register-class-ctor! "java.io.File" jolt-file-ctor)
 ;; java.nio.charset.StandardCharsets: the constants ARE the charset names —
 ;; every jolt charset seam (.getBytes, String ctors, InputStreamReader) takes
 ;; the name string, so the constant composes with all of them (clj-uuid's v3/v5

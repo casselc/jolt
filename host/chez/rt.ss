@@ -141,6 +141,42 @@
         (guard (_ (#t #f)) (flush-output-port (current-error-port)))
         (jolt-c-exit code))))
 
+;; Build a foreign procedure whose invocation returns both the native result
+;; and the calling thread's native error slot as Scheme values. Chez captures
+;; the slot in the foreign-call return path, before collect-safe reactivation or
+;; later Scheme/native work can overwrite it.
+;;
+;; Select from the compiler target, not this process's machine-type: cross-image
+;; builds rebind #%$target-machine while the build host remains unchanged. An
+;; unrecognized target fails during expansion rather than guessing a nearby ABI.
+(define-syntax jolt-ffi-native-error-convention-case
+  (lambda (x)
+    (syntax-case x ()
+      ((_ get-last-error-form errno-form)
+       (case (eval '(#%$target-machine))
+         ((i3nt ti3nt a6nt ta6nt arm64nt tarm64nt)
+          #'get-last-error-form)
+         ((i3le ti3le a6le ta6le
+           ppc32le tppc32le arm32le tarm32le
+           arm64le tarm64le rv64le trv64le la64le tla64le
+           i3osx ti3osx a6osx ta6osx
+           ppc32osx tppc32osx arm64osx tarm64osx)
+          #'errno-form)
+         (else
+          (error 'jolt-ffi-native-error-convention-case
+                 "unsupported target machine"
+                 (eval '(#%$target-machine)))))))))
+
+(define-syntax jolt-ffi-native-error-procedure
+  (lambda (x)
+    (syntax-case x ()
+      ((_ (conv ...) name args res)
+       #'(jolt-ffi-native-error-convention-case
+           (sa-foreign-procedure-native-error
+            __get_last_error (conv ...) name args res)
+           (sa-foreign-procedure-native-error
+            __errno (conv ...) name args res))))))
+
 ;; --- how many processors can this process use ---------------------------------
 ;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
 ;; pmap's look-ahead window read. Each host is asked the question the JVM asks
@@ -281,7 +317,12 @@
         ((number? x) (exact->inexact x))
         (else (jolt-num-cast-throw x))))
 ;; jolt `not`: only nil and false are falsey.
-(define (jolt-not x) (if (jolt-truthy? x) #f #t))
+;; Spliced, like the predicates in values.ss (see jolt-nil? there for why).
+(define (jolt-not-fn x) (if (jolt-truthy? x) #f #t))
+(define-syntax jolt-not
+  (syntax-rules ()
+    ((_ e) (if (jolt-truthy? e) #f #t))
+    ((_ e ...) (jolt-not-fn e ...))))
 
 ;; --- ex-info record type -----------------------------------------------------
 ;; A throwable (ex-info or host-constructed typed throwable) is a distinct
@@ -341,7 +382,7 @@
 ;; ~2.4ns vs ~3.3ns, a smaller but free win.
 ;;
 ;; Virtual registers are a fixed global resource: (virtual-register-count) slots for
-;; the whole process (16 on every platform jolt targets). jolt claims three, allocated
+;; the whole process (16 on every platform jolt targets). jolt claims 0-9, listed
 ;; here so the assignment is in one place; nothing else in the runtime uses them.
 ;; A freshly forked thread starts every slot at fixnum 0, NOT #f, so "unset" means
 ;; fixnum 0 (the site slots hold a site pair or 0). Slot 0 was claimed by R1's
@@ -349,10 +390,9 @@
 ;; write is ~2ns against ~33ns for a thread-parameter write, which is what keeps
 ;; the 3.4M switches/sec design point (R0(c)); the fibers define re-defines the
 ;; value in fibers.ss so the standalone gate can load it without rt.ss. Slot 1
-;; remains FREE since R3 (jolt-230w) removed the R1 ring/mark vregs — the tail
-;; marks live on the continuation, not in a vreg — so new virtual-register users
-;; should claim it before renumbering anything. The surviving slots keep their
-;; R2 numbers.
+;; was freed by R3 (jolt-230w), which moved the R1 ring/mark vregs onto the
+;; continuation, and re-claimed by fibers.ss for park-unwinding; the next free
+;; slot is 10. The surviving slots keep their R2 numbers.
 (define jolt-vreg-site 2)        ; ('ns/fn' . line) of the innermost live call site
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
@@ -365,6 +405,18 @@
 ;;   dispatched the running fiber with, so the park's finally walk knows where to stop
 ;; slot 8: values.ss jolt-vreg-symcell-cache — this thread's bounded identity
 ;;   front cache over the symbol-string pool (intern-symbol-cell)
+;; slot 9: java/host-static-methods.ss jolt-vreg-interrupt-box — this thread's
+;;   interrupt flag. A vreg and NOT a thread parameter on purpose: a thread
+;;   parameter is inherited by a forked thread, so the box had to carry the
+;;   owning thread's id and be re-checked on every read; a vreg starts at
+;;   fixnum 0 in a fresh thread, which is the property that workaround was
+;;   buying.
+;; slot 10: java/host-static-classes.ss jolt-vreg-threadlocals — this thread's
+;;   java.lang.ThreadLocal -> value table. Same reason as slot 9, and one step
+;;   stronger: a thread parameter here does not merely leak a flag, it hands a
+;;   child the parent's stored VALUE, which is the one thing ThreadLocal promises
+;;   it will not do (jolt-uecg). InheritableThreadLocal, whose contract is the
+;;   opposite, keeps a per-instance thread parameter and its inheritance.
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
@@ -396,6 +448,13 @@
 ;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
 ;; reporter validates it against the callsite table before splicing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
+;; A top-level form is a root: nothing tail-called it, so whatever the slot holds
+;; when one starts is a returned call's residue — the reporter's validator cannot
+;; tell it from a live pair when the innermost live frame is a host fn (the
+;; loader, the eval loop), which registers no callees. compile-eval.ss clears the
+;; slot when a form starts to compile and again when its compiled code starts to
+;; run, since macroexpansion runs user code in between.
+(define (jolt-site-reset!) (set-virtual-register! jolt-vreg-site 0))
 ;; The line to report for the INNERMOST frame. Inside a catch clause that is the
 ;; line the throw came from, snapshotted on the way in; else the pair stashed at
 ;; the raise. Never the live vreg — it can be stale between throws.
@@ -528,6 +587,12 @@
 ;; the condition itself, which is what jolt-unwrap-throw hands the reporter for
 ;; a non-&jolt-throw raise. jolt throws skip this (they captured already, with
 ;; the RIGHT identity — overwriting would orphan their k).
+;; The condition the stash below describes. A fault a `guard` catches never
+;; reaches this handler (the guard's own is nearer), so the catch boundary
+;; snapshots the site itself when it converts the condition (java/
+;; host-faults.ss) — unless this handler already did, which is what the
+;; identity says.
+(define jolt-fault-captured (make-thread-parameter #f))
 (define (jolt-capture-fault! c)
   (unless (jolt-throw-condition? c)
     ;; NO call/cc here: Chez already attaches &continuation to a serious
@@ -535,18 +600,48 @@
     ;; would heap-freeze a whole stack for every INTERNALLY-CAUGHT host
     ;; condition, which a hot raise path cannot afford. Only the site pair is
     ;; stashed; an O(1) read.
-    (jolt-throw-sitep (let ((s (virtual-register jolt-vreg-site)))
-                        (and (pair? s) s)))))
+    (jolt-fault-captured c)
+    (jolt-throw-sitep (jolt-live-site))))
+;; The site pair the vreg holds now, or #f.
+(define (jolt-live-site)
+  (let ((s (virtual-register jolt-vreg-site)))
+    (and (pair? s) s)))
+;; The value a raise carries, as jolt code sees it. A &jolt-throw condition
+;; unwraps to the value it wraps. A raw Chez condition — a fault the host itself
+;; raised, such as a primitive handed nil — becomes a typed jolt throwable, so a
+;; catch binds something with a class, a message and the Throwable surface, and
+;; a catch clause dispatches on that class like on any other. The conversion is
+;; the java layer's (java/host-faults.ss installs it); until that file loads a
+;; condition passes through as itself.
+(define jolt-fault->throwable (lambda (c) c))
 (define (jolt-unwrap-throw x)
-  (if (jolt-throw-condition? x) (jolt-throw-condition-value x) x))
+  (cond ((jolt-throw-condition? x) (jolt-throw-condition-value x))
+        ((condition? x) (jolt-fault->throwable x))
+        (else x)))
+;; The raw condition a converted fault came from, or #f: the reporter reads the
+;; continuation Chez attached to it (source-registry.ss). Installed with the
+;; conversion.
+(define jolt-fault-condition-of (lambda (v) #f))
 ;; ex-info builds a jolt-ex-info-record (NOT a pmap — pmap?/coll?/seqable?/ifn?
 ;; /associative?/counted? are naturally false). Arity 2 (msg data) or 3 (msg data cause).
 ;; No :jolt/class field on plain ex-info — class defaults to clojure.lang.ExceptionInfo
 ;; via ex-info-class in records-interop.ss.
+;;
+;; nil data reads back as {}, not nil: ExceptionInfo's constructor rejects a null
+;; map, so an ExceptionInfo whose data is nil cannot exist and (ex-data (ex-info
+;; "m" nil)) is {}. Coercing HERE covers every caller — the emitter lowers the
+;; ex-info native op to a direct call to this procedure, so a wrapper around the
+;; clojure.core/ex-info var root would miss every compiled call site. It is also
+;; what makes (some? (ex-data e)) a sound "is this an ExceptionInfo" test, which
+;; is how the analyzer's throw-message tells one from a host throwable.
+;;
+;; A throwable that genuinely has NO data is a different construction:
+;; jolt-host-throwable / throw-jvm, which is what the JVM raises wherever
+;; ex-data is nil.
 (define (jolt-ex-info msg data . more)
   (make-jolt-ex-info-record "clojure.lang.ExceptionInfo" msg
                              (if (null? more) jolt-nil (car more))
-                             data 0))
+                             (if (jolt-nil? data) empty-pmap data) 0))
 ;; A host-constructed throwable (RuntimeException. etc.): a jolt-ex-info-record
 ;; carrying its canonical JVM class-name, so (class …) / instance? / .getMessage /
 ;; ex-message all reflect the real type.
@@ -626,8 +721,8 @@
 ;; the same reason meta and macro? are.
 (define-record-type var-cell
   (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
-          (mutable dyn-bound?))
-  (nongenerative var-cell-v4))
+          (mutable dyn-bound?) (mutable dynamic?))
+  (nongenerative var-cell-v5))
 (define var-table (make-hashtable string-hash string=?))
 (define var-table-mu (make-mutex))
 ;; var-table-mu covers EVERY mutation of var-table and of ns-has-vars-set below
@@ -702,7 +797,7 @@
     (or (hashtable-ref var-table k #f)
         (jolt-with-mutex var-table-mu
           (or (hashtable-ref var-table k #f)
-              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f)))
+              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f)))
                 (hashtable-set! var-table k c)
                 (ns-cells-add! c)
                 c))))))
@@ -725,6 +820,18 @@
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
 ;; probe never interns an empty cell.
 (define (var-cell-lookup ns name) (hashtable-ref var-table (string-append ns "/" name) #f))
+;; A direct-linked call to a seed var binds the var's root ONCE, when the def
+;; that holds the site loads (backend emit-invoke, jolt.host/seed-callable?).
+;; The compile-time check proved the root a procedure in the same seed, so
+;; anything else here is a runtime that does not match the build — say so
+;; rather than let the site fail on its first call with a bare Chez error.
+(define (jolt-seed-root cell)
+  (let ((r (var-cell-root cell)))
+    (if (procedure? r)
+        r
+        (error 'jolt-seed-root
+               (string-append "direct-linked seed var " (var-cell-ns cell) "/" (var-cell-name cell)
+                              " is not bound to a procedure in this runtime")))))
 (define (var-deref ns name) (var-cell-root (jolt-var ns name)))
 ;; def-var! / declare-var! return the VAR CELL, not the value — Clojure's `def`
 ;; evaluates to #'ns/name (a first-class var), so (var? (def x 1)) is true and
@@ -745,15 +852,79 @@
 ;; (java/host-class.ss) — so none of them can afford to skip it either.
 (define proc-name-mu (make-mutex))
 (define (proc-name-of v) (jolt-with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
+;; Name a procedure def-var! never saw. A core fn in VALUE position compiles to
+;; the runtime's own procedure, not the var's root, and a native that is
+;; set!-extended after its def-var! leaves that procedure unnamed -- so an image,
+;; which writes a procedure as its var name, could not write values built from it.
+;; post-prelude.ss calls this once everything has finished extending; the shared
+;; file reaches it through this rather than the table, so the Gambit host can shim
+;; it (jolt-6cwk).
+(define (register-proc-name! v ns name)
+  (jolt-with-mutex proc-name-mu (hashtable-set! proc-name-tbl v (cons ns name)))
+  v)
+;; "ns/name" of every var defined more than once with a value. Guarded by
+;; var-table-mu like the other var-table side sets; reads are single-key.
+(define var-redefined-set (make-hashtable string-hash string=?))
+(define (var-redefined? ns name)
+  (jolt-with-mutex var-table-mu
+    (hashtable-contains? var-redefined-set (string-append ns "/" name))))
+;; A var root that is CODE rather than data. A procedure always is; a multimethod
+;; and a reify are code too, but they are RECORDS, so `procedure?` misses them and
+;; nothing recorded their name -- which is why a state image walked a multimethod's
+;; dispatch tables and refused it, instead of writing the var's name and resolving
+;; it back to the live one (jolt-2cny). Registered rather than hardcoded because
+;; multimethods.ss and records.ss both load after this file.
+(define code-value-arms '())
+(define (register-code-value! pred) (set! code-value-arms (cons pred code-value-arms)))
+(define (code-value? v)
+  (let loop ((ps code-value-arms))
+    (cond ((null? ps) #f)
+          (((car ps) v) #t)
+          (else (loop (cdr ps))))))
+
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
-  (when (procedure? v)
+  (when (or (procedure? v) (code-value? v))
     (jolt-with-mutex proc-name-mu
       (unless (hashtable-contains? proc-name-tbl v)
         (hashtable-set! proc-name-tbl v (cons ns name)))))
   (jolt-with-mutex var-table-mu (hashtable-set! ns-has-vars-set ns #t))
-  (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+  (let ((c (jolt-var ns name)))
+    ;; A var this def is REDEFINING -- it already had a value. Recorded because the
+    ;; inline pass may not splice such a var's body: a caller compiled between two
+    ;; defs would freeze the first one while a later caller splices the second, and
+    ;; the same binary then answers two ways (jolt-rtjm). The build loads the whole
+    ;; app before it emits any of it, so by stash time this set is complete.
+    ;;
+    ;; "Already had a value" is the root not being the unbound marker -- NOT
+    ;; var-cell-defined?, which means interned/resolvable and is set by
+    ;; declare-var! too (and by the compiler interning a global as it classifies
+    ;; it), so it is true on the very first def of every var.
+    ;;
+    ;; That distinction is the point: (declare x) leaves the unbound root intact,
+    ;; so a forward declaration ahead of the real defn is ONE definition and stays
+    ;; spliceable. The string-append is inside the branch, so it runs once per
+    ;; actual redefinition rather than once per def.
+    (when (not (jolt-var-unbound? (var-cell-root c)))
+      (jolt-with-mutex var-table-mu
+        (hashtable-set! var-redefined-set (string-append ns "/" name) #t)))
+    (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+;; A def whose form declared NO metadata. Same as def-var!, plus the half of the
+;; :dynamic assignment def-var-with-meta! does from the other side: a def ASSIGNS
+;; the flag from what it declared, so a plain (def *x* 2) over a
+;; (def ^:dynamic *x* 1) leaves a var that no longer binds, as on the JVM.
+;;
+;; Separate from def-var! because def-var! is not only a def: filling a var's
+;; root is spelled the same way (multimethods.ss defmulti-setup does exactly
+;; that, right after the (def ^:dynamic name) the macro expands to), and that is
+;; not a redeclaration of anything.
+;;
+;; Nothing else moves the flag: alter-meta!, reset-meta! and intern write
+;; metadata and leave it where it is, and .setDynamic writes it without touching
+;; metadata — all three matching the JVM, where the flag is a field on the Var.
+(define (def-var-plain! ns name v)
+  (let ((c (def-var! ns name v))) (var-cell-dynamic?-set! c #f) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.
@@ -843,7 +1014,15 @@
 (define jolt-kw-var-name (keyword #f "name"))
 (define jolt-kw-var-macro (keyword #f "macro"))
 (define (def-var-with-meta! ns name v m)
-  (let ((c (def-var! ns name v))) (var-cell-meta-set! c m) c))
+  (let ((c (def-var! ns name v)))
+    (var-cell-meta-set! c m)
+    (var-cell-dynamic?-set! c (var-meta-dynamic? m))
+    c))
+;; Does this DECLARED metadata map ask for a dynamic var? Only a def consults it
+;; — see def-var! on why the flag is not read back out of the metadata later.
+(define (var-meta-dynamic? m)
+  (and m (not (jolt-nil? m))
+       (jolt-truthy? (jolt-get m (keyword #f "dynamic")))))
 ;; A runtime-defined DYNAMIC var (the *earmuffed* core vars): tagged :dynamic so
 ;; push-thread-bindings accepts it — with no meta entry a var is non-dynamic and
 ;; binding throws, like the JVM.
@@ -853,7 +1032,9 @@
 ;; Attach meta to an already-interned var (the declare/no-init emission path:
 ;; (def ^:dynamic *x*) must be bindable before its root is set).
 (define (set-var-meta! ns name m)
-  (var-cell-meta-set! (jolt-var ns name) m))
+  (let ((c (jolt-var ns name)))
+    (var-cell-meta-set! c m)
+    (var-cell-dynamic?-set! c (var-meta-dynamic? m))))
 ;; runtime-macro registry: a var whose root holds a macro
 ;; expander fn is flagged here, so the ON-CHEZ analyzer's form-macro?/form-expand-1
 ;; (host-contract.ss) expand it. The prelude emits each core/stdlib defmacro as a
@@ -883,7 +1064,7 @@
           (let ((c (hashtable-ref var-table k #f)))
             (if c
                 (begin (var-cell-defined?-set! c #t) c)
-                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f)))  ; declared => interned/resolvable
+                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f)))  ; declared => interned/resolvable
                   (hashtable-set! var-table k c)
                   (ns-cells-add! c)
                   c)))))))
@@ -1364,6 +1545,7 @@
 (load "host/chez/protocols.ss")
 (load "host/chez/records-dispatch.ss")
 (load "host/chez/java/records-interop.ss")   ; exception hierarchy + instance-check taxonomy
+(load "host/chez/java/host-faults.ss")       ; a raw host fault caught = a typed throwable
 
 ;; metadata: meta / with-meta over an identity-keyed
 ;; side-table. After records.ss (jrec) + the collection ctors it copies.
@@ -1544,6 +1726,12 @@
 ;; runtime (it depends on async.ss).
 (load "host/chez/java/fibers-async.ss")
 
+;; Escape continuations as a jolt API (issue #736): jolt.host/call-cc, which
+;; stdlib/jolt/continuations.clj presents as call-cc / letcc. After fibers.ss —
+;; the guard that refuses an escape captured on another fiber reads the fiber
+;; vreg, and refusing is what keeps a cross-fiber invoke from hanging.
+(load "host/chez/continuations.ss")
+
 ;; The cheap park (R7, jolt-nvpr.9): __sm-spawn/__sm-take/__sm-put, the ops a
 ;; CPS'd go body (the pass in clojure.core.async) calls. A
 ;; lexically-parking body stores the rest of the computation as an ordinary
@@ -1559,6 +1747,11 @@
 ;; printing. Loads LAST so its set!-wraps of jolt-class/jolt=2/the printers sit
 ;; outermost over every earlier extension.
 (load "host/chez/java/bigdec.ss")
+
+;; The library seam for extending / overriding a class jolt already part-shims.
+;; After every java shim and after bigdec.ss's class-arm wraps, so the class name
+;; a lookup resolves against is the final one.
+(load "host/chez/java/class-extensions.ss")
 
 ;; Native stack traces: jv$ns$name -> source registry + continuation frame walk +
 ;; uncaught-throwable renderer. After the printers/equality it relies on.

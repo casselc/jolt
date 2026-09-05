@@ -17,6 +17,58 @@
   {:suite "uuid" :expr "(every? (fn [_] (re-matches #\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\" (str (random-uuid)))) (range 200))" :expected "true"}
   {:suite "uuid" :expr "(let [us (repeatedly 400 #(str (random-uuid)))] (every? #(> (count (distinct (map (fn [u] (nth u %)) us))) 8) [0 1 2 7 9 35]))" :expected "true"}
   {:suite "uuid" :expr "(= (str (random-uuid)) (str (random-uuid)))" :expected "false"}
+  ;; The reflection member model: jolt reports what its registries KNOW a class
+  ;; declares, not what the JVM ships. Three registries answer: the protocol/type
+  ;; registry (a deftype's methods), the host shim tables (an ArrayList's), and
+  ;; class-statics (a procedure is a static method, anything else a static field's
+  ;; value). A member that lives in none of them — String's instance methods are a
+  ;; `cond` in natives-str.ss, not data anything can enumerate — is absent rather
+  ;; than guessed at. jolt-only: the JVM answers differently by construction, so
+  ;; these cannot be corpus rows.
+  {:suite "reflect-member-model" :expr "(let [ns (set (map (fn [m] (.getName m)) (.getMethods String)))] [(contains? ns \"format\") (contains? ns \"substring\")])" :expected "[true false]"}
+  {:suite "reflect-member-model" :expr "(java.lang.reflect.Modifier/isStatic (.getModifiers (.getMethod String \"format\" nil)))" :expected "true"}
+  {:suite "reflect-member-model" :expr "(mapv (fn [f] (.getName f)) (.getDeclaredFields String))" :expected "[\"CASE_INSENSITIVE_ORDER\"]"}
+  ;; a registered static is a Field, and reading it reflectively gives the value
+  ;; the static reference gives
+  {:suite "reflect-member-model" :expr "(.get (.getField Long \"MAX_VALUE\") nil)" :expected "9223372036854775807"}
+  {:suite "reflect-member-model" :expr "(sort (map (fn [f] (.getName f)) (.getDeclaredFields Long)))" :expected "(\"MAX_VALUE\" \"MIN_VALUE\" \"TYPE\")"}
+  {:suite "reflect-member-model" :expr "(identical? (.get (.getField clojure.lang.RT \"REQUIRE_LOCK\") clojure.lang.RT) clojure.lang.RT/REQUIRE_LOCK)" :expected "true"}
+  {:suite "reflect-member-model" :expr "(try (.getField Long \"NOPE\") (catch NoSuchFieldException _ :nsf))" :expected ":nsf"}
+  ;; a shim-backed class reports the methods its tag registers
+  {:suite "reflect-member-model" :expr "(contains? (set (map (fn [m] (.getName m)) (.getMethods java.util.ArrayList))) \"add\")" :expected "true"}
+  ;; a member object is a java.lang.reflect.* value, not an opaque :object
+  {:suite "reflect-member-model" :expr "(mapv class [(.getField Long \"MAX_VALUE\") (.getMethod Math \"floor\" nil) (first (.getConstructors java.util.ArrayList))])" :expected "[java.lang.reflect.Field java.lang.reflect.Method java.lang.reflect.Constructor]"}
+  {:suite "reflect-member-model" :expr "(str (.getField Long \"MAX_VALUE\"))" :expected "\"public static final java.lang.Object java.lang.Long.MAX_VALUE\""}
+  ;; getMethod / getConstructor select by parameter COUNT (jolt has no signatures)
+  ;; and raise NoSuchMethodException only for a name no registry has
+  {:suite "reflect-member-model" :expr "(try (.getMethod Math \"nope\" nil) (catch NoSuchMethodException _ :nsm))" :expected ":nsm"}
+  {:suite "reflect-member-model" :expr "(do (defrecord RC [a b]) (.getParameterCount (.getConstructor RC (into-array Class [Object Object]))))" :expected "2"}
+  {:suite "reflect-member-model" :expr "(.invoke (.getMethod Math \"floor\" nil) nil (into-array Object [2.7]))" :expected "2.0"}
+  {:suite "reflect-member-model" :expr "(do (defprotocol PA (pa [this])) (defprotocol PB (pb [this])) (deftype TT [] PA (pa [_] 1) PB (pb [_] 2)) (count (.getMethods TT)))" :expected "2"}
+  {:suite "reflect-member-model" :expr "(do (defrecord RR [a b]) (mapv (fn [f] (.getName f)) (.getDeclaredFields RR)))" :expected "[\"a\" \"b\"]"}
+  {:suite "reflect-member-model" :expr "(do (defrecord RS [a]) (.getName (.getDeclaredField RS \"a\")))" :expected "\"a\""}
+  {:suite "reflect-member-model" :expr "(do (defrecord RT [a]) (= (.getName (.getField RT \"a\")) (.getName (.getDeclaredField RT \"a\"))))" :expected "true"}
+  ;; the class graph answers modifiers for a name it models; one it does not
+  ;; reports PUBLIC alone rather than claiming non-finality it cannot know
+  {:suite "reflect-member-model" :expr "(.getModifiers (Class/forName \"java.lang.Thread\"))" :expected "1"}
+  ;; clojure.reflect over the same registries: the reference JavaReflector is a
+  ;; thin layer on getDeclaredFields/Methods/Constructors + getModifiers + bases,
+  ;; so the port is the reference apart from the member-set model above.
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (defrecord Rr1 [a b]) (sort (map (comp str :name) (filter :type (:members (clojure.reflect/reflect Rr1))))))" :expected "(\"a\" \"b\")"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (= #{:public :final} (:flags (clojure.reflect/type-reflect 'java.lang.String))))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (= #{:public :interface :abstract} (:flags (clojure.reflect/type-reflect 'java.util.List))))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (contains? (:bases (clojure.reflect/type-reflect 'java.lang.Integer)) 'java.lang.Number))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (defprotocol Prf (prf [this])) (deftype Trf [] Prf (prf [_] 1)) (contains? (set (map (comp str :name) (:members (clojure.reflect/reflect Trf)))) \"prf\"))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (defrecord Rr2 [a]) (= (clojure.reflect/reflect Rr2) (clojure.reflect/reflect (->Rr2 1))))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (map? (clojure.reflect/type-reflect 'java.lang.String :ancestors true)))" :expected "true"}
+  {:suite "assert-args" :expr "(:private (meta #'clojure.core/assert-args))" :expected "true"}
+  {:suite "assert-args" :expr "(:macro (meta #'clojure.core/assert-args))" :expected "true"}
+  {:suite "assert-args" :expr "(seq? (@#'clojure.core/assert-args true \"x\"))" :expected "true"}
+  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m1 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok)) (eval '(aa-m1 [1])))" :expected ":ok"}
+  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m2 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok)) (try (eval '(aa-m2 (1))) (catch IllegalArgumentException e (boolean (re-find #\"aa-m2 requires a vector for its binding\" (ex-message e))))))" :expected "true"}
+  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m3 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\" (even? (count b)) \"an even number of forms in binding vector\") :ok)) (try (eval '(aa-m3 [1 2 3])) (catch IllegalArgumentException e (boolean (re-find #\"aa-m3 requires an even number of forms in binding vector\" (ex-message e))))))" :expected "true"}
+  {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (clojure.repl/demunge \"my_ns$my_fn_QMARK_\"))" :expected "\"my-ns/my-fn?\""}
+  {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (ifn? (requiring-resolve 'clojure.repl/demunge)))" :expected "true"}
   {:suite "special-form precedence" :expr "(do (ns sftest (:refer-clojure :exclude [def])) (defmacro def [n v] :shadowed) (clojure.core/defn ff [] 99) (ff))" :expected "99"}
   {:suite "special-form precedence" :expr "(do (set! (. clojure.lang.RT checkSpecAsserts) true) clojure.lang.RT/checkSpecAsserts)" :expected "true"}
   {:suite "atomwatch" :expr "(let [a (atom 0) seen (atom 0)] (add-watch a :k (fn [k r o n] (reset! seen 1))) (reset! a 5) @seen)" :expected "1"}
@@ -145,13 +197,39 @@
   {:suite "hostctor" :expr "(instance? java.net.URI (java.net.URI. \"/x\"))" :expected "true"}
   {:suite "hostctor" :expr "(let [a (java.util.ArrayList.)] (.add a 1) (.add a 2) (.add a 3) (.remove a 0) [(.size a) (vec (.toArray a))])" :expected "[2 [2 3]]"}
   {:suite "hostctor" :expr "[(.indexOf [:a :b :c] :b) (.indexOf (list :a :b) :b) (.indexOf [:a] :z) (.indexOf (range 0 10) 1)]" :expected "[1 1 -1 1]"}
-  {:suite "sdf" :expr "(.format (java.text.SimpleDateFormat. \"EEE, dd MMM yyyy HH:mm:ss zzz\") (java.util.Date. 1348401170000))" :expected "\"Sun, 23 Sep 2012 11:52:50 GMT\""}
+  {:suite "sdf" :expr "(.format (doto (java.text.SimpleDateFormat. \"EEE, dd MMM yyyy HH:mm:ss zzz\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1348401170000))" :expected "\"Sun, 23 Sep 2012 11:52:50 GMT\""}
   {:suite "sdf" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"EEE, dd MMM yyyy HH:mm:ss zzz\") \"Sun, 23 Sep 2012 11:52:50 GMT\"))" :expected "1348401170000"}
   {:suite "sdf" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"EEEE, dd-MMM-yy HH:mm:ss zzz\") \"Sunday, 23-Sep-12 11:52:50 GMT\"))" :expected "1348401170000"}
-  {:suite "sdf" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"EEE MMM d HH:mm:ss yyyy\") \"Sun Sep 23 11:52:50 2012\"))" :expected "1348401170000"}
+  {:suite "sdf" :expr "(.getTime (.parse (doto (java.text.SimpleDateFormat. \"EEE MMM d HH:mm:ss yyyy\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) \"Sun Sep 23 11:52:50 2012\"))" :expected "1348401170000"}
   {:suite "sdf" :expr "(let [f (java.text.SimpleDateFormat. \"yyyy-MM-dd\")] (.format f (.parse f \"2023-07-15\")))" :expected "\"2023-07-15\""}
   {:suite "reader" :expr "(let [r (-> \"foo bar baz\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (slurp r)])" :expected "[foo \" bar baz\"]"}
   {:suite "reader" :expr "(let [r (-> \"(+ 1 2) 99\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (read r)])" :expected "[(+ 1 2) 99]"}
+  ;; A namespaced-map prefix ends at the namespace token.  Ordinary reader
+  ;; whitespace and commas may separate it from the opening map delimiter.
+  {:suite "reader / namespaced-map boundary" :expr "(= #:nsmap.foo{:a 1 :_/raw 2} #:nsmap.foo {:a 1 :_/raw 2})" :expected "true"}
+  {:suite "reader / namespaced-map boundary" :expr "(= #::{:a 1 :_/raw 2} #:: {:a 1 :_/raw 2})" :expected "true"}
+  {:suite "reader / namespaced-map boundary" :expr "(do (alias (quote nsmap-str) (quote clojure.string)) (= (read-string \"#::nsmap-str{:a 1}\") (read-string \"#::nsmap-str {:a 1}\")))" :expected "true"}
+  {:suite "reader / namespaced-map boundary" :expr "[(= #:nsmap.foo{:a 1} #:nsmap.foo, {:a 1}) (= #::{:a 1} #::, {:a 1}) (do (alias (quote nsmap-str) (quote clojure.string)) (= (read-string \"#::nsmap-str{:a 1}\") (read-string \"#::nsmap-str, {:a 1}\")))]" :expected "[true true true]"}
+  {:suite "reader / namespaced-map boundary" :expr "(= #:nsmap.foo{:a 1} (read-string \"#:nsmap.foo {; comment inside the map\\n :a 1}\"))" :expected "true"}
+  ;; JVM Clojure treats a comment as a reader macro, not whitespace at this
+  ;; exact boundary.  Junk and malformed/non-map payloads also fail closed.
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:nsmap.foo ; not boundary whitespace\\n{:a 1}\")" :expected :throws}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:foo bar{:a 1}\")" :expected :throws}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:nsmap.foo\")" :expected :throws}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:nsmap.foo :a\")" :expected :throws}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#: {:a 1}\")" :expected :throws}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#:foo/bar{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: foo/bar\""}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#:123{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: 123\""}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#::missing-alias {:a 1}\")" :expected :throws}
+  ;; The JVM decides the payload is not a map before it judges the namespace
+  ;; token, and it applies the same token rules to both prefix forms.  Messages
+  ;; below were taken from Clojure 1.12 on the JVM.
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#::foo/bar{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: foo/bar\""}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#::123{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: 123\""}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#:{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: nil\""}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#::nosuchalias{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Unknown auto-resolved namespace alias: nosuchalias\""}
+  {:suite "reader / namespaced-map boundary" :expr "[(try (read-string \"#:foo/bar :a\") (catch Throwable e (ex-message e))) (try (read-string \"#::nosuch :a\") (catch Throwable e (ex-message e))) (try (read-string \"#:foo (1)\") (catch Throwable e (ex-message e)))]" :expected "[\"Namespaced map must specify a map\" \"Namespaced map must specify a map\" \"Namespaced map must specify a map\"]"}
+  {:suite "reader / namespaced-map boundary" :expr "[(try (read-string \"#: {:a 1}\") (catch Throwable e (ex-message e))) (try (read-string \"#:: :a\") (catch Throwable e (ex-message e)))]" :expected "[\"Namespaced map must specify a namespace\" \"Namespaced map must specify a namespace\"]"}
   {:suite "hostctor" :expr "(String/format \"%d-%s\" 5 \"x\")" :expected "\"5-x\""}
   {:suite "hostctor" :expr "[(.format (java.text.NumberFormat/getInstance) 1234567.5) (.format (java.text.NumberFormat/getIntegerInstance) 1234567)]" :expected "[\"1,234,567.5\" \"1,234,567\"]"}
   {:suite "hostobj" :expr "(try (throw (ex-info \"x\" {})) (catch Throwable e [(.getNextException e) (vec (.getStackTrace e))]))" :expected "[nil []]"}
@@ -162,12 +240,117 @@
   {:suite "interrupt" :expr "(let [t (jolt.host/make-interrupt)] (jolt.host/interrupt! t) (try (jolt.host/run-interruptible t (fn [] (loop [i 0] (recur (inc i))))) :not-interrupted (catch :default e (:jolt/interrupted (ex-data e)))))" :expected "true"}
   {:suite "interrupt" :expr "(do (Thread/yield) :ok)" :expected ":ok"}
   {:suite "interrupt" :expr "(nil? (Thread/yield))" :expected "true"}
+  {:suite "threads / id" :expr "(let [t (Thread/currentThread) a (.getId t) b (.getId t)] (and (integer? a) (= a b)))" :expected "true"}
+  {:suite "threads / id" :expr "(let [current-id (.getId (Thread/currentThread)) ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) f (future (let [id (.getId (Thread/currentThread))] (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS) id))] (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (.countDown release) (let [child-id (deref f)] (and (integer? child-id) (not= current-id child-id))))" :expected "true"}
+  ;; A handle asks about the thread it STANDS FOR, not the thread doing the
+  ;; asking — the distinction only shows through a handle for someone else, which
+  ;; is what Thread/getAllStackTraces hands back.
+  {:suite "threads / id" :expr "(let [ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) seen (atom nil) t (Thread. (fn [] (reset! seen (.getId (Thread/currentThread))) (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS)))] (.start t) (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (let [ids (into #{} (map #(.getId %) (keys (Thread/getAllStackTraces))))] (.countDown release) (contains? ids @seen)))" :expected "true"}
+  {:suite "threads / id" :expr "(let [ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) t (Thread. (fn [] (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS)))] (.start t) (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (let [ths (keys (Thread/getAllStackTraces)) ids (map #(.getId %) ths)] (.countDown release) (= (count ths) (count (set ids)))))" :expected "true"}
+  {:suite "threads / name" :expr "(.getName (Thread/currentThread))" :expected "\"main\""}
+  {:suite "threads / name" :expr "(let [p (promise)] (.start (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))))) (not= \"main\" (deref p 5000 :timeout)))" :expected "true"}
+  {:suite "threads / name" :expr "(let [p (promise) t (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))) \"worker-x\")] (.start t) [(.getName t) (deref p 5000 :timeout)])" :expected "[\"worker-x\" \"worker-x\"]"}
+  {:suite "threads / name" :expr "(let [t (Thread. (fn []) \"a\")] (.setName t \"b\") (.getName t))" :expected "\"b\""}
+  ;; renaming through the currentThread handle, done inside a worker so the row
+  ;; cannot rename the thread the rest of the suite runs on
+  {:suite "threads / name" :expr "(let [p (promise)] (.start (Thread. (fn [] (let [t (Thread/currentThread)] (.setName t \"renamed\") (deliver p (.getName t)))))) (deref p 5000 :timeout))" :expected "\"renamed\""}
+  ;; .interrupt from outside and the thread's own view of its flag are ONE flag on
+  ;; the JVM — the whole interruption idiom is an outside caller setting it and the
+  ;; worker polling Thread/currentThread or Thread/interrupted. All three answers
+  ;; certified against JVM Clojure 1.12. The worker SPINS rather than parking on a
+  ;; latch: on the JVM an interrupt out of an interruptible wait throws
+  ;; InterruptedException instead, which would test something else.
+  {:suite "threads / interrupt" :expr "(let [ready (promise) release (atom false) done (promise) t (Thread. (fn [] (deliver ready true) (loop [] (when-not @release (Thread/yield) (recur))) (deliver done (.isInterrupted (Thread/currentThread)))))] (.start t) (deref ready 5000 :timeout) (.interrupt t) (reset! release true) [(.isInterrupted t) (deref done 5000 :timeout)])" :expected "[true true]"}
+  {:suite "threads / interrupt" :expr "(let [ready (promise) release (atom false) done (promise) t (Thread. (fn [] (deliver ready true) (loop [] (when-not @release (Thread/yield) (recur))) (deliver done [(Thread/interrupted) (Thread/interrupted)])))] (.start t) (deref ready 5000 :timeout) (.interrupt t) (reset! release true) (deref done 5000 :timeout))" :expected "[true false]"}
+  ;; a handle taken for the thread by SOMEONE ELSE reaches the same flag
+  {:suite "threads / interrupt" :expr "(let [ready (promise) release (atom false) done (promise) t (Thread. (fn [] (deliver ready true) (loop [] (when-not @release (Thread/yield) (recur))) (deliver done (.isInterrupted (Thread/currentThread)))) \"interruptee\")] (.start t) (deref ready 5000 :timeout) (doseq [h (keys (Thread/getAllStackTraces))] (when (= \"interruptee\" (.getName h)) (.interrupt h))) (reset! release true) (deref done 5000 :timeout))" :expected "true"}
+  ;; the name a handle answers is the name of the thread it stands for
+  {:suite "threads / name" :expr "(let [ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) t (Thread. (fn [] (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS)) \"named-worker\")] (.start t) (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (let [names (into #{} (map #(.getName %) (keys (Thread/getAllStackTraces))))] (.countDown release) (contains? names \"named-worker\")))" :expected "true"}
   {:suite "interrupt" :expr "(.isInterrupted (Thread/currentThread))" :expected "false"}
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) (.isInterrupted t))" :expected "true"}
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) [(.isInterrupted t) (.isInterrupted t)])" :expected "[true true]"}
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) [(Thread/interrupted) (Thread/interrupted)])" :expected "[true false]"}
   {:suite "interrupt" :expr "(do (.interrupt (Thread/currentThread)) (Thread/interrupted) (.isInterrupted (Thread/currentThread)))" :expected "false"}
-  {:suite "interrupt" :expr "(let [t (atom nil) started (promise) go (promise) f (future (reset! t (Thread/currentThread)) (deliver started true) (deref go) (.isInterrupted (deref t)))] (deref started) (.interrupt (deref t)) (deliver go true) (deref f))" :expected "true"}
+  ;; a future's worker sees an interrupt aimed at the handle it published. It SPINS
+  ;; on an atom rather than parking on a promise for the reason the threads/interrupt
+  ;; rows above give: a park is thrown out with InterruptedException now, which is a
+  ;; different thing to test (the "interrupt / blocking" suite below tests it).
+  {:suite "interrupt" :expr "(let [t (atom nil) started (promise) go (atom false) f (future (reset! t (Thread/currentThread)) (deliver started true) (loop [] (when-not @go (Thread/yield) (recur))) (.isInterrupted (deref t)))] (deref started) (.interrupt (deref t)) (reset! go true) (deref f))" :expected "true"}
+  ;; --- interrupt out of a blocking wait ---------------------------------------
+  ;; The JVM's second half of interruption: a thread parked in an interruptible wait
+  ;; is THROWN OUT of it with InterruptedException and the flag is left cleared.
+  ;; The behavior these rows pin was probed on JVM Clojure 1.12.5 rather than read
+  ;; off the javadoc, and every thread row below was run there and answers the same
+  ;; value it does here.
+  ;;
+  ;; The ops jolt makes interruptible are the ones a JVM caller can already name;
+  ;; the runtime's own plumbing (carrier idle wait, load barrier, main-queue pump,
+  ;; tap queue, channel internals) is deliberately NOT — see host/chez/locks.ss.
+  ;; jolt has no Object.wait/notify at all, on any object, so the JVM's Object.wait
+  ;; has nothing here to make interruptible; monitor-wait! in java/concurrency.ss is
+  ;; the monitor ENTER wait, which correctly stays uninterruptible (row (e) below).
+  ;;
+  ;; NO ROW MAY BLOCK THE EVALUATING THREAD UNBOUNDEDLY. A row that hangs stalls the
+  ;; gate with no output instead of reporting, so every wait here is either on a
+  ;; worker read back through a bounded deref, or rescued by a late deliver.
+  ;; A flag that is ALREADY set makes the next blocking op throw without waiting
+  ;; at all, and clears it. Nothing here blocks THIS thread unboundedly: the late
+  ;; deliver rescues the deref, so a runtime that ignores the interrupt answers
+  ;; :late after 4s and the row FAILS instead of hanging the gate with no output.
+  {:suite "interrupt / blocking" :expr "(let [p (promise) t (Thread/currentThread) t0 (System/nanoTime)] (future (Thread/sleep 4000) (deliver p :late)) (.interrupt t) (let [r (try (deref p) :no-throw (catch InterruptedException e :threw))] [r (< (quot (- (System/nanoTime) t0) 1000000) 2000) (.isInterrupted t)]))" :expected "[:threw true false]"}
+  ;; ...and a thread already PARKED when the interrupt arrives. Every row below is
+  ;; the same shape: the worker parks in one op, the main thread interrupts it, and
+  ;; the answer pins both that it threw (a) and that it threw promptly rather than
+  ;; running the wait out (b).
+  {:suite "interrupt / blocking" :expr "(let [p (promise) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (deref p) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [p (promise) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (deref p 30000 :to) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [f (future (Thread/sleep 30000) 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (deref f 30000 :to) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (future-cancel f) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [f (future (Thread/sleep 30000) 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (deref f) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (future-cancel f) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [l (java.util.concurrent.CountDownLatch. 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.await l) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (Thread/sleep 30000) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.sleep java.util.concurrent.TimeUnit/SECONDS 30) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [w (doto (Thread. (fn [] (try (Thread/sleep 30000) (catch InterruptedException e nil)))) (.start)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.join w) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (.interrupt w) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [q (java.util.concurrent.ArrayBlockingQueue. 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.take q) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [q (doto (java.util.concurrent.ArrayBlockingQueue. 1) (.put :fill)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.put q :blocked) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor) fut (.submit ex ^java.util.concurrent.Callable (fn [] (Thread/sleep 30000) 42)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.get fut) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (.shutdownNow ex) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ft (java.util.concurrent.FutureTask. (fn [] (Thread/sleep 30000) 1)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.get ft) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ex (doto (java.util.concurrent.Executors/newSingleThreadExecutor) (.submit ^java.util.concurrent.Callable (fn [] (Thread/sleep 30000) 1)) (.shutdown)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.awaitTermination ex 30 java.util.concurrent.TimeUnit/SECONDS) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (.shutdownNow ex) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [pr (.start (ProcessBuilder. [\"sleep\" \"30\"])) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.waitFor pr) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 200) (.interrupt t) (let [r (deref out 5000 :timeout)] (.destroyForcibly pr) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [a (agent 0) ready (promise) out (promise)] (send-off a (fn [x] (Thread/sleep 4000) (inc x))) (let [t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (await a) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout)))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [a (agent 0) ready (promise) out (promise)] (send-off a (fn [x] (Thread/sleep 4000) (inc x))) (let [t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (await-for 30000 a) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout)))" :expected "[:threw true]"}
+  ;; future-cancel is cancel(true) on the JVM: the worker gets a real interrupt.
+  {:suite "interrupt / blocking" :expr "(let [ready (promise) out (promise) f (future (deliver ready true) (try (Thread/sleep 30000) (deliver out :no-throw) (catch InterruptedException e (deliver out :threw))))] (deref ready 5000 :timeout) (Thread/sleep 50) [(future-cancel f) (deref out 5000 :timeout)])" :expected "[true :threw]"}
+  ;; ...and deref of a cancelled future is CancellationException, not ExceptionInfo.
+  {:suite "interrupt / blocking" :expr "(let [f (future (Thread/sleep 30000) 1)] (future-cancel f) (try (deref f) :no-throw (catch java.util.concurrent.CancellationException e :cancelled)))" :expected ":cancelled"}
+  ;; (e) THE OTHER DIRECTION, and the reason it is a row rather than a comment:
+  ;; monitor-enter / locking is NOT interruptible on the JVM, and the flag is left
+  ;; SET rather than consumed. jolt matches it exactly. Probed on both runtimes —
+  ;; if a later change made every wait interruptible, this row is what refuses it.
+  {:suite "interrupt / blocking" :expr "(let [o (Object.) held (promise) rel (promise) ready (promise) out (promise) h (Thread. (fn [] (locking o (deliver held true) (deref rel 5000 :t)))) t (Thread. (fn [] (deliver ready true) (deliver out (try (locking o [:entered (.isInterrupted (Thread/currentThread))]) (catch InterruptedException e :threw)))))] (.start h) (deref held 5000 :t) (.start t) (deref ready 5000 :t) (Thread/sleep 100) (.interrupt t) (Thread/sleep 200) (deliver rel true) (deref out 5000 :timeout))" :expected "[:entered true]"}
+  ;; (c) a wait nobody interrupts still returns its value, and the flag stays clear
+  {:suite "interrupt / blocking" :expr "(let [p (promise)] (future (Thread/sleep 20) (deliver p :ok)) [(deref p 5000 :timeout) (.isInterrupted (Thread/currentThread))])" :expected "[:ok false]"}
+  ;; THE FIBER ROWS, and they bind *go-backend* :fiber ON PURPOSE — go defaults to
+  ;; :thread, so an unbound (go ...) row runs on a plain OS thread and re-tests the
+  ;; thread rows above rather than the fiber path. (jolt.host/fiber?) is carried in
+  ;; each answer so the row cannot silently stop testing what it claims to.
+  ;;
+  ;; A fiber has no interrupt flag of its own: it registers under the interrupt box
+  ;; of the CARRIER it runs on, and (Thread/currentThread) inside a go block is that
+  ;; carrier. So a fiber can interrupt its own blocking wait. The late deliver keeps
+  ;; a runtime that ignores it from hanging the gate.
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [p (promise)] (future (Thread/sleep 4000) (deliver p :late)) (a/<!! (a/go [(jolt.host/fiber?) (do (.interrupt (Thread/currentThread)) (try (deref p) :no-throw (catch InterruptedException e :threw)))])))))" :expected "[true :threw]"}
+  ;; ...and a genuinely PARKED fiber, woken by an external .interrupt of its carrier.
+  ;; This is the half a self-interrupt cannot show: the fiber is off the CPU when the
+  ;; interrupt lands, so it is the registry that has to find it.
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [p (promise) carrier (promise) out (promise)] (a/go (deliver carrier [(jolt.host/fiber?) (Thread/currentThread)]) (deliver out (try (deref p) :no-throw (catch InterruptedException e :threw)))) (let [[fib? c] (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt c) [fib? (deref out 5000 :timeout)]))))" :expected "[true :threw]"}
+  ;; Thread/sleep on a fiber sleeps its CARRIER (fibers-pool-test case 6 pins that),
+  ;; but it still owes the already-set half of the rule.
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (a/<!! (a/go [(jolt.host/fiber?) (try (.interrupt (Thread/currentThread)) (Thread/sleep 2000) :no-throw (catch InterruptedException e :threw))]))))" :expected "[true :threw]"}
+  ;; THE DIVERGENCE, pinned rather than left to prose: an interrupt arriving DURING a
+  ;; fiber's sleep is not seen, because Chez's sleep has no wakeup. Reading the flag
+  ;; with Thread/interrupted proves it was set all along AND clears it, so this row
+  ;; cannot leak a set flag onto a carrier the later rows share.
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) out (promise)] (a/go (deliver carrier (Thread/currentThread)) (deliver out [(try (Thread/sleep 1200) :no-throw (catch InterruptedException e :threw)) (Thread/interrupted)])) (let [c (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt c) (deref out 5000 :timeout)))))" :expected "[:no-throw true]"}
   {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "\"foo.bar\""}
   {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "\"my.ns\""}
   {:suite "ns-tl" :expr "(do (in-ns (quote app.core)) (def sekret 42) (in-ns (quote user)) (binding [*ns* (find-ns (quote app.core))] (load-string \"sekret\")))" :expected "42"}
@@ -232,10 +415,15 @@
   {:suite "insttime" :expr "(str (Duration/ofSeconds 90))" :expected "\"PT1M30S\""}
   {:suite "insttime" :expr "(.getMonths (Period/of 1 2 3))" :expected "2"}
   {:suite "insttime" :expr "(str (Year/of 2024))" :expected "\"2024\""}
-  ;; DateTimeFormatter, ZoneOffset/ZoneId and Locale are the jolt-lang/time library,
-  ;; not core (RFC 0008); with no dependency the error names the library.
-  {:suite "insttime" :expr "(try (java.time.format.DateTimeFormatter/ofPattern \"yyyy\") (catch Exception e (boolean (re-find #\"jolt-lang/time\" (ex-message e)))))" :expected "true"}
-  {:suite "insttime" :expr "(try (ZoneOffset/ofHours 5) (catch Exception e (boolean (re-find #\"jolt-lang/time\" (ex-message e)))))" :expected "true"}
+  ;; DateTimeFormatter, ZoneOffset/ZoneId and Locale are not core (RFC 0008): a
+  ;; provider declares them with :jolt/provides (RFC 0014). With nothing providing
+  ;; one, the error says a JDK class has no implementation — and deliberately does
+  ;; NOT name a library. Which library supplies java.time is not the runtime's to
+  ;; say, and a caller may write the shim themselves.
+  {:suite "insttime" :expr "(try (java.time.format.DateTimeFormatter/ofPattern \"yyyy\") (catch Exception e (boolean (re-find #\"No dependency provides\" (ex-message e)))))" :expected "true"}
+  {:suite "insttime" :expr "(try (ZoneOffset/ofHours 5) (catch Exception e (boolean (re-find #\"No dependency provides\" (ex-message e)))))" :expected "true"}
+  ;; ...and it must not regress into naming one.
+  {:suite "insttime" :expr "(try (ZoneOffset/ofHours 5) (catch Exception e (boolean (re-find #\"jolt-lang\" (ex-message e)))))" :expected "false"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (io/file \"/a/b\")))" :expected "\"/a/b\""}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (io/file \"/a\" \"b\")))" :expected "\"/a/b\""}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.getName (io/file \"/a/b/c.txt\")))" :expected "\"c.txt\""}
@@ -245,6 +433,17 @@
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.isFile (io/file \"stdlib\")))" :expected "false"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.exists (io/file \"/no/such/path/xyz\")))" :expected "false"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.exists (io/file \"README.md\")))" :expected "true"}
+  ;; canRead/canWrite/canExecute ask access(2) — whether the EFFECTIVE user may
+  ;; read/write/execute the path — not whether the file exists. Answering
+  ;; existence made a read-only file report writable and every regular file
+  ;; report executable, so a caller testing writability before a write took the
+  ;; wrong branch and found out at the open.
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-ro.txt\") (spit \"/tmp/jolt-access-ro.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-ro.txt\" (fs/str->posix \"r--r--r--\")) (let [f (java.io.File. \"/tmp/jolt-access-ro.txt\")] [(.canRead f) (.canWrite f) (.canExecute f)]))" :expected "[true false false]"}
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-rwx.txt\") (spit \"/tmp/jolt-access-rwx.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-rwx.txt\" (fs/str->posix \"rwxr-xr-x\")) (let [f (java.io.File. \"/tmp/jolt-access-rwx.txt\")] [(.canRead f) (.canWrite f) (.canExecute f)]))" :expected "[true true true]"}
+  {:suite "io" :expr "(let [f (java.io.File. \"/tmp/jolt-access-absent-xyz\")] [(.canRead f) (.canWrite f) (.canExecute f)])" :expected "[false false false]"}
+  ;; java.nio.file.Files/isReadable etc. (what babashka.fs/readable? routes to)
+  ;; answer from the same predicate, so the two spellings cannot disagree
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-ro2.txt\") (spit \"/tmp/jolt-access-ro2.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-ro2.txt\" (fs/str->posix \"r--r--r--\")) [(fs/readable? \"/tmp/jolt-access-ro2.txt\") (fs/writable? \"/tmp/jolt-access-ro2.txt\") (fs/executable? \"/tmp/jolt-access-ro2.txt\")])" :expected "[true false false]"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File (io/file \"/a/b\")))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File \"/a/b\"))" :expected "false"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (type (io/file \"/a\"))))" :expected "\"class java.io.File\""}
@@ -252,6 +451,7 @@
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (pos? (count (filter (fn [f] (.isFile f)) (file-seq (io/file \"stdlib\"))))))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.string :as s])) (boolean (some (fn [p] (s/ends-with? p \"README.md\")) (file-seq \".\"))))" :expected "true"}
   {:suite "io" :expr "(string? (slurp \"README.md\"))" :expected "true"}
+  {:suite "io" :label "slurp accepts the IReader used by *in*" :expr "(with-in-str \"one\\ntwo\" (slurp *in*))" :expected "\"one\\ntwo\""}
   {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"hello\") (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"hello\""}
   {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"a\") (spit \"/tmp/jolt-io-test.txt\" \"b\" :append true) (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"ab\""}
   {:suite "io" :expr "(flush)" :expected ""}
@@ -291,6 +491,32 @@
   ;; Restores the roots in a finally: set-source-roots! is global, and leaving a
   ;; temp dir as the only root breaks every later row that needs to require.
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltresunit\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (spit (io/file d \"probe.txt\") \"hello\") (try (jolt.host/set-source-roots! [d]) (let [u (io/resource \"probe.txt\")] [(instance? java.net.URL u) (.getName (class u)) (slurp u) (io/resource \"absent.txt\")]) (finally (jolt.host/set-source-roots! prior)))))" :expected "[true \"java.net.URL\" \"hello\" nil]"}
+  ;; The 2-arity (resource n loader) resolves the same as the 1-arity: jolt has
+  ;; one source-root classloader, so the loader argument is accepted and
+  ;; ignored. cognitect aws-api calls it this way and used to fail to load.
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltresloader\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (spit (io/file d \"probe2.txt\") \"hello\") (try (jolt.host/set-source-roots! [d]) [(slurp (io/resource \"probe2.txt\" (clojure.lang.RT/baseLoader))) (= (str (io/resource \"probe2.txt\")) (str (io/resource \"probe2.txt\" nil))) (io/resource \"absent2.txt\" (clojure.lang.RT/baseLoader))] (finally (jolt.host/set-source-roots! prior)))))" :expected "[\"hello\" true nil]"}
+  ;; The JVM's resource has exactly two arities, so a third argument is an arity
+  ;; error there and must stay one here — a rest argument would have swallowed it.
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (io/resource \"probe.txt\" nil nil))" :expected :throws}
+  ;; A nil resource name is an NPE on the JVM — from io/resource and from every
+  ;; ClassLoader method — because nil is a MISSING name, not the empty one. It
+  ;; used to render as "" through the str coercion, and "" is the classpath root,
+  ;; so the answer was a URL for the first source root. "" keeps that answer,
+  ;; which is the JVM's.
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (io/resource nil))" :expected :throws}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (io/resource nil (clojure.lang.RT/baseLoader)))" :expected :throws}
+  {:suite "ioreader" :expr "(.getResource (clojure.lang.RT/baseLoader) nil)" :expected :throws}
+  {:suite "ioreader" :expr "(.getResourceAsStream (clojure.lang.RT/baseLoader) nil)" :expected :throws}
+  {:suite "ioreader" :expr "(.getResources (clojure.lang.RT/baseLoader) nil)" :expected :throws}
+  {:suite "ioreader" :expr "(.getResource String nil)" :expected :throws}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltresnil\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (try (jolt.host/set-source-roots! [d]) (some? (io/resource \"\")) (finally (jolt.host/set-source-roots! prior)))))" :expected "true"}
+  ;; Every ClassLoader resource method answers through io/resource's resolver, so
+  ;; the loader surface resolves neither more nor less than io/resource does:
+  ;; getResource agrees on the URL, getResourceAsStream reads the same content,
+  ;; getResources enumerates the one root holding it, Class.getResource takes an
+  ;; absolute "/name", and an absent name is nil on all of them. (The embedded
+  ;; branch of the same claim needs a built binary — build-smoke's --resloader.)
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltrescl\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (spit (io/file d \"probe3.txt\") \"hello\") (try (jolt.host/set-source-roots! [d]) (let [cl (clojure.lang.RT/baseLoader)] [(= (str (io/resource \"probe3.txt\")) (str (.getResource cl \"probe3.txt\"))) (slurp (.getResourceAsStream cl \"probe3.txt\")) (count (enumeration-seq (.getResources cl \"probe3.txt\"))) (= (str (io/resource \"probe3.txt\")) (str (.getResource String \"/probe3.txt\"))) [(.getResource cl \"absent3.txt\") (.getResourceAsStream cl \"absent3.txt\")]]) (finally (jolt.host/set-source-roots! prior)))))" :expected "[true \"hello\" 1 true [nil nil]]"}
   ;; a file: URL is a first-class source — slurp / .openStream / io/reader /
   ;; io/input-stream read its bytes (verified by content, not type) and io/file
   ;; strips the scheme. All five must hold before io/resource can return a URL.
@@ -298,6 +524,15 @@
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [f (java.io.File/createTempFile \"joltres\" \".txt\")] (spit f \"hello\") (let [u (java.net.URL. (str \"file:\" (.getAbsolutePath f))) r (and (= \"hello\" (slurp u)) (= \"hello\" (slurp (.openStream u))) (= \"hello\" (slurp (io/reader u))) (= \"hello\" (slurp (io/input-stream u))) (= (.getAbsolutePath f) (str (io/file u))))] (.delete f) r)))" :expected "true"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "\"/tmp/x\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "\"/a/b\""}
+  ;; Normalizing &form rebuilds the call form, so its reader metadata has to ride
+  ;; along — a macro reading (:line (meta &form)) is how a library reports the
+  ;; position of the call it is expanding. jolt-only: in an eval'd (do ...) the
+  ;; JVM attaches no line meta to the inner form, so the two disagree here for a
+  ;; reason that has nothing to do with the normalization. Loaded from a FILE both
+  ;; answer the same {:line :column}, which is the case that matters.
+  {:suite "macro-form" :expr "(do (defmacro amf-meta [& _] (list 'quote (boolean (:line (meta &form))))) (amf-meta x))" :expected "true"}
+  ;; and the set-form normalization itself still holds through &form
+  {:suite "macro-form" :expr "(do (defmacro amf-set [& _] (list 'quote [(set? (nth &form 1)) (map? (nth &form 1))])) (amf-set #{1 2}))" :expected "[true false]"}
   {:suite "ioreader" :expr "(slurp (StringReader. \"a=1\"))" :expected "\"a=1\""}
   {:suite "ioreader" :expr "(slurp (StringReader. \"b\") :encoding \"UTF-8\")" :expected "\"b\""}
   {:suite "ioreader" :expr "(with-open [r (StringReader. \"a\")] (.read r))" :expected "97"}
@@ -309,6 +544,12 @@
   {:suite "javastatic" :expr "(Math/sqrt 16)" :expected "4.0"}
   {:suite "javastatic" :expr "(Math/abs -3)" :expected "3"}
   {:suite "javastatic" :expr "(Math/max 2 7)" :expected "7"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/inc 41) (clojure.lang.Numbers/dec -1) (clojure.lang.Numbers/unchecked_inc 9) (clojure.lang.Numbers/unchecked_dec 9)]" :expected "[42 -2 10 8]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/isZero 0) (clojure.lang.Numbers/isPos 1/2) (clojure.lang.Numbers/isNeg -1)]" :expected "[true true true]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/add 2 3) (clojure.lang.Numbers/minus 2 3) (clojure.lang.Numbers/multiply 6 7) (clojure.lang.Numbers/remainder -7 3)]" :expected "[5 -1 42 -1]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/add 1 1/2) (clojure.lang.Numbers/multiply 3 1/2) (clojure.lang.Numbers/add 100000000000000000000 1)]" :expected "[3/2 3/2 100000000000000000001N]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/unchecked_inc Long/MAX_VALUE) (clojure.lang.Numbers/unchecked_dec Long/MIN_VALUE) (clojure.lang.Numbers/unchecked_add Long/MAX_VALUE 1) (clojure.lang.Numbers/unchecked_minus Long/MIN_VALUE 1) (clojure.lang.Numbers/unchecked_multiply Long/MAX_VALUE 2)]" :expected "[-9223372036854775808 9223372036854775807 -9223372036854775808 9223372036854775807 -2]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/lt 1 2) (clojure.lang.Numbers/gt 2.0 1) (clojure.lang.Numbers/lte 2 2) (clojure.lang.Numbers/gte 3/2 1) (clojure.lang.Numbers/equiv 3 3.0) (clojure.lang.Numbers/equiv 3 4)]" :expected "[true true true true true false]"}
   {:suite "javastatic" :expr "(pos? Long/MAX_VALUE)" :expected "true"}
   {:suite "javastatic" :expr "(String/valueOf 42)" :expected "\"42\""}
   {:suite "javastatic" :expr "(String/valueOf \"hi\")" :expected "\"hi\""}
@@ -384,6 +625,41 @@
   ;; still wins when :clj is listed first.
   {:suite "reader-features" :expr "#?(:bb :bb-branch :clj :clj-branch)" :expected ":bb-branch"}
   {:suite "reader-features" :expr "#?(:clj :clj-first :bb :bb-second)" :expected ":clj-first"}
+  ;; jolt.reader — the # dispatch table is open for punctuation. #$ is jolt's own
+  ;; reader macro (clojure.core.strint's ~{}/~() grammar over a string literal),
+  ;; registered through the same table a program registers into.
+  {:suite "reader-macros" :expr "(let [x 3] #$\"a ~{x} b ~(inc x)\")" :expected "\"a 3 b 4\""}
+  {:suite "reader-macros" :expr "[(string? #$\"plain\") #$\"plain\"]" :expected "[true \"plain\"]"}
+  {:suite "reader-macros" :expr "#$\"~{\\\"~{\\\"}x\"" :expected "\"~{x\""}
+  {:suite "reader-macros" :expr "#$\"100~ ok ~x\"" :expected "\"100~ ok ~x\""}
+  {:suite "reader-macros" :expr "(= (quote (clojure.core/str \"a \" x)) (read-string \"#$\\\"a ~{x}\\\"\"))" :expected "true"}
+  {:suite "reader-macros" :expr "(try (load-string \"#$(+ 1 2)\") (catch Exception e (ex-message e)))" :expected "\"string interpolation reads a string literal, got (+ 1 2)\""}
+  ;; an interpolated form's offsets are into the STRING, not the file, so it
+  ;; carries no reader position — with one a throw inside ~(…) reported line 1 of
+  ;; whatever file the literal sits in. An ordinary read still positions its lists.
+  {:suite "reader-macros" :expr "[(meta (nth (read-string \"#$\\\"a ~(inc x)\\\"\") 2)) (some? (:line (meta (read-string \"(inc x)\"))))]" :expected "[nil true]"}
+  ;; edn is a closed grammar with no user extension point, so the table is not
+  ;; consulted there and #$ stays the unreadable tag it always was.
+  {:suite "reader-macros" :expr "(try (clojure.edn/read-string \"#$\\\"a\\\"\") :no-throw (catch Exception e (ex-message e)))" :expected "\"No reader function for tag $\""}
+  ;; the two registration tiers: the default reads the next form and hands it to
+  ;; the fn, :raw hands the fn the source and an index and takes back [form end].
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\% (fn [f] (list (quote clojure.core/vector) f f))) (load-string \"#%(+ 1 2)\"))" :expected "[3 3]"}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\| (fn [s i] (let [e (.indexOf s \"|\" i)] [(subs s i e) (inc e)])) {:raw true}) (load-string \"#|a(b|\"))" :expected "\"a(b\""}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\& (fn [s i] :nope) {:raw true}) (try (load-string \"#& x\") (catch Exception e (ex-message e))))" :expected "\"reader macro #& must return [form end-index]\""}
+  ;; an end-index that does not move forward would spin the read loop on the same
+  ;; character forever, so it is rejected rather than trusted.
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\& (fn [s i] [1 0]) {:raw true}) (try (load-string \"#& x\") (catch Exception e (ex-message e))))" :expected "\"reader macro #& returned an out-of-range end-index: 0\""}
+  ;; a character the reader claims, and a letter (which begins a #tag — a #s
+  ;; reader would swallow every #some/tag), are refused rather than shadowed.
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (try (r/set-dispatch-macro! \\{ identity) :no-throw (catch Exception e (ex-message e))))" :expected "\"cannot register a reader macro on #{: the reader claims it\""}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (try (r/set-dispatch-macro! \\s identity) :no-throw (catch Exception e (ex-message e))))" :expected "\"cannot register a reader macro on #s: only punctuation can carry one (a letter or digit starts a #tag)\""}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\% (fn [f] f)) (r/remove-dispatch-macro! \\%) (:tag (read-string \"#% x\")))" :expected "%"}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (contains? (r/dispatch-macros) \\$))" :expected "true"}
+  ;; clojure.core.strint: core.incubator's << over the same grammar #$ reads.
+  {:suite "reader-macros" :expr "(do (require (quote [clojure.core.strint :refer [<<]])) (let [v 30.5] (<< \"This trial required ~{v}ml of solution.\")))" :expected "\"This trial required 30.5ml of solution.\""}
+  {:suite "reader-macros" :expr "(do (require (quote [clojure.core.strint :refer [<<]])) (let [m {:a [1 2 3]}] (<< \"total ~(->> m :a (apply +)).\")))" :expected "\"total 6.\""}
+  {:suite "reader-macros" :expr "(do (require (quote [clojure.core.strint :refer [<<]])) (<< \"a\" \"~{(+ 1 1)}\"))" :expected "\"a2\""}
+  {:suite "reader-macros" :expr "(do (require (quote clojure.core.strint)) (try (load-string \"(clojure.core.strint/<< x)\") (catch Exception e (ex-message e))))" :expected "\"java.lang.IllegalArgumentException: << takes string literals, got x\""}
   {:suite "ns" :expr "(do (def npv 1) (some? (get (ns-publics 'user) 'npv)))" :expected "true"}
   {:suite "ns" :expr "(do (def nmv 1) (some? (get (ns-map 'user) 'nmv)))" :expected "true"}
   {:suite "ns" :expr "(map? (ns-aliases 'clojure.core))" :expected "true"}
@@ -397,6 +673,8 @@
   {:suite "ns" :expr "(do (in-ns 'my.ns) (symbol? 'x))" :expected "true"}
   {:suite "ns" :expr "(str (ns-name *ns*))" :expected "\"user\""}
   {:suite "ns" :expr "(var? (find-var 'clojure.core/map))" :expected "true"}
+  {:suite "ns / core compatibility" :expr "(let [v (find-var 'clojure.core/imap-cons)] (and (var? v) (= {:a 1 :b 2} ((var-get v) {:a 1} [:b 2]))))" :expected "true"}
+  {:suite "ns / core compatibility" :expr "(let [v (find-var 'clojure.core/system-newline)] (and (var? v) (= \"\\n\" (var-get v))))" :expected "true"}
   {:suite "ns" :expr "(= 'user (ns-name (the-ns 'user)))" :expected "true"}
   {:suite "ns" :expr "(= 'foo.bar (ns-name (create-ns 'foo.bar)))" :expected "true"}
   {:suite "reader" :expr "(= 42 (read-string \"42\"))" :expected "true"}
@@ -415,6 +693,13 @@
   {:suite "reader" :expr "(true? (read-string \"true\"))" :expected "true"}
   {:suite "reader" :expr "(false? (read-string \"false\"))" :expected "true"}
   {:suite "reader" :expr "(let [r (read-string \"#foo bar\")] (and (tagged-literal? r) (= (quote foo) (:tag r)) (= (quote bar) (:form r)) (= \"#foo bar\" (pr-str r))))" :expected "true"}
+  ;; …but COMPILING one is an error, and it names the tag the way the JVM's reader
+  ;; does. It used to reach the analyzer's catch-all as "unsupported form", which
+  ;; said nothing about what to fix. The tags the compiler does build a leaf for
+  ;; are unaffected.
+  {:suite "reader" :expr "(try (load-string \"#foo/bar [1 2]\") (catch Throwable e (str e)))" :expected "\"jolt/uncompilable: No reader function for tag foo/bar\""}
+  {:suite "reader" :expr "(try (load-string \"#zz 1\") (catch Throwable e (str e)))" :expected "\"jolt/uncompilable: No reader function for tag zz\""}
+  {:suite "reader" :expr "[(try (load-string \"#inst \\\"2020-01-01\\\"\") :ok (catch Throwable e (str e))) (try (load-string \"#uuid \\\"00000000-0000-0000-0000-000000000000\\\"\") :ok (catch Throwable e (str e))) (try (load-string \"1.5M\") :ok (catch Throwable e (str e)))]" :expected "[:ok :ok :ok]"}
   {:suite "reader" :expr "(let [t (first (quote [#foo bar]))] (and (tagged-literal? t) (= (quote foo) (:tag t)) (= \"#foo bar\" (pr-str t))))" :expected "true"}
   {:suite "reader" :expr "(= \\a (read-string \"\\\\a\"))" :expected "true"}
   {:suite "reader" :expr "(= \\newline (read-string \"\\\\newline\"))" :expected "true"}
@@ -452,6 +737,14 @@
   {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"(when x y)\"))))" :expected "1"}
   {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"\\n\\n(when x y)\"))))" :expected "3"}
   {:suite "reader" :expr "(:column (meta (macroexpand-1 (read-string \"(when x y)\"))))" :expected "1"}
+  ;; Each -> step keeps its own form's position, so a fault inside a chain reports
+  ;; the step's line and not the whole chain's. A bare-symbol step has no form of
+  ;; its own, so it inherits the -> call's position.
+  {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"(-> 1\\n  (inc))\"))))" :expected "2"}
+  {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"(-> 1\\n  (inc)\\n  (dec))\"))))" :expected "3"}
+  {:suite "reader" :expr "(:line (meta (second (macroexpand-1 (read-string \"(-> 1\\n  (inc)\\n  (dec))\")))))" :expected "2"}
+  {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"\\n(-> 1 inc)\"))))" :expected "2"}
+  {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"(->> [1]\\n  (map inc))\"))))" :expected "2"}
   {:suite "reader" :expr "(= 42 (with-in-str \"42\" (read)))" :expected "true"}
   {:suite "reader" :expr "(= (quote (+ 1 2)) (with-in-str \"(+ 1 2)\" (read)))" :expected "true"}
   {:suite "reader" :expr "(with-in-str \"1 2\" [(read) (read)])" :expected "[1 2]"}
@@ -828,6 +1121,59 @@
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box2\" (fn [v] (let [t (jolt.host/tagged-table :my/box2)] (jolt.host/ref-put! t :v v) t))) (__register-class-methods! :my/box2 {\"add\" (fn [self n] (+ n (jolt.host/ref-get self :v)))}) (.add (Box2. 10) 5))" :expected "15"}
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box3\" (fn [] (jolt.host/tagged-table :my/box3))) (__register-instance-check! (fn [cn val] (if (= cn \"Box3\") (= :my/box3 (jolt.host/ref-get val :jolt/type)) nil))) (instance? Box3 (Box3.)))" :expected "true"}
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box4\" (fn [] (jolt.host/tagged-table :my/box4))) (__register-instance-check! (fn [cn val] (if (= cn \"Box4\") (= :my/box4 (jolt.host/ref-get val :jolt/type)) nil))) (instance? Box4 \"not-a-box\"))" :expected "false"}
+  ;; class-extensions (jolt#575): a library adds to / replaces the shim jolt
+  ;; already has for a class, instead of replacing the whole class with its own.
+  ;; jolt.host/extend-class! keys by class NAME, so every shim family — the jfile
+  ;; record, a jhost, a jinst, a regex, a boxed number, a string — is reachable
+  ;; through the one seam. Extensions are process-wide, so run-unit.ss clears them
+  ;; between rows (class-ext-reset!).
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"shout\" (fn [self] (.toUpperCase (.getPath self)))}}) (.shout (java.io.File. \"a/b\")))" :expected "\"A/B\""}
+  ;; the default tier only fills gaps — it cannot take a method the shim answers
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"getPath\" (fn [self] \"hijacked\")}}) (.getPath (java.io.File. \"a/b\")))" :expected "\"a/b\""}
+  ;; …and :override does, for every caller in the process
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"getPath\" (fn [self] \"overridden\")} :override true}) (.getPath (java.io.File. \"a/b\")))" :expected "\"overridden\""}
+  ;; a registration on a SUPERCLASS answers for a subclass receiver (class graph)
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.Reader\" {:methods {\"kind\" (fn [_] :reader)}}) (.kind (java.io.StringReader. \"x\")))" :expected ":reader"}
+  ;; either spelling of the class name resolves
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"File\" {:methods {\"kind\" (fn [_] :file)}}) (.kind (java.io.File. \"a\")))" :expected ":file"}
+  ;; a Class value (the bare token) names the class too
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! java.io.File {:methods {\"kind\" (fn [_] :token)}}) (.kind (java.io.File. \"a\")))" :expected ":token"}
+  ;; jhost receiver (java.util.ArrayList)
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.util.ArrayList\" {:methods {\"secondItem\" (fn [self] (.get self 1))}}) (let [l (java.util.ArrayList.)] (.add l :a) (.add l :b) (.secondItem l)))" :expected ":b"}
+  ;; jinst receiver (java.util.Date) — its arm used to raise its own message
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.util.Date\" {:methods {\"epochish\" (fn [self] (.getTime self))}}) (.epochish (java.util.Date. 5)))" :expected "5"}
+  ;; regex receiver (java.util.regex.Pattern)
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.util.regex.Pattern\" {:methods {\"src\" (fn [self] (.pattern self))}}) (.src #\"a+\"))" :expected "\"a+\""}
+  ;; boxed-number receiver
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.lang.Long\" {:methods {\"twice\" (fn [self] (* 2 self))}}) (.twice 21))" :expected "42"}
+  ;; a string receiver reaches the tier too — only OVERRIDING one is refused
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.lang.String\" {:methods {\"shoutIt\" (fn [self] (.toUpperCase self))}}) (.shoutIt \"hi\"))" :expected "\"HI\""}
+  ;; …because the backend lowers a proven String receiver directly, so an
+  ;; override would apply at some call sites and not others
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.lang.String\" {:methods {\"length\" (fn [_] 0)} :override true})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"clojure.lang.Keyword\" {:methods {\"getName\" (fn [_] \"x\")} :override true})" :expected :throws}
+  ;; …and the refusal is derived from the class graph, so an ANCESTOR of one of
+  ;; those three is refused too — a proven String receiver would reach it
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.lang.CharSequence\" {:methods {\"length\" (fn [_] 0)} :override true})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.lang.Object\" {:methods {\"toString\" (fn [_] \"x\")} :override true})" :expected :throws}
+  ;; an unrelated class is still overridable
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"getName\" (fn [_] \"ok\")} :override true}) (.getName (java.io.File. \"a/b\")))" :expected "\"ok\""}
+  ;; a dashed name answers the FIELD spelling
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"-ext\" (fn [_] \"clj\")}}) (.-ext (java.io.File. \"a\")))" :expected "\"clj\""}
+  ;; statics merge into the class's existing member table
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:statics {\"tmpName\" (fn [] \"t\")}}) [(java.io.File/tmpName) java.io.File/separator])" :expected "[\"t\" \"/\"]"}
+  ;; :ctor registers (Class. args) for a class jolt does not model
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"ExtBox\" {:ctor (fn [v] (let [t (jolt.host/tagged-table :ext/box)] (jolt.host/ref-put! t :v v) t))}) (jolt.host/ref-get (ExtBox. 7) :v))" :expected "7"}
+  ;; an unclaimed method still raises — the tier must not turn a miss into nil
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"a\" (fn [_] 1)}}) (try (.zzz (java.io.File. \"a\")) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: zzz for class java.io.File\""}
+  ;; a class with no extension at all is unaffected
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"a\" (fn [_] 1)}}) (try (.zzz (java.util.ArrayList.)) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: zzz for class java.util.ArrayList\""}
+  ;; spec validation
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.io.File\" :nope)" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.io.File\" {:methods {\"x\" 42}})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.io.File\" {:methods :nope})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! 42 {:methods {\"x\" (fn [_] 1)}})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.io.File\" {:ctor 42})" :expected :throws}
   ;; eq-fast-probes: an arm may not claim keyword/string keys — pmap-fast-get
   ;; answers those without consulting the arms, so such an arm would be silently
   ;; skipped by map lookups.
@@ -880,12 +1226,79 @@
   {:suite "threads" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor)] (.submit ex (fn [] (Thread/sleep 200))) (.shutdown ex) (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS))" :expected "true"}
   ;; a bounded Future/get throws TimeoutException instead of waiting out the task
   {:suite "threads" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor) f (.submit ex (fn [] (Thread/sleep 30000)))] (try (.get f 50 java.util.concurrent.TimeUnit/MILLISECONDS) :no-throw (catch Throwable e :timeout)))" :expected ":timeout"}
+  ;; A CACHED POOL GROWS. These are the properties of Executors/newCachedThreadPool
+  ;; that a fixed pool of any size does not have, so each one is a size-independent
+  ;; statement rather than a count to update when a number changes.
+  ;;
+  ;; The first five expected values were read off reference JVM Clojure running the
+  ;; same expression, so those are conformance rows in substance. They live in the
+  ;; host unit file and not the corpus because they are timing-shaped — a corpus row
+  ;; is a value, and \"how many threads by now\" is not one. The last three are
+  ;; jolt's own: a fiber is not a JVM thing at all, the ThreadPoolExecutor row
+  ;; leaves out the queue argument the JVM ctor requires (jolt supplies its own
+  ;; unbounded one, and grows past core on the no-idle-worker test rather than on a
+  ;; full queue), and the fixed-pool row records the eager core threads.
+  ;;
+  ;; Nothing is forked until a task arrives, and max is the JVM's own
+  ;; Integer/MAX_VALUE.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] [(.getPoolSize ex) (.getCorePoolSize ex) (.getMaximumPoolSize ex)])" :expected "[0 0 2147483647]"}
+  ;; 64 tasks that all block until the last one has started: a pool with any fixed
+  ;; ceiling below 64 never gets there, whatever the ceiling is.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool) n 64 latch (java.util.concurrent.CountDownLatch. n) go (promise)] (dotimes [_ n] (.execute ex (fn [] (.countDown latch) (deref go 20000 :timeout)))) (let [started (.await latch 20 java.util.concurrent.TimeUnit/SECONDS) grown (.getPoolSize ex)] (deliver go true) (.shutdown ex) [started grown (.awaitTermination ex 20 java.util.concurrent.TimeUnit/SECONDS)]))" :expected "[true 64 true]"}
+  ;; The shape that used to deadlock: a task that submits a task and waits on it,
+  ;; 40 deep in parallel — 80 workers at once, which no 32-worker pool reaches.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool) outer (mapv (fn [i] (.submit ex (fn [] (+ i (.get (.submit ex (fn [] 100))))))) (range 40))] (reduce + (map (fn [f] (.get f)) outer)))" :expected "4780"}
+  ;; and it is a POOL: 20 tasks submitted one at a time, each waited out before the
+  ;; next, are served by a worker or two rather than by 20 — the growth above is
+  ;; concurrency, not churn. Not exactly one, because a worker that has just
+  ;; finished a task may not be back at the queue when the next submit tests for an
+  ;; idle worker; reference Clojure answers 3 to this same expression, for the same
+  ;; race against its SynchronousQueue handoff.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (dotimes [_ 20] (.get (.submit ex (fn [] 1)))) (< (.getPoolSize ex) 5))" :expected "true"}
+  ;; A burst of 2000 short tasks: every one runs, the pool drains and terminates,
+  ;; and it is served by the workers that keep up with the burst rather than by one
+  ;; thread per task. The bound on the peak is deliberately loose — the growth test
+  ;; is \"no idle worker to take this task\", so how far the pool actually grows
+  ;; depends on how far the producer runs ahead of the workers, which is a property
+  ;; of the machine: 4 workers on an idle 8-core box, 136 pinned to one core (and
+  ;; 13 on reference Clojure, which grows on the same rule).
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool) c (atom 0) peak (atom 0)] (dotimes [_ 2000] (.execute ex (fn [] (swap! c inc))) (swap! peak max (.getPoolSize ex))) (.shutdown ex) [(.awaitTermination ex 30 java.util.concurrent.TimeUnit/SECONDS) @c (< @peak 1000)])" :expected "[true 2000 true]"}
+  ;; Growth reached from a FIBER: .execute on a fiber's carrier forks the new
+  ;; worker, and that worker must not inherit the fiber context — a worker that
+  ;; thought it was a fiber would refuse the condition wait it lives in. 20 fibers,
+  ;; each handing the pool a task and waiting on its promise.
+  {:suite "cached-pool" :expr "(do (require '[clojure.core.async :as a]) (let [ex (java.util.concurrent.Executors/newCachedThreadPool) out (a/chan 20)] (dotimes [i 20] (a/io-thread (let [p (promise)] (.execute ex (fn [] (deliver p i))) (a/>!! out (deref p 5000 :timeout))))) (= (set (repeatedly 20 (fn [] (a/<!! out)))) (set (range 20)))))" :expected "true"}
+  ;; A ThreadPoolExecutor's core, max and keepAlive all reach the pool: it grows to
+  ;; max on demand and retires the grown workers after keepAlive, keeping core.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.ThreadPoolExecutor. 1 6 100 java.util.concurrent.TimeUnit/MILLISECONDS) latch (java.util.concurrent.CountDownLatch. 6) go (promise)] (dotimes [_ 6] (.execute ex (fn [] (.countDown latch) (deref go 20000 :timeout)))) (let [started (.await latch 20 java.util.concurrent.TimeUnit/SECONDS) grown (.getPoolSize ex)] (deliver go true) (Thread/sleep 1000) [started grown (.getPoolSize ex) (.getActiveCount ex)]))" :expected "[true 6 1 0]"}
+  ;; A fixed pool is still fixed: every worker eager, none retired, max = core.
+  ;; Eager is jolt's, and unchanged by the growth work: the JVM creates even core
+  ;; threads on demand, so getPoolSize there is 0 until the first task. Which is
+  ;; why this is a host unit case and not a corpus row.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 3)] (Thread/sleep 300) [(.getPoolSize ex) (.getCorePoolSize ex) (.getMaximumPoolSize ex)])" :expected "[3 3 3]"}
+  ;; SHUTDOWN, the three spellings, each of which was quietly not doing what its
+  ;; name says. All four expected values are reference JVM Clojure's, read off the
+  ;; same expressions on Java 21.
+  ;;
+  ;; A submit after shutdown is REJECTED rather than queued-and-abandoned.
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor)] (.shutdown ex) (try (.submit ex (fn [] 1)) :no-throw (catch java.util.concurrent.RejectedExecutionException e :rejected)))" :expected ":rejected"}
+  ;; and so is an execute, catchable as the RuntimeException it is on the JVM
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (.shutdown ex) (try (.execute ex (fn [] 1)) :no-throw (catch RuntimeException e :rejected)))" :expected ":rejected"}
+  ;; close BLOCKS until the work is done, which is what makes it usable as the
+  ;; closing half of with-open
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) done (atom nil)] (.execute ex (fn [] (Thread/sleep 300) (reset! done :ran))) (.close ex) [@done (.isTerminated ex)])" :expected "[:ran true]"}
+  ;; shutdownNow DROPS what is queued and hands it back, instead of answering an
+  ;; empty list and running it all anyway. The first task is known to be running
+  ;; before the five are queued, so the count is not a race.
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) started (promise) go (promise) ran (atom 0)] (.execute ex (fn [] (deliver started true) (deref go 5000 :timeout))) (deref started 5000 :timeout) (dotimes [_ 5] (.execute ex (fn [] (swap! ran inc)))) (let [returned (.shutdownNow ex)] (deliver go true) [(count returned) @ran (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS)]))" :expected "[5 0 true]"}
   {:suite "telemetry" :expr "(clojure.string/starts-with? (jolt.host/scheme-version) \"Chez Scheme\")" :expected "true"}
   {:suite "telemetry" :expr "(let [m (jolt.host/machine-type)] [(string? m) (pos? (count m))])" :expected "[true true]"}
-  ;; bytes-allocated reads the LIVE heap, so it only has to grow across an
-  ;; allocation the test still holds a reference to — dropping the data instead
-  ;; lets a collection land in between and legitimately shrink it.
-  {:suite "telemetry" :expr "(let [a (jolt.host/bytes-allocated) keep (into [] (map (fn [i] (str \"padpadpadpad\" i)) (range 100000))) b (jolt.host/bytes-allocated)] [(count keep) (> b a)])" :expected "[100000 true]"}
+  ;; bytes-allocated reads the heap as it stands: live data AND garbage not yet
+  ;; collected. Two readings around an allocation therefore do not order — a
+  ;; collection landing between them can free more of the earlier rows' garbage
+  ;; than the new data adds, and did on CI. What holds whatever the collector
+  ;; does is the lower bound: the reading counts the data still referenced.
+  {:suite "telemetry" :expr "(let [keep (into [] (map (fn [i] (str \"padpadpadpad\" i)) (range 100000))) b (jolt.host/bytes-allocated)] [(count keep) (> b (* 100000 16))])" :expected "[100000 true]"}
   ;; System/nanoTime is the JVM's MONOTONIC high-resolution timer, so it must not be
   ;; the wall clock and must not be millisecond-granular.
   {:suite "telemetry" :expr "(let [a (System/nanoTime) b (System/nanoTime)] (>= b a))" :expected "true"}
@@ -1069,6 +1482,10 @@
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) f (future (a/alts!! [[c :v]]))] (Thread/sleep 50) (a/close! c) (let [[v p] @f] [v (= p c)])))" :expected "[false true]"}
   ;; 9. transducer chan works through alts put
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc))] (a/alts!! [[c 1]]) (a/<!! c)))" :expected "2"}
+  ;; Validate every put before any ready operation can mutate channel state.
+  ;; JVM core.async throws while leaving :kept available; validating only as
+  ;; each candidate is attempted consumes the earlier ready take first.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [ready (a/chan 1) other (a/chan) _ (a/>!! ready :kept)] (try (a/alts!! [ready [other nil]] :priority true) [:no-throw (a/poll! ready)] (catch AssertionError _ [:threw (a/poll! ready)]))))" :expected "[:threw :kept]"}
   ;; 10. mult/tap smoke — proves the dataflow layer still works
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) m (a/mult c) t1 (a/chan) t2 (a/chan)] (a/tap m t1) (a/tap m t2) (a/>!! c :x) [(a/<!! t1) (a/<!! t2)]))" :expected "[:x :x]"}
   ;; clojure.test — instance? in is still reports correctly (instance? is a fn)
@@ -1092,6 +1509,10 @@
   {:suite "io" :expr "(do (require '[clojure.java.io :as io]) (let [d (doto (java.io.File/createTempFile \"jtd\" \".d\") (.delete) (.mkdir)) child (java.io.File. d \"child.txt\")] (spit child \"x\") (let [deleted (.delete d)] (.delete child) (.delete d) deleted)))" :expected "false"}
   ;; Stage B — fixed-buffer transducer puts block when full
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc)) p (future (a/>!! c 1) (a/>!! c 2) (a/>!! c 3) :done)] (Thread/sleep 100) (let [parked (not (realized? p)) v1 (a/<!! c) v2 (a/<!! c) v3 (a/<!! c) result @p] [parked v1 v2 v3 result])))" :expected "[true 2 3 4 :done]"}
+  ;; nil is not a value a channel can carry, and the message is the reference's:
+  ;; channels.clj raises IllegalArgumentException "Can't put nil on channel".
+  ;; jolt said "on a channel".
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1)] (try (a/>!! c nil) :no-throw (catch IllegalArgumentException e (ex-message e)))))" :expected "\"Can't put nil on channel\""}
   ;; Stage B — pending rendezvous put parks until consumed (does NOT complete on close)
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) p (future (a/>!! c :v))] (Thread/sleep 50) (a/close! c) [(a/<!! c) @p]))" :expected "[:v true]"}
   ;; io-thread is the FIBER carrier (jolt-579): the three names pick the three
@@ -1166,7 +1587,9 @@
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'when-class))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'with-loading-context))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'add-doc-and-meta))" :expected "false"}
- {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'assert-args))" :expected "false"}
+ ;; assert-args moved out of the JVM-only set: ported (see the assert-args suite)
+ ;; because macro-heavy libraries reach it as @#'clojure.core/assert-args.
+ {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'assert-args))" :expected "true"}
  ;; amap/areduce are NOT JVM-only: they are index loops over alength/aget/aset/
  ;; aclone, all of which jolt has, so they are implemented in the overlay.
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'amap))" :expected "true"}
@@ -1181,6 +1604,9 @@
   {:suite "binding-no-autoderef" :expr "(do (def ^:dynamic *bd11* 10) (def bd11v 20) (.getName (class (binding [*bd11* (var bd11v)] *bd11*))))" :expected "\"clojure.lang.Var\""}
   ;; Stage B — getAbsoluteFile/getCanonicalFile share getAbsolutePath's JOLT_PWD base
   {:suite "io-file-base" :expr "(= (.getAbsolutePath (java.io.File. \"rel.txt\")) (.getPath (.getAbsoluteFile (java.io.File. \"rel.txt\"))))" :expected "true"}
+  {:suite "io-file-base"
+   :expr "(let [windows? (.contains (.toLowerCase (System/getProperty \"os.name\")) \"win\")] (and (= windows? (.isAbsolute (java.io.File. \"C:\\\\work\\\\report.edn\"))) (= windows? (.isAbsolute (java.io.File. \"C:/work/report.edn\"))) (= windows? (.isAbsolute (java.io.File. \"\\\\\\\\server\\\\share\\\\report.edn\"))) (false? (.isAbsolute (java.io.File. \"C:report.edn\"))) (false? (.isAbsolute (java.io.File. \"\\\\work\\\\report.edn\"))) (= (not windows?) (.isAbsolute (java.io.File. \"/work/report.edn\")))))"
+   :expected "true"}
   {:suite "io-file-base" :expr "(.exists (.getCanonicalFile (java.io.File. \".\")))" :expected "true"}
   ;; Stage C — getenv single-key matches map lookup
   {:suite "getenv" :expr "(= (get (System/getenv) \"HOME\") (System/getenv \"HOME\"))" :expected "true"}
@@ -1255,9 +1681,38 @@
   {:suite "jolt-version" :label "property and host fn match the var" :expected "true" :expr "(= *jolt-version* (System/getProperty \"jolt.version\") (jolt.host/jolt-version))"}
   {:suite "add-deps" :label "inline :local/root dep becomes requirable" :expected ":pong" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/adddep\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/adddep/core.clj\") \"(ns adddep.core) (defn ping [] :pong)\") (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) (require 'adddep.core) ((resolve 'adddep.core/ping))))"}
   {:suite "add-deps" :label "added roots append after existing roots" :expected "true" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\") before (vec (jolt.host/source-roots)) _ (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) after (vec (jolt.host/source-roots))] (= before (vec (take (count before) after)))))"}
+  ;; :jolt/min-version — the runtime floor a project or library declares. The
+  ;; comparison reads the LEADING NUMERIC components only, because the version
+  ;; string is a git describe: "v0.7.29-24-gabc" is 0.7.29 plus commits, and the
+  ;; commit count says nothing about which APIs are present. Component-wise, not
+  ;; lexicographic — 0.10.0 is newer than 0.8.0, which a string compare gets
+  ;; backwards, and that is the whole class of bug this comparison exists to avoid.
+  {:suite "min-version" :label "version-parts reads the numeric prefix of a git describe" :expected "true" :expr "(do (require 'jolt.deps) (let [p @#'jolt.deps/version-parts] (and (= [0 7 29] (p \"v0.7.29-24-g5ac1f4a0\")) (= [0 7 29] (p \"0.7.29\")) (= [0 8] (p \"0.8\")) (= [1 0 0] (p \"v1.0.0\")) (= [0 7 29] (p \"v0.7.29-dirty\")))))"}
+  {:suite "min-version" :label "version< compares components, not strings" :expected "true" :expr "(do (require 'jolt.deps) (let [lt @#'jolt.deps/version<] (and (lt \"0.7.29\" \"0.8.0\") (not (lt \"0.8.0\" \"0.7.29\")) (not (lt \"0.10.0\" \"0.8.0\")) (lt \"0.8.0\" \"0.10.0\") (not (lt \"0.8.0\" \"0.8\")) (not (lt \"0.8\" \"0.8.0\")) (not (lt \"v0.8.1-3-gabc\" \"0.8.0\")))))"}
+  {:suite "min-version" :label "a dev build reads as its last tag, so a floor above it is unmet" :expected "true" :expr "(do (require 'jolt.deps) (@#'jolt.deps/version< \"v0.7.29-24-g5ac1f4a0\" \"0.8.0\"))"}
+  ;; Pure, so the assertion does not need a runtime that actually fails the
+  ;; floor — under a source build nothing does, which is the case this gate runs
+  ;; in and the reason the decision is separated from the throw.
+  {:suite "min-version" :label "an unmet floor answers a message naming both versions" :expected "true" :expr "(do (require 'jolt.deps) (let [f (@#'jolt.deps/min-version-failure \"v0.7.29\" [[nil \"0.8.0\"]])] (and (some? f) (clojure.string/includes? (first f) \"0.8.0\") (clojure.string/includes? (first f) \"v0.7.29\") (clojure.string/includes? (first f) \"JOLT_SKIP_MIN_VERSION\") (= \"0.8.0\" (:jolt/required (second f))))))"}
+  {:suite "min-version" :label "a met floor answers nil" :expected "true" :expr "(do (require 'jolt.deps) (nil? (@#'jolt.deps/min-version-failure \"v0.8.0\" [[nil \"0.8.0\"] [(quote a/b) \"0.7.0\"]])))"}
+  ;; A library is the natural declarer, so an unmet dep floor has to name the dep.
+  {:suite "min-version" :label "an unmet dependency floor names the dependency" :expected "true" :expr "(do (require 'jolt.deps) (let [f (@#'jolt.deps/min-version-failure \"v0.7.29\" [[(quote minver/lib) \"98.0.0\"]])] (and (clojure.string/includes? (first f) \"98.0.0\") (clojure.string/includes? (first f) \"minver/lib\") (= (quote minver/lib) (:jolt/required-by (second f))))))"}
+  ;; Several unmet floors report ONE message, for the newest thing needed.
+  {:suite "min-version" :label "the highest unmet floor is the one reported" :expected "true" :expr "(do (require 'jolt.deps) (= \"0.10.0\" (:jolt/required (second (@#'jolt.deps/min-version-failure \"v0.7.0\" [[(quote a/a) \"0.8.0\"] [(quote b/b) \"0.10.0\"] [(quote c/c) \"0.9.0\"]])))))"}
+  {:suite "min-version" :label "a met project floor resolves" :expected "true" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-minver-unit2\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src\")) (spit (str d \"/deps.edn\") \"{:paths [\\\"src\\\"] :jolt/min-version \\\"0.0.1\\\"}\") (vector? (:roots (jolt.deps/resolve-project d)))))"}
+  ;; A LIBRARY is the natural declarer — it knows which jolt its FFI bindings
+  ;; need, and the app pulling it in does not. So a dep's floor has to be read
+  ;; and reported with the dep named.
+  ;; A source build answers "dev", which has no numeric components. Compared as
+  ;; 0.0.0 it is the OLDEST possible runtime and every floor refused it — so a
+  ;; contributor running from a clone could not run any project that declared
+  ;; one. An unnamed version is never refused.
+  {:suite "min-version" :label "a runtime that names no version is never refused" :expected "true" :expr "(do (require 'jolt.deps) (and (= [] (@#'jolt.deps/version-parts \"dev\")) (@#'jolt.deps/version< \"dev\" \"0.0.1\")))"}
+  {:suite "min-version" :label "JOLT_SKIP_MIN_VERSION is not consulted per-call but per-process" :expected "true" :expr "(do (require 'jolt.deps) (fn? @#'jolt.deps/check-min-versions!))"}
   {:suite "m2-repo" :label ":mvn/local-repo, JOLT_MAVEN_REPOSITORY, GRENADINE_MAVEN_REPOSITORY, HOME/.m2 precedence" :expected "true" :expr "(do (require 'jolt.deps) (let [m2 @#'jolt.deps/m2-repo-dir] (and (= \"/cfg\" (m2 \"/cfg\" \"/j\" \"/g\" \"/h\" \".\")) (= \"/j\" (m2 nil \"/j\" \"/g\" \"/h\" \".\")) (= \"/g\" (m2 nil nil \"/g\" \"/h\" \".\")) (= \"/h/.m2/repository\" (m2 nil nil nil \"/h\" \".\")))))"}
   {:suite "gitlibs-cache" :label "JOLT_GITLIBS_DIR, GRENADINE_GITLIBS_DIR, GITLIBS, HOME precedence" :expected "true" :expr "(do (require 'jolt.deps) (let [cache @#'jolt.deps/gitlibs-dir] (and (= \"/j\" (cache \"/j\" \"/g\" \"/t\" \"/h\")) (= \"/g/jolt\" (cache nil \"/g\" \"/t\" \"/h\")) (= \"/t/jolt\" (cache nil nil \"/t\" \"/h\")) (= \"/h/.jolt/gitlibs\" (cache nil nil nil \"/h\")))))"}
   {:suite "gitlibs-cache" :label "require-deps host exposes the effective Jolt Gitlibs directory" :expected "true" :expr "(do (require 'jolt.deps) (= (@#'jolt.deps/gitlibs-dir) ((:gitlibs-dir (@#'jolt.deps/required-host)))))"}
+  {:suite "gitlibs-cache" :label "require-deps host filesystem works under a caller namespace binding" :expected "true" :expr "(do (require 'jolt.deps) (let [caller (or (find-ns 'required-host-caller) (create-ns 'required-host-caller)) root (str (System/getProperty \"java.io.tmpdir\") \"/required-host-\" (System/currentTimeMillis)) source (str root \"/source\") target (str root \"/target\")] (try (binding [*ns* caller] (let [host (@#'jolt.deps/required-host)] ((:mkdirs! host) root) (spit source \"ok\") ((:atomic-move! host) source target) (and (= \"ok\" (slurp target)) (do ((:delete! host) target) (not (jolt.host/file-exists? target)))))) (finally (jolt.host/delete-tree! root)))))"}
   {:suite "git-url-inference" :label "io.github.OWNER/REPO -> github https .git" :expected "\"https://github.com/paintparty/lasertag.git\"" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'io.github.paintparty/lasertag))"}
   {:suite "git-url-inference" :label "com.github.OWNER/REPO -> github" :expected "\"https://github.com/seancorfield/next.jdbc.git\"" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'com.github.seancorfield/next.jdbc))"}
   {:suite "git-url-inference" :label "io.gitlab.OWNER/REPO -> gitlab" :expected "\"https://gitlab.com/owner/repo.git\"" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'io.gitlab.owner/repo))"}
@@ -1318,6 +1773,10 @@
   {:suite "atomics" :label "reset-vals! returns [old new]" :expected "[5 9]" :expr "(let [a (atom 5)] (reset-vals! a 9))"}
   {:suite "atomics" :label "compare-and-set! true on match and sets" :expected "[true 6]" :expr "(let [a (atom 5)] [(compare-and-set! a 5 6) (deref a)])"}
   {:suite "atomics" :label "compare-and-set! false on mismatch and no set" :expected "[false 5]" :expr "(let [a (atom 5)] [(compare-and-set! a 0 6) (deref a)])"}
+  {:suite "atomics" :label "compare-and-set! rejects an equal distinct expectation" :expected "[false true]" :expr "(let [initial (list :value) equal (list :value) a (atom initial)] [(compare-and-set! a equal :bad) (identical? initial (deref a))])"}
+  {:suite "atomics" :label "compare-and-set! accepts the identical expectation" :expected "[true :ok]" :expr "(let [v (list :value) a (atom v)] [(compare-and-set! a v :ok) (deref a)])"}
+  {:suite "atomics" :label "compare-and-set! identity check does not realize equal lazy values" :expected "[false 0 true]" :expr "(let [calls (atom 0) actual (lazy-seq (swap! calls inc) (list :x)) expected (lazy-seq (swap! calls inc) (list :x)) a (atom actual)] [(compare-and-set! a expected :changed) (deref calls) (identical? actual (deref a))])"}
+  {:suite "atomics" :label "compare-and-set! notifies watches once only after an identity match" :expected "[false true [[:watch true true :ok]]]" :expr "(let [v (list :value) a (atom v) events (atom [])] (add-watch a :watch (fn [k ref old new] (swap! events conj [k (identical? ref a) (identical? old v) new]))) [(compare-and-set! a (list :value) :bad) (compare-and-set! a v :ok) (deref events)])"}
   ;; The receiver check. swap!/reset! run jolt-need-atom and report the JVM's cast
   ;; failure; the other three reached a record accessor directly, so a non-atom got
   ;; a condition naming jolt's own record type ("... is not of type #<record type
@@ -1333,6 +1792,20 @@
   {:suite "atomics" :label "swap-vals! on nil is a NullPointerException" :expected "\"java.lang.NullPointerException\"" :expr "(try (swap-vals! nil inc) (catch Throwable e (.getName (class e))))"}
   {:suite "atomics" :label "reset-vals! on nil is a NullPointerException" :expected "\"java.lang.NullPointerException\"" :expr "(try (reset-vals! nil 1) (catch Throwable e (.getName (class e))))"}
   {:suite "atomics" :label "CAS-retry increments across futures lose no updates (atomic native)" :expected "\"true\"" :expr "(do (let [a (atom 0) done (atom 0) n 4 per 2000 target (* n per)] (dotimes [_ n] (future (dotimes [_ per] (loop [] (let [cur (deref a)] (when-not (compare-and-set! a cur (inc cur)) (recur))))) (swap! done inc))) (loop [w 0] (cond (== (deref done) n) :fin (> w 1000000) :timeout :else (do (Thread/yield) (recur (inc w))))) (str (== (deref a) target))))"}
+  {:suite "atomics" :label "AtomicInteger constructors preserve valid primitive values" :expected "[0 7]" :expr "[(.get (AtomicInteger.)) (.get (AtomicInteger. 7))]"}
+  {:suite "atomics" :label "AtomicLong constructors preserve valid primitive values" :expected "[0 9]" :expr "[(.get (AtomicLong.)) (.get (AtomicLong. 9))]"}
+  {:suite "atomics" :label "AtomicInteger constructor rejects an out-of-range value" :expected :throws :expr "(AtomicInteger. 2147483648)"}
+  {:suite "atomics" :label "AtomicInteger addAndGet wraps signed overflow" :expected "-2147483648" :expr "(.addAndGet (AtomicInteger. 2147483647) 1)"}
+  {:suite "atomics" :label "AtomicInteger decrementAndGet wraps signed underflow" :expected "2147483647" :expr "(.decrementAndGet (AtomicInteger. -2147483648))"}
+  {:suite "atomics" :label "AtomicLong addAndGet wraps signed overflow" :expected "-9223372036854775808" :expr "(.addAndGet (AtomicLong. 9223372036854775807) 1)"}
+  {:suite "atomics" :label "AtomicLong decrementAndGet wraps signed underflow" :expected "9223372036854775807" :expr "(.decrementAndGet (AtomicLong. -9223372036854775808))"}
+  {:suite "atomics" :label "AtomicLong getAndAdd returns old and stores wrapped result" :expected "[9223372036854775807 -9223372036854775808]" :expr "(let [a (AtomicLong. 9223372036854775807)] [(.getAndAdd a 1) (.get a)])"}
+  {:suite "atomics" :label "AtomicLong intValue narrows to signed 32 bits" :expected "[1 -2147483648 2147483647 7]" :expr "[(.intValue (AtomicLong. 4294967297)) (.intValue (AtomicLong. 2147483648)) (.intValue (AtomicLong. -2147483649)) (.intValue (AtomicInteger. 7))]"}
+  {:suite "atomics" :label "AtomicInteger getAndSet validates before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.getAndSet a 2147483648) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
+  {:suite "atomics" :label "AtomicInteger compareAndSet validates next before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.compareAndSet a 7 2147483648) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
+  {:suite "atomics" :label "AtomicInteger compareAndSet validates expected before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.compareAndSet a 2147483648 8) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
+  {:suite "atomics" :label "AtomicReference compareAndSet rejects equal distinct expectations" :expected "[false true]" :expr "(let [v (list 1) a (AtomicReference. v)] [(.compareAndSet a (list 1) :bad) (identical? v (.get a))])"}
+  {:suite "atomics" :label "AtomicReference compareAndSet accepts the same expectation" :expected "[true :ok]" :expr "(let [v (list 1) a (AtomicReference. v)] [(.compareAndSet a v :ok) (.get a)])"}
   ;; shadow-emitted (compiler-review R2 stage 1). Each row binds a local whose
   ;; name is a bare Scheme head the back end emits, in the scope of a construct
   ;; that emits that head, so the local would shadow the emitted form. Pre-remint
@@ -1617,6 +2090,9 @@
   {:suite "r5-refer" :expr "(do (refer (quote clojure.set) :only (quote [union])) [(some? (resolve (quote union))) (resolve (quote difference))])" :expected "[true nil]"}
   {:suite "r5-refer" :expr "(do (refer (quote clojure.set) :exclude (quote [difference])) [(some? (resolve (quote union))) (resolve (quote difference))])" :expected "[true nil]"}
   {:suite "r5-refer" :expr "(do (refer (quote clojure.set) :only (quote [union])) (union #{1} #{2}))" :expected "#{1 2}"}
+  {:suite "r5-refer" :label "refer :rename resolves and reports the local name" :expr "(do (require (quote clojure.string)) (refer (quote clojure.string) :only (quote [upper-case]) :rename (quote {upper-case renamed-upper-case})) [(renamed-upper-case \"ok\") (some? (resolve (quote renamed-upper-case))) (contains? (ns-refers *ns*) (quote renamed-upper-case))])" :expected "[\"OK\" true true]"}
+  {:suite "r5-refer" :label "defmethod through a :rename'd refer extends the TARGET's multifn, not a local shadow" :expr "(do (in-ns (quote mmr-src)) (defmulti shape identity) (defmethod shape :circle [_] :src-circle) (in-ns (quote mmr-use)) (refer (quote mmr-src) :only (quote [shape]) :rename (quote {shape figure})) (defmethod figure :square [_] :use-square) (in-ns (quote user)) [(mmr-src/shape :circle) (mmr-src/shape :square)])" :expected "[:src-circle :use-square]"}
+  {:suite "r5-refer" :label "a locally defined multifn shadowing a :rename'd refer keeps its OWN dispatch fn" :expr "(do (in-ns (quote mmr2-src)) (defmulti shape identity) (in-ns (quote mmr2-use)) (refer (quote mmr2-src) :only (quote [shape]) :rename (quote {shape figure})) (defmulti figure :t) (defmethod figure :square [_] :use-square) (in-ns (quote user)) (mmr2-use/figure {:t :square}))" :expected ":use-square"}
   {:suite "r5-syntax-quote" :expr "(pr-str (eval (read-string \"(pr-str `())\")))" :expected "\"\\\"()\\\"\""}
   {:suite "r5-syntax-quote" :expr "(pr-str (read-string \"`.foo\"))" :expected "\"(quote .foo)\""}
   {:suite "r5-syntax-quote" :expr "(pr-str (read-string \"`foo.\"))" :expected "\"(quote foo.)\""}
@@ -1660,10 +2136,47 @@
   {:suite "pmap-order" :expr "(str (into {} [[:a 1] [:b 2] [:a 9]]))" :expected "\"{:a 9, :b 2}\""}
   {:suite "pmap-order" :expr "(get (into {} [[:a 1] [:a 9]]) :a)" :expected "9"}
   {:suite "pmap-order" :expr "(str (keys (array-map :k0 0 :k1 1 :k2 2 :k3 3 :k4 4 :k5 5 :k6 6 :k7 7 :k8 8 :k9 9)))" :expected "\"(:k0 :k1 :k2 :k3 :k4 :k5 :k6 :k7 :k8 :k9)\""}
+  {:suite "pmap-order" :expr "(str (keys (dissoc {:a 1 :b 2 :c 3} :b)))" :expected "\"(:a :c)\""}
+  {:suite "pmap-order" :expr "(str (keys (dissoc (dissoc {:a 1 :b 2 :c 3} :a) :c)))" :expected "\"(:b)\""}
+  ;; TransientArrayMap.doWithout moves the last entry into the removed slot
+  {:suite "pmap-order" :expr "(str (keys (persistent! (dissoc! (transient {:a 1 :b 2 :c 3}) :a))))" :expected "\"(:c :b)\""}
+  {:suite "pmap-order" :expr "(str (keys (persistent! (dissoc! (transient {:a 1 :b 2 :c 3}) :c))))" :expected "\"(:a :b)\""}
+  {:suite "pmap-order" :expr "(str (keys (persistent! (assoc! (dissoc! (transient {:a 1 :b 2 :c 3}) :a) :d 4))))" :expected "\"(:c :b :d)\""}
+  ;; assoc of the value already held answers the same map (PersistentArrayMap
+  ;; and PersistentHashMap both return this), dissoc of an absent key too
+  {:suite "pmap-order" :expr "(let [m {:a 1 :b 2}] (identical? m (assoc m :a 1)))" :expected "true"}
+  {:suite "pmap-order" :expr "(let [m (hash-map :a 1 :b 2)] (identical? m (assoc m :a 1)))" :expected "true"}
+  {:suite "pmap-order" :expr "(let [m {:a 1 :b 2}] (identical? m (dissoc m :zz)))" :expected "true"}
+  {:suite "pmap-order" :expr "(let [m (hash-map :a 1 :b 2)] (identical? m (dissoc m :zz)))" :expected "true"}
+  {:suite "pmap-order" :expr "(let [m {:a 1 :b 2}] (identical? m (assoc m :a 2)))" :expected "false"}
+  ;; the map keeps the key object it holds: find and a replacing assoc answer
+  ;; with the stored key, not the equal one probed with
+  {:suite "pmap-order" :expr "(let [k1 (str \"x\" \"y\") k2 (str \"x\" \"y\") m {k1 1}] [(identical? k1 k2) (identical? k1 (key (find m k2))) (identical? k1 (key (first (assoc m k2 2))))])" :expected "[false true true]"}
+  {:suite "pmap-order" :expr "(let [k1 (str \"x\" \"y\") k2 (str \"x\" \"y\") m (hash-map k1 1)] [(identical? k1 (key (find m k2))) (identical? k1 (key (first (assoc m k2 2))))])" :expected "[true true]"}
+  ;; lookup answers by kind: a keyword only matches a keyword, a string a
+  ;; string, a fixnum a fixnum of the same exactness class
+  {:suite "pmap-order" :expr "[(get {:a 1} 'a) (get {'a 1} :a) (get {\"a\" 1} 'a) (get {'a 1} \"a\") (get {1 :i} 1.0) (get {1.0 :d} 1) (get {1 :i} 1) (get {nil :n} nil) (get {\\a :c} \\a) (get {[1 2] :v} [1 2]) (get {12345678901234567890 :big} 12345678901234567890)]" :expected "[nil nil nil nil nil nil :i :n :c :v :big]"}
+  {:suite "pmap-order" :expr "(let [m (reduce (fn [m i] (assoc m (keyword (str \"k\" i)) i)) {} (range 40))] [(type m) (get m :k37) (get m :k0) (get m :zz) (count (dissoc m :k3))])" :expected "[clojure.lang.PersistentArrayMap 37 0 nil 39]"}
+  {:suite "pmap-order" :expr "(meta (dissoc (with-meta {:a 1} {:m 1}) :a))" :expected "{:m 1}"}
+  {:suite "pmap-order" :expr "(let [m (dissoc {:a 1} :a)] [(= {} m) (count m) (type m) (type (assoc m :b 2))])" :expected "[true 0 clojure.lang.PersistentArrayMap clojure.lang.PersistentArrayMap]"}
+  {:suite "pmap-order" :expr "(str (keys (into {} [[:c 3] [:a 1] [:b 2]])))" :expected "\"(:c :a :b)\""}
+  {:suite "pmap-order" :expr "(str (keys (persistent! (transient {:c 3 :a 1 :b 2}))))" :expected "\"(:c :a :b)\""}
+  ;; the seq view counts without walking and keeps the map's order
+  {:suite "pmap-order" :expr "(let [s (seq {:c 3 :a 1 :b 2})] [(count s) (count (rest s)) (key (first s)) (key (second s)) (chunked-seq? s) (type s)])" :expected "[3 2 :c :a false clojure.lang.PersistentArrayMap$Seq]"}
+  {:suite "pmap-order" :expr "(let [s (seq (hash-map :a 1 :b 2))] [(count s) (type s) (= (map key s) (keys (hash-map :a 1 :b 2)))])" :expected "[2 clojure.lang.PersistentHashMap$NodeSeq true]"}
+  {:suite "pmap-order" :expr "(let [m {:c 3 :a 1 :b 2}] [(type (keys m)) (type (vals m)) (count (keys m)) (= (keys m) (map key (seq m))) (= (vals m) (map val (seq m)))])" :expected "[clojure.lang.APersistentMap$KeySeq clojure.lang.APersistentMap$ValSeq 3 true true]"}
+  ;; reduce-kv is native: folds in place, honors reduced, drives IKVReduce
+  {:suite "pmap-order" :expr "(reduce-kv (fn [a k v] (if (= k :b) (reduced a) (+ a v))) 0 (array-map :a 1 :b 2 :c 3))" :expected "1"}
+  {:suite "pmap-order" :expr "(reduce-kv (fn [a i v] (if (= i 1) (reduced a) (+ a v))) 0 [10 20 30])" :expected "10"}
+  {:suite "pmap-order" :expr "(reduce-kv (fn [a k v] (+ a v)) 7 nil)" :expected "7"}
+  {:suite "pmap-order" :expr "(sort (reduce-kv (fn [a k v] (conj a (+ k v))) [] (zipmap (range 20) (range 20))))" :expected "(0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38)"}
+  {:suite "pmap-order" :expr "(reduce-kv (fn [a k v] (conj a k)) [] (sorted-map 3 1 1 2 2 3))" :expected "[1 2 3]"}
+  {:suite "pmap-order" :expr "(do (defrecord KvRec [x y]) (reduce-kv (fn [a k v] (assoc a k v)) {} (->KvRec 1 2)))" :expected "{:x 1, :y 2}"}
+  {:suite "pmap-order" :expr "(try (reduce-kv + 0 5) (catch IllegalArgumentException e :iae))" :expected ":iae"}
   ;; satisfies? on a host interface (a Class, not a defprotocol) must throw — the
   ;; JVM errors too — but with a non-empty message naming the offending value.
   ;; Not JVM-certifiable (the JVM's own message differs), so a unit row.
-  {:suite "satisfies" :expr "(do (deftype S [x] CharSequence (toString [_] \"x\")) (try (satisfies? CharSequence (S. 1)) (catch Throwable e (let [m (ex-message e)] [(boolean (and (string? m) (seq m))) (boolean (and m (.contains m \"CharSequence\")))]))))" :expected "[true true]"}
+  {:suite "satisfies" :expr "(do (deftype S [x] CharSequence (toString [_] \"x\")) [(satisfies? CharSequence (S. 1)) (satisfies? CharSequence 1) (try (satisfies? 42 1) (catch IllegalArgumentException e (boolean (.contains (ex-message e) \"42\"))))])" :expected "[true false true]"}
   ;; The `-e` / REPL result printer is READABLE, like Clojure's REPL, which prints
   ;; with pr: a nested string keeps its quotes and a char its \\c syntax, so the
   ;; printed result reads back as the value it names. str/print/println are
@@ -1734,13 +2247,13 @@
   ;; corpus row — jolt's SimpleDateFormat formats in UTC while the JVM's uses the
   ;; machine's default zone, so the JVM side of this is machine-dependent and
   ;; uncertifiable (see the :documented entry in known-divergences).
-  {:suite "date names" :expr "(.format (java.text.SimpleDateFormat. \"yyyy-MM-dd HH:mm\") (java.util.Date. 1393632000000))" :expected "\"2014-03-01 00:00\""}
-  {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"fr-test\" {:months [\"janvier\" \"février\" \"mars\" \"avril\" \"mai\" \"juin\" \"juillet\" \"août\" \"septembre\" \"octobre\" \"novembre\" \"décembre\"] :months-short [\"janv.\" \"févr.\" \"mars\" \"avr.\" \"mai\" \"juin\" \"juil.\" \"août\" \"sept.\" \"oct.\" \"nov.\" \"déc.\"] :days [\"lundi\" \"mardi\" \"mercredi\" \"jeudi\" \"vendredi\" \"samedi\" \"dimanche\"] :days-short [\"lun.\" \"mar.\" \"mer.\" \"jeu.\" \"ven.\" \"sam.\" \"dim.\"]}) [(.format (java.text.SimpleDateFormat. \"MMMM\" \"fr-test\") (java.util.Date. 1393632000000)) (.format (java.text.SimpleDateFormat. \"EEE\" \"fr-test\") (java.util.Date. 1393632000000)) (.format (java.text.SimpleDateFormat. \"EEEE\" \"fr-test\") (java.util.Date. 1393632000000)) (.format (java.text.SimpleDateFormat. \"yyyy-MM-dd\" \"fr-test\") (java.util.Date. 1393632000000))])" :expected "[\"mars\" \"sam.\" \"samedi\" \"2014-03-01\"]"}
+  {:suite "date names" :expr "(.format (doto (java.text.SimpleDateFormat. \"yyyy-MM-dd HH:mm\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000))" :expected "\"2014-03-01 00:00\""}
+  {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"fr-test\" {:months [\"janvier\" \"février\" \"mars\" \"avril\" \"mai\" \"juin\" \"juillet\" \"août\" \"septembre\" \"octobre\" \"novembre\" \"décembre\"] :months-short [\"janv.\" \"févr.\" \"mars\" \"avr.\" \"mai\" \"juin\" \"juil.\" \"août\" \"sept.\" \"oct.\" \"nov.\" \"déc.\"] :days [\"lundi\" \"mardi\" \"mercredi\" \"jeudi\" \"vendredi\" \"samedi\" \"dimanche\"] :days-short [\"lun.\" \"mar.\" \"mer.\" \"jeu.\" \"ven.\" \"sam.\" \"dim.\"]}) [(.format (doto (java.text.SimpleDateFormat. \"MMMM\" \"fr-test\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000)) (.format (doto (java.text.SimpleDateFormat. \"EEE\" \"fr-test\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000)) (.format (doto (java.text.SimpleDateFormat. \"EEEE\" \"fr-test\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000)) (.format (doto (java.text.SimpleDateFormat. \"yyyy-MM-dd\" \"fr-test\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000))])" :expected "[\"mars\" \"sam.\" \"samedi\" \"2014-03-01\"]"}
   ;; the ctor renders the locale argument to an id rather than naming a class —
   ;; a symbol renders to its name, the same seam the library's Locale :str uses.
   ;; A PARTIAL provider value merges over ROOT: only :months is stated, and MMMM
   ;; still answers.
-  {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"de-test\" {:months [\"Januar\" \"Februar\" \"März\" \"April\" \"Mai\" \"Juni\" \"Juli\" \"August\" \"September\" \"Oktober\" \"November\" \"Dezember\"]}) (.format (java.text.SimpleDateFormat. \"MMMM\" 'de-test) (java.util.Date. 1393632000000)))" :expected "\"März\""}
+  {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"de-test\" {:months [\"Januar\" \"Februar\" \"März\" \"April\" \"Mai\" \"Juni\" \"Juli\" \"August\" \"September\" \"Oktober\" \"November\" \"Dezember\"]}) (.format (doto (java.text.SimpleDateFormat. \"MMMM\" 'de-test) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000)))" :expected "\"März\""}
 
   ;; ---- java.lang.Throwable: one inherited surface -------------------------
   ;; These were split between the raw-condition arm and the ex-info arm, so a
@@ -1901,4 +2414,31 @@
   ;; collect when multiple threads are active"; the adapter retries and then
   ;; degrades to a no-op instead.
   {:suite "concurrency" :expr "(let [stop (atom false) f (future (loop [] (when-not @stop (recur))))] (try (do (jolt.host/gc-full!) :ok) (finally (reset! stop true))))" :expected ":ok"}
+  ;; The clojure.lang reference, box, entry and chunk classes typed.ann.clojure
+  ;; annotates: each resolves, sits in the class graph under its JVM supers, and
+  ;; names the jolt value that implements it — so instance?, supers, protocol
+  ;; dispatch and Class/forName all answer from the one graph.
+  {:suite "class-lattice" :expr "(vec (remove (comp some? resolve) '[clojure.lang.Agent clojure.lang.AMapEntry clojure.lang.ChunkBuffer clojure.lang.IAtom clojure.lang.IAtom2 clojure.lang.IBlockingDeref clojure.lang.IChunk clojure.lang.IMapEntry clojure.lang.Reduced clojure.lang.Volatile]))" :expected "[]"}
+  {:suite "class-lattice" :expr "(class (reduced 1))" :expected "clojure.lang.Reduced"}
+  {:suite "class-lattice" :expr "(instance? clojure.lang.IDeref (reduced 1))" :expected "true"}
+  {:suite "class-lattice" :expr "[(instance? clojure.lang.IAtom (atom 1)) (instance? clojure.lang.IAtom2 (atom 1)) (instance? clojure.lang.IAtom (volatile! 1))]" :expected "[true true false]"}
+  {:suite "class-lattice" :expr "[(instance? clojure.lang.IBlockingDeref (promise)) (instance? clojure.lang.IBlockingDeref (future 1)) (instance? clojure.lang.IBlockingDeref (delay 1)) (instance? clojure.lang.IBlockingDeref (atom 1))]" :expected "[true true false false]"}
+  ;; a promise or future is a reify over the deref interfaces, not a fn: no AFunction/Fn
+  {:suite "class-lattice" :expr "(let [s (set (map #(.getName %) (supers (class (promise)))))] (mapv (partial contains? s) [\"clojure.lang.IBlockingDeref\" \"clojure.lang.IPending\" \"clojure.lang.IFn\" \"clojure.lang.AFunction\" \"clojure.lang.Fn\"]))" :expected "[true true true false false]"}
+  {:suite "class-lattice" :expr "(let [s (set (map #(.getName %) (supers clojure.lang.MapEntry)))] (mapv (partial contains? s) [\"clojure.lang.AMapEntry\" \"clojure.lang.IMapEntry\" \"java.util.Map$Entry\" \"clojure.lang.APersistentVector\" \"clojure.lang.AFunction\"]))" :expected "[true true true true false]"}
+  ;; an interface registered with no supers has none — a $ in its name does not make it a fn
+  {:suite "class-lattice" :expr "(bases java.util.Map$Entry)" :expected ""}
+  {:suite "class-lattice" :expr "[(.getName (.getSuperclass clojure.lang.MapEntry)) (.getName (.getSuperclass clojure.lang.AMapEntry)) (.getSuperclass clojure.lang.IMapEntry)]" :expected "[\"clojure.lang.AMapEntry\" \"clojure.lang.APersistentVector\" nil]"}
+  {:suite "class-lattice" :expr "[(.isInterface clojure.lang.IAtom) (.isInterface clojure.lang.IChunk) (.isInterface clojure.lang.AMapEntry) (bit-and (.getModifiers clojure.lang.AMapEntry) 1024) (bit-and (.getModifiers clojure.lang.ChunkBuffer) 16) (bit-and (.getModifiers clojure.lang.Volatile) 16) (bit-and (.getModifiers clojure.lang.Reduced) 16)]" :expected "[true true false 1024 16 16 16]"}
+  {:suite "class-lattice" :expr "(let [b (chunk-buffer 4)] [(.getName (class b)) (count b) (instance? clojure.lang.Counted b) (do (chunk-append b 1) (chunk-append b 2) (count b))])" :expected "[\"clojure.lang.ChunkBuffer\" 0 true 2]"}
+  ;; protocol dispatch reads the same class the value reports
+  {:suite "class-lattice" :expr "(do (defprotocol PLat (plat [x])) (extend-protocol PLat clojure.lang.Volatile (plat [x] :vol) clojure.lang.Agent (plat [x] :agent) clojure.lang.Reduced (plat [x] :reduced) clojure.lang.Delay (plat [x] :delay) clojure.lang.ChunkBuffer (plat [x] :chunkbuf)) [(plat (volatile! 1)) (plat (agent 1)) (plat (reduced 1)) (plat (delay 1)) (plat (chunk-buffer 1))])" :expected "[:vol :agent :reduced :delay :chunkbuf]"}
+  {:suite "class-lattice" :expr "(do (defprotocol PLatD (platd [x])) (extend-protocol PLatD clojure.lang.IDeref (platd [x] :deref)) [(platd (volatile! 1)) (platd (reduced 1)) (platd (promise)) (platd (ref 1)) (platd #'platd) (platd (agent 1))])" :expected "[:deref :deref :deref :deref :deref :deref]"}
+  {:suite "class-lattice" :expr "[(instance? clojure.lang.IRef #'first) (instance? clojure.lang.IRef (ref 1)) (instance? clojure.lang.IFn (ref 1)) (instance? clojure.lang.IPending (delay 1)) (instance? clojure.lang.IPending (future 1)) (instance? clojure.lang.IPending (atom 1))]" :expected "[true true true true true false]"}
+  {:suite "class-lattice" :expr "(do (import 'clojure.lang.Volatile) (instance? Volatile (volatile! 1)))" :expected "true"}
+  ;; Class/forName answers for every class resolve does — interfaces included — and
+  ;; only for a fully qualified name, as on the JVM.
+  {:suite "class-lattice" :expr "[(.getName (Class/forName \"clojure.lang.IDeref\")) (.getName (Class/forName \"clojure.lang.IAtom\")) (try (Class/forName \"IDeref\") :found (catch ClassNotFoundException _ :not-found)) (try (Class/forName \"String\") :found (catch ClassNotFoundException _ :not-found))]" :expected "[\"clojure.lang.IDeref\" \"clojure.lang.IAtom\" :not-found :not-found]"}
+  {:suite "host faults" :expr "(try (.concat \"a\" nil) (catch Throwable t (ex-message t)))" :expected "\"string-append: nil is not a string\""}
+  {:suite "host faults" :expr "(try (subs \"abc\" 5) (catch Throwable t [(.getName (class t)) (ex-message t)]))" :expected "[\"java.lang.StringIndexOutOfBoundsException\" \"substring: 5 and 3 are not valid start/end indices for \\\"abc\\\"\"]"}
 ]

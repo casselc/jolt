@@ -41,10 +41,13 @@ do **not** contain submodules, so they can't run or build — clone the repo
 instead.
 
 `bin/jolt` needs a **threaded Chez Scheme 10.x** on `PATH` as `chez` or
-`chezscheme`; set `JOLT_CHEZ` to point at a specific one. `make` provisions its
-own 10.4.1 when `PATH` has a different version, and exports `JOLT_CHEZ` so both
-halves of a build agree — running `bin/jolt` by hand against a 9.x picks up
-whatever primitive that release predates (`variable flvector? is not bound`).
+`chezscheme`; set `JOLT_CHEZ` to point at a specific one. `make` uses a Chez on
+`PATH` at or above its pinned version as-is, and provisions its own 10.4.1 only
+when nothing qualifies. It exports `JOLT_CHEZ` so both halves of a build agree —
+running `bin/jolt` by hand against a 9.x picks up whatever primitive that
+release predates (`variable flvector? is not bound`) — and, when provisioning
+did run, `JOLT_CC` too, so the standalone binary links with the same GCC that
+built Chez instead of whatever `cc` happens to resolve to.
 
 `make build` provisions [Chez Scheme](https://cisco.github.io/ChezScheme/) and a
 C compiler locally through [Makes](https://github.com/makeplus/makes), then
@@ -222,16 +225,47 @@ make corpus                   # conformance corpus vs the JVM-sourced spec
 make unit                     # host-specific unit cases
 make selfhost                 # bootstrap fixpoint (rebuild == checked-in seed)
 make smoke                    # bin/jolt CLI smoke
+make errorreport              # what a failing program PRINTS, pinned per case
 make sci                      # load borkdude/sci's source through jolt (compat stress)
-make ffi                      # HTTP-server GC-safety + http-client temp paths
+make ffi                      # the foreign-function interface, against C witnesses
 make transient                # transient mutation + linear-time builds
 make certify                  # JVM oracle (skips if clojure is absent)
 make libconformance           # replay the downstream library suites vs recorded tallies
 ```
 
+None of those measure throughput, and that is a real hole rather than an
+oversight to live with: `bench/arrays` once went 5.4x slower on a codegen change
+with all 88 ci targets and all 47 libraries still green — every answer was still
+correct. **Run `bench/run.sh` after any change to the compiler passes, the
+emitter, or the runtime's hot paths**, and read the table rather than the exit
+code; the suite reports, it does not judge.
+
+```bash
+NO_JVM=1 bench/run.sh          # the suite, optimized AOT binaries
+bench/run.sh sorted-access     # one benchmark, to re-check a suspicious row
+ci/bench-gate.sh A B           # two compilers head to head, ratios, exits nonzero
+```
+
+Suite noise is around 1.07x per benchmark on a quiet machine, and the FIRST
+benchmark of a run can be much further out than that, so a single suite run is
+not evidence on its own: re-measure anything that moved by running that
+benchmark alone, both before and after. A release runs `ci/bench-gate.sh`
+against the previous release automatically (`.github/workflows/release.yml`),
+and `publish` waits on it.
+
 The conformance corpus (`test/chez/corpus.edn`) is a host-neutral language spec
 whose expected values are sourced from reference JVM Clojure. See
 [test/conformance/SPEC.md](test/conformance/SPEC.md).
+
+Error *reports* are pinned the same way, by `make errorreport`: one directory per
+case under `test/errors/`, holding the program and the exact report jolt prints
+for it — message, position, ex-data, trace and exit status. The golden files
+record today's behaviour, bugs included, so that fixing one shows up as a diff a
+reviewer can read. After an intended change:
+
+```bash
+sh host/chez/error-report-check.sh generate    # then read the diff
+```
 
 Divergences from JVM Clojure are tracked, not tolerated silently:
 `test/conformance/known-divergences.edn` holds both the corpus rows whose value

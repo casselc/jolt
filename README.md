@@ -57,8 +57,9 @@ With Homebrew:
 brew install jolt-lang/jolt/jolt
 ```
 
-Or with the install script (installs to `/usr/local/bin` by default; `--dir <dir>`
-and `--version <v>` override that):
+Or with the install script (installs to `~/.local/bin`, or `/usr/local/bin` as
+root; `--dir <dir>` and `--version <v>` — or `nightly`, the daily build of
+`main` — override that):
 
 ```bash
 curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash
@@ -133,7 +134,8 @@ $ jolt -e '(/ 1 2)'
 When the current directory has a `deps.edn`, `-e` resolves it first, so the
 expression can require the project's own namespaces and its dependencies.
 `-Sdeps` and `-A` compose with it for a one-off evaluation, and `-M` takes the
-same main options on the command line when the selected aliases declare none:
+same main options on the command line when the selected aliases declare none
+(none at all starts a REPL, like `clj -M:dev`):
 
 ```bash
 jolt -Sdeps '{:paths ["src" "test"]}' -e "(require 'my.app-test 'clojure.test)
@@ -160,9 +162,8 @@ failing the query, so `jolt -A:test:dev -Spath` and `jolt -Spath -M:test` both
 answer. Under `-Scp` the deps.edn is still read — aliases, `:main-opts` and
 tasks work — but nothing is expanded, so a shared library declared by a
 *dependency* is not loaded (the project's own `:jolt/native` still is).
-`-Sforce`, `-Sthreads`, and `-Jopt` are accepted and ignored: there is no
-classpath cache to force, fetching is serial, and there is no JVM to pass
-options to.
+`-Sforce`, `-Sthreads`, and `-Jopt` are accepted and ignored: no classpath
+cache to force, serial fetching, no JVM to pass options to.
 
 ## Differences from Clojure
 
@@ -173,7 +174,7 @@ doubles, `BigDecimal` with `M` literals and `with-precision`), lazy and infinite
 sequences, transducers, destructuring, multimethods with hierarchies,
 protocols/records (`deftype`/`defrecord`/`reify`/`extend-protocol`), metadata,
 namespaces, atoms, refs/STM (`ref`/`dosync`/`alter`/`commute`),
-`future`/`promise`/`agent`/`pmap`, `clojure.core.async`, runtime
+`future`/`promise`/`agent`/`pmap`, `clojure.core.async` (and `.flow`), runtime
 `eval`/`load-string`/`defmacro`, and the full reader (`#()`, `#_`, `#?`, tagged
 literals, `#"…"`) all behave as on the JVM. `=` is category-aware
 (`(= 3 3.0)` ⇒ `false`) and `==` is value-equality, as in Clojure. The genuine
@@ -208,6 +209,18 @@ divergences:
   portable Clojure. It resolves first, so a library can ship a portable
   `foo.cljc` next to a `foo.jolt` that wins on jolt, the way `.clj` wins over
   `.cljc` on the JVM. `data_readers.jolt` works like `data_readers.clj` too.
+- **Digit separators in numbers.** `1_000_000`, `0xFF_FF` and `36rR_Z` read as
+  numbers; the JVM raises `Invalid number` on all three. The rule is Java's — an
+  underscore must sit between two digits, never against a sign, radix marker,
+  decimal point, exponent marker or `N`/`M` suffix — so `1_` and `0x_52` still
+  raise. A leading underscore is still an ordinary symbol. `clojure.edn` refuses
+  separators: edn's grammar has none, and a config that read only here would
+  fail in every other edn reader. Additive — nothing that reads on the JVM
+  changes meaning.
+- **Reader macros.** The `#` dispatch table is open for punctuation:
+  `jolt.reader/set-dispatch-macro!` puts a reader on a character. jolt ships
+  `#$"a ~{x}"` interpolation (`clojure.core.strint`'s grammar) on it. Additive —
+  `#<punct>` is a read error on the JVM.
 - **Clojure is a terminal dependency.** jolt *is* Clojure, so
   `org.clojure/clojure` in a `deps.edn` contributes neither an artifact nor
   children. On the JVM that artifact pulls in `org.clojure/spec.alpha`, so a

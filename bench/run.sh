@@ -21,13 +21,28 @@
 set -e
 cd "$(dirname "$0")"
 root="$(cd .. && pwd)"
-jolt="$root/bin/jolt"
+# $JOLT_BIN points the suite at another jolt — a released binary, or the one a
+# release workflow just built. ci/bench-gate.sh drives both sides through it.
+jolt="${JOLT_BIN:-$root/bin/jolt}"
 export JOLT_PWD="$PWD"
+
+# The benchmark list is the single source of truth for what the suite covers, and
+# ci/bench-gate.sh reads it from here rather than keeping a second copy. Printed
+# before the toolchain check below, so listing needs no Chez and no cc.
+if [ "${1:-}" = "--list" ]; then
+  # defined below; re-stated by name so the list lives in exactly one place
+  # cd'd into bench/ above, so name the script rather than reusing $0 (which is
+  # still relative to the caller's directory and no longer resolves)
+  sed -n 's/^BENCHES="\(.*\)"$/\1/p' run.sh | tr ' ' '\n' | grep .
+  exit 0
+fi
 
 # Locate Chez's kernel dev files for the optimized build (as build-smoke.sh does).
 csv="$JOLT_CHEZ_CSV"
 if [ -z "$csv" ]; then
-  chez_bin="$(command -v chez || command -v scheme || command -v petite || true)"
+  # JOLT_CHEZ wins (see host/chez/selfcheck.sh) — else this can pair a
+  # PATH-resolved Chez's csv dir with a running interpreter built elsewhere.
+  chez_bin="${JOLT_CHEZ:-$(command -v chez || command -v scheme || command -v petite || true)}"
   if [ -n "$chez_bin" ]; then
     base="$(cd "$(dirname "$chez_bin")/.." 2>/dev/null && pwd)"
     for d in "$base"/lib/csv*/*/; do
@@ -46,7 +61,7 @@ bindir="$(mktemp -d)"
 trap 'rm -rf "$bindir"' EXIT
 
 # name:default-arg, each sized to run in a few seconds. Axes: see README.md.
-BENCHES="fib:30 tak:24 loop-recur:20000 mandelbrot:200 arrays:40000 mathfns:1000000 collections:30000 vecops:60000 seqs:20000 sorted-access:40000 nth-access:1000000 transducers:20000 transients:50000 keyed-lookup:3000 hash-eq:2000 literals:100000 string-build:60000 string-ops:100000 char-scan:40000 mono-dispatch:2000 dispatch:2000 binary-trees:14"
+BENCHES="fib:30 tak:24 loop-recur:20000 mandelbrot:200 arrays:40000 mathfns:1000000 collections:30000 vecops:60000 seqs:20000 sorted-access:40000 nth-access:1000000 transducers:20000 transients:50000 keyed-lookup:3000 hash-eq:2000 literals:100000 string-build:60000 string-ops:100000 char-scan:40000 mono-dispatch:2000 dispatch:2000 binary-trees:14 executors:60000"
 
 run_one() {
   ns="${1%%:*}"; arg="${2:-${1##*:}}"

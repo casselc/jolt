@@ -22,8 +22,8 @@
 
   {:name "cuerdas"
    :paths ["src" "test"]
+   :local-deps ["~time"]
    ;; str/abbreviate formats through a Locale, which is jolt-lang/time's (RFC 0008)
-   :deps ["~time/src"]
    ;; The two errors are java.text.BreakIterator, which abbreviate uses to find a
    ;; word boundary. That is Unicode text segmentation (UAX #29) and jolt has no
    ;; shim; an approximate one would quietly cut in the wrong place, so it stays
@@ -85,7 +85,7 @@
    ;; assert thread identity or timing and flap between fail and pass run to run,
    ;; hence the tolerance.
    :tolerance 2
-   :expect {:tests 31 :pass 210 :fail 8 :error 0}}
+   :expect {:tests 31 :pass 211 :fail 7 :error 0}}
 
   {:name "core.cache"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -141,9 +141,11 @@
   {:name "tools.reader"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   ;; the 3 fails are the syntax-quote reader-model divergence (a quoted
-   ;; syntax-quote is data on the JVM, a form on jolt); see known-divergences.edn
-   :expect {:tests 50 :pass 884 :fail 3 :error 0}}
+   ;; The 3 fails here were the syntax-quote reader-model divergence — a quoted
+   ;; backtick was data on the JVM and jolt's unlowered marker here. Gone since
+   ;; the analyzer lowers every marker before anything can see the form
+   ;; (jolt-024c).
+   :expect {:tests 50 :pass 887 :fail 0 :error 0}}
 
   {:name "edamame"
    :paths ["src" "resources" "test"]
@@ -262,7 +264,8 @@
    ;; jolt's vendored sci on the path does not change the count — it is a chain,
    ;; not one gap, and it is what `make sci`'s own floor already tracks. So the
    ;; :=> / function-schema surface stays unexercised here rather than pretending.
-   :deps ["~time/src" "@spec.alpha/src/main/clojure" "@test.check/src/main/clojure"]
+   :deps ["@spec.alpha/src/main/clojure" "@test.check/src/main/clojure"]
+   :local-deps ["~time"]
    :timeout 900
    ;; The residue is one :escape-unicode true case in each of the two APIs, and
    ;; it is the string model rather than a bug: jolt strings are codepoint-indexed,
@@ -282,7 +285,7 @@
   {:name "yamlstar"
    :root "yamlstar/core"
    :paths ["src" "test"]
-   :deps ["~time/src"]
+   :local-deps ["~time"]
    :expect {:tests 44 :pass 103 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- markup / text
@@ -315,8 +318,8 @@
    ;; jolt-lang/crypto supplies java.security.MessageDigest, which the hash: filter
    ;; calls — the JVM has it built in, jolt gets it from the library. It goes on as
    ;; a real dependency, not a source path, so its :jolt/native libcrypto is loaded.
-   :deps ["@data.json/src/main/clojure" "~time/src"]
-   :local-deps ["~crypto"]
+   :deps ["@data.json/src/main/clojure"]
+   :local-deps ["~time" "~crypto"]
    ;; core_test does (:require [cheshire.core :refer :all]). Selmer's own source
    ;; resolves cheshire -> data.json -> jsonista at load and is fine on data.json,
    ;; but the test names cheshire outright, and real cheshire wraps Jackson. The
@@ -344,9 +347,10 @@
    ;; needs test.check and test.chuck's generators the way honeysql's own
    ;; deps.edn declares them; without those on the recipe the namespace is a
    ;; load failure rather than a missing dependency anyone would notice.
-   :deps ["~time/src" "@core.cache/src/main/clojure"
+   :deps ["@core.cache/src/main/clojure"
           "@data.priority-map/src/main/clojure"
           "@test.check/src/main/clojure" "@test.chuck/src" "@test.chuck/resources"]
+   :local-deps ["~time"]
    ;; test.chuck's string-from-regex generator parses the pattern with instaparse,
    ;; at the version test.chuck itself declares
    :extra-deps {instaparse/instaparse {:mvn/version "1.4.10"}}
@@ -377,9 +381,10 @@
 
   {:name "malli"
    :paths ["src" "resources" "test"]
-   :deps ["~time/src" "@spec.alpha/src/main/clojure"
+   :deps ["@spec.alpha/src/main/clojure"
           "@test.check/src/main/clojure" "@spec-tools/src"
           "@test.chuck/src" "@ordered/src"]
+   :local-deps ["~time"]
    ;; malli's own deps, from the upstream deps.edn; jolt resolves the source out
    ;; of the Maven jars.
    :extra-deps {borkdude/dynaload {:mvn/version "0.3.5"}
@@ -432,8 +437,8 @@
    :paths ["ring-core/src" "ring-core-protocols/src" "ring-websocket-protocols/src"
            "ring-core/test"]
    :test-paths ["ring-core/test"]
-   :deps ["@ring-codec/src" "~time/src" "~multipart/src"]
-   :local-deps ["~crypto"]
+   :deps ["@ring-codec/src" "~multipart/src"]
+   :local-deps ["~time" "~crypto"]
    :extra-deps {crypto-random/crypto-random {:mvn/version "1.2.1"}
                 crypto-equality/crypto-equality {:mvn/version "1.0.1"}}
    ;; The two session/cookie suites are written against clj-time, which is Joda —
@@ -454,7 +459,7 @@
    ;; its classes at load.
    :preload ["jolt.shim.commons-io" "jolt.shim.commons-fileupload"]
    :note "clj-time (Joda) + commons-fileupload are JVM-only; URLClassLoader/jar: URLs are jolt gaps"
-   :expect {:tests 152 :pass 450 :fail 1 :error 5 :load-fail 2}}
+   :expect {:tests 152 :pass 451 :fail 0 :error 5 :load-fail 2}}
 
   {:name "ring-spec"
    :paths ["src" "test"]
@@ -501,7 +506,7 @@
 
   {:name "lasertag"
    :paths ["src" "test"]
-   :deps ["~time/src"]
+   :local-deps ["~time"]
    ;; lasertag classifies a value by its class, so every failure here is jolt's class
    ;; model rather than a behavioral difference, all recorded in
    ;; known-divergences.edn. The 9 that remain: six narrow numeric classes collapsing
@@ -536,7 +541,8 @@
   ;; ---------------------------------------------------------- time
   {:name "tick"
    :paths ["src" "test"]
-   :deps ["~time/src" "@spec.alpha/src/main/clojure"]
+   :deps ["@spec.alpha/src/main/clojure"]
+   :local-deps ["~time"]
    ;; the one failure is the suite's :bb branch asserting babashka's
    ;; English-only locale rendering ("3030-May-03" under Locale/FRENCH); jolt
    ;; renders the correct French "mai" through the time library.

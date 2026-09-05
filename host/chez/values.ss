@@ -15,8 +15,39 @@
 ;; --- nil ---------------------------------------------------------------------
 (define-record-type jolt-nil-t (fields) (nongenerative jolt-nil-v1))
 (define jolt-nil (make-jolt-nil-t))
-(define (jolt-nil? x) (jolt-nil-t? x))
-(define (jolt-some? x) (not (jolt-nil-t? x)))
+;; SPLICED, not called. Chez compiles each top-level form on its own -- verified:
+;; (define (f x) (fx+ x 1)) (define (g y) (f y)) in one compiled file, then
+;; (set! f ...) after load, still changes what g returns -- so a plain (define
+;; (jolt-nil? x) ...) here is an out-of-line call from every one of the thousands
+;; of sites the emitter writes, and from the whole runtime besides. Measured per
+;; check at optimize-level 2: 2.78ns called, 1.25ns spliced.
+;;
+;; Value position keeps an ordinary <name>-fn procedure and names it explicitly:
+;; op-registry's :value entry for the op, and every host reference that hands the
+;; predicate around rather than calling it. These are plain syntax-rules macros
+;; with NO identifier clause on purpose. Chez would accept a variable transformer
+;; (syntax-case with an (identifier? #'id) arm) and Gambit will not -- "Macro name
+;; can't be used as a variable" -- so a bare use has to be a compile error on both
+;; hosts rather than working on one. That is also what makes the -fn sweep
+;; verifiable: a missed value-position use fails the build, it does not silently
+;; keep the old cost.
+;; An arity the inline arm does not cover falls through to the procedure, so a
+;; wrong-arity use raises exactly what it raised before.
+;;
+;; An arm that uses its operand twice binds it first (jolt-truthy? below), so the
+;; argument expression is still evaluated exactly once; the binding is hygienic
+;; and cannot capture. The single-use arms splice the expression directly.
+(define (jolt-nil?-fn x) (jolt-nil-t? x))
+(define-syntax jolt-nil?
+  (syntax-rules ()
+    ((_ e) (jolt-nil-t? e))
+    ((_ e ...) (jolt-nil?-fn e ...))))
+
+(define (jolt-some?-fn x) (not (jolt-nil-t? x)))
+(define-syntax jolt-some?
+  (syntax-rules ()
+    ((_ e) (not (jolt-nil-t? e)))
+    ((_ e ...) (jolt-some?-fn e ...))))
 
 ;; --- the exit-only-cleanup marker --------------------------------------------
 ;; A fiber park is a continuation escape that is NOT an exit — the computation
@@ -53,7 +84,14 @@
 (define jolt-park-unwinding?-hook (lambda () #f))
 (define (jolt-park-unwinding?) (jolt-park-unwinding?-hook))
 
-(define (jolt-truthy? x) (not (or (jolt-nil? x) (eq? x #f))))
+;; The hot one: every `if` whose test is not provably a Scheme boolean goes
+;; through this, 2395 sites in a trivial app's emitted source before any of the
+;; runtime's own. See jolt-nil? above for why it is a macro.
+(define (jolt-truthy?-fn x) (not (or (jolt-nil-t? x) (eq? x #f))))
+(define-syntax jolt-truthy?
+  (syntax-rules ()
+    ((_ e) (let ((v e)) (not (or (jolt-nil-t? v) (eq? v #f)))))
+    ((_ e ...) (jolt-truthy?-fn e ...))))
 
 ;; --- keywords: interned so identity works; optional namespace ----------------
 (define-record-type keyword-t (fields ns name khash) (nongenerative keyword-v1))
@@ -298,6 +336,17 @@
         (cons (keyword #f "a") (keyword #f "b"))
         (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
         (cons "s1" "s2")
+        ;; Two base scalars of DIFFERENT kinds, and nil against anything, are
+        ;; answered ahead of the walk too (jolt=2's base-scalar clause), so an
+        ;; arm that would claim such a pair is refused for the same reason. The
+        ;; JVM's Util.equiv has no extension point here either: a Keyword is
+        ;; never equal to a String, a Long never to a Double, nil only to nil.
+        ;; The number pairs cover the exactness-aware number clause that moved
+        ;; up with them (bignum and ratio pairs used to reach the arms).
+        (cons (keyword #f "a") "a") (cons "a" (jolt-symbol #f "a"))
+        (cons (keyword #f "a") jolt-nil) (cons jolt-nil 0) (cons jolt-nil "s")
+        (cons 1 2.5) (cons #t (keyword #f "a")) (cons #\a "a") (cons 0 #f)
+        (cons (expt 2 70) (expt 2 71)) (cons 1/2 1/3) (cons #\a #\b) (cons #t #f)
         ;; jolt's own collection types, now answered ahead of the walk. All
         ;; THREE that jolt=2 hoists must be probed — a hoisted type missing from
         ;; here is one whose arms register happily and are then silently dead.
@@ -403,10 +452,33 @@
         ;; EQUAL case); answering the unequal case here keeps a fn-keyed map's
         ;; bucket scan off the arm walk. The pair is in eq-fast-probes.
         ((and (procedure? a) (procedure? b)) #f)
+        ;; nil is equal only to nil (the eq? clause above answered that pair),
+        ;; and two base scalars of different kinds are never equal. Both used to
+        ;; reach jolt=2-base only AFTER every registered arm had been asked —
+        ;; 145-240 ns per miss with 17 arms in a bare runtime, more per library
+        ;; loaded — and `case` lowers to a chain of exactly these compares, so
+        ;; a keyword case fed a symbol paid that per clause. Sound because the
+        ;; JVM's Util.equiv has no extension point for a base-vs-base pair: it
+        ;; goes straight to k1.equals(k2), and Keyword/Symbol/String/Character/
+        ;; Boolean equality is by kind. Numbers keep the exactness-aware
+        ;; compare of jolt=2-base. Every pair answered here is in
+        ;; eq-fast-probes, so the registry refuses an arm that would claim one.
+        ((or (jolt-nil? a) (jolt-nil? b)) #f)
+        ((and (base-scalar? a) (base-scalar? b))
+         (cond ((and (number? a) (number? b)) (and (eq? (exact? a) (exact? b)) (= a b)))
+               ((and (char? a) (char? b)) (char=? a b))
+               ((and (boolean? a) (boolean? b)) (eq? a b))
+               (else #f)))
         (else (let loop ((as jolt-eq-arms))
                 (cond ((null? as) (jolt=2-base a b)) 
                       (((caar as) a b) ((cdar as) a b)) 
                       (else (loop (cdr as))))))))
+;; the scalar kinds whose equality the JVM decides by kind: nil, Number, Keyword,
+;; Symbol, String, Character, Boolean. Records, host types and collections are
+;; NOT here — those are what the arm registry exists for.
+(define (base-scalar? x)
+  (or (number? x) (keyword-t? x) (string? x) (symbol-t? x) (char? x) (boolean? x)
+      (jolt-nil? x)))
 (define (jolt= a . rest)
   (let loop ((a a) (rest rest))
     (cond ((null? rest) #t)

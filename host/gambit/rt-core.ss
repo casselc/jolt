@@ -121,7 +121,14 @@
         ((number? x) (exact->inexact x))
         (else (jolt-num-cast-throw x))))
 ;; jolt `not`: only nil and false are falsey.
-(define (jolt-not x) (if (jolt-truthy? x) #f #t))
+;; Mirrors rt.ss's spliced jolt-not (see values.ss jolt-nil? for why these are
+;; macros); rt-core.ss is the Gambit port of rt.ss's kernel, so the shape has to
+;; match or the Gambit host keeps paying the call.
+(define (jolt-not-fn x) (if (jolt-truthy? x) #f #t))
+(define-syntax jolt-not
+  (syntax-rules ()
+    ((_ e) (if (jolt-truthy? e) #f #t))
+    ((_ e ...) (jolt-not-fn e ...))))
 
 ;; --- ex-info record type -----------------------------------------------------
 ;; A throwable (ex-info or host-constructed typed throwable) is a distinct
@@ -355,10 +362,22 @@
 ;; /associative?/counted? are naturally false). Arity 2 (msg data) or 3 (msg data cause).
 ;; No :jolt/class field on plain ex-info — class defaults to clojure.lang.ExceptionInfo
 ;; via ex-info-class in records-interop.ss.
+;;
+;; nil data reads back as {}, not nil: ExceptionInfo's constructor rejects a null
+;; map, so an ExceptionInfo whose data is nil cannot exist and (ex-data (ex-info
+;; "m" nil)) is {}. Coercing HERE covers every caller — the emitter lowers the
+;; ex-info native op to a direct call to this procedure, so a wrapper around the
+;; clojure.core/ex-info var root would miss every compiled call site. It is also
+;; what makes (some? (ex-data e)) a sound "is this an ExceptionInfo" test, which
+;; is how the analyzer's throw-message tells one from a host throwable.
+;;
+;; A throwable that genuinely has NO data is a different construction:
+;; jolt-host-throwable / throw-jvm, which is what the JVM raises wherever
+;; ex-data is nil.
 (define (jolt-ex-info msg data . more)
   (make-jolt-ex-info-record "clojure.lang.ExceptionInfo" msg
                              (if (null? more) jolt-nil (car more))
-                             data 0))
+                             (if (jolt-nil? data) empty-pmap data) 0))
 ;; A host-constructed throwable (RuntimeException. etc.): a jolt-ex-info-record
 ;; carrying its canonical JVM class-name, so (class …) / instance? / .getMessage /
 ;; ex-message all reflect the real type.
@@ -429,13 +448,13 @@
 ;; two hosts' cells must not drift (this one sat at v2 while chez moved twice).
 (define-record-type var-cell
   (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
-          (mutable dyn-bound?))
-  (nongenerative var-cell-v4))
+          (mutable dyn-bound?) (mutable dynamic?))
+  (nongenerative var-cell-v5))
 (define var-table (make-hashtable string-hash string=?))
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f)))
+        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f)))
           (hashtable-set! var-table k c)
           c))))
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
@@ -450,13 +469,25 @@
 ;; JVM-style class name and clojure.spec.alpha's fn-sym can recover the symbol of a
 ;; bare-fn predicate. Weak so GC'd fns drop out. Last def of a given proc wins.
 (define proc-name-tbl (make-weak-eq-hashtable))
+(define var-redefined-set (make-hashtable string-hash string=?))
+(define (var-redefined? ns name)
+  (hashtable-contains? var-redefined-set (string-append ns "/" name)))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
   (when (and (procedure? v) (not (hashtable-contains? proc-name-tbl v)))
     (hashtable-set! proc-name-tbl v (cons ns name)))
   (hashtable-set! ns-has-vars-set ns #t)
-  (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+  (let ((c (jolt-var ns name)))
+    ;; see host/chez/rt.ss def-var! -- a var defined more than once with a value
+    ;; may not have its body spliced (jolt-rtjm). (declare x) emits declare-var!,
+    ;; so a forward declaration is not a redefinition.
+    (when (not (jolt-var-unbound? (var-cell-root c)))
+      (hashtable-set! var-redefined-set (string-append ns "/" name) #t))
+    (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+;; A def whose form declared NO metadata — see host/chez/rt.ss def-var-plain!.
+(define (def-var-plain! ns name v)
+  (let ((c (def-var! ns name v))) (var-cell-dynamic?-set! c #f) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.
@@ -490,16 +521,23 @@
 ;; keyed by the cell. jolt-meta (natives-meta.ss) merges it onto {:ns :name},
 ;; which it derives from the cell — so EVERY var (plain def, native-op, declare)
 ;; reports {:ns :name} like Clojure, with the user meta layered on when present.
-;; Meta and the macro flag live IN the cell (var-cell-v4 fields), matching
-;; chez: the shared files read and write the fields directly (dyn-binding.ss's
-;; dynamic check reads meta, ns.ss's alter-meta! sync writes macro?), so the
+;; Meta, the macro flag and the dynamic flag live IN the cell (var-cell-v5
+;; fields), matching chez: the shared files read and write the fields directly
+;; (dyn-binding.ss's dynamic check reads dynamic?, ns.ss's alter-meta! sync
+;; writes macro?), so the
 ;; eq-side-tables this file used to keep were invisible to them — a var defined
 ;; ^:dynamic through the seed still threw "non-dynamic" at the first binding.
 (define jolt-kw-var-ns (keyword #f "ns"))
 (define jolt-kw-var-name (keyword #f "name"))
 (define jolt-kw-var-macro (keyword #f "macro"))
 (define (def-var-with-meta! ns name v m)
-  (let ((c (def-var! ns name v))) (var-cell-meta-set! c m) c))
+  (let ((c (def-var! ns name v)))
+    (var-cell-meta-set! c m)
+    (var-cell-dynamic?-set! c (var-meta-dynamic? m))
+    c))
+(define (var-meta-dynamic? m)
+  (and m (not (jolt-nil? m))
+       (jolt-truthy? (jolt-get m (keyword #f "dynamic")))))
 ;; A runtime-defined DYNAMIC var (the *earmuffed* core vars): tagged :dynamic so
 ;; push-thread-bindings accepts it — with no meta entry a var is non-dynamic and
 ;; binding throws, like the JVM.
@@ -509,7 +547,9 @@
 ;; Attach meta to an already-interned var (the declare/no-init emission path:
 ;; (def ^:dynamic *x*) must be bindable before its root is set).
 (define (set-var-meta! ns name m)
-  (var-cell-meta-set! (jolt-var ns name) m))
+  (let ((c (jolt-var ns name)))
+    (var-cell-meta-set! c m)
+    (var-cell-dynamic?-set! c (var-meta-dynamic? m))))
 ;; runtime-macro flag: a var whose root holds a macro expander fn, so the
 ;; analyzer's form-macro?/form-expand-1 (host-contract.ss) expand it. The
 ;; prelude emits each core/stdlib defmacro as a def-var! of its expander
@@ -533,7 +573,7 @@
         ;; declaration-only var stays defined?=#f and resolve/find-var/ns-interns
         ;; miss it in an AOT build. The existing root is left intact.
         (begin (var-cell-defined?-set! c #t) c)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f)))  ; declared => interned/resolvable
+        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f)))  ; declared => interned/resolvable
           (hashtable-set! var-table k c)
           c))))
 
@@ -784,6 +824,15 @@
     (cond ((null? rs) #f)
           (((caar rs) x) ((cdar rs) x))
           (else (loop (cdr rs))))))
+;; The class a value reports. This host has no class model, so the answer is no
+;; class: jolt-object-repr below prints the value plainly, and the last arm of
+;; value-host-tags (records-gambit.ss, from host/chez/protocols.ss) leaves it a
+;; plain Object — the same outcomes the guarded call used to reach by raising.
+(define (jolt-class-name x) #f)
+;; alength in call position (the op registry's native, natives-array.ss on
+;; Chez): the count of any array-like, nil refused — post-prelude names it.
+(define (jolt-alength a)
+  (if (jolt-nil? a) (error 'alength "null") (jolt-count a)))
 (define (jolt-object-repr x readable?)
   (let ((cls (guard (e (#t #f)) (jolt-class-name x)))
         (content (guard (e (#t #f)) (jolt-object-content x))))
@@ -1227,6 +1276,14 @@
 ;; the anon-fn emission registers source forms for image closure capture — a
 ;; no-op keeps those calls inert, matching the image-off degradation.
 (define (image-register-fn-form! . _) #f)
+;; chez's def-var! records the var name of a code value (a multimethod, a reify)
+;; so a state image can write it as a reference. Gambit has no image, so the
+;; registration is a no-op and nothing is ever a named code value.
+(define (register-code-value! . _) #f)
+;; chez names a procedure def-var! never saw, so a state image can write it as a
+;; var reference. Gambit has no image; the registration is a no-op.
+(define (register-proc-name! v . _) v)
+(define (code-value? x) #f)
 
 ;; jclass?/jclass-name and the class objects they read live in host-vars.ss.
 

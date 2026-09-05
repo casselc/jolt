@@ -125,13 +125,18 @@
             ((char-by-char-match? s i needle nlen) i)
             (else (loop (fx- i 1) found))))))
 
+;; A string argument to a String method: nil is a NullPointerException, as
+;; String's own methods raise on null (they used to read as the empty string,
+;; so (.indexOf "abc" nil) answered 0 and (.contains "a" nil) true).
+(define (str-arg x)
+  (if (jolt-nil? x) (throw-jvm 'NullPointerException "str") x))
 ;; A needle arg: a char value -> its 1-char string; a number -> the char at that
 ;; code point (JVM treats an int arg to indexOf as a char code); else a string.
 (define (str-needle x)
   (cond ((char? x) (string x))
         ((number? x) (string (integer->char (exact (truncate x)))))
         ((string? x) x)
-        (else (jolt-str x))))
+        (else (jolt-str (str-arg x)))))
 
 ;; literal replace-all (JVM String.replace(CharSequence,CharSequence)).
 (define (str-replace-literal s a b)
@@ -287,7 +292,15 @@
   (java-hash-combine (java-string-hash name) (if ns (java-string-hash ns) 0)))
 
 (define (jolt-string-method method s rest)
-  (define (arg n) (list-ref rest n))
+  ;; A missing argument is the JVM's reflective miss (dispatch-miss: a 0-arg read
+  ;; reports as a field, more as a method of that arity), not an index fault from
+  ;; reading past the argument list — that left the call uncatchable as the
+  ;; IllegalArgumentException it is.
+  (define (arg n)
+    (let loop ((l rest) (i n))
+      (cond ((null? l) (dispatch-miss s method rest))
+            ((fx=? i 0) (car l))
+            (else (loop (cdr l) (fx- i 1))))))
    (cond
     ;; hot-first: length/charAt/indexOf/startsWith dominate library interop
     ;; (honeysql, string codecs); a miss at the bottom of the chain cost ~100ns
@@ -296,10 +309,10 @@
     ((string=? method "charAt") (string-ref s (jolt->idx (arg 0))))
     ((string=? method "toString") s)
     ((string=? method "indexOf")
-     (str-index-of-any s (arg 0)
+     (str-index-of-any s (str-arg (arg 0))
                    (if (fx>? (length rest) 1) (jolt->idx (arg 1)) 0)))
     ((string=? method "startsWith")
-     (let ((p (arg 0))) (and (fx>=? (string-length s) (string-length p))
+     (let ((p (str-arg (arg 0)))) (and (fx>=? (string-length s) (string-length p))
                              (string=? (substring s 0 (string-length p)) p))))
     ((string=? method "hashCode") (java-string-hash s))
     ((string=? method "toLowerCase") (string-downcase s))
@@ -323,12 +336,12 @@
     ((string=? method "lastIndexOf")
      (str-last-index-of s (str-needle (arg 0))))
     ((string=? method "endsWith")
-     (let ((p (arg 0)) (slen (string-length s)))
+     (let ((p (str-arg (arg 0))) (slen (string-length s)))
        (and (fx>=? slen (string-length p))
             (string=? (substring s (fx- slen (string-length p)) slen) p))))
     ((string=? method "contains")
      (fx>=? (str-index-of s (str-needle (arg 0)) 0) 0))
-    ((string=? method "concat") (string-append s (arg 0)))
+    ((string=? method "concat") (string-append s (str-arg (arg 0))))
     ((string=? method "replace") (str-replace-literal s (str-needle (arg 0)) (str-needle (arg 1))))
     ((string=? method "equalsIgnoreCase")
      (string=? (ascii-string-down s) (ascii-string-down (arg 0))))
@@ -410,7 +423,7 @@
     ((string=? method "isArray") (and (fx>? (string-length s) 0) (char=? (string-ref s 0) #\[)))
     ;; the shared end of the chain, so a string reports the same way every other
     ;; value does — including "No matching field found" for a (.-x "s") read
-    (else (no-method-throw method s (length rest)))))
+    (else (dispatch-miss s method rest))))
 
 ;; --- clojure.core str-* primitives (the substrate clojure.string.clj calls) ---
 ;; clojure.string.clj is pure Clojure over these
@@ -714,11 +727,24 @@
 ;; import: bring a deftype/defrecord from another ns into the current one. A spec
 ;; [from-ns Type ...] binds each Type's ctor closure under the current ns, so its
 ;; (Type. ...) constructor (host-new resolves it as a var) works after :import.
+;; A bare fully-qualified symbol spec — (import 'java.util.Date), or java.util.Date
+;; in an ns :import clause — is the (java.util Date) list it abbreviates. A name
+;; with no package (a default-package class the JVM would look up) binds nothing.
+(define (import-spec-of-fqn nm)
+  (let ((i (let loop ((i (fx- (string-length nm) 1)))
+             (cond ((fx<? i 0) #f)
+                   ((char=? (string-ref nm i) #\.) i)
+                   (else (loop (fx- i 1)))))))
+    (if i
+        (list (jolt-symbol #f (substring nm 0 i))
+              (jolt-symbol #f (substring nm (fx+ i 1) (string-length nm))))
+        '())))
 (define (chez-runtime-import . specs)
   (for-each
     (lambda (spec)
       (let ((items (cond ((pvec? spec) (seq->list spec))
                          ((or (cseq? spec) (empty-list-t? spec)) (seq->list spec))
+                         ((symbol-t? spec) (import-spec-of-fqn (symbol-t-name spec)))
                          (else '()))))
         (when (and (pair? items) (symbol-t? (car items)))
           (let ((from (symbol-t-name (car items))))

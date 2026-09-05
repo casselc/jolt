@@ -2,8 +2,8 @@
 # CLI smoke: exercise the real jolt process end to end — core eval, runtime
 # eval/load-string, runtime defmacro, futures, and the numeric tower. The in-process
 # corpus/unit gates cover semantics in depth; this confirms the CLI entry itself.
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
-cd "$root"
+root="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
+cd "$root" || exit 1
 
 # JOLT_BIN overrides the jolt under test (make test points it at the freshly
 # built target/release/jolt — 10x faster boot than script mode; the explicit
@@ -423,6 +423,15 @@ printf '{jx/up jx.rdrs/up}\n' > "$jx/src/data_readers.jolt"
 printf '(ns jx.rd (:require [jx.rdrs]))\n(defn -main [& _] (println #jx/up "shout"))\n' > "$jx/src/jx/rd.clj"
 jx_check "data_readers.jolt registers a tag" "SHOUT" \
          "$(JOLT_PWD="$jx" $jolt run -m jx.rd 2>&1 | tail -1)"
+# A RELATIVE file: URL resolves against the project directory, like the JVM
+# resolving one against user.dir. Only visible with JOLT_PWD set: the launcher
+# cd's to the jolt root, so a bare relative path here used to read from THERE and
+# the URL came back FileNotFoundException for a file sitting in the project.
+printf 'relative-url-ok\n' > "$jx/rel-probe.txt"
+jx_check "a relative file: URL resolves against the project dir" "relative-url-ok" \
+         "$(JOLT_PWD="$jx" $jolt -e '(print (slurp (java.net.URL. "file:rel-probe.txt")))' 2>&1 | tail -1)"
+jx_check "and through openStream, which is a byte stream" "relative-url-ok" \
+         "$(JOLT_PWD="$jx" $jolt -e '(print (.readLine (java.io.BufferedReader. (java.io.InputStreamReader. (.openStream (java.net.URL. "file:rel-probe.txt")) "UTF-8"))))' 2>&1 | tail -1)"
 # a missing namespace names .jolt in the error, so the extension is discoverable
 miss="$(JOLT_PWD="$jx" $jolt -e "(require 'jx.nope)" 2>&1 | head -1)"
 case "$miss" in
@@ -465,6 +474,27 @@ printf "(intern (create-ns 'aux) 'AAA 42)\n(ns main)\n(refer 'aux :only '[AAA])\
 cla_check "$jolt - < \"$ns_prog\"" '42'
 rm -rf "$ns_dir"
 
+# A dialect-defined use macro owns the quoting of its arguments. The stdin
+# evaluator must not quote them first and turn one module spec into (quote ...).
+use_dir="$(mktemp -d)"; use_prog="$use_dir/p.clj"
+printf '%s\n' \
+  '(defmacro use [& specs] `(println (quote ~specs)))' \
+  '(use (demo :as d))' > "$use_prog"
+cla_check "$jolt - < \"$use_prog\"" '((demo :as d))'
+# ... and the same for a dialect-defined require, which shadows core's just as
+# a use macro does.
+printf '%s\n' \
+  '(defmacro require [& specs] `(println (quote ~specs)))' \
+  '(require (demo :as d))' > "$use_prog"
+cla_check "$jolt - < \"$use_prog\"" '((demo :as d))'
+# Shadowing is what turns the convenience off, not the name: an UNshadowed
+# top-level use still gets its args auto-quoted, the way require does.
+printf '%s\n' \
+  '(use [clojure.set :only [union]])' \
+  '(prn (union #{1} #{2}))' > "$use_prog"
+cla_check "$jolt - < \"$use_prog\"" '#{1 2}'
+rm -rf "$use_dir"
+
 # help prints usage (bare `help` and --help/-h are synonyms) and lists the
 # nREPL server as a bare command.
 help_out="$($jolt help 2>/dev/null)"
@@ -496,6 +526,37 @@ else
   echo "  FAIL: bare jolt should start a REPL (got \`$repl_out\`)"
   fails=$((fails + 1))
 fi
+
+# Every CLI entry starts in user, like clojure.main's. The image bakes jolt.main
+# at heap build, and loading a namespace leaves it current, so -e, the REPL and a
+# run's -main all evaluated in jolt.main: a REPL def landed as #'jolt.main/x
+# under a prompt that said user.
+ns_e="$($jolt -e '(defn h [] 1) (println (str *ns*) (str #'"'"'h))' 2>/dev/null)"
+if printf '%s' "$ns_e" | grep -q "^user #'user/h"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: -e should evaluate in user (got \`$ns_e\`)"
+  fails=$((fails + 1))
+fi
+repl_ns="$(printf '(in-ns (quote foo))\n(str *ns*)\n' | $jolt repl 2>/dev/null)"
+if printf '%s' "$repl_ns" | grep -q '^foo=> "foo"'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: the REPL prompt should name the current namespace (got \`$repl_ns\`)"
+  fails=$((fails + 1))
+fi
+nsm="$(mktemp -d)"
+mkdir -p "$nsm/src/nsm"
+printf '{:paths ["src"]}\n' > "$nsm/deps.edn"
+printf '(ns nsm.core)\n(defn -main [& _] (println (str *ns*)))\n' > "$nsm/src/nsm/core.clj"
+nsm_out="$(JOLT_PWD="$nsm" $jolt run -m nsm.core 2>/dev/null | tail -1)"
+if [ "$nsm_out" = "user" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: run -m should invoke -main in user (got \`$nsm_out\`)"
+  fails=$((fails + 1))
+fi
+rm -rf "$nsm"
 
 # The runtime's shared side-tables (metadata, the variadic fixed-arity registry)
 # must survive concurrent access: a Chez hashtable is not thread-safe, and
@@ -556,17 +617,39 @@ else
   # tear the evidence down — to say which stage dropped the wakeup: still :pending
   # (never drained), waiters parked with no event (kernel set), or ready with no
   # waiters (resume lost). `tail -1` kept only the verdict and discarded exactly
-  # that, which is why the one occurrence on record (1 of 8 in round 29, during a
-  # make test run, not reproducible in ~105 runs since — isolated, 8-way
-  # concurrent, and under full CPU load) cannot be attributed to a stage.
+  # that, which is why the first occurrence on record could not be attributed to
+  # a stage.
   #
-  # A wedge or a throw prints no POLLER-DEBUG at all, so fall back to the tail
-  # rather than reporting nothing.
-  if printf '%s' "$pr_out" | grep -q '^POLLER'; then
-    printf '%s\n' "$pr_out" | grep '^POLLER' | sed 's/^/    /'
-  else
-    printf '%s\n' "$pr_out" | tail -3 | sed 's/^/    /'
-  fi
+  # WHAT THIS ACTUALLY CAUGHT (2026-08-30). Not a lost registration: the poller
+  # was innocent every time. jolt.socket's io-call read errno AFTER the syscall,
+  # and twice -- once for EINTR, once for EAGAIN. errno survives only until the
+  # next thing that can set it, and reading it is itself a foreign call, so under
+  # load recv's EAGAIN (35) read back as ENOMEM (12): the retry branch was missed,
+  # the -1 fell through, and do-recv answered EOF on a live connection. The go
+  # block then threw on (String. b 0 -1 "UTF-8"), its channel closed empty, and
+  # alts!! returned nil instantly -- which this case reports as a lost
+  # registration. 13 of 60 runs under load; 0 of 100 with errno captured at the
+  # syscall. Guarded now by host/chez/errno-check.sh.
+  #
+  # Two things worth keeping from the hunt. The failing run is FASTER than a
+  # passing one (it stops at the losing round) and no timeout elapses -- that is
+  # what says "channel closed empty", not "wakeup lost". And the exception was in
+  # the captured output all along; the tail -1 that this block replaced is what
+  # hid it.
+  #
+  # To reproduce the class: saturate the CPU (eight background
+  # `jolt -e '(reduce + (map inc (range 3000000)))'` loops) and run this case in a
+  # loop. On an idle machine it is ~0 in 145 runs, which is why it only ever
+  # appeared inside a parallel `make test`. Instrumenting the case itself changes
+  # the answer -- a probe in one-round took 6-of-60 to 0-of-60 -- so measure the
+  # rate before concluding anything from a quiet run, and probe the runtime
+  # rather than the workload.
+
+  # EVERYTHING, not just the POLLER lines. The cause turned out to be an
+  # exception printed by the go block ("Exception in go/fiber body (channel
+  # closed)"), which a ^POLLER filter drops on the floor — the same mistake as
+  # the tail -1 this replaced, one level up.
+  printf '%s\n' "$pr_out" | sed 's/^/    /' 
   fails=$((fails + 1))
 fi
 
@@ -923,6 +1006,40 @@ else
   fails=$((fails + 1))
 fi
 
+# A project root must not shadow a namespace Jolt provides as a host built-in.
+# Jolt's reader matches :bb, so a copy of babashka.fs pulled in as a dependency
+# is source written to be inert here (0.4.18 guards list-dir behind
+# `#?(:bb nil …)` and its list-dirs then fails to compile). A built binary
+# already resolves Jolt's copy first because install sources are embedded; this
+# asserts source mode answers the same file. The decoy would load fine on its
+# own — it is Jolt's copy winning that makes list-dir resolve.
+bbs_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+bbshadow="$(mktemp -d)"; mkdir -p "$bbshadow/src/babashka"
+printf '(ns babashka.fs)\n(def marker :decoy)\n' > "$bbshadow/src/babashka/fs.cljc"
+printf '{:paths ["src"]}\n' > "$bbshadow/deps.edn"
+bbs_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '(do (require (quote babashka.fs)) [(nil? (resolve (quote babashka.fs/marker))) (boolean (some-> (resolve (quote babashka.fs/list-dir)) deref fn?))])' 2>&1 | tail -1)"
+if [ "$bbs_out" = '[true true]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a project root shadowed babashka.fs"
+  echo "    want \`[true true]\` got \`$bbs_out\`"
+  fails=$((fails + 1))
+fi
+
+# ...and the escape hatch: a project that DECLARES it supplies the namespace
+# itself gets its own copy, with no supplement interned over it. Without one,
+# "jolt always wins" would be a thing a project could not get out of.
+printf '{:paths ["src"] :jolt/replaces [babashka.fs]}\n' > "$bbshadow/deps.edn"
+bbr_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '(do (require (quote babashka.fs)) [(= :decoy @(resolve (quote babashka.fs/marker))) (nil? (resolve (quote babashka.fs/list-dir)))])' 2>&1 | tail -1)"
+if [ "$bbr_out" = '[true true]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: :jolt/replaces did not reach the project's own babashka.fs"
+  echo "    want \`[true true]\` got \`$bbr_out\`"
+  fails=$((fails + 1))
+fi
+rm -rf "$bbshadow"
+
 # jolt.fs — the stdlib file-system API against a scratch temp dir (glob, copy-tree,
 # move, mtime round-trip, which). The file self-checks and prints one marker.
 fs_out="$($jolt run test/chez/fs-test.clj 2>/dev/null)"
@@ -943,6 +1060,18 @@ if printf '%s' "$canon_out" | grep -q 'CANONICAL-PATH OK'; then
 else
   echo "  FAIL: File.getCanonicalPath"
   printf '%s\n' "$canon_out" | tail -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# java.io.File path normalization — every JVM constructor collapses duplicate
+# separators and drops a trailing one, so a File's path is always normalized.
+# "." and ".." are left alone; resolving those is getCanonicalPath's job above.
+norm_out="$($jolt run test/chez/path-normalize-test.clj 2>&1)"
+if printf '%s' "$norm_out" | grep -q 'PATH-NORMALIZE OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: File path normalization"
+  printf '%s\n' "$norm_out" | tail -8 | sed 's/^/    /'
   fails=$((fails + 1))
 fi
 
@@ -1040,6 +1169,70 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.host's libc timezone probe must not leave TZ set. It is process global,
+# and the capability check at boot ends on "UTC", so an unrestored write left
+# every jolt process answering UTC from localtime() while the machine was
+# somewhere else. Self-checks, one marker; same capture rules as the gates above.
+# TZ is scrubbed for this one: the gate's first check is that the BOOT probe left
+# no TZ behind, and an inherited TZ (a container's ENV TZ=UTC, an exporting shell)
+# is indistinguishable from that leak from inside the process — the test skips the
+# check rather than fail on it, so unsetting here is what keeps it covered. The
+# subshell is the command substitution's own, so nothing below sees the unset.
+tzprobe_out="$(unset TZ; $jolt run test/chez/jolt-tz-probe-test.clj 2>&1)"
+if printf '%s' "$tzprobe_out" | grep -q 'JOLT-TZ-PROBE-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.host tz probe"
+  if printf '%s\n' "$tzprobe_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$tzprobe_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$tzprobe_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$tzprobe_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
+# Core reads no system file for its default zone: with TZ unset and no provider
+# registered it is UTC on every machine; a provider (jolt.time registers its
+# machine-zone lookup) is consulted before that; TZ wins over both.
+tzdefault_out="$(unset TZ; $jolt -e '[(.getID (java.util.TimeZone/getDefault)) (.format (java.text.SimpleDateFormat. "HH:mm zzz") (java.util.Date. 0)) (do (jolt.host/set-default-zone-provider! (fn [] "Asia/Tokyo")) (.getID (java.util.TimeZone/getDefault))) (.format (java.text.SimpleDateFormat. "HH:mm zzz") (java.util.Date. 0))]' 2>&1 | tail -1)"
+if [ "$tzdefault_out" = '["UTC" "00:00 UTC" "Asia/Tokyo" "09:00 JST"]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: default zone without TZ is UTC, then the provider's: $tzdefault_out"
+  fails=$((fails + 1))
+fi
+
+# TZ names the default zone (the process's own setting): under it the deprecated Date getters,
+# SimpleDateFormat and Calendar read that zone's clock, its short name and
+# offset render, and a zone-less parse lands on the instant it names there.
+tzdef_out="$(TZ=America/New_York $jolt -e '[(.format (java.text.SimpleDateFormat. "yyyy-MM-dd HH:mm zzz Z") (java.util.Date. 1393632000000)) (.getHours (java.util.Date. 1393632000000)) (.getID (java.util.TimeZone/getDefault)) (.get (doto (java.util.Calendar/getInstance) (.setTime (java.util.Date. 1393632000000))) java.util.Calendar/HOUR_OF_DAY) (.getTime (.parse (java.text.SimpleDateFormat. "yyyy-MM-dd HH:mm") "2014-02-28 19:00")) (.getDate (java.util.Date. 114 2 1))]' 2>&1 | tail -1)"
+if [ "$tzdef_out" = '["2014-02-28 19:00 EST -0500" 19 "America/New_York" 19 1393632000000 1]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: default zone under TZ=America/New_York: $tzdef_out"
+  fails=$((fails + 1))
+fi
+
+# The same file's OTHER libc probe: LC_TIME is process global just like TZ, and
+# both the boot capability check and locale-name itself write it. An unrestored
+# write left every jolt process in en_US.UTF-8 and moved to "C" on the first
+# format call. Also gates that a locale the OS lacks reads as nil rather than
+# borrowing a name from whichever locale was current.
+localeprobe_out="$($jolt run test/chez/jolt-locale-probe-test.clj 2>&1)"
+if printf '%s' "$localeprobe_out" | grep -q 'JOLT-LOCALE-PROBE-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.host locale probe"
+  if printf '%s\n' "$localeprobe_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$localeprobe_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$localeprobe_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$localeprobe_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.ffi :string <-> NULL. Chez's `string` type carries NULL as #f in both
 # directions; these gates prove jolt's nil translates to it and back, so a C
 # API where NULL is a real argument (setlocale) or a real result (getenv of an
@@ -1092,6 +1285,31 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.host/extend-class! (jolt#575) end to end, in a real process: the extend
+# tier fills a gap in the shim jolt already has for java.io.File, does NOT take a
+# method the shim answers, and :override does. The whole point of the seam is
+# that the class keeps its OTHER methods, so each case reads a shim method back
+# alongside the extension.
+check '(do (jolt.host/extend-class! "java.io.File" {:methods {"shout" (fn [self] (.toUpperCase (.getName self)))}}) [(.shout (java.io.File. "a/b.txt")) (.getName (java.io.File. "a/b.txt"))])' '["B.TXT" "b.txt"]'
+check '(do (jolt.host/extend-class! "java.io.File" {:methods {"getName" (fn [_] "hijacked")}}) (.getName (java.io.File. "a/b.txt")))' '"b.txt"'
+check '(do (jolt.host/extend-class! "java.io.File" {:methods {"getName" (fn [_] "overridden")} :override true}) [(.getName (java.io.File. "a/b.txt")) (.getPath (java.io.File. "a/b.txt"))])' '["overridden" "a/b.txt"]'
+# file-seq lowers (.isDirectory f) through jolt-host-call rather than the arm
+# chain, so an override has to reach that spelling too or one method would have
+# two behaviours in the same program.
+check '(do (jolt.host/extend-class! "java.io.File" {:methods {"isDirectory" (fn [_] false)} :override true}) (count (file-seq (java.io.File. "host/chez/java"))))' '1'
+
+# An override is a process-wide substitution the same way a replaced constructor
+# is, so it is reported under JOLT_DEBUG and stays silent for the additive tier.
+extend_out="$(JOLT_DEBUG=1 $jolt -e '(do (jolt.host/extend-class! "java.io.File" {:methods {"getName" (fn [_] "x")} :override true}) (jolt.host/extend-class! "java.io.File" {:methods {"quietlyAdded" (fn [_] :ok)}}) nil)' 2>&1)"
+if printf '%s' "$extend_out" | grep -q 'overrode java.io.File/getName' &&
+   ! printf '%s' "$extend_out" | grep -q 'quietlyAdded'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a class-method override is not reported under JOLT_DEBUG"
+  printf '%s\n' "$extend_out" | tail -3 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # jolt.ffi bulk byte buffers — the foreign<->bytevector block moves under
 # read-array / read-into! / write-array / read-bytes / write-bytes. Binary
 # faithfulness across the unsigned-octet/signed-byte fold, offsets, and bounds.
@@ -1141,7 +1359,10 @@ fi
 # single check, "FAIL: jolt.process" with nothing under it is all the gate says, and
 # the reason — the exception — is exactly what was thrown away.
 process_log="$(mktemp)"
-$jolt run test/chez/process-test.clj >"$process_log" 2>&1 || true
+# JOLT_EXE names the jolt under test for the cases that spawn a child jolt, so a
+# built binary tests itself rather than whatever `jolt` is on PATH.
+JOLT_EXE="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")" \
+  $jolt run test/chez/process-test.clj >"$process_log" 2>&1 || true
 process_out="$(cat "$process_log")"
 if printf '%s' "$process_out" | grep -q 'PROCESS-TEST OK'; then
   pass=$((pass + 1))
@@ -1226,14 +1447,35 @@ fi
 # A data reader that returns a CODE form (deps.edn data_readers.clj -> reader fn)
 # must have its result spliced in and COMPILED, like Clojure — #code [:x] becomes
 # (+ 40 2) and evaluates to 42, not the literal list. A project run so the source
-# root's data_readers.clj is picked up.
+# root's data_readers.clj is picked up. The last two lines cover a *data-readers*
+# entry that holds the reader FUNCTION rather than a symbol naming it (the JVM's
+# own table shape): a form result compiles, a value result is spliced.
 dr_out="$(JOLT_PWD="$root/test/chez/datareader-app" $jolt run -m drtest.main 2>/dev/null)"
 dr_want="42
-olleh!"
+olleh!
+3
+shout-value"
 if [ "$dr_out" = "$dr_want" ]; then
   pass=$((pass + 1))
 else
-  echo "  FAIL: data readers — got \`$dr_out\`, want 42 + olleh! (#code compiled; transitive reader-ns require)"
+  echo "  FAIL: data readers — got \`$dr_out\`, want \`$dr_want\` (#code compiled; transitive reader-ns require; fn-valued table entries)"
+  fails=$((fails + 1))
+fi
+
+# Reader macros (jolt.reader): a source file registers a #<char> reader and uses
+# it BELOW in the same file, which only works because jolt reads and evaluates a
+# file one top-level form at a time. Covers both tiers (form and :raw), the
+# baked-in #$ interpolation, and clojure.core.strint's << over the same grammar.
+rm_out="$(JOLT_PWD="$root/test/chez/readermacro-app" $jolt run -m rmtest.main 2>/dev/null)"
+rm_want="[3 3]
+C:\\new
+interp 3 4
+strint 3 4
+($ % |)"
+if [ "$rm_out" = "$rm_want" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: reader macros — got \`$rm_out\`, want \`$rm_want\`"
   fails=$((fails + 1))
 fi
 
@@ -1250,7 +1492,9 @@ fi
 
 # Loader: require :reload / :reload-all, failed-load rollback, a data-reader fn
 # whose var resolves surfaces a throw (not silently degraded), the LIST-libspec
-# superset (use '(ns :only [x])), and the prefix-list form ((require '(pfx [c :as s]))).
+# superset (use '(ns :only [x])), the prefix-list form ((require '(pfx [c :as s])))
+# and that a require fired under a (binding [*ns* ..]) still interns each loaded
+# file's defs into its own namespace.
 # The fixture writes its own scratch ns files under a temp dir and requires them.
 loader_out="$($jolt run test/chez/loader-test.clj 2>/dev/null)"
 if printf '%s' "$loader_out" | grep -q 'LOADER OK'; then
@@ -1489,6 +1733,21 @@ check '(do (require (quote jolt.nrepl)) (if jolt.nrepl/windows? :close-on-exec (
 # silently load nothing.
 check '(do (require (quote jolt.ffi)) (jolt.ffi/load-library {:darwin "libsqlite3.0.dylib" :linux "libsqlite3.so.0" :windows "winsqlite3.dll"}) :map-form-ok)' ':map-form-ok'
 check '(do (require (quote jolt.ffi)) (try (jolt.ffi/load-library {:no-such-os "x.so"}) :no-raise (catch Exception e (if (clojure.string/includes? (ex-message e) "entry in the per-OS spec") :named-raise :wrong-message))))' ':named-raise'
+
+# clojure.main wraps repl / -e / -m in with-bindings, so a top-level
+# (set! *warn-on-reflection* true) — the standard idiom in ported libraries —
+# has a thread-local slot to write. jolt's REPL bound them and -e did not, so
+# the same expression worked from a file and raised "Can't change/establish
+# root binding" here. Each of the three flags, and the write must be visible to
+# a later form in the same -e.
+check '(do (set! *warn-on-reflection* true) *warn-on-reflection*)' 'true'
+check '(do (set! *unchecked-math* true) *unchecked-math*)' 'true'
+check '(do (set! *assert* false) *assert*)' 'false'
+# ...and load-string scopes its own set! the way a file load does. This listed
+# two of the three vars by hand, so *unchecked-math* escaped into the caller.
+check '(do (load-string "(set! *unchecked-math* true) :x") *unchecked-math*)' 'false'
+check '(do (load-string "(set! *warn-on-reflection* true) :x") *warn-on-reflection*)' 'false'
+check '(do (load-string "(set! *assert* false) :x") *assert*)' 'true'
 
 echo "cli smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]

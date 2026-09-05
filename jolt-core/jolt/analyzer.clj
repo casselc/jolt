@@ -31,9 +31,11 @@
                                form-ns-value? form-ns-value-name
                                form-var-value? form-var-value-ns form-var-value-name
                                form-class-value? form-class-value-name
+                               form-tagged? form-tag-name
                                unchecked-math? allow-unresolved-vars?
                                form-macro? form-expand-1 resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
+                               form-syntax-quote-expand
                                record-type? record-ctor-key deftype-ctor-class form-position form-line late-bind?
                                resolve-class-hint host-class-name? jolt-class-for]]))
 
@@ -112,7 +114,11 @@
 ;; A recur target carries its name (the compiled self-call) and its ARITY (the
 ;; binding count) so a recur with the wrong number of args is a compile error,
 ;; like the JVM, instead of failing only at runtime on the branch that runs.
-(defn- with-recur [env name arity] (assoc env :recur name :recur-arity arity))
+;; Establishing a target also lifts any `try` boundary crossed to get here: the
+;; boundary is about reaching an OUTER target, and a fn or loop written inside a
+;; try recurs to itself normally, exactly as it does on the JVM.
+(defn- with-recur [env name arity]
+  (-> env (assoc :recur name :recur-arity arity) (dissoc :recur-blocked)))
 
 ;; Type hints. The reader keeps ^hint metadata on the binding symbol.
 ;; Two hints resolve to the :struct fast path (a constant-keyword lookup skips
@@ -270,6 +276,77 @@
           (recur (inc i) (conj out (if dup? (gen-name (str nm "_")) nm))))
         out))))
 
+;; The JVM's macro calling convention: an expander fn's parameters are
+;; [&form &env & declared], so (apply macro-fn form env args) is a legal call.
+;; That shape is not decoration — every tools.analyzer-style macroexpand-1
+;; (typedclojure's included) expands a macro by applying its fn that way, and a
+;; declared-params-only fn answers those with an ArityException. Inside the body
+;; &form/&env are then ordinary lexical params, so a closure over them works
+;; where a dynamically-bound var would already have been popped. The DECLARED
+;; params are what :arglists keeps, as on the JVM.
+(defn- macro-arity-params [pvec]
+  (let [m (form-coll-meta pvec)
+        v (vec (concat [(symbol "&form") (symbol "&env")] (form-vec-items pvec)))]
+    (if m (with-meta v m) v)))
+
+;; Split a defmacro's forms after the docstring and leading attr-map into
+;; [arity-forms trailing-attr-map]. defmacro takes a trailing attr-map exactly as
+;; defn does (the JVM's hands the whole fdecl, that map included, straight to
+;; defn); jolt used to run it through the arity lowering, which made it a bogus
+;; ([&form &env]) clause and lost it from the var's metadata. Only a MULTI-arity
+;; body can carry one — a single `[params] body` is one clause already, so its
+;; last form is a map-returning body, not an attr-map (the same rule defn states).
+(defn- macro-trail-attr [after]
+  (if (and (form-list? (first after)) (> (count after) 1))
+    (let [lst (last after)]
+      (if (form-map? lst) [(butlast after) lst] [after nil]))
+    [after nil]))
+
+;; The arity CLAUSES, each with the two implicit params in front. `after` here is
+;; already past the docstring, the leading attr-map and the trailing one.
+;; Always a list of clauses, never a spliced single arity — the reference
+;; normalizes a lone `[params] body` into one clause before it prepends anything
+;; ((if (vector? (first fdecl)) (list fdecl) fdecl)), and both readers of this
+;; want that shape: `fn` accepts either, and the macroexpand-1 answer has to BE
+;; the JVM's. Empty when the form declares no arity at all: (defmacro m) is a defn
+;; with no body, not one taking [&form &env].
+(defn- macro-fn-arities [after]
+  (cond
+    (empty? after) after
+    (form-list? (first after))
+    (map (fn [clause]
+           (let [es (vec (form-elements clause))]
+             (cons (macro-arity-params (first es)) (rest es))))
+         after)
+    :else (list (cons (macro-arity-params (first after)) (rest after)))))
+
+;; What macroexpand-1 answers for a defmacro form. defmacro is a special form
+;; here, so this never runs during compilation — but a tools.analyzer-style
+;; consumer expands to a fixpoint and reads the result, and on the JVM that
+;; result is a defn plus a setMacro, not an opaque call to defmacro. It shares
+;; macro-arity-params with the special-form arm below so the reported shape
+;; cannot drift from the compiled one: docstring and attr-map keep their place,
+;; every arity becomes a clause, and &form/&env lead the declared params.
+(defn defmacro-expansion [form]
+  (let [items (vec (form-elements form))
+        name-sym (nth items 1)
+        after (drop 2 items)
+        [after doc] (if (string? (first after)) [(rest after) (first after)] [after nil])
+        [after attr] (if (form-map? (first after)) [(rest after) (first after)] [after nil])
+        [after trail] (macro-trail-attr after)
+        vform (list 'var name-sym)]
+    (list 'do
+          ;; the arity lowering is macro-fn-arities, the SAME one the special-form
+          ;; arm compiles through — a second copy here is a shape that can drift
+          ;; from the one the compiler actually uses.
+          (concat (list (symbol "clojure.core" "defn") name-sym)
+                  (when doc (list doc))
+                  (when attr (list attr))
+                  (macro-fn-arities after)
+                  (when trail (list trail)))
+          (list '. vform (list 'setMacro))
+          vform)))
+
 (defn- analyze-arity [ctx pvec body env fn-name]
   (let [pp (parse-params ctx (vec (form-vec-items pvec)))
         rst (:rest pp)
@@ -400,11 +477,24 @@
                             (into (if (:name n) (conj bound (:name n)) bound)
                                   (if (:rest a) (conj (:params a) (:rest a)) (:params a))))))
                   (or (= op :let) (= op :loop))
-                  (let [b* (reduce (fn [b [nm init]]
-                                     (walk init b)
-                                     (conj b nm))
-                                   bound (:bindings n))]
-                    (walk (:body n) b*))
+                  ;; letrec (letfn, and the state-machine loops core.async's CPS
+                  ;; transform builds from it) binds EVERY name across EVERY init,
+                  ;; including the init's own. Walking those inits with only the
+                  ;; earlier names bound — which is right for let* and loop, where
+                  ;; an init sees only what precedes it — reports a letrec binding
+                  ;; as free in its own init. That over-approximates :free-names,
+                  ;; and a name the literal itself binds has no captured value to
+                  ;; recover, so the closure refuses at dump for a variable that
+                  ;; was never a capture.
+                  (if (:letrec n)
+                    (let [b* (into bound (map first (:bindings n)))]
+                      (doseq [b (:bindings n)] (walk (second b) b*))
+                      (walk (:body n) b*))
+                    (let [b* (reduce (fn [b [nm init]]
+                                       (walk init b)
+                                       (conj b nm))
+                                     bound (:bindings n))]
+                      (walk (:body n) b*)))
                   (= op :try)
                   (do (walk (:body n) bound)
                       (when (:catch-body n)
@@ -506,7 +596,21 @@
     ;; everything; this gives real per-class dispatch.) :catch-sym/:catch-body/
     ;; :finally are added only when present — an absent key must stay absent (a
     ;; nil-valued key would make the node a phm and force back-end densification).
-    (let [n {:op :try :body (analyze-seq ctx @body env)}
+    ;; `recur` may not cross a try. On the JVM that is a bytecode limit; here the
+    ;; lowering re-enters the handler scope each iteration without leaving the
+    ;; previous one, so a recur that crossed one leaked ~400 bytes an iteration and
+    ;; ran `finally` bodies LIFO at loop exit rather than per iteration — and with
+    ;; no loop condition it simply hung. The target stays VISIBLE (with-recur in an
+    ;; inner fn/loop lifts this again); marking the boundary rather than dropping
+    ;; :recur is what lets the recur arm tell "no target at all" from "a target it
+    ;; may not reach", which are different diagnostics.
+    ;;
+    ;; Body and catch/finally are marked differently because the reference reports
+    ;; them differently: the body is "Cannot recur across try", while a catch or
+    ;; finally is not a tail position in the first place and reports as such.
+    (let [benv (assoc env :recur-blocked :try)
+          tenv (assoc env :recur-blocked :non-tail)
+          n {:op :try :body (analyze-seq ctx @body benv)}
           n (if (seq @catches)
               (let [evar-name (gen-name "catch")
                     raw-name (gen-name "catch-raw")
@@ -532,10 +636,10 @@
                 (assoc n :catch-sym evar-name
                          :catch-raw-sym raw-name
                          :catch-body (analyze-seq ctx (list dispatch)
-                                                  (add-locals env [evar-name]))))
+                                                  (add-locals tenv [evar-name]))))
               n)
           n (if @finally-body
-              (assoc n :finally (analyze-seq ctx @finally-body env))
+              (assoc n :finally (analyze-seq ctx @finally-body tenv))
               n)]
       n)))
 
@@ -658,8 +762,9 @@
           (if me (assoc node :meta-expr me) node))))))
 
 ;; (set! (.-field obj) v) mutates a deftype instance field in place; (set! *var* v)
-;; sets the var's innermost thread binding, else its root. A local target (jolt
-;; binds fields immutably) or any other shape is uncompilable.
+;; sets the var's innermost thread binding through jolt.host/set-var! — Var.set,
+;; which throws when there is none rather than establishing a root. A local target
+;; (jolt binds fields immutably) or any other shape is uncompilable.
 (defn- analyze-set! [ctx items env]
   (let [target (nth items 1)
         val-node (analyze ctx (nth items 2) env)
@@ -681,6 +786,14 @@
       (invoke (var-ref "jolt.host" "set-static-field!")
               [(const (:name (resolve-global ctx (nth ti 1))))
                (const (form-sym-name (nth ti 2))) val-node])
+      ;; (set! (. obj -field) val) and (set! (. obj field) val) — the two-part
+      ;; spelling of the instance-field set above; a deftype method writes its
+      ;; mutable fields as (set! (. this -field) v). After the static arm, so a
+      ;; class name in the object position still means a static field.
+      (and (= thead ".") (= 3 (count ti)) (form-sym? (nth ti 2)))
+      (let [mname (form-sym-name (nth ti 2))]
+        {:op :set-field :obj (analyze ctx (nth ti 1) env)
+         :field (if (= \- (first mname)) (subs mname 1) mname) :val val-node})
       (form-sym? target)
       (do (when (local? env (form-sym-name target)) (uncompilable "set! of a local"))
           (let [r (resolve-global ctx target)]
@@ -737,6 +850,15 @@
                   arity (:recur-arity env)
                   n (dec (count items))]
               (when-not rt (uncompilable "recur outside loop/fn"))
+              ;; A target exists but a `try` stands between here and it. Reported
+              ;; before the arity check because the arity is beside the point when
+              ;; the recur cannot happen at all, and with the reference's own two
+              ;; messages: a try body may not be recurred ACROSS, while a catch or
+              ;; finally is not a tail position to begin with.
+              (case (:recur-blocked env)
+                :try (throw "Cannot recur across try")
+                :non-tail (throw "Can only recur from tail position")
+                nil)
               (when (and arity (not= n arity))
                 (throw (str "Mismatched argument count to recur, expected: " arity
                             " args, got: " n)))
@@ -768,9 +890,6 @@
                   (uncompilable (str "Unable to resolve var: "
                                      (if-let [ns (form-sym-ns sym)] (str ns "/") "")
                                      (form-sym-name sym) " in this context"))))))
-    ;; (set! *var* val): set the var's innermost thread binding; throws if none.
-    ;; Uses jolt-set-var! (not jolt-var-set — that's the public root-setter).
-    ;; supported (jolt binds fields immutably); an interop (.-field) target too.
     ;; A defmacro that is not top-level (the spine intercepts those) — e.g. one
     ;; produced by a macro like (when … (defmacro …)). Lower it the way the spine
     ;; does: def the expander fn, then mark the var a macro at runtime so later
@@ -781,29 +900,37 @@
                      after (drop 2 items)
                      [after doc] (if (string? (first after)) [(rest after) (first after)] [after nil])
                      [after attr] (if (form-map? (first after)) [(rest after) (first after)] [after nil])
+                     ;; …and a TRAILING attr-map, which defn takes too (the JVM's
+                     ;; defmacro hands it the whole fdecl, that map included). It
+                     ;; used to run through the arity lowering, becoming a bogus
+                     ;; ([&form &env]) clause and a [:k 1] entry in :arglists.
+                     [after trail] (macro-trail-attr after)
                      ;; build (fn params body…) and analyze it through the fn MACRO
                      ;; so a destructuring macro arglist desugars (the fn* primitive
                      ;; would not), then def it and mark the var a macro. Head with
                      ;; the QUALIFIED clojure.core/fn so it resolves to the real fn
                      ;; macro even when the macro being defined is `fn` (schema/s/fn)
                      ;; or the ns excluded it.
-                     fn-form (cons (symbol "clojure.core" "fn") after)
+                     fn-form (cons (symbol "clojure.core" "fn") (macro-fn-arities after))
                      ;; var meta like defn: ^meta on the name, docstring, attr-map, arglists
-                     arglists (if (form-list? (first after))
-                                (map first after)
-                                (list (first after)))
+                     arglists (cond (empty? after) nil          ; (defmacro m) declares none
+                                    (form-list? (first after)) (map first after)
+                                    :else (list (first after)))
                      ;; the derived arglists is a DEFAULT: an explicit :arglists in
                      ;; the attr-map (or on the name) overrides it, as defn allows.
                      ;; Merging it last instead silently discarded the user's value.
-                     ;; precedence, matching the JVM for both defn and defmacro:
-                     ;; name metadata < the derived arglists < attr-map < docstring.
-                     ;; So ^{:arglists …} on the NAME does not override (the JVM
-                     ;; ignores it there) but {:arglists …} in the attr-map does.
-                     ;; Merging the derived value last discarded the attr-map's.
+                     ;; Precedence is DEFN'S, because on the JVM this form becomes a
+                     ;; defn: name metadata < the derived arglists < docstring <
+                     ;; leading attr-map < trailing attr-map. So ^{:arglists …} on
+                     ;; the NAME does not override (the JVM ignores it there),
+                     ;; {:arglists …} in an attr-map does, and an attr-map's :doc
+                     ;; beats the docstring — which is what jolt's own defn already
+                     ;; did while this arm had the docstring winning.
                      base (merge (or (form-sym-meta name-sym) {})
-                                 {:arglists arglists}
+                                 (if arglists {:arglists arglists} {})
+                                 (if doc {:doc doc} {})
                                  (or attr {})
-                                 (if doc {:doc doc} {}))
+                                 (or trail {}))
                      meta-expr (def-meta-expr ctx base env)]
                  (host-intern! ctx cur nm)
                  (merge {:op :defmacro :ns cur :name nm
@@ -868,6 +995,14 @@
             (= :sb (:hint target)))
     :sb))
 
+;; The list form's source position on a node, when the reader recorded one —
+;; the same stamp an :invoke carries. A host call in tail position stores it as
+;; its trace site (backend sited host call), and it is what a report names when
+;; the host raises from inside the call.
+(defn- stamp-pos [node form]
+  (let [p (form-position form)]
+    (if p (assoc node :pos p) node)))
+
 (defn- analyze-host-call [ctx hname items env]
   (when (< (count items) 2)
     (throw (str "Malformed member expression, expecting (.method target ...): " hname)))
@@ -899,74 +1034,103 @@
   (host-new (or (deftype-ctor-class ctx class) class)
             (mapv #(analyze ctx % env) args)))
 
-;; Literal, data-only struct descriptors. Keep the analyzer representation free
+;; Literal, data-only layout descriptors. Keep the analyzer representation free
 ;; of reader objects so it survives self-hosting and can be embedded in the IR.
 (def ^:private ffi-layout-scalars
-  #{"int" "uint" "int8" "i8" "uint8" "u8" "byte" "char"
+  #{"int" "uint" "int8" "i8" "uint8" "u8" "byte" "char" "bool"
     "int16" "short" "uint16" "ushort" "int32" "uint32"
     "long" "ulong" "int64" "uint64" "size_t" "ssize_t" "iptr" "uptr"
     "double" "float" "pointer" "void*"})
 
 (declare analyze-ffi-layout-type)
 
-(defn- analyze-ffi-layout-struct [form]
-  (when-not (form-vec? form)
-    (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]], got "
-                (pr-str form))))
-  (let [parts (vec (form-vec-items form))]
-    (when-not (and (= 2 (count parts))
-                   (form-keyword? (nth parts 0))
-                   (nil? (namespace (nth parts 0)))
-                   (= "struct" (name (nth parts 0)))
-                   (form-vec? (nth parts 1)))
-      (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]], got "
-                  (pr-str form))))
-    (let [field-forms (vec (form-vec-items (nth parts 1)))]
-      (when (empty? field-forms)
-        (throw "jolt.ffi struct descriptor must contain at least one field"))
-      (loop [remaining field-forms names #{} fields []]
-        (if (empty? remaining)
-          {:ffi-kind :struct :fields fields}
-          (let [field (first remaining)]
-            (when-not (form-vec? field)
-              (throw (str "jolt.ffi struct field must be [keyword type], got "
-                          (pr-str field))))
-            (let [fp (vec (form-vec-items field))]
-              (when-not (= 2 (count fp))
-                (throw (str "jolt.ffi struct field must be [keyword type], got "
+(defn- ffi-layout-form-kind [form]
+  (when (form-vec? form)
+    (let [parts (vec (form-vec-items form))
+          head (first parts)]
+      (when (and (form-keyword? head) (nil? (namespace head)))
+        (name head)))))
+
+;; A struct and a union differ only in how the ABI lays the members out, so one
+;; analyzer reads both and the :ffi-kind it answers is what the back end turns
+;; into Chez's (struct ...) or (union ...) ftype. Everything downstream — offsets,
+;; size, alignment, field paths — is computed by the SAME ftype machinery, so a
+;; union needs no arithmetic of its own here.
+(defn- analyze-ffi-layout-aggregate [form]
+  (let [kind (ffi-layout-form-kind form)
+        kind (when (or (= "struct" kind) (= "union" kind)) kind)]
+    (when-not (form-vec? form)
+      (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]] "
+                  "or [:union [[field type] ...]], got " (pr-str form))))
+    (let [parts (vec (form-vec-items form))]
+      (when-not (and kind (= 2 (count parts)) (form-vec? (nth parts 1)))
+        (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]] "
+                    "or [:union [[field type] ...]], got " (pr-str form))))
+      (let [field-forms (vec (form-vec-items (nth parts 1)))]
+        (when (empty? field-forms)
+          (throw (str "jolt.ffi " kind " descriptor must contain at least one field")))
+        (loop [remaining field-forms names #{} fields []]
+          (if (empty? remaining)
+            {:ffi-kind (if (= "union" kind) :union :struct) :fields fields}
+            (let [field (first remaining)]
+              (when-not (form-vec? field)
+                (throw (str "jolt.ffi " kind " field must be [keyword type], got "
                             (pr-str field))))
-              (let [field-name (nth fp 0)]
-                (when-not (and (form-keyword? field-name)
-                               (nil? (namespace field-name)))
-                  (throw (str "jolt.ffi struct field name must be an unqualified keyword, got "
-                              (pr-str field-name))))
-                (let [nm (name field-name)]
-                  (when (contains? names nm)
-                    (throw (str "jolt.ffi struct field names must be unique; duplicate :" nm)))
-                  (recur (rest remaining)
-                         (conj names nm)
-                         (conj fields {:name nm
-                                       :type (analyze-ffi-layout-type (nth fp 1))})))))))))))
+              (let [fp (vec (form-vec-items field))]
+                (when-not (= 2 (count fp))
+                  (throw (str "jolt.ffi " kind " field must be [keyword type], got "
+                              (pr-str field))))
+                (let [field-name (nth fp 0)]
+                  (when-not (and (form-keyword? field-name)
+                                 (nil? (namespace field-name)))
+                    (throw (str "jolt.ffi " kind " field name must be an unqualified keyword, got "
+                                (pr-str field-name))))
+                  (let [nm (name field-name)]
+                    (when (contains? names nm)
+                      (throw (str "jolt.ffi " kind " field names must be unique; duplicate :" nm)))
+                    (recur (rest remaining)
+                           (conj names nm)
+                           (conj fields {:name nm
+                                         :type (analyze-ffi-layout-type (nth fp 1))}))))))))))))
+
+(defn- analyze-ffi-layout-array [form]
+  (let [parts (vec (form-vec-items form))]
+    (when-not (= 3 (count parts))
+      (throw (str "jolt.ffi array descriptor must be [:array element-type positive-count], got "
+                  (pr-str form))))
+    (let [count (nth parts 2)]
+      (when-not (and (integer? count) (pos? count))
+        (throw (str "jolt.ffi array count must be a positive integer literal, got "
+                    (pr-str count))))
+      {:ffi-kind :array
+       :count count
+       :type (analyze-ffi-layout-type (nth parts 1))})))
 
 (defn- analyze-ffi-layout-type [form]
   (cond
     (form-keyword? form)
     (let [n (name form)]
       (when-not (and (nil? (namespace form)) (contains? ffi-layout-scalars n))
-        (throw (str "jolt.ffi struct field type must be a fixed-size scalar or nested struct; got "
+        (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct or union, or fixed array; got "
                     (pr-str form))))
       n)
 
-    (form-vec? form) (analyze-ffi-layout-struct form)
+    (form-vec? form)
+    (case (ffi-layout-form-kind form)
+      "struct" (analyze-ffi-layout-aggregate form)
+      "union" (analyze-ffi-layout-aggregate form)
+      "array" (analyze-ffi-layout-array form)
+      (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct or union, or fixed array; got "
+                  (pr-str form))))
 
     :else
-    (throw (str "jolt.ffi struct field type must be a fixed-size scalar or nested struct; got "
+    (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct or union, or fixed array; got "
                 (pr-str form)))))
 
 (defn- analyze-ffi-layout [items]
   (when-not (= 2 (count items))
-    (throw "jolt.ffi/layout expects one literal struct descriptor"))
-  {:op :ffi-layout :layout (analyze-ffi-layout-struct (nth items 1))})
+    (throw "jolt.ffi/layout expects one literal struct or union descriptor"))
+  {:op :ffi-layout :layout (analyze-ffi-layout-aggregate (nth items 1))})
 
 (defn- ffi-by-value-form? [form]
   (when (form-vec? form)
@@ -976,13 +1140,32 @@
            (nil? (namespace (nth parts 0)))
            (= "by-value" (name (nth parts 0)))))))
 
+;; A union has no by-value ABI a caller can rely on: which member is live is the
+;; program's knowledge, not the type's, and the register classification of the
+;; bytes differs by which one it is. babashka.ffi refuses it in a signature for
+;; the same reason. So a union reaches C as a :pointer, alone or as a member of
+;; a struct that would otherwise travel by value.
+(defn- ffi-layout-holds-union? [type]
+  (cond
+    (string? type) false
+    (= :union (:ffi-kind type)) true
+    (= :struct (:ffi-kind type))
+      (boolean (some (fn [f] (ffi-layout-holds-union? (:type f))) (:fields type)))
+    (= :array (:ffi-kind type)) (ffi-layout-holds-union? (:type type))
+    :else false))
+
 (defn- analyze-ffi-signature-type [form position]
   (cond
     (form-keyword? form) (name form)
     (ffi-by-value-form? form)
-      (let [parts (vec (form-vec-items form))]
+      (let [parts (vec (form-vec-items form))
+            analyzed (analyze-ffi-layout-aggregate (nth parts 1))]
+        (when (ffi-layout-holds-union? analyzed)
+          (throw (str "jolt.ffi " position
+                      " type: a union is not passed by value, alone or inside a struct"
+                      " — declare :pointer and read the member you know applies")))
         {:ffi-kind :by-value
-         :type (analyze-ffi-layout-struct (nth parts 1))})
+         :type analyzed})
     :else
       (throw (str "jolt.ffi " position
                   " type must be a keyword or [:by-value [:struct ...]], got "
@@ -990,22 +1173,72 @@
 
 ;; jolt.ffi/__cfn: the low-level foreign-function form a jolt library
 ;; uses (via the jolt.ffi/foreign-fn macro) to bind native code. Shape:
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)            ; non-blocking
-;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)  ; may block
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)             ; non-blocking
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype :blocking)   ; may block
+;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype {opts})      ; options map
 ;; The C symbol is a string literal and the types are literal keywords, read here
 ;; at compile time; the Chez back end lowers it to a real `foreign-procedure`
 ;; (typed marshaling, no runtime eval). A :blocking call is emitted __collect_safe
 ;; so it deactivates the thread for the call — a blocking call (accept/recv/...)
 ;; must not pin the stop-the-world collector. A leaf IR node.
+;;
+;; Normalize the optional form to the two literal Boolean flags understood by
+;; the back end. Direct __cfn calls and the public macros share this fail-closed
+;; validation: keys must be unqualified keywords, values literal Booleans, and
+;; unknown keys are rejected rather than ignored.
+(defn- ffi-option
+  ([]
+   {:blocking false :capture-native-error false})
+  ([opt]
+   (cond
+     (and (form-keyword? opt)
+          (nil? (namespace opt))
+          (= "blocking" (name opt)))
+     {:blocking true :capture-native-error false}
+
+     (form-map? opt)
+     (reduce
+       (fn [res pr]
+         (let [k (nth pr 0) v (nth pr 1)]
+           (when-not (and (form-keyword? k) (nil? (namespace k)))
+             (throw (str "jolt.ffi: option key must be an unqualified keyword, got: " k)))
+           (let [kn (name k)]
+             (when-not (or (= kn "blocking") (= kn "capture-native-error"))
+               (throw (str "jolt.ffi: unknown option :" kn)))
+             (when-not (or (true? v) (false? v))
+               (throw (str "jolt.ffi: option :" kn
+                           " must be a literal Boolean, got: " v)))
+             (assoc res
+                    (if (= kn "blocking") :blocking :capture-native-error)
+                    v))))
+       {:blocking false :capture-native-error false}
+       (form-map-pairs opt))
+
+     :else
+     (throw (str "jolt.ffi: option must be :blocking or an options map, got: " opt)))))
+
 (defn- analyze-ffi-fn [ctx items env]
   (when-not (<= 4 (count items) 5)
-    (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking])")))
-  {:op :ffi-fn
-   :csym (nth items 1)
-   :argtypes (mapv #(analyze-ffi-signature-type % "argument")
-                   (form-vec-items (nth items 2)))
-   :rettype (analyze-ffi-signature-type (nth items 3) "return")
-   :blocking (and (= 5 (count items)) (= "blocking" (name (nth items 4))))})
+    (throw (str "jolt.ffi/foreign-fn expects "
+                "(foreign-fn \"sym\" [argtypes] rettype [:blocking | {opts}])")))
+  (let [rettype (analyze-ffi-signature-type (nth items 3) "return")
+        opt (if (= 5 (count items))
+              (ffi-option (nth items 4))
+              (ffi-option))
+        blocking (:blocking opt)
+        capture (:capture-native-error opt)]
+    (when (and capture (= rettype "void"))
+      (throw (str "jolt.ffi: :capture-native-error is not supported for :void "
+                  "(no stable native result to pair with the error code)")))
+    (when (and capture (map? rettype))
+      (throw "jolt.ffi: :capture-native-error is not supported for by-value returns"))
+    {:op :ffi-fn
+     :csym (nth items 1)
+     :argtypes (mapv #(analyze-ffi-signature-type % "argument")
+                     (form-vec-items (nth items 2)))
+     :rettype rettype
+     :blocking blocking
+     :capture-native-error capture}))
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
 ;; macro) — the inverse of __cfn. It wraps a jolt fn as a C-callable function
@@ -1013,13 +1246,13 @@
 ;; Shape:
 ;;   (jolt.ffi/__ccallable f [:argtype ...] :rettype)                ; thread stays active
 ;;   (jolt.ffi/__ccallable f [:argtype ...] :rettype :collect-safe)  ; may be invoked
-;;                                                                   ; while the thread is
-;;                                                                   ; parked in a :blocking call
+;;                                                                   ; on a thread that is
+;;                                                                   ; not active at the time
 ;; Unlike __cfn, the fn is a CHILD expression (analyzed + walked by the passes);
 ;; the types are literal keywords read at compile time. The Chez back end lowers
 ;; it to a locked `foreign-callable` and returns its entry-point address (a jolt
-;; pointer). :collect-safe is required when C invokes the callback from a thread
-;; that is deactivated inside a :blocking foreign call (e.g. a GTK main loop).
+;; pointer). :collect-safe is required when the callback can arrive on a thread
+;; that is not ACTIVE: one the runtime never started, or one in a :blocking call.
 (defn- analyze-ffi-callable [ctx items env]
   (when-not (<= 4 (count items) 5)
     (throw (str "jolt.ffi/foreign-callable expects (foreign-callable f [argtypes] rettype [:collect-safe])")))
@@ -1268,7 +1501,15 @@
     (cond (= hname "double") {:kind :double :cast-fn "jolt-double"}
           (= hname "long")   {:kind :long   :cast-fn "jolt-long-cast"}
           (= hname "int")    {:kind :long   :cast-fn "jolt-int-cast"}
-          (= hname "float")  {:kind :double :cast-fn "jolt-float"})))
+          (= hname "float")  {:kind :double :cast-fn "jolt-float"}
+          ;; the unchecked casts are casts too: a primitive long/int on the JVM,
+          ;; so the result feeds the :long lattice the same way. Their wrap
+          ;; result can be a bignum past the 61-bit fixnum, which is the case
+          ;; every :long consumer already guards (the jolt-l* fixnum? tests) —
+          ;; the same reason a ^long param is admitted. Before this they were
+          ;; ordinary var calls and left every loop counter they fed untyped.
+          (= hname "unchecked-long") {:kind :long :cast-fn "jolt-unchecked-long"}
+          (= hname "unchecked-int")  {:kind :long :cast-fn "jolt-unchecked-int"})))
 
 (defn- analyze-list* [ctx form env]
   (let [items (vec (form-elements form))]
@@ -1345,7 +1586,7 @@
                   p (form-position form)]
               (if (and p (= :def (:op node))) (stamp-def-pos ctx env node p) node))
           (and hname (not shadowed) (method-head? hname))
-            (analyze-host-call ctx hname items env)
+            (stamp-pos (analyze-host-call ctx hname items env) form)
           ;; (Class. args*) — trailing-dot constructor sugar.
           (and hname (not shadowed) (ctor-head? hname))
             (analyze-ctor ctx (subs hname 0 (dec (count hname))) (rest items) env)
@@ -1355,10 +1596,10 @@
             (analyze-ctor ctx (form-sym-name (nth items 1)) (drop 2 items) env)
           ;; (. target member arg*) — the `.` special form.
           (and (= hname ".") (not shadowed))
-            (analyze-dot ctx items env)
+            (stamp-pos (analyze-dot ctx items env) form)
           ;; (.-field target) — field-access head.
           (and hname (not shadowed) (field-head? hname))
-            (analyze-field ctx hname items env)
+            (stamp-pos (analyze-field ctx hname items env) form)
           (and hname (not shadowed) (form-special? hname))
             (uncompilable (str "special form " hname))
           ;; (ns/Name. args*) — a QUALIFIED trailing-dot constructor (a cross-ns or
@@ -1376,7 +1617,7 @@
           (and (form-sym? head) (form-sym-ns head)
                (let [n (form-sym-name head)]
                  (and (> (count n) 1) (= "." (subs n 0 1)))))
-            (analyze-host-call ctx (form-sym-name head) items env)
+            (stamp-pos (analyze-host-call ctx (form-sym-name head) items env) form)
           ;; (Class/MEMBER) with no arguments carries the same ambiguity that
           ;; (. Class MEMBER) does, and Clojure reads it as a static field when one
           ;; exists: (Math/PI), (Integer/MAX_VALUE) and (Locale/US) all evaluate to
@@ -1468,10 +1709,18 @@
    ;; inside, which is what the single shared atom used to give it on one thread.
    (binding [*positioned-form-box* (or *positioned-form-box* (atom nil))]
      (try
+       ;; ` is a reader macro in Clojure, so a form is already past its backticks
+       ;; by the time anything looks at it. jolt reads one to a marker and lowers
+       ;; it here — up front, over the whole form, so a macro reading its own
+       ;; argument forms and a quoted form see the expansion and not the marker.
+       ;; Costs nothing on a form that has no backtick in it: the walk returns it
+       ;; unchanged and unallocated (jolt-024c).
+       ;;
        ;; Stamp the compile namespace on the TOP-LEVEL node so the back end can
        ;; gate anon-fn naming/registration on it even for a non-def form (a def
        ;; carries its own :ns). Invisible to emission unless read.
-       (assoc (analyze ctx form (empty-env)) :fnsrc-ns (compile-ns ctx))
+       (assoc (analyze ctx (form-syntax-quote-expand ctx form) (empty-env))
+              :fnsrc-ns (compile-ns ctx))
        (catch Throwable e (throw (as-analysis-diagnostic e))))))
   ([ctx form env]
    (cond
@@ -1515,4 +1764,11 @@
      ;; compiles to the interner call the class symbol itself compiles to.
      (form-class-value? form) (invoke (var-ref "jolt.host" "jolt-class-for")
                                       [(const (form-class-value-name form))])
+     ;; Any other #tag form is one no reader function was found for — the four
+     ;; above are the whole set the compiler builds a leaf for, and a registered
+     ;; data reader is applied before the form reaches here (loader.ss
+     ;; ldr-apply-readers). Name the tag, the way the JVM's reader does; the
+     ;; generic "unsupported form" pointed at nothing to fix.
+     (form-tagged? form) (uncompilable (str "No reader function for tag "
+                                            (form-tag-name form)))
      :else (uncompilable "unsupported form"))))

@@ -71,6 +71,14 @@
 ;; erroring; the scanner only extracts require clauses and discards every
 ;; other form, so the placeholder value is never observed.
 (define rdr-scan-mode (make-parameter #f))
+;; Suppress the :line/:column/:file metadata a list form carries. Set while
+;; reading a form out of a string that is NOT the source being read — the
+;; ~(…) inside a #$ interpolation, whose offsets are into the string literal.
+;; Attaching them would report line 1 of the real file for a throw inside the
+;; interpolated form, and would thrash rdr-line-col-at's per-string cursor back
+;; and forth between the two strings. With no position of its own the form
+;; inherits the enclosing form's, which is the right answer.
+(define rdr-suppress-pos (make-parameter #f))
 
 (define (rdr-skip-ws s i end)
   (let loop ((i i))
@@ -99,6 +107,132 @@
 ;; Numeric tower (JVM parity): integer literals read as exact integers (= Long/
 ;; BigInt, arbitrary precision), a/b ratios as exact rationals (= Ratio), and
 ;; decimal/exponent literals as flonums (= double).
+;; --- digit separators: 1_000_000 (issue #389) --------------------------------
+;; A jolt superset: the JVM reader raises "Invalid number" on every token below,
+;; so nothing that reads today changes meaning. Only a token that ALREADY starts
+;; like a number is affected — a leading underscore is still an ordinary symbol
+;; (_1 reads as the symbol _1 here exactly as on the JVM), because that decision
+;; is made before this runs.
+;;
+;; The rule is Java's, which is the one someone writing 1_000_000 expects: an
+;; underscore must sit BETWEEN TWO DIGITS of the literal. Never at either end,
+;; never against the sign, the 0x / NrDDD radix marker, the decimal point, the
+;; exponent marker, the ratio slash, or the N/M suffix. Being looser would be
+;; easier — strip every underscore and let the parse decide — but that accepts
+;; 0x_FF, 1e_5 and 2r_10, which reads as a second, stranger divergence to
+;; explain. One rule, matching the language jolt models, is cheaper to document
+;; than three special cases.
+;;
+;; "Digit" is per literal kind, so the marker characters are located FIRST and
+;; excluded by position rather than by character class: r IS a digit in base 36
+;; (36rR_Z is legal) and e IS a hex digit (0x1e_5 is legal), so a rule phrased
+;; over characters alone gets both wrong.
+(define (rdr-digit-sep-marker-positions body blen)
+  ;; Positions in BODY that are structural markers, not digits: the x of a 0x
+  ;; prefix, the r of a radix literal, and a trailing N/M suffix. The decimal
+  ;; point, exponent marker, sign and slash are handled by the alphanumeric
+  ;; test itself — none of them is alphanumeric except e/E, which is only a
+  ;; marker when the token has no hex or radix prefix.
+  (let* ((hex? (and (>= blen 2) (char=? (string-ref body 0) #\0)
+                    (let ((c (string-ref body 1)))
+                      (or (char=? c #\x) (char=? c #\X)))))
+         (ri (and (not hex?)
+                  (let loop ((i 0))
+                    (cond ((>= i blen) #f)
+                          ((let ((c (string-ref body i)))
+                             (or (char=? c #\r) (char=? c #\R)))
+                           i)
+                          (else (loop (+ i 1)))))))
+         (acc '()))
+    (when hex? (set! acc (cons 1 acc)))
+    (when (and ri (> ri 0)) (set! acc (cons ri acc)))
+    ;; A trailing N (bigint) or M (bigdecimal) is a suffix, not a digit.
+    (when (> blen 0)
+      (let ((c (string-ref body (- blen 1))))
+        (when (or (char=? c #\N) (char=? c #\M))
+          (set! acc (cons (- blen 1) acc)))))
+    ;; e/E is the exponent marker only in a plain decimal literal; in hex and in
+    ;; base>14 radix literals it is a digit.
+    (when (and (not hex?) (not ri))
+      (let loop ((i 0))
+        (when (< i blen)
+          (let ((c (string-ref body i)))
+            (when (or (char=? c #\e) (char=? c #\E)) (set! acc (cons i acc))))
+          (loop (+ i 1)))))
+    acc))
+
+(define (rdr-digit-sep-alnum? c)
+  (or (and (char>=? c #\0) (char<=? c #\9))
+      (and (char>=? c #\a) (char<=? c #\z))
+      (and (char>=? c #\A) (char<=? c #\Z))))
+
+;; TOK with its underscores removed, or #f when any of them is misplaced. #f
+;; reaches the caller's "starts like a number but does not parse" arm, which
+;; raises NumberFormatException naming the original token — the same answer the
+;; JVM gives, which is what a misplaced separator deserves.
+(define (rdr-strip-digit-separators tok)
+  (let* ((len (string-length tok))
+         (c0 (string-ref tok 0))
+         (start (if (or (char=? c0 #\+) (char=? c0 #\-)) 1 0))
+         (body (substring tok start len))
+         (blen (string-length body))
+         (markers (rdr-digit-sep-marker-positions body blen)))
+    (let loop ((i 0) (acc '()))
+      (cond
+        ((>= i blen)
+         (string-append (substring tok 0 start)
+                        (list->string (reverse acc))))
+        ((char=? (string-ref body i) #\_)
+         ;; The RUN of underscores starting here must be between two digits —
+         ;; 5_______2 is legal, the same as 5_2 (JLS 3.10.1). So look past the
+         ;; rest of the run for the right-hand neighbour rather than requiring
+         ;; the very next character to be a digit.
+         (let scan ((j i))
+           (cond
+             ((and (< j blen) (char=? (string-ref body j) #\_)) (scan (+ j 1)))
+             (else
+              ;; Both neighbours must exist, be alphanumeric, and not be one of
+              ;; this literal's structural markers.
+              (and (> i 0) (< j blen)
+                   (rdr-digit-sep-alnum? (string-ref body (- i 1)))
+                   (rdr-digit-sep-alnum? (string-ref body j))
+                   (not (memv (- i 1) markers))
+                   (not (memv j markers))
+                   (loop j acc))))))
+        (else (loop (+ i 1) (cons (string-ref body i) acc)))))))
+
+(define (rdr-has-digit-separator? tok)
+  (let ((n (string-length tok)))
+    (let loop ((i 0))
+      (cond ((>= i n) #f)
+            ((char=? (string-ref tok i) #\_) #t)
+            (else (loop (+ i 1)))))))
+
+;; NOT in EDN. edn is an interchange format with a published grammar, and its
+;; integers are [+-]?(0|[1-9][0-9]*)N? — no separators. jolt's PRINTER never
+;; emits one (numbers print canonically), so jolt-written edn stays portable
+;; either way; what accepting them would add is the other direction, a
+;; hand-written deps.edn or config that reads here and fails in tools.deps or
+;; any other edn reader. That is the trap edn strict mode already exists to
+;; prevent — it is why #(), #= and auto-resolved keywords are refused too — so
+;; a separator is refused with it, and the divergence stays confined to source
+;; jolt reads for itself.
+;; The separator retry, for a token that ALREADY failed to parse and already
+;; looks like a number. It is deliberately NOT part of rdr-try-number: that runs
+;; on every token in every source file, and a symbol fails the ordinary parse
+;; too, so hanging the retry off failure alone made every symbol in the file pay
+;; a parameter read and a scan of its own name to discover it is not a number.
+;; Measured on a 2593-line file: 7.06 ms/read became 7.22.
+;;
+;; rdr-token->value already knows which failures are numeric-looking, so the
+;; retry sits in that arm — on the path whose only other outcome is raising
+;; "Invalid number". Nothing that reads today reaches it.
+(define (rdr-try-separated-number tok)
+  (and (not (rdr-edn-mode))
+       (rdr-has-digit-separator? tok)
+       (let ((stripped (rdr-strip-digit-separators tok)))
+         (and stripped (rdr-try-number-raw stripped)))))
+
 (define (rdr-try-number tok)
   (rdr-try-number-raw tok))
 
@@ -344,9 +478,13 @@
       (n n)
       ;; a token that starts like a number but doesn't parse as one is an
       ;; invalid number (1a, 08, 0x2g, 2r2), never a symbol — like the JVM.
+      ;; Except that a digit separator (1_000_000) lands here too, so the
+      ;; retry goes in front of the raise: this is the only arm it can help,
+      ;; and putting it anywhere earlier taxes tokens that can never benefit.
       ((rdr-numeric-lead? tok)
-       (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
-                                        (string-append "Invalid number: " tok))))
+       (or (rdr-try-separated-number tok)
+           (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
+                                            (string-append "Invalid number: " tok)))))
       ((string=? tok "nil") jolt-nil)
       ((string=? tok "true") #t)
       ((string=? tok "false") #f)
@@ -724,7 +862,13 @@
 ;; #a.b.C[..] -> (a.b/->C  (datafy val)...).  The factory call compiles like any
 ;; invoke; defrecord interns map->C/->C in the type's ns.
 (define (rdr-record-ctor-form tok form)
-  (let* ((di (rdr-string-rindex-char tok #\.))
+  ;; The JVM's reader resolves the CLASS the literal names, and the JVM spelling
+  ;; of a type in a dashed namespace is munged (#my_app.core.Foo{…} — what the
+  ;; JVM printed it as). The class graph maps that back to the registered name,
+  ;; whose namespace holds the factory; a name it does not know (the type's ns
+  ;; not loaded yet) is taken as written, as before.
+  (let* ((tok (or (jch-registered-name tok) tok))
+         (di (rdr-string-rindex-char tok #\.))
          (ns (substring tok 0 di))
          (simple (substring tok (+ di 1) (string-length tok))))
     (cond
@@ -761,22 +905,69 @@
         ((null? (cdr es)) es)
         (else (cons (rdr-nsmap-key mapns (car es))
                     (cons (cadr es) (rdr-nsmap-kvs mapns (cddr es)))))))
+(define (rdr-simple-symbol-token? tok)
+  (guard (e (#t #f))
+    (let ((v (rdr-token->value tok)))
+      (and (symbol-t? v) (not (symbol-t-ns v))))))
 (define (rdr-read-ns-map s i end)        ; i points just past "#:"
   (let* ((auto? (and (< i end) (char=? (string-ref s i) #\:)))
-         (i2 (if auto? (+ i 1) i)))
-    (let loop ((j i2))
-      (cond
-        ((>= j end) (rdr-error s j "EOF in namespaced map literal"))
-        ((char=? (string-ref s j) #\{)
-         (let* ((nstok (substring s i2 j))
-                (mapns (if auto?
-                           (if (string=? nstok "") (chez-current-ns)
-                               (let ((a (chez-resolve-alias (chez-current-ns) nstok)))
-                                 (if a a (rdr-invalid-token (string-append "::" nstok)))))
-                           nstok)))
-           (let-values (((es k) (rdr-read-seq s (+ j 1) end #\})))
-             (values (rdr-make-map (rdr-nsmap-kvs mapns es)) k))))
-        (else (loop (+ j 1)))))))
+         (i2 (if auto? (+ i 1) i))
+         ;; Reader whitespace (a comma included) directly after the prefix means
+         ;; no namespace token was written at all. Only `#::` may still reach a
+         ;; map from there, naming the current namespace.
+         (spaced? (and (< i2 end) (rdr-ws? (string-ref s i2)))))
+    ;; The namespace is a token, not every byte up to the opening brace.
+    ;; Whitespace may separate that token from the map; anything else at the
+    ;; boundary is an error rather than part of the namespace or a non-map
+    ;; payload borrowing a later opening brace.
+    (let-values (((nstok j) (rdr-read-token s i2 end)))
+      (when (and spaced? (not auto?))
+        (rdr-error s i2 "Namespaced map must specify a namespace"))
+      (let skip-boundary ((k j))
+        (cond
+          ((and (< k end) (rdr-ws? (string-ref s k)))
+           (skip-boundary (+ k 1)))
+          ((or (>= k end) (not (char=? (string-ref s k) #\{)))
+           ;; A comment is a reader macro rather than whitespace at this exact
+           ;; boundary on the JVM, so do not use rdr-skip-ws (which skips it).
+           ;; A missing map is also reported BEFORE the namespace token is
+           ;; judged, which is the order the JVM reports these two in.
+           (rdr-error s k (if spaced?
+                              "Namespaced map must specify a namespace"
+                              "Namespaced map must specify a map")))
+          (else
+           ;; Both prefix forms require a simple, unqualified symbol here; only
+           ;; the auto form may leave the token out, naming the current ns.
+           ;; The JVM renders the offending namespace the way Java prints the
+           ;; object it read, so an absent one reads as "null" there and as
+           ;; "nil" here. Reading a TOKEN rather than a whole form is what
+           ;; makes a non-map payload fail closed, and it is why the two
+           ;; cannot agree on every degenerate spelling (`#:"s"{}` names the
+           ;; string on the JVM and no token at all here) — so report the
+           ;; value jolt actually has rather than imitate Java's printer.
+           (when (if (string=? nstok "")
+                     (not auto?)
+                     (not (rdr-simple-symbol-token? nstok)))
+             (rdr-error s i2 (string-append "Namespaced map must specify a valid namespace: "
+                                            (if (string=? nstok "") "nil" nstok))))
+           (let ((mapns (if auto?
+                            (if (string=? nstok "") (chez-current-ns)
+                                (let ((a (chez-resolve-alias (chez-current-ns) nstok)))
+                                  (cond (a a)
+                                        ;; The build's require/class-provider scans
+                                        ;; read every top-level form before the ns
+                                        ;; declaration has installed its aliases.
+                                        ;; Preserve the alias spelling just as the
+                                        ;; ::alias/keyword reader does below; scan
+                                        ;; mode discards the value after extracting
+                                        ;; dependency names.
+                                        ((rdr-scan-mode) nstok)
+                                        (else
+                                         (rdr-error s i2 (string-append
+                                                          "Unknown auto-resolved namespace alias: " nstok))))))
+                            nstok)))
+             (let-values (((es next) (rdr-read-seq s (+ k 1) end #\})))
+               (values (rdr-make-map (rdr-nsmap-kvs mapns es)) next)))))))))
 
 ;; *read-eval* gate for #= — the cell is captured lazily (the var is def'd
 ;; after this file loads) and the value read per use, so a
@@ -787,6 +978,169 @@
     (set! rdr-read-eval-cell (jolt-var "clojure.core" "*read-eval*")))
   (let ((v (jolt-var-get rdr-read-eval-cell)))
     (and v (not (jolt-nil? v)))))
+
+;; --- user reader macros -----------------------------------------------------
+;; Clojure's dispatch table is closed: after a `#`, the reader claims a fixed set
+;; of characters, a letter starts a data-reader tag, and everything else is a read
+;; error ("No dispatch macro for: $"). jolt owns its reader, so the punctuation
+;; half of that table is open here — a program registers a reader for one
+;; character and `#<c>` from then on reads through it. It is the seam the two
+;; things Clojure never shipped both need: string interpolation (`#$"…"` below)
+;; and user-defined reader macros. See stdlib/jolt/reader.clj.
+;;
+;; Two tiers, the same shape as jolt.host/extend-class!:
+;;   form tier  (fn [form]) -> form         the next form is read normally and the
+;;                                          registered fn rewrites it
+;;   raw  tier  (fn [src i]) -> [form j]    the fn reads the SOURCE itself, from
+;;                                          index i, and says where it stopped
+;; The raw tier is for a literal whose body is not Clojure data (a raw string, a
+;; heredoc); the form tier covers everything else. Either way a registration is
+;; a runtime call and jolt reads a file one top-level form at a time, so a file
+;; can register a macro and use it below — and `jolt build` loads the app from
+;; source before it scans it, so a build reads what a run reads.
+;;
+;; A character the reader itself claims can never be registered, and neither can
+;; a letter or a digit — those begin a data-reader tag, so a `#s` reader would
+;; silently swallow every `#some/tag`. Registration throws on both rather than
+;; shadowing.
+;;
+;; The table is an immutable alist swapped whole under a mutex. Reads happen on
+;; every `#` in every file jolt reads and take no lock: a reader sees either the
+;; old list or the new one, where a Chez hashtable read while another thread
+;; writes it faults in the collector.
+(define rdr-dispatch-mu (make-mutex))
+(define rdr-dispatch-macros '())        ; ((char raw? . fn) …) — swapped, never mutated
+
+(define (rdr-dispatch-macro-ref c)
+  (let ((tbl rdr-dispatch-macros))      ; one read of the pointer, then work off it
+    (and (pair? tbl) (assv c tbl))))
+
+;; the characters rdr-read-dispatch handles itself, above the registry clause
+(define rdr-dispatch-builtins '(#\{ #\( #\" #\_ #\! #\' #\^ #\# #\= #\? #\:))
+(define (rdr-dispatch-char-ok? c)
+  (and (char? c)
+       (not (memv c rdr-dispatch-builtins))
+       (not (char-alphabetic? c))       ; a data-reader tag's first character
+       (not (char-numeric? c))
+       (not (rdr-ws? c))                ; whitespace and the comma the reader skips
+       (not (memv c '(#\; #\\ #\) #\] #\}))))) ; comment, char literal, closers
+
+(define (rdr-dispatch-reject c why)
+  (jolt-throw (jolt-ex-info (string-append "cannot register a reader macro on #"
+                                           (if (char? c) (string c) (jolt-pr-str c))
+                                           ": " why)
+                            (jolt-hash-map (keyword #f "char") c))))
+
+(define (rdr-set-dispatch-macro! c fn raw?)
+  (unless (char? c) (rdr-dispatch-reject c "not a character"))
+  (when (memv c rdr-dispatch-builtins) (rdr-dispatch-reject c "the reader claims it"))
+  (unless (rdr-dispatch-char-ok? c)
+    (rdr-dispatch-reject c "only punctuation can carry one (a letter or digit starts a #tag)"))
+  (unless (procedure? fn)
+    (jolt-throw (jolt-ex-info "a reader macro must be a function" (jolt-hash-map))))
+  (jolt-with-mutex rdr-dispatch-mu
+    (set! rdr-dispatch-macros
+          (cons (cons c (cons (and (jolt-truthy? raw?) #t) fn))
+                (filter (lambda (e) (not (eqv? (car e) c))) rdr-dispatch-macros))))
+  jolt-nil)
+
+(define (rdr-remove-dispatch-macro! c)
+  (jolt-with-mutex rdr-dispatch-mu
+    (set! rdr-dispatch-macros (filter (lambda (e) (not (eqv? (car e) c))) rdr-dispatch-macros)))
+  jolt-nil)
+
+;; {char fn} of what is registered — the tier is not in it: a caller re-registers
+;; with the tier it wants rather than reading one back out.
+(define (rdr-dispatch-macro-map)
+  (let loop ((es rdr-dispatch-macros) (acc '()))
+    (if (null? es)
+        (apply jolt-hash-map acc)
+        (loop (cdr es) (cons (caar es) (cons (cddr (car es)) acc))))))
+
+;; Apply a registered reader macro. i points AT the dispatch character.
+(define (rdr-apply-dispatch-macro entry s i end)
+  (let ((c (car entry)) (raw? (cadr entry)) (fn (cddr entry)))
+    (if raw?
+        (let ((res (jolt-invoke fn s (+ i 1))))
+          (unless (and (pvec? res) (= 2 (vector-length (pvec-v res))))
+            (rdr-error s i (string-append "reader macro #" (string c)
+                                          " must return [form end-index]")))
+          (let ((j (vector-ref (pvec-v res) 1)))
+            ;; the index has to move forward and stay inside the input, or the
+            ;; read loop above either spins on the same character forever or
+            ;; indexes past the end of the string.
+            (unless (and (integer? j) (exact? j) (>= j (+ i 1)) (<= j end))
+              (rdr-error s i (string-append "reader macro #" (string c)
+                                            " returned an out-of-range end-index: "
+                                            (jolt-pr-str j))))
+            (values (vector-ref (pvec-v res) 0) j)))
+        (let-values (((form j) (rdr-read-form s (+ i 1) end)))
+          (when (rdr-eof? form)
+            (rdr-error s i (string-append "EOF after #" (string c))))
+          (values (jolt-invoke fn form) j)))))
+
+;; --- #$"…" — string interpolation -------------------------------------------
+;; clojure.core.strint's ~{form} / ~(form) markers, applied to a string LITERAL
+;; at read time:
+;;
+;;   #$"a ~{x} b ~(inc x)"  ->  (clojure.core/str "a " x " b " (inc x))
+;;
+;; A string with no marker reads as itself, so #$"plain" IS "plain" and costs
+;; nothing at runtime. A `~` that is not followed by `{` or `(` is literal, as in
+;; strint; a literal `~{` is written `~{"~{"}`.
+;;
+;; This is registered through the table above rather than wired into
+;; rdr-read-dispatch directly, so (jolt.reader/dispatch-macros) lists it and
+;; jolt.reader/remove-dispatch-macro! takes it back off like any other.
+(define (rdr-interp-error msg str)
+  (jolt-throw (jolt-ex-info (string-append msg ": " (jolt-pr-str str)) (jolt-hash-map))))
+
+(define (rdr-interp-parts str)
+  (let ((n (string-length str)))
+    (let loop ((i 0) (lit '()) (parts '()))
+      (let ((flush (lambda (ps) (if (null? lit) ps (cons (list->string (reverse lit)) ps)))))
+        (cond
+          ((>= i n) (reverse (flush parts)))
+          ((and (char=? (string-ref str i) #\~) (< (+ i 1) n)
+                (memv (string-ref str (+ i 1)) '(#\{ #\()))
+           (let ((brace? (char=? (string-ref str (+ i 1)) #\{)))
+             ;; ~{x} delimits the form with the brace; ~(f x) IS the form, so the
+             ;; read starts on the paren and consumes its own closer.
+             (let-values (((form j) (parameterize ((rdr-suppress-pos #t))
+                                      (rdr-read-form str (if brace? (+ i 2) (+ i 1)) n))))
+               (when (rdr-eof? form)
+                 (rdr-interp-error "EOF in an interpolated form" str))
+               (let ((k (if brace?
+                            (let ((k (rdr-skip-ws str j n)))
+                              (unless (and (< k n) (char=? (string-ref str k) #\}))
+                                (rdr-interp-error "unterminated ~{…} in an interpolated string" str))
+                              (+ k 1))
+                            j)))
+                 (loop k '() (cons form (flush parts)))))))
+          (else (loop (+ i 1) (cons (string-ref str i) lit) parts)))))))
+
+(define (rdr-interp-check! str)
+  (unless (string? str)
+    (jolt-throw (jolt-ex-info (string-append "string interpolation reads a string literal, got "
+                                             (jolt-pr-str str))
+                              (jolt-hash-map)))))
+
+;; the literal-and-form parts, in source order — what clojure.core.strint's <<
+;; splices into its own (str …) so the macro and the reader macro share one
+;; implementation of the ~{} / ~() grammar.
+(define (rdr-interpolate-parts str)
+  (rdr-interp-check! str)
+  (apply jolt-vector (rdr-interp-parts str)))
+
+(define (rdr-interpolate str)
+  (rdr-interp-check! str)
+  (let ((parts (rdr-interp-parts str)))
+    (cond
+      ((null? parts) "")
+      ((and (null? (cdr parts)) (string? (car parts))) (car parts))
+      (else (apply jolt-list (jolt-symbol "clojure.core" "str") parts)))))
+
+(rdr-set-dispatch-macro! #\$ rdr-interpolate #f)
 
 (define (rdr-read-dispatch s i end)      ; i points just past the '#'
   (when (>= i end) (rdr-error s i "EOF after #"))
@@ -851,6 +1205,11 @@
        (rdr-read-reader-cond s (+ i 1) end))
       ((char=? c #\:)                    ; #:ns{...} namespaced map literal
        (rdr-read-ns-map s (+ i 1) end))
+      ;; a registered reader macro (see the table above). EDN has a closed
+      ;; grammar and no user extension point, so clojure.edn never consults it —
+      ;; a #$ there stays the unreadable tag it already was.
+      ((and (not (rdr-edn-mode)) (rdr-dispatch-macro-ref c))
+       => (lambda (entry) (rdr-apply-dispatch-macro entry s i end)))
       (else                              ; #tag form -> tagged {:tag :#tag :form ...}
        (let-values (((tok j) (rdr-read-token s i end)))
          (let-values (((form k) (rdr-read-form s j end)))
@@ -916,9 +1275,14 @@
         (values rdr-eof i)
         (let ((c (string-ref s i)))
           (cond
-            ((char=? c #\() (let-values (((line col) (rdr-line-col-at s i)))
-                              (let-values (((es j) (rdr-read-seq s (+ i 1) end #\))))
-                                (values (rdr-attach-pos (apply jolt-list es) line col) j))))
+            ((char=? c #\()
+             (let-values (((es j) (rdr-read-seq s (+ i 1) end #\))))
+               (let ((lst (apply jolt-list es)))
+                 (values (if (rdr-suppress-pos)
+                             lst
+                             (let-values (((line col) (rdr-line-col-at s i)))
+                               (rdr-attach-pos lst line col)))
+                         j))))
             ((char=? c #\[) (let-values (((es j) (rdr-read-seq s (+ i 1) end #\])))
                               (values (apply jolt-vector es) j)))
             ((char=? c #\{) (let-values (((es j) (rdr-read-seq s (+ i 1) end #\})))
@@ -1189,9 +1553,10 @@
           ((var-cell-lookup cns nm)                              ; the ns's own var
            => (lambda (cell) (or (jsq-class-symbol cell) (jolt-symbol cns nm))))
           ((chez-resolve-refer cns nm)                             ; a :refer'd name
-           => (lambda (target)
-                (let ((cell (var-cell-lookup target nm)))
-                  (or (jsq-class-symbol cell) (jolt-symbol target nm)))))
+           => (lambda (ref)
+                (let ((cell (var-cell-lookup (car ref) (cdr ref))))
+                  (or (jsq-class-symbol cell)
+                      (jolt-symbol (car ref) (cdr ref))))))
           ((and (not (chez-core-excluded? cns nm))                 ; else clojure.core,
                 (not (eq? (hashtable-ref ns-refer-table (cons cns nm) #f) 'unmapped))
                 (var-cell-lookup "clojure.core" nm))               ; unless excluded/unmapped
@@ -1482,6 +1847,16 @@
   (let ((r (rdr-parse-at s i)))
     (if r (jolt-vector (car r) (cdr r)) jolt-nil)))
 
+
+;; --- the reader-extension seam (stdlib/jolt/reader.clj wraps these) ----------
+;; raw? picks the tier: #f hands the fn the next FORM, #t hands it the source
+;; string and the index just past the dispatch character.
+(def-var! "jolt.host" "set-dispatch-macro!" rdr-set-dispatch-macro!)
+(def-var! "jolt.host" "remove-dispatch-macro!" rdr-remove-dispatch-macro!)
+(def-var! "jolt.host" "dispatch-macros" rdr-dispatch-macro-map)
+;; the ~{}/~() split behind #$, so clojure.core.strint's << expands through
+;; exactly the same grammar instead of a second copy of it.
+(def-var! "jolt.host" "interpolate-parts" rdr-interpolate-parts)
 (def-var! "clojure.core" "read-string" jolt-read-string)
 (def-var! "clojure.core" "__parse-next" jolt-parse-next)
 (def-var! "clojure.core" "__parse-next-from" jolt-parse-next-from)

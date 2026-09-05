@@ -17,6 +17,7 @@ block-sigint
 build-binary
 build-library
 bytes-allocated
+call-cc
 call-on-main-thread
 call-on-main-thread-async
 callable-host?
@@ -37,9 +38,12 @@ deftype-ctor-class
 delete-file!
 delete-tree!
 directory?
+dispatch-macros
 enable-trace!
 entry-at
+escape-fn?
 exact?
+extend-class!
 extension-epoch
 extension-has?
 extension-value
@@ -92,6 +96,9 @@ form-sym-meta
 form-sym-name
 form-sym-ns
 form-sym?
+form-tag-name
+form-tagged?
+form-syntax-quote-expand
 form-syntax-quote-lower
 form-uuid-source
 form-uuid-value-source
@@ -129,6 +136,7 @@ image-write!
 inference-enabled?
 inline-enabled?
 inline-ir
+interpolate-parts
 interrupt!
 interrupted?
 java-hashcode
@@ -144,6 +152,7 @@ machine-type
 make-interrupt
 make-thread-local
 map-entry
+mark-spliced!
 maximum-memory-bytes
 mkdirs!
 monitor-enter
@@ -165,11 +174,14 @@ ref-get
 ref-put!
 refine-extension!
 regex-compiled?
+register-class-provider!
 register-class-supers!
 register-extension!
 register-extension-point!
 register-source!
+remove-dispatch-macro!
 rename-file!
+replace-builtin-ns!
 resolvable-names
 resolve-class-hint
 resolve-global
@@ -179,6 +191,9 @@ run-main-pump
 scheme-eval-string
 scheme-proc
 scheme-version
+seed-callable?
+set-default-zone-provider!
+set-dispatch-macro!
 set-field!
 set-instant-ctor!
 set-source-roots!
@@ -201,5 +216,6 @@ type-satisfies?
 tz-backend
 tz-offset-seconds
 unchecked-math?
+var-redefined?
 wall-nanos
 with-monitor

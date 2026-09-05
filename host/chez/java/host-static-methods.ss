@@ -97,22 +97,33 @@
 ;; A thread handle (from currentThread) captures this box, so .interrupt from
 ;; another thread sets the target thread's flag.
 ;;
-;; The cell carries the owning thread's id, because a Chez thread parameter is
-;; INHERITED: a forked thread starts with the creating thread's value. A plain
-;; (make-thread-parameter #f) therefore handed a child its PARENT's box — so
-;; interrupting the child set the parent's flag, and the monitor-ownership check in
-;; concurrency.ss saw a child as holding a lock the parent had taken. Comparing the
-;; stored id against (get-thread-id) makes an inherited cell miss, so the child
-;; allocates its own box on first use; no global table, so no per-thread leak.
-(define thread-interrupt-cell (make-thread-parameter #f))   ; (thread-id . box)
+;; A VIRTUAL REGISTER and not a thread parameter, and the reason is the bug this
+;; used to carry a workaround for: a Chez thread parameter is INHERITED, so a
+;; forked thread started out holding its PARENT's box and interrupting the child
+;; set the parent's flag. That was patched by storing (thread-id . box) and
+;; comparing the id on every read. A vreg has the property directly — a freshly
+;; forked thread starts every slot at fixnum 0 — so the id compare, the pair, and
+;; the (get-thread-id) call all go away, and what is left is one register read.
+;; That read is on the hot path: every interruptible wait consults it before
+;; deciding, including the ones that never wait (a deref of a delivered promise),
+;; and so do Thread/interrupted, .isInterrupted, monitor enter/exit and
+;; ReentrantLock's owner check.
+(define jolt-vreg-interrupt-box 9)      ; rt.ss owns the slot map; 0-8 were taken
 (define (current-interrupt-box)
-  (let ((c (thread-interrupt-cell))
-        (id (get-thread-id)))
-    (if (and (pair? c) (eqv? (car c) id))
-        (cdr c)
-        (let ((b (box #f)))
-          (thread-interrupt-cell (cons id b))
-          b))))
+  (let ((b (virtual-register jolt-vreg-interrupt-box)))
+    (if (box? b)
+        b
+        (let ((nb (box #f)))
+          (set-virtual-register! jolt-vreg-interrupt-box nb)
+          nb))))
+;; A thread jolt itself forked already HAS a flag — the box its Thread object hands
+;; .interrupt — so it must not lazily allocate a second one. The child adopts that
+;; box as its own before running the body; without this, .interrupt from outside
+;; and (.isInterrupted (Thread/currentThread)) inside were two unrelated flags and
+;; the ordinary interruption idiom never reached the worker.
+(define (adopt-interrupt-box! b)
+  (set-virtual-register! jolt-vreg-interrupt-box b)
+  b)
 (define (clear-thread-interrupt!) (set-box! (current-interrupt-box) #f))
 
 ;; libc sched_yield, resolved once; fall back to a zero-length park if the symbol
@@ -126,13 +137,40 @@
       (if fp (fp) (sleep (make-time 'time-duration 0 0)))
       jolt-nil)))
 
+;; Thread/sleep, and TimeUnit.sleep through the same door (java/concurrency.ss).
+;;
+;; A THREAD sleeps in an interruptible wait on a private mutex and condition, so
+;; .interrupt throws it out with InterruptedException the way the JVM does. The
+;; pair is fresh and unreachable from anywhere else, so the only wake it can get is
+;; an interrupt; the deadline is what ends the sleep otherwise, read from the clock
+;; by decide rather than signalled (jolt-cv-wait, host/chez/locks.ss).
+;;
+;; A FIBER still sleeps its CARRIER, and that is deliberate rather than an omission.
+;; Thread/sleep is a user-facing request to stop a THREAD, a go block doing it stops
+;; its carrier on the JVM too, and test/chez/fibers-pool-test.ss case 6 asserts
+;; exactly that. jolt.host's jolt-pause-ms is the park-with-a-deadline for runtime
+;; code that must not take its carrier away; this is not that.
+(define (jolt-thread-sleep-ms ms)
+  (let ((ms (exact (floor ms))))
+    (if (jolt-current-fiber)
+        (begin
+          ;; The ALREADY-SET half of the rule, which a bare sleep silently dropped:
+          ;; entering any interruptible op with the flag set throws without waiting,
+          ;; and a fiber reads that flag on its carrier's box like every other wait
+          ;; here. What a fiber cannot get is the other half — Chez's sleep has no
+          ;; wakeup, so an interrupt arriving DURING the nap is not seen until it
+          ;; ends. That is in known-divergences.edn rather than papered over: closing
+          ;; it means parking the fiber with a deadline, and releasing the carrier is
+          ;; the thing fibers-pool-test case 6 deliberately pins the other way.
+          (jolt-interrupt-poll-check! "sleep interrupted")
+          (sleep (make-time 'time-duration (* (remainder ms 1000) 1000000) (quotient ms 1000))))
+        (let ((mu (make-mutex)) (cv (make-condition)))
+          (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (+ (now-millis) ms)
+            (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))))
+    jolt-nil))
+
 (define thread-statics
-  (list (cons "sleep" (lambda (ms . _)
-                        (let* ((ms* (exact (floor (jolt-need-num ms))))
-                               (secs (quotient ms* 1000))
-                               (nanos (* (remainder ms* 1000) 1000000)))
-                          (sleep (make-time 'time-duration nanos secs)))
-                        jolt-nil))
+  (list (cons "sleep" (lambda (ms . _) (jolt-thread-sleep-ms (jolt-need-num ms))))
         (cons "yield" (lambda _ (thread-yield!)))
         (cons "interrupted" (lambda _ (let* ((b (current-interrupt-box)) (v (unbox b)))
                                         (set-box! b #f) (and v #t))))))
@@ -219,6 +257,20 @@
 (register-class-statics! "RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
 (register-class-statics! "clojure.lang.RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
 
+;; clojure.lang.RT/REQUIRE_LOCK — the JVM's `static final Object REQUIRE_LOCK`.
+;; Nothing inside require takes it; it is the AGREED lock a caller holds around a
+;; require so two threads do not load the same namespace at once, and its whole
+;; value is that everyone reaches for the same object. clojure.core/serialized-require
+;; locks it, and so does io.github.frenchy64.fully-satisfies.requiring-resolve —
+;; which typedclojure's runtime requires, and which read the field REFLECTIVELY
+;; ((.getField clojure.lang.RT "REQUIRE_LOCK")) and fell back to locking
+;; #'clojure.core/require when it was absent. A plain (Object.), the same value
+;; the JVM field holds: locking only needs identity, and every jolt value has a
+;; monitor (java/concurrency.ss object-monitor).
+(define rt-require-lock (make-jhost "object" (vector)))
+(register-class-statics! "RT" (list (cons "REQUIRE_LOCK" rt-require-lock)))
+(register-class-statics! "clojure.lang.RT" (list (cons "REQUIRE_LOCK" rt-require-lock)))
+
 ;; clojure.lang.PersistentList/create: a list (in order) from a seq; empty -> ().
 ;; Build it the way clojure.core/list does — list->cseq alone yields plain seq
 ;; cells, and jolt marks the HEAD cell to record that a chain IS a list, so an
@@ -244,8 +296,8 @@
 (register-class-statics! "clojure.lang.PersistentHashSet" (list (cons "createWithCheck" phs-create-with-check)))
 
 ;; java.lang.Character statics. digit(ch, radix) -> the digit value or -1; ch may
-;; be a char or an int codepoint (tools.reader passes (int c)). isDigit/
-;; isWhitespace take a char; valueOf boxes a char (identity on jolt).
+;; be a char or an int codepoint (tools.reader passes (int c)), as it may for
+;; every predicate below; valueOf boxes a char (identity on jolt).
 (define (char->cp x) (if (char? x) (char->integer x) (jnum->exact x)))
 (define (char-digit-value cp radix)
   (let ((d (cond ((and (fx>=? cp 48) (fx<=? cp 57)) (fx- cp 48))            ; 0-9
@@ -253,8 +305,9 @@
                  ((and (fx>=? cp 65) (fx<=? cp 90)) (fx+ 10 (fx- cp 65)))   ; A-Z
                  (else 99))))
     (if (fx<? d radix) d -1)))
-;; Character's isDigit/isWhitespace/isUpperCase/isLowerCase/TYPE are registered
-;; in one block further below; these are the codepoint conversion statics.
+;; Character's getType/isDigit/isWhitespace/isUpperCase/isLowerCase/TYPE and the
+;; category constants are registered in one block further below; these are the
+;; codepoint conversion statics.
 (register-class-statics! "java.lang.Character"
   (list (cons "digit" (lambda (ch radix) (->num (char-digit-value (char->cp ch) (jnum->exact radix)))))
         (cons "toChars" (lambda (cp) (na-char-array (jolt-vector (integer->char (char->cp cp))))))
@@ -271,7 +324,16 @@
 (register-class-statics! "BigInt" identity-num-statics)
 (register-class-statics! "clojure.lang.BigInt" identity-num-statics)
 (register-class-statics! "clojure.lang.Numbers"
-  (list (cons "reduceBigInt" (lambda (x) x)) (cons "toRatio" (lambda (x) x))))
+  (list (cons "reduceBigInt" (lambda (x) x)) (cons "toRatio" (lambda (x) x))
+        (cons "inc" jolt-inc) (cons "dec" jolt-dec)
+        (cons "unchecked_inc" jolt-uncinc) (cons "unchecked_dec" jolt-uncdec)
+        (cons "isZero" jolt-zero?) (cons "isPos" jolt-pos?) (cons "isNeg" jolt-neg?)
+        (cons "add" jolt-add2) (cons "minus" jolt-sub2) (cons "multiply" jolt-mul2)
+        (cons "unchecked_add" jolt-uncadd2) (cons "unchecked_minus" jolt-uncsub2)
+        (cons "unchecked_multiply" jolt-uncmul2) (cons "remainder" jolt-rem)
+        (cons "lt" jolt-lt2) (cons "gt" jolt-gt2)
+        (cons "lte" jolt-le2) (cons "gte" jolt-ge2)
+        (cons "equiv" jolt-num-equiv)))
 
 (define (now-millis)
   (let ((t (current-time 'time-utc)))
@@ -322,7 +384,16 @@
         ;; decide whether to emit ANSI, and a nil means "not a tty".
         (cons "console" (lambda _ jolt-nil))
         (cons "lineSeparator" (lambda _ "\n"))
-        (cons "identityHashCode" (lambda (x) (->num (equal-hash x))))
+        ;; identityHashCode is the object's own hash, not its contents' —
+        ;; equal-hash answers one constant for every procedure and hashes a
+        ;; collection structurally, so two distinct fns (and two equal vectors)
+        ;; came back with the same "identity". jolt-identity-hasheq is the
+        ;; per-object id a weak side table hands out, which is also what
+        ;; (hash f) reports, exactly as on the JVM.
+        ;; nil is the one input with no object to identify, and the JVM answers 0
+        ;; for it rather than hashing the reference.
+        (cons "identityHashCode"
+              (lambda (x) (if (jolt-nil? x) 0 (->num (jolt-identity-hasheq x)))))
         ;; System.arraycopy(src, srcPos, dest, destPos, length). Specified to
         ;; behave as if the source range were copied to a temporary first, so a
         ;; copy that OVERLAPS within one array still reads pre-copy values —
@@ -476,22 +547,68 @@
         (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0)
         (cons "NaN" +nan.0)))
 
-;; Character: ASCII predicates (the engine is byte/ASCII oriented).
+;; Character: the JVM's classification is the Unicode general category, and Chez's
+;; char-general-category IS that property (the same table the JVM reads), so
+;; getType is a rename of its symbol to the JVM's constant, and the predicates are
+;; the JVM's own category rules: isLetter is L*, isDigit is Nd (a vulgar fraction
+;; is numeric but not a digit), isUpperCase/isLowerCase are the Uppercase/Lowercase
+;; properties (Lu/Ll plus Other_Uppercase/Other_Lowercase, which is exactly what
+;; char-upper-case?/char-lower-case? answer: a Roman numeral is upper case, the
+;; feminine ordinal is lower case, a titlecase digraph is neither). They used to be
+;; ASCII ranges, so \é was not a letter and \É was not upper case.
+;;
+;; Every one takes a char or an int codepoint. An int that is not a Unicode scalar
+;; value (negative, a surrogate, above U+10FFFF) is no char on this host, and the
+;; JVM classifies it as nothing: every predicate is false and getType is
+;; UNASSIGNED, except that a surrogate is SURROGATE. A signed high byte reaches
+;; these — cognitect aws-api's request signer classifies each UTF-8 byte of a URI
+;; through isLetterOrDigit — and is negative, so it must not reach integer->char.
+(define (scalar-char x)            ; the char for x, or #f when x is not a scalar value
+  (if (char? x) x
+      (let ((cp (jnum->exact x)))
+        (and (fixnum? cp) (fx>=? cp 0) (fx<=? cp #x10FFFF)
+             (not (and (fx>=? cp #xD800) (fx<=? cp #xDFFF)))
+             (integer->char cp)))))
+(define (char-category-in? x cats)
+  (let ((c (scalar-char x)))
+    (and c (memq (char-general-category c) cats) #t)))
+;; general-category symbol -> java.lang.Character.getType constant. 17 is unused
+;; on the JVM as well; Cs is listed for the record, though no char here carries it.
+(define char-category-types
+  '((Cn . 0) (Lu . 1) (Ll . 2) (Lt . 3) (Lm . 4) (Lo . 5) (Mn . 6) (Me . 7) (Mc . 8)
+    (Nd . 9) (Nl . 10) (No . 11) (Zs . 12) (Zl . 13) (Zp . 14) (Cc . 15) (Cf . 16)
+    (Co . 18) (Cs . 19) (Pd . 20) (Ps . 21) (Pe . 22) (Pc . 23) (Po . 24)
+    (Sm . 25) (Sc . 26) (Sk . 27) (So . 28) (Pi . 29) (Pf . 30)))
+(define (char-type x)
+  (let ((c (scalar-char x)))
+    (if c
+        (cdr (assq (char-general-category c) char-category-types))
+        (let ((cp (jnum->exact x)))   ; not a char: scalar-char answers every char
+          (if (and (fixnum? cp) (fx>=? cp #xD800) (fx<=? cp #xDFFF)) 19 0)))))
 (register-class-statics! "java.lang.Character"
   (list (cons "TYPE" "char")
-        (cons "isUpperCase" (lambda (c) (let ((n (char-code c))) (and (>= n 65) (<= n 90)))))
-        (cons "isLowerCase" (lambda (c) (let ((n (char-code c))) (and (>= n 97) (<= n 122)))))
-        (cons "isDigit" (lambda (c) (let ((n (char-code c))) (and (>= n 48) (<= n 57)))))
-        ;; isLetter / isLetterOrDigit take a char or an int codepoint, so a byte read
-        ;; out of a byte[] reaches them — negative for a high byte, which is not a
-        ;; letter on the JVM either (it is not a valid codepoint). cognitect aws-api's
-        ;; request signer classifies each UTF-8 byte of a URI this way.
-        (cons "isLetter" (lambda (c) (let ((n (char-code c)))
-                                       (or (and (>= n 65) (<= n 90)) (and (>= n 97) (<= n 122))))))
-        (cons "isLetterOrDigit" (lambda (c) (let ((n (char-code c)))
-                                              (or (and (>= n 48) (<= n 57))
-                                                  (and (>= n 65) (<= n 90))
-                                                  (and (>= n 97) (<= n 122))))))
+        (cons "getType" (lambda (c) (->num (char-type c))))
+        (cons "isUpperCase" (lambda (c) (let ((ch (scalar-char c))) (and ch (char-upper-case? ch)))))
+        (cons "isLowerCase" (lambda (c) (let ((ch (scalar-char c))) (and ch (char-lower-case? ch)))))
+        (cons "isDigit" (lambda (c) (char-category-in? c '(Nd))))
+        (cons "isLetter" (lambda (c) (char-category-in? c '(Lu Ll Lt Lm Lo))))
+        (cons "isLetterOrDigit" (lambda (c) (char-category-in? c '(Lu Ll Lt Lm Lo Nd))))
+        ;; The getType constants, in JVM order (17 is skipped there too).
+        (cons "UNASSIGNED" (->num 0)) (cons "UPPERCASE_LETTER" (->num 1))
+        (cons "LOWERCASE_LETTER" (->num 2)) (cons "TITLECASE_LETTER" (->num 3))
+        (cons "MODIFIER_LETTER" (->num 4)) (cons "OTHER_LETTER" (->num 5))
+        (cons "NON_SPACING_MARK" (->num 6)) (cons "ENCLOSING_MARK" (->num 7))
+        (cons "COMBINING_SPACING_MARK" (->num 8)) (cons "DECIMAL_DIGIT_NUMBER" (->num 9))
+        (cons "LETTER_NUMBER" (->num 10)) (cons "OTHER_NUMBER" (->num 11))
+        (cons "SPACE_SEPARATOR" (->num 12)) (cons "LINE_SEPARATOR" (->num 13))
+        (cons "PARAGRAPH_SEPARATOR" (->num 14)) (cons "CONTROL" (->num 15))
+        (cons "FORMAT" (->num 16)) (cons "PRIVATE_USE" (->num 18))
+        (cons "SURROGATE" (->num 19)) (cons "DASH_PUNCTUATION" (->num 20))
+        (cons "START_PUNCTUATION" (->num 21)) (cons "END_PUNCTUATION" (->num 22))
+        (cons "CONNECTOR_PUNCTUATION" (->num 23)) (cons "OTHER_PUNCTUATION" (->num 24))
+        (cons "MATH_SYMBOL" (->num 25)) (cons "CURRENCY_SYMBOL" (->num 26))
+        (cons "MODIFIER_SYMBOL" (->num 27)) (cons "OTHER_SYMBOL" (->num 28))
+        (cons "INITIAL_QUOTE_PUNCTUATION" (->num 29)) (cons "FINAL_QUOTE_PUNCTUATION" (->num 30))
         ;; JVM Character.isWhitespace: Unicode whitespace (so U+2028 line separator
         ;; counts, like the JVM) MINUS the no-break spaces the JVM excludes
         ;; (U+00A0/U+2007/U+202F). char<=?space missed everything above ASCII.
@@ -551,10 +668,36 @@
          (v (jolt-get-dispatch data (keyword #f name) jolt-nil)))
     (if (jolt-nil? v) dflt v)))
 
+;; String.CASE_INSENSITIVE_ORDER: String's one public static field, a Comparator
+;; of String's own (private, nested) class — class-hierarchy.ss maps the tag.
+;; compare is String.compareToIgnoreCase, character for character: each pair is
+;; folded to upper case, then to lower case when that still differs, and the
+;; first pair that differs answers the DIFFERENCE of the folded chars (not a
+;; sign); equal prefixes answer the length difference. So "a" vs "B" is -1, "Z"
+;; vs "a" is 25 and "É" vs "é" is 0.
+(define (string-ci-compare a b)
+  (let ((la (string-length a)) (lb (string-length b)))
+    (let loop ((i 0))
+      (cond ((or (fx=? i la) (fx=? i lb)) (fx- la lb))
+            (else
+             (let ((ca (string-ref a i)) (cb (string-ref b i)))
+               (if (char=? ca cb)
+                   (loop (fx+ i 1))
+                   (let ((ua (char-upcase ca)) (ub (char-upcase cb)))
+                     (if (char=? ua ub)
+                         (loop (fx+ i 1))
+                         (let ((da (char-downcase ua)) (db (char-downcase ub)))
+                           (if (char=? da db)
+                               (loop (fx+ i 1))
+                               (fx- (char->integer da) (char->integer db)))))))))))))
+(register-host-methods! "string-ci-comparator"
+  (list (cons "compare" (lambda (self a b) (string-ci-compare a b)))))
+(define string-ci-comparator (make-jhost "string-ci-comparator" #f))
 (register-class-statics! "String"
   ;; String.valueOf(char[]) is the chars as a string, not the array's own rendering —
   ;; it answered "#object[[C]" where (String. ca) already gave "hi".
-  (list (cons "valueOf" (lambda (x . _)
+  (list (cons "CASE_INSENSITIVE_ORDER" string-ci-comparator)
+        (cons "valueOf" (lambda (x . _)
                           (cond ((jolt-nil? x) "null")
                                 ((and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
                                  (list->string (vector->list (jolt-array-vec x))))
@@ -719,29 +862,52 @@
   ;; matches a known class (e.g. "com.acme.String" when "java.lang.String"
   ;; exists). jch-known? does last-segment matching and is NOT used here;
   ;; it lives on for jch-isa?'s suffix matching (round-6 territory).
-  (or (hashtable-ref class-statics-tbl nm #f)
-      (hashtable-ref class-ctors-tbl nm #f)
-      (hashtable-ref jvm-class-parents nm #f)))
+  ;; And a full name only: the statics table is keyed by the short name as
+  ;; well, and jch-known-exact? holds each simple segment (the spelling
+  ;; chez-condition-exc-class hands over), where (Class/forName "String") is a
+  ;; ClassNotFoundException on the JVM. Every class the graph models answers,
+  ;; interfaces included — the set resolve answers for.
+  (and (forname-qualified? nm)
+       (or (hashtable-ref class-statics-tbl nm #f)
+           (hashtable-ref class-ctors-tbl nm #f)
+           (jch-known-exact? nm))))
+(define (forname-qualified? nm)
+  (let loop ((i 0))
+    (and (< i (string-length nm))
+         (or (char=? (string-ref nm i) #\.) (loop (+ i 1))))))
 ;; A namespace with a hyphen munges to an underscore in the package name, so a
 ;; record defined in my-app.core is my_app.core.Foo on the JVM. jolt keeps the
-;; namespace as written, so a forName of the munged name has to demunge to find
-;; it — that is the name a library computes from (munge (str *ns*)), and it is how
-;; a #my_app.core.Foo[…] record literal names its class.
-(define (forname-demunged nm)
-  (and (let loop ((i 0))
-         (cond ((>= i (string-length nm)) #f)
-               ((char=? (string-ref nm i) #\_) #t)
-               (else (loop (+ i 1)))))
-       (let ((d (list->string (map (lambda (c) (if (char=? c #\_) #\- c)) (string->list nm)))))
-         (and (forname-known? d) d))))
-(register-class-statics! "Class"
-  (list (cons "forName"
-              (lambda (nm . _)
-                (cond
-                  ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[)) nm)
-                  ((forname-known? nm) (make-class-obj nm))
-                  ((forname-demunged nm) => make-class-obj)
-                  (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm))))))))
+;; namespace as written, so a forName of the munged name goes through the class
+;; graph's registered-name lookup (class-hierarchy.ss jch-registered-name, the
+;; one canonicalizer every name seam shares) — that is the name a library
+;; computes from (munge (str *ns*)). The interned token, so the answer is the
+;; very token the type's values report.
+(define (class-for-name nm . _)
+  (cond
+    ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[)) nm)
+    ((forname-known? nm) (jolt-class-for nm))
+    ((let ((c (jch-registered-name nm))) (and c (forname-known? c) c)) => jolt-class-for)
+    (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm)))))
+(register-class-statics! "Class" (list (cons "forName" class-for-name)))
+;; clojure.lang.RT's own class lookups (the analyzer's resolve path): the same
+;; answer as Class/forName. Non-loading is a distinction without a difference
+;; here — nothing is initialized on lookup.
+;; clojure.lang.Util's comparison statics and the empty list, as clojure.core's
+;; gvec (vector-of) calls them; SeqIterator over a seq is the iterator arm.
+(define util-extra-statics
+  (list (cons "compare" (lambda (a b) (jolt-compare a b)))
+        (cons "isInteger" (lambda (x) (if (and (number? x) (exact? x) (integer? x)) #t #f)))
+        (cons "equals" (lambda (a b) (if (jolt= a b) #t #f)))))
+(register-class-statics! "Util" util-extra-statics)
+(register-class-statics! "clojure.lang.Util" util-extra-statics)
+(register-class-statics! "PersistentList" (list (cons "EMPTY" jolt-empty-list)))
+(register-class-statics! "clojure.lang.PersistentList" (list (cons "EMPTY" jolt-empty-list)))
+(register-class-ctor! "SeqIterator" (lambda (s) (make-jiterator (jolt-seq s))))
+(register-class-ctor! "clojure.lang.SeqIterator" (lambda (s) (make-jiterator (jolt-seq s))))
+(register-class-statics! "RT"
+  (list (cons "classForName" class-for-name) (cons "classForNameNonLoading" class-for-name)))
+(register-class-statics! "clojure.lang.RT"
+  (list (cons "classForName" class-for-name) (cons "classForNameNonLoading" class-for-name)))
 
 ;; ---- System helpers (defined before use above via top-level order) ----------
 ;; os.name reflects the actual platform (Chez's machine-type names it): a *osx
@@ -984,6 +1150,11 @@
 ;; (Object.) — a fresh value with distinct identity (libraries use it as a lock
 ;; or a unique sentinel). Each call returns a new jhost so identical?/= separate.
 (register-class-ctor! "Object" (lambda _ (make-jhost "object" (vector))))
+;; …and it reports java.lang.Object. Without this arm it fell off the end of
+;; jolt-class-name's chain onto jolt-type's internal keyword, so (class (Object.))
+;; answered :object — and that keyword was what count's refusal message named.
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "object")))
+                     (lambda (x) "java.lang.Object"))
 
 ;; ---- clojure.lang.LispReader$StringReader -----------------------------------
 ;; The JVM reader's string-literal handler. It is package-private, but a library
@@ -1024,4 +1195,3 @@
 (for-each (lambda (nm)
             (register-class-ctor! nm (lambda _ (lambda (rdr . _) (lrsr-read-literal rdr)))))
           '("LispReader$StringReader" "clojure.lang.LispReader$StringReader"))
-

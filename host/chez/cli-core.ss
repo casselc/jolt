@@ -27,7 +27,6 @@
 ;; {:type :symbol :suggestions :ns}; those fields are lifted to the top of the
 ;; diagnostic, alongside the human :message and the current form's :line/:column/
 ;; :file. A plain error still yields {:message ... :line ... :column ...}.
-(define diag-kw-jolt-error (keyword "jolt" "error"))
 (define diag-kw-message (keyword #f "message"))
 (define diag-kw-line (keyword #f "line"))
 (define diag-kw-column (keyword #f "column"))
@@ -38,7 +37,7 @@
     (and e (string? e) (string-ci=? e "edn"))))
 
 ;; Build the EDN diagnostic map for an unwrapped throw value.
-(define (jolt-diagnostic-map v)
+(define (jolt-diagnostic-map raw v)
   (let* ((msg (cond ((jolt-ex-info-record? v)
                      (jolt-str-render-one (jolt-ex-info-record-message v)))
                     ((condition? v)
@@ -47,7 +46,7 @@
          (data (and (jolt-ex-info-record? v) (jolt-ex-info-record-data v)))
          (err (and data (pmap? data) (jolt-get data diag-kw-jolt-error jolt-nil)))
          (base (if (and err (pmap? err)) err (jolt-hash-map)))
-         (pos (jolt-current-source))
+         (pos (or (jolt-throw-source-position raw) (jolt-current-source)))
          (m (jolt-assoc base diag-kw-message msg)))
     (if (pmap? pos)
         ;; The loader's per-top-level-form position FILLS IN only what the
@@ -67,28 +66,6 @@
             m))
         m)))
 
-;; The ":jolt/error" map an analyzer diagnostic carries, or #f. Its presence marks
-;; a COMPILE-time diagnostic: raised while analyzing a form, so the live Chez stack
-;; is the analyzer recursing into it, never the user's program.
-(define (jolt-analyzer-diagnostic v)
-  (let* ((data (and (jolt-ex-info-record? v) (jolt-ex-info-record-data v)))
-         (err (and data (pmap? data) (jolt-get data diag-kw-jolt-error jolt-nil))))
-    (and (pmap? err) err)))
-
-;; "file:line:col" for a diagnostic that carries its own position, else #f — so the
-;; report can name the offending expression rather than the enclosing top-level
-;; form. Same shape jolt-current-source-string renders, so the two are
-;; indistinguishable in the report.
-(define (jolt-diagnostic-location-string err)
-  (let ((line (jolt-get err diag-kw-line jolt-nil))
-        (col (jolt-get err diag-kw-column jolt-nil))
-        (file (jolt-get err diag-kw-file jolt-nil)))
-    (and (not (jolt-nil? line))
-         (string-append
-           (if (jolt-nil? file) "" (string-append (jolt-str-render-one file) ":"))
-           (number->string (jnum->exact line)) ":"
-           (if (jolt-nil? col) "?" (number->string (jnum->exact col)))))))
-
 ;; Render an uncaught jolt throw (any value, not just a Chez condition) to stderr
 ;; and exit non-zero, instead of Chez's opaque "non-condition value" dump. The
 ;; message/ex-data/cause + a mapped Clojure backtrace come from the shared
@@ -100,14 +77,13 @@
     (if (jolt-diag-machine?)
         ;; jolt-pr-readable, not jolt-pr-str: strings must be quoted so the line
         ;; is valid EDN a tool can read back.
-        (begin (display (jolt-pr-readable (jolt-diagnostic-map v)) port) (newline port))
+        (begin (display (jolt-pr-readable (jolt-diagnostic-map raw v)) port) (newline port))
         (let ((diag (jolt-analyzer-diagnostic v)))
           (jolt-render-throwable v port)
-          ;; Where it failed: the diagnostic's own position when it has one (the
-          ;; innermost form the analyzer was in), else the top-level form that was
-          ;; evaluating when this propagated.
-          (let ((loc (or (and diag (jolt-diagnostic-location-string diag))
-                         (jolt-current-source-string))))
+          ;; Where it failed: the diagnostic's own position, the form a file load
+          ;; was at when this crossed it, or the top-level form evaluating now
+          ;; (jolt-throwable-source-string, compile-eval.ss).
+          (let ((loc (jolt-throwable-source-string raw)))
             (when loc (display "  at " port) (display loc port) (newline port)))
           ;; No trace for a compile-time diagnostic. It is raised while ANALYZING,
           ;; so the frames are jolt's own analyzer recursing into the form
@@ -152,6 +128,14 @@
 ;; The CLI auto-quotes require/use vector/list args (but NOT symbols — a plain
 ;; (require sym) evaluates sym normally) so `(require [my.lib :as m])` works
 ;; without an explicit quote, matching the convenience of JVM Clojure's ns macro.
+;;
+;; The convenience belongs to clojure.core's require/use, not to the SPELLING of
+;; the head symbol. Forms are read and evaluated one at a time, so a dialect that
+;; defines its own `use` (or `require`) macro earlier in the same stdin program
+;; has already interned it by the time the next form is rewritten — and it owns
+;; the quoting of its own arguments. So the head is resolved the way the compiler
+;; will resolve it (a locally defined var, then a :refer, then clojure.core) and
+;; auto-quoting applies only when that lands on clojure.core's own var.
 (define (jolt-run-expr-string expr app-args print?)
   (let ((cla (if (null? app-args) jolt-nil (list->cseq app-args)))
         (end (string-length expr))
@@ -161,15 +145,36 @@
            (let ((ah (car (seq->list a))))
              (and (symbol-t? ah)
                   (string=? (symbol-t-name ah) "quote")))))
+    ;; Does HEAD name clojure.core's require/use? Resolved to the (ns . name) pair
+    ;; the compiler would reach — a locally DEFINED var shadows, then a :refer
+    ;; (which carries the name it was renamed FROM), else the implicit core refer.
+    ;; Deliberately compares the resolved pair rather than dereferencing
+    ;; clojure.core/require by name: a literal (var-cell-lookup "clojure.core"
+    ;; "require") here would be a runtime shim reference that has to be pinned as
+    ;; a dce-runtime-core-roots entry, which would keep require/use (and the whole
+    ;; loader behind them) unshakeable in every tree-shaken app.
+    (define (core-require-head? h)
+      (and (symbol-t? h)
+           (let* ((nm (symbol-t-name h))
+                  (sns (symbol-t-ns h))
+                  (qualified (and sns (not (jolt-nil? sns)) (not (null? sns)) sns))
+                  (here (chez-current-ns))
+                  (target
+                    (if qualified
+                        ;; a qualified ns may be a require :as alias
+                        (cons (or (chez-resolve-alias here qualified) qualified) nm)
+                        (cond ((let ((c (var-cell-lookup here nm)))
+                                 (and c (var-cell-defined? c)))
+                               (cons here nm))
+                              ((chez-resolve-refer here nm) => values)
+                              (else (cons "clojure.core" nm))))))
+             (and (string=? (car target) "clojure.core")
+                  (or (string=? (cdr target) "require")
+                      (string=? (cdr target) "use"))))))
     (define (maybe-quote-require-args form)
       (if (and (cseq? form)
                (let ((items (seq->list form)))
-                 (and (pair? items)
-                      (let ((h (car items)))
-                        (and (symbol-t? h)
-                             (let ((hn (symbol-t-name h)))
-                               (or (string=? hn "require")
-                                   (string=? hn "use"))))))))
+                 (and (pair? items) (core-require-head? (car items)))))
           (let ((items (seq->list form)))
             (list->cseq
               (cons (car items)
@@ -180,8 +185,21 @@
                                a))
                          (cdr items)))))
           form))
-    (jolt-push-thread-bindings
-      (jolt-hash-map (jolt-var "clojure.core" "*command-line-args*") cla))
+    ;; clojure.main wraps every entry — repl, -e, -m — in with-bindings, so a
+    ;; top-level (set! *warn-on-reflection* true) has a thread-local slot to
+    ;; write. jolt's REPL already binds them; -e (and the `-` stdin script, which
+    ;; comes through here too) bound only *command-line-args*, so the same
+    ;; expression that works from a file or the REPL raised "Can't
+    ;; change/establish root binding" here.
+    ;; Both frames are scoped, not bracketed by hand: a form that throws mid-loop
+    ;; used to skip the pops and leave them standing for the rest of the thread.
+    ;; That is invisible from `-e`, which exits through the uncaught handler, but
+    ;; run-expr-string is also the -M/-A/-Sdeps re-dispatch path, which does not.
+    (jolt-with-thread-bindings
+      (jolt-hash-map (jolt-var "clojure.core" "*command-line-args*") cla)
+      (lambda ()
+       (jolt-with-ns-load-vars
+        (lambda ()
     (let ((result (let loop ((i 0) (result jolt-nil))
                     (if (>= i end)
                         result
@@ -199,10 +217,9 @@
                                             (maybe-quote-require-args form)
                                             (chez-current-ns))))
                               result))))))
-      (jolt-pop-thread-bindings)
       (let ((s (jolt-repl-str result)))
         (when (and print? (not (string=? s "")))
-          (display s) (newline))))))
+          (display s) (newline))))))))))
 
 ;; Expose the evaluator (and the stdin reader it pairs with) to Clojure. jolt.main's
 ;; -e arm — the project-aware path, reached from -Sdeps/-A/-M, an alias's
@@ -215,15 +232,18 @@
     jolt-nil))
 (def-var! "jolt.host" "read-all-stdin" (lambda () (jolt-read-all-stdin)))
 
-;; Does the project dir have a deps.edn? The launcher's -e / - arms below skip
-;; jolt.main entirely — no deps chain, no project source roots, no natives — which
-;; is only equivalent to the real thing when there is no project to resolve. With a
-;; deps.edn present the argv falls through to jolt.main instead, so `jolt -e
-;; "(require 'my.app)"` sees the project's paths and deps like every other command.
+;; Does the project dir have a config file — a deps.edn, or a bb.edn, which
+;; jolt.deps reads for the same :paths / :deps / :tasks? The launcher's -e / -
+;; arms below skip jolt.main entirely — no deps chain, no project source roots,
+;; no natives — which is only equivalent to the real thing when there is no
+;; project to resolve. With one present the argv falls through to jolt.main
+;; instead, so `jolt -e "(require 'my.app)"` sees the project's paths and deps
+;; like every other command.
 (define (jolt-project-deps-edn?)
   (let* ((pwd (getenv "JOLT_PWD"))
          (dir (if (and pwd (string? pwd) (not (string=? pwd ""))) pwd ".")))
-    (file-exists? (string-append dir "/deps.edn"))))
+    (or (file-exists? (string-append dir "/deps.edn"))
+        (file-exists? (string-append dir "/bb.edn")))))
 
 ;; Is this argv a `build`? The build driver has to be loaded before jolt.main
 ;; runs, and the command can sit behind the global options that re-dispatch the
@@ -241,6 +261,12 @@
     (else #f)))
 
 (define (jolt-cli-run cli-args prepare-build!)
+  ;; Every entry starts in user, as clojure.main's does. The image bakes jolt.main
+  ;; and jolt.deps at heap build, and loading a namespace leaves it current, so
+  ;; without this a bare -e or a REPL evaluated in jolt.main: (str *ns*) said so,
+  ;; and a REPL def landed as #'jolt.main/x under a prompt that said user. The
+  ;; script driver arrives with user already current; here it costs nothing.
+  (set-chez-ns! "user")
   ;; On the main thread, before anything user code can reach: Chez's exit-handler
   ;; is a thread parameter, so the shutdown-hook wrapper has to be installed on
   ;; the thread that will call (exit), and this is that thread for both CLI

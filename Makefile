@@ -21,7 +21,36 @@ include $M/init.mk
 
 # An explicit caller-selected Chez is authoritative. This preserves CI/release
 # toolchains whose threading, libc floor, and native libraries are intentional.
+#
+# Same-or-newer system Chez: with nothing explicit selected, a Chez on PATH at
+# or above JOLT-CHEZ-FLOOR is also used as-is — the system toolchain then
+# builds and links everything, one self-consistent toolchain end to end, and
+# nothing is downloaded. Older, broken, or absent, fall through to provisioning
+# the pinned Chez + xPack GCC below. Set JOLT_SYSTEM_CHEZ= (empty) to always
+# provision the pinned versions.
+JOLT-CHEZ-FLOOR ?= 10.4.1
+JOLT_SYSTEM_CHEZ ?= 1
 JOLT-CHEZ := $(or $(CHEZ),$(CHEZSCHEME))
+ifeq (,$(JOLT-CHEZ))
+ifeq (1,$(JOLT_SYSTEM_CHEZ))
+JOLT-CHEZ := $(shell \
+  for name in chez chezscheme scheme; do \
+    exe=$$(command -v $$name 2>/dev/null) || continue; \
+    test -x "$$exe" || continue; \
+    exe=$$(cd "$$(dirname "$$exe")" && pwd -P)/$$(basename "$$exe"); \
+    v=$$(printf '(display (scheme-version)) (newline)\n' | "$$exe" -q 2>/dev/null | tr -d '\r'); \
+    v=$$(printf '%s\n' "$$v" | awk '{print $$NF}'); \
+    ok=$$(awk -v v="$$v" -v f="$(JOLT-CHEZ-FLOOR)" 'BEGIN { \
+      split(v, V, "."); split(f, F, "."); \
+      for (i = 1; i <= 3; i = i + 1) { \
+        if (V[i] + 0 > F[i] + 0) { print 1; exit } \
+        if (V[i] + 0 < F[i] + 0) { exit } \
+      } \
+      print 1 }'); \
+    if [ "$$ok" = 1 ]; then printf '%s\n' "$$exe"; break; fi; \
+  done)
+endif
+endif
 ifneq (,$(JOLT-CHEZ))
 SHELL-DEPS += $(JOLT-CHEZ)
 else
@@ -35,6 +64,11 @@ include $M/shell.mk
 MAKES-CLEAN := \
   build/ \
   target/ \
+
+MAKES-REALCLEAN := \
+  .jolt/ \
+  test/chez/*/.jolt/ \
+  test/chez/*/*/.jolt/ \
 
 PREFIX ?= $(if $(IS-ROOT),/usr/local,$(HOME)/.local)
 CHEZ ?= $(JOLT-CHEZ)
@@ -53,16 +87,22 @@ CHEZSCHEME-LIB-DIRS := \
   $(LOCAL-TMP)/$(CHEZSCHEME-DIR)/pb/lz4/lib \
   $(LOCAL-TMP)/$(CHEZSCHEME-DIR)/pb/zlib
 export LIBRARY_PATH := $(subst $(space),:,$(strip $(CHEZSCHEME-LIB-DIRS)))$(if $(LIBRARY_PATH),:$(LIBRARY_PATH))
+# The provisioned GCC built Chez, so the same driver links the standalone
+# binary: gcc.mk puts the bundle's bin FIRST on the exported PATH, but the
+# bundle ships no `cc`, so a bare cc falls through to the distro driver and
+# pairs it with the bundle's older as/ld (#788: gcc 16 .base64 into pre-2.43
+# gas). build.ss bld-cc reads JOLT_CC. A command-line JOLT_CC=... still wins.
+export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
-  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
-  gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate \
+  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
+  gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
@@ -118,16 +158,16 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
+CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
+  smoke tracesmoke errorreport buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
-  hasheq \
-  protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
-  fnform traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
+  hasheq narrowhash \
+  protoret pic narrow directlink directcall arraymap unitcontext numeric oparity mathfl flarr \
+  fnform coreproc traceemit traceeval degradedbacktrace \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
+  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -230,6 +270,19 @@ values:
 hasheq:
 	@$(CHEZ) --script test/chez/hasheq-test.ss
 
+# The same suites again with the hash engine's NARROW arms selected. hasheq.ss
+# and collections.ss compute in the Java int window, which is fixnum on a 64-bit
+# Chez and bignum on a 32-bit one (tpb32l, the pb/WASM build), so each operator
+# has a generic exact-integer twin that only a 32-bit host would otherwise ever
+# run. JOLT_NARROW_HASH=1 forces that arm at expand time here, which puts the
+# generic twins under the JVM-pinned hash goldens, the value-model suite and the
+# transient HAMT suite on ordinary hardware. Slower than `hasheq`: the knob is
+# read during expansion, so gate-boot has to compile the preamble from source.
+narrowhash:
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/hasheq-test.ss
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/values-test.ss
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/transient-test.ss
+
 # Fibers R1 (epic jolt-nvpr.2): the fiber primitive + single-carrier scheduler
 # behind the CONTRACT.txt coroutines tier. Correctness (round trip, completion,
 # per-fiber raise isolation, round-robin order, deep-stack yield) plus the
@@ -273,6 +326,12 @@ fibers:
 asynctimer:
 	@$(CHEZ) --script test/chez/async-timer-test.ss
 
+# A nested run-interruptible extent restores the enclosing polling timer after
+# normal return, exception, or interruption, without sharing ownership between
+# application threads.
+interruptnest:
+	@$(CHEZ) --script test/chez/interrupt-nesting-test.ss
+
 # The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
 # against the number of vars in one frame, push/pop throughput, and the two
 # workloads the trade-off is judged on — N nested fn literals (deep) and a real
@@ -300,6 +359,18 @@ corpus:
 # Host-specific unit cases.
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
+
+# The jolt half of the known-divergences :documented gate: every entry's :check
+# must render exactly its recorded :jolt value, its :jvm and :jolt must differ,
+# and an entry with no :check fails. certify.clj runs the JVM half against
+# reference Clojure; this half needs no JVM, so it lives in `ci`.
+# `make documented-record` prints what jolt currently answers, for recording a
+# new entry. Run `make certify` for the JVM side through the pinned oracle.
+documented:
+	@$(CHEZ) --script host/chez/run-documented.ss
+
+documented-record:
+	@$(CHEZ) --script host/chez/run-documented.ss --record
 
 # Real-CLI smoke over bin/jolt.
 # The CLI and build gates spawn a jolt process per case; a prebuilt binary boots
@@ -330,6 +401,14 @@ smoke: testbin
 tracesmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/trace-smoke.sh
 
+# What a user READS when jolt rejects their program: message, position, ex-data,
+# trace and exit status, pinned per case as golden files under test/errors. Every
+# other gate asserts that a bad program is rejected; this one asserts what the
+# report then says. Regenerate deliberately with:
+#   sh host/chez/error-report-check.sh generate
+errorreport: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/error-report-check.sh
+
 # The IR schema validator (JOLT_IR_VALIDATE) reports no problems on real code.
 irvalidate:
 	@sh host/chez/ir-validate-smoke.sh
@@ -354,6 +433,13 @@ buildlibsmoke: testbin
 # default), and --dynamic keeps the runtime load-shared-object path.
 staticnativesmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/static-native-smoke.sh
+
+# Duplicate native symbol detection (issue #731): a declared :jolt/native that
+# carries its own static copy of another's code — raygui linked against
+# libraylib.a — used to go inert with no error. Pins that the footgun build is
+# reported AND that a correctly linked one is not.
+ffidupsym:
+	@sh host/chez/ffi-duplicate-symbol-smoke.sh
 
 # OPT-IN: jolt.mvn-http cert-verifying HTTPS fetch against Central + Clojars.
 # Not in `make test` — needs network + a working system OpenSSL.
@@ -433,6 +519,13 @@ hotscaling: testbin
 depssmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/deps-alias-smoke.sh
 
+# bb.edn / deps.edn :tasks through the real CLI: babashka task semantics
+# (:depends, :init, :requires, :enter/:leave, :private, :extra-paths/:extra-deps,
+# the babashka.tasks API), the `tasks` listing, and exit-code propagation.
+# Offline fixture projects in test/chez/tasks/.
+taskssmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/tasks-smoke.sh
+
 # The resolved-roots cache (.jolt/cpcache): a warm run reuses a project's final
 # dependency resolution instead of re-expanding the graph. Offline throwaway
 # project in a temp dir; gates the cache key, invalidation, and dev posture.
@@ -480,6 +573,12 @@ stdlibfasl: testbin
 sci:
 	@$(CHEZ) --script host/chez/run-sci.ss
 
+# A complementary functional gate: load SCI through Jolt's ordinary dependency
+# path, then initialize and reuse real contexts. run-sci.ss remains the broad,
+# intentionally lenient source-loading compatibility gate.
+scifunctional: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:deps {borkdude/sci {:local/root "vendor/sci"}}}' run test/chez/sci-functional-test.clj
+
 # clojure-test-suite conformance: run the vendored jank-lang/clojure-test-suite
 # per-namespace under jolt, gated on the per-namespace baseline
 # (test/chez/cts-known-failures.txt).
@@ -489,15 +588,40 @@ cts: testbin
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 # The widths gate covers the exact scalar vocabulary across both halves of the
-# API: runtime memory access and compiler-emitted procedures/callables. The
-# layout gate compares declarative struct metadata and field access against C;
-# the aggregate gate covers structs passed and returned by C value.
+# API: runtime memory access and compiler-emitted procedures/callables, :bool
+# included — the one type whose value, not just width, converts at the boundary.
+# The layout gate compares declarative struct metadata and field access against
+# C; the aggregate gate covers structs passed and returned by C value; the native
+# error gate covers atomic errno/GetLastError capture and option composition.
+# The arena gate covers the allocation-lifetime API (issue #799) and the rest of
+# the babashka.ffi-compatible surface built on it — the four arena kinds and who
+# closes each, arena-owned blocks/strings/callbacks/views, the pointer
+# vocabulary, layout-shaped read and write, places, and the typed array moves.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-layout-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
+	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
+	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+
+# Escape continuations (jolt.continuations, issue #736): the one-shot contract
+# call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber
+# is not an ownership boundary, and the four misuses. The cross-fiber rows are
+# why this gate exists — unguarded, invoking an escape captured on another
+# fiber hangs the process rather than raising, so each of those rows runs on a
+# watchdog thread and FAILS on a deadline instead of wedging the run.
+continuations:
+	@bin/jolt run test/chez/continuations-test.clj
+
+# clojure.core.async.flow: the graph end to end (start/pause/resume/ping/inject,
+# the error channel, casts) and the j.u.c seams under it — deref of a Future,
+# ExecutionException out of .get, instance? Executor, and the workload -> carrier
+# mapping. The scale row is the one that would regress silently: :io processes
+# run on fibers, so 200 of them do not need 200 threads.
+flow:
+	@bin/jolt run test/chez/flow-test.clj
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
@@ -643,6 +767,17 @@ degradedbacktrace:
 narrow:
 	@$(CHEZ) --script host/chez/run-narrow.ss
 
+# The direct call shapes of a --direct-link build: seed vars called through a
+# load-bound root, the unhinted string/keyword interop guard, the unchecked
+# family lowered to its helpers, case on interned constants (run-directcall.ss).
+directcall:
+	@$(CHEZ) --script host/chez/run-directcall.ss
+
+# Array-mode maps are one flat k/v slot vector (PersistentArrayMap), their
+# transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
+arraymap:
+	@$(CHEZ) --script test/chez/arraymap-test.ss
+
 # Direct-linking emission: a closed-world build binds top-level app defs to jv$
 # Scheme bindings and routes app->app calls/refs to them, skipping var-deref +
 # jolt-invoke; ^:dynamic/^:redef and nested defs opt out.
@@ -654,6 +789,14 @@ directlink:
 # closure's inspector name must agree; system-ns closures stay unregistered.
 fnform:
 	@$(CHEZ) --script test/chez/fnform-test.ss
+
+# Every clojure.core fn must be nameable in value position: the state image
+# writes a procedure as its var NAME, and a native that is set!-extended after
+# its def-var! leaves a procedure nothing named — so values built from it stop
+# being writable, silently. Swept from the var table, so a fn added later is
+# covered without anyone remembering.
+coreproc:
+	@$(CHEZ) --script test/chez/core-proc-name-test.ss
 
 # Compilation-unit context: the emit-session state (mode flags, direct-link
 # registries, ctor shapes, gensym, cache cells) is per-unit, so two units are
@@ -749,6 +892,22 @@ census:
 adaptercheck:
 	@$(CHEZ) --script host/scheme-adapter/chez.ss
 
+# The three derived host properties (sa-os-family / sa-arch / sa-endian) are all
+# host logic may ask about the platform, so one wrong row is a wrong SIGCHLD,
+# LC_TIME and struct-stat offset at once. The row that broke in #796 — a
+# portable-bytecode tag, which names no OS — is only reachable from a host we do
+# not build on, so the table is pinned per tag rather than per running machine.
+hostprops:
+	@$(CHEZ) --script test/chez/host-derived-props-test.ss
+
+# The other half of the same rule: knowing the platform is only useful if the
+# struct stat offsets it selects are the ones this machine actually uses. The
+# gate measures the layout with no identity to go on — the pb case — and then
+# reads a file whose mode it just set, which no offset that merely happens to
+# carry S_IFDIR would answer correctly.
+statlayout:
+	@$(CHEZ) --script test/chez/stat-layout-test.ss
+
 # Every lock in the runtime must route through jolt's wrapper, because
 # preemption is refused while one is held and that only works if the runtime can
 # tell. A wrapper nobody is obliged to use decays into the hand-marked scheme it
@@ -777,16 +936,36 @@ parkcheck:
 shelloutcheck:
 	@sh host/chez/shellout-check.sh
 
+# errno survives only until the next thing that can set it, and reading it is
+# itself a foreign call — so a syscall wrapper must capture it once, at the
+# syscall, and branch on the value. See the script for what asking twice cost.
+errnocheck:
+	@sh host/chez/errno-check.sh
+
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.
 makefilesmoke:
 	@bash test/makefile-smoke.sh
 
+# tools/version.sh is the one definition of a checkout's version (bin/jolt,
+# build-jolt.ss and the release workflow all read it). The property: release
+# tags only, so the rolling `vnightly` tag the nightly moves to main's head is
+# never the answer, and a checkout with no release tag reachable answers
+# dev-g<sha>, which no :jolt/min-version floor can misread as a version.
+versionsmoke:
+	@bash test/version-smoke.sh
+
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
+# The oracle version is READ from the committed profile, which certify.clj also
+# checks the running Clojure against — so the pin has one source, and bumping the
+# oracle is a profile edit rather than two edits that can drift apart.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
-		clojure -M test/conformance/certify.clj --self-test && \
-		clojure -M test/conformance/certify.clj; \
+		v=$$(sed -n 's/^ :clojure-version "\([^"]*\)".*/\1/p' test/conformance/profile.edn); \
+		if [ -z "$$v" ]; then echo "certify: no :clojure-version in test/conformance/profile.edn"; exit 1; fi; \
+		deps="{:deps {org.clojure/clojure {:mvn/version \"$$v\"}}}"; \
+		clojure -Sdeps "$$deps" -M test/conformance/certify.clj --self-test && \
+		clojure -Sdeps "$$deps" -M test/conformance/certify.clj; \
 	else \
 		echo "certify: clojure not on PATH — skipped"; \
 	fi

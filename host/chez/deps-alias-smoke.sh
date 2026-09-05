@@ -295,11 +295,20 @@ check "the dot form of a static autoloads too" "fixture-zone:UTC" "$(run -A:time
 # the imported simple name did not. malli's transform.cljc builds one that way.
 check "constructing a library class autoloads" "fixture-builder" "$(run -A:time run -m appzonector)"
 
-# off the roots the reference still names the dependency to add
+# Off the roots the reference reports that nothing provides the class — and
+# deliberately does NOT name a library (RFC 0014). Which library supplies
+# java.time is not the runtime's to say, and a caller may write the shim
+# themselves; naming one would put the removed coupling back as a string.
 out="$(runfull run -m appzone)"
 case "$out" in
-  *jolt-lang/time*) check "library miss names the dependency" ok ok ;;
-  *) check "library miss names the dependency" "message naming jolt-lang/time" "$(printf '%s' "$out" | head -1)" ;;
+  *"No dependency provides"*) check "library miss reports no provider" ok ok ;;
+  *) check "library miss reports no provider" "message saying no dependency provides it" "$(printf '%s' "$out" | head -1)" ;;
+esac
+# The first line only: the traceback below it carries absolute paths, and this
+# checkout lives under a directory called jolt-lang.
+case "$(printf '%s' "$out" | head -1)" in
+  *jolt-lang/*) check "library miss names no library" "no library named" "$(printf '%s' "$out" | head -1)" ;;
+  *) check "library miss names no library" ok ok ;;
 esac
 
 # io/resource answers an ABSOLUTE file: URL for a file on a source root, like the
@@ -319,9 +328,13 @@ case "$out" in
   *"failed to load"*) check "broken provider says it failed to load" ok ok ;;
   *) check "broken provider says it failed to load" "message saying failed to load" "$(printf '%s' "$out" | head -1)" ;;
 esac
+# The two cases must not read alike: "declared but broken" is fixed by repairing
+# the library, "nothing provides it" by supplying one. Asserting the absence of
+# the no-provider wording is what keeps them apart now that neither names a
+# coordinate.
 case "$out" in
-  *"Add io.github.jolt-lang/time"*)
-    check "broken provider is not reported as missing" "no add-the-dependency advice" "$(printf '%s' "$out" | head -1)" ;;
+  *"No dependency provides"*)
+    check "broken provider is not reported as missing" "no missing-provider wording" "$(printf '%s' "$out" | head -1)" ;;
   *) check "broken provider is not reported as missing" ok ok ;;
 esac
 
@@ -367,11 +380,51 @@ check "-e - reads the expression from stdin" "main1" \
       "$(printf "(require 'appmain) (appmain/-main)" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" -e - 2>&1 | tail -1)"
 check "- runs a stdin program against the project" "main1" \
       "$(printf "(require 'appmain) (appmain/-main)" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" - 2>&1 | tail -1)"
-out="$(runfull -M)"
-case "$out" in
-  *"have no :main-opts"*) check "bare -M with nothing to run errors" ok ok ;;
-  *) check "bare -M with nothing to run errors" "no-main-opts error" "$(printf '%s' "$out" | head -1)" ;;
-esac
+# -M is clojure.main: with no :main-opts anywhere and nothing on the command
+# line it starts a REPL (`clj -M:dev` is how a REPL over an alias's deps is
+# started), and -r / --repl ask for one explicitly. Resolved WITH the alias:
+# libc is on the roots only through :dev. Piped stdin drives the REPL.
+repl() { expr="$1"; shift; printf '%s\n' "$expr" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>&1; }
+replcheck() { # label expected-fragment out
+  case "$3" in
+    *"$2"*) check "$1" ok ok ;;
+    *) check "$1" "$2" "$(printf '%s' "$3" | head -3)" ;;
+  esac
+}
+replcheck "bare -M with nothing to run starts a REPL" "user=> 3" "$(repl '(+ 1 2)' -M)"
+replcheck "-M:alias without :main-opts starts a REPL over the alias" "libc C" \
+          "$(repl "(require 'appc) (appc/-main)" -M:dev)"
+replcheck ":main-opts [\"-r\"] starts a REPL" "user=> 42" "$(repl '(+ 40 2)' -M:r1)"
+replcheck "-M:alias -r starts a REPL over the alias" "libc C" \
+          "$(repl "(require 'appc) (appc/-main)" -M:dev --repl)"
+# an option jolt's clojure.main does not take says what it does take
+replcheck "unsupported :main-opts names the accepted forms" "accepted: -m NS, -e EXPR, -r, or a script FILE" \
+          "$(runfull -M:bad)"
+
+# A data_readers entry whose namespace fails to load is a WARNING (the project
+# still loads), and the warning has to be actionable: which namespace, why,
+# WHERE it failed, and which tags are now unreadable. And the position the
+# failed load was at must not stick: it used to blame every later, unrelated
+# error on that file ("at .../clj_time/core.clj:254:1" under a CLI arg error).
+RB="$root/test/chez/deps-alias/rdrbroken"
+runrb() { JOLT_PWD="$RB" JOLT_QUIET=1 "$JOLT" "$@" 2>&1; }
+after_report() { printf '%s\n' "$1" | sed -n '/^Unhandled exception/,$p'; }
+warning_block() { printf '%s\n' "$1" | sed '/^Unhandled exception/,$d'; }
+out="$(runrb -X:x)"
+replcheck "data-reader load warning names the namespace and cause" \
+          "data-reader namespace rb.rdr failed to load: Unknown class NoSuchHostClass" "$out"
+replcheck "data-reader load warning says where it failed" "rb/rdr.clj:3:" "$(warning_block "$out")"
+replcheck "data-reader load warning names the tags it takes down" "#rb/up" "$out"
+replcheck "the CLI's own error still reports after the warning" "No function to execute" "$out"
+check "a caught data-reader load leaves no stale 'at' location" "0" \
+      "$(after_report "$out" | grep -c '^  at ')"
+# same leak through a require caught in user code
+out="$(runrb run -m rb.app)"
+replcheck "an error after a caught require is reported" "after a caught load" "$out"
+check "a caught require leaves no stale 'at' location" "0" "$(after_report "$out" | grep -c '^  at ')"
+# …while a load error that PROPAGATES still names the form that failed
+out="$(runrb run -m rb.boom)"
+replcheck "a propagating load error names its form" "rb/boom.clj:3:1" "$(after_report "$out")"
 
 # -X: :exec-fn / :exec-args from the alias, k v overrides, a trailing map, an
 # explicit ns/fn argument, and :ns-aliases qualification

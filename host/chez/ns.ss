@@ -66,10 +66,16 @@
   (jolt-with-mutex ns-map-mu (hashtable-set! ns-alias-table (cons cns alias) target)))
 (define (chez-resolve-alias cns alias)
   (hashtable-ref ns-alias-table (cons cns alias) #f))
-;; :refer brings an UNQUALIFIED name into cns, resolving to target-ns/name.
+;; :refer brings an UNQUALIFIED name into cns.  The table value records both
+;; the target namespace and the source name so :rename can map local-name to
+;; target-ns/source-name.
 (define ns-refer-table (make-hashtable equal-hash equal?))
-(define (chez-register-refer! cns name target)
-  (jolt-with-mutex ns-map-mu (hashtable-set! ns-refer-table (cons cns name) target)))
+(define (chez-register-refer! cns name target . source-name)
+  (jolt-with-mutex ns-map-mu
+    (hashtable-set! ns-refer-table
+                    (cons cns name)
+                    (cons target
+                          (if (pair? source-name) (car source-name) name)))))
 ;; refer-all (a bare `use`): cns -> list of fully-referred target ns names. A name
 ;; not found per-name resolves to the first refer-all target that defines it.
 (define ns-refer-all-table (make-hashtable equal-hash equal?))
@@ -107,7 +113,7 @@
         (cond ((null? ts) #f)
               ((and (not (chez-refer-all-excluded? cns (car ts) name))
                     (let ((c (var-cell-lookup (car ts) name))) (and c (var-cell-defined? c))))
-               (car ts))
+               (cons (car ts) name))
               (else (loop (cdr ts)))))))))
 ;; --- libspec parsing (shared by the loader + compile-eval) ------------------
 ;; A libspec is one of: a bare symbol `foo`; a vector `[foo :as f :refer [x]]`;
@@ -207,9 +213,24 @@
           (cdr parsed))))))
 
 ;; a namespace designator -> its name string (a jns or a symbol; the corpus never
-;; passes a bare string).
+;; passes a bare string). Anything else is refused HERE, with the throw the JVM
+;; makes for it: nil is its NullPointerException (Namespace.find hashes the key),
+;; and any other value is the failed cast to Symbol. Without these two arms a bad
+;; designator reached symbol-t-name — a bare Chez record accessor — and escaped as
+;; a condition with no jolt class and no message at all, printing as
+;; #object[:object]. (ns-name nil) is a plausible slip in any macro that reads a
+;; :ns out of metadata, and it said nothing whatsoever about what went wrong.
 (define (ns-desig->name d)
-  (if (jns? d) (jns-name d) (symbol-t-name d)))
+  (cond ((jns? d) (jns-name d))
+        ((symbol-t? d) (symbol-t-name d))
+        ((jolt-nil? d)
+         (jolt-throw (jolt-host-throwable "java.lang.NullPointerException"
+                                          "namespace designator is nil")))
+        (else
+         (jolt-throw (jolt-host-throwable
+                      "java.lang.ClassCastException"
+                      (string-append "class " (jolt-class-name d)
+                                     " cannot be cast to class clojure.lang.Symbol"))))))
 
 (define (ns-has-vars? nm)
   (hashtable-ref ns-has-vars-set nm #f))
@@ -264,13 +285,22 @@
 (define (var-private? c)
   (let ((m (var-cell-meta c)))
     (and m (jolt-truthy? (jolt-get m (keyword #f "private"))))))
+;; A namespace maps class names as well as vars, and the JVM keeps the two apart:
+;; a class mapping is an IMPORT, never an intern, so ns-interns / ns-publics /
+;; ns-map's intern layer must skip it. jolt holds a class mapping as a cell —
+;; (:import ...) binds the short name, deftype/defrecord binds its own name, and
+;; the class model registers a token for every class it knows in clojure.core —
+;; so without this the tokens leak into every namespace as refers and shadow
+;; ns-imports' entry for the same name. That model is not loaded where this file
+;; is, so it starts as "no cell is one" and host-static-classes.ss replaces it.
+(define ns-cell-class-mapping? (lambda (c) #f))
 (define (ns-vars-pmap-when nm keep?)
   ;; the namespace's own bucket (rt.ss ns-cells-index): O(vars in nm), where a
   ;; var-table-cells scan cost O(every var in the image) per call
   (let ((m (jolt-hash-map)))
     (for-each
       (lambda (c)
-        (when (and (var-cell-defined? c) (keep? c))
+        (when (and (var-cell-defined? c) (keep? c) (not (ns-cell-class-mapping? c)))
           (set! m (jolt-assoc m (jolt-symbol #f (var-cell-name c)) c))))
       (ns-cells-list nm))
     m))
@@ -310,8 +340,9 @@
      (vector-for-each
        (lambda (k)
          (when (string=? (car k) cns)
-           (let* ((target (hashtable-ref ns-refer-table k #f))
-                  (c (and target (var-cell-lookup target (cdr k)))))
+           (let* ((ref (hashtable-ref ns-refer-table k #f))
+                  (c (and (pair? ref)
+                          (var-cell-lookup (car ref) (cdr ref)))))
              (when c (set! m (jolt-assoc m (jolt-symbol #f (cdr k)) c))))))
        (jolt-with-mutex ns-map-mu (hashtable-keys ns-refer-table)))
      ;; refer-all: merge all public vars from :refer :all namespaces
@@ -359,11 +390,36 @@
     "Thread$UncaughtExceptionHandler" "ThreadDeath" "ThreadGroup" "ThreadLocal" "Throwable"
     "TypeNotPresentException" "UnknownError" "UnsatisfiedLinkError" "UnsupportedClassVersionError"
     "UnsupportedOperationException" "VerifyError" "VirtualMachineError" "Void"))
+;; Four of the 96 are not java.lang, so the canonical name is not derivable from
+;; the short one for all of them.
+(define jolt-default-import-overrides
+  '(("BigDecimal" . "java.math.BigDecimal")
+    ("BigInteger" . "java.math.BigInteger")
+    ("Callable"   . "java.util.concurrent.Callable")
+    ("Compiler"   . "clojure.lang.Compiler")))
+(define (jolt-default-import-canonical n)
+  (let ((o (assoc n jolt-default-import-overrides)))
+    (if o (cdr o) (string-append "java.lang." n))))
 (define jolt-default-imports
   (let loop ((ns jolt-default-import-names) (m (jolt-hash-map)))
     (if (null? ns) m
         (loop (cdr ns)
-              (jolt-assoc m (jolt-symbol #f (car ns)) (string-append "java.lang." (car ns)))))))
+              (jolt-assoc m (jolt-symbol #f (car ns))
+                          (jolt-default-import-canonical (car ns)))))))
+;; The same set as a name lookup. A bare class name is a namespace MAPPING, not a
+;; global fact — (:import ...) and deftype map one into a single namespace, and
+;; these are the only ones mapped everywhere — so resolve asks this before it
+;; answers a bare capitalized symbol (host-static-classes.ss rsv-mapping-visible?).
+(define jolt-default-import-tbl
+  (let ((t (make-hashtable string-hash string=?)))
+    (for-each (lambda (n) (hashtable-set! t n (jolt-default-import-canonical n)))
+              jolt-default-import-names)
+    t))
+(define (jolt-default-import-fqn nm) (hashtable-ref jolt-default-import-tbl nm #f))
+;; The base is the auto-imports alone; host-static-classes.ss extends it with the
+;; namespace's OWN class mappings (its :imports and deftypes) once the class model
+;; it reads them out of exists. jolt-ns-map below goes through this variable, so
+;; that extension reaches ns-map too.
 (define (jolt-ns-imports . _) jolt-default-imports)
 
 ;; ns-map: every mapping visible in the ns — the java.lang imports, the refers
@@ -388,7 +444,8 @@
          (c (if (string? sns)
                 (var-cell-lookup (or (chez-resolve-alias cns sns) sns) nm)
                 (or (var-cell-lookup cns nm)
-                    (let ((ref (chez-resolve-refer cns nm))) (and ref (var-cell-lookup ref nm)))
+                    (let ((ref (chez-resolve-refer cns nm)))
+                      (and ref (var-cell-lookup (car ref) (cdr ref))))
                     ;; the implicit clojure.core refer — blocked by an ns-unmap tombstone
                     (and (not (eq? (hashtable-ref ns-refer-table (cons cns nm) #f) 'unmapped))
                          (var-cell-lookup "clojure.core" nm))))))
@@ -431,7 +488,8 @@
          (c (if (string? sns)
                 (var-cell-lookup (or (chez-resolve-alias cns sns) sns) nm)
                 (or (var-cell-lookup cns nm)
-                    (let ((ref (chez-resolve-refer cns nm))) (and ref (var-cell-lookup ref nm)))
+                    (let ((ref (chez-resolve-refer cns nm)))
+                      (and ref (var-cell-lookup (car ref) (cdr ref))))
                     (and (not (eq? (hashtable-ref ns-refer-table (cons cns nm) #f) 'unmapped))
                          (var-cell-lookup "clojure.core" nm))))))
     (if (and c (var-cell-defined? c)) c jolt-nil)))
@@ -495,12 +553,12 @@
   jolt-nil)
 
 ;; refer: bring the public vars of `ns-sym` into the current ns as unqualified
-;; names. :only [names] restricts to those names; :exclude [names] drops them.
-;; (:rename is not yet supported — the refer table keys on the plain name.)
+;; names. :only [names] restricts to those names; :exclude [names] drops them;
+;; :rename {source local} installs the var under its requested local name.
 (define (jolt-refer ns-sym . filters)
   (let ((target (ns-desig->name ns-sym)) (cns (chez-current-ns))
-        (only #f) (excl '()))
-    ;; parse :only / :exclude name lists into string sets
+        (only #f) (excl '()) (rename #f))
+    ;; parse :only / :exclude name lists and the :rename map
     (let loop ((a filters))
       (when (and (pair? a) (pair? (cdr a)))
         (let ((k (car a)) (v (cadr a)))
@@ -509,7 +567,8 @@
                                       (map symbol-t-name (filter symbol-t? xs))))))
               (cond
                 ((string=? (keyword-t-name k) "only")    (set! only (names)))
-                ((string=? (keyword-t-name k) "exclude") (set! excl (names)))))))
+                ((string=? (keyword-t-name k) "exclude") (set! excl (names)))
+                ((string=? (keyword-t-name k) "rename")  (set! rename v))))))
         (loop (cddr a))))
     ;; the target's own bucket (rt.ss ns-cells-index): a refer walked EVERY
     ;; interned var in the image before, so each (:use ...)/(refer ...) cost
@@ -519,7 +578,13 @@
         (when (var-cell-defined? c)
           (let ((nm (var-cell-name c)))
             (when (and (or (not only) (member nm only)) (not (member nm excl)))
-              (chez-register-refer! cns nm target)))))
+              (let ((renamed (and rename
+                                  (jolt-get rename (jolt-symbol #f nm)))))
+                (chez-register-refer!
+                 cns
+                 (if (symbol-t? renamed) (symbol-t-name renamed) nm)
+                 target
+                 nm))))))
       (ns-cells-list target))
     jolt-nil))
 ;; (:refer-clojure :exclude [names…]) — clojure.core always resolves on Chez, so
@@ -553,7 +618,9 @@
 ;; switches chez-current-ns when the expansion EVALUATES. Emit a runtime call
 ;; instead; it runs after in-ns, so the exclusion lands in the ns the form
 ;; creates and is in place before the loader reads the next form.
-(define (jolt-refer-clojure . args)
+;; A Scheme-side macro expander takes the JVM's leading &form / &env like any
+;; other (host-contract.ss hc-expand-1); neither is read here.
+(define (jolt-refer-clojure _form _env . args)
   (let loop ((a args) (names '()))
     (cond
      ((or (null? a) (null? (cdr a)))
@@ -613,11 +680,12 @@
   (list
     (cons "+" jolt-add) (cons "-" jolt-sub) (cons "*" jolt-mul) (cons "/" jolt-div)
     (cons "<" <) (cons ">" >) (cons "<=" <=) (cons ">=" >=)
-    (cons "=" jolt=) (cons "inc" jolt-inc) (cons "dec" jolt-dec) (cons "not" jolt-not)
+    (cons "=" jolt=) (cons "inc" jolt-inc) (cons "dec" jolt-dec) (cons "not" jolt-not-fn)
     (cons "min" min) (cons "max" max)
     (cons "mod" modulo) (cons "rem" remainder) (cons "quot" quotient)
     (cons "vector" jolt-vector) (cons "hash-map" jolt-hash-map) (cons "hash-set" jolt-hash-set)
-    (cons "conj" jolt-conj) (cons "get" jolt-get) (cons "nth" jolt-nth) (cons "count" jolt-count)
+    (cons "conj" jolt-conj) (cons "imap-cons" jolt-conj)
+    (cons "get" jolt-get) (cons "nth" jolt-nth) (cons "count" jolt-count)
     (cons "assoc" jolt-assoc) (cons "dissoc" jolt-dissoc) (cons "contains?" jolt-contains?)
     (cons "empty?" jolt-empty?) (cons "peek" jolt-peek) (cons "pop" jolt-pop)
     (cons "first" jolt-first) (cons "rest" jolt-rest) (cons "next" jolt-next) (cons "seq" jolt-seq)
@@ -628,7 +696,7 @@
     (cons "iterate" jolt-iterate)
     (cons "keys" jolt-keys) (cons "vals" jolt-vals)
     (cons "even?" jolt-even?) (cons "odd?" jolt-odd?) (cons "pos?" jolt-pos?) (cons "neg?" jolt-neg?)
-    (cons "zero?" jolt-zero?) (cons "identity" jolt-identity)
+    (cons "zero?" jolt-zero?) (cons "identity" jolt-identity-fn)
     (cons "ex-info" jolt-ex-info)))
 
 ;; --- bindings + *ns* --------------------------------------------------------
@@ -654,13 +722,23 @@
 (def-var! "clojure.core" "refer" jolt-refer)
 (def-var! "clojure.core" "refer-clojure" jolt-refer-clojure)
 (mark-macro! "clojure.core" "refer-clojure")
+(def-var! "clojure.core" "system-newline" "\n")
 ;; Runtime half of the refer-clojure macro: the expansion calls this AFTER the
 ;; enclosing ns form's in-ns has switched chez-current-ns (see jolt-refer-clojure).
 (def-var! "clojure.core" "refer-clojure-register!" jolt-refer-clojure-register!)
-;; defmacro — special form; the var cell exists so (resolve 'defmacro) works.
-;; The expander re-emits the form (the special-form path handles analysis).
+;; defmacro — special form; the var cell exists so (resolve 'defmacro) works and
+;; so macroexpand-1 can answer the JVM's shape,
+;;   (do (clojure.core/defn n ([&form &env …] …)) (. (var n) (setMacro)) (var n)).
+;; Analysis goes through the special-form path, never through here. The expansion
+;; is built by jolt.analyzer, which normalizes a defmacro form the same way that
+;; path does, so the reported shape cannot drift from the compiled one; before the
+;; analyzer image loads, the form comes back unchanged.
 (def-var! "clojure.core" "defmacro"
-  (lambda args (apply jolt-list (cons (jolt-symbol #f "defmacro") (list->cseq args)))))
+  (lambda (form _env . args)
+    (let ((mk (var-deref "jolt.analyzer" "defmacro-expansion")))
+      (if (procedure? mk)
+          (jolt-invoke1 mk form)
+          (apply jolt-list (jolt-symbol #f "defmacro") args)))))
 (mark-macro! "clojure.core" "defmacro")
 (def-var! "clojure.core" "alter-meta!" jolt-alter-meta!)
 (def-var! "clojure.core" "reset-meta!" jolt-reset-meta!)

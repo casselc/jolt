@@ -21,14 +21,41 @@
 ;; map: {:name "sqlite3" :darwin ["libsqlite3.0.dylib" ...] :linux ["libsqlite3.so.0" ...]}
 ;; with optional :optional (missing is fine — a feature-gated dep) and :process
 ;; (use the running process's symbols, e.g. libc sockets — no external file).
-(defn- load-natives! [natives]
+;; A :jolt/native candidate that names a PATH — it has a separator — is relative
+;; to the project, not to the current directory. dlopen draws the same line:
+;; a name with no separator is searched for, a name with one is used as given.
+;; Without this, a project that keeps its shared library beside its sources
+;; ("native/libfoo.so", which is what a build task produces) loaded only when
+;; jolt happened to be run from the project root: `bin/jolt` exports JOLT_PWD and
+;; then cd's to its own tree, so the path resolved against the wrong directory
+;; and the library read as missing.
+(defn- native-candidate [base c]
+  (if (and base
+           (or (str/includes? c "/") (str/includes? c "\\"))
+           (not (str/starts-with? c "/"))
+           (not (re-find #"^[A-Za-z]:" c)))
+    (str base "/" c)
+    c))
+
+;; strict? false lets a MISSING required library through with a warning instead of
+;; an error. A task is the one command that may be what PRODUCES the library it
+;; is declared alongside: a project whose native/ holds C sources and whose
+;; :jolt/native names the .so/.dylib built from them could not run its own build
+;; task, because applying the project loaded the natives first and the artifact
+;; was not there yet. Any task that actually needs the library still fails on
+;; use, and the warning names what was missing either way.
+(defn- load-natives!
+  ([natives] (load-natives! natives true))
+  ([natives strict?] (load-natives! natives strict? nil))
+  ([natives strict? base]
   (when (seq natives)
     (let [plat (current-platform)]
       (doseq [spec natives]
         (if (:process spec)
           (jolt.ffi/load-library)
           (let [c (get spec plat)
-                cands (if (string? c) [c] (vec c))
+                cands (mapv #(native-candidate base %)
+                            (if (string? c) [c] (vec c)))
                 ;; Load the native RTLD_LOCAL and register its handle, so the
                 ;; spec's defcfns resolve from the handle (isolated from the
                 ;; process-global namespace) rather than depending on global
@@ -40,16 +67,43 @@
             ;; skip it rather than fail. Its foreign calls only resolve in a static
             ;; build; document a dynamic candidate too to use it under `run`.
             (when (and (nil? hit) (not (:optional spec)) (not (:static spec)))
-              (throw (ex-info (str "required native library "
-                                   (or (:name spec) (first cands) "?")
-                                   " not found — tried " (pr-str cands) " for " (name plat))
-                              {:native spec})))))))))
+              (let [msg (str "required native library "
+                             (or (:name spec) (first cands) "?")
+                             " not found — tried " (pr-str cands) " for " (name plat))]
+                (if strict?
+                  (throw (ex-info msg {:native spec}))
+                  (binding [*out* *err*]
+                    (println (str "warning: " msg " (a task may build it)")))))))))))))
+
+;; Install the :jolt/provides declarations a resolved project collected (RFC 0014).
+;; An entry is [install-ns lib class ...]; lib is nil for the project's own.
+(defn- register-class-providers! [provides]
+  (doseq [[install-ns lib & classes] provides]
+    (jolt.host/register-class-provider! install-ns lib (vec classes))))
+
+;; Install the project's :jolt/replaces declarations: namespaces jolt provides as
+;; a host built-in that this project supplies itself. Like the providers above,
+;; it has to land before anything of the project compiles — the first require of
+;; babashka.fs is what reads it.
+(defn- register-ns-replacements! [replaces]
+  (doseq [n replaces] (jolt.host/replace-builtin-ns! n)))
 
 ;; Apply a resolved project's roots on top of the current (jolt-core) roots so app
-;; namespaces resolve while jolt.* stays loadable, then load its native deps.
-(defn- apply-project! [{:keys [roots natives]}]
-  (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
-  (load-natives! natives))
+;; namespaces resolve while jolt.* stays loadable, then register its declared host
+;; class providers and load its native deps.
+(defn- apply-project!
+  ([resolved] (apply-project! resolved true))
+  ([{:keys [roots natives provides replaces project-dir]} strict?]
+   (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
+   ;; Providers go in BEFORE anything of the project compiles (RFC 0014): the
+   ;; table has to be complete before the first class reference can miss, which
+   ;; is the whole reason the mapping is declared rather than registered by the
+   ;; provider as it loads.
+   (register-class-providers! provides)
+   (register-ns-replacements! replaces)
+   ;; project-dir is absent from a cpcache entry written by an older jolt; JOLT_PWD
+   ;; is where the user invoked us, which is the same directory in the common case.
+   (load-natives! natives strict? (or project-dir (jolt.host/getenv "JOLT_PWD")))))
 
 ;; Aliases selected by a leading -A:… — bound around the re-dispatch so every
 ;; command that resolves the project (run/path/build/repl/nrepl/task, and a
@@ -83,13 +137,29 @@
 (def ^:private ^:dynamic *cli-cp* nil)
 
 (defn- resolve-current
-  ([] (resolve-current []))
-  ([aliases] (deps/resolve-project (project-dir) (into *cli-aliases* aliases)
-                                   *cli-extra-edn*
-                                   {:tool? *cli-tool?*
-                                    :repro? *cli-repro?*
-                                    :cp *cli-cp*
-                                    :trace? (contains? #{:tree :trace-file} *cli-report*)})))
+  ([] (resolve-current [] nil))
+  ([aliases] (resolve-current aliases nil))
+  ([aliases opts]
+   (deps/resolve-project (project-dir) (into *cli-aliases* aliases)
+                         *cli-extra-edn*
+                         (merge {:tool? *cli-tool?*
+                                 :repro? *cli-repro?*
+                                 :cp *cli-cp*
+                                 :trace? (contains? #{:tree :trace-file} *cli-report*)}
+                                opts))))
+
+;; The resolution a task runs against: :tasks? lets a project's bb.edn
+;; contribute its own :paths/:deps (see jolt.deps), and a task's :extra-paths /
+;; :extra-deps ride in as a synthetic alias so they combine by the ordinary
+;; tools.deps rules rather than by a second set of them.
+(defn- resolve-for-task
+  ([] (resolve-for-task nil))
+  ([task]
+   (if-let [extra (and (map? task) (not-empty (select-keys task [:extra-paths :extra-deps])))]
+     (binding [*cli-aliases* (conj (vec *cli-aliases*) :jolt/task)
+               *cli-extra-edn* (assoc-in (or *cli-extra-edn* {}) [:aliases :jolt/task] extra)]
+       (resolve-current [] {:tasks? true}))
+     (resolve-current [] {:tasks? true}))))
 
 (defn- print-roots [{:keys [roots]}]
   (println (str/join ":" roots)))
@@ -205,11 +275,18 @@
 ;; with trailing args). The user-supplied extra args are appended, so an alias's
 ;; :main-opts and the command line combine exactly like the clj CLI, which
 ;; prepends the alias's :main-opts to the argv.
+(declare repl-session)
+
 (defn- apply-main-opts [main-opts extra-args]
   (let [opts (concat main-opts extra-args)]
     (cond
       (= "-m" (first opts)) (run-ns (second opts) (drop 2 opts))
       (= "-e" (first opts)) (eval-expr-string (second opts) (drop 2 opts) true)
+      ;; clojure.main -r / --repl: a REPL, the rest as *command-line-args*.
+      (#{"-r" "--repl"} (first opts))
+      (do (push-thread-bindings
+            {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest opts)))})
+          (repl-session))
       ;; clojure.main: a bare non-option first arg is a script path and the
       ;; rest is *command-line-args* — `jolt -M file.clj a b`, or an alias
       ;; whose :main-opts name a script. Same load shape as `run FILE`.
@@ -220,7 +297,9 @@
             {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest opts)))})
           (load-file (file-arg (first opts)))
           nil)
-      :else (throw (ex-info (str "unsupported :main-opts " (pr-str (vec opts))) {})))))
+      :else (throw (ex-info (str "unsupported :main-opts " (pr-str (vec opts))
+                                 " (accepted: -m NS, -e EXPR, -r, or a script FILE)")
+                            {:main-opts (vec opts)})))))
 
 (defn- parse-aliases [s]            ; "-M:a:b" / ":a:b" -> [:a :b]
   (let [s (if (str/starts-with? s "-") (subs s 2) s)]
@@ -241,21 +320,37 @@
            (some #(str/ends-with? x %) [".jolt" ".clj" ".cljc" ".cljs"])
            (jolt.host/file-exists? x))))
 
-;; run [-m NS args… | FILE]  — FILE may be "-" (stdin)
+(declare run-task)
+
+;; run [-m NS args… | FILE | TASK]  — FILE may be "-" (stdin). A token that
+;; isn't a file names a task, so `jolt run build` works like `bb run build`
+;; (and like the bare `jolt build`); --parallel is bb's flag for running a
+;; task's :depends concurrently.
 (defn- cmd-run [more]
-  (apply-project! (resolve-current))
-  (cond
-    (= "-m" (first more)) (run-ns (second more) (drop 2 more))
-    (seq more)            (do (push-thread-bindings
-                                {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest more)))})
-                              (load-file (file-arg (first more))) nil)
-    :else (throw (ex-info "run needs -m NS or a FILE" {}))))
+  (let [parallel? (= "--parallel" (first more))
+        more (if parallel? (rest more) more)]
+    (cond
+      (= "-m" (first more))
+      (do (apply-project! (resolve-current)) (run-ns (second more) (drop 2 more)))
+
+      (and (seq more) (not (run-file-arg? (first more))))
+      (run-task (first more) (rest more) parallel?)
+
+      (seq more)
+      (do (apply-project! (resolve-current))
+          (push-thread-bindings
+            {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest more)))})
+          (load-file (file-arg (first more))) nil)
+
+      :else (throw (ex-info "run needs -m NS, a FILE, or a task name" {})))))
 
 ;; -M[:alias…] [main-opts…] — resolve with the aliases (plus any bound by a
 ;; leading -A), then run their :main-opts followed by the command-line ones. With
 ;; no :main-opts anywhere in the selected aliases the command line supplies them
-;; on its own, so a bare `jolt -M -e EXPR` (or `-M -m NS`) works like clj — only
-;; an empty command line with no :main-opts is an error.
+;; on its own, so a bare `jolt -M -e EXPR` (or `-M -m NS`) works like clj. With
+;; nothing to run at all this is clojure.main with no arguments: a REPL over the
+;; resolved project — `clj -M:dev` is how a REPL with an alias's deps is started.
+;; (It used to be an error, "alias(es) [...] have no :main-opts".)
 (defn- cmd-M [arg more]
   (let [aliases (parse-aliases arg)
         {:keys [main-opts] :as resolved} (resolve-current aliases)]
@@ -263,7 +358,7 @@
       (fn []
         (if (or (seq main-opts) (seq more))
           (apply-main-opts main-opts more)
-          (throw (ex-info (str "alias(es) " (pr-str aliases) " have no :main-opts") {})))))))
+          (repl-session))))))
 
 ;; -A:alias… — select the aliases, then run the remaining argv as a command with
 ;; *cli-aliases* bound, so the command's own project resolution (run/path/build/
@@ -383,7 +478,7 @@
   ;; accumulated buffer is a complete form. Returns the (possibly multi-line)
   ;; buffer, or nil on EOF at the primary prompt.
   (loop [buf nil]
-    (print (if buf "... " "user=> ")) (flush)
+    (print (if buf "... " (str (ns-name *ns*) "=> "))) (flush)
     (let [line (read-line)]
       (cond
         (nil? line) buf                                 ; EOF: nil at primary, partial mid-form
@@ -394,11 +489,16 @@
         :else       (let [nb (str buf "\n" line)]
                       (if (repl-form-complete? nb) nb (recur nb)))))))
 
+;; `jolt repl`: resolve the project so deps (git libs) are on the roots and
+;; native libs are loaded — same context a run gets, so (require '[some.lib])
+;; works in the REPL — then the session. -M reaches the session directly, with
+;; its aliases already applied.
 (defn- repl []
-  ;; resolve the project so deps (git libs) are on the roots and native libs are
-  ;; loaded — same context a run gets, so (require '[some.lib]) works in the REPL.
   (try (apply-project! (resolve-current))
        (catch :default _ nil))
+  (repl-session))
+
+(defn- repl-session []
   ;; REPL-driven development: trace by default so an uncaught error in evaluated
   ;; code shows a tail-frame backtrace, no JOLT_TRACE needed (JOLT_TRACE=0 opts out).
   (jolt.host/enable-trace!)
@@ -430,21 +530,58 @@
                      (print bt))))
             (recur)))))))
 
-;; A deps.edn :tasks entry: a string is a shell command; a map is {:main-opts …}.
-(defn- run-task [name more]
-  (let [{:keys [tasks] :as resolved} (resolve-current)
-        task (get tasks (symbol name))]
-    (cond
-      (nil? task) (throw (ex-info (str "unknown command or task: " name " (see 'jolt help')") {:name name}))
-      (string? task) (jolt.host/sh task)
-      (map? task) (do (apply-project! resolved) (apply-main-opts (:main-opts task) more))
-      :else (throw (ex-info (str "bad task " name) {})))))
+;; A bb.edn / deps.edn :tasks entry. The semantics live in jolt.tasks — required
+;; here only when a task actually runs, so the CLI's startup closure (and the
+;; AOT'd jolt.main in a built binary) stays free of it and of babashka.process.
+;; The task's own :extra-paths / :extra-deps change the resolution, so the map is
+;; read from a first resolution and the run gets a second one only when it must.
+(defn- run-task [name more parallel?]
+  (let [base (resolve-for-task)
+        task (get (:tasks base) (symbol name))
+        resolved (if (and (map? task)
+                          (or (:extra-paths task) (:extra-deps task)))
+                   (resolve-for-task task)
+                   base)]
+    (when (nil? task)
+      (throw (ex-info (str "unknown command or task: " name " (see 'jolt tasks')")
+                      {:name name})))
+    ;; tolerant: see load-natives! — the task may be the build step for a
+    ;; :jolt/native library that does not exist yet
+    (apply-project! resolved false)
+    ((requiring-resolve 'jolt.tasks/run-task!)
+     {:tasks (:tasks resolved)
+      :name name
+      ;; :args verbatim — a :main-opts task hands them to run-ns, which is the
+      ;; one end-of-options point for every ns entry form and consumes the
+      ;; leading "--" itself. :app-args is the same list with it consumed, for
+      ;; the *command-line-args* a code body sees. Dropping it in both places
+      ;; would eat a second standalone "--" that is the program's own data.
+      :args (vec more)
+      :app-args (vec (drop-end-of-options more))
+      :parallel parallel?
+      :run-main-opts apply-main-opts})))
+
+;; `jolt tasks` — the listing. Reads the :tasks maps alone: naming the tasks
+;; needs no dependency expansion, and a project whose deps don't resolve should
+;; still be able to say what it can run.
+(defn- cmd-tasks []
+  ((requiring-resolve 'jolt.tasks/list-tasks!) (deps/project-tasks (project-dir))))
+
+;; babashka's :override-builtin — a task only displaces the jolt command of the
+;; same name when it says so. Checked from the :tasks maps directly, so it costs
+;; a small file read rather than loading the task runner on every command.
+(defn- builtin-overridden? [cmd]
+  (let [t (get (deps/project-tasks (project-dir)) (symbol cmd))]
+    (boolean (and (map? t) (:override-builtin t)))))
 
  ;; build [-m NS | FILE] [-o OUT] [--opt | --dev] [--no-direct-link] — AOT-compile
  ;; the app into a standalone executable. Resolves deps + roots like `run`, then hands
  ;; the entry namespace to the host build driver (jolt.host/build-binary, defined by
- ;; build.ss). Default mode is release; --opt selects optimized (release + the riskier
- ;; inline/scalar-replace passes), --dev unoptimized.
+ ;; build.ss). Default mode is release; --dev unoptimized. --opt now selects only
+ ;; the Chez compile parameters (inspector + procedure-source information off, so
+ ;; a smaller and faster binary that cannot render a Clojure backtrace) — it no
+ ;; longer changes what the compiler emits, because inline/scalar-replace follow
+ ;; direct-linking rather than a separate opt-in.
  ;; Release and optimized default to closed-world direct-linking + whole-program
  ;; inference (the throughput lever the perf audit identified). The tradeoff is runtime
  ;; redefinition: a plain def is frozen in the built binary (its eval/load-string and
@@ -547,14 +684,12 @@
             ;; DIR or $JOLT_TARGET_PACK) — see tools/cross-compile/README.md.
             target (:target opts)
             target-pack (or (:target-pack opts) (System/getenv "JOLT_TARGET_PACK"))]
-        (when (and target library?)
-          (throw (ex-info "cross build (--target) does not support --library yet" {})))
         (when (and target (nil? target-pack))
           (throw (ex-info "--target needs a target pack: --target-pack DIR (or $JOLT_TARGET_PACK)" {:target target})))
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake?)
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack)
           (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack))))))
 
 (defn- nrepl [more]
@@ -609,11 +744,16 @@
   (println "  run -m NS [args]       resolve deps.edn, load NS, call its -main")
   (println "  run FILE [args]        load a Clojure file")
   (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--tree-shake] [--dynamic]")
-  (println "              [--target MACHINE --target-pack DIR]")
-  (println "                         compile a standalone binary (--target cross-compiles")
-  (println "                         for another Chez machine; see tools/cross-compile)")
+  (println "              [--library] [--target MACHINE --target-pack DIR]")
+  (println "                         compile a standalone binary, or with --library a")
+  (println "                         shared object an embedder dlopens and calls through")
+  (println "                         jolt_library_init + jolt_lookup; --target")
+  (println "                         cross-compiles either one for another Chez machine")
+  (println "                         (see tools/cross-compile)")
   (println "  path                   print the resolved source roots")
-  (println "  <task> [args]          run a deps.edn :tasks entry")
+  (println "  tasks                  list the project's bb.edn/deps.edn :tasks")
+  (println "  <task> [args]          run a task (`run <task>` and `run --parallel")
+  (println "                         <task>` do the same)")
   (println "  help, --help, -h       print this message")
   (println "  version, --version, -V print the jolt version")
   (println)
@@ -714,10 +854,20 @@
 
       (#{"help" "--help" "-h"} cmd)      (usage)
       (#{"version" "--version" "-V"} cmd) (println (str "jolt " (version)))
+
+      ;; A task may take a built-in command's name, but only by asking to
+      ;; (babashka's :override-builtin). Checked here, after the two commands
+      ;; that read no project at all, so it costs nothing a command doesn't
+      ;; already pay: everything below resolves the project anyway.
+      (and (#{"run" "repl" "nrepl-server" "path" "build" "tasks"} cmd)
+           (builtin-overridden? cmd))
+      (run-task cmd more false)
+
       (= cmd "run")                      (cmd-run more)
       (= cmd "repl")                     (repl)
       (= cmd "nrepl-server")             (nrepl more)
       (= cmd "path")                     (cmd-path)
+      (= cmd "tasks")                    (cmd-tasks)
       ;; -Sdeps '<edn>' — an extra deps.edn map merged last into the chain,
       ;; bound around the re-dispatch of the remaining argv.
       (= cmd "-Sdeps")
@@ -752,6 +902,6 @@
                            " -Sforce, -Sthreads)")
                       {:option cmd}))
       ;; a bare FILE (or "-" for stdin) runs it, `run` optional — like bb; a
-      ;; non-file token falls through to a deps.edn :tasks lookup.
+      ;; non-file token falls through to a bb.edn/deps.edn :tasks lookup.
       (run-file-arg? cmd)                (cmd-run (cons cmd more))
-      :else                              (run-task cmd more))))
+      :else                              (run-task cmd more false))))

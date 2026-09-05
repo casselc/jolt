@@ -144,24 +144,34 @@
             specs)))
 
 ;; Threading: a list form threads x in as the first (->) or last (->>) arg; a bare
-;; symbol becomes (form x). Recursive; the expand-once cache makes that free.
+;; symbol becomes (form x). Iterative, so ONE expansion step yields the whole
+;; chain: a consumer that reads a single macroexpand-1 (tools.analyzer, a linter)
+;; gets the threaded shape, where a recursive definition would hand back another
+;; (-> ...) and only agree after a full macroexpand. A threaded step keeps its own
+;; form's metadata, so a fault inside the chain reports that step's line and not
+;; the whole chain's; a bare symbol has no form of its own and inherits the call's.
+;; loop*/recur, not loop: the loop macro is defined further down this file.
 (defmacro -> [x & forms]
-  (if (empty? forms)
-    x
-    (let [form (first forms)
-          threaded (if (seq? form)
-                     `(~(first form) ~x ~@(rest form))
-                     `(~form ~x))]
-      `(-> ~threaded ~@(rest forms)))))
+  (loop* [x x
+          forms (seq forms)]
+    (if forms
+      (let* [form (first forms)
+             threaded (if (seq? form)
+                        (with-meta `(~(first form) ~x ~@(rest form)) (meta form))
+                        `(~form ~x))]
+        (recur threaded (next forms)))
+      x)))
 
 (defmacro ->> [x & forms]
-  (if (empty? forms)
-    x
-    (let [form (first forms)
-          threaded (if (seq? form)
-                     `(~(first form) ~@(rest form) ~x)
-                     `(~form ~x))]
-      `(->> ~threaded ~@(rest forms)))))
+  (loop* [x x
+          forms (seq forms)]
+    (if forms
+      (let* [form (first forms)
+             threaded (if (seq? form)
+                        (with-meta `(~(first form) ~@(rest form) ~x) (meta form))
+                        `(~form ~x))]
+        (recur threaded (next forms)))
+      x)))
 
 ;; Forward declaration interns unbound vars (Clojure semantics). The interpreter
 ;; resolves forward refs lazily either way, but the COMPILER classifies globals at
@@ -545,12 +555,26 @@
         ;; :arglists — the parameter vectors as written (single arity: the one
         ;; vector; multi-arity: each clause's), attached to the var like Clojure so
         ;; doc/spec/expound tools can read it. tier-0 primitives only (loop, not
-        ;; map/reduce, which load later). def-meta-expr quotes it (data, not code).
+        ;; map/reduce, which load later). QUOTED in the expansion like the JVM's
+        ;; (def ^{:arglists (quote ([x]))} f …): def-meta-expr strips one quote
+        ;; layer either way, but a consumer that EVALUATES the def-name meta
+        ;; (tools.analyzer, typedclojure) read the bare ([x]) as a call of [x].
+        ;; A macro's two implicit params are elided, as the JVM's `sigs` elides
+        ;; them: a defmacro expands to a defn whose params are
+        ;; [&form &env & declared], and the var still reports the declared ones —
+        ;; what `doc` and every arglists-driven tool show. The trigger is &form in
+        ;; FIRST position, which is what the reference keys on. Guarded on length:
+        ;; a lone [&form] is an IndexOutOfBoundsException there (subvec 2..1), a
+        ;; crash rather than a shape worth reproducing.
+        declared-params (fn [pv]
+                          (if (and (vector? pv) (> (count pv) 1) (= (first pv) '&form))
+                            (subvec pv 2)
+                            pv))
         arglists (if (vector? (first body))
-                   (list (first body))
+                   (list (declared-params (first body)))
                    (loop [cs body acc []]
                      (if (seq cs)
-                       (recur (rest cs) (conj acc (first (first cs))))
+                       (recur (rest cs) (conj acc (declared-params (first (first cs)))))
                        (seq acc))))
         ;; precedence, matching the JVM's conj order: name metadata < the derived
         ;; :arglists < docstring < leading attr-map < trailing attr-map. So an
@@ -559,7 +583,7 @@
         ;; attr-map overrides the docstring (the JVM conj'es the attr-maps onto
         ;; {:doc docstring}, so they are what wins).
         m1 name-meta
-        m2 (if arglists (assoc (if m1 m1 {}) :arglists arglists) m1)
+        m2 (if arglists (assoc (if m1 m1 {}) :arglists (list 'quote arglists)) m1)
         m3 (if docstring (assoc (if m2 m2 {}) :doc docstring) m2)
         m4 (if attr-map (conj (if m3 m3 {}) attr-map) m3)
         meta-map (if trail-attr (conj (if m4 m4 {}) trail-attr) m4)]
@@ -583,18 +607,31 @@
 (defn- fresh-sym [] (symbol (str (gensym))))
 
 ;; cond->: thread expr through each (test form) pair, only when the test is truthy.
-;; Linear nested let*, a distinct fresh symbol per step.
+;; ONE let with g rebound per step, each step delegating to -> rather than
+;; building the call itself — the reference's shape, and cond->>'s (30-macros).
+;; It used to be a nest of let* forms with a fresh symbol per step, threading by
+;; hand, so a consumer reading a single macroexpand-1 saw neither shape nor the
+;; per-step position -> now carries. It stays in this tier, not beside cond->>,
+;; because jolt.analyzer uses it and compiles while 10-seq loads.
+;; loop/conj/nth only: partition, butlast and interleave are later tiers, and
+;; this body runs at expansion time (like `ns` above), so `let` and `loop` from
+;; earlier in this file are what it has.
 (defmacro cond-> [expr & clauses]
-  (let [step (fn step [prev cls]
-               (if (empty? cls)
-                 prev
-                 (let [t (first cls)
-                       f (nth cls 1)
-                       gn (fresh-sym)
-                       call (if (seq? f) `(~(first f) ~prev ~@(rest f)) `(~f ~prev))]
-                   `(let* [~gn (if ~t ~call ~prev)] ~(step gn (drop 2 cls))))))
-        g0 (fresh-sym)]
-    `(let* [~g0 ~expr] ~(step g0 clauses))))
+  (let [g (fresh-sym)
+        steps (loop [cs (seq clauses) acc []]
+                (if cs
+                  (recur (next (next cs))
+                         (conj acc `(if ~(first cs) (-> ~g ~(nth cs 1)) ~g)))
+                  acc))
+        n (count steps)]
+    (if (zero? n)
+      `(let [~g ~expr] ~g)
+      ;; g is rebound by every step but the last; the last IS the body.
+      (let [binds (loop [i 0 acc [g expr]]
+                    (if (< i (dec n))
+                      (recur (inc i) (conj (conj acc g) (nth steps i)))
+                      acc))]
+        `(let ~binds ~(nth steps (dec n)))))))
 
 ;; case: nested =/or tests (no jump table). Test constants are NOT evaluated —
 ;; symbols, lists, and composite literals (vectors/maps/sets) are quoted so their
@@ -611,10 +648,20 @@
         mk-const (fn [c] (if (and (or (symbol? c) (seq? c) (vector? c) (map? c) (set? c))
                                   (not (tagged? c)))
                            `(quote ~c) c))
+        ;; a keyword, nil, true or false constant is compared by identity: a
+        ;; keyword is interned (and re-interned on image restore), and identical?
+        ;; is an inline native op where = is a call. That is what the reference
+        ;; does for these too (its case hashes then compares identity). Symbols,
+        ;; strings and numbers keep = — a symbol is not interned here.
+        ident-const? (fn [c] (or (keyword? c) (nil? c) (true? c) (false? c)))
+        mk-test1 (fn [c]
+                   (if (ident-const? c)
+                     `(identical? ~g ~c)
+                     `(= ~g ~(mk-const c))))
         mk-test (fn [c]
                   (if (seq? c)
-                    `(or ~@(map (fn [v] `(= ~g ~(mk-const v))) c))
-                    `(= ~g ~(mk-const c))))
+                    `(or ~@(map mk-test1 c))
+                    (mk-test1 c)))
         ;; Collect test constants pairwise (so a trailing unpaired default is
         ;; excluded), flattening list/or-group tests into individual constants.
         ;; seed-only fns (reduce/conj/first/rest/drop/empty?/seq?) — analyzer.clj

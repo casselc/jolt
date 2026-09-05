@@ -59,6 +59,10 @@
 ;; either backing. Chez has flvector? / make-flvector / flvector-ref / -set! / -length.
 (define (na-fl-kind? k) (or (eq? k 'double) (eq? k 'float)))
 (define (ja-len v)     (if (flvector? v) (flvector-length v) (vector-length v)))
+;; alength in call position (op registry): the count of any array-like, but nil
+;; is the NullPointerException the JVM raises rather than 0.
+(define (jolt-alength a)
+  (if (jolt-nil? a) (throw-jvm 'NullPointerException "") (jolt-count a)))
 ;; An out-of-range index on the generic aget/aset path throws the typed JVM
 ;; exception with the JVM message. The proven ^doubles fast path (jolt-flaget/
 ;; jolt-flaset below) skips this pre-check — it relies on flvector-ref's own
@@ -252,6 +256,9 @@
     (make-pvec out)))
 (define (na-chunk-cons chunk rest)
   (if (fx=? 0 (pvec-count chunk)) rest (cseq-chunked chunk 0 rest)))
+;; the buffer is clojure.lang.ChunkBuffer, a Counted: count reads its fill
+(register-class-arm! jolt-chunkbuf? (lambda (b) "clojure.lang.ChunkBuffer"))
+(register-count-arm! jolt-chunkbuf? (lambda (b) (jolt-chunkbuf-cnt b)))
 
 ;; --- extend the collection dispatchers to see a jolt-array ------------------
 (register-count-arm! jolt-array? (lambda (c) (ja-len (jolt-array-vec c))))
@@ -317,6 +324,18 @@
 ;; dominant per-access cost in the hot loop. Non-fixnum indices (flonum/bignum/
 ;; ratio) keep the coercing path unchanged; out-of-range still raises via
 ;; flvector-ref's range check (the array bounds contract).
+;; The backing flvector of a ^doubles PARAM, bound once at the arity's entry by
+;; the back end so a loop over the array indexes the flvector directly instead
+;; of re-reading the checked record accessor on every aget/aset (bench/arrays
+;; 225 -> 145 ms in a Chez probe of the emitted loop). Raising here is the JVM
+;; checkcast at the call boundary: a ^doubles parameter that is not a double[]
+;; raises on entry there too, whether or not the body ever reads it.
+(define (jolt-array-vec-of a)
+  (if (jolt-array? a)
+      (jolt-array-vec a)
+      (jolt-throw (jolt-host-throwable "java.lang.ClassCastException"
+                   (string-append "class " (guard (e (#t "?")) (jolt-class-name a))
+                                  " cannot be cast to class [D")))))
 (define (jolt-flaget a i)
   (flvector-ref (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i)))))
 ;; unboxed write target for (aset ^doubles a i v): direct flvector-set!, returning
@@ -327,24 +346,11 @@
 
 ;; A range condition escaping jolt-flaget/jolt-flaset IS the array bounds error
 ;; on the proven ^doubles path (a typed pre-check there costs ~1ns/access, ~11%
-;; on an array-walking loop; wrapping in guard costs ~30ns/call). Classify the
-;; raw Chez condition at inspection time instead: (class e) and instance? report
-;; java.lang.ArrayIndexOutOfBoundsException, so a typed catch dispatches
-;; precisely through the exception hierarchy and an unrelated class does not
-;; broad-match. flvector-ref/-set! appear nowhere else in the runtime (the
-;; generic ja-ref/ja-set! path pre-checks and throws typed before reaching
-;; them), so the condition's who field is a precise key.
-(define (na-flv-oob-condition? c)
-  (and (condition? c) (who-condition? c)
-       (memq (condition-who c) '(flvector-ref flvector-set!))))
-(register-class-arm! na-flv-oob-condition?
-  (lambda (c) "java.lang.ArrayIndexOutOfBoundsException"))
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (if (na-flv-oob-condition? val)
-        (exception-isa? "ArrayIndexOutOfBoundsException"
-                        (last-dot (if (string? type-sym) type-sym (symbol-t-name type-sym))))
-        'pass)))
+;; on an array-walking loop; wrapping in guard costs ~30ns/call). The catch
+;; boundary turns that raw condition into a
+;; java.lang.ArrayIndexOutOfBoundsException by its who field (host-faults.ss
+;; array-index-whos), so a typed catch dispatches precisely through the
+;; exception hierarchy and an unrelated class does not match.
 
 ;; --- array identity: type / class / instance? recognize arrays ---------------
 ;; (type arr) / (class arr) -> the JVM array class name; (class …) delegates to
@@ -453,14 +459,46 @@
 ;; answering getName / setAccessible / get — the reflective field walk
 ;; (fireworks' datatype->map) works because the model already holds the field
 ;; list in the type's descriptor.
+;;
+;; "<modifiers> <type> <declaring-class>.<name>" for a field, and the same with a
+;; "(params)" tail for a method — the two shapes java.lang.reflect's own toString
+;; prints, spelled once. jmod-string (java/host-static-classes.ss) names the
+;; modifier bits exactly as Modifier/toString does.
+(define (jreflect-member-str mods type cls nm params)
+  (let ((ms (jmod-string mods)))
+    (string-append (if (string=? ms "") "" (string-append ms " "))
+                   type " " cls "." nm
+                   (if params (string-append "(" params ")") ""))))
+
 (define (reflect-field-name self) (vector-ref (jhost-state self) 0))
+;; The field's NAME as the JVM reports it: a record's field keys are keywords, and
+;; Field.getName has no leading colon. getDeclaredField used to match against
+;; jolt-str-render-one instead, which renders :x as ":x", so a lookup by the name
+;; getDeclaredFields had just reported could never hit and every field on every
+;; record raised NoSuchFieldException. One helper now answers for both.
+(define (reflect-key-name k) (if (keyword? k) (keyword-t-name k) (jolt-str-render-one k)))
 (register-host-methods! "reflect-field"
-  (list (cons "getName" (lambda (self) (let ((k (reflect-field-name self)))
-                                         (if (keyword? k) (keyword-t-name k) (jolt-str-render-one k)))))
+  (list (cons "getName" (lambda (self) (reflect-key-name (reflect-field-name self))))
         (cons "setAccessible" (lambda (self v) jolt-nil))
+        ;; the declaring class travels with the field so a caller can ask where it
+        ;; came from, as clojure.reflect's field->map does
+        (cons "getDeclaringClass"
+              (lambda (self) (let ((c (vector-ref (jhost-state self) 1)))
+                               (if c (jolt-class-for c) jolt-nil))))
+        (cons "getType" (lambda (self) (jolt-class-for "java.lang.Object")))
+        (cons "getModifiers" (lambda (self) (->num 1)))
         (cons "get" (lambda (self obj)
                       (jolt-get obj (reflect-field-name self) jolt-nil)))
-        (cons "toString" (lambda (self) (jolt-str-render-one (reflect-field-name self))))))
+        ;; the JVM's shape — "public java.lang.Object user.Foo.a". It used to be
+        ;; the bare field name, which said neither where the field lives nor that
+        ;; it is a field at all.
+        (cons "toString"
+              (lambda (self)
+                (jreflect-member-str 1 "java.lang.Object"
+                                     (let ((c (vector-ref (jhost-state self) 1))) (or c "?"))
+                                     (reflect-key-name (reflect-field-name self)) #f)))))
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "reflect-field")))
+                      (lambda (x) (record-method-dispatch x "toString" jolt-nil)))
 ;; --- reflective STATIC fields -------------------------------------------------
 ;; class name + field name -> a thunk returning the field's value. Class.getDeclared
 ;; Field consults this before the deftype/defrecord descriptor, so a host-modeled
@@ -473,15 +511,40 @@
   (hashtable-set! static-field-tbl (static-field-key cls nm) getter)
   jolt-nil)
 (define (lookup-static-field cls nm) (hashtable-ref static-field-tbl (static-field-key cls nm) #f))
+;; The names registered here FOR one class, so getDeclaredFields can report them
+;; alongside the class's other fields. The table is keyed "Class/field" because
+;; the lookup is by pair; a listing has to take the scan.
+(define (static-field-names-of cls)
+  (let ((prefix (string-append cls "/"))
+        (ks (hashtable-keys static-field-tbl)))
+    (let loop ((i 0) (acc '()))
+      (cond ((fx=? i (vector-length ks)) (reverse acc))
+            ((let ((k (vector-ref ks i)))
+               (and (fx>=? (string-length k) (string-length prefix))
+                    (string=? (substring k 0 (string-length prefix)) prefix)
+                    (substring k (string-length prefix) (string-length k))))
+             => (lambda (nm) (loop (fx+ i 1) (cons nm acc))))
+            (else (loop (fx+ i 1) acc))))))
 ;; One host type serves every registered static: it carries the class/field names
 ;; (so getName / toString read correctly) plus the getter.
 (register-host-methods! "static-field"
   (list (cons "setAccessible" (lambda (self v) jolt-nil))
         (cons "get" (lambda (self obj) ((vector-ref (jhost-state self) 2))))
         (cons "getName" (lambda (self) (vector-ref (jhost-state self) 1)))
-        (cons "toString" (lambda (self)
-                           (string-append "static field " (vector-ref (jhost-state self) 0)
-                                          "." (vector-ref (jhost-state self) 1))))))
+        (cons "getDeclaringClass" (lambda (self) (jolt-class-for (vector-ref (jhost-state self) 0))))
+        (cons "getType" (lambda (self) (jolt-class-for "java.lang.Object")))
+        ;; public static final — the shape every static jolt models is registered
+        ;; in, and the flags clojure.reflect turns into #{:public :static :final}.
+        ;; A caller filtering members by :static (typedclojure's static-members
+        ;; does) sees nothing at all without this, since the default was 1.
+        (cons "getModifiers" (lambda (self) (->num 25)))
+        (cons "toString"
+              (lambda (self)
+                (jreflect-member-str 25 "java.lang.Object"
+                                     (vector-ref (jhost-state self) 0)
+                                     (vector-ref (jhost-state self) 1) #f)))))
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "static-field")))
+                      (lambda (x) (record-method-dispatch x "toString" jolt-nil)))
 
 ;; Snapshot of the keyword intern tables as a jolt map of symbol -> keyword,
 ;; the way the JVM's clojure.lang.Keyword.table reads (its Reference values are
@@ -497,16 +560,57 @@
     (apply jolt-hash-map acc)))
 ;; clojure.lang.Keyword.table — compliment's keyword source reads it reflectively.
 (register-static-field! "clojure.lang.Keyword" "table" keyword-intern-table-map)
+;; --- the class-statics registry as MEMBERS -------------------------------------
+;; class-statics-tbl (java/host-static.ss) holds a class's statics with one rule:
+;; a procedure is a static METHOD, anything else a static FIELD's value. That is
+;; the same split reflection asks for, so the registry answers both halves of
+;; Class.getDeclaredFields / getDeclaredMethods for every host class jolt models —
+;; Long/MAX_VALUE, System/out, Math/floor, clojure.lang.RT/REQUIRE_LOCK. Before
+;; this, a host class reported no members at all and every reflective lookup on
+;; one raised, which is what a caller with a NoSuchFieldException handler could not
+;; tell apart from a field that genuinely is not there.
+;;
+;; Answers (name . value) pairs of one half or the other: a Method member needs the
+;; procedure as well as the name, and pairing them here is one table walk instead
+;; of a walk plus a lookup per hit.
+(define (class-static-members cls want-methods?)
+  (let ((h (lookup-class class-statics-tbl cls)))
+    (if (not h) '()
+        (let-values (((ks vs) (hashtable-entries h)))
+          (let loop ((i 0) (acc '()))
+            (cond ((fx=? i (vector-length ks)) (reverse acc))
+                  ((eq? want-methods? (and (procedure? (vector-ref vs i)) #t))
+                   (loop (fx+ i 1) (cons (cons (vector-ref ks i) (vector-ref vs i)) acc)))
+                  (else (loop (fx+ i 1) acc))))))))
+;; A Field over a registered static: the getter goes back through host-static-ref
+;; rather than closing over the value, so a mutable static cell (Compiler/LINE)
+;; reads its CURRENT value the way the JVM's Field.get does.
+(define (class-static-field-obj cls nm)
+  (make-jhost "static-field" (vector cls nm (lambda () (host-static-ref cls nm)))))
+;; Does cls register nm as a static FIELD — present, and not a procedure? A field
+;; may hold a falsy value (Boolean/FALSE is #f), so a bare hashtable-ref result
+;; cannot answer this; the miss marker host-static.ss already has is what can.
+(define (class-static-field? cls nm)
+  (let ((h (lookup-class class-statics-tbl cls)))
+    (and h (let ((v (hashtable-ref h nm host-static-miss)))
+             (and (not (eq? v host-static-miss)) (not (procedure? v)))))))
+
 (register-host-methods! "class"
   (list (cons "getDeclaredFields"
               (lambda (self)
-                (let ((desc (hashtable-ref chez-tag-desc (jclass-name self) #f)))
-                  (make-jolt-array
-                   (if desc
-                       (vector-map (lambda (k) (make-jhost "reflect-field" (vector k)))
-                                   (jrdesc-fkeys desc))
-                       (vector))
-                   'objects))))
+                (let* ((cls (jclass-name self))
+                       (desc (hashtable-ref chez-tag-desc cls #f))
+                       (declared (if desc
+                                     (map (lambda (k) (make-jhost "reflect-field" (vector k cls)))
+                                          (vector->list (jrdesc-fkeys desc)))
+                                     '()))
+                       (registered (map (lambda (nm)
+                                          (make-jhost "static-field"
+                                                      (vector cls nm (lookup-static-field cls nm))))
+                                        (static-field-names-of cls)))
+                       (statics (map (lambda (p) (class-static-field-obj cls (car p)))
+                                     (class-static-members cls #f))))
+                  (make-jolt-array (list->vector (append declared registered statics)) 'objects))))
         (cons "getDeclaredField"
               (lambda (self name)
                 (cond ((lookup-static-field (jclass-name self) name)
@@ -515,7 +619,161 @@
                                         (vector (jclass-name self) name getter))))
                       ((let ((desc (hashtable-ref chez-tag-desc (jclass-name self) #f)))
                          (and desc
-                              (find (lambda (k) (string=? (jolt-str-render-one k) name))
+                              (find (lambda (k) (string=? (reflect-key-name k) name))
                                     (vector->list (jrdesc-fkeys desc)))))
-                       => (lambda (k) (make-jhost "reflect-field" (vector k))))
-                      (else (throw-jvm 'NoSuchFieldException name)))))))
+                       => (lambda (k) (make-jhost "reflect-field" (vector k (jclass-name self)))))
+                      ((class-static-field? (jclass-name self) name)
+                       (class-static-field-obj (jclass-name self) name))
+                      (else (throw-jvm 'NoSuchFieldException name)))))
+        ;; getFields / getField are the public-member spellings. jolt's member
+        ;; sets are already flat per type (there is no separate inherited set to
+        ;; add), so they answer the same as the declared pair.
+        (cons "getFields"
+              (lambda (self) (record-method-dispatch self "getDeclaredFields" jolt-nil)))
+        (cons "getField"
+              (lambda (self name) (record-method-dispatch self "getDeclaredField" (list->cseq (list name)))))
+        ;; --- methods ----------------------------------------------------------
+        ;; Every method jolt's registries record for this class: the protocol
+        ;; registry's (whichever protocol or interface declares it), the host shim
+        ;; table's for a class a jhost tag models, and the class-statics table's
+        ;; procedures as static methods. A class jolt models by other means answers
+        ;; with whatever of those it has rather than guessing at the JVM's full set
+        ;; (recorded divergence :reflection-member-model) — String's instance
+        ;; methods are a `cond` in java/natives-str.ss, not data anything can
+        ;; enumerate, so String reports its statics and nothing else.
+        (cons "getDeclaredMethods" (lambda (self) (class-method-array self)))
+        (cons "getMethods" (lambda (self) (class-method-array self)))
+        ;; getMethod / getDeclaredMethod: the JVM selects an overload by parameter
+        ;; TYPES; jolt has no signatures, so it selects by parameter COUNT and
+        ;; raises NoSuchMethodException when nothing matches — the exception the
+        ;; callers that ask this way are already catching.
+        (cons "getDeclaredMethod" (lambda (self name . params) (class-find-method self name params)))
+        (cons "getMethod" (lambda (self name . params) (class-find-method self name params)))
+        (cons "getConstructor" (lambda (self . params) (class-find-ctor self params)))
+        (cons "getDeclaredConstructor" (lambda (self . params) (class-find-ctor self params)))))
+
+;; How many parameters a reflective lookup was asked for. Java spells these
+;; (String, Class...) so from Clojure the types arrive as ONE array — the usual
+;; (into-array Class [...]) — but a caller may also spell them out, and nil is the
+;; no-argument case either way.
+(define (jreflect-arity params)
+  (cond ((null? params) 0)
+        ((and (null? (cdr params)) (jolt-nil? (car params))) 0)
+        ((and (null? (cdr params)) (jolt-array? (car params)))
+         (ja-len (jolt-array-vec (car params))))
+        ((and (null? (cdr params)) (or (pvec? (car params)) (cseq? (car params))))
+         (length (seq->list (jolt-seq (car params)))))
+        (else (length params))))
+(define (class-find-method cls name params)
+  (let* ((want (jreflect-arity params))
+         (ms (vector->list (jolt-array-vec (class-method-array cls))))
+         (named (filter (lambda (m) (string=? (reflect-method-name m) name)) ms)))
+    (or (find (lambda (m) (fx=? want (reflect-method-arity m))) named)
+        ;; Parameter counts are a FLOOR, not a signature: most registered statics
+        ;; are (lambda args …) and report 0, so an exact-count miss is far more
+        ;; often jolt not knowing the arity than the method not existing. A name
+        ;; that IS registered therefore answers with its member rather than
+        ;; raising — the caller gets the method it asked for, with the parameter
+        ;; types jolt has for everything (Object). Only an unknown NAME raises.
+        (and (pair? named) (car named))
+        (throw-jvm 'NoSuchMethodException
+                   (string-append (jclass-name cls) "." name "(" (jreflect-param-str want) ")")))))
+(define (class-find-ctor cls params)
+  (let ((want (jreflect-arity params))
+        (cs (seq->list (jolt-seq (class-constructors cls)))))
+    (or (find (lambda (c) (= want (jnum->exact (vector-ref (jhost-state c) 1)))) cs)
+        (throw-jvm 'NoSuchMethodException
+                   (string-append (jclass-name cls) ".<init>(" (jreflect-param-str want) ")")))))
+
+;; java.lang.reflect.Method, enough of one to name it, say where it was declared,
+;; and call it.
+(define (reflect-method-cls self) (vector-ref (jhost-state self) 0))
+(define (reflect-method-name self) (vector-ref (jhost-state self) 1))
+(define (reflect-method-fn self) (vector-ref (jhost-state self) 2))
+;; A STATIC method's impl takes exactly its arguments; an instance method's takes
+;; `this` first. The flag is what tells the two apart everywhere it matters —
+;; the parameter count, the modifiers, and whether invoke passes the target — so
+;; it travels in the member itself rather than being re-derived per call site.
+(define (reflect-method-static? self) (vector-ref (jhost-state self) 3))
+;; Lowest arity the impl accepts, less the leading `this` for an instance method —
+;; the JVM's parameter count for the same method.
+(define (reflect-method-param-count f static?)
+  (if (procedure? f)
+      (let ((mask (procedure-arity-mask f))
+            (drop (if static? 0 1)))
+        (let loop ((k (if static? 0 1)))
+          (cond ((fx>? k 24) 0)
+                ((bitwise-bit-set? mask k) (fx- k drop))
+                (else (loop (fx+ k 1))))))
+      0))
+(define (reflect-method-arity self)
+  (reflect-method-param-count (reflect-method-fn self) (reflect-method-static? self)))
+(register-host-methods! "reflect-method"
+  (list (cons "getName" (lambda (self) (reflect-method-name self)))
+        (cons "getDeclaringClass" (lambda (self) (jolt-class-for (reflect-method-cls self))))
+        (cons "setAccessible" (lambda (self v) jolt-nil))
+        (cons "getParameterCount" (lambda (self) (->num (reflect-method-arity self))))
+        (cons "getParameterTypes"
+              (lambda (self)
+                (make-jolt-array
+                 (make-vector (reflect-method-arity self) (jolt-class-for "java.lang.Object"))
+                 'objects)))
+        ;; jolt's registries carry no return or throws signature; Object and empty
+        ;; are the honest answers, and they are what the JVM reports for an
+        ;; Object-returning method with no checked exceptions anyway.
+        (cons "getReturnType" (lambda (self) (jolt-class-for "java.lang.Object")))
+        (cons "getExceptionTypes" (lambda (self) (make-jolt-array (vector) 'objects)))
+        ;; public, plus static for a class-statics entry — the bit clojure.reflect
+        ;; renders as :static and every "is this a static method" filter reads.
+        (cons "getModifiers" (lambda (self) (->num (if (reflect-method-static? self) 9 1))))
+        ;; Method.invoke(obj, Object... args) — from Clojure the varargs arrive as
+        ;; one array, so a lone trailing array IS the argument list and gets
+        ;; splatted. Anything else is passed straight through, which is what a
+        ;; caller spelling the arguments out means. A static ignores the target,
+        ;; as the JVM does (Method.invoke takes null there).
+        (cons "invoke"
+              (lambda (self target . args)
+                (let ((as (if (and (= 1 (length args)) (jolt-array? (car args)))
+                              (vector->list (jolt-array-vec (car args)))
+                              args)))
+                  (if (reflect-method-static? self)
+                      (apply (reflect-method-fn self) as)
+                      (apply (reflect-method-fn self) target as)))))
+        (cons "toString"
+              (lambda (self)
+                (jreflect-member-str (if (reflect-method-static? self) 9 1)
+                                     "java.lang.Object"
+                                     (reflect-method-cls self) (reflect-method-name self)
+                                     (jreflect-param-str (reflect-method-arity self)))))))
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "reflect-method")))
+                      (lambda (x) (record-method-dispatch x "toString" jolt-nil)))
+;; The type's registered methods as a Method[]. type-registry is
+;; tag -> (proto -> (method-name -> fn)); a name declared by two protocols
+;; surfaces once per declaration, as it does on the JVM for two interfaces.
+(define (class-method-array cls)
+  (let* ((nm (jclass-name cls))
+         (fqn (jch-fqn-of-simple nm))
+         (ti (or (hashtable-ref type-registry nm #f)
+                 (hashtable-ref type-registry fqn #f)))
+         (acc '()))
+    (define (add! owner name f static?)
+      (set! acc (cons (make-jhost "reflect-method" (vector owner name f static?)) acc)))
+    (when ti
+      (let-values (((protos impls) (hashtable-entries ti)))
+        (vector-for-each
+         (lambda (proto pi)
+           (let-values (((names fns) (hashtable-entries pi)))
+             (vector-for-each (lambda (n f) (add! nm n f #f)) names fns)))
+         protos impls)))
+    ;; the shim's instance methods, for a class a jhost tag models. Two tags can
+    ;; name one class, so both are walked; a name registered under both surfaces
+    ;; twice, as an interface method inherited twice does on the JVM.
+    (for-each
+     (lambda (tag)
+       (let ((h (hashtable-ref host-methods-tbl tag #f)))
+         (when h
+           (let-values (((names fns) (hashtable-entries h)))
+             (vector-for-each (lambda (n f) (add! nm n f #f)) names fns)))))
+     (jhost-tags-for-fqn fqn))
+    (for-each (lambda (p) (add! nm (car p) (cdr p) #t)) (class-static-members nm #t))
+    (make-jolt-array (list->vector (reverse acc)) 'objects)))

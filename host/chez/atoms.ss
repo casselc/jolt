@@ -79,7 +79,8 @@
   (cond
     ((jolt-atom? x) (jolt-atom-val x))
     ((jolt-reduced? x) (jolt-reduced-val x))
-    (else (throw-jvm (quote ClassCastException) (string-append "deref: unsupported reference type " (jolt-final-str x))))))
+    ;; the reference's last resort is a Future cast: nil is a NullPointerException
+    (else (jolt-cast-throw x "java.util.concurrent.Future"))))
 
 ;; CAS the val from `old` to `nv` by identity (eq?), atomically. Returns #t on
 ;; success. The compute step (f) runs outside this, so we re-check under the lock.
@@ -110,12 +111,14 @@
     (jolt-atom-notify a old v)
     v))
 
-;; compare-and-set! keeps jolt= (value) semantics, done atomically under the lock.
+;; compare-and-set! uses the same identity comparison as the swap! CAS helper,
+;; but keeps this hot public path inline rather than adding another procedure
+;; call around the mutex transition.
 (define (jolt-compare-and-set! a oldv newv)
   (jolt-need-atom a)
   (jolt-atom-validate a newv)
   (let ((swapped (jolt-with-mutex (jolt-atom-lock a)
-                   (if (jolt= (jolt-atom-val a) oldv)
+                   (if (eq? (jolt-atom-val a) oldv)
                        (begin (jolt-atom-val-set! a newv) #t)
                        #f))))
     (when swapped (jolt-atom-notify a oldv newv))

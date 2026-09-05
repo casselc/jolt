@@ -145,23 +145,37 @@
 ;; identity-keyed alist of mutable pairs and push. Vars without metadata yet
 ;; (early bootstrap) pass through: the check fires once metadata is settled.
 (define (jolt-push-thread-bindings frame)
+  (dyn-push-frame! (thread-binding-pairs frame))
+  jolt-nil)
+;; The scoped form, and the one to reach for: dyn-with-frame restores the whole
+;; stack instead of popping a head, so a throw (or a park) inside the extent
+;; cannot leave the frame standing for the rest of the thread. Same relationship
+;; jolt-with-ns-load-vars has to its own push!/pop! pair.
+(define (jolt-with-thread-bindings frame thunk)
+  (dyn-with-frame (thread-binding-pairs frame) thunk))
+;; A jolt map of var-cell -> value as the alist dyn-push-frame! wants, refusing a
+;; non-dynamic var on the way (the check is the JVM's, and belongs to both forms).
+(define (thread-binding-pairs frame)
   (let ((pairs (pmap-fold frame
                  (lambda (cell v acc)
-                   ;; JVM semantics: only an explicitly ^:dynamic var binds. No
-                   ;; meta entry = non-dynamic (runtime dynamic vars are tagged
-                   ;; via def-dynvar!/def-var-with-meta!; the declare path via
-                   ;; set-var-meta!).
-                   (let ((m (var-cell-meta cell)))
-                     (when (not (and m (jolt-truthy? (jolt-get m (keyword #f "dynamic")))))
-                       (jolt-throw
-                        (jolt-ex-info
-                         (string-append "Can't dynamically bind non-dynamic var: "
-                                        (var-cell-ns cell) "/" (var-cell-name cell))
-                         jolt-nil))))
+                   ;; JVM semantics: only an explicitly ^:dynamic var binds. The
+                   ;; FLAG is what says so — a field set by the def that declared
+                   ;; it (rt.ss def-var-with-meta!/set-var-meta!, and def-dynvar!
+                   ;; for the runtime ones) or by .setDynamic. Reading :dynamic
+                   ;; back out of the metadata instead let alter-meta! hand a var
+                   ;; the ability to bind, and take it away again, neither of
+                   ;; which moves the JVM's flag.
+                   (begin
+                     (when (not (var-cell-dynamic? cell))
+                       ;; Var.pushThreadBindings raises IllegalStateException, not
+                       ;; an ExceptionInfo — so ex-data on it is nil, and only a
+                       ;; typed host throwable can say that.
+                       (throw-jvm (quote IllegalStateException)
+                                  (string-append "Can't dynamically bind non-dynamic var: "
+                                                 (var-cell-ns cell) "/" (var-cell-name cell)))))
                    (cons (cons cell v) acc))
                  '())))
-    (dyn-push-frame! pairs)
-    jolt-nil))
+    pairs))
 
 (define (jolt-pop-thread-bindings)
   (when (pair? (dyn-binding-stack))
@@ -177,21 +191,28 @@
 ;; source loads). Frames push directly like the loader's; an empty frame keeps
 ;; push/pop balanced if the cells are ever absent.
 (define jolt-nsload-cells #f)
-(define (jolt-ns-load-vars-push!)
+(define (jolt-ns-load-var-pairs)
   (unless jolt-nsload-cells
     (set! jolt-nsload-cells
       (let ((cells (map (lambda (nm) (var-cell-lookup "clojure.core" nm))
                         '("*warn-on-reflection*" "*assert*" "*unchecked-math*"))))
         (if (for-all values cells) cells 'missing))))
-  (dyn-push-frame!
-    (if (pair? jolt-nsload-cells)
-        (map (lambda (c) (cons c (var-cell-root c))) jolt-nsload-cells)
-        '()))
+  (if (pair? jolt-nsload-cells)
+      (map (lambda (c) (cons c (var-cell-root c))) jolt-nsload-cells)
+      '()))
+(define (jolt-ns-load-vars-push!)
+  (dyn-push-frame! (jolt-ns-load-var-pairs))
   jolt-nil)
 (define (jolt-ns-load-vars-pop!)
   (when (pair? (dyn-binding-stack))
     (dyn-binding-stack (cdr (dyn-binding-stack))))
   jolt-nil)
+;; The same frame for a caller that has a thunk rather than a pair of emitted
+;; statements: dyn-with-frame restores the whole stack instead of popping a head,
+;; so a nested load that leaves a frame standing cannot make the pop take the
+;; wrong one, and a fiber parking mid-load re-enters without pushing twice.
+(define (jolt-with-ns-load-vars thunk)
+  (dyn-with-frame (jolt-ns-load-var-pairs) thunk))
 
 ;; get-thread-bindings: a jolt map of every currently-bound cell -> value,
 ;; innermost wins. Merge oldest-frame-first (the stack head is innermost). The
@@ -211,34 +232,27 @@
 (define (jolt-thread-bound? v)
   (and (var-cell? v) (dyn-find-binding v) #t))
 
-;; var-set (clojure.core/var-set): set the var's root value, always allowed.
-;; This is the public API — different from set! (the special form), which only
-;; sets thread-local bindings.
-(define (jolt-var-set v val)
-  (if (var-cell? v)
-      (let ((p (dyn-find-binding v)))
-        (if p
-            (begin (set-cdr! p val) val)
-            ;; a ROOT change is Var.bindRoot: validate, set, notify watches
-            (let ((old (var-cell-root v)))
-              (iref-validate v val)
-              (var-cell-root-set! v val) (var-cell-defined?-set! v #t)
-              (iref-notify v old val)
-              val)))
-      (throw-jvm (quote ClassCastException) "var-set: not a var")))
-
-;; jolt-set-var!: the set! special form lowered to a call. Throws when there
-;; is no active thread binding — set! never mutates the root, matching JVM.
+;; jolt-set-var!: Var.set — the ONE write path behind both the set! special form
+;; and clojure.core/var-set, which is `(. x (set val))` and nothing else. It
+;; writes the innermost thread binding; with no binding it throws, because
+;; establishing a root is bindRoot's job (alter-var-root / def / with-redefs) and
+;; a var-set that quietly did it instead let code that reference Clojure refuses
+;; to run mutate a root shared with every other thread.
+;;
+;; The validator runs FIRST, ahead of the binding lookup, so a value the var
+;; rejects reports the validator rather than the missing binding — the order
+;; Var.set has, and observable: (var-set #'v bad) on an unbound var says
+;; "Invalid reference state", not "Can't change/establish root binding".
 (define (jolt-set-var! v val)
   (if (var-cell? v)
-      (let ((p (dyn-find-binding v)))
-        (if p
-            (begin (set-cdr! p val) val)
-            (jolt-throw
-             (jolt-ex-info
-              (string-append "Can't change/establish root binding of: "
-                             (var-cell-name v) " with set")
-              jolt-nil))))
+      (begin
+        (iref-validate v val)
+        (let ((p (dyn-find-binding v)))
+          (if p
+              (begin (set-cdr! p val) val)
+              (throw-jvm (quote IllegalStateException)
+                         (string-append "Can't change/establish root binding of: "
+                                        (var-cell-name v) " with set")))))
       (throw-jvm (quote ClassCastException) "set!: not a var")))
 
 ;; alter-var-root: apply f to the current root plus args, atomically.
@@ -280,8 +294,13 @@
         new))))
 
 ;; __local-var: a fresh free-standing var cell (not interned). with-local-vars
-;; binds these as lexical locals; var-get/var-set read/write the root. Each gets a
-;; unique name so two locals never compare/hash equal as map keys.
+;; binds these as lexical locals and gives each a THREAD binding for the extent of
+;; the form; var-get/var-set read and write that binding. Each gets a unique name
+;; so two locals never compare/hash equal as map keys.
+;;
+;; With no init the root is the Unbound marker, as Var/create leaves it: the cell
+;; only ever holds a thread binding, so a local var carried out of the form past
+;; the pop reads back unbound rather than nil.
 ;; The bump and the read are one step — "two locals never compare/hash equal" is
 ;; the whole reason for the counter, and unlocked two threads draw the same
 ;; number. See jolt-gensym in converters.ss.
@@ -289,15 +308,18 @@
 (define local-var-mutex (make-mutex))
 (define local-var-meta (jolt-hash-map (keyword #f "dynamic") #t))
 (define (jolt-local-var . args)
-  (let ((c (make-var-cell "" (string-append "local-"
-                                            (number->string
-                                             (jolt-with-mutex local-var-mutex
-                                               (set! local-var-counter (fx+ local-var-counter 1))
-                                               local-var-counter)))
-                          (if (pair? args) (car args) jolt-nil)
-                          #t #f #f #f)))
+  (let* ((name (string-append "local-"
+                              (number->string
+                               (jolt-with-mutex local-var-mutex
+                                 (set! local-var-counter (fx+ local-var-counter 1))
+                                 local-var-counter))))
+         (c (make-var-cell "" name
+                           (if (pair? args) (car args) (make-jolt-var-unbound "" name))
+                           #t #f #f #f #t)))
     ;; Clojure builds these with Var/create + setDynamic, so a local var takes a
     ;; thread binding like any other — tools.reader hands one to with-bindings.
+    ;; Hence the flag in the constructor above, beside the metadata that says the
+    ;; same thing to a reader of (meta v).
     (var-cell-meta-set! c local-var-meta)
     c))
 
@@ -342,6 +364,16 @@
                 (else (%dyn-var-get v))))
         (%dyn-var-get v))))
 
+;; bound? (vars.ss): Var.isBound is hasRoot() OR a thread binding — a var with no
+;; root is still bound while one is in scope, which is the only state a
+;; with-local-vars local is ever in. Chained here for the same reason var-get is:
+;; vars.ss loads before the binding stack exists.
+(define %dyn-var-bound-one? jolt-var-bound-one?)
+(set! jolt-var-bound-one?
+  (lambda (v)
+    (or (%dyn-var-bound-one? v)
+        (and (var-cell? v) (dyn-find-binding v) #t))))
+
 ;; var-cell keys hash/compare by ns/name (jolt=2 in vars.ss already compares
 ;; ns/name) — stable under root mutation, so a var works as a map key (with-redefs
 ;; builds (hash-map (var f) v); get-thread-bindings returns a var-keyed map).
@@ -352,10 +384,11 @@
 (def-var! "clojure.core" "pop-thread-bindings" jolt-pop-thread-bindings)
 (def-var! "clojure.core" "get-thread-bindings" jolt-get-thread-bindings)
 (def-var! "clojure.core" "__thread-bound?" jolt-thread-bound?)
-(def-var! "clojure.core" "var-set" jolt-var-set)
+(def-var! "clojure.core" "var-set" jolt-set-var!)
 (def-var! "clojure.core" "alter-var-root" jolt-alter-var-root)
 (def-var! "clojure.core" "__local-var" jolt-local-var)
-;; jolt-set-var! is the set! special form backend — throws when no thread binding.
+;; jolt.host/set-var! is the set! special form backend — the same Var.set as
+;; clojure.core/var-set above, under the name the analyzer emits.
 (def-var! "jolt.host" "set-var!" jolt-set-var!)
 ;; re-assert var-get / deref to the new (stack-aware) closures (vars.ss captured
 ;; the pre-chain values).

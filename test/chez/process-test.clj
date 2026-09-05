@@ -94,6 +94,34 @@
 (let [sub (fs/create-temp-dir {:prefix "jp-dir-"})]
   (check-eq "dir set" (str/trim (:out (sh ["pwd"] {:dir (str sub)}))) (str sub))
   (fs/delete-tree sub))
+;; JOLT_PWD is the launcher's message to THIS process — bin/jolt exports the user's
+;; cwd before cd'ing to its checkout. A child's cwd is whatever the spawn chose, so
+;; the variable is never forwarded: a child jolt reads user.dir from its own cwd
+;; instead of inheriting the parent's project. A caller that puts it in the env map
+;; asked for it and gets it.
+(check-eq "JOLT_PWD is not forwarded"
+          (str/trim (:out (sh ["sh" "-c" "echo ${JOLT_PWD-unset}"]))) "unset")
+(check-eq "JOLT_PWD is not forwarded through :extra-env"
+          (str/trim (:out (sh ["sh" "-c" "echo ${JOLT_PWD-unset}"] {:extra-env {"JP_Y" "1"}}))) "unset")
+(check-eq "an explicit JOLT_PWD is honored"
+          (str/trim (:out (sh ["sh" "-c" "echo $JOLT_PWD"] {:extra-env {"JOLT_PWD" "/explicit"}}))) "/explicit")
+;; End to end, in the shape a test harness takes: this process's own directory
+;; has a README.md (the jolt checkout's), and a child jolt rooted at another
+;; project — one with its own README.md — must read THAT one, whether it is put
+;; there by :dir or by a shell's cd. The wrong answer is the parent's README, a
+;; different text rather than a missing file. The child is the jolt under test:
+;; smoke.sh hands it down in JOLT_EXE, and bin/jolt exports the same.
+(let [sub (fs/create-temp-dir {:prefix "jp-proj-"})
+      exe (or (System/getenv "JOLT_EXE") (some-> (fs/which "jolt") str) "jolt-not-found:set-JOLT_EXE")
+      expr "(print (slurp \"README.md\"))"]
+  (spit (str sub "/README.md") "PROJECT-README-MARKER")
+  (check-eq "the parent's own README is not the project's"
+            (str/includes? (slurp "README.md") "PROJECT-README-MARKER") false)
+  (check-eq "a child jolt under :dir reads its own project"
+            (:out (sh [exe "-e" expr] {:dir (str sub)})) "PROJECT-README-MARKER")
+  (check-eq "a child jolt behind a cd reads its own project"
+            (:out (sh ["sh" "-c" (str "cd '" sub "' && '" exe "' -e '" expr "'")])) "PROJECT-README-MARKER")
+  (fs/delete-tree sub))
 
 ;; ProcessBuilder.start throws (like the JVM) when the program can't be resolved,
 ;; with a "No such file" message — not a shell "not found" after spawning
@@ -382,6 +410,40 @@
 (jolt.host/block-sigint)
 (check-eq "a child does not inherit jolt's blocked SIGINT"
           (:exit @(process ["sh" "-c" "kill -INT $$"] {:out :string :err :inherit})) 130)
+
+;; A per-thread subprocess — ThreadLocal<Process>, the shape a worker pool uses to
+;; give each thread its own long-lived helper program. It only works if the child
+;; threads run initialValue themselves: jolt's ThreadLocal was a Chez thread
+;; parameter, which a forked thread inherits, so every worker got the PARENT's
+;; already-drained process and read an empty string off it (jolt-uecg).
+(let [tl   (proxy [ThreadLocal] []
+             (initialValue [] (.start (ProcessBuilder. ["sh" "-c" "echo $$"]))))
+      ;; each caller reaps the process it owns, on its own thread — the child
+      ;; threads are the only holders of theirs once .join returns
+      pid  (fn [] (let [p (.get tl) s (str/trim (slurp (.getInputStream p)))]
+                    (.waitFor p)
+                    s))
+      main (pid)
+      seen (atom [])
+      ts   (mapv (fn [_] (Thread. (fn [] (swap! seen conj (pid))))) (range 3))]
+  (doseq [t ts] (.start t))
+  (doseq [t ts] (.join t))
+  (check-eq "each thread's ThreadLocal<Process> is its own subprocess"
+            (count (distinct (cons main @seen))) 4)
+  (check-eq "and every worker actually read a pid"
+            (every? (fn [s] (and (seq s) (parse-long s))) @seen) true))
+
+;; The inheritable variant is the opposite contract and must keep working: the
+;; child shares the parent's process rather than spawning a second one.
+(let [tl   (proxy [InheritableThreadLocal] []
+             (initialValue [] (.start (ProcessBuilder. ["sh" "-c" "echo $$"]))))
+      main (.get tl)
+      got  (promise)]
+  (.start (Thread. (fn [] (deliver got (identical? (.get tl) main)))))
+  (check-eq "an InheritableThreadLocal<Process> child shares the parent's process"
+            (deref got 5000 :TIMED-OUT) true)
+  (slurp (.getInputStream main))
+  (.waitFor main))
 
 (if (empty? @failures)
   (println "PROCESS-TEST OK")

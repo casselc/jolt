@@ -165,10 +165,21 @@
 
 ;; Fresh free-standing var cells bound as locals; read/write with
 ;; var-get/var-set. The cells come from the host seam __local-var.
+;;
+;; The init goes into a THREAD BINDING, not the cell's root — Clojure's expansion
+;; is Var/create + setDynamic followed by pushThreadBindings, and var-set (Var.set)
+;; only ever writes a thread binding. Rooting them instead left the locals
+;; thread-bound? false and only worked because var-set used to fall back to a root
+;; write. The frame is scoped like `binding`'s, so leaving the form — by a throw as
+;; much as by returning — unbinds them again.
 (defmacro with-local-vars [bindings & body]
-  (let [binds (reduce (fn [acc p] (conj (conj acc (first p)) `(__local-var ~(second p))))
-                      [] (partition 2 bindings))]
-    `(let [~@binds] ~@body)))
+  (let [ps (partition 2 bindings)
+        binds (reduce (fn [acc p] (conj (conj acc (first p)) `(__local-var))) [] ps)
+        pairs (reduce (fn [acc p] (conj (conj acc (first p)) (second p))) [] ps)]
+    `(let* [~@binds
+            frame# (array-map ~@pairs)]
+       (push-thread-bindings frame#)
+       (try (do ~@body) (finally (pop-thread-bindings))))))
 
 ;; Canonical recursive expansion; closing goes through the host seam __close
 ;; (a map-like value's :close fn or a host file — no .close interop here).
@@ -210,6 +221,20 @@
 ;; via rest-destructuring.
 (defmacro if-not [test then & [else]]
   `(if (not ~test) ~then ~else))
+
+;; Macro-argument validation, the reference implementation verbatim: each
+;; pred/message pair expands to a check that throws IllegalArgumentException
+;; naming the calling macro (via &form) and the requirement. Private on the JVM,
+;; but reachable there as @#'clojure.core/assert-args — the shape typedclojure
+;; and other macro-heavy libraries use, and what this exists to serve.
+(defmacro ^{:private true} assert-args
+  [& pairs]
+  `(do (when-not ~(first pairs)
+         (throw (IllegalArgumentException.
+                  (str (first ~'&form) " requires " ~(second pairs) " in " ~'*ns* ":" (:line (meta ~'&form))))))
+     ~(let [more (nnext pairs)]
+        (when more
+          (list* `assert-args more)))))
 
 ;; Conditional binding macros: the name is bound ONLY in the taken branch (the
 ;; auto-gensym temp# tests the value; the else/empty branch sees the surrounding
@@ -355,6 +380,13 @@
 ;; group, every other form appends to the current one. (extend-protocol uses
 ;; parse-extend-impls instead — it must treat a COMPUTED class type like
 ;; (Class/forName "[B"), a seq, as a head, which this would misread as a method.)
+;; deftype/defrecord options: leading keyword/value pairs before the specs
+;; (:load-ns, and any other the reference's parse-opts+specs consumes without
+;; reading, such as gvec's :no-print). Skipped, as the reference skips them.
+(defn- drop-type-opts [body]
+  (loop [b (seq body)]
+    (if (and b (keyword? (first b))) (recur (nnext b)) b)))
+
 (defn- group-by-head [items]
   ;; nil is a valid extension head (extend-protocol P ... nil (m [x] ...)).
   (reduce (fn [acc x]
@@ -481,6 +513,20 @@
                   do-art (fn [ar] (cons (first ar) (map (fn [x] (rw inst (psyms (first ar)) x)) (rest ar))))
                   arts' (if (vector? (first arts)) (do-art arts) (map do-art arts))]
               (concat (list head) (when named? (list fname)) arts'))
+            ;; (. obj member args*) / (. obj (method args*)): the member position
+            ;; names a field or method, it is not a value — rewrite the object and
+            ;; argument positions only. Without this a member named like a mutable
+            ;; field ((. this v)) had its member symbol rewritten into a field
+            ;; read, producing (. this (.-v this)).
+            (and (seq? form) (seq form) (symbol? (first form)) (= "." (name (first form)))
+                 (>= (count form) 3) (symbol? (nth form 2)))
+            (concat (list (first form) (rw inst shadowed (second form)) (nth form 2))
+                    (map (fn [x] (rw inst shadowed x)) (drop 3 form)))
+            (and (seq? form) (seq form) (symbol? (first form)) (= "." (name (first form)))
+                 (= 3 (count form)) (seq? (nth form 2)) (symbol? (first (nth form 2))))
+            (list (first form) (rw inst shadowed (second form))
+                  (cons (first (nth form 2))
+                        (map (fn [x] (rw inst shadowed x)) (rest (nth form 2)))))
             ;; a bare read of a mutable field -> live field access
             (and (symbol? form) (mutable? form) (not (contains? shadowed form)))
             (list (symbol (str ".-" (name form))) inst)
@@ -512,14 +558,21 @@
                           pnames (set (map name shadowed))
                           ;; let-bind only immutable fields; mutable ones are read live
                           ;; via rewrite-body so a set! within the method is observed.
-                          binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
+                          ;; The read is the DECLARED-SLOT one, not get: a type
+                          ;; declaring clojure.lang.ILookup answers get through its
+                          ;; own valAt, so binding fields with get would re-enter
+                          ;; that valAt on every method entry — including valAt's
+                          ;; own — and never come back. It is also the cheaper read
+                          ;; (straight to the slot, no type cascade).
+                          binds (vec (mapcat (fn [f] [f (list (symbol "clojure.core" "__deftype-field")
+                                                              inst (keyword (name f)))])
                                              (filter (fn [f] (and (not (mutable? f))
                                                                   (not (contains? pnames (name f)))))
                                                      fields)))
                           mbody (map (fn [bf] (rewrite-body inst shadowed bf)) (drop 2 spec))
                           mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
                       (list argv (list* 'let binds mbody))))
-        groups (group-by-head body)
+        groups (group-by-head (drop-type-opts body))
         ;; merge clauses by method NAME across ALL protocols into one multi-arity
         ;; fn, so a name appearing in two interfaces with different arities
         ;; (data.priority-map's seq is in Seqable [this] AND Sorted [this asc])
@@ -719,8 +772,25 @@
 (defmacro proxy [supers ctor-args & methods]
   (if (and (vector? supers) (= 1 (count supers))
            (let [s (name (first supers))] (or (= s "ThreadLocal") (= s "InheritableThreadLocal"))))
-    (let [init (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
-      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))))
+    ;; WHICH of the two is load-bearing: they differ only in what a forked thread
+    ;; sees, and that is the entire difference between the classes. Lowering both
+    ;; to one object made whichever storage was chosen wrong for the other.
+    ;;
+    ;; initialValue is the only override this lowering can honour — the object it
+    ;; builds is a host storage shim, not a subclass, so a get/set/remove/
+    ;; toString/childValue body has nowhere to go. It used to be dropped in
+    ;; silence, which is a method that looks defined and never runs; say so at
+    ;; the call site instead.
+    (let [extra (remove (fn [m] (= "initialValue" (name (first m)))) methods)
+          init  (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
+      (when (seq extra)
+        (throw (ex-info (str "proxy over " (name (first supers))
+                             " can only override initialValue, not "
+                             (apply str (interpose ", " (map (fn [m] (name (first m))) extra))))
+                        {:class (name (first supers))
+                         :unsupported (mapv (fn [m] (name (first m))) extra)})))
+      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))
+                                    ~(= (name (first supers)) "InheritableThreadLocal")))
     ;; group the flattened specs by method name, so several arities of one method
     ;; become one multi-arity fn — the same shape reify builds.
     (loop [specs (seq (apply concat (map proxy-arity-specs methods)))
@@ -798,7 +868,7 @@
                           mbody (drop 2 spec)
                           mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
                       (list hinted (list* 'let binds mbody))))
-        groups (group-by-head body)
+        groups (group-by-head (drop-type-opts body))
         ;; merge clauses by name across protocols into one multi-arity fn (see
         ;; deftype's by-name).
         by-name (reduce (fn [m spec]

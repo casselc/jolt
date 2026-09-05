@@ -19,7 +19,9 @@ case "$jolt" in /*) joltabs="$jolt" ;; *) joltabs="$root/$jolt" ;; esac
 # csv dir we validate so the build uses exactly it.
 csv="$JOLT_CHEZ_CSV"
 if [ -z "$csv" ]; then
-  chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)"
+  # JOLT_CHEZ wins (see host/chez/selfcheck.sh) — else this can pair a
+  # PATH-resolved Chez's csv dir with a running interpreter built elsewhere.
+  chez_bin="${JOLT_CHEZ:-$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)}"
   if [ -n "$chez_bin" ]; then
     base="$(cd "$(dirname "$chez_bin")/.." 2>/dev/null && pwd)"
     for d in "$base"/lib/csv*/*/; do
@@ -55,7 +57,8 @@ args: [alpha bb ccc]
 sum: 10
 greet-default: greet:default
 greet-loud: greet:loud
-greet-soft: greet:soft'
+greet-soft: greet:soft
+boot-threads: :ran :ran'
 if [ "$got" != "$want" ]; then
   echo "  FAIL: binary output mismatch"
   echo "--- want ---"; echo "$want"
@@ -84,10 +87,22 @@ done
 # throughput lever the perf audit identified) AND run wp-infer — both were opt-in
 # (--direct-link / --opt) before. $out is still the plain release build here.
 
-# The cross-ns app.core -> app.util/shout call lowers to a direct jv$ binding in
-# the plain release build, not var-deref.
-if ! grep -q '(jv\$app.util\$shout' "$out.build/flat.ss"; then
+# The cross-ns app.core -> app.util/shout reference is direct-linked in the plain
+# release build, not var-routed.
+#
+# Asserted on the BINDING, not on a (jv$app.util$shout ...) call form. Release
+# inlines now (jolt-mbcm.6), and shout is small enough to be spliced into its
+# caller, so there is no call left to find -- the old assertion failed on a build
+# that had done MORE than it asked for. The binding is emitted for every
+# direct-linked def whether or not any particular call to it survives, and it is
+# absent entirely under --no-direct-link, so it still discriminates.
+if ! grep -q 'define jv\$app.util\$shout' "$out.build/flat.ss"; then
   echo "  FAIL: release build did not direct-link the app->app call"; exit 1
+fi
+# ...and nothing reads it through its var, which is the thing direct-linking is
+# for. This holds whether the call was spliced or left as a jv$ application.
+if grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.build/flat.ss"; then
+  echo "  FAIL: release build still var-routed the app->app call"; exit 1
 fi
 
 # wp-infer ran: a hintless double fn (app.util/area, called with 2.0) gets its
@@ -169,8 +184,13 @@ fi
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then
   echo "  FAIL: jolt build --no-direct-link exited non-zero"; exit 1
 fi
-if grep -q '(jv\$app.util\$shout' "$out.nodl.build/flat.ss"; then
+if grep -q 'define jv\$app.util\$shout' "$out.nodl.build/flat.ss"; then
   echo "  FAIL: --no-direct-link still direct-linked the app->app call"; exit 1
+fi
+# and it IS var-routed there -- without this the check above would pass on a
+# build that emitted no reference to shout at all.
+if ! grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.nodl.build/flat.ss"; then
+  echo "  FAIL: --no-direct-link did not var-route the app->app call"; exit 1
 fi
 # An OPEN-WORLD build maps its frames too. emit-def-cached only emits a source
 # registration under direct-link, so without one a built binary printed a bare
@@ -194,6 +214,124 @@ if ! printf '%s' "$got_rd" | grep -q '^redef: :patched$'    || ! printf '%s' "$g
   echo "--- got ----"; echo "$got_rd"; exit 1
 fi
 
+# A NAMED inner fn inside a spliced callee (jolt-pzos). Two claims:
+#  - the alpha-rename the splicer applies for hygiene (step-boom -> step-boom__ilN)
+#    is a compiler artifact and must not reach the user;
+#  - app.util/inner-boom appears ONCE. The inner fn is emitted as its own lambda
+#    and has its own runtime frame, so stamping the inline chain through the fn
+#    boundary made the reporter expand that frame as spliced code as well, and the
+#    callee was printed twice — once for the inner fn's frame, once for its own.
+got_if="$(cd / && "$out" --innerfn 2>&1)"
+if printf '%s' "$got_if" | grep -q '__il'; then
+  echo "  FAIL: inner-fn trace leaked the __ilN alpha-rename artifact"
+  echo "--- got ----"; echo "$got_if"; exit 1
+fi
+if ! printf '%s' "$got_if" | grep -q 'step-boom'; then
+  echo "  FAIL: inner-fn trace lost the inner fn's frame (want a step-boom frame)"
+  echo "--- got ----"; echo "$got_if"; exit 1
+fi
+n_inner="$(printf '%s\n' "$got_if" | grep -c 'app\.util/inner-boom')"
+if [ "$n_inner" != "1" ]; then
+  echo "  FAIL: inner-fn trace names app.util/inner-boom $n_inner times, want 1"
+  echo "--- got ----"; echo "$got_if"; exit 1
+fi
+
+# --tree-shake must not cost the trace its inlined frames. A callee whose every
+# call site was spliced has no reference left in the graph, so the shake dropped
+# its def -- and with it the (jolt-register-source! ...) that def's record
+# carries, which is the only thing mapping an inlined frame back to ns/name
+# (file:line). The shaken binary printed ONE frame where this same build prints
+# three (jolt-o13s). Same assertion as the plain release build above, so the two
+# cannot drift.
+if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.ts" --tree-shake >/dev/null 2>&1; then
+  echo "  FAIL: jolt build --tree-shake exited non-zero"; exit 1
+fi
+got_ts="$(cd / && "$out.ts" --boom 2>&1)"
+for frame in 'app\.util/deep-boom .*util\.clj:[0-9]' 'app\.util/mid-boom .*util\.clj:[0-9]' 'app\.core/-main .*core\.clj:[0-9]'; do
+  if ! printf '%s' "$got_ts" | grep -qE "$frame"; then
+    echo "  FAIL: --tree-shake trace missing inlined frame $frame"
+    echo "--- got ----"; echo "$got_ts"; exit 1
+  fi
+done
+# ...and in that order, innermost first — a backwards chain contains every frame
+# and would pass the per-frame loop above.
+if ! printf '%s' "$got_ts" | tr '\n' '~' | grep -qE 'deep-boom[^~]*~[^~]*mid-boom[^~]*~[^~]*-main'; then
+  echo "  FAIL: --tree-shake trace frames out of order"
+  echo "--- got ----"; echo "$got_ts"; exit 1
+fi
+
+# A var defined TWICE must answer the same through every call path, and the same
+# as `jolt run` (jolt-rtjm). app.util defines dd-target, then dd-caller which
+# calls it, then dd-target again: the stashed inline body froze the FIRST
+# definition into dd-caller, while dd-late — compiled after the second def —
+# spliced the second. One binary, two answers. `apply` is in there because a
+# direct (dd-caller) can fold at its own call site and mask the frozen body.
+got_dd="$(cd / && "$out" --doubledef 2>&1)"
+for line in 'dd-apply: second' 'dd-call:  second' 'dd-late:  second'; do
+  if ! printf '%s' "$got_dd" | grep -qF "$line"; then
+    echo "  FAIL: double-def — want '$line' (a stashed body froze the first def)"
+    echo "--- got ----"; echo "$got_dd"; exit 1
+  fi
+done
+
+# A closure returned by a SPLICED callee must still travel in a state image, and
+# the built binary must agree with `jolt run` about it. Only a built binary
+# splices, and the splicer used to drop the fn's source registration -- so the
+# same program wrote the closure under `jolt run` and refused it here.
+#
+# Compared against `jolt run` rather than pinned to a literal, because the bug
+# was a DIVERGENCE between the two; a literal would have to be re-derived every
+# time the fixture's arithmetic changes, and would not say what it is for.
+# A deftype that DECLARES clojure.lang.ILookup answers every key through that
+# valAt, field-named ones included -- the JVM gives such a type no other key
+# lookup, and the slot may hold exactly what valAt is there to transform. The
+# runtime honours it; the BUILD folded past it in two places, because every
+# deftype is registered as a record shape and nothing told the passes this one
+# has a lookup of its own (jolt-fpp3.1): scalar replacement's (:k <ctor>) fold,
+# and whole-program inference proving a param a struct and dropping the guard.
+#
+# Compared against `jolt run` because the bug is a DIVERGENCE between the two,
+# then against the literal so the two cannot agree on a shared failure.
+got_dt="$(cd / && "$out" --dtlookup 2>&1)"
+want_dt="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --dtlookup 2>&1)"
+if [ "$got_dt" != "$want_dt" ]; then
+  echo "  FAIL: a deftype's declared valAt does not answer the same as under jolt run"
+  echo "--- binary ----"; echo "$got_dt"
+  echo "--- jolt run --"; echo "$want_dt"; exit 1
+fi
+for line in 'dt-ctor:   :from-valat' 'dt-proven: :from-valat' 'dt-opaque: :from-valat :none'; do
+  if ! printf '%s' "$got_dt" | grep -qF "$line"; then
+    echo "  FAIL: declared valAt -- want '$line' (the field slot was read instead)"
+    echo "--- got ----"; echo "$got_dt"; exit 1
+  fi
+done
+
+fasl="$(dirname "$out")/closure.fasl"
+got_cl="$(cd / && "$out" --closure "$fasl" 2>&1)"
+want_cl="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --closure "$fasl" 2>&1)"
+if [ "$got_cl" != "$want_cl" ]; then
+  echo "  FAIL: a spliced callee's closure does not travel the same as under jolt run"
+  echo "--- binary ----"; echo "$got_cl"
+  echo "--- jolt run --"; echo "$want_cl"; exit 1
+fi
+# ...and both actually wrote one, rather than agreeing on a shared failure. The
+# img-* lines cover the rest of the value kinds an image carries -- a lazy seq
+# built by clojure.core, one already walked part-way, a multimethod, an unkept
+# promise and a namespace -- through the BUILD emit path, which is a different
+# path from `jolt run` and which nothing else exercises for images.
+if ! printf '%s' "$got_cl" | grep -q '^closure-scan: 0 0$'; then
+  echo "  FAIL: spliced closure is not writable (scan reported refusals)"
+  echo "--- got ----"; echo "$got_cl"; exit 1
+fi
+for line in 'closure-folded: 115 115' 'closure-live: 110 110' \
+            'img-dumpable: true true' 'img-lazy: [1 2 3 4]' 'img-walked: [1 2 3]' \
+            'img-multi: :got-a :dflt' 'img-misc: false true'; do
+  if ! printf '%s' "$got_cl" | grep -qF "$line"; then
+    echo "  FAIL: spliced closure round trip — want '$line'"
+    echo "--- got ----"; echo "$got_cl"; exit 1
+  fi
+done
+
 # The :str-stamped interop answers at runtime with the same values the generic
 # dispatch would (the emit-level proof is the flat.ss grep above).
 got_strd="$(cd / && "$out" --strd 2>&1)"
@@ -216,6 +354,17 @@ got_sbjoin="$(cd / && "$out" --sbjoin 2>&1)"
 if ! printf '%s' "$got_sbjoin" | grep -q '^sbjoin: a\.b\.c  x$'; then
   echo "  FAIL: :sb-stamped interop output — want 'sbjoin: a.b.c  x'"
   echo "--- got ----"; echo "$got_sbjoin"; exit 1
+fi
+
+# The ClassLoader resource surface resolves what io/resource resolves. It used to
+# walk the source roots on its own and never consult the embedded table, so a
+# baked-in resource answered nil through RT/baseLoader while io/resource served
+# it — invisible in the source tree, and only ever wrong in a built binary, which
+# is why the check lives here.
+got_rl="$(cd / && "$out" --resloader 2>&1)"
+if ! printf '%s' "$got_rl" | grep -q '^resloader: true true 1 true true$'; then
+  echo "  FAIL: ClassLoader resource surface — want 'resloader: true true 1 true true'"
+  echo "--- got ----"; echo "$got_rl"; exit 1
 fi
 
 # Portable embed: remove the build-time source tree and run from / — the
@@ -259,7 +408,7 @@ if [ "$got_dl" != "$want" ]; then
   echo "--- got ----"; echo "$got_dl"
   exit 1
 fi
-if ! grep -q '(jv\$app.util\$shout' "$out.build/flat.ss"; then
+if ! grep -q 'define jv\$app.util\$shout' "$out.build/flat.ss"; then
   echo "  FAIL: --direct-link did not emit a direct app->app call"; exit 1
 fi
 # A direct-link build registers fn sources, so an uncaught throw prints a Clojure
@@ -268,13 +417,27 @@ if ! grep -q 'jolt-register-source!' "$out.build/flat.ss"; then
   echo "  FAIL: --direct-link did not emit source registrations"; exit 1
 fi
 boom_err="$(cd / && "$out" --boom 2>&1 >/dev/null)"
-for frame in 'app.util/deep-boom' 'app.util/mid-boom' 'app.core/-main'; do
-  if ! printf '%s' "$boom_err" | grep -q "$frame"; then
-    echo "  FAIL: stack trace missing frame $frame"
+# A direct-linked build INLINES (jolt-mbcm.6): deep-boom is spliced into
+# mid-boom and mid-boom into -main, so all three of these frames come out of ONE
+# physical frame, reconstructed from the inline chain the splicer stamped
+# (jolt-mbcm.7). The --no-direct-link loop above asserts the same three without
+# splicing, so the two together are the parity claim: inlining must not change
+# what a backtrace says.
+for frame in 'app\.util/deep-boom .*util\.clj:[0-9]' 'app\.util/mid-boom .*util\.clj:[0-9]' 'app\.core/-main .*core\.clj:[0-9]'; do
+  if ! printf '%s' "$boom_err" | grep -Eq "$frame"; then
+    echo "  FAIL: stack trace missing located frame $frame"
     echo "--- got ----"; echo "$boom_err"
     exit 1
   fi
 done
+# ...and in that order, innermost first. A chain reconstructed backwards would
+# still contain every frame and pass the loop above.
+if ! printf '%s' "$boom_err" | tr '\n' '|' \
+     | grep -q 'deep-boom.*mid-boom.*-main'; then
+  echo "  FAIL: reconstructed frames are not innermost-first"
+  echo "--- got ----"; echo "$boom_err"
+  exit 1
+fi
 
 # A pure-fn fold must not discard a throwing op. scalar-replace folds
 # (:a {:a 1 :b (/ 1 0)}) -> 1 under --opt --direct-link, dropping the sibling;
@@ -402,7 +565,8 @@ fi
 # datareader-app's #code literal builds to 42, not the literal list.
 # Also exercises transitive reader requires: #my/rev calls app.readers/reverse-str
 # which requires app.util, proving the require-graph closure pulls in helper
-# namespaces reachable only through the data-readers table.
+# namespaces reachable only through the data-readers table — and the two fn-valued
+# *data-readers* entries, whose results the emit path has to splice by value.
 drapp="$root/test/chez/datareader-app"
 drout="$(dirname "$out")/dr-bin"
 if ! JOLT_PWD="$drapp" "$jolt" build -m drtest.main -o "$drout" >/dev/null 2>&1; then
@@ -410,7 +574,9 @@ if ! JOLT_PWD="$drapp" "$jolt" build -m drtest.main -o "$drout" >/dev/null 2>&1;
 fi
 got_dr="$(cd / && "$drout" 2>&1)"
 dr_want='42
-olleh!'
+olleh!
+3
+shout-value'
 if [ "$got_dr" != "$dr_want" ]; then
   echo "  FAIL: built data-reader output mismatch"
   echo "--- want ---"; echo "$dr_want"
@@ -571,6 +737,36 @@ if [ "$got_procs" != "PROC-APP hi 0 143" ]; then
   echo "  FAIL: petite-only process binary output mismatch — want 'PROC-APP hi 0 143', got \`$got_procs\`"; exit 1
 fi
 
+# A built binary must carry the CLOJURE half of jolt.ffi (stdlib/jolt/ffi.clj),
+# not just the host primitives from java/ffi.ss. jolt.ffi sits in the CLI's own
+# AOT closure and in neither the runtime image nor the stdlib-fasl manifest, so
+# an app build that reads the CLI's closure as preloaded interns layout-size /
+# field-offset / read-field / write-field UNBOUND and fails at the call. `jolt
+# run` compiles the source at require time and masks it entirely.
+ffiapp="$root/test/chez/ffi-app"
+ffiout="$(dirname "$out")/ffi-app-bin"
+if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffiout" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build of a jolt.ffi app exited non-zero"; exit 1
+fi
+got_ffi="$(cd / && "$ffiout" 2>&1 | tail -1)"
+if [ "$got_ffi" != "FFI-APP 8 4 4 2.5 true" ]; then
+  echo "  FAIL: built binary missing the jolt.ffi Clojure layer — want 'FFI-APP 8 4 4 2.5 true', got \`$got_ffi\`"; exit 1
+fi
+
+# The same ffi app tree-shaken: a petite-only boot has no compiler, so
+# errno-message's strerror defcfn must resolve as a compiled foreign-procedure.
+ffishake="$(dirname "$out")/ffi-app-shake-bin"
+if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffishake" --tree-shake >/dev/null 2>&1; then
+  echo "  FAIL: jolt build --tree-shake of the jolt.ffi app exited non-zero"; exit 1
+fi
+if grep -q 'scheme.boot' "$ffishake.build/compile.ss" 2>/dev/null; then
+  echo "  FAIL: tree-shaken ffi app still bundles scheme.boot (petite-only boot expected)"; exit 1
+fi
+got_ffis="$(cd / && "$ffishake" 2>&1 | tail -1)"
+if [ "$got_ffis" != "FFI-APP 8 4 4 2.5 true" ]; then
+  echo "  FAIL: petite-only ffi binary output mismatch — want 'FFI-APP 8 4 4 2.5 true', got \`$got_ffis\`"; exit 1
+fi
+
 # A declaration-only var and a no-root dynamic var must stay resolvable
 # (find-var / resolve / ns-interns) in an AOT binary. A no-init def now carries
 # source-position metadata, so it emits set-var-meta! then declare-var! —
@@ -642,19 +838,40 @@ fi
 [ -x "$sdeps_out" ] || { echo "  FAIL: \`-Sdeps '{}' build\` produced no executable"; exit 1; }
 
 # Everything above builds through $jolt, which the make target points at the
-# prebuilt binary. Build one app through the source-mode driver too, so the
-# bin/jolt path a developer actually runs stays gated here and not only as a
-# side effect of devbootsmoke's cached-project-build case. Redundant when $jolt
-# already is bin/jolt, so skip it then.
+# prebuilt binary. Build through bin/jolt too, so the driver a developer actually
+# runs stays gated here and not only as a side effect of devbootsmoke's
+# cached-project-build case. Redundant when $jolt already is bin/jolt, so skip it
+# then. The first case takes whichever image bin/jolt picks (a fresh
+# target/dev/flat.so, else source); the second pins source mode, for the reason
+# spelled out there.
 if [ "$jolt" != "bin/jolt" ]; then
-  echo "build smoke: source-mode driver check"
+  echo "build smoke: checkout-driver check"
   srcout="$(dirname "$out")/srcmode-bin"
   if ! JOLT_PWD="$root/test/chez/jolt-ext-app" bin/jolt build -m jxapp.main -o "$srcout" >/dev/null 2>&1; then
-    echo "  FAIL: source-mode (bin/jolt) build exited non-zero"; exit 1
+    echo "  FAIL: bin/jolt build exited non-zero"; exit 1
   fi
   got_src="$(cd / && "$srcout" 2>&1 | tail -1)"
   if [ "$got_src" != "JOLT-EXT BUILT! (:x :x)" ]; then
-    echo "  FAIL: source-mode build output — want 'JOLT-EXT BUILT! (:x :x)', got \`$got_src\`"; exit 1
+    echo "  FAIL: bin/jolt build output — want 'JOLT-EXT BUILT! (:x :x)', got \`$got_src\`"; exit 1
+  fi
+
+  # The ffi-app case above, through the source-mode driver. Only this ordering
+  # reaches it: both the release binary and the dev boot cache bake jolt.main
+  # with bld-emit-cli-aot, which marks its closure ldr-cli-aot? and re-emits it
+  # into the app regardless, while source mode loads jolt.main — and with it
+  # jolt.ffi — into the driver process as an ordinary require. A boot-image
+  # snapshot still emits jolt.ffi into the app; snapshotting loaded-ns at
+  # build-binary time reads it as already in the app's image and leaves
+  # layout-size interned but UNBOUND (#756's shape, reached the other way).
+  # JOLT_NO_DEVCACHE is what keeps this honest: without it the gate passes on a
+  # fresh target/dev/flat.so whether or not the bug is present.
+  ffisrcout="$(dirname "$out")/ffi-app-srcmode-bin"
+  if ! JOLT_NO_DEVCACHE=1 JOLT_PWD="$ffiapp" bin/jolt build -m ffiapp.main -o "$ffisrcout" >/dev/null 2>&1; then
+    echo "  FAIL: source-mode (bin/jolt) build of the jolt.ffi app exited non-zero"; exit 1
+  fi
+  got_ffisrc="$(cd / && "$ffisrcout" 2>&1 | tail -1)"
+  if [ "$got_ffisrc" != "FFI-APP 8 4 4 2.5 true" ]; then
+    echo "  FAIL: source-mode build dropped the jolt.ffi Clojure layer — want 'FFI-APP 8 4 4 2.5 true', got \`$got_ffisrc\`"; exit 1
   fi
 fi
 
@@ -766,8 +983,8 @@ if grep -q 'set-chez-ns! "app.other"' "$aaout.build/flat.ss"; then
   echo "  FAIL: :as-alias pulled app.other into the binary"; exit 1
 fi
 got_aa="$(cd / && "$aaout" 2>&1)"
-if [ "$got_aa" != ":kw :app.other/x :aliased true" ]; then
-  echo "  FAIL: as-alias-app — want ':kw :app.other/x :aliased true', got \`$got_aa\`"; exit 1
+if [ "$got_aa" != ":kw :app.other/x :map 1 :aliased true" ]; then
+  echo "  FAIL: as-alias-app — want ':kw :app.other/x :map 1 :aliased true', got \`$got_aa\`"; exit 1
 fi
 
 # --- split flat source + cached runtime fasl ---------------------------------
@@ -823,4 +1040,4 @@ if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nospli
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache)"

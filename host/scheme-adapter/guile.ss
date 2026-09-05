@@ -100,9 +100,17 @@
 ;; ---------------------------------------------------------------------------
 ;; tier: capability-ffi
 ;; ---------------------------------------------------------------------------
+;;   sa-call-with-escape-continuation UNIMPLEMENTED Guile has call/cc; wrap it with a
+;;                                        spent flag so a second invocation (or one after
+;;                                        the capturing call returned) RAISES rather than
+;;                                        re-entering. The escape must unwind dynamic-wind
+;;                                        on the way out — jolt's `finally` rides that.
 ;;   sa-foreign-procedure   UNIMPLEMENTED  Guile: (pointer->procedure ret (dynamic-func name
 ;;                                        lib) args) — (system foreign). must verify call
 ;;                                        shape translation; SYNTAX on Chez (lowering).
+;;   sa-foreign-procedure-native-error UNIMPLEMENTED Must capture errno atomically
+;;                                        at the foreign call boundary; a later
+;;                                        read is racy and not equivalent.
 ;;   sa-foreign-procedure-blocking UNIMPLEMENTED  ?? must verify collect-safety; may
 ;;                                        collapse to plain sa-foreign-procedure only if the
 ;;                                        collector never stops other threads.
@@ -156,6 +164,19 @@
 ;;                                        may RAISE (jolt.image surfaces a clean unsupported
 ;;                                        error — the raise must carry a message).
 ;;   sa-fasl-read           UNIMPLEMENTED  ?? same, must verify externals resolution shape.
+
+;; ---------------------------------------------------------------------------
+;; tier: capability-unchecked
+;; ---------------------------------------------------------------------------
+;;   sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=?  UNIMPLEMENTED  Guile: the
+;;                                        checked (rnrs arithmetic fixnums) ops are
+;;                                        the permitted degradation; a tuned port may
+;;                                        expand to the unchecked variants.
+;;   sa-uvector-ref sa-uvector-set!       UNIMPLEMENTED  Guile: vector-ref /
+;;                                        vector-set! (degradation), or the
+;;                                        unchecked accessors when the port is tuned.
+;;   sa-vector-copy-range!                UNIMPLEMENTED  Guile: R7RS vector-copy!
+;;                                        has the contract's argument order.
 
 ;; ---------------------------------------------------------------------------
 ;; tier: misc
