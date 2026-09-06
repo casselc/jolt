@@ -100,7 +100,11 @@ if [ -f "$lock" ] && git -C "$root" rev-parse --verify HEAD >/dev/null 2>&1; the
       echo "tools/version.sh: locked upstream base is not the aspect root parent" >&2
       exit 1
     }
-    distance="$(git -C "$root" rev-list --count "$base..HEAD")"
+    # A canonical epoch join preserves the prior integration line as one
+    # parent and the replay from this locked base as the other. Count only
+    # commits descended from the base, not unrelated history that merely
+    # becomes reachable through the join's other parent.
+    distance="$(git -C "$root" rev-list --ancestry-path --count "$base..HEAD")"
     short="$(git -C "$root" rev-parse --short HEAD)"
     dirty=
     git -C "$root" update-index -q --refresh >/dev/null 2>&1 || :
