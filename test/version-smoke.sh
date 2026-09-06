@@ -136,7 +136,53 @@ got="$("$script" "$aspect_repo")"
 [ "$got" = "v0.7.0-2-g$missing_sha" ] ||
   fail "missing-root lock: got '$got', want 'v0.7.0-2-g$missing_sha'"
 
-# (g) every consumer goes through the script; none re-derives it inline
+# (g) a canonical epoch join may retain an unrelated historical line as its
+#     first parent while joining the replay descended from the locked base as
+#     its second parent. Only commits on an ancestry path from that base count
+#     toward the release distance; merely reachable historical commits do not.
+epoch_repo="$tmp/epoch-repo"
+mkdir -p "$epoch_repo"
+eg() { git -C "$epoch_repo" -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@"; }
+eg init -q
+echo historical > "$epoch_repo/f"
+eg add f
+eg commit -q -m historical-root
+echo historical-2 > "$epoch_repo/f"
+eg commit -q -am historical-2
+echo historical-3 > "$epoch_repo/f"
+eg commit -q -am historical-3
+historical_tip="$(eg rev-parse HEAD)"
+epoch_tree="$(eg rev-parse HEAD^{tree})"
+epoch_base="$(printf 'current-base\n' | eg commit-tree "$epoch_tree")"
+epoch_root="$(printf 'aspect-root\n' | eg commit-tree "$epoch_tree" -p "$epoch_base")"
+replay_one="$(printf 'replay-one\n' | eg commit-tree "$epoch_tree" -p "$epoch_root")"
+replay_tip="$(printf 'replay-tip\n' | eg commit-tree "$epoch_tree" -p "$replay_one")"
+epoch_join="$(printf 'epoch-join\n' | eg commit-tree "$epoch_tree" \
+  -p "$historical_tip" -p "$replay_tip")"
+mkdir -p "$epoch_repo/config"
+cat > "$epoch_repo/config/aspect-integration.lock" <<EOF
+schema=1
+upstream_release=v0.8.3
+upstream_base_commit=$epoch_base
+aspect_root_commit=$epoch_root
+EOF
+
+eg checkout -q --detach "$replay_tip"
+replay_sha="$(eg rev-parse --short HEAD)"
+got="$("$script" "$epoch_repo")"
+[ "$got" = "v0.8.3-3-g$replay_sha" ] ||
+  fail "replay distance: got '$got', want 'v0.8.3-3-g$replay_sha'"
+
+eg checkout -q --detach "$epoch_join"
+join_sha="$(eg rev-parse --short HEAD)"
+reachable_distance="$(eg rev-list --count "$epoch_base..HEAD")"
+[ "$reachable_distance" -gt 4 ] ||
+  fail "epoch fixture control did not include historical reachable commits"
+got="$("$script" "$epoch_repo")"
+[ "$got" = "v0.8.3-4-g$join_sha" ] ||
+  fail "epoch join distance: got '$got', want 'v0.8.3-4-g$join_sha' (all reachable: $reachable_distance)"
+
+# (h) every consumer goes through the script; none re-derives it inline
 for f in bin/jolt host/chez/build-jolt.ss tools/testbin-current.sh \
          .github/workflows/release.yml; do
   grep -q 'tools/version.sh' "$root/$f" || fail "$f does not use tools/version.sh"
