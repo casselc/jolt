@@ -1,7 +1,11 @@
 {:schema 1
  :library {:id test/aspect-target :version "fixture-v1"}
  :aspects
- [{:id :test/callback-entry
+ [{:id :test/byte-callback-entry
+   :match {:arity 1 :entry app.target/byte-callback}
+   :advice-role :test/bytes-entry-around
+   :expect {:matches 1}}
+  {:id :test/callback-entry
    :match {:arity 1 :entry app.target/callback}
    :advice-role :test/entry-around
    :expect {:matches 1}}

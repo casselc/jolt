@@ -10,7 +10,10 @@
                                :contract :args-v1}
            :test/numeric-entry-around
            {:fn 'instrumentation.audit-provider/numeric-entry-around
-            :contract :replace-args-v1}}})
+            :contract :replace-args-v1}
+           :test/bytes-entry-around
+           {:fn 'instrumentation.audit-provider/bytes-entry-around
+            :contract :args-v1}}})
 
 (defn around [join-point evaluated-args proceed]
   (provider/assert-runtime-site! join-point)
@@ -46,4 +49,13 @@
   (println (str "numeric-audit-args " (pr-str evaluated-args)))
   (let [value (proceed [(inc (first evaluated-args))])]
     (println (str "numeric-audit-after " value))
+    :ignored-audit-result))
+
+(defn bytes-entry-around [join-point evaluated-args proceed]
+  (provider/assert-runtime-site! join-point)
+  (println (str "bytes-audit-before " (:id join-point)))
+  (let [original (first evaluated-args)
+        value (proceed)]
+    (println (str "bytes-audit-after "
+                  (pr-str [(identical? original value) (vec value)])))
     :ignored-audit-result))

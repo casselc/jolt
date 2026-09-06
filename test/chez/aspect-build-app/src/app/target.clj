@@ -24,3 +24,12 @@
   numeric-callback [^long x]
   (println (str "numeric-callback " x))
   (inc x))
+
+(defn ^{:jolt.aspects/id :test/byte-callback-entry
+        :jolt.aspects/role :test/bytes-entry-around}
+  byte-callback [^bytes bs]
+  (println (str "byte-callback " (pr-str (vec bs))))
+  ;; 255 narrows to signed byte -1. An empty array deliberately exercises the
+  ;; same ArrayIndexOutOfBoundsException through both plain and woven builds.
+  (aset-byte bs 1 255)
+  bs)
