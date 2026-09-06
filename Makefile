@@ -165,7 +165,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke aspectintegrationcheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke testbincurrentsmoke aspectintegrationcheck \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
@@ -382,10 +382,13 @@ documented-record:
 # the graph) but charged every single-gate run 18s — enough to make `make
 # buildlibsmoke` slower with the prerequisite than without it. The staleness
 # check covers the same inputs build-jolt.ss embeds: the runtime .ss files, the
-# install roots, and the launcher stub. JOLT_FORCE_TESTBIN=1 rebuilds anyway.
+# install roots, and the launcher stub. The binary also embeds tools/version.sh's
+# git identity, so a commit with unchanged source mtimes must make it stale too.
+# JOLT_FORCE_TESTBIN=1 rebuilds anyway.
 TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/grenadine/src vendor/grenadine-generated vendor/irregex
 testbin:
-	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
+	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || \
+	   ! tools/testbin-current.sh target/release/jolt "$(CURDIR)" || \
 	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
 	  $(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt; \
 	else \
@@ -980,6 +983,12 @@ makefilesmoke:
 # dev-g<sha>, which no :jolt/min-version floor can misread as a version.
 versionsmoke:
 	@bash test/version-smoke.sh
+
+# A commit changes the version baked into testbin even when no watched source
+# mtime changes. Keep that identity check executable and control-tested so an
+# exact-head CI receipt never accidentally runs a binary from the prior commit.
+testbincurrentsmoke:
+	@sh test/testbin-current-smoke.sh
 
 aspectintegrationcheck:
 	@bash test/aspect-integration-provenance-smoke.sh

@@ -137,7 +137,8 @@ got="$("$script" "$aspect_repo")"
   fail "missing-root lock: got '$got', want 'v0.7.0-2-g$missing_sha'"
 
 # (g) every consumer goes through the script; none re-derives it inline
-for f in bin/jolt host/chez/build-jolt.ss .github/workflows/release.yml; do
+for f in bin/jolt host/chez/build-jolt.ss tools/testbin-current.sh \
+         .github/workflows/release.yml; do
   grep -q 'tools/version.sh' "$root/$f" || fail "$f does not use tools/version.sh"
   if grep -n 'describe --' "$root/$f"; then
     fail "$f runs git describe itself; use tools/version.sh"
