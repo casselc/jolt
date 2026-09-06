@@ -105,18 +105,17 @@
 ;; work was 0 + 1 + ... + (k-1). An object array keeps this witness bounded and
 ;; isolates the relevant operation — linear scan followed by constant-time
 ;; append — from LinkedList iterator overhead.
-(defn- linear-scan-insert-burst [k]
-  (let [pending (object-array k)]
-    (loop [i 0 seen 0]
-      (if (= i k)
-        seen
-        (let [seen' (loop [j 0 seen seen]
-                      (if (= j i)
-                        seen
-                        (recur (inc j)
-                               (if (nil? (aget pending j)) seen (inc seen)))))]
-          (aset pending i i)
-          (recur (inc i) seen'))))))
+(defn- linear-scan-insert-block! [pending start k]
+  (loop [i start seen 0]
+    (if (= i (+ start k))
+      seen
+      (let [seen' (loop [j 0 seen seen]
+                    (if (= j i)
+                      seen
+                      (recur (inc j)
+                             (if (nil? (aget pending j)) seen (inc seen)))))]
+        (aset pending i i)
+        (recur (inc i) seen')))))
 
 ;; --- deque drain -------------------------------------------------------------
 (defn- deque-drain [n]
@@ -153,30 +152,41 @@
     (judge-scaling "tokenizer" #(tok-drain n1) #(tok-drain (* 4 n1)) 4 2.0
            "StringTokenizer is scanning its token list per token again (host-static-classes.ss)"))
 
-  ;; Timeout arming is not idempotent: a best-of retry would measure a heap
-  ;; pre-loaded by the prior sample. Use one measurement per size, far-future
-  ;; deadlines so nothing fires mid-measure, and enough work to clear the old
-  ;; millisecond clock floor. Keep raw monotonic nanoseconds through the ratio;
-  ;; the former 1ms clamp made 1ms vs 18ms and 3ms vs 10ms alternate between
-  ;; failure and success for the same binary.
-  (let [k 8000
-        [t1 _] (timed-ns #(arm-timeouts k 3600000))
-        [t4 _] (timed-ns #(arm-timeouts (* 4 k) 7200000))]
-    (judge-ns "timeout" t1 t4 8.0
+  ;; Timeout arming is not idempotent, so compare two consecutive EQUAL-SIZED
+  ;; blocks after a small warmup. This gives both arms the same channel/thunk
+  ;; allocation volume and, with the current doubling heap, nearly equal
+  ;; aggregate vector-copy volume. A heap remains near 1x as it grows; the old
+  ;; sorted-list insert scans indices 0..k and then k..2k, whose sums have ratio
+  ;; near 3x.
+  ;; Keep raw monotonic nanoseconds through the ratio and do not retry into a
+  ;; differently sized global heap.
+  (let [warm 64
+        ;; 4k is above the monotonic-clock floor (~2ms locally) but below the
+        ;; retained-channel GC transition that made only the second 8k block
+        ;; pay a collection and mimic the quadratic control's 3x ratio.
+        k 4000
+        base-ms 3600000
+        _ (arm-timeouts warm base-ms)
+        [t1 _] (timed-ns #(arm-timeouts k (+ base-ms warm)))
+        [t2 _] (timed-ns #(arm-timeouts k (+ base-ms warm k)))]
+    (judge-ns "timeout" t1 t2 2.0
               "timeout-insert! is walking the pending list per arm again (async.ss)"))
 
-  ;; Prove that the selected sizes and ceiling still reject the old algorithmic
-  ;; shape. This is deliberately separate from the live global timeout heap.
-  (linear-scan-insert-burst 100)
-  (let [k 1000
-        [t1 c1] (timed-ns #(linear-scan-insert-burst k))
-        [t4 c4] (timed-ns #(linear-scan-insert-burst (* 4 k)))
-        ratio (double (/ t4 t1))]
-    (println (format "control timeout-list %8.3fms vs %8.3fms, ratio %6.2f (floor 8.0)"
-                     (/ t1 1e6) (/ t4 1e6) ratio))
-    (when-not (and (= c1 (/ (* k (dec k)) 2))
-                   (= c4 (/ (* 4 k (dec (* 4 k))) 2))
-                   (> ratio 8.0))
+  ;; Prove that the same block shape and ceiling reject the old algorithm.
+  ;; The smaller bounded k keeps the deliberately quadratic witness cheap.
+  (let [warm 16
+        k 1500
+        pending (object-array (+ warm (* 2 k)))
+        _ (linear-scan-insert-block! pending 0 warm)
+        [t1 c1] (timed-ns #(linear-scan-insert-block! pending warm k))
+        [t2 c2] (timed-ns #(linear-scan-insert-block! pending (+ warm k) k))
+        ratio (double (/ t2 t1))
+        scan-sum (fn [start n] (/ (* n (+ (* 2 start) (dec n))) 2))]
+    (println (format "control timeout-list %8.3fms vs %8.3fms, ratio %6.2f (floor 2.5)"
+                     (/ t1 1e6) (/ t2 1e6) ratio))
+    (when-not (and (= c1 (scan-sum warm k))
+                   (= c2 (scan-sum (+ warm k) k))
+                   (> ratio 2.5))
       (println "FAIL hotpath timeout-list control: gate no longer distinguishes the former quadratic insertion path")
       (swap! failures inc)))
 
