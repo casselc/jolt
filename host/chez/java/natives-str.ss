@@ -4,9 +4,15 @@
 ;; which falls through to jolt-string-method here when the target is a string.
 ;; Covers the
 ;; portable java.lang.String/CharSequence methods cljc libraries actually call.
-;; Case mapping is ASCII (the whole engine is byte-oriented), indexOf returns -1
-;; on miss as on the JVM, indices come in as flonums, char results are Scheme
-;; chars, and numeric results are flonums to match jolt's number model.
+;; Case handling here is Java's, in two flavours that must not be confused:
+;; toUpperCase / toLowerCase map the whole of Unicode, while the ignore-case
+;; COMPARISONS use Java's own per-character upper-then-lower fold
+;; (jvm-char-ci-diff), which is neither that nor Scheme's full case folding. The
+;; ascii-string-up/down pair below is for neither — it serves the ASCII-only
+;; lookups other files do (a month abbreviation, a charset alias, "true").
+;; indexOf returns -1 on miss as on the JVM, indices come in as flonums, char
+;; results are Scheme chars, and numeric results are flonums to match jolt's
+;; number model.
 ;;
 ;; Loaded from rt.ss AFTER regex.ss (the regex methods reuse jolt-re-pattern /
 ;; regex-t-irx) and records.ss (which calls jolt-string-method).
@@ -40,6 +46,66 @@
                     ((fx=? j n) r)
                   (string-set! r j (ascii-down-char (string-ref s j)))))
               (check (fx+ i 1)))))))
+
+;; Java's per-character case fold, as a DIFFERENCE: 0 when the two characters are
+;; equal ignoring case, else the difference of the folded characters. The fold is
+;; Character.toUpperCase, then Character.toLowerCase when that still differs.
+;;
+;; This one function is the whole ignore-case contract on the JVM:
+;; equalsIgnoreCase IS regionMatches(true, 0, other, 0, length), and
+;; compareToIgnoreCase and CASE_INSENSITIVE_ORDER differ from it only in
+;; answering the difference rather than a boolean. So they share it here, and a
+;; new ignore-case method has one place to reach for.
+;;
+;; It is NOT Scheme's string-ci=?, which folds the full Unicode way: the two
+;; disagree on "I" vs "\x131;" (dotless i), which Java calls equal because both
+;; upper-case to #\I while Unicode case folding maps them to different letters.
+;; regionMatches used string-ci=? and answered #f there while equalsIgnoreCase,
+;; on the same pair, answered #t — two answers for one JVM operation.
+(define (jvm-char-ci-diff ca cb)
+  (if (char=? ca cb)
+      0
+      (let ((ua (char-upcase ca)) (ub (char-upcase cb)))
+        (if (char=? ua ub)
+            0
+            (let ((da (char-downcase ua)) (db (char-downcase ub)))
+              (if (char=? da db)
+                  0
+                  (fx- (char->integer da) (char->integer db))))))))
+
+;; String.compareToIgnoreCase, character for character: the first pair that does
+;; not fold equal answers the DIFFERENCE of the folded chars (not merely a sign);
+;; equal prefixes answer the length difference. This is also the comparison
+;; contract used by String.CASE_INSENSITIVE_ORDER.
+(define (jvm-string-ci-compare a b)
+  (let ((la (string-length a)) (lb (string-length b)))
+    (let loop ((i 0))
+      (if (or (fx=? i la) (fx=? i lb))
+          (fx- la lb)
+          (let ((d (jvm-char-ci-diff (string-ref a i) (string-ref b i))))
+            (if (fx=? d 0) (loop (fx+ i 1)) d))))))
+
+;; String.equalsIgnoreCase / String.regionMatches(true, ...): the same fold, as
+;; equality. Length first, so a prefix is not equal to what it prefixes.
+(define (jvm-string-ci=? a b)
+  (and (fx=? (string-length a) (string-length b))
+       (fx=? 0 (jvm-string-ci-compare a b))))
+
+;; String.compareTo, the case-sensitive twin of jvm-string-ci-compare and the
+;; same shape without the fold: the first differing pair answers the DIFFERENCE
+;; of the chars, and equal prefixes the length difference. The JVM's magnitude is
+;; not decoration — (.compareTo "a" "c") is -2 and (.compareTo "abcd" "ab") is 2 —
+;; and a sign-only answer beside a compareToIgnoreCase that reports the real
+;; difference is two contracts for one pair of methods.
+(define (jvm-string-compare a b)
+  (let ((la (string-length a)) (lb (string-length b)))
+    (let loop ((i 0))
+      (if (or (fx=? i la) (fx=? i lb))
+          (fx- la lb)
+          (let ((ca (string-ref a i)) (cb (string-ref b i)))
+            (if (char=? ca cb)
+                (loop (fx+ i 1))
+                (fx- (char->integer ca) (char->integer cb))))))))
 
 ;; Two different notions of whitespace, and the JVM uses both. String.trim drops
 ;; anything at or below the space character; clojure.string/trim drops whatever
@@ -125,13 +191,18 @@
             ((char-by-char-match? s i needle nlen) i)
             (else (loop (fx- i 1) found))))))
 
+;; A string argument to a String method: nil is a NullPointerException, as
+;; String's own methods raise on null (they used to read as the empty string,
+;; so (.indexOf "abc" nil) answered 0 and (.contains "a" nil) true).
+(define (str-arg x)
+  (if (jolt-nil? x) (throw-jvm 'NullPointerException "str") x))
 ;; A needle arg: a char value -> its 1-char string; a number -> the char at that
 ;; code point (JVM treats an int arg to indexOf as a char code); else a string.
 (define (str-needle x)
   (cond ((char? x) (string x))
         ((number? x) (string (integer->char (exact (truncate x)))))
         ((string? x) x)
-        (else (jolt-str x))))
+        (else (jolt-str (str-arg x)))))
 
 ;; literal replace-all (JVM String.replace(CharSequence,CharSequence)).
 (define (str-replace-literal s a b)
@@ -286,8 +357,92 @@
 (define (java-symbol-hash name ns)
   (java-hash-combine (java-string-hash name) (if ns (java-string-hash ns) 0)))
 
+;; --- String methods as named natives -----------------------------------------
+;; The back end's string-direct-emit (backend_scheme.clj) open-codes a `.method`
+;; call whose receiver is PROVEN a string, and jolt-string-method below dispatches
+;; the same call when it is not. Every method whose body is more than a single
+;; Chez form gets its native here so those two paths are the SAME code rather than
+;; two transcriptions of it — a divergence between them would show up only on the
+;; hinted path, which is exactly where nobody looks.
+;;
+;; The `jolt-` prefix is load-bearing: munge-name (backend_scheme.clj) prefixes any
+;; user local whose name starts with "jolt-", so a bare emitted head with it can
+;; never be shadowed by a local, and the name needs no entry in rt-emitted-names.
+(define (jolt-str-equals? s o) (and (string? o) (string=? s o)))
+;; Thin wrappers over the jvm-string-* fold, NOT second implementations. Java's
+;; ignore-case comparison is a per-character upper-then-lower fold and its
+;; compareTo answers a character DIFFERENCE, not a sign — a downcase-and-sign
+;; transcription disagrees on "É"/"é", on dotless i, and on every magnitude
+;; ((.compareTo "a" "c") is -2, not -1). One implementation, reached from both the
+;; generic dispatch above and the proven-receiver emission, is the only way the
+;; two paths cannot drift.
+(define (jolt-str-equals-ci? s o)
+  (and (not (jolt-nil? o)) (jvm-string-ci=? s (jolt-need-str o))))
+(define (jolt-str-compare s o)
+  (jvm-string-compare s (jolt-need-str o)))
+(define (jolt-str-compare-ci s o)
+  (jvm-string-ci-compare s (jolt-need-str o)))
+(define (jolt-str-blank? s)
+  (let blank ((i 0))
+    (cond ((fx=? i (string-length s)) #t)
+          ((char-whitespace? (string-ref s i)) (blank (fx+ i 1)))
+          (else #f))))
+(define (jolt-str-repeat s n)
+  (let ((n (jolt->idx n)))
+    (if (fx<=? n 0) ""
+        (apply string-append
+               (let rep ((i n) (a (quote ()))) (if (fx=? i 0) a (rep (fx- i 1) (cons s a))))))))
+(define (jolt-str-code-point-at s i) (char->integer (string-ref s (jolt->idx i))))
+(define (jolt-str-last-index-of s needle) (str-last-index-of s (str-needle needle)))
+(define (jolt-str-strip s left? right?) (str-strip s left? right?))
+(define (jolt-str-to-char-array s) (na-char-array s))
+(define (jolt-str-get-bytes s cs) (na-byte-array (charset-encode-bv s cs)))
+(define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
+(define (jolt-str-replace-all s pat repl) (irregex-replace/all (str-irx pat) s repl))
+(define (jolt-str-replace-first s pat repl) (irregex-replace (str-irx pat) s repl))
+;; re-split, not irregex-split: irregex-split collapses an empty field, so
+;; ("a::b" ":") came back ("a" "b") where the JVM gives ("a" "" "b").
+;; `limit` arrives raw from the direct-emit path (the JVM's 2-arg overload) and
+;; already normalized from split-limit-arg on the dispatch path; normalizing here
+;; is idempotent, so both callers can hand over whatever they hold.
+(define (jolt-str-split s pat limit)
+  (jvm-split-array (str-irx pat) s (if (number? limit) (exact (truncate limit)) 0)))
+(define (jolt-str-sub-sequence s from to) (substring s (jolt->idx from) (jolt->idx to)))
+(define (jolt-str-simple-name s)
+  (let ((i (str-last-index-of s "."))) (if (>= i 0) (substring s (+ i 1) (string-length s)) s)))
+
+;; --- lattice-proven clojure.core calls ---------------------------------------
+;; The back end lowers (count s) / (str a b) to these when the collection lattice
+;; proved every operand a string (jolt.passes.types str-prim-op).
+;;
+;; They tolerate NIL, and that is the whole reason they exist rather than
+;; string-length / string-append being emitted directly. A :str type can come from
+;; a DECLARED ^String hint, and a hint is not a nil proof — people write ^String on
+;; a parameter that may be nil — while (count nil) is 0 and (str nil) is "" in
+;; Clojure, which is load-bearing in real code. The nil test costs one branch
+;; against the four failed type tests jolt-count runs before its string? arm, and
+;; against a var-deref plus jolt-invoke plus str's own render loop.
+;;
+;; This mirrors the :nilable rule on the struct path: where nil is possible, keep
+;; the nil-safe form. A LYING hint (a non-string, non-nil receiver) fails here, the
+;; same contract every other hint-directed path has.
+(define (jolt-str-count s) (if (jolt-nil? s) 0 (string-length s)))
+(define (jolt-str-nil->empty x) (if (jolt-nil? x) "" x))
+(define (jolt-str-cat2 a b)
+  (string-append (jolt-str-nil->empty a) (jolt-str-nil->empty b)))
+(define (jolt-str-cat3 a b c)
+  (string-append (jolt-str-nil->empty a) (jolt-str-nil->empty b) (jolt-str-nil->empty c)))
+
 (define (jolt-string-method method s rest)
-  (define (arg n) (list-ref rest n))
+  ;; A missing argument is the JVM's reflective miss (dispatch-miss: a 0-arg read
+  ;; reports as a field, more as a method of that arity), not an index fault from
+  ;; reading past the argument list — that left the call uncatchable as the
+  ;; IllegalArgumentException it is.
+  (define (arg n)
+    (let loop ((l rest) (i n))
+      (cond ((null? l) (dispatch-miss s method rest))
+            ((fx=? i 0) (car l))
+            (else (loop (cdr l) (fx- i 1))))))
    (cond
     ;; hot-first: length/charAt/indexOf/startsWith dominate library interop
     ;; (honeysql, string codecs); a miss at the bottom of the chain cost ~100ns
@@ -296,49 +451,38 @@
     ((string=? method "charAt") (string-ref s (jolt->idx (arg 0))))
     ((string=? method "toString") s)
     ((string=? method "indexOf")
-     (str-index-of-any s (arg 0)
+     (str-index-of-any s (str-arg (arg 0))
                    (if (fx>? (length rest) 1) (jolt->idx (arg 1)) 0)))
     ((string=? method "startsWith")
-     (let ((p (arg 0))) (and (fx>=? (string-length s) (string-length p))
+     (let ((p (str-arg (arg 0)))) (and (fx>=? (string-length s) (string-length p))
                              (string=? (substring s 0 (string-length p)) p))))
     ((string=? method "hashCode") (java-string-hash s))
     ((string=? method "toLowerCase") (string-downcase s))
     ((string=? method "toUpperCase") (string-upcase s))
     ((string=? method "trim") (str-trim s))
     ((string=? method "isEmpty") (fx=? (string-length s) 0))
-    ((string=? method "isBlank")
-     (let blank ((i 0))
-       (cond ((fx=? i (string-length s)) #t)
-             ((char-whitespace? (string-ref s i)) (blank (fx+ i 1)))
-             (else #f))))
-    ((string=? method "repeat")
-     (let ((n (jolt->idx (arg 0))))
-       (if (fx<=? n 0) ""
-           (apply string-append (let rep ((i n) (a '())) (if (fx=? i 0) a (rep (fx- i 1) (cons s a))))))))
-    ((string=? method "codePointAt")
-     (char->integer (string-ref s (jolt->idx (arg 0)))))
+    ((string=? method "isBlank") (jolt-str-blank? s))
+    ((string=? method "repeat") (jolt-str-repeat s (arg 0)))
+    ((string=? method "codePointAt") (jolt-str-code-point-at s (arg 0)))
     ((string=? method "substring")
      (substring s (jolt->idx (arg 0))
                 (if (fx>? (length rest) 1) (jolt->idx (arg 1)) (string-length s))))
-    ((string=? method "lastIndexOf")
-     (str-last-index-of s (str-needle (arg 0))))
+    ((string=? method "lastIndexOf") (jolt-str-last-index-of s (arg 0)))
     ((string=? method "endsWith")
-     (let ((p (arg 0)) (slen (string-length s)))
+     (let ((p (str-arg (arg 0))) (slen (string-length s)))
        (and (fx>=? slen (string-length p))
             (string=? (substring s (fx- slen (string-length p)) slen) p))))
     ((string=? method "contains")
      (fx>=? (str-index-of s (str-needle (arg 0)) 0) 0))
-    ((string=? method "concat") (string-append s (arg 0)))
+    ((string=? method "concat") (string-append s (str-arg (arg 0))))
     ((string=? method "replace") (str-replace-literal s (str-needle (arg 0)) (str-needle (arg 1))))
-    ((string=? method "equalsIgnoreCase")
-     (string=? (ascii-string-down s) (ascii-string-down (arg 0))))
-    ;; compareTo answers an INT on the JVM, not a double — it fed straight into
-    ;; (neg? …) fine but printed as -1.0, and (= -1 (.compareTo …)) was false.
-    ((string=? method "compareTo")
-     (let ((o (jolt-need-str (arg 0)))) (cond ((string<? s o) -1) ((string>? s o) 1) (else 0))))
-    ((string=? method "compareToIgnoreCase")
-     (let ((a (string-downcase s)) (b (string-downcase (jolt-need-str (arg 0)))))
-       (cond ((string<? a b) -1) ((string>? a b) 1) (else 0))))
+    ;; These three go through the same jolt-str-* wrappers the PROVEN-receiver
+    ;; path emits (below), so the hinted and generic paths cannot answer
+    ;; differently — a divergence between them would surface only on the hinted
+    ;; path, which is where nobody looks.
+    ((string=? method "equalsIgnoreCase") (jolt-str-equals-ci? s (arg 0)))
+    ((string=? method "compareTo") (jolt-str-compare s (arg 0)))
+    ((string=? method "compareToIgnoreCase") (jolt-str-compare-ci s (arg 0)))
     ;; CharSequence content equality — the same characters, whatever the receiver's
     ;; concrete type (a StringBuilder compares equal to the String it holds).
     ((string=? method "contentEquals")
@@ -357,14 +501,14 @@
             (fx<=? (fx+ ooff len) (string-length other))
             (let ((a (substring s toff (fx+ toff len)))
                   (b (substring other ooff (fx+ ooff len))))
-              (if ic? (string-ci=? a b) (string=? a b))))))
+              (if ic? (jvm-string-ci=? a b) (string=? a b))))))
     ;; char[] of the string's characters — a real 'char array, the same value
     ;; (char-array s) builds and (String. ca) reads back.
-    ((string=? method "toCharArray") (na-char-array s))
+    ((string=? method "toCharArray") (jolt-str-to-char-array s))
     ;; Java 11 strip family. Unicode-aware whitespace, where trim cuts at <= U+0020.
-    ((string=? method "strip") (str-strip s #t #t))
-    ((string=? method "stripLeading") (str-strip s #t #f))
-    ((string=? method "stripTrailing") (str-strip s #f #t))
+    ((string=? method "strip") (jolt-str-strip s #t #t))
+    ((string=? method "stripLeading") (jolt-str-strip s #t #f))
+    ((string=? method "stripTrailing") (jolt-str-strip s #f #t))
     ((string=? method "getBytes")
      ;; (.getBytes s) / (.getBytes s charset) -> a jolt byte-array (seqable /
      ;; countable / alength-able, like (byte-array …)); the JVM returns byte[].
@@ -372,40 +516,34 @@
      ;; name string or a Charset object through charset-arg-name. Rendering a
      ;; Charset here produced "#object[java.nio.charset.Charset]", which matched
      ;; no arm and silently encoded as UTF-8.
-     (na-byte-array
-      (charset-encode-bv s (if (null? rest) "utf-8" (arg 0)))))
-    ((string=? method "matches") (if (irregex-match (str-irx (arg 0)) s) #t #f))
-    ((string=? method "replaceAll") (irregex-replace/all (str-irx (arg 0)) s (arg 1)))
-    ((string=? method "replaceFirst") (irregex-replace (str-irx (arg 0)) s (arg 1)))
-    ;; re-split, not irregex-split: irregex-split collapses an empty field, so
-    ;; ("a::b" ":") came back ("a" "b") where the JVM gives ("a" "" "b").
-    ((string=? method "split")
-     (jvm-split-array (str-irx (arg 0)) s (split-limit-arg rest 1)))
+     (jolt-str-get-bytes s (if (null? rest) "utf-8" (arg 0))))
+    ((string=? method "matches") (jolt-str-matches? s (arg 0)))
+    ((string=? method "replaceAll") (jolt-str-replace-all s (arg 0) (arg 1)))
+    ((string=? method "replaceFirst") (jolt-str-replace-first s (arg 0) (arg 1)))
+    ((string=? method "split") (jolt-str-split s (arg 0) (split-limit-arg rest 1)))
     ;; universal object-methods that reach a string target (seed object-methods):
     ;; a thrown string / Exception. ctor (which keeps the message string) answers
     ;; getMessage with itself; equals is value equality.
     ((or (string=? method "getMessage") (string=? method "getLocalizedMessage")) s)
-    ((string=? method "equals") (and (string? (arg 0)) (string=? s (arg 0))))
+    ((string=? method "equals") (jolt-str-equals? s (arg 0)))
     ;; String.intern: jolt strings aren't pooled, but value equality holds, so the
     ;; canonical representation is the string itself.
     ((string=? method "intern") s)
     ;; A class token is its canonical-name string, so Class methods land here:
     ;; (.getName (.getClass x)) / (.getSimpleName …) over the name string.
     ((or (string=? method "getName") (string=? method "getCanonicalName")) s)
-    ((string=? method "getSimpleName")
-     (let ((i (str-last-index-of s "."))) (if (>= i 0) (substring s (+ i 1) (string-length s)) s)))
+    ((string=? method "getSimpleName") (jolt-str-simple-name s))
     ;; .getChars srcBegin srcEnd dst dstBegin — copy s[srcBegin,srcEnd) into the
     ;; char-array dst at dstBegin (used by buffered readers, e.g. data.json).
     ((string=? method "getChars")
      (let ((src-begin (jolt->idx (arg 0))) (src-end (jolt->idx (arg 1)))
-           (dv (jolt-array-vec (arg 2))) (dst-begin (jolt->idx (arg 3))))
+           (dst (arg 2)) (dst-begin (jolt->idx (arg 3))))
        (let loop ((i src-begin) (j dst-begin))
          (when (fx<? i src-end)
-           (vector-set! dv j (string-ref s i))
+           (ja-set! dst j (string-ref s i))
            (loop (fx+ i 1) (fx+ j 1)))))
      jolt-nil)
-    ((string=? method "subSequence")
-     (substring s (jolt->idx (arg 0)) (jolt->idx (arg 1))))
+    ((string=? method "subSequence") (jolt-str-sub-sequence s (arg 0) (arg 1)))
     ;; Class.isArray over a class-name string: array classes are "[…" (e.g. "[C").
     ((string=? method "isArray") (and (fx>? (string-length s) 0) (char=? (string-ref s 0) #\[)))
     ;; the shared end of the chain, so a string reports the same way every other
@@ -714,11 +852,24 @@
 ;; import: bring a deftype/defrecord from another ns into the current one. A spec
 ;; [from-ns Type ...] binds each Type's ctor closure under the current ns, so its
 ;; (Type. ...) constructor (host-new resolves it as a var) works after :import.
+;; A bare fully-qualified symbol spec — (import 'java.util.Date), or java.util.Date
+;; in an ns :import clause — is the (java.util Date) list it abbreviates. A name
+;; with no package (a default-package class the JVM would look up) binds nothing.
+(define (import-spec-of-fqn nm)
+  (let ((i (let loop ((i (fx- (string-length nm) 1)))
+             (cond ((fx<? i 0) #f)
+                   ((char=? (string-ref nm i) #\.) i)
+                   (else (loop (fx- i 1)))))))
+    (if i
+        (list (jolt-symbol #f (substring nm 0 i))
+              (jolt-symbol #f (substring nm (fx+ i 1) (string-length nm))))
+        '())))
 (define (chez-runtime-import . specs)
   (for-each
     (lambda (spec)
       (let ((items (cond ((pvec? spec) (seq->list spec))
                          ((or (cseq? spec) (empty-list-t? spec)) (seq->list spec))
+                         ((symbol-t? spec) (import-spec-of-fqn (symbol-t-name spec)))
                          (else '()))))
         (when (and (pair? items) (symbol-t? (car items)))
           (let ((from (symbol-t-name (car items))))

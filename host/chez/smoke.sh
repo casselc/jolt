@@ -243,10 +243,19 @@ check_loc '(zzzptqx 1)' 'Unable to resolve symbol: zzzptqx'
 nested_unresolved='(defn nestedf []
   (let [a 1]
     (bogusxyz a)))'
-check_loc "$nested_unresolved" '  at 3:'
+check_loc "$nested_unresolved" '  --> 3:'
 # The position must reach the machine-readable diagnostic too, not just the text.
-diag_nested="$(JOLT_DIAG=edn $jolt -e "$nested_unresolved" 2>&1 >/dev/null)"
-if printf '%s' "$diag_nested" | grep -q ':line 3'; then
+#
+# READ the line rather than grep it. Every key in the map is :jolt.error/-
+# namespaced, so the printer emits the namespaced-map form #:jolt.error{:line 3}
+# — the same data a reader gives back either way, and the shape flips to the flat
+# spelling the moment a thrower's own ex-data key joins it. A gate that matches
+# text is asserting the printer's choice; a tool consuming this reads it.
+diag_dir="$(mktemp -d)"
+JOLT_DIAG=edn $jolt -e "$nested_unresolved" 2>"$diag_dir/nested.edn" >/dev/null
+diag_nested="$(cat "$diag_dir/nested.edn")"
+diag_nested_line="$($jolt -e "(:jolt.error/line (read-string (slurp \"$diag_dir/nested.edn\")))" 2>/dev/null)"
+if [ "$diag_nested_line" = "3" ]; then
   pass=$((pass + 1))
 else
   echo "  FAIL: JOLT_DIAG=edn carries the nested line"
@@ -264,18 +273,21 @@ check_no '(prinltn 1)' '  trace:'
 check_trace '(do (defn keepstrace [x] (inc (/ x 0))) (keepstrace 1))' 'keepstrace'
 
 # JOLT_DIAG=edn emits one machine-readable EDN diagnostic line (valid EDN with
-# quoted strings) carrying the structured :type/:suggestions plus source position.
-diag_out="$(JOLT_DIAG=edn $jolt -e '(prinltn 1)' 2>&1 >/dev/null)"
-if printf '%s' "$diag_out" | grep -q ':type :unresolved-symbol' \
-   && printf '%s' "$diag_out" | grep -q ':suggestions \[' \
-   && printf '%s' "$diag_out" | grep -q '"println"' \
-   && printf '%s' "$diag_out" | grep -q ':line 1'; then
+# quoted strings) carrying the structured kind/suggestions plus source position.
+# The keys are namespaced (:jolt.error/...) so a diagnostic's own metadata cannot
+# collide with a thrower's ex-data; :kind is the specific handle on the error and
+# :type is the phase that raised it. Read back as data, for the reason above.
+JOLT_DIAG=edn $jolt -e '(prinltn 1)' 2>"$diag_dir/sugg.edn" >/dev/null
+diag_out="$(cat "$diag_dir/sugg.edn")"
+diag_fields="$($jolt -e "(let [d (read-string (slurp \"$diag_dir/sugg.edn\"))] (pr [(:jolt.error/kind d) (vec (:jolt.error/suggestions d)) (:jolt.error/line d)]))" 2>/dev/null)"
+if [ "$diag_fields" = '[:analyze/unresolved-symbol ["print" "printf" "println"] 1]' ]; then
   pass=$((pass + 1))
 else
   echo "  FAIL: JOLT_DIAG=edn structured diagnostic"
-  echo "    got \`$diag_out\`"
+  echo "    got \`$diag_out\` -> \`$diag_fields\`"
   fails=$((fails + 1))
 fi
+rm -rf "$diag_dir"
 
 # JOLT_CHECK surfaces the success-type checker as located warnings; off by
 # default it must stay silent.
@@ -458,6 +470,20 @@ cla_check "$jolt -e '(println *command-line-args*)'"                 'nil'
 rc_dir="$(mktemp -d)"; rc="$rc_dir/rc.clj"; printf '(prn *command-line-args*)\n' > "$rc"
 cla_check "$jolt run \"$rc\" -- -e x" '("-e" "x")'
 rm -rf "$rc_dir"
+# read-string does not inherit the file being loaded. rdr-source-file is bound
+# around a WHOLE file load, so a (read-string s) the file's own code runs at
+# runtime used to come back with forms tagged :file "<that file>", and a read
+# error then carried a position into the STRING rendered against that file — a
+# framed snippet of a line that had nothing to do with it. Only reachable from
+# inside a real load, which is the one place the parameter is set; :line stays,
+# and describes the string that was read (known-divergences: the JVM records no
+# position for read-string at all).
+rs_dir="$(mktemp -d)"
+printf '%s\n' '(ns p)' \
+  '(prn [(:file (meta (read-string "(foo)"))) (:line (meta (read-string "(foo)")))])' \
+  > "$rs_dir/p.clj"
+cla_check "$jolt run \"$rs_dir/p.clj\"" '[nil 1]'
+rm -rf "$rs_dir"
 # -m NS -- ... : same end-of-options rule for a namespace -main.
 mp="$(mktemp -d)"; mkdir -p "$mp/src"
 printf '{:paths ["src"]}\n' > "$mp/deps.edn"
@@ -526,6 +552,37 @@ else
   echo "  FAIL: bare jolt should start a REPL (got \`$repl_out\`)"
   fails=$((fails + 1))
 fi
+
+# Every CLI entry starts in user, like clojure.main's. The image bakes jolt.main
+# at heap build, and loading a namespace leaves it current, so -e, the REPL and a
+# run's -main all evaluated in jolt.main: a REPL def landed as #'jolt.main/x
+# under a prompt that said user.
+ns_e="$($jolt -e '(defn h [] 1) (println (str *ns*) (str #'"'"'h))' 2>/dev/null)"
+if printf '%s' "$ns_e" | grep -q "^user #'user/h"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: -e should evaluate in user (got \`$ns_e\`)"
+  fails=$((fails + 1))
+fi
+repl_ns="$(printf '(in-ns (quote foo))\n(str *ns*)\n' | $jolt repl 2>/dev/null)"
+if printf '%s' "$repl_ns" | grep -q '^foo=> "foo"'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: the REPL prompt should name the current namespace (got \`$repl_ns\`)"
+  fails=$((fails + 1))
+fi
+nsm="$(mktemp -d)"
+mkdir -p "$nsm/src/nsm"
+printf '{:paths ["src"]}\n' > "$nsm/deps.edn"
+printf '(ns nsm.core)\n(defn -main [& _] (println (str *ns*)))\n' > "$nsm/src/nsm/core.clj"
+nsm_out="$(JOLT_PWD="$nsm" $jolt run -m nsm.core 2>/dev/null | tail -1)"
+if [ "$nsm_out" = "user" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: run -m should invoke -main in user (got \`$nsm_out\`)"
+  fails=$((fails + 1))
+fi
+rm -rf "$nsm"
 
 # The runtime's shared side-tables (metadata, the variadic fixed-arity registry)
 # must survive concurrent access: a Chez hashtable is not thread-safe, and
@@ -975,6 +1032,40 @@ else
   fails=$((fails + 1))
 fi
 
+# A project root must not shadow a namespace Jolt provides as a host built-in.
+# Jolt's reader matches :bb, so a copy of babashka.fs pulled in as a dependency
+# is source written to be inert here (0.4.18 guards list-dir behind
+# `#?(:bb nil …)` and its list-dirs then fails to compile). A built binary
+# already resolves Jolt's copy first because install sources are embedded; this
+# asserts source mode answers the same file. The decoy would load fine on its
+# own — it is Jolt's copy winning that makes list-dir resolve.
+bbs_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+bbshadow="$(mktemp -d)"; mkdir -p "$bbshadow/src/babashka"
+printf '(ns babashka.fs)\n(def marker :decoy)\n' > "$bbshadow/src/babashka/fs.cljc"
+printf '{:paths ["src"]}\n' > "$bbshadow/deps.edn"
+bbs_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '(do (require (quote babashka.fs)) [(nil? (resolve (quote babashka.fs/marker))) (boolean (some-> (resolve (quote babashka.fs/list-dir)) deref fn?))])' 2>&1 | tail -1)"
+if [ "$bbs_out" = '[true true]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a project root shadowed babashka.fs"
+  echo "    want \`[true true]\` got \`$bbs_out\`"
+  fails=$((fails + 1))
+fi
+
+# ...and the escape hatch: a project that DECLARES it supplies the namespace
+# itself gets its own copy, with no supplement interned over it. Without one,
+# "jolt always wins" would be a thing a project could not get out of.
+printf '{:paths ["src"] :jolt/replaces [babashka.fs]}\n' > "$bbshadow/deps.edn"
+bbr_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '(do (require (quote babashka.fs)) [(= :decoy @(resolve (quote babashka.fs/marker))) (nil? (resolve (quote babashka.fs/list-dir)))])' 2>&1 | tail -1)"
+if [ "$bbr_out" = '[true true]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: :jolt/replaces did not reach the project's own babashka.fs"
+  echo "    want \`[true true]\` got \`$bbr_out\`"
+  fails=$((fails + 1))
+fi
+rm -rf "$bbshadow"
+
 # jolt.fs — the stdlib file-system API against a scratch temp dir (glob, copy-tree,
 # move, mtime round-trip, which). The file self-checks and prints one marker.
 fs_out="$($jolt run test/chez/fs-test.clj 2>/dev/null)"
@@ -1127,6 +1218,28 @@ else
   fails=$((fails + 1))
 fi
 
+# Core reads no system file for its default zone: with TZ unset and no provider
+# registered it is UTC on every machine; a provider (jolt.time registers its
+# machine-zone lookup) is consulted before that; TZ wins over both.
+tzdefault_out="$(unset TZ; $jolt -e '[(.getID (java.util.TimeZone/getDefault)) (.format (java.text.SimpleDateFormat. "HH:mm zzz") (java.util.Date. 0)) (do (jolt.host/set-default-zone-provider! (fn [] "Asia/Tokyo")) (.getID (java.util.TimeZone/getDefault))) (.format (java.text.SimpleDateFormat. "HH:mm zzz") (java.util.Date. 0))]' 2>&1 | tail -1)"
+if [ "$tzdefault_out" = '["UTC" "00:00 UTC" "Asia/Tokyo" "09:00 JST"]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: default zone without TZ is UTC, then the provider's: $tzdefault_out"
+  fails=$((fails + 1))
+fi
+
+# TZ names the default zone (the process's own setting): under it the deprecated Date getters,
+# SimpleDateFormat and Calendar read that zone's clock, its short name and
+# offset render, and a zone-less parse lands on the instant it names there.
+tzdef_out="$(TZ=America/New_York $jolt -e '[(.format (java.text.SimpleDateFormat. "yyyy-MM-dd HH:mm zzz Z") (java.util.Date. 1393632000000)) (.getHours (java.util.Date. 1393632000000)) (.getID (java.util.TimeZone/getDefault)) (.get (doto (java.util.Calendar/getInstance) (.setTime (java.util.Date. 1393632000000))) java.util.Calendar/HOUR_OF_DAY) (.getTime (.parse (java.text.SimpleDateFormat. "yyyy-MM-dd HH:mm") "2014-02-28 19:00")) (.getDate (java.util.Date. 114 2 1))]' 2>&1 | tail -1)"
+if [ "$tzdef_out" = '["2014-02-28 19:00 EST -0500" 19 "America/New_York" 19 1393632000000 1]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: default zone under TZ=America/New_York: $tzdef_out"
+  fails=$((fails + 1))
+fi
+
 # The same file's OTHER libc probe: LC_TIME is process global just like TZ, and
 # both the boot capability check and locale-name itself write it. An unrestored
 # write left every jolt process in en_US.UTF-8 and moved to "C" on the first
@@ -1272,7 +1385,10 @@ fi
 # single check, "FAIL: jolt.process" with nothing under it is all the gate says, and
 # the reason — the exception — is exactly what was thrown away.
 process_log="$(mktemp)"
-$jolt run test/chez/process-test.clj >"$process_log" 2>&1 || true
+# JOLT_EXE names the jolt under test for the cases that spawn a child jolt, so a
+# built binary tests itself rather than whatever `jolt` is on PATH.
+JOLT_EXE="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")" \
+  $jolt run test/chez/process-test.clj >"$process_log" 2>&1 || true
 process_out="$(cat "$process_log")"
 if printf '%s' "$process_out" | grep -q 'PROCESS-TEST OK'; then
   pass=$((pass + 1))

@@ -1,15 +1,15 @@
-;; Hot-path shape gates: split-with-limit, timeout arming, deque draining,
-;; StringTokenizer, ns-publics/refer, and set/intersection must not scale
+;; Hot-path shape gates: split-with-limit, deque draining, StringTokenizer,
+;; ns-publics/refer, and set/intersection must not scale
 ;; worse than linearly (or must be independent of a dimension they used to
 ;; scale with). One file, one boot: each section is the same in-process
-;; judgment as read_scaling_test.clj — ratio-based, sized so a REGRESSED
-;; implementation still finishes and fails rather than hanging.
+;; judgment as read_scaling_test.clj — balanced alternating arms where the
+;; workload is repeatable. Every regressed shape is sized to finish and fail
+;; rather than hang. The stateful timeout heap's deterministic comparison-count
+;; gate lives with its white-box functional coverage in async-timer-test.ss.
 ;;
 ;; What each section pins (all were real, found in the 2026-08 structural
 ;; sweep):
 ;;   split      (.split s LIMIT) recomputed (length out) per part — O(parts^2).
-;;   timeout    core.async timeout arming was a linear sorted-list insert —
-;;              O(k^2) for a burst; now a binary min-heap.
 ;;   deque      ArrayDeque/LinkedList front ops shifted the whole backing
 ;;              vector — the standard .poll worklist idiom was O(n^2).
 ;;   tokenizer  StringTokenizer called length/list-ref per token — O(n^2).
@@ -22,18 +22,15 @@
 
 (ns hotpath-scaling-test
   (:require [clojure.string :as str]
-            [clojure.set :as set]
-            [clojure.core.async :as async]))
+            [clojure.set :as set]))
 
+;; Milliseconds as a double, from the nanosecond clock: a row whose small arm
+;; takes a millisecond or two is otherwise quantized to 1 or 2, and its ratio
+;; to 5.0 or 10.0 — which is where the timeout row's noise came from.
 (defn- timed [f]
-  (let [t (System/currentTimeMillis)
-        v (f)]
-    [(- (System/currentTimeMillis) t) v]))
-
-(defn- timed-ns [f]
   (let [t (System/nanoTime)
         v (f)]
-    [(- (System/nanoTime) t) v]))
+    [(/ (- (System/nanoTime) t) 1e6) v]))
 
 (defn- best-of [k f]
   (reduce min (map first (repeatedly k #(timed f)))))
@@ -41,50 +38,45 @@
 (def ^:private failures (atom 0))
 
 (defn- judge [label t1 t4 ceiling detail]
-  (let [t1 (max 1 t1)
+  (let [t1 (max 0.05 t1)
         ratio (double (/ t4 t1))]
-    (println (format "hotpath %-9s %4dms vs %4dms, ratio %6.2f (ceiling %.1f)"
+    (println (format "hotpath %-9s %7.1fms vs %7.1fms, ratio %6.2f (ceiling %.1f)"
                      label t1 t4 ratio (double ceiling)))
     (when (> ratio ceiling)
       (println (str "FAIL hotpath " label ": " detail))
       (swap! failures inc))))
 
-(defn- judge-ns [label t1 t4 ceiling detail]
-  (let [ratio (double (/ t4 t1))]
-    (println (format "hotpath %-9s %8.3fms vs %8.3fms, ratio %6.2f (ceiling %.1f)"
-                     label (/ t1 1e6) (/ t4 1e6) ratio (double ceiling)))
-    (when (> ratio ceiling)
-      (println (str "FAIL hotpath " label ": " detail))
-      (swap! failures inc))))
+;; Two arms measured together: best-of-5 each, the runs ALTERNATING arms so a
+;; contended stretch of a shared CI runner lands on both. Measured separately,
+;; a short arm nearly always finds one clean run and a long arm often does not,
+;; which reads as the long arm being superlinear — the deque row read 8.33 on a
+;; 4-vs-16 expectation that way, then the tokenizer row 8.50. A miss is measured
+;; once more before it counts; a regression misses twice.
+(defn- judge-thunks [label fa fb ceiling detail]
+  (let [measure (fn []
+                  (let [ts (doall (repeatedly 5 #(vector (first (timed fa)) (first (timed fb)))))]
+                    [(reduce min (map first ts)) (reduce min (map second ts))]))
+        [ta tb] (measure)
+        ratio (double (/ tb (max 0.05 ta)))]
+    (if (<= ratio ceiling)
+      (judge label ta tb ceiling detail)
+      (do (println (format "hotpath %-9s %7.1fms vs %7.1fms, ratio %6.2f — over %.1f, measuring again"
+                           label ta tb ratio (double ceiling)))
+          (let [[ua ub] (measure)] (judge label ua ub ceiling detail))))))
+
+;; A scaling row: f1 drains the base size, f4 four times it. The arms are
+;; balanced to the SAME wall time for a linear implementation — f1 runs 4×reps
+;; times, f4 reps times — so the ratio reads ~1 for linear and ~4 for quadratic
+;; (the ceiling sits at 2), and contention inflates both arms alike rather than
+;; only the longer one. The big arm's total work is what "still finishes when
+;; regressed" is sized around, and it is unchanged: reps drains of 4n.
+(defn- judge-scaling [label f1 f4 reps ceiling detail]
+  (judge-thunks label #(dotimes [_ (* 4 reps)] (f1)) #(dotimes [_ reps] (f4)) ceiling detail))
 
 ;; --- split with a positive limit ---------------------------------------------
 (defn- split-drain [n]
   (let [s (str/join "," (range n))]
     (count (str/split s #"," 10000000))))
-
-;; --- timeout arming: k pending timers, far-future distinct deadlines ---------
-(defn- arm-timeouts [k base-ms]
-  (dotimes [i k] (async/timeout (+ base-ms i)))
-  k)
-
-;; Negative control for the implementation this gate guards against. The old
-;; timeout queue was a sorted mutable list. A burst of increasing deadlines
-;; scanned every existing entry before appending the next one, so the total
-;; work was 0 + 1 + ... + (k-1). An object array keeps this witness bounded and
-;; isolates the relevant operation — linear scan followed by constant-time
-;; append — from LinkedList iterator overhead.
-(defn- linear-scan-insert-burst [k]
-  (let [pending (object-array k)]
-    (loop [i 0 seen 0]
-      (if (= i k)
-        seen
-        (let [seen' (loop [j 0 seen seen]
-                      (if (= j i)
-                        seen
-                        (recur (inc j)
-                               (if (nil? (aget pending j)) seen (inc seen)))))]
-          (aset pending i i)
-          (recur (inc i) seen'))))))
 
 ;; --- deque drain -------------------------------------------------------------
 (defn- deque-drain [n]
@@ -109,45 +101,17 @@
     (println "FAIL hotpath: wrong results from a fixed path")
     (System/exit 1))
 
-  ;; Each timed arm repeats its drain 4x: the deque small arm measured ~3ms,
-  ;; under the CI noise floor, and read 8.33 against the 8.0 ceiling on a
-  ;; shared runner (a regressed shifting impl sits ~16). Repetition grows the
-  ;; measurement without growing n, so a quadratic regression's per-drain cost
-  ;; — what "still finishes when broken" was sized around — is unchanged.
+  ;; 4 drains of 4n against 16 drains of n: a linear drain reads ~1, a
+  ;; quadratic one ~4 (a regressed shifting deque sat at 16 on a 4-vs-16
+  ;; expectation, which is 4 here). The base arm alone measured ~3ms, under the
+  ;; CI noise floor; the repetition grows the measurement without growing n.
   (let [n1 4000]
-    (judge "split" (best-of 3 #(dotimes [_ 4] (split-drain n1))) (best-of 3 #(dotimes [_ 4] (split-drain (* 4 n1)))) 8.0
+    (judge-scaling "split" #(split-drain n1) #(split-drain (* 4 n1)) 4 2.0
            "re-split is recomputing (length out) per part again (natives-str.ss)")
-    (judge "deque" (best-of 3 #(dotimes [_ 4] (deque-drain n1))) (best-of 3 #(dotimes [_ 4] (deque-drain (* 4 n1)))) 8.0
+    (judge-scaling "deque" #(deque-drain n1) #(deque-drain (* 4 n1)) 4 2.0
            "ArrayDeque front ops are shifting the backing vector again (host-static-classes.ss)")
-    (judge "tokenizer" (best-of 3 #(dotimes [_ 4] (tok-drain n1))) (best-of 3 #(dotimes [_ 4] (tok-drain (* 4 n1)))) 8.0
+    (judge-scaling "tokenizer" #(tok-drain n1) #(tok-drain (* 4 n1)) 4 2.0
            "StringTokenizer is scanning its token list per token again (host-static-classes.ss)"))
-
-  ;; Timeout arming is not idempotent: a best-of retry would measure a heap
-  ;; pre-loaded by the prior sample. Use one measurement per size, far-future
-  ;; deadlines so nothing fires mid-measure, and enough work to clear the old
-  ;; millisecond clock floor. Keep raw monotonic nanoseconds through the ratio;
-  ;; the former 1ms clamp made 1ms vs 18ms and 3ms vs 10ms alternate between
-  ;; failure and success for the same binary.
-  (let [k 8000
-        [t1 _] (timed-ns #(arm-timeouts k 3600000))
-        [t4 _] (timed-ns #(arm-timeouts (* 4 k) 7200000))]
-    (judge-ns "timeout" t1 t4 8.0
-              "timeout-insert! is walking the pending list per arm again (async.ss)"))
-
-  ;; Prove that the selected sizes and ceiling still reject the old algorithmic
-  ;; shape. This is deliberately separate from the live global timeout heap.
-  (linear-scan-insert-burst 100)
-  (let [k 1000
-        [t1 c1] (timed-ns #(linear-scan-insert-burst k))
-        [t4 c4] (timed-ns #(linear-scan-insert-burst (* 4 k)))
-        ratio (double (/ t4 t1))]
-    (println (format "control timeout-list %8.3fms vs %8.3fms, ratio %6.2f (floor 8.0)"
-                     (/ t1 1e6) (/ t4 1e6) ratio))
-    (when-not (and (= c1 (/ (* k (dec k)) 2))
-                   (= c4 (/ (* 4 k (dec (* 4 k))) 2))
-                   (> ratio 8.0))
-      (println "FAIL hotpath timeout-list control: gate no longer distinguishes the former quadratic insertion path")
-      (swap! failures inc)))
 
   ;; ns-publics shape independence: a tiny namespace's ns-publics must not get
   ;; slower because unrelated vars exist. R repetitions beat the clock floor.
@@ -165,14 +129,9 @@
   ;; intersection shape independence: big ∩ small vs small ∩ big.
   (let [big (set (range 100000))
         small #{1 2 3}
-        reps 200
-        t-bs (best-of 3 #(dotimes [_ reps] (set/intersection big small)))
-        t-sb (max 1 (best-of 3 #(dotimes [_ reps] (set/intersection small big))))
-        ratio (double (/ t-bs t-sb))]
-    (println (format "hotpath set-shape %4dms vs %4dms, ratio %6.2f (ceiling 5.0)" t-bs t-sb ratio))
-    (when (> ratio 5.0)
-      (println "FAIL hotpath set-shape: intersection is walking its larger argument (set.clj)")
-      (swap! failures inc)))
+        reps 200]
+    (judge-thunks "set-shape" #(dotimes [_ reps] (set/intersection small big)) #(dotimes [_ reps] (set/intersection big small)) 5.0
+           "intersection is walking its larger argument (set.clj)"))
 
   ;; protocol-count shape independence: a record collection op looks for a
   ;; declared impl before falling back to the record behaviour, and that lookup
@@ -206,10 +165,8 @@
                          (contains? one :x) (contains? many :x))
             (println "FAIL hotpath proto-shape: record ops answered wrong")
             (System/exit 1))
-        probe (fn [r] #(dotimes [_ reps] (do (count r) (contains? r :x) (seq r))))
-        t1 (max 1 (best-of 3 (probe one)))
-        t8 (best-of 3 (probe many))]
-    (judge "proto-shape" t1 t8 3.0
+        probe (fn [r] #(dotimes [_ reps] (do (count r) (contains? r :x) (seq r))))]
+    (judge-thunks "proto-shape" (probe one) (probe many) 3.0
            "record collection ops are re-walking the type's protocol table (find-method-any-protocol, protocols.ss) — 8 protocols cost more than 1"))
 
   (if (pos? @failures)

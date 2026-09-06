@@ -159,13 +159,13 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
-  smoke tracesmoke buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
+  smoke tracesmoke errorreport errorkinds buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
-  protoret pic narrow directlink directcall arraymap unitcontext numeric oparity mathfl flarr \
+  protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke aspectintegrationcheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke testbincurrentsmoke aspectintegrationcheck \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
@@ -365,8 +365,7 @@ unit:
 # and an entry with no :check fails. certify.clj runs the JVM half against
 # reference Clojure; this half needs no JVM, so it lives in `ci`.
 # `make documented-record` prints what jolt currently answers, for recording a
-# new entry (the JVM side comes from
-# `clojure -M test/conformance/certify.clj --record-documented`).
+# new entry. Run `make certify` for the JVM side through the pinned oracle.
 documented:
 	@$(CHEZ) --script host/chez/run-documented.ss
 
@@ -383,10 +382,13 @@ documented-record:
 # the graph) but charged every single-gate run 18s — enough to make `make
 # buildlibsmoke` slower with the prerequisite than without it. The staleness
 # check covers the same inputs build-jolt.ss embeds: the runtime .ss files, the
-# install roots, and the launcher stub. JOLT_FORCE_TESTBIN=1 rebuilds anyway.
+# install roots, and the launcher stub. The binary also embeds tools/version.sh's
+# git identity, so a commit with unchanged source mtimes must make it stale too.
+# JOLT_FORCE_TESTBIN=1 rebuilds anyway.
 TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/grenadine/src vendor/grenadine-generated vendor/irregex
 testbin:
-	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
+	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || \
+	   ! tools/testbin-current.sh target/release/jolt "$(CURDIR)" || \
 	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
 	  $(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt; \
 	else \
@@ -401,6 +403,21 @@ smoke: testbin
 # method surface.
 tracesmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/trace-smoke.sh
+
+# What a user READS when jolt rejects their program: message, position, ex-data,
+# trace and exit status, pinned per case as golden files under test/errors. Every
+# other gate asserts that a bad program is rejected; this one asserts what the
+# report then says. Regenerate deliberately with:
+#   sh host/chez/error-report-check.sh generate
+errorreport: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/error-report-check.sh
+
+# Every diagnostic kind the sources raise is registered in
+# test/conformance/error-kinds.edn, and every registered kind is still raised.
+# Both directions: an unregistered kind is an error with no documented meaning,
+# and a registry entry nothing raises is a doc rotting into decoration.
+errorkinds:
+	@sh host/chez/error-kinds-check.sh
 
 # The IR schema validator (JOLT_IR_VALIDATE) reports no problems on real code.
 irvalidate:
@@ -506,9 +523,10 @@ complexity: testbin
 ioscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/io_scaling_test.clj
 
-# The 2026-08 sweep's remaining hot-path shapes in one gate: split-with-limit,
-# core.async timeout arming, ArrayDeque/StringTokenizer draining, ns-publics/
-# refer var-table independence, set/intersection smaller-side walk.
+# The 2026-08 sweep's repeatable hot-path shapes in one gate: split-with-limit,
+# ArrayDeque/StringTokenizer draining, ns-publics/refer var-table independence,
+# and set/intersection smaller-side walk. The stateful timeout heap is covered
+# deterministically by the white-box asynctimer gate.
 hotscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/hotpath_scaling_test.clj
 
@@ -783,6 +801,12 @@ directcall:
 arraymap:
 	@$(CHEZ) --script test/chez/arraymap-test.ss
 
+# Array backings: which Chez vector type each element kind stores its elements
+# in (fxvector / bytevector / flvector / boxed vector), the fixnum-range
+# widening, and that a boxed array of a typed kind still behaves.
+arraybacking:
+	@$(CHEZ) --script test/chez/array-backing-test.ss
+
 # Direct-linking emission: a closed-world build binds top-level app defs to jv$
 # Scheme bindings and routes app->app calls/refs to them, skipping var-deref +
 # jolt-invoke; ^:dynamic/^:redef and nested defs opt out.
@@ -960,14 +984,26 @@ makefilesmoke:
 versionsmoke:
 	@bash test/version-smoke.sh
 
+# A commit changes the version baked into testbin even when no watched source
+# mtime changes. Keep that identity check executable and control-tested so an
+# exact-head CI receipt never accidentally runs a binary from the prior commit.
+testbincurrentsmoke:
+	@sh test/testbin-current-smoke.sh
+
 aspectintegrationcheck:
 	@bash test/aspect-integration-provenance-smoke.sh
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
+# The oracle version is READ from the committed profile, which certify.clj also
+# checks the running Clojure against — so the pin has one source, and bumping the
+# oracle is a profile edit rather than two edits that can drift apart.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
-		clojure -M test/conformance/certify.clj --self-test && \
-		clojure -M test/conformance/certify.clj; \
+		v=$$(sed -n 's/^ :clojure-version "\([^"]*\)".*/\1/p' test/conformance/profile.edn); \
+		if [ -z "$$v" ]; then echo "certify: no :clojure-version in test/conformance/profile.edn"; exit 1; fi; \
+		deps="{:deps {org.clojure/clojure {:mvn/version \"$$v\"}}}"; \
+		clojure -Sdeps "$$deps" -M test/conformance/certify.clj --self-test && \
+		clojure -Sdeps "$$deps" -M test/conformance/certify.clj; \
 	else \
 		echo "certify: clojure not on PATH — skipped"; \
 	fi

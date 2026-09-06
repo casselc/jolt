@@ -14,8 +14,12 @@
 
 ;; with-out-str: capture everything the body prints to *out* and return it as a
 ;; string. __with-out-str (clojure.core) runs the thunk with the output captured.
+;; The bare try is the same guard locking carries: the reference's with-out-str
+;; expands through `binding`, which is a try/finally, so a recur may not cross it.
+;; Without it jolt's capture thunk became the recur target and
+;; (loop [] (with-out-str (recur))) spun forever.
 (defmacro with-out-str [& body]
-  `(__with-out-str (fn* [] ~@body)))
+  `(__with-out-str (fn* [] (try ~@body))))
 
 ;; defmulti/defmethod are sugar over defmulti-setup/defmethod-setup (ctx-capturing
 ;; clojure.core fns) so they compile as plain invokes. name/mm are passed quoted;
@@ -114,8 +118,16 @@
 
 ;; Take x's monitor for the duration of body (futures/agents/threads share one
 ;; heap, so this is a real per-object lock), releasing on any exit.
+;;
+;; The bare try costs nothing — with no catch and no finally, emit-try emits the
+;; body and nothing else — and it is what keeps `recur` honest. The reference's
+;; locking IS a try/finally, so a recur may not cross it; jolt's thunk is a
+;; fiber-scheduling requirement (an OS mutex has thread granularity and a fiber
+;; is not a thread — java/concurrency.ss), and without the try that thunk quietly
+;; became the recur TARGET: (loop [] (locking o (recur))) spun forever instead of
+;; being refused.
 (defmacro locking [x & body]
-  `(jolt.host/with-monitor ~x (fn* [] ~@body)))
+  `(jolt.host/with-monitor ~x (fn* [] (try ~@body))))
 
 ;; STM macros over the host transaction seams (refs.ss). sync keeps the
 ;; reference's (sync flags & body) shape — flags are ignored, like the JVM.
@@ -380,6 +392,13 @@
 ;; group, every other form appends to the current one. (extend-protocol uses
 ;; parse-extend-impls instead — it must treat a COMPUTED class type like
 ;; (Class/forName "[B"), a seq, as a head, which this would misread as a method.)
+;; deftype/defrecord options: leading keyword/value pairs before the specs
+;; (:load-ns, and any other the reference's parse-opts+specs consumes without
+;; reading, such as gvec's :no-print). Skipped, as the reference skips them.
+(defn- drop-type-opts [body]
+  (loop [b (seq body)]
+    (if (and b (keyword? (first b))) (recur (nnext b)) b)))
+
 (defn- group-by-head [items]
   ;; nil is a valid extension head (extend-protocol P ... nil (m [x] ...)).
   (reduce (fn [acc x]
@@ -551,14 +570,21 @@
                           pnames (set (map name shadowed))
                           ;; let-bind only immutable fields; mutable ones are read live
                           ;; via rewrite-body so a set! within the method is observed.
-                          binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
+                          ;; The read is the DECLARED-SLOT one, not get: a type
+                          ;; declaring clojure.lang.ILookup answers get through its
+                          ;; own valAt, so binding fields with get would re-enter
+                          ;; that valAt on every method entry — including valAt's
+                          ;; own — and never come back. It is also the cheaper read
+                          ;; (straight to the slot, no type cascade).
+                          binds (vec (mapcat (fn [f] [f (list (symbol "clojure.core" "__deftype-field")
+                                                              inst (keyword (name f)))])
                                              (filter (fn [f] (and (not (mutable? f))
                                                                   (not (contains? pnames (name f)))))
                                                      fields)))
                           mbody (map (fn [bf] (rewrite-body inst shadowed bf)) (drop 2 spec))
                           mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
                       (list argv (list* 'let binds mbody))))
-        groups (group-by-head body)
+        groups (group-by-head (drop-type-opts body))
         ;; merge clauses by method NAME across ALL protocols into one multi-arity
         ;; fn, so a name appearing in two interfaces with different arities
         ;; (data.priority-map's seq is in Seqable [this] AND Sorted [this asc])
@@ -758,8 +784,25 @@
 (defmacro proxy [supers ctor-args & methods]
   (if (and (vector? supers) (= 1 (count supers))
            (let [s (name (first supers))] (or (= s "ThreadLocal") (= s "InheritableThreadLocal"))))
-    (let [init (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
-      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))))
+    ;; WHICH of the two is load-bearing: they differ only in what a forked thread
+    ;; sees, and that is the entire difference between the classes. Lowering both
+    ;; to one object made whichever storage was chosen wrong for the other.
+    ;;
+    ;; initialValue is the only override this lowering can honour — the object it
+    ;; builds is a host storage shim, not a subclass, so a get/set/remove/
+    ;; toString/childValue body has nowhere to go. It used to be dropped in
+    ;; silence, which is a method that looks defined and never runs; say so at
+    ;; the call site instead.
+    (let [extra (remove (fn [m] (= "initialValue" (name (first m)))) methods)
+          init  (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
+      (when (seq extra)
+        (throw (ex-info (str "proxy over " (name (first supers))
+                             " can only override initialValue, not "
+                             (apply str (interpose ", " (map (fn [m] (name (first m))) extra))))
+                        {:class (name (first supers))
+                         :unsupported (mapv (fn [m] (name (first m))) extra)})))
+      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))
+                                    ~(= (name (first supers)) "InheritableThreadLocal")))
     ;; group the flattened specs by method name, so several arities of one method
     ;; become one multi-arity fn — the same shape reify builds.
     (loop [specs (seq (apply concat (map proxy-arity-specs methods)))
@@ -837,7 +880,7 @@
                           mbody (drop 2 spec)
                           mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
                       (list hinted (list* 'let binds mbody))))
-        groups (group-by-head body)
+        groups (group-by-head (drop-type-opts body))
         ;; merge clauses by name across protocols into one multi-arity fn (see
         ;; deftype's by-name).
         by-name (reduce (fn [m spec]

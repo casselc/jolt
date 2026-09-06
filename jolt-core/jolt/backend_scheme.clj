@@ -91,6 +91,34 @@
                             (str "(substring " t " (jolt->idx " a0 ") (jolt->idx " a1 "))"))
       (= m "replace")     (when (= argc 2)
                              (str "(str-replace-literal " t " (str-needle " a0 ") (str-needle " a1 "))"))
+      ;; The rest route to a jolt-str-* native (java/natives-str.ss), which is the
+      ;; SAME procedure the generic jolt-string-method arm calls — so the hinted
+      ;; and unhinted paths cannot drift, and each argument is spliced exactly
+      ;; once (they are raw expressions here, not temporaries: a second splice
+      ;; would evaluate the argument twice).
+      (= m "equals")               (when (= argc 1) (str "(jolt-str-equals? " t " " a0 ")"))
+      (= m "equalsIgnoreCase")     (when (= argc 1) (str "(jolt-str-equals-ci? " t " " a0 ")"))
+      (= m "compareTo")            (when (= argc 1) (str "(jolt-str-compare " t " " a0 ")"))
+      (= m "compareToIgnoreCase")  (when (= argc 1) (str "(jolt-str-compare-ci " t " " a0 ")"))
+      (= m "isBlank")              (when (= argc 0) (str "(jolt-str-blank? " t ")"))
+      (= m "repeat")               (when (= argc 1) (str "(jolt-str-repeat " t " " a0 ")"))
+      (= m "codePointAt")          (when (= argc 1) (str "(jolt-str-code-point-at " t " " a0 ")"))
+      (= m "lastIndexOf")          (when (= argc 1) (str "(jolt-str-last-index-of " t " " a0 ")"))
+      (= m "strip")                (when (= argc 0) (str "(jolt-str-strip " t " #t #t)"))
+      (= m "stripLeading")         (when (= argc 0) (str "(jolt-str-strip " t " #t #f)"))
+      (= m "stripTrailing")        (when (= argc 0) (str "(jolt-str-strip " t " #f #t)"))
+      (= m "toCharArray")          (when (= argc 0) (str "(jolt-str-to-char-array " t ")"))
+      (= m "getBytes")             (cond (= argc 0) (str "(jolt-str-get-bytes " t " \"utf-8\")")
+                                         (= argc 1) (str "(jolt-str-get-bytes " t " " a0 ")")
+                                         :else nil)
+      (= m "matches")              (when (= argc 1) (str "(jolt-str-matches? " t " " a0 ")"))
+      (= m "replaceAll")           (when (= argc 2) (str "(jolt-str-replace-all " t " " a0 " " a1 ")"))
+      (= m "replaceFirst")         (when (= argc 2) (str "(jolt-str-replace-first " t " " a0 " " a1 ")"))
+      (= m "split")                (cond (= argc 1) (str "(jolt-str-split " t " " a0 " 0)")
+                                         (= argc 2) (str "(jolt-str-split " t " " a0 " " a1 ")")
+                                         :else nil)
+      (= m "subSequence")          (when (= argc 2) (str "(jolt-str-sub-sequence " t " " a0 " " a1 ")"))
+      (= m "intern")               (when (= argc 0) t)
       :else nil)))
 
 ;; Direct emission for (.m target …) whose target is PROVEN a keyword
@@ -811,7 +839,7 @@
                   "hashtable-ref"
                   ;; top-level def / forward-declare / ns-value splice
                   ;; (emit-def-cached, :forward-decl, :the-ns).
-                  "define" "def-var!" "def-var-with-meta!"
+                  "define" "def-var!" "def-var-plain!" "def-var-with-meta!"
                   "declare-var!" "intern-ns!"
                   ;; ffi lowering (emit-ffi-fn/emit-ffi-callable: the sa-* adapter
                   ;; syntaxes a Chez foreign-procedure/callable expands to).
@@ -873,10 +901,25 @@
 ;; way a stray true can't leak into, say, a call sitting in a vector literal.
 ;; :throw is tail-transparent so the :throw emit case still sees *tail?* — a
 ;; TAIL throw must store the site-vreg pair (sited-tail-call) or its TCO-erased
-;; frame has no name at report time (app.tailstale's thrower).
-(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw})
+;; frame has no name at report time (app.tailstale's thrower). :host-call for
+;; the same reason: a (.concat s nil) in tail position raises from inside the
+;; host, and without the site the fn it sat in is the one frame the report
+;; cannot recover.
+(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw :host-call})
+;; A try with neither a catch nor a finally is tail-transparent too, because
+;; emit-try emits it as its body and nothing else: there is no guard and no
+;; dynamic-wind between the caller and that body, so a tail call inside one is a
+;; real tail call and needs its site stored like any other. Treating it as opaque
+;; stored nothing, TCO erased the frames anyway, and the trace lost every frame
+;; from the try outwards — (defn wrapped [x] (try (boom x))) reported `boom` and
+;; then stopped, where the same fn without the try named itself and its caller.
+;; A try that HAS a catch or a finally is genuinely not tail-transparent and stays
+;; opaque; this reads the same two keys emit-try branches on.
+(defn- tail-transparent? [node]
+  (or (contains? tail-transparent-ops (:op node))
+      (and (= :try (:op node)) (nil? (:catch-sym node)) (nil? (:finally node)))))
 (defn emit [node]
-  (let [s (if (and *tail?* (not (tail-transparent-ops (:op node))))
+  (let [s (if (and *tail?* (not (tail-transparent? node)))
             (binding [*tail?* false] (emit* node))
             (emit* node))]
     ;; a :long operand of a :double-specialized op is tagged :fl-coerce by
@@ -2274,26 +2317,32 @@
 ;; chains at runtime and ballooned the heap on delegation-heavy code — every
 ;; mark op allocated; see rt.ss.) Self-tail calls never reach here (emit-call
 ;; elides them), so a tight self-loop stores once, not per iteration.
+;; The static site pair literal: the cdr is the line, or #(line callee-fqn
+;; call-site-line) when this site is code the inline pass copied out of another
+;; fn — the same shape a trace marker carries, read back by the same accessors
+;; (source-registry jolt-marker-entry-*). Without it a tail site inside a
+;; spliced body reports the fn it was spliced INTO, at a line that fn does not
+;; contain: this is the path the continuation walk cannot cover, because the
+;; tail call erased the frame.
+(defn- site-literal [site-qname line inl-chain]
+  (str "'(" (chez-str-lit site-qname) " . "
+       (if (seq inl-chain)
+         (str "#(" line " ("
+              (str/join " " (map (fn [e] (str "(" (chez-str-lit (nth e 0))
+                                              " . " (nth e 1) ")")) inl-chain))
+              "))")
+         (str line))
+       ")"))
+;; The inline chain a node carries, when every fn in it can be named by a marker.
+(defn- node-inline-chain [node]
+  (let [c (get node :inline-chain)]
+    (when (and (seq c) (every? (fn [e] (marker-safe-fqn? (nth e 0))) c)) c)))
 (defn- sited-tail-call
   ([site-qname line callee operand-strs] (sited-tail-call site-qname line callee operand-strs nil))
   ([site-qname line callee operand-strs inl-chain]
   (let [tts (mapv (fn [_] (fresh-label "_tt$")) operand-strs)
         binds (str/join " " (map (fn [t a] (str "(" t " " a ")")) tts operand-strs))
-        ;; The cdr is the line, or #(line callee-fqn call-site-line) when this
-        ;; site is code the inline pass copied out of another fn — the same shape
-        ;; a trace marker carries, read back by the same accessors
-        ;; (source-registry jolt-marker-entry-*). Without it a tail site inside a
-        ;; spliced body reports the fn it was spliced INTO, at a line that fn does
-        ;; not contain: this is the path the continuation walk cannot cover,
-        ;; because the tail call erased the frame.
-        site (str "'(" (chez-str-lit site-qname) " . "
-                  (if (seq inl-chain)
-                    (str "#(" line " ("
-                         (str/join " " (map (fn [e] (str "(" (chez-str-lit (nth e 0))
-                                                         " . " (nth e 1) ")")) inl-chain))
-                         "))")
-                    (str line))
-                  ")")]
+        site (site-literal site-qname line inl-chain)]
     (if (seq binds)
       (str "(let* (" binds ") (jolt-site! " site ") " (plain-call callee tts) ")")
       (str "(begin (jolt-site! " site ") " (plain-call callee operand-strs) ")")))))
@@ -2313,14 +2362,20 @@
   (let [tail? *tail?*]           ; capture: children below emit non-tail
    (binding [*tail?* false]
     (let [fnode (:fn node)
+        ;; TWO parallel vectors, same length, same order, one character apart in
+        ;; name: arg-nodes are the IR NODES, args are their EMITTED STRINGS.
+        ;; Anything that needs to ask a question about an argument — its type, its
+        ;; :num-kind, whether it is a constant — has to read arg-nodes; args can
+        ;; only be spliced into output. Reaching for `args` and calling (:op …) on
+        ;; it yields nil for every argument and fails silently, which is a real bug
+        ;; this file has already shipped once.
         arg-nodes (:args node)
         args (mapv emit arg-nodes)
         tl (or (node-line node) 0)
         ;; the same stamp with-site folds into the marker; a TAIL site needs it in
         ;; the site pair instead, because the call erases the frame the marker
         ;; would have been read against (source-registry jolt-site-frame*)
-        ich (let [c (get node :inline-chain)]
-              (when (and (seq c) (every? (fn [e] (marker-safe-fqn? (nth e 0))) c)) c))
+        ich (node-inline-chain node)
         ;; R2: record this site's static callee for the callsite table. Runs after
         ;; the args are emitted, so when a line carries both a call and its
         ;; operand's call the OUTER (later-emitted) callee wins — the tail call's.
@@ -2454,7 +2509,19 @@
                     (or hv (str "(jolt-array-vec " (first as) ")"))
                     " " (second as) " " v ") " v ")"))
              (str "(jolt-flaset " (str/join " " as) ")")))))
+      ;; (aget ^longs/^ints/^bytes/^objects a i) and its aset twin. A boxed backing
+      ;; cannot unbox, so there is no inline form and no hoisted vector — the win is
+      ;; skipping jolt-nth's dispatch walk, which the call already gets.
+      (:v-aget node) (order-args (fn [as] (str "(jolt-vaget " (str/join " " as) ")")))
+      (:v-aset node) (order-args (fn [as] (str "(jolt-vaset " (str/join " " as) ")")))
       (:fl-op node) (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")")))
+      ;; the integer twin of :fl-op — a java.lang.Math member over proven fixnum
+      ;; operands, lowered to its jolt-l-* macro (jolt.passes.numeric math-lng-ops).
+      (:lng-op node) (order-args (fn [as] (str "(" (:lng-op node) " " (str/join " " as) ")")))
+      ;; a clojure.core call the collection lattice proved reduces to a Chez
+      ;; primitive — (count s) / (str a b) over proven strings (jolt.passes.types
+      ;; str-prim-op). No var deref, no jolt-invoke, no type dispatch.
+      (:prim-op node) (order-args (fn [as] (str "(" (:prim-op node) " " (str/join " " as) ")")))
       ;; hint-directed fast arithmetic: jolt.passes.numeric proved every operand a
       ;; flonum (^double) or fixnum (^long), so emit the Chez fl*/fx* op.
       (:num-kind node) (emit-numeric (:num-kind node) (:name fnode) args order-args)
@@ -2592,12 +2659,50 @@
              shape (get (ctor-shapes) key)]
          (and (= :var (:op fnode)) shape
               (= (count (get shape :fields)) (count args))
-              (<= (count args) 6)
-              ;; skip if any ^double field — the inlined path doesn't coerce
-              (not-any? #{"double"} (get shape :tags))))
+              (<= (count args) 6)))
        (let [s (get (ctor-shapes) (str (:ns fnode) "/" (:name fnode)))
              tag (:type s)
              cells *cache-cells*
+             ;; A ^double field is widened on the way in, exactly as the dispatched
+             ;; ctor does it (make-deftype-ctor's build calls the same jolt-rec-dbl).
+             ;; This used to disqualify the whole inline path — which meant a
+             ;; coordinate record, the shape the ^double machinery exists for, always
+             ;; paid the slow ctor: jolt-invoke, var-deref, rest-list, ctor call,
+             ;; hashtable lookup and a field vector.
+             tags (vec (get s :tags))
+             ;; ...but only over an argument that is not ALREADY a flonum.
+             ;; jolt-rec-dbl is a runtime guard — (number? a) and (not (flonum? a))
+             ;; before exact->inexact — so wrapping it around a proven double makes
+             ;; the ^double DECLARATION cost two type tests per field per
+             ;; construction that the same record without the tag does not pay.
+             ;; Measured: (->Vec3 i (+ i 1) 2.5) in a loop ran 2.3x SLOWER declared
+             ;; ^double than undeclared, all of it here. Extra static type
+             ;; information must never make the emitted code slower than its
+             ;; absence; where it cannot help it has to cost nothing.
+             ;;
+             ;; Proven means: a literal flonum (double? is exact here — a bigdec
+             ;; and a ratio both answer false, and both still need the coercion),
+             ;; or a node the numeric pass typed :double, whose emission is an fl
+             ;; op and so yields a flonum by construction. Anything else keeps the
+             ;; guard: a :long is 64-bit and may be a bignum at runtime, which is
+             ;; exactly what jolt-rec-dbl's exact->inexact handles.
+             proven-double? (fn [nd]
+                              (and (map? nd)
+                                   (or (and (= :const (:op nd)) (double? (:val nd)))
+                                       (= :double (:num-kind nd)))))
+             ;; One tag per ARGUMENT (a record may declare fewer tags than the
+             ;; ctor takes), so the three vectors below are the same length and
+             ;; map together. Mapping rather than indexing three vectors apart is
+             ;; the point: it is what makes pairing a field's tag with another
+             ;; field's argument impossible to write.
+             arg-tags (mapv (fn [i] (nth tags i nil)) (range (count arg-nodes)))
+             ;; field-tag: what the FIELD declares. nd: the IR node being passed
+             ;; into it. a: that node already emitted. Only nd can answer a
+             ;; question about the value. Named field-tag, not tag, because `tag`
+             ;; in this scope is the record's TYPE tag two lines below.
+             coerce-arg (fn [field-tag nd a]
+                          (if (and (= "double" field-tag) (not (proven-double? nd)))
+                            (str "(jolt-rec-dbl " a ")") a))
              desc-lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
              cached-desc (if cells
                            (let [c (fresh-label "_cdesc$")]
@@ -2605,7 +2710,8 @@
                              (str "(or " c " (let ((_d " desc-lookup ")) (set! " c " _d) _d))"))
                            desc-lookup)]
          (order-args (fn [as]
-                       (let [n (count as)]
+                       (let [n (count as)
+                             as (vec (map coerce-arg arg-tags arg-nodes as))]
                          (if (<= n 8)
                            (str "(make-jrec" n " " cached-desc " jolt-nil 0"
                                 (when (pos? n) (str " " (str/join " " as))) ")")
@@ -2764,6 +2870,56 @@
       (if-some [c (emit-impl-clone node)]
         (str "(begin " c " " base ")")
         base))))
+
+;; (.method target arg*) as a Scheme form. A node carrying :sited-target /
+;; :sited-args (the tail-site emission in emit*) uses those already-bound temps
+;; instead of emitting the receiver and args itself.
+(defn- host-call-emit [node]
+  (let [m (:method node)
+        chez? (not= :gambit (target))
+        t (or (:sited-target node) (emit (:target node)))
+        args (or (:sited-args node) (map emit (:args node)))
+        direct (when chez?
+                 (or (when (= :str (:target-type node))
+                       (string-direct-emit m (count args) t args))
+                     (when (= :kw (:target-type node))
+                       (keyword-direct-emit m (count args) t args))
+                     (when (= :sb (:target-type node))
+                       (sb-direct-emit m (count args) t args))))]
+    (cond
+      direct direct
+      (supported-host-methods m)
+      (str "(jolt-host-call " (chez-str-lit m) " " t
+           (if (empty? args) "" (str " " (str/join " " args))) ")")
+      ;; An UNPROVEN receiver whose method has a string or keyword
+      ;; direct form: test the receiver's type at the site and take
+      ;; that form, with the generic dispatch as the slow arm — the
+      ;; same open-code-the-fast-case shape the bit ops use. Strings
+      ;; and keywords are what library code calls .length/.charAt/
+      ;; .getName on without a hint, and the generic walk cost
+      ;; 60-135 ns per call against 3-11 for the direct form. The
+      ;; receiver and args are bound once, in order, so nothing is
+      ;; evaluated twice and the direct forms may splice `t` freely.
+      ;; A receiver of any other type behaves exactly as before.
+      chez?
+      (let [tt (fresh-label "_ht$")
+            as (mapv (fn [_] (fresh-label "_ha$")) args)
+            sd (string-direct-emit m (count as) tt as)
+            kd (keyword-direct-emit m (count as) tt as)
+            generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
+                         " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
+        (if (or sd kd)
+          (str "(let* ((" tt " " t ")"
+               (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
+               ") (cond"
+               (when sd (str " ((string? " tt ") " sd ")"))
+               (when kd (str " ((keyword-t? " tt ") " kd ")"))
+               " (else " generic ")))")
+          (str "(record-method-dispatch " t " " (chez-str-lit m)
+               " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
+      :else
+      (str "(record-method-dispatch " t " " (chez-str-lit m)
+           " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
 
 (defn emit* [node]
   (case (:op node)
@@ -2928,51 +3084,35 @@
      ;; that native directly — no dispatch walk, no rest-args vector. The emitted
      ;; target is bound as `t` rather than `target` so the host predicate
      ;; `(target)` stays reachable in this scope.
-     :host-call (let [m (:method node)
-                      chez? (not= :gambit (target))
-                      t (emit (:target node))
-                      args (map emit (:args node))
-                      direct (when chez?
-                               (or (when (= :str (:target-type node))
-                                     (string-direct-emit m (count args) t args))
-                                   (when (= :kw (:target-type node))
-                                     (keyword-direct-emit m (count args) t args))
-                                   (when (= :sb (:target-type node))
-                                     (sb-direct-emit m (count args) t args))))]
-                  (cond
-                    direct direct
-                    (supported-host-methods m)
-                    (str "(jolt-host-call " (chez-str-lit m) " " t
-                         (if (empty? args) "" (str " " (str/join " " args))) ")")
-                    ;; An UNPROVEN receiver whose method has a string or keyword
-                    ;; direct form: test the receiver's type at the site and take
-                    ;; that form, with the generic dispatch as the slow arm — the
-                    ;; same open-code-the-fast-case shape the bit ops use. Strings
-                    ;; and keywords are what library code calls .length/.charAt/
-                    ;; .getName on without a hint, and the generic walk cost
-                    ;; 60-135 ns per call against 3-11 for the direct form. The
-                    ;; receiver and args are bound once, in order, so nothing is
-                    ;; evaluated twice and the direct forms may splice `t` freely.
-                    ;; A receiver of any other type behaves exactly as before.
-                    chez?
-                    (let [tt (fresh-label "_ht$")
-                          as (mapv (fn [_] (fresh-label "_ha$")) args)
-                          sd (string-direct-emit m (count as) tt as)
-                          kd (keyword-direct-emit m (count as) tt as)
-                          generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
-                                       " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
-                      (if (or sd kd)
-                        (str "(let* ((" tt " " t ")"
-                             (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
-                             ") (cond"
-                             (when sd (str " ((string? " tt ") " sd ")"))
-                             (when kd (str " ((keyword-t? " tt ") " kd ")"))
-                             " (else " generic ")))")
-                        (str "(record-method-dispatch " t " " (chez-str-lit m)
-                             " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
-                    :else
-                    (str "(record-method-dispatch " t " " (chez-str-lit m)
-                         " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
+     ;; In tail position with tracing on, the receiver and args are bound first
+     ;; and the site pair stored before the call (the same shape as
+     ;; sited-tail-call, for the same reason: a callee's own tail sites must not
+     ;; stomp the slot). The host raising from inside that call — string-append
+     ;; on nil — is then reported at this fn and line, TCO having erased the
+     ;; frame. Untraced and non-tail emission is byte-identical to before.
+     :host-call (let [tail? *tail?*
+                      sited? (and (trace-frames?) tail? *trace-site*)]
+                 (binding [*tail?* false]
+                  (if sited?
+                    ;; A bare local or a constant runs no tail site, so it is
+                    ;; spliced as it is; only an operand that can call is bound
+                    ;; to a temp. (Keeps a proven-keyword (.sym k) at the exact
+                    ;; inline shape the build smoke pins.)
+                    (let [trivial? (fn [n] (contains? #{:local :const} (:op n)))
+                          bind (fn [n] (let [e (emit n)]
+                                         (if (trivial? n) [nil e] [(fresh-label "_hs$") e])))
+                          [tt t] (bind (:target node))
+                          bs (mapv bind (:args node))
+                          as (mapv (fn [[l e]] (or l e)) bs)
+                          binds (str/join " " (keep (fn [[l e]] (when l (str "(" l " " e ")")))
+                                                    (cons [tt t] bs)))
+                          site (site-literal *trace-site* (or (node-line node) 0)
+                                             (node-inline-chain node))
+                          call (host-call-emit (assoc node :sited-target (or tt t) :sited-args as))]
+                      (if (seq binds)
+                        (str "(let* (" binds ") (jolt-site! " site ") " call ")")
+                        (str "(begin (jolt-site! " site ") " call ")")))
+                    (host-call-emit node))))
     :let (emit-let node)
     :loop (emit-loop node)
     :recur (emit-recur node)
@@ -3011,7 +3151,7 @@
                      (str "(def-var-with-meta! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
                           (emit-with-cells #(emit (:init node))) " " (emit-def-meta node) ")")
                      :else
-                     (str "(def-var! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
+                     (str "(def-var-plain! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
                           (emit-with-cells #(emit (:init node))) ")"))
                    creg (trace-callsite-reg)
                    freg (fnsrc-flush)]
@@ -3100,7 +3240,7 @@
         (str "(begin" freg " (define " b " " init ") (def-var-with-meta! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b " " (emit-def-meta node) ")"
              (or reg "") (or vreg "") creg ")")
-        (str "(begin" freg " (define " b " " init ") (def-var! "
+        (str "(begin" freg " (define " b " " init ") (def-var-plain! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") creg ")"))
       (jmeta-nonempty? (:meta node))
       (if (= (str creg freg) "")
@@ -3110,9 +3250,9 @@
           (str "(begin" freg " (let ((" v " (def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")))" creg " " v "))")))
       :else
       (if (= (str creg freg) "")
-        (str "(def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")")
+        (str "(def-var-plain! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")")
         (let [v (fresh-label "_dv$")]
-          (str "(begin" freg " (let ((" v " (def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
+          (str "(begin" freg " (let ((" v " (def-var-plain! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
 
 (defn emit-top-form [node]
   (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node))

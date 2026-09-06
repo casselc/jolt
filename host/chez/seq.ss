@@ -581,7 +581,10 @@
 ;; A non-numeric operand is a ClassCastException, like the JVM.
 (define (jolt-num-cast-throw x)
   (if (jolt-nil? x)
-      (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" ""))
+      ;; Same empty-message defect as jolt-cast-throw below, same fix.
+      (jolt-throw (jolt-host-throwable
+                   "java.lang.NullPointerException"
+                   "nil where a java.lang.Number is required"))
       (jolt-throw (jolt-host-throwable
                    "java.lang.ClassCastException"
                    (string-append "class " (jolt-class-name x)
@@ -593,9 +596,17 @@
 ;; value straight to a Chez primitive. The condition Chez raises carries no class,
 ;; so it escapes as #object[:object] and no catch clause can select it; these name
 ;; the class the JVM names instead. nil is the JVM's NullPointerException.
+;; The nil arm names the type that was required. It threw an EMPTY message, so
+;; the report read "Unhandled exception (NullPointerException): " and stopped —
+;; the one thing the reader needed, what was expected here, was the one thing not
+;; said. The reference says "Cannot invoke \"String.substring(int, int)\" because
+;; \"s\" is null"; jolt cannot name the method, since these coercions are shared
+;; by every operation that needs a string, but it can name the requirement.
 (define (jolt-cast-throw x target)
   (if (jolt-nil? x)
-      (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" ""))
+      (jolt-throw (jolt-host-throwable
+                   "java.lang.NullPointerException"
+                   (string-append "nil where a " target " is required")))
       (jolt-throw (jolt-host-throwable
                    "java.lang.ClassCastException"
                    (string-append "class " (jolt-class-name x)
@@ -741,8 +752,10 @@
     (else (error 'register-num-arm!
                  "unknown numeric extension point (an op is its jolt- var minus the prefix)"
                  op))))
-(define (jolt-num-check1 x)   ; (+ x)/(* x) return x but still type-check it
-  (if (or (number? x) (jolt-num-slow? x)) x (jolt-num-cast-throw x)))
+;; (+ x)/(* x) return x but still type-check it. nil passes: the reference casts
+;; the lone operand to Number, and null passes any cast.
+(define (jolt-num-check1 x)
+  (if (or (number? x) (jolt-nil? x) (jolt-num-slow? x)) x (jolt-num-cast-throw x)))
 (define (jolt-add . xs)
   (cond ((null? xs) 0)
         ((null? (cdr xs)) (jolt-num-check1 (car xs)))
@@ -954,6 +967,30 @@
 (define-l-binop jolt-l-quot fxquotient quotient)
 (define-l-binop jolt-l-rem  fxremainder remainder)
 (define-l-binop jolt-l-mod  fxmodulo modulo)
+;; java.lang.Math over proven-:long operands (jolt.passes.numeric math-lng-ops).
+;; Most members reuse the ops above — Math.floorMod IS Scheme's modulo, and the
+;; Exact family is the checked +/-/* whose overflow arm raises ArithmeticException,
+;; which is what Math.addExact does. Two need their own name.
+;;
+;; Math.floorDiv is FLOOR division, where quotient above truncates toward zero:
+;; (Math/floorDiv -7 2) is -4 and (quot -7 2) is -3. Built from quotient and
+;; remainder rather than Chez's `div`, so the same definition compiles into the
+;; Gambit unit (which includes this file and shims the fx spellings to generic
+;; arithmetic) with no new shim.
+(define (jolt-floor-quotient a b)
+  (let ((q (quotient a b)))
+    (if (and (not (eqv? 0 (remainder a b)))
+             (if (negative? b) (positive? a) (negative? a)))
+        (- q 1)
+        q)))
+;; Math.abs. Deliberately the generic `abs`, not fxabs: a :long is only promised
+;; to be within the 64-bit range, not Chez's 61-bit fixnum range (jolt-l-checked
+;; accepts the wider one), and fxabs additionally raises on the most-negative
+;; fixnum. The win here is against host-static-call's string-keyed method lookup,
+;; beside which fixnum-vs-generic abs is noise. Named (and jolt- prefixed) so the
+;; emitted head cannot be shadowed by a user local.
+(define-syntax jolt-l-abs
+  (syntax-rules () ((_ a) (abs a))))
 (define-syntax jolt-l-inc (syntax-rules () ((_ a) (jolt-l-checked (+ a 1)))))
 (define-syntax jolt-l-dec (syntax-rules () ((_ a) (jolt-l-checked (- a 1)))))
 
@@ -1439,6 +1476,10 @@
     ((or (pvec? to) (pmap? to) (pset? to))
      (meta-carry to
        (jolt-persistent! (into-fold (lambda (t x) (jolt-conj! t x)) (jolt-transient-new to) from))))
+    ;; into nil is (reduce conj nil from): the first conj onto nil starts a
+    ;; list, and an empty source leaves nil, as on the JVM.
+    ((jolt-nil? to)
+     (into-fold (lambda (acc x) (jolt-conj1 (if (jolt-nil? acc) jolt-empty-list acc) x)) jolt-nil from))
     (else
      (meta-carry to
        (into-fold (lambda (acc x) (jolt-conj1 acc x)) to from)))))

@@ -9,7 +9,10 @@
                                :contract :args-v1}
            :test/numeric-entry-around
            {:fn 'instrumentation.provider/numeric-entry-around
-            :contract :replace-args-v1}}})
+            :contract :replace-args-v1}
+           :test/bytes-entry-around
+           {:fn 'instrumentation.provider/bytes-entry-around
+            :contract :args-v1}}})
 
 (def runtime-sites (atom {}))
 
@@ -66,4 +69,13 @@
   (println (str "numeric-entry-args " (pr-str evaluated-args)))
   (let [value (proceed [(inc (first evaluated-args))])]
     (println (str "numeric-entry-after " value))
+    :ignored-provider-result))
+
+(defn bytes-entry-around [join-point evaluated-args proceed]
+  (assert-runtime-site! join-point)
+  (println (str "bytes-entry-before " (:id join-point)))
+  (let [original (first evaluated-args)
+        value (proceed)]
+    (println (str "bytes-entry-after "
+                  (pr-str [(identical? original value) (vec value)])))
     :ignored-provider-result))

@@ -17,26 +17,84 @@
 ;; cur, so seq just yields it — clojure.test's (iterator-seq (.iterator coll)).
 (register-seq-arm! jiterator? jiterator-cur)
 
-;; A Chez condition's message string (for Throwable .getMessage/.toString): the
-;; &message text plus any &irritants, or display-condition output as a fallback.
+;; A Chez condition's message: "who: text", where text is the &message template
+;; with each ~s / ~a directive filled by the matching irritant printed as a jolt
+;; value — "string-append: nil is not a string", not "#[jolt-nil-v1] is not a
+;; string". This is Throwable .getMessage on a raw condition, jolt.host/
+;; condition-message, and the message of the throwable a fault becomes at the
+;; catch boundary (java/host-faults.ss). A template with any other directive
+;; (open-input-file's "failed for ~a: ~(~a~)") is left to Chez's format, its
+;; irritants appended when format rejects it; a message with no directive gets
+;; its irritants appended. A condition with no message at all renders through
+;; display-condition.
 (define (condition->message-string c)
   (if (message-condition? c)
       (let* ((m (condition-message c))
              (irr (if (irritants-condition? c) (condition-irritants c) '()))
-             (append-irr (lambda ()
-                           (let loop ((xs irr) (acc m))
-                             (if (null? xs) acc
-                                 (loop (cdr xs) (string-append acc " " (jolt-pr-str (car xs)))))))))
-        ;; some Chez conditions (open-input-file etc.) carry a format-template
-        ;; message ("failed for ~a: ~(~a~)") whose irritants fill the directives;
-        ;; format it in. Fall back to appending the irritants if that fails.
-        (if (and (string? m) (let scan ((i 0))
-                               (cond ((>= i (string-length m)) #f)
-                                     ((char=? (string-ref m i) #\~) #t)
-                                     (else (scan (+ i 1))))))
-            (guard (e (#t (append-irr))) (apply format m irr))
-            (append-irr)))
+             (irr (if (list? irr) irr '()))
+             (who (and (who-condition? c) (condition-who c)))
+             (text (if (string? m)
+                       (condition-template-fill m irr)
+                       (with-output-to-string (lambda () (display m))))))
+        (cond ((symbol? who) (string-append (symbol->string who) ": " text))
+              ((string? who) (string-append who ": " text))
+              (else text)))
       (with-output-to-string (lambda () (display-condition c)))))
+;; The directive at position i of template m: (next-index . kind) — kind is
+;; #\s / #\a for a plain (or ~:s) print directive, #\~ for a literal tilde, #f
+;; for anything else. i indexes the ~ itself.
+(define (condition-directive m i)
+  (let* ((n (string-length m))
+         (j (if (and (fx<? (fx+ i 1) n) (char=? (string-ref m (fx+ i 1)) #\:)) (fx+ i 2) (fx+ i 1)))
+         (d (and (fx<? j n) (char-downcase (string-ref m j)))))
+    (cond ((memv d '(#\s #\a)) (cons (fx+ j 1) d))
+          ((eqv? d #\~) (cons (fx+ j 1) #\~))
+          (else (cons (fx+ j 1) #f)))))
+(define (condition-append-irritants s irr)
+  (let loop ((xs irr) (acc s))
+    (if (null? xs) acc
+        (loop (cdr xs) (string-append acc " " (condition-irritant-string (car xs) #t))))))
+(define (condition-template-fill m irr)
+  (let ((n (string-length m)))
+    (let scan ((i 0) (simple? #t))
+      (cond
+        ((fx>=? i n)
+         (if simple?
+             (condition-fill-simple m irr)
+             (guard (e (#t (condition-append-irritants m irr)))
+               (apply format m irr))))
+        ((char=? (string-ref m i) #\~)
+         (let ((d (condition-directive m i)))
+           (scan (car d) (and simple? (cdr d) #t))))
+        (else (scan (fx+ i 1) simple?))))))
+;; An irritant as text: ~s prints it readably (a string keeps its quotes), ~a
+;; displays it. A host value jolt's printer has no class for (a Chez flvector
+;; behind a ^doubles array) would print as #object[:object]; Chez's own writer
+;; names it instead.
+(define (condition-irritant-string x readable?)
+  (let ((s (if readable? (jolt-pr-readable x) (jolt-str-render-one x))))
+    (if (string=? s "#object[:object]")
+        (with-output-to-string (lambda () (write x)))
+        s)))
+;; Every directive is ~s / ~a: substitute in order and append any left over.
+(define (condition-fill-simple m irr)
+  (let ((n (string-length m)))
+    (let loop ((i 0) (start 0) (irr irr) (acc '()))
+      (cond
+        ((fx>=? i n)
+         (condition-append-irritants
+           (apply string-append (reverse (cons (substring m start n) acc)))
+           irr))
+        ((char=? (string-ref m i) #\~)
+         (let* ((d (condition-directive m i))
+                (next (car d)) (kind (cdr d))
+                (acc (cons (substring m start i) acc)))
+           (cond ((eqv? kind #\~) (loop next next irr (cons "~" acc)))
+                 ((null? irr) (loop next next irr acc))
+                 (else (loop next next (cdr irr)
+                             (cons (condition-irritant-string (car irr) (not (eqv? kind #\a)))
+                                   acc))))))
+        (else (loop (fx+ i 1) start irr acc))))))
 ;; expose a Chez condition's message to Clojure (ex-message returns nil for raw
 ;; host conditions): the nREPL eval handler surfaces it instead of an opaque
 ;; "#<compound condition>".
@@ -47,6 +105,33 @@
 ;; the table has no such method so the caller can fall through.
 (define rd-class-method-hook #f)
 (define (set-rd-class-method-hook! f) (set! rd-class-method-hook f))
+
+;; jolt's own immutable collections that are a java.util.List / Set on the JVM:
+;; the receivers of the SequencedCollection accessors and the mutator refusal in
+;; the base below. A map is not here — its `.name` reads stay the documented
+;; map-as-object superset — and neither is a deftype.
+(define (rd-persistent-coll? obj)
+  (or (pvec? obj) (pset? obj) (cseq? obj) (empty-list-t? obj) (jolt-lazyseq? obj)))
+(define (rd-coll-last obj)
+  (if (pvec? obj)
+      (jolt-nth obj (fx- (jolt-count obj) 1))
+      (let loop ((s (jolt-seq obj)))
+        (let ((n (jolt-seq (seq-more s))))
+          (if (jolt-nil? n) (seq-first s) (loop n))))))
+(define rd-java-util-mutator-names
+  '("add" "addAll" "addFirst" "addLast" "clear" "remove" "removeAll" "removeFirst"
+    "removeLast" "removeIf" "replaceAll" "retainAll" "set" "sort"))
+(define (rd-java-util-mutator? m) (and (member m rd-java-util-mutator-names) #t))
+
+;; clojure.lang.Var meta reads for the instance arm below. A cell's meta is a
+;; pmap, or #f / nil before anything attached one (state-image rebuilds a cell with
+;; #f), so both empty shapes read as "no such key".
+(define (rd-var-meta obj)
+  (let ((m (var-cell-meta obj))) (and m (not (jolt-nil? m)) m)))
+(define (rd-var-meta-get obj key)
+  (let ((m (rd-var-meta obj))) (if m (jolt-get m (keyword #f key) jolt-nil) jolt-nil)))
+(define (rd-var-meta-flag? obj key) (jolt-truthy? (rd-var-meta-get obj key)))
+(define (rd-args->list x) (let ((s (jolt-seq x))) (if (jolt-nil? s) '() (seq->list s))))
 
 (define (record-method-dispatch-base obj method-name rest-args)
   (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))
@@ -66,11 +151,14 @@
             (let ((hit (and rd-class-method-hook (rd-class-method-hook tag method-name rest))))
               (if (pair? hit)
                   (car hit)                       ; the hook wraps, so a nil/#f answer is still a hit
-                  (cond ((or (string=? method-name "getName") (string=? method-name "getCanonicalName")
-                             (string=? method-name "getTypeName")) tag)
-                        ((string=? method-name "getSimpleName") (last-dot tag))
-                        ((string=? method-name "toString") (string-append "class " tag))
-                        (else (dispatch-miss obj method-name rest)))))))
+                  ;; presented in the JVM spelling of the tag (my_app.core.Foo for
+                  ;; a type in my-app.core), as the class token's own methods are
+                  (let ((jvm (jch-munge-segments tag)))
+                    (cond ((or (string=? method-name "getName") (string=? method-name "getCanonicalName")
+                               (string=? method-name "getTypeName")) jvm)
+                          ((string=? method-name "getSimpleName") (last-dot jvm))
+                          ((string=? method-name "toString") (string-append "class " jvm))
+                          (else (dispatch-miss obj method-name rest))))))))
       ;; clojure.lang.MultiFn interop on a defmulti value: addMethod/removeMethod/
       ;; getMethod/getMethodTable, the same table (defmethod) fills — schema's
       ;; abstract-map registers dispatch methods by calling .addMethod directly.
@@ -212,6 +300,44 @@
              ;; clojure.core/*loaded-libs* rather than whatever a load has bound
              ;; over it. deref would answer the binding.
              ((string=? method-name "getRawRoot") (var-cell-root obj))
+             ;; The rest of Var's surface, each reading the state the clojure.core
+             ;; fn of the same meaning reads: isMacro the cell's macro flag (which
+             ;; alter-meta! keeps in step with meta :macro), isBound hasRoot OR a
+             ;; thread binding (bound?), hasRoot the root alone, isDynamic /
+             ;; isPublic / getTag the meta, deref / get the thread binding then
+             ;; the root — an unbound root answers its Unbound object rather than
+             ;; throwing, as Var.deref does. These used to fall to "No matching
+             ;; field", and typedclojure reads (.isMacro v) at every def it checks.
+             ((string=? method-name "isMacro") (var-cell-macro? obj))
+             ((string=? method-name "isBound") (jolt-var-bound-one? obj))
+             ((string=? method-name "hasRoot") (not (jolt-var-unbound? (var-cell-root obj))))
+             ((string=? method-name "isDynamic") (var-cell-dynamic? obj))
+             ((string=? method-name "isPublic") (not (rd-var-meta-flag? obj "private")))
+             ((string=? method-name "getTag") (rd-var-meta-get obj "tag"))
+             ((or (string=? method-name "deref") (string=? method-name "get")) (var-cell-deref obj))
+             ;; setMacro sets the flag AND meta :macro, the pair alter-meta! keeps
+             ;; together. bindRoot / alterRoot go through alter-var-root so the
+             ;; validator and watches see the change; bindRoot also clears the
+             ;; macro flag, as Var.bindRoot does (a def over a macro un-macros it).
+             ;; setDynamic writes the FLAG and leaves the metadata alone, as the
+             ;; JVM does — the two are separate there, and (:dynamic (meta v))
+             ;; after a bare .setDynamic is nil on both now. It answers the var,
+             ;; and the boolean overload turns the flag off.
+             ((string=? method-name "setDynamic")
+              (var-cell-dynamic?-set! obj (if (pair? rest) (jolt-truthy? (car rest)) #t))
+              obj)
+             ((string=? method-name "setMacro")
+              (var-cell-macro?-set! obj #t)
+              (var-cell-meta-set! obj (jolt-assoc (or (rd-var-meta obj) (jolt-hash-map)) jolt-kw-var-macro #t))
+              jolt-nil)
+             ((string=? method-name "bindRoot")
+              (jolt-alter-var-root obj (lambda (_) (car rest)))
+              (var-cell-macro?-set! obj #f)
+              (let ((m (rd-var-meta obj)))
+                (when m (var-cell-meta-set! obj (jolt-dissoc2 m jolt-kw-var-macro))))
+              jolt-nil)
+             ((string=? method-name "alterRoot")
+              (apply jolt-alter-var-root obj (car rest) (rd-args->list (cadr rest))))
              (else (dispatch-miss obj method-name rest))))
       ;; java.lang.Throwable interop over a Chez condition. A jolt host error
       ;; (`error`/`assertion-violationf`) raises a Chez condition; Clojure code
@@ -231,6 +357,27 @@
              ((string=? method-name "compareTo")
               (let ((o (car rest))) (cond ((char<? obj o) -1) ((char>? obj o) 1) (else 0))))
              (else (dispatch-miss obj method-name rest))))
+      ;; java.util.SequencedCollection (JDK 21) over jolt's own persistent
+      ;; collections — vector / list / seq / set are java.util.List or Set on the
+      ;; JVM and carry these. getFirst / getLast raise NoSuchElementException on
+      ;; an empty one; reversed() is a reverse-order VIEW there, and for an
+      ;; immutable collection a copy is that view.
+      ((and (string=? method-name "getFirst") (rd-persistent-coll? obj))
+       (let ((s (jolt-seq obj)))
+         (if (jolt-nil? s) (throw-jvm 'NoSuchElementException "") (seq-first s))))
+      ((and (string=? method-name "getLast") (rd-persistent-coll? obj))
+       (if (jolt-nil? (jolt-seq obj)) (throw-jvm 'NoSuchElementException "") (rd-coll-last obj)))
+      ((and (string=? method-name "reversed") (rd-persistent-coll? obj))
+       (let ((items (reverse (seq->list (jolt-seq obj)))))
+         (if (pvec? obj) (apply jolt-vector items) (list->cseq items))))
+      ;; The java.util.Collection / List / Set mutators: an immutable collection
+      ;; refuses every one with UnsupportedOperationException, as on the JVM. It
+      ;; used to fall to dispatch-miss — an IllegalArgumentException "no matching
+      ;; method" that a (catch UnsupportedOperationException …) does not see. A
+      ;; deftype is not a persistent collection here: its own methods answered
+      ;; above, and an interface method it does not declare stays its own miss.
+      ((and (rd-java-util-mutator? method-name) (rd-persistent-coll? obj))
+       (throw-jvm 'UnsupportedOperationException ""))
       ;; java.util.List .indexOf / .lastIndexOf over any seqable (vector / list /
       ;; seq) — -1 when absent, like the JVM (medley/index-of reads this).
       ((or (string=? method-name "indexOf") (string=? method-name "lastIndexOf"))
@@ -356,7 +503,12 @@
 (define arm-priority-nio-path 42)     ; java.nio.file.Path methods (above jfile)
 (define arm-priority-htable 43)       ; tagged htable method registry
 (define arm-priority-host-type 44)    ; jhost/number/string per-type dispatch
+;; A nil receiver is a NullPointerException before any arm looks: the JVM
+;; cannot invoke anything on null. (.toString nil) used to answer "" and
+;; (.equals nil 1) false through the universal Object arm.
 (define (record-method-dispatch obj method-name rest-args)
+  (when (jolt-nil? obj)
+    (no-method-throw method-name obj (if (jolt-nil? rest-args) 0 (jolt-count rest-args))))
   (let loop ((as method-dispatch-arms))
     (if (null? as)
         (record-method-dispatch-base obj method-name rest-args)
@@ -454,10 +606,18 @@
                    (lambda (x) (jolt-seq (record-method-dispatch x "iterator" jolt-nil))))
 
 
-;; satisfies?: does obj's type implement the protocol? proto must be a defprotocol
-;; value (a map with a :name); a host Class/interface or any non-protocol throws —
-;; matching the JVM, which also errors — with a message naming what was passed.
+;; satisfies?: does obj's type implement the protocol? proto is a defprotocol
+;; value (a map with a :name). A host Class or interface answers instance?: jolt
+;; takes :bb reader branches, and code written for babashka asks
+;; (satisfies? clojure.lang.IObj x) where its JVM branch asks instance? — the
+;; JVM raises on the class form, babashka answers false for everything, jolt
+;; answers the question the code means. Any other non-protocol throws, with a
+;; message naming what was passed.
 (define (jolt-satisfies? proto obj)
+  (if (jclass? proto)
+      (if (instance-check proto obj) #t #f)
+      (jolt-satisfies-protocol? proto obj)))
+(define (jolt-satisfies-protocol? proto obj)
   (let* ((pn (jolt-get proto (keyword #f "name") jolt-nil))
          (pn-str (if (symbol-t? pn) (symbol-t-name pn) pn)))
     (unless (string? pn-str)
@@ -577,7 +737,13 @@
 (def-var! "clojure.core" "protocol-dispatch3" (lambda (pn mn obj a b) (protocol-dispatch3 pn mn obj a b)))
 (def-var! "clojure.core" "satisfies?" jolt-satisfies?)
 (def-var! "clojure.core" "extenders" extenders)
-(def-var! "jolt.host" "type-satisfies?" type-satisfies?)
+;; extends? asks with the name a class token PRESENTS (.getName: the JVM spelling,
+;; my_app.core.Foo), and the registry is keyed by the tag (my-app.core.Foo). Map
+;; it back here, at the jolt-visible entry only — the Scheme callers above hand
+;; over tags already, and this keeps the satisfies? path at its measured cost.
+(def-var! "jolt.host" "type-satisfies?"
+  (lambda (type-tag proto)
+    (type-satisfies? (or (deftype-tag-for-jvm-name type-tag) type-tag) proto)))
 ;; The dispatch key for the protocol SYM names — resolved the way any other
 ;; reference resolves, through :refer and :as — or nil when the symbol names no
 ;; protocol (a host class or interface, which keeps its bare name). deftype /

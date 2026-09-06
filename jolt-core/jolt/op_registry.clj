@@ -126,6 +126,13 @@
    "hash-set"    {:call "jolt-hash-set"}
    "conj"        {:call "jolt-conj"    :arity #(>= % 1) :fixed {2 "jolt-conj2"}}
    "get"         {:call "jolt-get"     :arity #(or (= % 2) (= % 3)) :pure? true}
+   ;; Reads a deftype/defrecord's DECLARED slot, bypassing the get path — the
+   ;; deftype macro binds each immutable field with it. Not a public name: a
+   ;; type declaring clojure.lang.ILookup answers get through its own valAt, and
+   ;; a method body reading its own fields through get would re-enter that valAt
+   ;; on every entry. Cheaper than get too — straight to the slot, no type
+   ;; cascade. (records.ss jrec-field / clojure.core/__deftype-field.)
+   "__deftype-field" {:call "jrec-field" :arity #(= % 2) :pure? true}
    "nth"         {:call "jolt-nth"     :arity #(or (= % 2) (= % 3))}
    "count"       {:call "jolt-count"   :arity #(= % 1) :num-result? true}
    "assoc"       {:call "jolt-assoc"   :arity #(and (>= % 3) (odd? %))
@@ -149,7 +156,7 @@
    ;; uses fall back to the clojure.core overlay var (the multi-dim walker).
    "aget"    {:call "jolt-nth"    :arity #(= % 2) :inline-only? true}
    "aset"    {:call "jolt-aset3"  :arity #(= % 3) :inline-only? true}
-   "alength" {:call "jolt-count"  :arity #(= % 1) :num-result? true}
+   "alength" {:call "jolt-alength" :arity #(= % 1) :num-result? true}
    ;; seq
    "first"   {:call "jolt-first"   :arity #(= % 1)}
    "rest"    {:call "jolt-rest"    :arity #(= % 1)}

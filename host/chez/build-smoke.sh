@@ -312,6 +312,30 @@ done
 # Compared against `jolt run` rather than pinned to a literal, because the bug
 # was a DIVERGENCE between the two; a literal would have to be re-derived every
 # time the fixture's arithmetic changes, and would not say what it is for.
+# A deftype that DECLARES clojure.lang.ILookup answers every key through that
+# valAt, field-named ones included -- the JVM gives such a type no other key
+# lookup, and the slot may hold exactly what valAt is there to transform. The
+# runtime honours it; the BUILD folded past it in two places, because every
+# deftype is registered as a record shape and nothing told the passes this one
+# has a lookup of its own (jolt-fpp3.1): scalar replacement's (:k <ctor>) fold,
+# and whole-program inference proving a param a struct and dropping the guard.
+#
+# Compared against `jolt run` because the bug is a DIVERGENCE between the two,
+# then against the literal so the two cannot agree on a shared failure.
+got_dt="$(cd / && "$out" --dtlookup 2>&1)"
+want_dt="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --dtlookup 2>&1)"
+if [ "$got_dt" != "$want_dt" ]; then
+  echo "  FAIL: a deftype's declared valAt does not answer the same as under jolt run"
+  echo "--- binary ----"; echo "$got_dt"
+  echo "--- jolt run --"; echo "$want_dt"; exit 1
+fi
+for line in 'dt-ctor:   :from-valat' 'dt-proven: :from-valat' 'dt-opaque: :from-valat :none'; do
+  if ! printf '%s' "$got_dt" | grep -qF "$line"; then
+    echo "  FAIL: declared valAt -- want '$line' (the field slot was read instead)"
+    echo "--- got ----"; echo "$got_dt"; exit 1
+  fi
+done
+
 fasl="$(dirname "$out")/closure.fasl"
 got_cl="$(cd / && "$out" --closure "$fasl" 2>&1)"
 want_cl="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --closure "$fasl" 2>&1)"
@@ -899,14 +923,14 @@ printf '{}\n' > "$badsrc/deps.edn"
 printf '(ns app.core (:require [app.broke]))\n(defn -main [& _] (println :x))\n' > "$badsrc/src/app/core.clj"
 printf '(ns app.broke)\n(defn f [] (+ 1 2)\n' > "$badsrc/src/app/broke.clj"
 read_err="$(JOLT_PWD="$badsrc" "$joltabs" build -m app.core -o "$(dirname "$out")/badread-bin" 2>&1 || true)"
-if ! printf '%s' "$read_err" | grep -q '^  at .*app/broke\.clj'; then
+if ! printf '%s' "$read_err" | grep -qE '^  (at|-->) .*app/broke\.clj'; then
   echo "  FAIL: build failure did not name src/app/broke.clj"
   echo "--- got ---"; echo "$read_err"; exit 1
 fi
 
 # A compile error names the line of the OFFENDING form, and prints no trace.
 #
-# The reporter can only do either when the throw carries a :jolt/error map, and
+# The reporter can only do either when the throw carries a :jolt.error/kind, and
 # only the unresolved-symbol diagnostic built one. Everything else raised while
 # analyzing — an uncompilable form, a destructuring pattern the desugarer rejects,
 # a macro that threw expanding — arrived bare, so the report was the LOADER's
@@ -927,7 +951,7 @@ printf '{}\n' > "$badpos/deps.edn"
   echo '    (println a b)))'
 } > "$badpos/src/app/core.clj"
 pos_err="$(JOLT_PWD="$badpos" "$joltabs" build -m app.core -o "$(dirname "$out")/badpos-bin" 2>&1 || true)"
-if ! printf '%s' "$pos_err" | grep -q '^  at .*app/core\.clj:7:'; then
+if ! printf '%s' "$pos_err" | grep -qE '^  (at|-->) .*app/core\.clj:7:'; then
   echo "  FAIL: compile error did not name app/core.clj line 7 (the let it is in)"
   echo "--- got ---"; echo "$pos_err"; exit 1
 fi

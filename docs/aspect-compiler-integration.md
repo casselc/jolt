@@ -9,20 +9,17 @@ reproducible dependency version.
 
 ## Current provenance epoch
 
-The current line was built on the source tree released as Jolt v0.8.1.
-Upstream later rewrote the release history and moved the tag without changing
-that tree:
+The current line is replayed directly onto the published Jolt v0.8.3 release:
 
 | Fact | Revision |
 | --- | --- |
-| Historical v0.8.1 base in this line | `9b7683953b444ece2a2e783e8fa46d31177bb476` |
-| Live rewritten v0.8.1 release commit | `51f10a0239096f804a6017f850b7b235ebe40168` |
-| Tree shared by both commits | `1179a2730c7098b1cc65ec6becdc36309d87d55e` |
-| First aspect compiler commit | `b89f801aed85d572225474504011a340d0e39a2b` |
-| Initial canonical verified ancestor | `88821cf18b32a11b9b9c934b909ff187bf56e043` |
+| Published v0.8.3 release commit | `343f730922cf16fafe673b466cedcdcfe0596854` |
+| Published v0.8.3 tree | `39ba588512ec3c970db3a708393426199bd88520` |
+| First replayed aspect compiler commit | `eaf4ae8588feaf88bfba7a727d50d08d7ee5945a` |
+| Initial replayed verified ancestor | `efeeeb0580bfed731d977b405a796af2d479595c` |
 
 `config/aspect-integration.lock` is the machine-readable copy of these facts.
-The verifier proves that the historical base has the recorded tree, that the
+The verifier proves that the release base has the recorded tree, that the
 first aspect commit is its direct child, and that the checked revision retains
 the aspect root and verified anchor in its ancestry. Its online mode separately
 proves that the live upstream release tag still resolves to the recorded commit
@@ -46,6 +43,8 @@ CI skip a revision outside the aspect lineage; the dedicated canonical workflow
 sets it to `1` and fails closed instead.
 
 The immutable record for this epoch is
+[`docs/aspect-compiler-epochs/v0.8.3-2026-09.md`](aspect-compiler-epochs/v0.8.3-2026-09.md).
+The preceding v0.8.1 epoch, including its rewritten-tag history, remains in
 [`docs/aspect-compiler-epochs/v0.8.1-2026-09.md`](aspect-compiler-epochs/v0.8.1-2026-09.md).
 Every later epoch adds another file under `docs/aspect-compiler-epochs/`; a
 history rewrite includes its old-to-new commit map there. The active lock

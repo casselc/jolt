@@ -37,6 +37,13 @@
       (if (= x "entry-number")
         (println (str "result "
                       (target/invoke-callback target/numeric-callback 40)))
+        (if (or (= x "entry-bytes") (= x "entry-bytes-oob"))
+          (let [bs (if (= x "entry-bytes")
+                     (byte-array [0 1 127])
+                     (byte-array 0))
+                result (target/byte-callback bs)]
+            (println (str "result "
+                          (pr-str [(identical? bs result) (vec result)]))))
         (let [result (aspects/at
                       {:id :test/target-call :role :test/around}
                       (target/operation (evaluated-argument x)))
@@ -45,6 +52,8 @@
                                (= x "entry-throw") "throw"
                                :else result)]
           (println (str "result "
-                        (target/invoke-callback target/callback callback-input)))))
+                        (target/invoke-callback target/callback callback-input))))))
       (catch Exception e
-        (println (str "caught " (ex-message e) " " (:kind (ex-data e))))))))
+        (if (= x "entry-bytes-oob")
+          (println (str "caught " (.getName (class e))))
+          (println (str "caught " (ex-message e) " " (:kind (ex-data e)))))))))

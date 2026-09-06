@@ -85,7 +85,7 @@
    ;; assert thread identity or timing and flap between fail and pass run to run,
    ;; hence the tolerance.
    :tolerance 2
-   :expect {:tests 31 :pass 210 :fail 8 :error 0}}
+   :expect {:tests 31 :pass 211 :fail 7 :error 0}}
 
   {:name "core.cache"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -195,6 +195,15 @@
    ;; trace. jolt does tail calls, so the calling frame is gone before anything can
    ;; look — the conform failure still throws with the same explain-data, it just
    ;; carries no ::caller. See known-divergences.edn.
+   ;;
+   ;; Tolerance because this suite GENERATES: map-spec-generators draws 200 samples
+   ;; through test.check and asserts that all seven key-combinations of an (or ...)
+   ;; :req appear. Usually they do; occasionally one does not, and the tally moves
+   ;; by one. Observed as a spurious REGRESSED (pass 170 -> 169, fail 4 -> 5) that
+   ;; four consecutive re-runs did not reproduce. Its test.check dependency already
+   ;; carries a tolerance for the same reason; this one was pinned exactly and
+   ;; should not have been.
+   :tolerance 2
    :expect {:tests 13 :pass 170 :fail 4 :error 0}}
 
   {:name "test.check"
@@ -459,7 +468,7 @@
    ;; its classes at load.
    :preload ["jolt.shim.commons-io" "jolt.shim.commons-fileupload"]
    :note "clj-time (Joda) + commons-fileupload are JVM-only; URLClassLoader/jar: URLs are jolt gaps"
-   :expect {:tests 152 :pass 450 :fail 1 :error 5 :load-fail 2}}
+   :expect {:tests 152 :pass 451 :fail 0 :error 5 :load-fail 2}}
 
   {:name "ring-spec"
    :paths ["src" "test"]

@@ -64,6 +64,663 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use the same scan-only placeholder rule as auto-resolved keywords; ordinary
   reads remain strict.
 
+## [0.8.3] - 2026-09-06
+
+A primitive array holds its elements unboxed, and a type hint costs nothing it
+did not buy. `^longs`/`^ints`/`^bytes` arrays move onto backings that know what
+they hold, so a byte array is 8x smaller, the collector stops walking a large
+numeric one, and every raw-byte crossing is a block move. Separately, declaring
+a `^double`/`^long` return made a function's inlined copies about half as fast as
+leaving it undeclared — type inference stopped at the coercion the inliner wraps
+them in and annotated nothing inside.
+
+### Performance
+
+- **`^longs`, `^ints` and `^bytes` arrays hold their elements unboxed.** A jolt
+  array is a Chez vector plus an element-kind tag, and only `double`/`float`
+  arrays had a backing that knew what it held (an flvector). Now `int`, `long`
+  and `short` arrays are backed by an **fxvector** and `byte` arrays by a
+  **bytevector**:
+
+  - a `byte-array` is 8x smaller — one byte per element rather than one machine
+    word — so a megabyte of bytes read off a stream costs a megabyte;
+  - the collector walks neither an fxvector nor a bytevector, so a large numeric
+    array stops being traced work on every collection: a major collection with a
+    live 20-million-element `long-array` costs 0.19ms where the boxed vector cost
+    29ms, and a `byte-array` of the same length 0.67ms. An `object-array` of the
+    same length is the control and is unchanged at ~40ms;
+  - the raw-byte seam is now a block move rather than an element loop with a
+    sign fold per byte. `(.getBytes s)`, `(String. bytes)`, `InputStream/read`
+    into a buffer, `readNBytes`, `ByteBuffer` bulk `get`/`put`, `slice`,
+    `SecureRandom/nextBytes`, `jolt.ffi/read-into!` / `write-array` and
+    `System/arraycopy` between two byte arrays all reach `bytevector-copy!`.
+    A 1MB `System/arraycopy` between two byte arrays went from 11.4ms to 0.02ms,
+    2000 8KB `InputStream/read`s into a buffer from 169ms to 11ms, and 2000
+    `(String. (.getBytes s))` round trips over a 5KB string from 104ms to 26ms.
+
+  What it costs: a hinted `(aget ^longs a i)` pays one tag test asking which
+  backing it is holding — 4.94ns to 5.36ns per read over 40M reads. `^objects`
+  pays that plus its new bounds pre-check (below), 4.94ns to 5.83ns. `^doubles`
+  asks nothing and is unchanged at 3.52ns: its flvector is a promise that kind
+  can keep. End to end, `bench/arrays` — which is nothing but hinted array reads
+  and writes — is 1.10x slower (538ms to 592ms), of which the pre-check is 0.03
+  and the tag test the rest; `bench/arrays-unhinted` is unchanged.
+
+  Nothing changes at the jolt level. jolt's integers promote to bignums past
+  Chez's 2^60 fixnum ceiling — that is the numeric model, not an array rule — so
+  an `int`/`long`/`short` array handed a value an fxvector cannot hold widens its
+  own backing once and goes on behaving exactly as it did:
+
+  ```clojure
+  (let [a (long-array 3)]
+    (aset a 0 Long/MAX_VALUE)   ; past the fixnum range: the array widens
+    (aget a 0))                 ; => 9223372036854775807
+  ```
+
+  Every accessor dispatches on the backing rather than on the element kind, so a
+  widened array — and an array restored from an image written before this
+  change — reads and writes through the same path.
+
+- **Declaring a return type made a function's inlined copies about half as
+  fast.** The inline pass wraps a spliced body in a `:coerce` node to preserve
+  the `^double`/`^long` return coercion the callee's own arity would have
+  applied, and the type pass had no arm for `:coerce` — so it answered `:any`
+  and handed the node back **unwalked**. Nothing inside an inlined copy of a
+  return-hinted fn was annotated: record field reads fell back from a direct
+  slot read to `jolt-get`, and arithmetic from the fl ops to the generic ones.
+  `bench/typed-records` went from 23.1ms to 10.7ms, against an unhinted twin
+  that measures 19.7ms and 20.0ms — so the hint went from 1.17x SLOWER than no
+  hint to 1.87x faster. The fallback walks its children now whatever the op, so
+  `(set! x expr)`, a field assignment's value and a constructor's arguments —
+  all of which land there today — are annotated too.
+
+### Changed
+
+- Confined FFI arenas skip the shared-arena compare-and-swap LOOP on their
+  owner-only attach and close paths, publishing with one compare-and-set!
+  instead, and an empty or single-allocation lexical arena skips cleanup work
+  it does not need. Arena lifetime, ownership and release order are unchanged.
+
+### Fixed
+
+- **`java.util.Arrays/copyOf` padded with `0`, whatever the array held.** A
+  reference array's spare tail came back `0` rather than `nil`, a `char[]`'s `0`
+  rather than `\u0000`, a `boolean[]`'s `0` rather than `false` — so
+  `(vec (Arrays/copyOf (object-array [1]) 3))` read `[1 0 0]` where the JVM says
+  `[1 nil nil]`. The pad is the element kind's own zero now, which is the same
+  value the array's constructor fills with. `copyOfRange` had it too.
+
+- **An out-of-bounds `(aget ^longs a i)` raised the wrong exception class.** The
+  hinted read skips the generic path's bounds pre-check and lets the backing's
+  own range check raise, and that condition was classified as a bare
+  `IndexOutOfBoundsException` — so a `catch ArrayIndexOutOfBoundsException`
+  around it never matched, where it does on the JVM and does for the same read
+  through untyped `aget`. Every hinted read and write answers the array
+  exception now. `^longs`, `^ints`, `^bytes` and `^doubles` get it from their
+  own backing's condition; `^objects` cannot — a plain Chez vector is what the
+  runtime uses for everything, so `vector-ref`'s range error carries nothing to
+  tell an array apart by — and pre-checks instead, one fixnum compare on the
+  boxed arm only. A hint must not decide which exception class a program
+  catches.
+
+## [0.8.2] - 2026-09-05
+
+Errors say what went wrong, where, and can be caught. A compile error is a framed
+diagnostic now — a kind you can grep and key tooling on, the offending line with a
+caret under the form that failed, and the name of the macro that generated the
+code when the code was generated — and it is a real throwable rather than a Scheme
+string, so a program can handle its own errors. `JOLT_DIAG=edn` emits the same
+diagnostic as one line of EDN for an editor. Read errors join it, and a read that
+fails while a program runs keeps its backtrace and reports the position of the
+code that called it.
+
+The other half is that type hints reach codegen. jolt has always parsed a broad
+Java-type-hint vocabulary; only three narrow bridges carried it into emission, and
+everything else was parsed and discarded. A hint now specializes the code that
+comes out.
+
+**`recur` outside tail position no longer compiles.** It never should have: the
+enclosing expression was silently discarded, so `(loop [i 0] (+ 1 (recur (inc i))))`
+looped forever and never applied the `(+ 1 …)`. The reference refuses it and so
+does jolt now. Code that relied on the old behaviour was not doing what it read
+as, but it did compile — **`jolt-lang/http-client` before `v0.0.7` is the case in
+point** and needs its pin bumped, along with `jolt-lang/glimmer-uikit` before
+`v0.1.1`, which had been writing a callback pointer past the end of its allocation
+since the `ffi/write` argument order changed in 0.8.0.
+
+### Added
+
+- **Type hints reach codegen.** jolt has always parsed a broad Java-type-hint
+  vocabulary, but only three narrow bridges carried it into emission; everything
+  else was parsed and discarded. A hint the compiler already understood now
+  specializes the code it emits — no new inference, just consuming what was
+  known:
+
+  ```clojure
+  (defrecord P [^long x ^String nm ^double d])
+
+  (fn [^P p] (.length (:nm p)))      ; a type test and a dispatch fallback
+                                     ; => (string-length (jrec3-f1 p))
+  (fn [^String s] (count s))         ; => (string-length s)
+  (fn [^String s ^String t] (str s t))  ; => (string-append s t)
+  (fn [^long x] (Math/abs x))        ; => (jolt-l-abs x)
+  (fn [^objects a ^long i] (aget a i))  ; => (jolt-vaget a i)
+  ```
+
+  `^int` on a parameter joins `^long`: reference Clojure has only `long` and
+  `double` primitive parameters and refuses any other primitive hint outright, so
+  an `^int`-hinted fn does not compile there at all. jolt accepts it as the
+  fixnum promise `^long` already is — an int and a long are the same value here —
+  and coerces at entry, so ported JVM code written in `^int` indices compiles and
+  takes the fx path. A value that was never an integer is refused at the
+  boundary rather than travelling on untyped. Recorded and machine-checked in
+  `test/conformance/known-divergences.edn`.
+
+- **A compile error names its kind, points at the code, and can be caught.**
+  A report used to be a message, a line number, and thirty frames of the
+  analyzer's own recursion. It is now a framed diagnostic:
+
+  ```
+  error[analyze/invalid-def]: First argument to def must be a Symbol
+    --> ./src/app.clj:6:1
+     |
+   4 |   `(def ~name ~val))
+   5 |
+   6 | (my-def [1 2 3] 123)
+     |         ^^^^^^^ the name must be a symbol
+     = note: raised while expanding the `my-def` macro
+  ```
+
+  The kind (`analyze/invalid-def`) is the stable handle on the error — search
+  for it, key tooling on it — while the wording beside it stays free to improve.
+  Every kind is registered in `test/conformance/error-kinds.edn`, which the
+  build holds against the compiler's actual raise sites in both directions, and
+  which the site's error reference page is generated from
+  (`tools/gen-error-docs.clj`). The position is the innermost form that failed,
+  not the top-level form it sits in, and when the failing code was GENERATED the
+  report names the macro that generated it.
+  `JOLT_DIAG=edn` gives the same diagnostic as one line of EDN carrying the
+  kind, the position, the offending token's text and the surrounding source, so
+  an editor needs neither the caret geometry nor a second read of the file. Its
+  keys are flat and `:jolt.error/`-namespaced — printed with EDN's
+  `#:jolt.error{…}` shorthand when they are all jolt's own, and spelled out when
+  a thrower's own ex-data sits beside them. Read the line; do not match its text.
+
+  The diagnostic is a real throwable. A program that caught a compile error used
+  to get a Scheme string: `(class e)` answered `String`, `(ex-message e)` nil,
+  `(instance? Exception e)` false. It is an `ExceptionInfo` now, carrying
+  `:jolt.error/kind` and the position as flat namespaced keys beside whatever
+  ex-data the thrower attached — which is preserved rather than replaced, and
+  shown in the report.
+
+- **The class rows typed.clojure's annotation corpus names.** `java.lang.ref.Reference`
+  (abstract, over the `SoftReference` / `WeakReference` shims, which now report
+  their own classes instead of `:object`, plus `ReferenceQueue` and
+  `.refersTo`), `java.util.RandomAccess` (on `APersistentVector` and
+  `ArrayList`), `java.util.Comparator` (on `AFunction`, so a fn is one and
+  answers `.compare`), `clojure.lang.MultiFn` (an `AFn`), the whole transient
+  lattice (`ITransientCollection` … `ITransientSet`, `ATransientMap` /
+  `ATransientSet`, and the four concrete transient classes, so `bases`, `isa?`
+  and `instance?` on a transient answer the JVM's ancestry instead of
+  `AFunction`'s), and `java.util.SequencedCollection` (JDK 21) between
+  `Collection` and `List` / `Deque`, with `getFirst` / `getLast` / `reversed`
+  on vectors, lists and seqs and `getFirst` / `getLast` / `addFirst` / `addLast`
+  / `removeFirst` / `removeLast` on `ArrayList`. `typed.ann.clojure.base` and
+  `typed.ann.clojure` load; `override-classes` stopped at
+  `java.lang.ref.Reference` before.
+- **`String/CASE_INSENSITIVE_ORDER`.** String's one public static field: a
+  `Comparator` of `String$CaseInsensitiveComparator` that compares like
+  `compareToIgnoreCase` (a char difference, length last), usable by `sort`,
+  `sort-by`, `sorted-set-by` and `.compare`, and findable by `.getField`.
+- **`Character/getType` and the general-category constants.** The Unicode
+  general category of a char or int codepoint as the JVM's constant, with
+  `Character/UNASSIGNED` through `Character/FINAL_QUOTE_PUNCTUATION` (all 30;
+  17 is unused, as on the JVM). An int that is not a Unicode scalar value
+  answers `UNASSIGNED`, a surrogate `SURROGATE`, as on the JVM.
+
+### Changed
+
+- **`recur` outside tail position is refused.** `recur` rebinds and jumps, so it
+  may only appear where its value IS the value of its target. Anywhere else the
+  surrounding expression is silently discarded, and jolt compiled it:
+  `(loop [i 0] (+ 1 (recur (inc i))))` looped forever and never applied the
+  `(+ 1 …)`, where the reference refuses it. Every construct that legitimately
+  carries tail position through — `if`, `do`, `let` and `letfn`, and the
+  `case` / `cond` / `when` / `or` / `and` macros over them — still compiles. Code that
+  relied on the old behaviour was already not doing what it read as.
+
+- **`-M` with nothing to run starts a REPL.** `jolt -M:test` where no selected
+  alias declares `:main-opts` and the command line adds none used to exit 1
+  with `alias(es) [:test] have no :main-opts`. `-M` is `clojure.main`, and
+  `clojure.main` with no arguments is a REPL — `clj -M:dev` is how a REPL over
+  an alias's extra deps is started — so jolt does the same now, over the
+  project resolved with those aliases. `:main-opts ["-r"]` (or `--repl`) asks
+  for one explicitly, as on the JVM. A `:main-opts` form jolt does not take
+  says which it does: `-m NS`, `-e EXPR`, `-r`, or a script file.
+
+### Fixed
+
+- **`recur` across `try` compiled, and leaked.** The reference refuses it; jolt
+  compiled it — Chez has no bytecode-size limit to stop it — at about 400 bytes
+  an iteration, so ten million iterations of
+  `(loop [i 0] (try (if (< i 10000000) (recur (inc i)) i)))` reached 4.2GB of
+  resident memory, and two other shapes hung outright. It is a compile error now,
+  with the reference's two messages: a `try` body may not be recurred ACROSS,
+  while a `catch` or `finally` is not a tail position to begin with.
+
+- **`locking` and `with-out-str` swallowed a `recur`.** Both run their body in a
+  thunk — an OS mutex has thread granularity and a fiber is not a thread — and
+  that thunk quietly became the `recur` target, so `(loop [] (locking o (recur)))`
+  spun forever instead of being refused. On the reference both are `try`/`finally`
+  and a `recur` may not cross them; both bodies now carry the same marker, which
+  costs nothing to emit.
+
+- **`:pre` cost its body tail position.** A conditions map wrapped the body in
+  `(let [% (do body)] %)` whether or not there were any `:post` conditions, and a
+  binding init is not tail position, so a tail `recur` inside a `:pre`-only fn was
+  rejected. The reference emits that wrapper only for `:post`. malli's
+  `validate-times` is one such fn, and eight of its test namespaces stopped
+  loading over it.
+
+- **A bare `try` erased every frame from itself outwards.** `(try x)` with no
+  catch and no finally emits as its body and nothing else, so a tail call inside
+  one is a real tail call and needs its site stored — but `try` was opaque to the
+  back end's tail-site pass, TCO erased the frames anyway, and the trace stopped
+  at the throw. `(defn wrapped [x] (try (boom x)))` reported `boom` and nothing
+  above it, where the same fn without the `try` named itself and its caller.
+
+- **Host faults reached the user as compile errors.** `(let [a 1 b] a)` reported
+  `java.lang.IndexOutOfBoundsException: index out of bounds` — the desugarer
+  walking off the end of an odd binding vector — and `(defn f 5 6)` reported
+  `Don't know how to create ISeq from: java.lang.Long`. Both are checked now and
+  report what the reference reports. `(def :foo 2)`, `(if)`, a malformed `catch`
+  clause, a `set!` of a local and the `jolt.ffi` descriptor forms all name
+  themselves the same way.
+
+- **Read errors carry a position, a kind, and no reader internals.** A duplicate
+  map key, an odd map literal, an invalid token, an invalid number, a bad
+  character or unicode escape all report the literal that was written, instead of
+  the top of the file over ten frames of `rdr-read-form` / `rdr-read-seq`. The
+  position is in the ex-data (`:jolt.error/line`) rather than glued onto the
+  message text, where it used to disagree with the location printed beneath it.
+  A read that fails while a program RUNS — a `read-string` on data — keeps its
+  backtrace, and reports the position of the code that called it rather than a
+  position into the string rendered against an unrelated file.
+
+- **`clojure.core` threw raw strings.** `zero?`, `pos?`, `NaN?`, `num`, `==`,
+  `pop`, `realized?`, `inst-ms`, `future-done?`, `parse-boolean`, `destructure`,
+  `case`'s duplicate-constant check, `clojure.zip` and `jolt.ffi`'s macro
+  argument checks all raised a bare string, which `(catch Exception e …)` could
+  not match and `ex-message` answered nil for. Each raises a typed throwable a
+  `catch` can select.
+
+- **`NullPointerException`s with nothing in them.** `(alength nil)`, a nil where
+  a string or a number was required, and `key`/`val` on a nil all raised an NPE
+  with an empty message, so the report read `Unhandled exception
+  (NullPointerException):` and stopped — leaving out the one fact the reader
+  needed. Each says what was required. (An empty message stays where the JVM's
+  is genuinely null, as on `NoSuchElementException`.)
+
+- **Modeled Java collections return and fill object arrays from `toArray`.**
+  `ArrayList`, `LinkedList`, and `ArrayDeque` share these methods. The
+  no-argument and destination-array overloads both ignored their Java contracts
+  and returned a persistent vector. The no-argument form now allocates an exact
+  `Object[]`;
+  the destination overload reuses a large-enough array, writes a null logical
+  terminator when it has spare capacity, preserves later cells, and allocates a
+  replacement when the supplied array is too short.
+
+  `HashSet` answers both overloads too. `toArray` is a `Collection` method, not
+  a `List` one, and the set had none at all — `(.toArray h)` was `No matching
+  field found: toArray for class java.util.HashSet`. It shares the one
+  implementation, which is written against a collection's element list rather
+  than against `ArrayList`'s backing vector, so whatever is modeled next needs
+  only its own list.
+- **Unicode-aware `String.equalsIgnoreCase` and JVM-compatible
+  `compareToIgnoreCase` results.** The instance methods used a separate ASCII
+  lowercase path and reduced every nonzero comparison to `-1` or `1`, even
+  though `String/CASE_INSENSITIVE_ORDER` already modeled Java's character-wise
+  upper-then-lower fold and returned the differing character values. They now
+  share that implementation, so non-ASCII pairs such as `"É"` / `"é"`, null
+  equality, and comparison magnitudes agree with the JVM.
+
+  `compareTo` and `regionMatches` are the same two contracts and are now on the
+  same footing. `compareTo` still answered a sign, so `(.compareTo "a" "c")` was
+  `-1` where the JVM says `-2` and `(.compareTo "abcd" "ab")` was `1` where the
+  JVM says `2` — a magnitude beside `compareToIgnoreCase`'s and a sign from its
+  case-sensitive twin. And `equalsIgnoreCase` IS
+  `regionMatches(true, 0, other, 0, length)` on the JVM, but `regionMatches`
+  folded with Scheme's `string-ci=?` — the full Unicode folding, which is not
+  Java's per-character upper-then-lower one: `"I"` and `"ı"` compared equal
+  through `equalsIgnoreCase` and unequal through `regionMatches`, one JVM
+  operation with two answers. All four now go through one fold, so a new
+  ignore-case method has one place to reach for.
+
+- **A jolt binary carries its own lz4 and zlib, and needs neither at runtime.**
+  They are the Chez kernel's fasl compressors, so every binary — jolt itself and
+  anything `jolt build` produces — links them. The macOS link line took lz4 from
+  `$(brew --prefix lz4)/lib`, and a directory holding both a `.dylib` and a `.a`
+  gives `-llz4` the dylib, so the released binary demanded
+  `/opt/homebrew/opt/lz4/lib/liblz4.1.dylib` off every machine that ran it: on a
+  Mac that never ran `brew install lz4` — which is most of them — `curl … | bash`
+  died in the install script's own `jolt --version` check with a dyld error.
+  Every link now names the static `liblz4.a` and `libz.a` that Chez installs next
+  to `libkernel.a`, which is what forces the static choice (Apple's ld has no
+  `-Bstatic`); on macOS the brew keg and pkg-config stay as fallbacks for a Chez
+  that installed without one. Linux already resolved those same archives, but
+  through `-L` and search order rather than by name, so a Chez installed without
+  them silently produced a binary with runtime compression dependencies; that
+  case now warns. The self-contained jolt carries both archives alongside the
+  Chez kernel it already bundles, so the one link it performs itself — the relink
+  that bakes a `:jolt/native` `:static` archive into an app — takes them from the
+  bundle rather than from the machine the app happens to be built on. A built app
+  carries no compression dependency at all: on Linux the smoke's apps come out
+  needing libc and libm and nothing else. The release workflow asserts the binary it built needs no
+  library a stock machine lacks, and the install script names the missing library
+  when one fails to load.
+
+- **A built binary no longer exports the compression symbols it baked in
+  (Linux).** `-rdynamic` puts the executable's symbols in the dynamic table, and
+  the executable is searched before any `dlopen`'d library, so a baked-in
+  `deflate` or `LZ4_decompress_safe` was answering for an FFI-loaded libpng,
+  libssl or libsqlite3 instead of the zlib each was built against. `liblz4.a` and
+  `libz.a` join ncurses on the `--exclude-libs` list, which already existed for
+  the same reason. A `:jolt/native`'s own symbols are still exported, so
+  `(load-shared-object #f)` resolution is unchanged.
+
+- **Windows absolute paths survive both project and dependency resolution.** A
+  drive-rooted `JOLT_PWD` such as `D:\work\app` was treated as relative by the
+  host file layer, producing paths such as
+  `D:\work\app/D:\work\app/deps.edn` before any program could run. The File
+  shim now recognizes drive-rooted and UNC spellings consistently for file
+  access, `getAbsolutePath`, and `isAbsolute`; a single-leading-separator path
+  remains non-absolute but resolves against `user.dir`'s drive. Dependency
+  roots independently preserve drive, UNC, and device paths with either
+  separator and resolve root-relative paths against the declaring base's drive;
+  ambiguous drive-relative forms such as `C:project` fail with a targeted
+  error that asks for a drive-absolute path.
+
+- **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
+  value lived in a Chez thread parameter, which a forked thread inherits, so a
+  child observed the parent's stored value instead of running its own
+  `initialValue` — every worker in a pool shared one `ThreadLocal<Process>`,
+  one `SimpleDateFormat`, one `test.check` generator. It is now a per-thread
+  table that a fresh thread starts empty, matching the JVM under either fork
+  model, and `.remove` releases the entry. `java.lang.InheritableThreadLocal`,
+  whose contract is the opposite, keeps the inheriting storage and is now a
+  distinct class: `proxy` lowered both to the same object, so whichever
+  behaviour was implemented, the other name was a lie. Along with it,
+  `(ThreadLocal.)` and `(InheritableThreadLocal.)` (no constructor existed —
+  `core.async`'s `impl.dispatch` does `(defonce in-go-dispatch (ThreadLocal.))`),
+  `ThreadLocal/withInitial` over a `java.util.function.Supplier` or a plain fn,
+  and `(class tl)` / `instance?`, which answered `:object` and `false`. A
+  `proxy` over either class now refuses an override it cannot honour —
+  `get`/`set`/`remove`/`toString`/`childValue` were accepted and then dropped,
+  which reads as a method that is defined and never runs. `initialValue`, the
+  one every real use overrides, is unchanged.
+
+- **`core.async/alts!` and `alts!!` validate every put before trying any
+  operation.** An invalid later `[channel nil]` put can no longer throw after
+  an earlier ready operation has already consumed or published a value.
+- **`compare-and-set!` compares the expected value by identity.** It compared
+  with `=`, so an equal but distinct object authorized a replacement of a value
+  the caller had never observed, and the comparison could realize a lazy value
+  on its way to saying no. It is `identical?` now — what `swap!`'s own CAS loop
+  and the `AtomicReference` shim already used, and what the JVM's atom does.
+  Code that relied on an equal-but-distinct expectation succeeding will see it
+  fail, which is what it does on the JVM. Chez immediates (a fixnum, a
+  character) have no distinct boxes, so a CAS between two equal ones still
+  succeeds where the JVM's boxing can tell them apart; that narrower case is
+  the `:concurrency-model` divergence now, recorded with an oracle.
+- **The default time zone is the machine's.** `TimeZone/getDefault`,
+  `Calendar/getInstance`, a `SimpleDateFormat` with no zone set, the deprecated
+  `Date` constructor and getters, `java.sql.Date.valueOf` and `toLocalDate` all
+  answered UTC where the JVM answers the machine's zone. They read one default
+  zone now: `TZ` from the process's environment, else what a provider
+  registered through `jolt.host/set-default-zone-provider!` answers, else UTC.
+  Core reads no system file for this — which zone a machine is in lives in
+  `/etc/localtime` or `/etc/timezone`, and looking there is I/O the program
+  never asked for; jolt.time knows how, and registers its `ZoneId/systemDefault`
+  lookup as the provider when it loads, so with the library a date formatted by
+  core and one formatted through java.time agree. `.setTimeZone` on a
+  `SimpleDateFormat` is honored: `z` renders the zone's short name (`EST`),
+  `Z` its RFC 822 offset, `X`/`XX`/`XXX` its ISO offset, and a zone-less
+  `parse` lands on the instant the reading names in that zone. Selmer's date
+  filter and data.json's date writer, which go through java.time, disagreed
+  with `SimpleDateFormat` by the machine's UTC offset.
+- **Two `TimeZone`s with one id are equal.** `=`, `hash`, `.equals` and
+  `.hashCode` compare by id; `.equals` was "No matching method" and two
+  `getTimeZone` results for one id were distinct set members.
+- **String shims refuse nil where the JVM throws.** `(.indexOf "abc" nil)`
+  answered 0, `(.contains "a" nil)` true, `(.replace "a" nil "b")` "bab",
+  `(.startsWith "a" nil)` false: a nil argument read as the empty string. It is
+  a `NullPointerException` now, as are `(StringBuilder. nil)`,
+  `(clojure.string/trim-newline nil)`, `(clojure.string/re-quote-replacement
+  nil)`, a nil replacement, `(alength nil)` (answered 0) and any method on a
+  nil receiver (`(.toString nil)` answered "", `(.equals nil 1)` false).
+  `clojure.string/replace` and `replace-first` refuse a nil match with the
+  reference's `IllegalArgumentException` "Invalid match arg: " and a
+  non-string replacement for a string match with a `ClassCastException`.
+- **`vector-of`.** clojure.core's primitive-typed vectors (`clojure.core.Vec`,
+  `VecSeq`, `ArrayChunk`) are a core tier, the reference's gvec.clj over jolt's
+  typed arrays: `(vector-of :int 1 2 3)` is a vector by every question —
+  `count`, `nth`, `conj`, `assoc`, `pop`, `rseq`, `subvec`, `reduce`, `seq`,
+  `=` and `hash` against a plain vector, printing — that coerces its elements
+  and grows through the same 32-way trie. The symbol was unresolved before.
+  Along the way: a deftype that is its own seq (a `clojure.lang.ISeq` whose
+  `seq` answers itself, as gvec's `VecSeq` does) walks through its own `first`
+  and `next`; `seq` used to re-ask the answer for its seq forever.
+  `clojure.lang.Util/compare`, `isInteger` and `equals`,
+  `PersistentList/EMPTY` and a `SeqIterator` over a seq are host statics now.
+- **`deftype` and `defrecord` skip leading option pairs.** `(deftype T [x]
+  :no-print true …)` — the reference consumes any keyword/value pairs before
+  the specs (`:load-ns` is its own) — raised "Can't pop empty vector" from the
+  body grouping. clojure.core's gvec, the `vector-of` implementation, opens its
+  `VecSeq` that way.
+- **`clojure.lang.AFunction`'s supers include `IObj`, `IMeta` and
+  `Serializable`.** `bases`, `supers` and `.getInterfaces` on a fn's class
+  answered `AFn`, `Fn` and `Comparator` only, and a protocol extended to
+  `IMeta` or `IObj` did not dispatch on a fn; the row carries the JVM's five
+  direct supers in declaration order now.
+
+- **A host fault a catch binds is a typed throwable.** A primitive handed the
+  wrong value — `(.concat "a" nil)`, `(subs "abc" 5)`, `(clojure.string/trim
+  nil)` — raised a raw Chez condition, and a catch bound it as it was:
+  `(class e)` answered `:object`, `ex-message` nil, `(instance? Exception e)`
+  false, `pr-str` printed `#object[:object]`, and every `RuntimeException`
+  clause matched it, so `(catch ArithmeticException e …)` caught a nil
+  argument. A raw condition becomes a typed throwable at the catch boundary
+  now, classified by what Chez reported: a nil argument is a
+  `NullPointerException`, a wrong-typed one a `ClassCastException`, a bad
+  index an `IndexOutOfBoundsException` (`StringIndexOutOfBoundsException`
+  from a string primitive), a wrong argument count an `ArityException`,
+  division by zero an `ArithmeticException`, an i/o failure an `IOException`,
+  anything else a `RuntimeException`. Catch clauses dispatch on that class, a
+  rethrow keeps the same object, a future's `.getCause` is it,
+  `.printStackTrace` prints the frames that led to the fault, and the message
+  names the primitive with the offending value printed as a jolt value:
+  `string-append: nil is not a string`, not `#[jolt-nil-v1] is not a string`.
+  typed.clojure's `check-form*` rethrows such a fault and reported
+  `#object[:object]`.
+- **A `.method` call in tail position is a trace site.** `(defn f [s] (.concat
+  s nil))` erased `f` from the trace: the tail call dropped its frame and,
+  unlike a fn call, the interop call stored no site pair, so the report and
+  `.printStackTrace` began at the caller. The host call carries its form's
+  line now and stores the site the way a tail fn call does; a fault caught by a
+  `catch` snapshots the site at the catch boundary too, since the guard's own
+  handler is nearer than the uncaught-path capture.
+- **The uncaught report names the class.** `Unhandled exception
+  (NullPointerException): …` for a typed throwable. An `ExceptionInfo` and a
+  bare `Exception` keep the message-only line, as the reference's report does.
+- **Throws whose class the JVM answers differently.** `(name nil)`,
+  `(namespace nil)`, `(deref nil)`, `(var-get nil)` and `(key nil)` are
+  `NullPointerException`s (were `ClassCastException` or `ExceptionInfo`);
+  `(key 1)`, `(val 1)` and `(rseq 1)` are `ClassCastException`s (were
+  `ExceptionInfo`); `(sorted-map 1)` is an `IllegalArgumentException` "No
+  value supplied for key: 1"; `(nth "abc" 5)` is a
+  `StringIndexOutOfBoundsException`; `(.get an-array-list 3)` past the end is
+  an `IndexOutOfBoundsException` (it answered nil); `(into {} [[1]])` is an
+  `IllegalArgumentException` "Vector arg to map conj must be a pair" (it
+  answered `{1 nil}`, though `conj` already refused the pair); `(spit nil "x")`
+  is an `IllegalArgumentException` "Cannot open <nil> as a Writer." (it wrote
+  a temp file into the working directory, then failed to rename it); and
+  `(+ nil)` / `(* nil)` are nil, as the reference's single-operand cast makes
+  them (were `NullPointerException`).
+- **`(into nil coll)` is a list.** `into` folded through `conj` on the nil
+  target directly instead of starting a list the way `(conj nil x)` does, and
+  died inside the host (`string-append: nil is not a string`) for any
+  non-empty source, in both the plain and the transducer arity; `(into nil
+  [1 2])` is `(2 1)` and `(into nil [])` nil, as on the JVM. typed.clojure's
+  pass scheduler does `(into affects (filter passes after))` with `affects`
+  nil, which is where `(t/cf (inc 1))` stopped.
+- **A record class constructs from its fields plus `__meta` and `__extmap`.**
+  `(R. f1 … fn meta ext)` is the JVM record class's second constructor, and
+  what a macro building records without the positional factory emits
+  (typed.clojure's `create-expr` expands to `new` with all of them); jolt's
+  constructor took exactly the fields and raised an `ArityException`. The
+  extra two attach the metadata and carry the map as extension fields.
+- **`(ns-resolve ns env sym)`.** The three-argument form, which answers nil for
+  a symbol the local environment binds, was missing (`resolve` had its env
+  arity); typed.clojure's analyzer resolves through it with `&env`.
+- **A record's `__meta` and `__extmap` read as fields.** The JVM record class
+  has both as public fields, and typed.clojure's `update-expr` reads
+  `(.-__extmap e)` to carry an expression's extra keys; jolt raised "No
+  matching field found". `__extmap` is the map of extension keys (nil when
+  there are none), `__meta` the metadata.
+- **`satisfies?` on a class or interface answers `instance?`.** jolt takes
+  `:bb` reader branches, and code written for babashka asks `(satisfies?
+  clojure.lang.IObj x)` where its JVM branch asks `instance?` (typed.clojure's
+  `obj?`); it raised "satisfies? expects a protocol". The JVM raises on the
+  class form and babashka answers false for everything; jolt answers the
+  question the code means.
+- **`clojure.lang.RT/classForName` and `classForNameNonLoading`.** The same
+  answer as `Class/forName`, including `ClassNotFoundException`; typed.clojure's
+  analyzer resolves class symbols through the RT statics.
+- **`bases` answers Class objects.** It handed back name strings where `supers`
+  handed back classes, so `(.getName (first (bases c)))` failed on every class
+  (typed.clojure builds its RClass ancestry exactly that way). Superclass first,
+  as on the JVM, with `Object` leading a class whose row names no concrete
+  super.
+- **`Class.getModifiers` on a nested class.** Every nested class jolt models is
+  a static nested class on the JVM, so the STATIC bit is set for a `$` name the
+  graph knows; the four transient classes and `PersistentArrayMap$Seq`,
+  `PersistentHashMap$NodeSeq` and `PersistentList$EmptyList` are
+  package-private, `String$CaseInsensitiveComparator` private, and
+  `Thread$State` an enum — all probed. `(.getModifiers (class (transient #{})))`
+  is 24, `java.util.Map$Entry` 1545, as on the JVM (1 and 1537 before).
+- **`(str an-interface-class)` says `interface`.** `java.util.List` rendered as
+  `class java.util.List`.
+- **A persistent collection refuses the `java.util` mutators with
+  `UnsupportedOperationException`.** `.add`, `.set`, `.remove`, `.clear`,
+  `.sort` and the rest on a vector, list, seq or set raised an
+  `IllegalArgumentException` "no matching method", which a
+  `(catch UnsupportedOperationException …)` never saw.
+- **A named fn carries the same ancestry as an anonymous one.** Its protocol
+  dispatch tags were a hand-copied list with no `Comparator`, `Runnable` or
+  `Callable`, so `(instance? java.util.Comparator inc)` was false while the
+  same question on `(fn [a b] 0)` was true; the list derives from the class
+  graph now.
+- **A native iOS build no longer reports itself as Linux.** #796 fixed the
+  portable-bytecode half of `sa-os-family` — a `pb` tag names no OS, so the
+  `else` branch called every bytecode build Linux, and it probes the filesystem
+  now. The native half still fell through: Chez's four iOS tags (`a6ios`,
+  `arm64ios`, `ta6ios` and `tarm64ios`, the last documented in `BUILDING` as
+  the iOS cross-target) contain none of `osx`, `macos`, `nt` or `pb`, so all
+  four reached that same `else` and called a Darwin system Linux. iOS is Darwin
+  and `ios` joins the macOS branch, which is the whole fix: that one function is
+  where the host asks what OS this is, so the wrong answer was `SIGCHLD` 17
+  instead of 20, `EAGAIN` 11 instead of 35, `O_NONBLOCK`, `LC_TIME`, the
+  `struct stat` offsets, the chmod and entropy fallbacks and the link libraries,
+  all at once — and, as in #796, `jolt.nrepl` handing Darwin's `socket()` the
+  Linux `SOCK_CLOEXEC`, which cannot bind. `jolt build --target tarm64ios
+  --library` also linked the output with ELF's `-shared` rather than
+  `-dynamiclib -install_name`, because the build's target-side Darwin predicate
+  matched only `osx`; it takes both spellings now. Android needs no such branch
+  and gets none: it has no Chez tag of its own, cross-builds as `tarm64le`, and
+  Bionic is Linux for every constant these select — its divergence is the link
+  libraries, which no tag can express (`tarm64le` is glibc arm64 Linux too) and
+  the target pack owns. The gate pins the iOS and `tarm64le` rows through
+  `sa-os-family-for-tag`, from hosts that are neither.
+- **A child process no longer inherits `JOLT_PWD`.** `bin/jolt` exports the
+  user's directory in `JOLT_PWD` before changing into its checkout, and a
+  spawned child's environment was seeded from the parent's, so a child jolt
+  started with `:dir` at another project took its user.dir from the variable
+  rather than from its own working directory: `(slurp "README.md")` under
+  `:dir` answered the parent's README. The variable is the launcher's message
+  to the process it started, and the child's directory is whatever the spawn
+  set, so `ProcessBuilder`, `jolt.process` and `clojure.java.shell` now start
+  every child without it — a child jolt, directly under `:dir` or behind a
+  shell's `cd`, reads its own project. A caller that puts `JOLT_PWD` in the
+  child's environment map asked for it and keeps it. An installed binary never
+  exports the variable, which is why the same program passed under one and
+  failed under a source checkout.
+- **`clojure.lang.Agent`, `AMapEntry`, `ChunkBuffer`, `IAtom`, `IAtom2`,
+  `IBlockingDeref`, `IChunk`, `IMapEntry`, `Reduced` and `Volatile` resolve.**
+  typed.clojure's core annotations name all ten, and its `override-classes`
+  stopped at the first: `Could not resolve class: clojure.lang.ChunkBuffer`.
+  Each is in the class graph under its JVM supers now, so `resolve`, `import`,
+  `Class/forName`, `bases`, `supers`, `.isInterface`, `.getModifiers` and
+  `instance?` agree: an atom is an `IAtom2`, a promise and a future are
+  `IBlockingDeref`, a reduced box is an `IDeref` and reports
+  `clojure.lang.Reduced` (it was `:object`), `MapEntry` extends `AMapEntry`
+  which is an `IMapEntry`, and a chunk buffer is `Counted` and answers `count`.
+  Three general faults came out with them. Protocol dispatch never consulted
+  the class a value reports through a class arm, so `extend-protocol` on
+  `clojure.lang.Volatile`, `Agent`, `Delay`, `Ref` or a promise's class — or on
+  `IDeref` for any of them — threw `No method`; dispatch now reads the same
+  class `instance?` does, and the hand-kept list of derefable values that
+  answered `instance?` for `IDeref`/`IRef`/`IPending` is gone in favour of the
+  graph. A class registered with no supers was read as unregistered, and a `$`
+  in its name then made it a fn, so `(supers java.util.Map$Entry)` and the
+  promise and future reify classes reported the `AFunction` chain, `Fn`
+  included. And `Class/forName` rejected every interface `resolve` accepts
+  (`"clojure.lang.IDeref"`) because it consulted a narrower table; it answers
+  for every modeled class now, under its full name only. `chunk` still seals
+  into a vector rather than an `ArrayChunk`, so nothing is an `IChunk`
+  (known-divergences).
+- **`Character/isLetter`, `isDigit`, `isLetterOrDigit`, `isUpperCase` and
+  `isLowerCase` classify all of Unicode.** They were ASCII range checks, so
+  `(Character/isLetter \é)` and `(Character/isUpperCase \É)` were false where
+  the JVM says true. They now apply the JVM's category rules over the same
+  Unicode general category `getType` reports: `isLetter` is L*, `isDigit` is Nd
+  (so `\½` is not a digit), and the case predicates are the Uppercase/Lowercase
+  properties (so `\Ⅰ` is upper case, `\ª` lower case, `\ǅ` neither). An int
+  codepoint that is not a scalar value is still false throughout.
+- **A caught load error no longer misplaces every later error.** The
+  `at file:line:col` line under an uncaught error is the top-level form that
+  was evaluating, and a file load deliberately left that position on its
+  failing form when it threw, so the report named the file that failed. When
+  the throw was *caught* — a `data_readers.clj` namespace the loader tolerates,
+  a `require` inside a `try` — the position stayed put anyway, and every later,
+  unrelated error was reported at it: a CLI argument error came out `at
+  …/clj_time/core.clj:254:1`, the form whose Joda class the clj-time data-reader
+  load had stumbled on. A file load now binds the position around the whole
+  load, and the failing form's position travels with the throw itself (recorded
+  by the innermost load it crosses, before the stack unwinds), which the report
+  reads back — so a propagating load error is placed exactly as before, and a
+  caught one leaves nothing behind. `JOLT_DIAG=edn` diagnostics read the same
+  position.
+- **The data-reader load warning says where and what.** `data-reader namespace
+  clj-time.coerce failed to load: Unknown class DateTimeZone` now carries the
+  position the load failed at and the tags that consequently have no reader
+  (`tags #clj-time/date-time will not read`), instead of leaving the reader to
+  find the form and to meet the missing tag later as an unrelated
+  unresolved-var error.
+- **A returned call no longer haunts a top-level throw.** The trace under an
+  error thrown at the top level of a file being loaded — or of a `-e`, a
+  `load-string`, a REPL input — opened with a frame from a fn that had returned
+  long before: `jolt.main/drop-end-of-options` under a `run -m` whose namespace
+  failed to load, a helper's tail call from the fn that called `require`, a
+  macro's helper when the expansion threw. The tail-site slot the reporter reads
+  holds the last tail call made, and nothing tail-calls a top-level form, so
+  the slot is cleared when one starts to compile and again when its compiled
+  code starts to run.
+- **Every CLI entry starts in `user`.** The built image bakes `jolt.main` and
+  loading a namespace leaves it current, so a bare `jolt -e '(str *ns*)'`
+  printed `jolt.main`, a REPL `(defn h …)` landed as `#'jolt.main/h` under a
+  prompt that said `user`, and `-main` under `run -m` ran in `jolt.main`.
+  `clojure.main` starts every entry in `user`; jolt does too now, and the REPL
+  prompt names whatever namespace is current, as `clojure.main`'s does.
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the

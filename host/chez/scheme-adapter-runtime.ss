@@ -180,8 +180,30 @@
 ;; the else-branch called every bytecode build 'linux, including one running on
 ;; macOS — which picks the Linux SIGCHLD, EAGAIN, O_NONBLOCK, LC_TIME and
 ;; struct-stat values on a Darwin host. Probe instead.
+;;
+;; Memoized, which is what the note on sa-probed-os-family below already asks
+;; for and does not deliver: that cache sits on the PROBE, which only a pb tag
+;; reaches, so every real tag (ta6le, ta6nt, tarm64osx) re-derived on every
+;; call. The derivation is not free — sa-host-tag allocates a fresh string per
+;; call through symbol->string, and each sa-tag-contains? walks it allocating a
+;; substring per position, five needles deep. machine-type cannot change while
+;; the process runs, so one derivation is all there is to do.
+;;
+;; It matters because path classification is host-specific: java.io.File's
+;; isAbsolute and the project-relative base every filesystem touch goes through
+;; (java/io.ss jfile-fs) ask this per call. Uncached, .isAbsolute measured 355ms
+;; per 200k calls against 141ms; .exists, syscall included, 167ms per 50k
+;; against 116ms.
+;;
+;; The memo is module state in a file the runtime LOADS, not a saved heap, so it
+;; starts empty in every process and a cross-built binary cannot carry the build
+;; host's answer.
+(define sa-os-family-memo #f)
 (define (sa-os-family)
-  (sa-os-family-for-tag (sa-host-tag)))
+  (or sa-os-family-memo
+      (let ((fam (sa-os-family-for-tag (sa-host-tag))))
+        (set! sa-os-family-memo fam)
+        fam)))
 
 ;; (sa-os-family-for-tag tag) -> 'macos | 'windows | 'linux
 ;; The derivation above, as a function OF the tag, so the gate can pin the whole
@@ -191,7 +213,25 @@
 ;; there was no way to ask it about a tag. NOT for callers: anything with a tag
 ;; to pass is branching on the tag, which sa-host-tag's contract forbids.
 (define (sa-os-family-for-tag m)
-  (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")) 'macos)
+  ;; "ios" joins the macos branch rather than getting one of its own: iOS is
+  ;; Darwin, so every constant this selects is already the right one, and the
+  ;; three-symbol contract has nowhere else to put it. Chez has four iOS tags
+  ;; (a6ios, arm64ios, ta6ios, tarm64ios; BUILDING documents tarm64ios as the
+  ;; cross-target), and not one of them contains "osx", "macos", "nt" or "pb",
+  ;; so all four reached the else-branch and called a Darwin system Linux.
+  ;; The substring is exact rather than lucky: those four are the only tags in
+  ;; the Chez tree containing "ios", and a tag that contained it by accident
+  ;; would have to be an "osx" tag, which wants 'macos anyway.
+  ;;
+  ;; Android takes no branch, and that is not an omission: it has no Chez tag of
+  ;; its own — it cross-builds as tarm64le (tools/cross-compile/README.md) — and
+  ;; Bionic is Linux for every constant this selects, SIGCHLD 17, EAGAIN 11,
+  ;; O_NONBLOCK, SOCK_CLOEXEC and the struct-stat offsets alike. Where Android
+  ;; does diverge is the link libraries (Bionic has no -lrt/-luuid/-ltinfo), and
+  ;; the tag cannot answer that: tarm64le is glibc arm64 Linux too. The target
+  ;; pack owns those flags, which is why they are not derived here.
+  (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")
+             (sa-tag-contains? m "ios")) 'macos)
         ((or (sa-tag-contains? m "nt") (sa-tag-contains? m "windows")) 'windows)
         ((sa-tag-contains? m "pb") (sa-probed-os-family))
         (else 'linux)))

@@ -227,6 +227,21 @@ numeric-entry-after 43
 result 43'
 test "$entry_number_output" = "$expected_entry_number"
 
+entry_bytes_output=$("$tmp/target/release/app" entry-bytes)
+expected_entry_bytes='bytes-entry-before :test/byte-callback-entry
+bytes-audit-before :test/byte-callback-entry
+byte-callback [0 1 127]
+bytes-audit-after [true [0 -1 127]]
+bytes-entry-after [true [0 -1 127]]
+result [true [0 -1 127]]'
+test "$entry_bytes_output" = "$expected_entry_bytes"
+
+entry_bytes_oob_output=$("$tmp/target/release/app" entry-bytes-oob)
+test "$entry_bytes_oob_output" = 'bytes-entry-before :test/byte-callback-entry
+bytes-audit-before :test/byte-callback-entry
+byte-callback []
+caught java.lang.ArrayIndexOutOfBoundsException'
+
 # A consumer that skips or throws before proceed fails open to the complete
 # downstream chain. A middle consumer does the same for the target nested
 # beneath it. In every case the selected operation still executes exactly once.
@@ -275,6 +290,7 @@ grep -q ':provider instrumentation.audit-provider/aspect-provider' "$tmp/target/
 grep -q ':contract :replace-args-v1' "$tmp/target/aspects.edn"
 grep -q ':entry app.target/callback' "$tmp/target/aspects.edn"
 grep -q ':entry app.target/numeric-callback' "$tmp/target/aspects.edn"
+grep -q ':entry app.target/byte-callback' "$tmp/target/aspects.edn"
 grep -q ':marker :test/target-call' "$tmp/target/aspects.edn"
 grep -q ':contract :args-v1' "$tmp/target/aspects.edn"
 grep -q ':ordinal 1' "$tmp/target/aspects.edn"
@@ -449,6 +465,12 @@ plain_number_output=$("$tmp/target/plain/app" entry-number)
 expected_plain_number='numeric-callback 40
 result 41'
 test "$plain_number_output" = "$expected_plain_number"
+plain_bytes_output=$("$tmp/target/plain/app" entry-bytes)
+test "$plain_bytes_output" = 'byte-callback [0 1 127]
+result [true [0 -1 127]]'
+plain_bytes_oob_output=$("$tmp/target/plain/app" entry-bytes-oob)
+test "$plain_bytes_oob_output" = 'byte-callback []
+caught java.lang.ArrayIndexOutOfBoundsException'
 
 # A stale exact selector fails before replacing an existing artifact.
 cp "$tmp/deps.instrumented.edn" "$tmp/deps.edn"

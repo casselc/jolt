@@ -113,6 +113,7 @@
     ((symbol-t? x) "clojure.lang.Symbol")
     ((jolt-atom? x) "clojure.lang.Atom")
     ((jolt-ref? x) "clojure.lang.Ref")
+    ((jolt-reduced? x) "clojure.lang.Reduced")
     ((char? x) "java.lang.Character")
     ((regex-t? x) "java.util.regex.Pattern")
     ;; an anonymous / unregistered fn — like the JVM, where (class #(..)) is a
@@ -146,8 +147,9 @@
 ;; the class NAME of x (string), or nil for nil. (class x) wraps it in a Class
 ;; value (make-class-obj, host-static-classes.ss) so it renders like a JVM Class
 ;; while staying = its name string.
-;; The condition? class-arm was removed as dead — all throws now use typed jolt
-;; throwables, so a raw Chez condition never reaches the class-name chain.
+;; No condition? class-arm: a raw Chez condition never reaches the class-name
+;; chain, because every one a catch binds has become a typed throwable at the
+;; boundary (jolt-unwrap-throw, java/host-faults.ss).
 ;; A fn def'd into a var reports a JVM-style class name "ns$munged-name" (the
 ;; forward CHAR_MAP), so clojure.spec.alpha's fn-sym (which splits on $ and
 ;; demunges) recovers the predicate's symbol. Anonymous / unregistered fns stay
@@ -189,9 +191,19 @@
     (cond ((null? as) (jolt-class-base x))
           (((caar as) x) ((cdar as) x))
           (else (loop (cdr as))))))
+;; A Class is ONE object per class, as on the JVM: (class 1) and (class 2) hand
+;; back the same token, and it is the same token the class-name symbol Long
+;; evaluates to. That makes identical? on two Class values a class-equality test,
+;; which library code takes for granted — typedclojure dispatches its whole
+;; RClass-vs-RClass subtype rule behind (identical? (.getClass s) (.getClass t)),
+;; so a fresh token per call answered false there and skipped the rule outright.
+;; jolt-class-for is the interner every other class seam already went through
+;; (a class token, resolve, supers, Class/forName); this was the one that minted
+;; its own. It also canonicalizes the spelling, so a deftype in a dashed
+;; namespace lands on the token its own values report.
 (define (jolt-class x)
   (let ((n (jolt-class-name x)))
-    (if (jolt-nil? n) jolt-nil (make-class-obj n))))
+    (if (jolt-nil? n) jolt-nil (jolt-class-for n))))
 
 (def-var! "clojure.core" "class" jolt-class)
 
@@ -256,29 +268,33 @@
         keys vals)
       (reverse result))))
 
+;; The hex an object's default toString appends is Integer.toHexString of its
+;; hashCode, i.e. its IDENTITY hash. equal-hash is not that: it answers one
+;; constant for every procedure (hasheq.ss records the measurement), so every
+;; anonymous fn rendered the same string and a two-operand cast error named
+;; both operands identically. jolt-identity-hasheq is the per-object id
+;; (hash f) already reports — the same number the JVM prints. Rendering it
+;; unsigned over 32 bits is what Integer.toHexString does; the old (abs …)
+;; collapsed h and -h onto one string.
+(define (jolt-identity-hex x)
+  (string-downcase (number->string (bitwise-and (jolt-identity-hasheq x) #xffffffff) 16)))
 ;; (str f) of a fn renders JVM-style — "ns$name@hexhash" — so code that parses
 ;; fn identity out of the string (expound's pprint-fn) finds the $-separated
 ;; class name instead of a raw Chez #<procedure> form.
 (register-str-render!
   (lambda (x) (procedure? x))
-  (lambda (x) (string-append (jolt-class-name x) "@"
-                             (string-downcase (number->string (abs (equal-hash x)) 16)))))
+  (lambda (x) (string-append (jolt-class-name x) "@" (jolt-identity-hex x))))
 ;; pr/print of a fn uses the JVM object form — #object[ns$name 0xHASH
 ;; "ns$name@HASH"] — which fn-identity parsers (lasertag's resolve-fn-name)
 ;; read the class name out of.
-(register-pr-arm!
-  (lambda (x) (procedure? x))
-  (lambda (x)
-    (let ((cn (jolt-class-name x))
-          (h (string-downcase (number->string (abs (equal-hash x)) 16))))
-      (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]"))))
+(define (jolt-fn-object-form x)
+  (let ((cn (jolt-class-name x))
+        (h (jolt-identity-hex x)))
+    (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]")))
+(register-pr-arm! (lambda (x) (procedure? x)) jolt-fn-object-form)
 ;; print of a fn uses the same #object form as pr (the JVM prints fns through
 ;; print-method Object on both paths); str keeps the bare cn@hash.
 (let ((prev (var-deref "clojure.core" "__print1")))
   (def-var! "clojure.core" "__print1"
     (lambda (x)
-      (if (procedure? x)
-          (let ((cn (jolt-class-name x))
-                (h (string-downcase (number->string (abs (equal-hash x)) 16))))
-            (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]"))
-          (jolt-invoke1 prev x)))))
+      (if (procedure? x) (jolt-fn-object-form x) (jolt-invoke1 prev x)))))
