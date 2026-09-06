@@ -344,14 +344,23 @@ esac
 # remain ordinary Maven dependencies. This needs the network for the two small
 # artifacts, so it is skipped when they cannot be fetched rather than failing.
 SPECPROJ="$root/test/chez/deps-alias/specproj"
-out="$(JOLT_PWD="$SPECPROJ" JOLT_QUIET=1 \
-      JOLT_MAVEN_REPOSITORY="$tmp/spec-m2" \
-      "$JOLT" run -m specapp 2>&1 | tail -1)"
-case "$out" in
-  "spec: true false") check "explicit spec.alpha dependency loads" ok ok ;;
-  *"Could not locate"*|*"could not"*|*"no such"*)
-    echo "  SKIP: spec.alpha transitivity (spec artifacts not fetchable offline)" >&2 ;;
-  *) check "explicit spec.alpha dependency loads" "spec: true false" "$out" ;;
+specout="$(JOLT_PWD="$SPECPROJ" JOLT_QUIET=1 \
+          JOLT_MAVEN_REPOSITORY="$tmp/spec-m2" \
+          "$JOLT" run -m specapp 2>&1)"
+specstatus=$?
+out="$(printf '%s\n' "$specout" | tail -1)"
+case "$specstatus:$out" in
+  "0:spec: true false") check "explicit spec.alpha dependency loads" ok ok ;;
+  *)
+    case "$specout" in
+      *"could not be fetched:"*|*"lookup failed:"*)
+        if [ "$specstatus" -ne 0 ]; then
+          echo "  SKIP: spec.alpha transitivity (spec artifacts not fetchable offline)" >&2
+        else
+          check "explicit spec.alpha dependency loads" "0:spec: true false" "$specstatus:$out"
+        fi ;;
+      *) check "explicit spec.alpha dependency loads" "0:spec: true false" "$specstatus:$out" ;;
+    esac ;;
 esac
 
 # --- tools.deps CLI surface -------------------------------------------------
