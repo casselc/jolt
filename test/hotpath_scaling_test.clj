@@ -175,7 +175,9 @@
   ;; Prove that the same block shape and ceiling reject the old algorithm.
   ;; The smaller bounded k keeps the deliberately quadratic witness cheap.
   (let [warm 16
-        k 1500
+        ;; At 3k the deliberately quadratic arms are long enough that an
+        ;; ordinary GC/scheduler pause cannot erase the expected ~3x ratio.
+        k 3000
         pending (object-array (+ warm (* 2 k)))
         _ (linear-scan-insert-block! pending 0 warm)
         [t1 c1] (timed-ns #(linear-scan-insert-block! pending warm k))
