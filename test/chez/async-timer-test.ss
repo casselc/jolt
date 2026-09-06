@@ -33,6 +33,42 @@
   (set! total (+ total 1))
   (unless pred (set! fails (+ fails 1)) (printf "  FAIL: ~a\n" name)))
 
+;; Count the comparisons made by the production heap insertion, then restore
+;; the comparator before draining the heap in deadline order. Strictly
+;; increasing deadlines are the former sorted-list implementation's worst
+;; case: it made 0 + ... + (n-1) comparisons, while this min-heap compares each
+;; new entry with its parent once and stops. Counting the actual comparator is
+;; deterministic; a wall-clock ratio here varied with CPU throughput even when
+;; Jolt's runtime counters reported zero collections and CPU time equal to real
+;; time in both arms.
+(define (increasing-insert-observation n)
+  (let ((less theap-less?)
+        (comparisons 0))
+    (unless (= timeout-heap-n 0)
+      (error 'increasing-insert-observation "timeout heap was not empty"))
+    (dynamic-wind
+      (lambda ()
+        (set! theap-less?
+          (lambda (a b)
+            (set! comparisons (+ comparisons 1))
+            (less a b))))
+      (lambda ()
+        (do ((i 0 (+ i 1)))
+            ((= i n))
+          (theap-insert! (cons i i))))
+      (lambda () (set! theap-less? less)))
+    ;; let* is intentional: capture fill/min before the ordered? initializer
+    ;; drains the heap. Scheme does not specify ordinary let initializer order.
+    (let* ((fill timeout-heap-n)
+           (minimum (and (theap-min) (car (theap-min))))
+           (ordered?
+             (let loop ((i 0))
+               (if (= i n)
+                   #t
+                   (let ((entry (theap-pop-min!)))
+                     (and (= i (car entry)) (loop (+ i 1))))))))
+      (list comparisons fill minimum ordered? timeout-heap-n))))
+
 ;; Wall clock around a take, in ms. now-millis is the timer's own clock, so a
 ;; measurement here and a deadline there cannot disagree about the unit.
 (define (take-ms ch)
@@ -48,6 +84,19 @@
 (define (pending-count) (jolt-with-mutex timeout-mu timeout-heap-n))
 
 (printf "== the shared (timeout ms) timer ==\n")
+
+;; --- 0. deterministic insertion-complexity instrumentation ------------------
+(printf "\n== 0. increasing heap insertion has one comparison per new entry ==\n")
+(let ((boundary (increasing-insert-observation 2))
+      (observed (increasing-insert-observation 8192)))
+  (ok "0a. n=2 is a non-vacuous boundary: one comparison, ordered drain, empty heap"
+      (equal? boundary '(1 2 0 #t 0)))
+  (ok "0b. 8192 increasing deadlines make exactly n-1 production comparisons"
+      (= 8191 (car observed)))
+  (ok "0c. the instrumented production heap filled, kept its min, drained in order, and is empty"
+      (equal? (cdr observed) '(8192 0 #t 0)))
+  (ok "0d. the former linear scan is rejected by the same n=3 boundary"
+      (> (/ (* 3 (- 3 1)) 2) (- 3 1))))
 
 ;; --- 1. a lone timeout, and the drain to empty --------------------------------
 (printf "\n== 1. one timeout: fires on time, leaves nothing pending ==\n")

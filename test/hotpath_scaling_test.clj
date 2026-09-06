@@ -1,17 +1,15 @@
-;; Hot-path shape gates: split-with-limit, timeout arming, deque draining,
-;; StringTokenizer, ns-publics/refer, and set/intersection must not scale
+;; Hot-path shape gates: split-with-limit, deque draining, StringTokenizer,
+;; ns-publics/refer, and set/intersection must not scale
 ;; worse than linearly (or must be independent of a dimension they used to
 ;; scale with). One file, one boot: each section is the same in-process
 ;; judgment as read_scaling_test.clj — balanced alternating arms where the
-;; workload is repeatable, and a monotonic one-shot measurement plus explicit
-;; negative control for the stateful timeout heap. Every regressed shape is
-;; sized to finish and fail rather than hang.
+;; workload is repeatable. Every regressed shape is sized to finish and fail
+;; rather than hang. The stateful timeout heap's deterministic comparison-count
+;; gate lives with its white-box functional coverage in async-timer-test.ss.
 ;;
 ;; What each section pins (all were real, found in the 2026-08 structural
 ;; sweep):
 ;;   split      (.split s LIMIT) recomputed (length out) per part — O(parts^2).
-;;   timeout    core.async timeout arming was a linear sorted-list insert —
-;;              O(k^2) for a burst; now a binary min-heap.
 ;;   deque      ArrayDeque/LinkedList front ops shifted the whole backing
 ;;              vector — the standard .poll worklist idiom was O(n^2).
 ;;   tokenizer  StringTokenizer called length/list-ref per token — O(n^2).
@@ -24,8 +22,7 @@
 
 (ns hotpath-scaling-test
   (:require [clojure.string :as str]
-            [clojure.set :as set]
-            [clojure.core.async :as async]))
+            [clojure.set :as set]))
 
 ;; Milliseconds as a double, from the nanosecond clock: a row whose small arm
 ;; takes a millisecond or two is otherwise quantized to 1 or 2, and its ratio
@@ -34,11 +31,6 @@
   (let [t (System/nanoTime)
         v (f)]
     [(/ (- (System/nanoTime) t) 1e6) v]))
-
-(defn- timed-ns [f]
-  (let [t (System/nanoTime)
-        v (f)]
-    [(- (System/nanoTime) t) v]))
 
 (defn- best-of [k f]
   (reduce min (map first (repeatedly k #(timed f)))))
@@ -81,41 +73,10 @@
 (defn- judge-scaling [label f1 f4 reps ceiling detail]
   (judge-thunks label #(dotimes [_ (* 4 reps)] (f1)) #(dotimes [_ reps] (f4)) ceiling detail))
 
-(defn- judge-ns [label t1 t4 ceiling detail]
-  (let [ratio (double (/ t4 t1))]
-    (println (format "hotpath %-9s %8.3fms vs %8.3fms, ratio %6.2f (ceiling %.1f)"
-                     label (/ t1 1e6) (/ t4 1e6) ratio (double ceiling)))
-    (when (> ratio ceiling)
-      (println (str "FAIL hotpath " label ": " detail))
-      (swap! failures inc))))
-
 ;; --- split with a positive limit ---------------------------------------------
 (defn- split-drain [n]
   (let [s (str/join "," (range n))]
     (count (str/split s #"," 10000000))))
-
-;; --- timeout arming: k pending timers, far-future distinct deadlines ---------
-(defn- arm-timeouts [k base-ms]
-  (dotimes [i k] (async/timeout (+ base-ms i)))
-  k)
-
-;; Negative control for the implementation this gate guards against. The old
-;; timeout queue was a sorted mutable list. A burst of increasing deadlines
-;; scanned every existing entry before appending the next one, so the total
-;; work was 0 + 1 + ... + (k-1). An object array keeps this witness bounded and
-;; isolates the relevant operation — linear scan followed by constant-time
-;; append — from LinkedList iterator overhead.
-(defn- linear-scan-insert-block! [pending start k]
-  (loop [i start seen 0]
-    (if (= i (+ start k))
-      seen
-      (let [seen' (loop [j 0 seen seen]
-                    (if (= j i)
-                      seen
-                      (recur (inc j)
-                             (if (nil? (aget pending j)) seen (inc seen)))))]
-        (aset pending i i)
-        (recur (inc i) seen')))))
 
 ;; --- deque drain -------------------------------------------------------------
 (defn- deque-drain [n]
@@ -151,46 +112,6 @@
            "ArrayDeque front ops are shifting the backing vector again (host-static-classes.ss)")
     (judge-scaling "tokenizer" #(tok-drain n1) #(tok-drain (* 4 n1)) 4 2.0
            "StringTokenizer is scanning its token list per token again (host-static-classes.ss)"))
-
-  ;; Timeout arming is not idempotent, so compare two consecutive EQUAL-SIZED
-  ;; blocks after a small warmup. This gives both arms the same channel/thunk
-  ;; allocation volume and, with the current doubling heap, nearly equal
-  ;; aggregate vector-copy volume. A heap remains near 1x as it grows; the old
-  ;; sorted-list insert scans indices 0..k and then k..2k, whose sums have ratio
-  ;; near 3x.
-  ;; Keep raw monotonic nanoseconds through the ratio and do not retry into a
-  ;; differently sized global heap.
-  (let [warm 64
-        ;; 4k is above the monotonic-clock floor (~2ms locally) but below the
-        ;; retained-channel GC transition that made only the second 8k block
-        ;; pay a collection and mimic the quadratic control's 3x ratio.
-        k 4000
-        base-ms 3600000
-        _ (arm-timeouts warm base-ms)
-        [t1 _] (timed-ns #(arm-timeouts k (+ base-ms warm)))
-        [t2 _] (timed-ns #(arm-timeouts k (+ base-ms warm k)))]
-    (judge-ns "timeout" t1 t2 2.0
-              "timeout-insert! is walking the pending list per arm again (async.ss)"))
-
-  ;; Prove that the same block shape and ceiling reject the old algorithm.
-  ;; The smaller bounded k keeps the deliberately quadratic witness cheap.
-  (let [warm 16
-        ;; At 3k the deliberately quadratic arms are long enough that an
-        ;; ordinary GC/scheduler pause cannot erase the expected ~3x ratio.
-        k 3000
-        pending (object-array (+ warm (* 2 k)))
-        _ (linear-scan-insert-block! pending 0 warm)
-        [t1 c1] (timed-ns #(linear-scan-insert-block! pending warm k))
-        [t2 c2] (timed-ns #(linear-scan-insert-block! pending (+ warm k) k))
-        ratio (double (/ t2 t1))
-        scan-sum (fn [start n] (/ (* n (+ (* 2 start) (dec n))) 2))]
-    (println (format "control timeout-list %8.3fms vs %8.3fms, ratio %6.2f (floor 2.5)"
-                     (/ t1 1e6) (/ t2 1e6) ratio))
-    (when-not (and (= c1 (scan-sum warm k))
-                   (= c2 (scan-sum (+ warm k) k))
-                   (> ratio 2.5))
-      (println "FAIL hotpath timeout-list control: gate no longer distinguishes the former quadratic insertion path")
-      (swap! failures inc)))
 
   ;; ns-publics shape independence: a tiny namespace's ns-publics must not get
   ;; slower because unrelated vars exist. R repetitions beat the clock floor.
