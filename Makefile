@@ -520,9 +520,10 @@ complexity: testbin
 ioscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/io_scaling_test.clj
 
-# The 2026-08 sweep's remaining hot-path shapes in one gate: split-with-limit,
-# core.async timeout arming, ArrayDeque/StringTokenizer draining, ns-publics/
-# refer var-table independence, set/intersection smaller-side walk.
+# The 2026-08 sweep's repeatable hot-path shapes in one gate: split-with-limit,
+# ArrayDeque/StringTokenizer draining, ns-publics/refer var-table independence,
+# and set/intersection smaller-side walk. The stateful timeout heap is covered
+# deterministically by the white-box asynctimer gate.
 hotscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/hotpath_scaling_test.clj
 
