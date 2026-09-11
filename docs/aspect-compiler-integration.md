@@ -9,22 +9,25 @@ reproducible dependency version.
 
 ## Current provenance epoch
 
-The current line is replayed directly onto the published Jolt v0.8.3 release:
+The aspect root was replayed onto Jolt v0.8.3. Published v0.8.6 is merged into
+that append-only line, preserving both histories:
 
 | Fact | Revision |
 | --- | --- |
 | Published v0.8.3 release commit | `343f730922cf16fafe673b466cedcdcfe0596854` |
 | Published v0.8.3 tree | `39ba588512ec3c970db3a708393426199bd88520` |
+| Published v0.8.6 release commit | `f3041a0e32ba0db1b92bd69b8ecb7b40f8b2e115` |
+| Published v0.8.6 tree | `21490693b24ad8fc86f4e37ec01489d876dc4994` |
 | First replayed aspect compiler commit | `eaf4ae8588feaf88bfba7a727d50d08d7ee5945a` |
 | Initial replayed verified ancestor | `efeeeb0580bfed731d977b405a796af2d479595c` |
 
 `config/aspect-integration.lock` is the machine-readable copy of these facts.
-The verifier proves that the release base has the recorded tree, that the
-first aspect commit is its direct child, and that the checked revision retains
-the aspect root and verified anchor in its ancestry. Its online mode separately
-proves that the live upstream release tag still resolves to the recorded commit
-and tree. A tag move therefore fails visibly even when its files happen to be
-unchanged.
+Schema 2 distinguishes the immutable base beneath the first aspect commit from
+the current upstream release merged later. The verifier checks both trees, the
+root-parent relation, stable upstream ancestry, and that the checked revision
+contains both the verified aspect line and the recorded release. Its online mode
+separately proves that the live release tag still resolves to the recorded
+commit and tree.
 
 `tools/version.sh` also consumes the lock when `HEAD` descends from the recorded
 aspect root. It reports the locked upstream release plus the commit distance
@@ -42,9 +45,11 @@ provenance verifier.
 CI skip a revision outside the aspect lineage; the dedicated canonical workflow
 sets it to `1` and fails closed instead.
 
-The immutable record for this epoch is
-[`docs/aspect-compiler-epochs/v0.8.3-2026-09.md`](aspect-compiler-epochs/v0.8.3-2026-09.md).
-The preceding v0.8.1 epoch, including its rewritten-tag history, remains in
+The current immutable record is
+[`docs/aspect-compiler-epochs/v0.8.6-2026-09.md`](aspect-compiler-epochs/v0.8.6-2026-09.md).
+The preceding v0.8.3 replay and v0.8.1 rewritten-tag history remain in
+[`docs/aspect-compiler-epochs/v0.8.3-2026-09.md`](aspect-compiler-epochs/v0.8.3-2026-09.md)
+and
 [`docs/aspect-compiler-epochs/v0.8.1-2026-09.md`](aspect-compiler-epochs/v0.8.1-2026-09.md).
 Every later epoch adds another file under `docs/aspect-compiler-epochs/`; a
 history rewrite includes its old-to-new commit map there. The active lock
@@ -64,7 +69,7 @@ this repository and linked from the same ledger entry.
 
 ## Branch workflow
 
-1. Fetch `fork/integration/aspects` and branch from its exact tip.
+1. Fetch `origin/integration/aspects` and branch from its exact tip.
 2. Keep one concern per pull request. Compiler behavior changes include a
    focused regression test and, where relevant, a stock-upstream reproducer.
 3. Run the focused tests first. Run heavy compiler builds serially with Chez

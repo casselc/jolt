@@ -454,6 +454,38 @@
   (or (hc-fq-class-name? nm)
       (host-class-registered? nm)))
 
+;; The other side of that line, for a DOTTED name: dotted, with a LOWERCASE
+;; segment after the last dot — jolt.host, clojure.string. That is what a
+;; NAMESPACE looks like, and what no class jolt models looks like: every class the
+;; host registers has a capitalized final segment, hc-fq-class-name? above calls
+;; a lowercase one not-a-class, and the reader refuses to read one as a class
+;; token.
+;;
+;; The analyzer needs the question asked this way because resolve-global cannot
+;; tell the two apart on its own: a qualified sym it cannot resolve comes back
+;; :unresolved whether it is `Math/sqrt` or `no.such.ns/foo`, and reading the
+;; second as a class static is what made `(no.such.ns/foo 1)` report "Unknown
+;; class no.such.ns" from inside the call. Paired with jolt.host/ns-loaded? below
+;; (ns.ss chez-ns-exists?, the rule find-ns uses) it fires only on a
+;; namespace-shaped ns that is not loaded AT ALL — the JVM's "No such namespace".
+;; A loaded namespace missing only the var must stay late-bound: that is how
+;; jolt-core reaches this very contract, and which jolt.host vars exist depends on
+;; which host files the boot loaded, so the guard there is the static one
+;; (jolt-host-manifest.txt) and the miss reports at the call.
+;;
+;; NOT merely (not (hc-fq-class-name? nm)): a name with no dot at all is
+;; genuinely ambiguous — `str/join` is an unregistered :as alias, but a bare
+;; `Foo` is how an :import-ed short name is spelled, and its class may not be
+;; registered until its provider autoloads. Those stay with the host-static arm.
+;; Anything but a lowercase LETTER after the last dot is left there too.
+(define (hc-ns-shaped-name? nm)
+  (let ((n (string-length nm)))
+    (let loop ((i (fx- n 1)))
+      (cond ((fx<? i 0) #f)                    ; no dot: ambiguous, not ours to reject
+            ((char=? (string-ref nm i) #\.)
+             (and (fx<? (fx+ i 1) n) (char-lower-case? (string-ref nm (fx+ i 1)))))
+            (else (loop (fx- i 1)))))))
+
 (define (hc-resolve-global ctx sym)
   (let* ((nm (symbol-t-name sym))
          (cell (hc-resolve-cell ctx sym)))
@@ -907,12 +939,20 @@
   (def-var! "jolt.host" "chez-number-literal" (lambda (n) (number->string n)))
   (def-var! "jolt.host" "form-special?" hc-special?)
   (def-var! "jolt.host" "compile-ns" hc-current-ns)
+  ;; A ctx for a DIFFERENT namespace than the one being compiled. The analyzer
+  ;; needs one to re-analyze a registered fn literal's SOURCE form in the ns it
+  ;; was compiled in (jolt-5n2p): its free symbols resolve there and not at the
+  ;; site the value was spliced into, which is the same reason the image restore
+  ;; path compiles its wrapper in (image-fnsrc-ns x).
+  (def-var! "jolt.host" "ctx-for-ns" (lambda (ns) (make-analyze-ctx ns)))
   (def-var! "jolt.host" "late-bind?" hc-late-bind?)
   (def-var! "jolt.host" "form-macro?" hc-macro?)
   (def-var! "jolt.host" "form-expand-1" hc-expand-1)
   (def-var! "jolt.host" "resolve-global" hc-resolve-global)
   (def-var! "jolt.host" "resolvable-names" hc-resolvable-names)
   (def-var! "jolt.host" "host-class-name?" hc-host-class-name?)
+  (def-var! "jolt.host" "ns-shaped-name?" hc-ns-shaped-name?)
+  (def-var! "jolt.host" "ns-loaded?" chez-ns-exists?)
   (def-var! "jolt.host" "host-intern!" hc-intern!)
   (def-var! "jolt.host" "form-syntax-quote-lower" hc-syntax-quote-lower)
   (def-var! "jolt.host" "form-syntax-quote-expand" hc-sq-expand-all)

@@ -106,7 +106,10 @@
                 "rdr-read-token" "rdr-read-dispatch" "rdr-read-anon-fn"
                 ;; the CLI's own entry frames: every trace ended with these, and
                 ;; they say only that jolt was started, which the reader knows.
-                "cmd-run" "load-jolt-file*" "jolt-cli-run"))
+                ;; run-script! is the one that loads a FILE (a script, a `run
+                ;; FILE`, an alias's :main-opts), so it sits directly under the
+                ;; program's own frames on every script trace.
+                "cmd-run" "run-script!" "load-jolt-file*" "jolt-cli-run"))
     h))
 ;; The `jolt-` prefix rule is also what BOUNDS A FIBER BACKTRACE, which is not
 ;; obvious from here. A throw inside a go body has the whole scheduler below it
@@ -605,7 +608,7 @@
                                (line (or (srcreg-frame-line f) (vector-ref r 3))))
                           (put-string port ns) (put-string port "/") (put-string port nm)
                           (when (string? file)
-                            (put-string port " (") (put-string port file)
+                            (put-string port " (") (put-string port (jolt-display-path file))
                             (put-string port ":") (put-string port (number->string line))
                             (put-string port ")")))
                         (put-string port (srcreg-display-name frame-name)))   ; 'ambiguous / unmapped: bare name

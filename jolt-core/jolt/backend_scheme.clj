@@ -14,6 +14,7 @@
                                form-map-pairs form-set-items form-char-code
                                form-regex? form-regex-source
                                form-inst? form-inst-source form-uuid? form-uuid-source
+                               form-bigdec? form-bigdec-source
                                form-class-value? form-class-value-name]]
             [jolt.passes.types :as types]
             [jolt.passes.numeric :as numeric]
@@ -137,12 +138,10 @@
 ;; has to bind t to a temporary first, or these three arms silently evaluate it
 ;; two and three times.
 ;;
-;; Note this path is NOT what honeysql's kw->sym reaches, despite being the shape
-;; that motivated it. jolt's reader advertises :bb (reader.ss rdr-features), and
+;; honeysql's kw->sym is the shape that motivated this, and jolt reaches it:
 ;; honeysql orders its conditional #?(:bb … :clj (.sym ^Keyword k)) with :bb
-;; first at all three of its .sym sites, so jolt takes the pure-Clojure branch
-;; and never sees the interop. It fires for code that writes .sym unconditionally
-;; or puts :clj first.
+;; first at all three of its .sym sites, and jolt stopped matching :bb in #893.
+;; Also fires for code that writes .sym unconditionally or puts :clj first.
 (defn- keyword-direct-emit [m argc t args]
   (let [a0 (first args)]
     (cond
@@ -630,6 +629,47 @@
         nm)
       expr)))
 
+;; ...and the same hoist keyed by the SOURCE OBJECT, which is what the reference
+;; compiler does: Compiler.registerConstant keys its pool on an IdentityHashMap,
+;; so one form object is one constant however many times it appears in the code
+;; being compiled, while two forms that merely READ alike stay two constants.
+;;
+;; Both halves matter and per-site had only the second. A macro that mentions its
+;; argument more than once — clojure.test/is names the tested form five times,
+;; across :form, :expected and three :actual arms — splices the SAME object into
+;; every one, and per-site emitted a fresh construction for each. Measured on one
+;; deftest holding 800 (is (= n n)): 6410 hoisted bindings of which 812 were
+;; distinct, 87% redundant. They all land in one let*, and Chez's compile is
+;; quadratic in that, so the waste is squared rather than added.
+;;
+;; The distinction per-site exists to protect is preserved exactly, because it is
+;; a distinction between OBJECTS: (defn f [] [\a ##NaN]) and a second literal
+;; written elsewhere read as two forms, so they stay two constants and
+;; (= (f) (f)) keeps answering true while two separate sites answer false. That
+;; is clojure.core-test/not-eq's row, and it passes on identity keying for the
+;; same reason it passes on the JVM.
+;;
+;; Keyed through jolt.host/identity-hash with an identical? check rather than a
+;; map with identity semantics: java.util.IdentityHashMap is value-keyed here (a
+;; recorded divergence), and a jolt seq does not cache its hash, so an
+;; equality-keyed map would walk the subtree this exists to avoid walking.
+;;
+;; The index is its OWN atom and not another key shape in the pool: the pool is
+;; flushed to let* bindings by position, so anything else living there would have
+;; to be filtered back out at that seam.
+(def ^:dynamic *const-ids* nil)
+
+(defn- hoist-const-for [obj expr]
+  (let [pool *const-pool* ids *const-ids*]
+    (if (or (nil? pool) (nil? ids) (nil? obj))
+      (hoist-const-per-site expr)
+      (let [k (jolt.host/identity-hash obj)]
+        (or (first (keep (fn [r] (when (identical? (nth r 0) obj) (nth r 1)))
+                         (get @ids k)))
+            (let [nm (hoist-const-per-site expr)]
+              (swap! ids update k (fnil conj []) [obj nm])
+              nm))))))
+
 ;; Is this literal a CONSTANT construction — one whose value is fully determined at
 ;; emit time, so building it once per def and sharing it is indistinguishable from
 ;; building it per evaluation? True for a scalar :const and for a collection literal
@@ -664,8 +704,10 @@
 (defn- emit-with-cells [emit-thunk]
   (let [cells (atom [])
         pool (atom {})
+        ids (atom {})
         raw (binding [*cache-cells* cells
-                      *const-pool* pool]
+                      *const-pool* pool
+                      *const-ids* ids]
               (emit-thunk))
         ;; constants bind eagerly (value first); lazy cache cells start #f. Ordered
         ;; by INSERTION so a constant that references an earlier one (a hoisted
@@ -1040,7 +1082,16 @@
 ;; An operand whose evaluation has no observable effect: constants, locals,
 ;; var/the-var reads, quoted literals.
 (defn- side-effect-free? [n]
-  (contains? #{:const :local :var :the-var :quote} (:op n)))
+  (or (contains? #{:const :local :var :the-var :quote} (:op n))
+      ;; ...and a CONSTANT collection literal, whose value is fully determined at
+      ;; emit time and which is hoisted rather than built here. Without this every
+      ;; nested constant map/vector/set read as effectful, so needs-order? wrapped
+      ;; its own construction in a let* of temporaries — and it is nested constants
+      ;; that a macro-heavy expansion is made of. Measured on 1000 deftest forms:
+      ;; 98000 ordering temporaries, one hoisted constant in every form wrapped in
+      ;; an ordering let* it cannot need. The reference emits no ordering
+      ;; temporaries for constants at all; they are constant-pool loads.
+      (const-coll-node? n)))
 
 ;; A var VALUE read is effect-free but order-SENSITIVE: a mutating sibling
 ;; (def/alter-var-root/set!) changes what it yields, so it must not move across
@@ -1202,6 +1253,11 @@
     ;; a quote) reconstructs through the interner, like #inst/#uuid.
     (form-class-value? form) (str "(jolt-class-for " (chez-str-lit (form-class-value-name form)) ")")
     (form-uuid? form) (str "(jolt-uuid-from-string " (chez-str-lit (form-uuid-source form)) ")")
+    ;; ...and a quoted 1.5M builds its BigDecimal the same way (the :bigdec IR
+    ;; leaf's emit). Without this arm the raw reader form went out as the datum:
+    ;; (first '[1.5M]) was an opaque object printing as #bigdec "1.5", = to
+    ;; nothing, and (eval '(+ 1.5M 1)) could not compile it.
+    (form-bigdec? form) (str "(jolt-bigdec-from-string " (chez-str-lit (form-bigdec-source form)) ")")
     ;; a quoted custom #tag with no registered reader -> a tagged-literal value
     ;; (Clojure's reader builds a TaggedLiteral), not the raw reader map. The tag is
     ;; stored as a :#name keyword; strip the leading # to the bare symbol.
@@ -2038,6 +2094,25 @@
                      (str (munge-name (:name node)) "$jf" (let [n @*fnsrc-counter*]
                                                             (swap! *fnsrc-counter* inc) n))
                      (fnsrc-name)))
+        ;; --- fn identity -------------------------------------------------
+        ;; Chez shares ONE closure object across every evaluation of a lambda
+        ;; with no free variables, where Clojure allocates a fresh fn each time.
+        ;; Observable, and real code depends on the Clojure answer: malli keys a
+        ;; cache on validator closures (two :? branches collided, backtracking
+        ;; died, m/validate returned false), and jolt's own fn meta is keyed on
+        ;; the procedure, so with-meta leaked between unrelated fns.
+        ;;
+        ;; So such a lambda is given something to capture. Only a literal that is
+        ;; EVALUATED REPEATEDLY needs it: a def's direct init runs once, so its
+        ;; single shared instance is already the only one there will ever be, and
+        ;; two distinct fn forms never share with each other.
+        ;;
+        ;; :free-names absent means the analyzer did not compute it (a node a pass
+        ;; built), not that there are none — so absent is treated as "might be
+        ;; shared" and gets the capture. Wrong only in costing a fn that already
+        ;; allocated.
+        force-id? (and (not def-init?) (empty? (:free-names node)))
+        id-nm (when force-id? (fresh-label "_fnid$"))
         clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
                           *trace-site* (or qname self)
                           *trace-self* (cond-> #{} self (conj self) qname (conj qname))
@@ -2050,11 +2125,29 @@
                           *letrec-binders* #{}
                           *fnsrc-def-init?* false]
                   (mapv emit-arity-clause arities))
+        ;; The capture must stay LIVE. Chez removes a dead one and the sharing
+        ;; comes back — measured for a dead reference, a captured value used
+        ;; through begin, an assigned variable and a captured fresh pair, all of
+        ;; which went back to eq?. A branch on an assigned top-level cannot be
+        ;; folded, so the reference survives; jolt-fn-identity-probe is never
+        ;; true, so no arity's behaviour changes. Body stays in tail position.
+        clauses (if force-id?
+                  (mapv (fn [c]
+                          [(nth c 0)
+                           (str "(if jolt-fn-identity-probe " id-nm " " (nth c 1) ")")])
+                        clauses)
+                  clauses)
         lambda (if (= 1 (count clauses))
                  (let [c (first clauses)] (str "(lambda " (nth c 0) " " (nth c 1) ")"))
                  (str "(case-lambda "
                       (str/join " " (map (fn [c] (str "(" (nth c 0) " " (nth c 1) ")")) clauses))
                       ")"))
+        ;; Wrapping in a let keeps Chez's procedure naming — it looks through the
+        ;; let, so `#<procedure inner>` still reports, which the source registry
+        ;; and native backtrace frames depend on. Verified before relying on it.
+        lambda (if force-id?
+                 (str "(let ((" id-nm " jolt-fn-identity-seed)) " lambda ")")
+                 lambda)
         ;; A fn with a variadic arity records that arity's FIXED param count, so
         ;; jolt-apply can hand it a lazy rest instead of realizing the tail. The
         ;; count is recorded rather than read back from procedure-arity-mask,
@@ -2525,6 +2618,10 @@
       ;; skipping jolt-nth's dispatch walk, which the call already gets.
       (:v-aget node) (order-args (fn [as] (str "(jolt-vaget " (str/join " " as) ")")))
       (:v-aset node) (order-args (fn [as] (str "(jolt-vaset " (str/join " " as) ")")))
+      ;; (aset ^bytes a i v): the store's own helper, because the byte kind narrows
+      ;; to signed 8 bits and must answer what it stored — jolt-vaset answers its
+      ;; argument. No inline form: there is nothing to unbox on the way out.
+      (:b-aset node) (order-args (fn [as] (str "(jolt-baset " (str/join " " as) ")")))
       (:fl-op node) (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")")))
       ;; the integer twin of :fl-op — a java.lang.Math member over proven fixnum
       ;; operands, lowered to its jolt-l-* macro (jolt.passes.numeric math-lng-ops).
@@ -3014,14 +3111,18 @@
     ;; A quoted scalar (form-char?/form-literal?) emits as an immediate constant
     ;; via emit-const — nothing to hoist. Every other quoted form (symbol, list,
     ;; vector, map, set, regex/inst/uuid/tagged) is a CONSTRUCTION rebuilt per
-    ;; evaluation, so hoist it to a per-site constant: built once per def, one
-    ;; object across calls of the same site, distinct objects across sites —
-    ;; the reference compiler's ConstantExpr behavior for quoted data.
+    ;; evaluation, so hoist it: built once per def, one object per source form,
+    ;; distinct objects for distinct forms — the reference compiler's
+    ;; ConstantExpr behavior for quoted data.
+    ;;
+    ;; Keyed by the FORM, so a macro that splices one form into several places in
+    ;; its expansion gets one constant rather than one per mention. See
+    ;; hoist-const-for.
     :quote (let [f (:form node)
                  s (emit-quoted f)]
              (if (or (form-char? f) (form-literal? f))
                s
-               (hoist-const-per-site s)))
+               (hoist-const-for f s)))
     ;; the thrown value is an operand (emitted non-tail); the throw itself goes
     ;; through emit-call with marks?=#f, so a TAIL throw gets the site-vreg pair
     ;; (sited-tail-call — stored after the operand is bound, so the operand's own
@@ -3268,9 +3369,24 @@
         (let [v (fresh-label "_dv$")]
           (str "(begin" freg " (let ((" v " (def-var-plain! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
 
-(defn emit-top-form [node]
+;; FNSRC-DEF names the enclosing top-level def for a node that does not carry the
+;; name itself. A macro's expander reaches the image emitter as a BARE fn form —
+;; ce-defmacro->fn has already split the name off — so the caller supplies it
+;; here; otherwise every macro in a namespace registers its anon fns under
+;; jfn$<ns>$$<n> with the counter restarting per form, and siblings collide.
+(defn emit-top-form
+  ([node] (emit-top-form node nil))
+  ([node fnsrc-def]
   (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node))
-            *fnsrc-def* (when (= :def (:op node)) (:name node))
+            ;; :defmacro too, not just :def. Without it every defmacro in a
+            ;; namespace emits its expander under jfn$<ns>$$<n> with the counter
+            ;; restarting per top-level form, so sibling macros all claim
+            ;; jfn$<ns>$$0 — last registration wins, and an image dump of a
+            ;; closure over an earlier macro's expander restores a different
+            ;; macro's source. A defmacro node carries :name exactly as :def
+            ;; does, so naming it is all that is needed.
+            *fnsrc-def* (or (when (#{:def :defmacro} (:op node)) (:name node))
+                            fnsrc-def)
             *fnsrc-counter* (atom 0)
             *fnsrc-regs* (atom [])]
     (let [scm (cond
@@ -3295,4 +3411,4 @@
           ;; dependency on the form's evaluation, and the form itself may dump a
           ;; closure it just created — the registration must already be there.
           ;; begin keeps the form's value as the result.
-        :else (str "(begin" freg " " scm ")")))))
+        :else (str "(begin" freg " " scm ")"))))))

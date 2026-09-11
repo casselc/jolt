@@ -37,9 +37,12 @@
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                form-syntax-quote-expand
                                record-type? record-ctor-key deftype-ctor-class form-position form-line late-bind?
-                               resolve-class-hint host-class-name? jolt-class-for]]))
+                               resolve-class-hint host-class-name? ns-shaped-name? ns-loaded?
+                               jolt-class-for embed-plan ctx-for-ns]]))
 
 (declare analyze)
+;; the quote arm reaches it well before its definition (it needs analyze itself)
+(declare embedded-plan-node)
 
 ;; Special forms analyze-special has a dispatch arm for — the subset of the host
 ;; contract's reserved words (jolt.host/form-special?) the analyzer lowers itself.
@@ -1057,9 +1060,18 @@
                   m (when (map? m)
                       (let [u (if (form-list? qf) (dissoc m :line :column :file) m)]
                         (when (seq u) u)))]
-              (if (nil? m)
-                (quote-node qf)
-                (invoke (var-ref "clojure.core" "with-meta") [(quote-node qf) (quote-node m)])))
+              ;; Quoting a live VALUE a macro spliced is the value — (quote 5) is
+              ;; 5, and (quote <fn>) is that fn — so it rebuilds the same way an
+              ;; unquoted one does rather than going to the quoted-data emitter,
+              ;; which can only render what has reader syntax. embed-plan answers
+              ;; nil for every ordinary form, so this asks one question instead of
+              ;; restating the list of shapes analyze already recognizes.
+              (if-let [plan (embed-plan qf)]
+                (embedded-plan-node ctx plan env)
+                (if (nil? m)
+                  (quote-node qf)
+                  (invoke (var-ref "clojure.core" "with-meta")
+                          [(quote-node qf) (quote-node m)]))))
     "if" (do
            ;; 2 or 3 argument forms only (spec 03-special-forms X1)
            (when (or (< (count items) 3) (> (count items) 4))
@@ -1215,10 +1227,11 @@
     :str))
 
 ;; Same seam for keywords. Sources mirror str-target-type: the ^Keyword tag, a
-;; :kw-hinted binding, or a keyword literal. Note jolt does NOT reach honeysql's
-;; (.sym ^clojure.lang.Keyword k) despite that being the shape this was written
-;; for — jolt's reader advertises :bb and honeysql orders its conditional with :bb
-;; first, so the pure-Clojure branch wins. See keyword-direct-emit.
+;; :kw-hinted binding, or a keyword literal. honeysql's
+;; (.sym ^clojure.lang.Keyword k) is the shape this was written for and jolt
+;; reaches it: honeysql orders its conditional #?(:bb … :clj (.sym …)) with :bb
+;; first at all three sites, and jolt stopped matching :bb in #893. See
+;; keyword-direct-emit.
 (defn- kw-target-type [raw target]
   (when (or (and (form-sym? raw) (kw-tag? (get (form-sym-meta raw) :tag)))
             (= :kw (:hint target))
@@ -1735,7 +1748,41 @@
              ;; A non-var qualified ref `Class/member` is a host class static
              ;; (Math/sqrt, Long/MAX_VALUE, System/getenv). The Chez back end
              ;; lowers it to a runtime static dispatch.
-             (host-static ns nm)))
+             ;;
+             ;; ...but a namespace-shaped ns that is not loaded AT ALL cannot be a
+             ;; class either, and reporting it as one is how `(no.such.ns/foo 1)`
+             ;; came back "Unknown class no.such.ns" from inside the call, naming a
+             ;; class the program never mentioned. resolve-global cannot draw the
+             ;; line itself: it answers :unresolved for `Math/sqrt` and for
+             ;; `no.such.ns/foo` alike, because looking the name up and finding
+             ;; nothing is all it can say. So check the shape, and report the JVM's
+             ;; "No such namespace" (Compiler.resolveIn) at COMPILE time — which is
+             ;; where a forgotten `require` or a typo in the ns half belongs.
+             ;;
+             ;; A LOADED namespace merely missing the var stays on the host-static
+             ;; arm, and deliberately. jolt-core and stdlib reach their host contract
+             ;; this way on purpose — several hundred `jolt.host/…` references, and
+             ;; jolt.ffi's and jolt.time's — and which vars exist depends on which host
+             ;; files the current boot loaded: jolt.main names jolt.host/build-library
+             ;; in a world where build.ss may not be loaded and the call cannot run.
+             ;; Late binding is the point there, so the compile-time guard for that
+             ;; namespace is a STATIC one (jolt-host-manifest.txt, pinned against
+             ;; both the def-var! sites and every jolt-core reference by
+             ;; manifestcheck), and the miss reports at the call, correctly, through
+             ;; static-miss-message's live-namespace arm: "No such var: ns/name",
+             ;; not "Unknown class".
+             ;;
+             ;; jolt#879 was in this second group — jolt.host loaded, `getenv` not
+             ;; yet — so it is the seed's own gates that hold it: manifestcheck
+             ;; rejects a namespace-shaped host-static in the minted seed, and
+             ;; `make seeddefs` asserts every var the seed defines survives the load.
+             (if (and (ns-shaped-name? ns) (not (ns-loaded? ns)))
+               (analysis-error :analyze/unknown-namespace
+                (str "No such namespace: " ns)
+                {:jolt.error/symbol (str ns "/" nm)
+                 :jolt.error/namespace ns
+                 :jolt.error/ns (compile-ns ctx)})
+               (host-static ns nm))))
       :else (let [r (resolve-global ctx form)]
               (case (:kind r)
                 ;; :num-ret (a ^double/^long declared return) rides on the var node so
@@ -1778,7 +1825,7 @@
     (= hname "dec") "unchecked-dec"
     :else nil))
 
-;; A non-shadowed clojure.core numeric cast (double/long/int/float of one arg)
+;; A clojure.core numeric cast (double/long/int/float/byte/short of one arg)
 ;; becomes a :coerce node carrying the checked runtime helper, so it feeds the
 ;; numeric lattice like a ^double/^long hint: (* (double x) 2.0) emits fl*. The
 ;; helper preserves clojure.core's full JVM semantics (checked, not bare
@@ -1792,6 +1839,15 @@
           (= hname "long")   {:kind :long   :cast-fn "jolt-long-cast"}
           (= hname "int")    {:kind :long   :cast-fn "jolt-int-cast"}
           (= hname "float")  {:kind :double :cast-fn "jolt-float"}
+          ;; byte/short narrow to a RANGE, so their answer is a fixnum on every
+          ;; tower jolt has (jolt-checked-cast returns a value inside [lo,hi] or
+          ;; throws) — :long, the same kind `int` takes, and for the same reason.
+          ;; Being in this table is what keeps (byte v) from costing more than the
+          ;; store it feeds: outside it, a var-deref + jolt-invoke1 wrap
+          ;; jolt-byte-cast's two fixnum compares for 17.9ns an element, in exactly
+          ;; the shape every byte-filling loop is written in.
+          (= hname "byte")   {:kind :long   :cast-fn "jolt-byte-cast"}
+          (= hname "short")  {:kind :long   :cast-fn "jolt-short-cast"}
           ;; the unchecked casts are casts too: a primitive long/int on the JVM,
           ;; so the result feeds the :long lattice the same way. Their wrap
           ;; result can be a bignum past the 61-bit fixnum, which is the case
@@ -1818,6 +1874,27 @@
                                    (contains? handled (form-sym-name head)))
                           (form-sym-name head)))
             shadowed (and hname (local? env hname))
+            ;; Does this head actually resolve to the clojure.core var it is named
+            ;; after? `shadowed` sees only LOCALS, so it cannot answer that: a
+            ;; namespace-level (defn byte …) or (defn + …) owns the name in call
+            ;; position, with or without :refer-clojure :exclude, and rewriting
+            ;; such a call to a cast or an unchecked op calls the wrong function.
+            ;;
+            ;; This is the test backend_scheme/native-op already makes on the
+            ;; resolved :var node before lowering first/aset/+ to a primitive, so
+            ;; the two lowering layers now agree about who owns a name — and a
+            ;; user-defined `first` and a user-defined `double` behave alike. A
+            ;; head written clojure.core/-qualified (syntax-quote emits those)
+            ;; names its ns outright and needs no lookup.
+            ;;
+            ;; Called only once unchecked-arith / num-cast have matched a name AND
+            ;; an arity, so an ordinary call — every other list head in the
+            ;; program — never pays for the resolution.
+            core-head?
+            (fn []
+              (or (and (form-sym? head) (= "clojure.core" (form-sym-ns head)))
+                  (let [r (resolve-global ctx head)]
+                    (and (= :var (:kind r)) (= "clojure.core" (:ns r))))))
             ;; under *unchecked-math*, a core +/-/*/inc/dec becomes its wrapping
             ;; unchecked-* (computed once; nil when off or not such an op). The op
             ;; may arrive bare (+) or clojure.core-qualified (clojure.core/*), the
@@ -1825,15 +1902,17 @@
             unm (when (unchecked-math?)
                   (let [opn (cond (and hname (not shadowed)) hname
                                   (and (form-sym? head) (= "clojure.core" (form-sym-ns head)))
-                                  (form-sym-name head))]
-                    (when opn (unchecked-arith opn (count items)))))
-            ;; a non-shadowed clojure.core numeric cast (bare or clojure.core/-
-            ;; qualified, the latter from syntax-quote) becomes a checked :coerce
-            ;; node. qn mirrors unm's opn so (clojure.core/double x) specializes too.
+                                  (form-sym-name head))
+                        u (when opn (unchecked-arith opn (count items)))]
+                    (when (and u (core-head?)) u)))
+            ;; a clojure.core numeric cast (bare or clojure.core/-qualified, the
+            ;; latter from syntax-quote) becomes a checked :coerce node. qn mirrors
+            ;; unm's opn so (clojure.core/double x) specializes too.
             cast (let [qn (cond (and hname (not shadowed)) hname
                                 (and (form-sym? head) (= "clojure.core" (form-sym-ns head)))
-                                (form-sym-name head))]
-                   (when qn (num-cast qn (count items))))]
+                                (form-sym-name head))
+                       c (when qn (num-cast qn (count items)))]
+                   (when (and c (core-head?)) c))]
         (cond
           ;; *unchecked-math* rewrite, before macro/special dispatch (these are
           ;; ordinary core fns). The unchecked-* form re-analyzes normally.
@@ -2027,6 +2106,60 @@
                      (diagnostic-data :analyze/internal-failure pos
                                       (when (map? orig) orig))))))
 
+;; A live value a macro put in its expansion, rendered as code that rebuilds it.
+;; embed-plan (state-image.ss) answers with the image writer's verdict:
+;;
+;;   :var   — the value is some var's root, so read that var. A named fn, a
+;;            multimethod, a reify: the restoring code already has it. Note this
+;;            tracks the var rather than freezing the object, which is the same
+;;            choice the image's fn-ref arm makes and the only one that can be
+;;            written as code at all.
+;;   :fnsrc — a registered anonymous literal. Its source form and the names it
+;;            closed over were recorded at load (fn-form-registry.ss), and the
+;;            captured values come back live, so it rebuilds as
+;;            ((fn* [free…] <source>) <captured…>) — the wrapper parameters
+;;            shadow the outer names the body reads, which is what reconstructs
+;;            the lexical environment it was compiled in. Analyzed in the ns it
+;;            was compiled in, because that is where its free symbols resolve.
+;;            Each captured value is analyzed normally and so lands back here if
+;;            it is opaque too.
+;;
+;; nil means there is nothing to rebuild it from — a closure the runtime built
+;; rather than one analyzed from a literal, or a host object with no reader
+;; syntax. That is the same line the image draws, and it is a real boundary
+;; rather than a missing case, so it reports instead of guessing.
+(defn- embedded-plan-node [ctx plan env]
+  (if (= (:kind plan) :var)
+    (var-ref (:ns plan) (:name plan))
+    (invoke (analyze (ctx-for-ns (:ns plan))
+                     (list 'fn* (apply vector (map symbol (:frees plan))) (:form plan))
+                     (empty-env))
+            ;; Each captured value is a VALUE, so it is analyzed QUOTED: a captured
+            ;; symbol or list analyzed bare would resolve or invoke instead of
+            ;; being the datum it is (a closure over 'foo read back as the var foo;
+            ;; one over (1 2) as a call). The quote arm hands a live fn straight
+            ;; back here, so a captured closure still rebuilds the same way.
+            (mapv #(analyze ctx (list 'quote %) env) (:vals plan)))))
+
+(defn- embedded-value [ctx form env]
+  (let [plan (embed-plan form)]
+    (if (and plan (not= (:kind plan) :folded))
+      (embedded-plan-node ctx plan env)
+      (analysis-error
+        :analyze/unsupported-form
+        (str "Cannot compile this value into code: " (pr-str form) ". "
+             "A macro put a live value in the form it returned, and this one "
+             "cannot be rebuilt as code. "
+             (if plan
+               (str "Its source closes over `" (:name plan) "`, whose value the "
+                    "compiler folded into the code, so there is no capture left "
+                    "to read it back from. Take the constant out of the closure "
+                    "— refer to it through a var, or make it a parameter.")
+               (str "It is a fn the runtime built rather than one written as a "
+                    "literal in a namespace, or a host object with no reader "
+                    "syntax. Return a form that BUILDS the value instead of the "
+                    "value itself, or store it in a var and splice the var.")))))))
+
 (defn analyze
   ([ctx form]
    ;; One position box per compilation, over the catch too — as-analysis-diagnostic
@@ -2099,5 +2232,19 @@
      (form-tagged? form) (analysis-error :read/invalid-data-reader
                                          (str "No reader function for tag "
                                               (form-tag-name form)))
-     :else (analysis-error :analyze/unsupported-form
-                           "Unsupported form"))))
+     ;; ...and anything else is a live VALUE a macro put in the form it returned,
+     ;; not a syntax error: every shape the reader can produce is handled above,
+     ;; so what is left came from evaluation. Clojure's compiler falls through to
+     ;; ConstantExpr here and the value simply IS the constant — verified on the
+     ;; 1.12.5 oracle, AOT included. jolt compiles to Scheme TEXT, so it cannot
+     ;; spell the value and has to rebuild it instead. sci's copy-var reaches
+     ;; this with a macro var's root (jolt-l7tq).
+     ;;
+     ;; How to rebuild it is exactly the question the image writer answers, so
+     ;; this reads that same verdict (state-image.ss image-proc-verdict) through
+     ;; embed-plan rather than a second copy of the rules: the image scan side,
+     ;; the image dump side and the compiler now agree by construction about
+     ;; which fns can be rebuilt from source. Both shapes it can return emit as
+     ;; ordinary self-contained code, so an embedded value travels into an AOT
+     ;; fasl and a built binary and does not need a process-local side table.
+     :else (embedded-value ctx form env))))

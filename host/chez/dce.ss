@@ -166,6 +166,32 @@
 (define (dce-app-refs ir str)
   (append (dce-collect-refs '() ir) (dce-sexp-refs-str str)))
 
+;; The (def-var! "ns" "name" …) / (def-var-with-meta! …) form a prelude record
+;; defines, or #f for a non-def form. A def whose value holds an anonymous fn
+;; literal is minted as (begin (let* <quote pool> (image-register-fn-form! …)…)
+;; (def-var…)) — the source registration first, then the def — so look through
+;; exactly that shape. Read as a non-def form, every such def (138 of the 685
+;; prelude defs) was an unprunable root, and two of them, clojure.repl/find-doc
+;; and apropos, reference all-ns, ns-interns and ns-publics: every --tree-shake
+;; build bailed from the commit that made core's literals register (7d11cfed,
+;; 0.7.29), whatever the app did.
+;; Any other begin (a defrecord's several defs, a def-var-plain! group) stays a
+;; keep form as before: a record carries one fqn, and pruning several defs
+;; under one of their names is unsound.
+(define (dce-def-var-form b)
+  (define (def-var-form? x)
+    (and (pair? x) (memq (car x) '(def-var! def-var-with-meta!))
+         (pair? (cdr x)) (string? (cadr x))
+         (pair? (cddr x)) (string? (caddr x))))
+  (cond
+    ((def-var-form? b) b)
+    ((and (pair? b) (eq? (car b) 'begin)
+          (pair? (cdr b)) (pair? (cadr b)) (eq? (car (cadr b)) 'let*)
+          (pair? (cddr b)) (null? (cdddr b))
+          (def-var-form? (caddr b)))
+     (caddr b))
+    (else #f)))
+
 ;; str re-serializes the read form (compiled identically; comments/whitespace are
 ;; irrelevant).
 (define (dce-blob-records path)
@@ -190,12 +216,10 @@
                          "tree-shake: a prelude form does not round-trip through write/read"
                          (if (pair? form) (car form) form)))
                 (loop (cons
-                         (if (or (and (pair? b) (eq? (car b) 'def-var!) (pair? (cdr b)) (string? (cadr b))
-                                      (pair? (cddr b)) (string? (caddr b)))
-                                 (and (pair? b) (eq? (car b) 'def-var-with-meta!) (pair? (cdr b)) (string? (cadr b))
-                                      (pair? (cddr b)) (string? (caddr b))))
-                            (dce-rec #f (string-append (cadr b) "/" (caddr b)) refs str)
-                            (dce-rec #t #f refs str))
+                         (let ((d (dce-def-var-form b)))
+                           (if d
+                               (dce-rec #f (string-append (cadr d) "/" (caddr d)) refs str)
+                               (dce-rec #t #f refs str)))
                         acc)))))))))
 
 ;; A reader fn reached ONLY via runtime (read-string "#my/tag ..") resolves through
@@ -236,7 +260,7 @@
 ;; --- the shake: graph -> reachable -> bail check -> partition ----------------
 ;; edges: fqn -> refs (prunable defs only). roots: -main + the runtime-core roots +
 ;; every non-def form's refs.
-;; A callee the inline pass spliced is a ROOT even when nothing calls it any more.
+;; A callee the inline pass spliced is KEPT even when nothing calls it any more.
 ;; Splicing removes the last reference to a fn whose every call site was inlined,
 ;; so the graph walk below would prune its def -- and the def's record carries the
 ;; (jolt-register-source! …) that maps an inlined frame back to ns/name
@@ -244,11 +268,20 @@
 ;; unshaken build printed three (jolt-o13s). The kept def is bounded by the inline
 ;; budget, so the size this costs is small and the alternative is a trace that
 ;; silently loses frames the same build shows without --tree-shake.
+;;
+;; Kept, but not a ROOT of the bail scan. A spliced callee that no remaining
+;; reference reaches is code that never runs: its call sites are all copies now.
+;; Rooting it treated its references as reachable code, so a helper the inline
+;; pass had spliced — core.async's go-macro walkers, which call `resolve` while
+;; expanding a go body — bailed the shake of a program that never expands a go
+;; form. dce-build-graph therefore returns the spliced set apart from the roots:
+;; dce-shake closes over roots alone for the bail scan, and over roots plus the
+;; spliced set for what the binary keeps, so a kept callee's load-time var
+;; lookups still find every def they name.
 ;; inline-spliced-fqns is host-contract.ss; loaded well before build.ss loads this.
 (define (dce-build-graph records entry-main)
   (let ((edges (make-hashtable string-hash string=?))
-        (roots (append (inline-spliced-fqns)
-                       (dce-data-reader-roots)
+        (roots (append (dce-data-reader-roots)
                        (cons entry-main dce-runtime-core-roots))))
     (for-each (lambda (r)
                 (if (dce-rec-keep? r)
@@ -257,7 +290,7 @@
                       (lambda (old) (append (dce-rec-refs r) old))
                       '())))
               records)
-    (values edges roots)))
+    (values edges roots (inline-spliced-fqns))))
 
 ;; Closure of roots over edges -> a reached set (hashtable fqn -> #t). The append
 ;; copies only the visited node's OWN edge list and shares (cdr work) — append
@@ -315,8 +348,14 @@
 ;; Returns (values core-strs app-strs drop-compiler?). core-strs is #f on a bail,
 ;; signalling "inline prelude.ss unshaken" + keep the compiler.
 (define (dce-shake core-records app-records entry-main)
-  (let-values (((edges roots) (dce-build-graph (append core-records app-records) entry-main)))
-    (let* ((reached (dce-reachable edges roots)))
+  (let-values (((edges roots spliced)
+                (dce-build-graph (append core-records app-records) entry-main)))
+    (let* ((reached (dce-reachable edges roots))
+           ;; what the binary keeps: the reachable code, plus the spliced
+           ;; callees kept for frame identity closed over what they reference
+           (kept (if (null? spliced)
+                     reached
+                     (dce-reachable edges (append spliced roots)))))
       (let-values (((bail why needs-compiler) (dce-bail-scan (append core-records app-records) reached)))
         (let ((drop-compiler? (and (not bail) (not needs-compiler))))
           (if bail
@@ -324,8 +363,8 @@
                 (display "jolt build: tree-shake skipped (reachable code resolves vars at runtime):\n")
                 (for-each (lambda (w) (display (string-append "  " (car w) " -> " (cdr w) "\n"))) why)
                 (values #f (map dce-rec-str app-records) drop-compiler?))
-              (let-values (((core-strs cn ck) (dce-partition core-records reached))
-                           ((app-strs an ak) (dce-partition app-records reached)))
+              (let-values (((core-strs cn ck) (dce-partition core-records kept))
+                           ((app-strs an ak) (dce-partition app-records kept)))
                 (display (string-append "jolt build: tree-shake kept " (number->string (+ ck ak))
                                         " of " (number->string (+ cn an)) " defs (core "
                                         (number->string ck) "/" (number->string cn) ")\n"))
