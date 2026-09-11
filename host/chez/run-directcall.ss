@@ -8,8 +8,9 @@
 ;;     for a wrong arity, a non-procedure root or an app var, the site keeps the
 ;;     var-routed jolt-invoke.
 ;;   * an interop call on an UNPROVEN receiver tests the receiver at the site and
-;;     takes the string/keyword direct form, with record-method-dispatch as the
-;;     slow arm; a method with no direct form keeps the plain dispatch.
+;;     takes the string/keyword/StringBuilder direct form, with
+;;     record-method-dispatch as the slow arm; a method with no direct form keeps
+;;     the plain dispatch.
 ;;   * the unchecked-* family lowers to its helpers (jolt-uncadd2, jolt-uncinc)
 ;;     and unchecked-long/-int are casts that type their result :long, so a loop
 ;;     written in the hinted-Clojure idiom keeps fixnum counters.
@@ -75,7 +76,7 @@
   (gate-check "unhinted .length keeps the generic slow arm" (gate-sub? e "record-method-dispatch") #t)
   (run-emit e)
   (gate-check "a string receiver answers" (call "uselen" "abcd") 4)
-  (gate-check "a StringBuilder receiver still reaches the generic arm"
+  (gate-check "a StringBuilder receiver takes its guarded direct arm"
               (ev "(user/uselen (doto (StringBuilder.) (.append \"ab\")))") 2))
 (let ((e (emit-dl "(def usecharat (fn [s i] (.charAt s i)))")))
   (gate-check "unhinted .charAt takes the direct form" (gate-sub? e "(string-ref _ht$") #t)
@@ -96,6 +97,47 @@
   (run-emit e)
   (gate-check "guarded site evaluates receiver then args once" (call "order") 2)
   (gate-check "...in source order" (jolt=2 (ev "@user/calls") (jolt-vector "hello" "l")) #t))
+
+;; Truthful interface hints stay guarded: String/StringBuilder take the direct
+;; arm, while another implementation keeps record dispatch. The interface tag
+;; is deliberately not a concrete-type proof in the analyzer.
+(let ((e (emit-dl "(def ifacechars (fn [^CharSequence s] [(.length s) (.charAt s 1) (.subSequence s 1 3)]))")))
+  (gate-check "^CharSequence tests for a String" (gate-sub? e "(string? _ht$") #t)
+  (gate-check "^CharSequence also tests for a StringBuilder" (gate-sub? e "(sb-jhost? _ht$") #t)
+  (gate-check "^CharSequence retains arbitrary-implementation fallback" (gate-sub? e "record-method-dispatch") #t)
+  (run-emit e)
+  (gate-check "String takes the guarded direct arm"
+              (jolt=2 (ev "(user/ifacechars \"abcd\")")
+                       (jolt-vector 4 #\b "bc")) #t)
+  (gate-check "StringBuilder takes its guarded direct arm"
+              (jolt=2 (ev "(user/ifacechars (StringBuilder. \"abcd\"))")
+                       (jolt-vector 4 #\b "bc")) #t)
+  (ev "(deftype Window [s] CharSequence (length [_] 3) (charAt [_ i] (.charAt s (+ i 1))) (subSequence [_ a b] (.substring s (+ a 1) (+ b 1))) (toString [_] (.substring s 1 4)))")
+  (gate-check "a non-String CharSequence reaches record dispatch"
+              (jolt=2 (ev "(user/ifacechars (Window. \"abcde\"))")
+                       (jolt-vector 3 #\c "cd")) #t))
+
+(let ((e (emit-dl "(def ifaceempty (fn [^CharSequence s] (.isEmpty s)))")))
+  (gate-check "^CharSequence isEmpty tests for a StringBuilder" (gate-sub? e "(sb-jhost? _ht$") #t)
+  (gate-check "^CharSequence isEmpty retains arbitrary-implementation fallback" (gate-sub? e "record-method-dispatch") #t)
+  (run-emit e)
+  (gate-check "empty StringBuilder takes the guarded isEmpty arm"
+              (call "ifaceempty" (ev "(StringBuilder.)")) #t)
+  (gate-check "nonempty StringBuilder takes the guarded isEmpty arm"
+              (call "ifaceempty" (ev "(StringBuilder. \"x\")")) #f))
+
+(let ((e (emit-dl "(def ifaceappend (fn [^Appendable out ^CharSequence s] (.append out s) (.append out s 1 3) out))")))
+  (gate-check "^Appendable tests for a StringBuilder" (gate-sub? e "(sb-jhost? _ht$") #t)
+  (gate-check "one-arg append uses the direct builder primitive" (gate-sub? e "(sb-append! _ht$") #t)
+  (gate-check "range append shares append-range-text" (gate-sub? e "(append-range-text _ha$") #t)
+  (gate-check "^Appendable retains arbitrary-implementation fallback" (gate-sub? e "record-method-dispatch") #t)
+  (run-emit e)
+  (gate-check "StringBuilder append is fluent and range-correct"
+              (ev "(.toString (user/ifaceappend (StringBuilder.) \"abcd\"))") "abcdbc")
+  (gate-check "a non-StringBuilder Appendable reaches record dispatch"
+              (ev "(.toString (user/ifaceappend (java.io.StringWriter.) \"abcd\"))") "abcdbc")
+  (gate-check "range errors still throw through the guarded direct arm"
+              (raises? (lambda () (ev "(user/ifaceappend (StringBuilder.) \"a\")"))) #t))
 
 ;; ---- the unchecked family --------------------------------------------------
 (let ((e (emit-dl "(def uadd (fn [a b] (unchecked-add a b)))")))

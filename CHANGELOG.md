@@ -719,6 +719,13 @@ rounds and reads flags the way `java.util.Formatter` does.
   other `Appendable` implementations, including range exceptions and fluent
   return identity.
 
+- **Interface-typed string builders keep their portable fallback without paying
+  generic method-dispatch cost for the built-in implementation.** Calls through
+  `CharSequence` and `Appendable` now use guarded direct arms for Jolt's
+  `StringBuilder`, including ranged append and `subSequence`, while arbitrary
+  interface implementations retain ordinary protocol dispatch. Receiver and
+  arguments are still evaluated exactly once in source order.
+
 - **Starting jolt where there is no project says so.** `jolt run -m app.core`
   from a subdirectory of a project, or from anywhere with no `deps.edn`, reported
   "Could not locate app/core" — a missing namespace, when the problem was the

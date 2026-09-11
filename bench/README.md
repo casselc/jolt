@@ -105,6 +105,13 @@ Diagnostics kept out of the table because the JVM has no reference for them:
 Run them from this directory with `../bin/jolt -Sdeps '{:paths ["."]}' -m <ns>`
 and compare exact base and candidate runs on one host.
 
+`interface_interop.clj` is a separate causal matrix for portable helpers typed
+to `CharSequence` and `Appendable`. It compares those helpers with otherwise
+identical concrete-hinted helpers for string scanning, one-argument append, and
+range append. Each round runs A/B/B/A and prints every monotonic-clock sample;
+compile the same source with exact base and candidate compilers. Its header has
+the Jolt and JVM commands.
+
 ## Running
 
 ```sh
