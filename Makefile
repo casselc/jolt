@@ -98,12 +98,12 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke effects \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling lazyscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
-  traceemit \
+  traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
 
@@ -158,14 +158,14 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke testbincurrentsmoke aspectintegrationcheck \
+  inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke testbincurrentsmoke aspectintegrationcheck \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
@@ -423,6 +423,18 @@ errorkinds:
 irvalidate:
 	@sh host/chez/ir-validate-smoke.sh
 
+# Every var the checked-in seed defines exists after the seed loads. The seed's
+# forms are emitted guard-wrapped so the MINT can skip one that fails to compile
+# (remint.sh fails on a nonzero skip count); the same guard is in the emitted
+# text, so it equally swallows a form that raises when the seed LOADS, and that
+# half went unchecked -- the var never appears and every read of the name gets
+# the truthy unbound sentinel (jolt#879). Run twice: the two compiler trace flags
+# are read in such defs, and each run pins them against its own environment, so
+# neither "always on" nor "always off" passes both arms.
+seeddefs:
+	@$(CHEZ) --script host/chez/run-seed-defs.ss
+	@JOLT_WP_TRACE=1 JOLT_IR_VALIDATE=1 $(CHEZ) --script host/chez/run-seed-defs.ss
+
 # The build-driving gates take testbin for the same reason smoke and cts do,
 # only more so: a `jolt build` costs ~2.5s through the prebuilt binary and
 # ~12.5s through the source-mode driver, and buildsmoke alone drives 26 of them
@@ -486,6 +498,30 @@ mvnhttp:
 readscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/read_scaling_test.clj
 
+# Compiling a namespace stays linear in its source, and a quoted form does not
+# cost dramatically more than the construction it is. The second half is not
+# implied by the first: a per-form cost regression is linear, just linear and
+# slow, and one shipped green through the whole gate (see the file).
+compilescaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/compile_scaling_test.clj
+
+# apply must stream a variadic's rest, not materialize it: guards the
+# jolt-register-variadic! registration on the native + - * / min max and the
+# comparison chains (host/chez/seq.ss). Without it (apply max (range)) realizes
+# an unbounded seq until the process dies.
+applyscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/apply_scaling_test.clj
+
+# Lazy realization costs the same whether or not a thread has ever existed: a
+# cell publishes its forced tail through one word and reads it lock-free, and the
+# once-only mutex is borrowed for the force, never kept per cell. The ratio of one
+# workload timed before and after a thread has existed, in ONE process, is the
+# judge; a per-cell mutex reads ~5 there (every collection visits a million
+# finalized objects), the claim design ~1.5. Also races eight walkers over
+# shared unrealized seqs and checks every producer ran exactly once.
+lazyscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/lazyseq_mt_scaling_test.clj
+
 # (into vec vec) and subvec stay O(log n) through core — the raw pvec ops have
 # rrbscaling; this catches core falling back to an element-by-element rebuild.
 vecscaling: testbin
@@ -542,6 +578,20 @@ depssmoke: testbin
 # Offline fixture projects in test/chez/tasks/.
 taskssmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/tasks-smoke.sh
+
+# Running a FILE as a script through the real CLI, including a
+# `#!/usr/bin/env jolt` shebang executed by the kernel: the shebang line as a
+# comment, *command-line-args*, *file*, stdin, exit-code propagation, a project's
+# roots, -f/--file, and which of a file, a command and a task wins a name.
+# Offline, throwaway projects in a temp dir.
+scriptsmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/script-smoke.sh
+
+# `jolt completions`: the name/doc lines a completing shell asks for, and the
+# zsh/bash/fish snippets it installs — parsed by their own shells, and the bash
+# one actually run against a project to see what it offers.
+completionssmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/completions-smoke.sh
 
 # The resolved-roots cache (.jolt/cpcache): a warm run reuses a project's final
 # dependency resolution instead of re-expanding the graph. Offline throwaway
@@ -928,6 +978,18 @@ adaptercheck:
 # not build on, so the table is pinned per tag rather than per running machine.
 hostprops:
 	@$(CHEZ) --script test/chez/host-derived-props-test.ss
+
+# The boot image's LZ4 ceiling (jolt-lang/jolt#886). Chez cannot read back a big
+# enough LZ4 fasl entry, and 0.8.5's vfasl boot is one entry per input boot file
+# rather than one per top-level form — so a large enough app built a binary that
+# died in Sbuild_heap. build.ss re-encodes such an image with gzip; this measures
+# the ceiling of the kernel in front of it (undefined behaviour, so 2^28 on some
+# platforms and 2^29 on others), then pins that jolt's constant sits safely under
+# it, plus the entry scanner and both fallbacks. JOLT_MAX_HEAP=off because some
+# of the checks have to allocate at the ceiling to ask the question at all, and
+# the runtime's own heap bound would otherwise answer first.
+vfaslceiling:
+	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/vfasl-ceiling-test.ss
 
 # The other half of the same rule: knowing the platform is only useful if the
 # struct stat offsets it selects are the ones this machine actually uses. The

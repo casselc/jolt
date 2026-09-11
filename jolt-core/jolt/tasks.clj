@@ -238,20 +238,50 @@
 
 ;; --- the listing -------------------------------------------------------------
 
+(defn- first-line
+  "Everything before the first newline. A listing is one task per line, so a
+  docstring that spans lines has to be cut to fit it — see list-tasks!."
+  [s]
+  (apply str (take-while #(not= \newline %) s)))
+
+(defn listable
+  "The entries a listing offers, sorted by name. Two kinds of task stay out,
+  both of them helpers for other tasks rather than things to pick off a list:
+  a :private one, and one whose name starts with `-`, which is babashka's
+  spelling of the same intent and reaches us through the bb.edn files we read.
+  Neither is unrunnable — `jolt -dash` works — they are only unlisted.
+
+  `jolt tasks` and shell completion both go through here, so that what a person
+  is shown and what TAB offers cannot drift apart."
+  [tasks]
+  (->> (tasks-of tasks)
+       (remove (fn [[k v]]
+                 (or (and (map? v) (:private v))
+                     (= \- (first (str k))))))
+       (sort-by (comp str key))))
+
+(defn doc-line
+  "The one line of :doc a listing shows for a task's value, or nil."
+  [v]
+  (when-let [d (and (map? v) (:doc v))]
+    (first-line d)))
+
 (defn list-tasks!
   "`jolt tasks` — the project's task names and their :doc, babashka's listing.
-  :private tasks are helpers for other tasks and stay out of it."
+  What is listed and what is hidden is `listable`. Only the first line of a
+  :doc is printed, because the listing's whole shape is one task per line: a
+  docstring's second line would otherwise sit in the name column and read as a
+  task of its own."
   [tasks]
-  (let [entries (->> (tasks-of tasks)
-                     (remove (fn [[_ v]] (and (map? v) (:private v))))
-                     (sort-by (comp str key)))]
+  (let [entries (listable tasks)]
     (if (empty? entries)
       (println "No tasks found. Add a :tasks map to bb.edn or deps.edn.")
       (let [w (apply max (map (comp count str key) entries))]
         (println "The following tasks are available:")
         (println)
         (doseq [[k v] entries]
-          (let [doc (when (map? v) (:doc v))]
+          (let [doc (doc-line v)]
             (println (if doc
-                       (str (apply str k (repeat (- w (count (str k))) \space)) "  " doc)
+                       (str (apply str k (repeat (- w (count (str k))) \space))
+                            "  " doc)
                        (str k)))))))))

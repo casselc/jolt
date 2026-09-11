@@ -90,12 +90,22 @@
   (current-memory-bytes))
 
 ;; (sa-max-memory-bytes) -> exact integer
-;; Upper bound on the heap the runtime may use — the JVM's maxMemory, which
-;; jolt maps to Long/MAX_VALUE when the heap is unbounded. Contract: an upper
-;; bound on heap bytes. Degradation: a large constant is acceptable — the JVM
-;; arm already falls back to Long.MAX_VALUE semantics.
+;; Peak heap bytes: the most the collector has held from the OS since the last
+;; sa-reset-max-memory-bytes! (or since boot) -- the high-water mark behind
+;; jolt.host/maximum-memory-bytes. Not the JVM's maxMemory: that is the heap
+;; ceiling (rt.ss jolt-heap-max-bytes), and Runtime.maxMemory reads it there.
+;; Contract: never below sa-total-memory-bytes. Degradation: the current total
+;; is acceptable -- a target that keeps no high-water mark answers "now".
 (define (sa-max-memory-bytes)
   (maximum-memory-bytes))
+
+;; (sa-reset-max-memory-bytes!) -> void
+;; Start the high-water mark over from the current total, so a caller can read
+;; the peak growth of one stretch of work (the apply-scaling gate). Contract:
+;; right after it, sa-max-memory-bytes answers the current total. Degradation:
+;; may no-op where sa-max-memory-bytes already answers the current total.
+(define (sa-reset-max-memory-bytes!)
+  (reset-maximum-memory-bytes!))
 
 ;; (sa-real-time-ms) -> exact integer
 ;; Wall-clock milliseconds, monotonic within a process — used for elapsed
@@ -124,6 +134,15 @@
 ;; only; collection still happens on its own schedule.
 (define (sa-gc-trip-bytes! n)
   (collect-trip-bytes n))
+
+;; (sa-gc-trip-bytes) -> exact integer
+;; The allocation threshold at which a trip collection triggers: between two
+;; collections at most this much is allocated, which bounds how far work that
+;; holds nothing can raise the heap footprint (the apply-scaling gate's floor).
+;; Contract: the threshold in bytes. Degradation: 0 -- the target has no such
+;; threshold, so nothing is invisible by construction.
+(define (sa-gc-trip-bytes)
+  (collect-trip-bytes))
 
 ;; ---- R6: introspection tier (capability: introspect) -------------------------
 
@@ -683,6 +702,53 @@
 (define (sa-make-boot-file out base-boots)
   (apply make-boot-file out '() base-boots))
 
+;; (sa-vfasl-convert-file in out [codec]) -> boolean
+;; Rewrite the boot file IN to OUT in Chez's vfasl format: a prebuilt image of
+;; what loading the fasl would have produced, laid out per space and loaded
+;; straight into the static generation, which is worth roughly a third of jolt's
+;; own startup (see build-jolt.ss). Contract: produce a boot the target's runtime
+;; can boot from, or answer #f. Degradation: #f rather than raise — an app that
+;; boots slower is strictly better than an app that fails to build, and the
+;; caller keeps the plain boot it already has.
+;;
+;; CODEC is 'default, or 'wide for an image the target's default entry codec
+;; cannot carry — the caller has measured the image and found it over a limit
+;; (build.ss bld-lz4-image-ceiling). A target with one codec ignores the
+;; argument; Chez has two, and 'wide picks gzip over LZ4, which is the whole
+;; point: gzip has no 256MiB ceiling and LZ4 does.
+(define (sa-vfasl-convert-file in out . codec)
+  (guard (e (#t #f))
+    (if (and (pair? codec) (eq? (car codec) 'wide))
+        (parameterize ((compress-format 'gzip)) (vfasl-convert-file in out '()))
+        (vfasl-convert-file in out '()))
+    #t))
+
+;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
+;; Install a collection hook enforcing a heap ceiling, and answer whether the
+;; target could. On each collection the target performs its normal collection,
+;; then: above SOFT live bytes it forces a FULL collection — the one a
+;; generational collector defers, and the whole point under memory pressure —
+;; and if live bytes still exceed HARD it calls ON-EXCEEDED with that count.
+;;
+;; The policy lives in the caller (rt.ss jolt-install-heap-ceiling!): the
+;; thresholds, the message, and what ON-EXCEEDED does. This is only the seam
+;; that hooks collection, because doing that needs a target-specific native.
+;;
+;; Contract: ON-EXCEEDED is called only when the heap genuinely cannot be
+;; brought under HARD, so raising from it is the expected use.
+;; Degradation: answer #f without installing anything. The ceiling is then
+;; unenforced, which is what every jolt before 0.8.5 did, and the caller
+;; reports maxMemory accordingly rather than promising a bound it lacks.
+(define (sa-gc-install-ceiling! soft hard on-exceeded)
+  (collect-request-handler
+    (lambda ()
+      (collect)
+      (when (> (bytes-allocated) soft)
+        (collect (collect-maximum-generation))
+        (when (> (bytes-allocated) hard)
+          (on-exceeded (bytes-allocated))))))
+  #t)
+
 ;; (sa-fasl-write obj port [externals-pred]) -> void
 ;; fasl-serialize OBJ to PORT, optionally under the externals predicate
 ;; state-image.ss passes so refused objects are COLLECTED as externals instead
@@ -751,6 +817,13 @@
 ;; chain on exit and would silently undo it. See jolt-park-drop-finallys!.
 (define (sa-current-winders) (#%$current-winders))
 (define (sa-current-winders-set! w) (#%$current-winders w))
+
+;; (sa-record-cas! r i old new): compare-and-swap field i (0-based) of record r,
+;; answering whether it swapped. What lets a lazy cell be claimed for forcing
+;; with no lock in the way and nothing allocated (seq.ss force-claimed!). A
+;; system primitive here; a target whose records are vectors swaps the slot
+;; under whatever makes that atomic for its threads.
+(define (sa-record-cas! r i old new) (#%$record-cas! r i old new))
 
 ;; (sa-disable-count) -> how many nested disable-interrupts this thread is
 ;; inside; 0 when interrupts are on. Chez keeps it in the thread context, and

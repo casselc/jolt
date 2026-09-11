@@ -1,4 +1,6 @@
 [
+  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$.]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
+  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core\\$mm\\$\" s)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (java.security.SecureRandom.)] (int? (.nextInt r)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.)] (every? (fn [x] (and (>= x 0) (< x 10))) (repeatedly 500 (fn [] (.nextInt r 10)))))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.) b (byte-array 16)] (.nextBytes r b) [(alength b) (> (count (distinct (seq b))) 4)])" :expected "[16 true]"}
@@ -17,6 +19,21 @@
   {:suite "uuid" :expr "(every? (fn [_] (re-matches #\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\" (str (random-uuid)))) (range 200))" :expected "true"}
   {:suite "uuid" :expr "(let [us (repeatedly 400 #(str (random-uuid)))] (every? #(> (count (distinct (map (fn [u] (nth u %)) us))) 8) [0 1 2 7 9 35]))" :expected "true"}
   {:suite "uuid" :expr "(= (str (random-uuid)) (str (random-uuid)))" :expected "false"}
+  ;; defonce takes (name doc-string? init), the shape `def` takes. The docstring
+  ;; position is a jolt superset (see :permissive in known-divergences.edn — the
+  ;; JVM's defonce is [name expr] and raises ArityException there), so it cannot be
+  ;; a corpus row. The rest of the parse is def's to the letter.
+  {:suite "defonce-shape" :expr "(do (defonce du-a \"the doc\" 42) [du-a (:doc (meta #'du-a))])" :expected "[42 \"the doc\"]"}
+  ;; a LONE string is the init, not a docstring — (def x \"s\") means the same
+  {:suite "defonce-shape" :expr "(do (defonce du-b \"just a value\") [du-b (:doc (meta #'du-b))])" :expected "[\"just a value\" nil]"}
+  ;; ^meta on the name rides along beside the docstring; an explicit docstring
+  ;; wins over ^{:doc ...}, exactly as it does for def
+  {:suite "defonce-shape" :expr "(do (defonce ^:private ^{:doc \"from meta\"} du-c \"from docstring\" 1) [(:private (meta #'du-c)) (:doc (meta #'du-c))])" :expected "[true \"from docstring\"]"}
+  ;; the init is still evaluated at most once
+  {:suite "defonce-shape" :expr "(do (def du-d-runs (atom 0)) (defonce du-d \"doc\" (do (swap! du-d-runs inc) 1)) (defonce du-d \"doc\" (do (swap! du-d-runs inc) 2)) [du-d @du-d-runs])" :expected "[1 1]"}
+  ;; and a shape that is neither gets a named error rather than a silent mis-parse
+  {:suite "defonce-shape" :expr "(try (eval '(defonce du-e)) (catch Throwable e (class e)))" :expected "java.lang.IllegalArgumentException"}
+  {:suite "defonce-shape" :expr "(try (eval '(defonce du-f 1 2 3)) (catch Throwable e (class e)))" :expected "java.lang.IllegalArgumentException"}
   ;; The reflection member model: jolt reports what its registries KNOW a class
   ;; declares, not what the JVM ships. Three registries answer: the protocol/type
   ;; registry (a deftype's methods), the host shim tables (an ArrayList's), and
@@ -633,10 +650,55 @@
   ;; name is nil here where the symbol itself still evaluates syntactically.
   {:suite "ns" :expr "(nil? (resolve 'java.lang.module.ModuleFinder))" :expected "true"}
   {:suite "ns" :expr "(nil? (ns-resolve *ns* 'no.such.ClassXyz))" :expected "true"}
-  ;; reader conditionals match :bb (ahead of :clj, like babashka); clause order
-  ;; still wins when :clj is listed first.
-  {:suite "reader-features" :expr "#?(:bb :bb-branch :clj :clj-branch)" :expected ":bb-branch"}
+  ;; A live value a macro puts in the form it returns is a CONSTANT, not a syntax
+  ;; error — Clojure falls through to ConstantExpr and jolt rebuilds it as code
+  ;; (jolt-l7tq). A named fn is read back through its var; an anonymous literal
+  ;; is rebuilt from the source form and captures the fn-form registry recorded.
+  {:suite "embedded-value" :expr "(do (defmacro ev-a [] (deref (var when))) (fn? (ev-a)))" :expected "true"}
+  {:suite "embedded-value" :expr "(do (defmacro ev-b [] (list (quote vector) inc 1)) (let [[f n] (ev-b)] [(fn? f) (f n)]))" :expected "[true 2]"}
+  {:suite "embedded-value" :expr "(do (defmacro ev-c [] `(vector ~(deref (var memfn)) :tag)) (count (ev-c)))" :expected "2"}
+  {:suite "embedded-value" :expr "(do (defn ev-mk [] (fn [x] (+ x 100))) (defmacro ev-d [] (ev-mk)) ((ev-d) 5))" :expected "105"}
+  {:suite "embedded-value" :expr "(do (defn ev-clo [n] (fn [x] (+ x n))) (defmacro ev-e [] (ev-clo 7)) ((ev-e) 5))" :expected "12"}
+  {:suite "embedded-value" :expr "(do (defmacro ev-f [] (list (quote quote) inc)) (fn? (ev-f)))" :expected "true"}
+  ;; ...and a value nothing can rebuild reports what it is, rather than
+  ;; \"Unsupported form\" at a line the user never wrote.
+  {:suite "embedded-value" :expr "(do (defmacro ev-g [] (java.lang.StringBuilder.)) (try (eval (quote (ev-g))) :no-throw (catch Throwable t (boolean (re-find #\"Cannot compile this value into code\" (or (.getMessage t) \"\"))))))" :expected "true"}
+  ;; ...and a capture cp0 folded away is a DIFFERENT refusal, named as such: the
+  ;; fn's source IS recorded, so \"no recorded source\" would be a lie about it.
+  {:suite "embedded-value" :expr "(do (defmacro ev-h [] (let [n 7] (fn [x] (+ x n)))) (try (eval (quote (ev-h))) :no-throw (catch Throwable t (boolean (re-find #\"folded into the code\" (or (.getMessage t) \"\"))))))" :expected "true"}
+  ;; ...and a captured value is a VALUE: a closure over a symbol, a list or a
+  ;; vector holding a symbol rebuilds with that datum, not with what the datum
+  ;; would mean as code (a closure over 'clojure.core/inc used to read back the fn).
+  {:suite "embedded-value" :expr "(do (defn ev-cs [k] (fn [m] (get m k))) (defmacro ev-i [] (ev-cs (quote foo))) ((ev-i) {(quote foo) 1}))" :expected "1"}
+  {:suite "embedded-value" :expr "(do (defn ev-cl [k] (fn [] k)) (defmacro ev-j [] (ev-cl (list 1 2))) ((ev-j)))" :expected "(1 2)"}
+  {:suite "embedded-value" :expr "(do (defn ev-cq [k] (fn [] k)) (defmacro ev-o [] (ev-cq (quote clojure.core/inc))) [(symbol? ((ev-o))) ((ev-o))])" :expected "[true clojure.core/inc]"}
+  {:suite "embedded-value" :expr "(do (defn ev-cv [k] (fn [] k)) (defmacro ev-l [] (ev-cv [1 (quote x)])) ((ev-l)))" :expected "[1 x]"}
+
+  ;; the feature set is {:jolt :clj :default}. :bb is NOT in it: a library's :bb
+  ;; branch is written for babashka's host model, not jolt's, and taking it sent
+  ;; jolt at namespaces babashka supplies natively and jolt does not. :jolt wins
+  ;; over :clj wherever a library gives jolt its own branch; otherwise jolt reads
+  ;; the :clj branch its clojure.lang.*/java.* shims target.
+  {:suite "reader-features" :expr "#?(:bb :bb-branch :clj :clj-branch)" :expected ":clj-branch"}
   {:suite "reader-features" :expr "#?(:clj :clj-first :bb :bb-second)" :expected ":clj-first"}
+  {:suite "reader-features" :expr "#?(:jolt :jolt-branch :clj :clj-branch)" :expected ":jolt-branch"}
+  {:suite "reader-features" :expr "[1 #?(:bb :bb-only) 2]" :expected "[1 2]"}
+  ;; seqable? is an instance? test over Seqable / ISeq / Iterable on the JVM, so a
+  ;; bare deftype or reify declaring one answers true even though it is not coll?.
+  ;; It has to agree with whether `seq` actually works on the value — the seq arms
+  ;; already accept exactly these, and clojure.core.Eduction is the one in core.
+  {:suite "seqable" :expr "(seqable? (eduction (map identity) [1 2 3]))" :expected "true"}
+  {:suite "seqable" :expr "(do (deftype SqA [xs] clojure.lang.Seqable (seq [_] (seq xs))) [(seqable? (->SqA [1 2])) (coll? (->SqA [1 2])) (vec (seq (->SqA [1 2])))])" :expected "[true false [1 2]]"}
+  {:suite "seqable" :expr "(seqable? (reify Iterable (iterator [_] (.iterator [1 2]))))" :expected "true"}
+  {:suite "seqable" :expr "(do (deftype SqB [x]) (seqable? (->SqB 1)))" :expected "false"}
+  ;; ...and the collection-BEHAVIOUR interfaces are not Seqable on the JVM: an
+  ;; ILookup-only deftype answers false (corpus has the same row).
+  {:suite "seqable" :expr "(do (deftype SqC [x] clojure.lang.ILookup (valAt [_ k] nil) (valAt [_ k nf] nf)) [(coll? (->SqC 1)) (seqable? (->SqC 1))])" :expected "[false false]"}
+  ;; ...nor is a bare Iterator: RT.canSeq names Iterable, not Iterator, so a
+  ;; deftype with only hasNext/next answers false there even though jolt's seq
+  ;; can walk it (a superset the predicate does not advertise).
+  {:suite "seqable" :expr "(do (deftype SqD [] java.util.Iterator (hasNext [_] false) (next [_] nil)) [(seqable? (->SqD)) (seq (->SqD))])" :expected "[false nil]"}
+  {:suite "reader-features" :expr "(pr-str (clojure.core/__reader-features))" :expected "\"(\\\"jolt\\\" \\\"clj\\\" \\\"default\\\")\""}
   ;; jolt.reader — the # dispatch table is open for punctuation. #$ is jolt's own
   ;; reader macro (clojure.core.strint's ~{}/~() grammar over a string literal),
   ;; registered through the same table a program registers into.
@@ -1238,6 +1300,8 @@
   {:suite "telemetry" :expr "(pos? (jolt.host/bytes-allocated))" :expected "true"}
   {:suite "telemetry" :expr "(pos? (jolt.host/current-memory-bytes))" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/maximum-memory-bytes) (jolt.host/current-memory-bytes))" :expected "true"}
+  {:suite "telemetry" :label "reset starts the peak over from the current total (a stale high-water mark from the dropped vector would exceed it)" :expr "(do (count (vec (range 4000000))) (System/gc) (let [c (jolt.host/current-memory-bytes) _ (jolt.host/reset-maximum-memory-bytes!) m (jolt.host/maximum-memory-bytes)] (<= m (+ c (jolt.host/gc-trip-bytes)))))" :expected "true"}
+  {:suite "telemetry" :expr "(pos? (jolt.host/gc-trip-bytes))" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/thread-id) 0)" :expected "true"}
   ;; Thread/join must honour its timeout: joining a thread that outlives the
   ;; timeout has to return, not block until the thread happens to finish.
@@ -1292,6 +1356,29 @@
   ;; idle worker; reference Clojure answers 3 to this same expression, for the same
   ;; race against its SynchronousQueue handoff.
   {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (dotimes [_ 20] (.get (.submit ex (fn [] 1)))) (< (.getPoolSize ex) 5))" :expected "true"}
+  ;; The same claim at a scale where the failure it guards is unmistakable rather
+  ;; than arguable. It is NOT a more reliable detector than the row above — the
+  ;; cascade below needs a contended machine to trigger at all, and it did so in
+  ;; roughly one run in five at 20, 100 and 400 tasks alike, so this is a second
+  ;; sample and not a sharper one. What it adds is the statement of the invariant:
+  ;; concurrency here is ONE — the .get means task k+1 is not submitted until task k has
+  ;; returned — so the pool needs exactly one worker and the count must not track
+  ;; the task count at all. It used to: a worker that had been forked but had not
+  ;; yet parked was counted by neither idle-workers nor anything else the growth
+  ;; rule read, so on a contended machine every submit inside that window forked
+  ;; another worker (each one lengthening the window by contending for the queue
+  ;; mutex), and 200 sequential tasks could reach ~20 threads with all 200 tasks
+  ;; running on the first of them. Counting starting workers as takers bounds it:
+  ;; at most one extra worker can be in flight at a time, so 2-3 rather than 20.
+  ;; Measured over 200 trials under 2x CPU oversubscription, the row above went
+  ;; from {1 172, 2 2, 3 3, 5 3, 6 4, 7 5, 8 3, 9 2, 20 6} to {1 166, 2 33, 3 1}.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (dotimes [_ 200] (.get (.submit ex (fn [] 1)))) (< (.getPoolSize ex) 5))" :expected "true"}
+  ;; and the workers that DID get forked are real workers, not a leaked count: the
+  ;; pool still serves work and terminates, so a starting worker that was counted
+  ;; as a taker actually arrived to take one. (A leaked start would be the worse
+  ;; failure — the growth rule would read a taker that is never coming and decline
+  ;; to grow for good, stranding the task instead of over-forking for it.)
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool) c (atom 0)] (dotimes [_ 200] (.get (.submit ex (fn [] (swap! c inc))))) (.shutdown ex) [@c (.awaitTermination ex 30 java.util.concurrent.TimeUnit/SECONDS)])" :expected "[200 true]"}
   ;; A burst of 2000 short tasks: every one runs, the pool drains and terminates,
   ;; and it is served by the workers that keep up with the burst rather than by one
   ;; thread per task. The bound on the peak is deliberately loose — the growth test
@@ -1774,8 +1861,8 @@
   ;; re-defmulti currently CLOBBERS methods (jolt-mw44.30; JVM keeps them —
   ;; jolt-mw44.51 stays an open bead). Pinned AS-IS so a cache change can't
   ;; quietly alter it: after re-defmulti the prior method is gone (default used).
-  {:suite "mm-cache" :label "re-defmulti clobbers prior methods (.30 behavior pin; .51 is open)" :expected "[:DEF :DEF]" :expr "(do (defmulti f (fn [x] x)) (defmethod f :a [x] :got-a) (defmulti f (fn [x] x) :default :d) (defmethod f :d [x] :DEF) [(f :a) (f :anything)])"}
-  {:suite "multimethods / re-defmulti (jolt-mw44.51 pin)" :expr "(do (defmulti mmr identity) (defmethod mmr :a [_] :hit) (defmulti mmr identity) (mmr :a))" :expected :throws}
+  {:suite "mm-cache" :label "re-defmulti is a no-op: the first definition and its methods stand, so a later :default option never applies" :expected :throws :expr "(do (defmulti f (fn [x] x)) (defmethod f :a [x] :got-a) (defmulti f (fn [x] x) :default :d) (defmethod f :d [x] :DEF) [(f :a) (f :anything)])"}
+  {:suite "multimethods / re-defmulti keeps methods" :expr "(do (defmulti mmr identity) (defmethod mmr :a [_] :hit) (defmulti mmr identity) (mmr :a))" :expected ":hit"}
   ;; clojure.math / java.lang.Math: Chez extends several real-domain ops onto the
   ;; complex plane for out-of-domain real inputs, but Java returns NaN there. The
   ;; run-unit harness compares the PRINTED form, so :expected "##NaN" is a string

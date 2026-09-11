@@ -956,15 +956,28 @@
                       (if (contains? seen k) [seen acc] [(conj seen k) (conj acc x)])))
                   [#{} []] xs)))
 
+;; The platform keys a :jolt/native spec declares its candidates under: exactly
+;; the values main.clj's current-platform selects with, so the identity below
+;; reads the same keys the loader does. It listed :win, which current-platform
+;; never produces, so on Windows a spec that declared candidates only under
+;; :windows keyed on nothing at all (jolt-ajd).
+(def ^:private native-platform-keys [:darwin :linux :windows])
+
 (defn- native-key
   "Identity of a :jolt/native spec. A :process lib (the running process's own
   symbols, e.g. libc) keys on that flag; a file lib on its :name, else on its
-  platform candidate paths — two deps naming the same lib reconcile to one load."
+  platform candidate paths — two deps naming the same lib reconcile to one load.
+  A spec with neither a :name nor a candidate under any platform key (it declares
+  only :static, or only a key no platform selects) keys on its own shape, minus
+  the declaring root: distinct specs stay distinct instead of collapsing to one
+  under dedup-by, and two deps declaring the same lib still reconcile."
   [spec]
   (letfn [(cands [k] (let [v (get spec k)] (cond (string? v) [v] (sequential? v) (vec v) :else [])))]
     (if (:process spec)
       [:process (:name spec)]
-      [:native (or (:name spec) (vec (sort (concat (cands :darwin) (cands :linux) (cands :win)))))])))
+      [:native (or (:name spec)
+                   (let [paths (vec (sort (mapcat cands native-platform-keys)))]
+                     (if (seq paths) paths (dissoc spec :jolt.deps/root))))])))
 
 (defn- provides-entries
   "A deps.edn :jolt/provides map as provider-table rows: [install-ns lib class ...].
@@ -1025,7 +1038,17 @@
                                 (map #(abspath root %) (or (:paths edn) ["src"]))
                                 [root]))
                             infos))
-        :natives (vec (mapcat (fn [{:keys [edn]}] (:jolt/native edn)) infos))
+        ;; Each spec carries the ROOT of the deps.edn that declared it. A
+        ;; :jolt/native path is written relative to its own project ("native/
+        ;; libfoo.so" is what a build task produces beside the sources), and
+        ;; without the root there is nothing to resolve it against: a dependency's
+        ;; relative path was being resolved against the APP's directory, and a
+        ;; :static archive not at all — it went to `cc` verbatim and resolved
+        ;; against whatever the build's cwd happened to be (jolt-9a8).
+        :natives (vec (mapcat (fn [{:keys [edn root]}]
+                                (map #(assoc % :jolt.deps/root root)
+                                     (:jolt/native edn)))
+                              infos))
         ;; Each dep's declared jolt floor, as [lib version] — checked by
         ;; resolve-project against the running runtime. A LIBRARY is the common
         ;; declarer: it knows which jolt its FFI bindings or host shims need, and
@@ -1337,6 +1360,25 @@
       (catch :default _
          (rm-f stage)))))
 
+(defn- resolution-empty?
+  "True when a resolution found nothing at all — no roots, no libs, no natives,
+  nothing to prep. Worth its own predicate because that is the common case for
+  `jolt -e` outside a project, and it is the one case the cache must NOT write.
+
+  Two reasons. The entry would buy nothing: what it stores is the empty map, and
+  recomputing that is the 2ms `bench/startup-phases.sh` attributes to dispatch,
+  with no graph to expand and no network to touch. And writing it has a cost that
+  is not jolt's to impose — cpcache-write! mkdirs its directory, so a one-off
+  `jolt -e` left a .jolt/ behind in whatever directory it was run from, project
+  or not. A real project resolves something and still caches."
+  [r]
+  (and (empty? (:roots r))
+       (empty? (:libs r))
+       (empty? (:natives r))
+       (empty? (:provides r))
+       (empty? (:prep r))
+       (empty? (:min-versions r))))
+
 (declare user-deps-path)   ; defined below with the deps.edn readers
 
 (defn- resolve-deps-cached
@@ -1364,7 +1406,9 @@
         (do (info "cpcache hit") cached)
         (let [r (resolve-deps deps project-dir opts)]
           (info "cpcache miss")
-          (cpcache-write! project-dir k material r)
+          (if (resolution-empty? r)
+            (info "cpcache not written (nothing resolved)")
+            (cpcache-write! project-dir k material r))
           r)))
     (resolve-deps deps project-dir opts)))
 
@@ -1604,17 +1648,30 @@
       ;; :tasks from both files, bb.edn last — a name in both is babashka's.
       ;; (When bb.edn IS the project config the second merge is a no-op.)
       :tasks (not-empty (merge (:tasks edn) (:tasks bb-edn)))
-      :natives (dedup-by native-key (concat (:jolt/native edn) dep-natives))
+      ;; the project's own specs are rooted at the project, the deps' at their own
+      ;; deps.edn's directory (resolve-deps attached those). Deduped by
+      ;; native-key, which does not read the root — two deps naming the same lib
+      ;; still reconcile to one load, keeping the first one's root.
+      :natives (dedup-by native-key
+                         (concat (map #(assoc % :jolt.deps/root project-dir)
+                                      (:jolt/native edn))
+                                 dep-natives))
       ;; declared host-class providers (RFC 0014), the project's own first: a
       ;; project may supply a class itself rather than take a library's.
       :provides (host-class-providers (concat (provides-entries edn nil) dep-provides))
       ;; :jolt/replaces — namespaces jolt provides as a host built-in
       ;; (babashka.fs, babashka.process) that THIS project supplies itself, so
-      ;; its copy resolves ahead of jolt's and no supplement loads over it.
+      ;; its copy resolves ahead of jolt's.
       ;; The PROJECT's only: a library that took a built-in over would decide
       ;; what the namespace means for every other library in the program, which
       ;; is what host-class-providers already refuses for classes.
       :replaces (mapv str (:jolt/replaces edn))
+      ;; :jolt/features — extra reader-conditional keys this project wants read,
+      ;; on top of jolt's own {:jolt :clj :default}. Additive: it cannot remove
+      ;; one. The PROJECT's only, for the same reason :jolt/replaces is — the
+      ;; feature set decides which branch EVERY library in the program is read
+      ;; through, so a dependency must not get to change it under the project.
+      :features (mapv #(if (keyword? %) (name %) (str %)) (:jolt/features edn))
       ;; the expansion trace, when it was asked for (-Stree renders it)
       :trace dep-trace
       ;; nREPL middleware a library contributes (jolt.nrepl composes them over its
@@ -1688,7 +1745,8 @@
        (jolt.host/set-source-roots! (into current added)))
      (when (seq natives)
        (info "added deps declare :jolt/native libraries (not auto-loaded): "
-             (pr-str (dedup-by native-key natives))))
+             (pr-str (mapv #(dissoc % :jolt.deps/root)
+                           (dedup-by native-key natives)))))
      added)))
 
 (defn- required-host

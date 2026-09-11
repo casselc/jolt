@@ -175,6 +175,32 @@
           tw tc ratio)
   (gate-check "reachable: cost independent of work-list depth" (<= ratio 5.0) #t))
 
+;; --- dce-def-var-form: which prelude records are prunable ---------------------
+;; A def whose value holds an anonymous fn literal is minted with its source
+;; registration first, (begin (let* …) (def-var-with-meta! …)); it is a prunable
+;; def under that name like a bare def-var! is. Anything else stays a keep form:
+;; a defrecord's several defs under one begin (one record, several fqns), a
+;; def-var-plain! group, and a side-effecting top-level form.
+(let ((bare '(def-var! "app.core" "f" 1))
+      (meta '(def-var-with-meta! "clojure.repl" "find-doc" (lambda (x) x) (jolt-hash-map)))
+      (registered '(begin (let* ((_q$0 (jolt-symbol #f "fn*")))
+                            (image-register-fn-form! "jfn$clojure.repl$find-doc$0" _q$0 "clojure.repl" (jolt-vector)))
+                          (def-var-with-meta! "clojure.repl" "find-doc" (lambda (x) x) (jolt-hash-map))))
+      (record-group '(begin (begin (def-var-plain! "clojure.pprint" "nl-t" 1)
+                                   (def-var-plain! "clojure.pprint" "->nl-t" 2))
+                            (def-var-with-meta! "clojure.pprint" "make-nl-t" 3 (jolt-hash-map))
+                            (def-var-with-meta! "clojure.pprint" "nl-t?" 4 (jolt-hash-map))))
+      (side-effect '(jolt-invoke4 (var-deref "clojure.core" "attach-core-doc-meta!") "clojure.repl" "special-doc" jolt-nil jolt-nil)))
+  (gate-check "def-var-form: bare def-var! is its own def" (dce-def-var-form bare) bare)
+  (gate-check "def-var-form: bare def-var-with-meta! is its own def" (dce-def-var-form meta) meta)
+  (gate-check "def-var-form: registration then def is the def"
+              (dce-def-var-form registered) (caddr registered))
+  (gate-check "def-var-form: a defrecord group is not one def" (dce-def-var-form record-group) #f)
+  (gate-check "def-var-form: a side-effecting form is not a def" (dce-def-var-form side-effect) #f)
+  (gate-check "def-var-form: guard-unwrapped registration form"
+              (dce-def-var-form (dce-unwrap (list 'guard '(e (#t #f)) registered)))
+              (caddr registered)))
+
 ;; --- dce-bail-refs / dce-compile-refs existence gate -------------------------
 ;; Every name in the hand-maintained bail/compile lists must resolve to a runtime
 ;; binding. A stale entry (one that no longer exists in the runtime) fails here
@@ -206,5 +232,35 @@
             (missing dce-bail-refs "bail-refs"))
   (for-each (lambda (n) (gate-check (string-append "compile-ref exists: " n) #f #t))
             (missing dce-compile-refs "compile-refs")))
+
+;; --- spliced callees: kept for frame identity, not roots of the bail scan ----
+;; The inline pass records every callee it spliced (hc-mark-spliced!), and the
+;; shake keeps those defs so an inlined frame still maps back to ns/name. They are
+;; not reachable code — every call site is a copy — so a spliced helper that
+;; resolves a var by name must not bail the shake, while a def nothing reaches
+;; is still pruned and everything a kept callee names stays defined.
+(let* ((rec (lambda (fqn refs) (dce-rec #f fqn refs (string-append "(" fqn ")"))))
+       (app (list (rec "gate.app/-main" '("gate.app/live"))
+                  (rec "gate.app/live" '())
+                  ;; spliced everywhere it was called, so no record references it
+                  (rec "gate.app/walker" '("clojure.core/resolve" "gate.app/named-by-walker"))
+                  (rec "gate.app/named-by-walker" '())
+                  (rec "gate.app/dead" '()))))
+  (hc-mark-spliced! #f "gate.app" "walker")
+  (let-values (((core-strs app-strs drop-compiler?) (dce-shake '() app "gate.app/-main")))
+    (gate-check "spliced: a spliced resolve caller does not bail the shake" (and core-strs #t) #t)
+    (gate-check "spliced: the compiler image is dropped" drop-compiler? #t)
+    (gate-check "spliced: the entry and what it reaches are kept"
+                (and (member "(gate.app/-main)" app-strs) (member "(gate.app/live)" app-strs) #t) #t)
+    (gate-check "spliced: the spliced callee is kept for frame identity"
+                (and (member "(gate.app/walker)" app-strs) #t) #t)
+    (gate-check "spliced: what the kept callee names stays defined"
+                (and (member "(gate.app/named-by-walker)" app-strs) #t) #t)
+    (gate-check "spliced: an unreferenced def is still pruned"
+                (and (member "(gate.app/dead)" app-strs) #t) #f))
+  ;; the same graph with the walker genuinely reachable bails as before
+  (let-values (((core-strs app-strs drop-compiler?)
+                (dce-shake '() (cons (rec "gate.app/-main" '("gate.app/walker")) (cdr app)) "gate.app/-main")))
+    (gate-check "spliced: a reachable resolve caller still bails" core-strs #f)))
 
 (gate-summary "dce-refs")

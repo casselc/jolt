@@ -45,18 +45,17 @@
     "vendor/grenadine-generated"))
 
 ;; True when `f` is a file owned by the Jolt runtime (compiler + stdlib) — either
-;; an embedded-resource key (string or bytevector value) or a path under one of
-;; ldr-install-roots.
+;; an embedded-resource key — eagerly registered, or carried by the source blob's
+;; index — or a path under one of ldr-install-roots.
 (define (ldr-install-file? f)
-  (let ((v (hashtable-ref embedded-resources f #f)))
-    (or (string? v) (bytevector? v)
-        (let loop ((roots ldr-install-roots))
-          (and (pair? roots)
-               (or (let ((root (car roots)))
-                     (and (>= (string-length f) (+ (string-length root) 1))
-                          (string=? (substring f 0 (string-length root)) root)
-                          (char=? (string-ref f (string-length root)) #\/)))
-                   (loop (cdr roots))))))))
+  (or (embedded-resource-has? f)
+      (let loop ((roots ldr-install-roots))
+        (and (pair? roots)
+             (or (let ((root (car roots)))
+                   (and (>= (string-length f) (+ (string-length root) 1))
+                        (string=? (substring f 0 (string-length root)) root)
+                        (char=? (string-ref f (string-length root)) #\/)))
+                 (loop (cdr roots)))))))
 
 ;; A Chez source string for the install roots list — "(list \"jolt-core\" \"stdlib\" \"vendor/fs/src\")".
 ;; Used by build templates so the literal stays in one place.
@@ -65,39 +64,29 @@
     (fold-left (lambda (s r) (string-append s " \"" r "\"")) "" ldr-install-roots)
     ")"))
 
-;; --- namespaces Jolt provides the way babashka provides a built-in ----------
-;; Jolt's reader matches :bb (reader.ss rdr-features), which a .cljc library
-;; reads as "this host defines that itself". Two things follow, and jolt owes
-;; both.
+;; --- namespaces Jolt vendors and owns ---------------------------------------
+;; A copy of one of these on a project's roots must not shadow jolt's. A built
+;; binary already resolves jolt's copy first (install sources are embedded, and
+;; resolve-on-roots probes those before any root), so resolving these from the
+;; install roots is what keeps source mode answering the same file as the
+;; binary — a project that pulls babashka.fs in as a transitive dependency gets
+;; one babashka.fs, not two. babashka does not let a classpath copy shadow a
+;; built-in either.
 ;;
-;; It has to DEFINE what the :bb branch skips. babashka.fs writes list-dir as
-;; #?(:bb nil :default (defn list-dir …)) because babashka supplies it natively,
-;; so on jolt the var stayed declared and unbound and list-dirs / modified-since
-;; / path-seq failed at the call. A supplement is an ordinary install-root
-;; namespace loaded immediately after the one it completes — where babashka's
-;; built-in would already be. It is the namespace-level counterpart of
-;; :jolt/provides for classes.
+;; There is no per-namespace "supplement" seam any more. There used to be one
+;; (babashka.fs -> jolt.bb.fs), because jolt's reader matched :bb and babashka.fs
+;; writes list-dir as #?(:bb nil :default (defn list-dir …)) — so on jolt the var
+;; stayed declared and unbound and jolt had to fill it. Dropping :bb (issue #893,
+;; reader.ss rdr-features) means babashka.fs defines its own list-dir off the
+;; :clj branch, which is the one jolt's java.nio shims target.
 ;;
-;; And a copy of one of these on a project's roots must not shadow jolt's. Such
-;; a copy is source written to be INERT here: babashka.fs 0.4.18 has no forward
-;; declaration, so its list-dirs fails to compile at all. A built binary already
-;; resolves jolt's copy first (install sources are embedded, and resolve-on-roots
-;; probes those before any root), so resolving these from the install roots is
-;; what keeps source mode answering the same file as the binary. babashka does
-;; not let a classpath copy shadow a built-in either.
-(define ldr-ns-supplements '(("babashka.fs" . "jolt.bb.fs")))
-(define (ldr-supplement-of name)
-  (and (not (ldr-ns-replaced? name))
-       (cond ((assoc name ldr-ns-supplements) => cdr) (else #f))))
-
-;; ...and the escape hatch, because "jolt always wins" is not a thing a project
+;; The escape hatch stays, because "jolt always wins" is not a thing a project
 ;; can be stuck with. A project declares (deps.edn) which of these it supplies
 ;; itself:
 ;;
 ;;   :jolt/replaces [babashka.fs]
 ;;
-;; and its own copy resolves, with no supplement loaded over it — it is claiming
-;; the whole namespace, completing it included. jolt.deps collects the key and
+;; and its own copy resolves ahead of jolt's. jolt.deps collects the key and
 ;; jolt.main hands it here through jolt.host/replace-builtin-ns! before any of
 ;; the project compiles, which is the same ordering :jolt/provides needs.
 ;;
@@ -354,9 +343,7 @@
 ;; `require` resolves with no source on disk. The dev bin/jolt has an empty
 ;; source store, so the hashtable probes miss and it falls straight to disk.
 (define (resolve-on-roots rel)
-  (define (embedded-key? k)
-    (let ((v (hashtable-ref embedded-resources k #f)))
-      (or (string? v) (bytevector? v))))
+  (define (embedded-key? k) (embedded-resource-has? k))
   (define (on-roots roots)
     (let loop ((roots roots))
       (and (pair? roots)
@@ -386,7 +373,7 @@
 ;; a real path read off disk. Bytevector entries (the bundled boots/stub, and
 ;; source embeds stored as bytevectors to save heap) decode via utf8->string.
 (define (ldr-read-source path)
-  (let ((emb (hashtable-ref embedded-resources path #f)))
+  (let ((emb (embedded-resource-ref path)))
     (cond ((string? emb) emb)
           ((bytevector? emb) (utf8->string emb))
           (else (read-file-string path)))))
@@ -1938,12 +1925,7 @@
            (lambda () (set-chez-ns! saved)))   ; the current ns is thread-local
          ;; the hook feeds `jolt build`, which needs the SOURCE path; an
          ;; artifact-only namespace has none to give.
-         (ns-loaded-hook name (or file art))
-         ;; then the built-in supplement, if this namespace has one. It runs
-         ;; AFTER the load and after the mark, so its own require of the
-         ;; namespace it completes is the no-op a cycle would otherwise be.
-         (cond ((ldr-supplement-of name)
-                => (lambda (sup) (load-namespace sup))))))
+         (ns-loaded-hook name (or file art))))
       ;; No source file but the namespace exists in memory (AOT'd into a built
       ;; binary): it's already defined — mark loaded and move on.
       ((ns-has-vars? name)
@@ -2126,6 +2108,15 @@
 (def-var! "jolt.host" "set-source-roots!"
   (lambda (roots) (set-source-roots! (seq->list roots)) jolt-nil))
 (def-var! "jolt.host" "source-roots" (lambda () (list->cseq source-roots)))
+;; The file a namespace would load from, or nil: the same search a require
+;; does, without loading. jolt.main asks before requiring an entry namespace
+;; so it can say "no project here" instead of "could not locate" -- a catch
+;; around the require would re-raise a propagating load error from the wrong
+;; place and lose its location.
+(def-var! "jolt.host" "ns-source"
+  (lambda (nm)
+    (let ((f (find-ns-file (if (string? nm) nm (jolt-str-render-one nm)))))
+      (if f f jolt-nil))))
 (def-var! "jolt.host" "load-namespace" (lambda (n) (load-namespace n) jolt-nil))
 ;; The Clojure-facing seam for :jolt/replaces (see ldr-ns-replacements above).
 ;; jolt.deps collects the key and jolt.main calls this once per namespace after
@@ -2138,7 +2129,8 @@
 ;; run-file-arg?), so `jolt test` in any project with a test/ dir — which is every
 ;; jolt library — took the file path and died decoding a directory.
 (def-var! "jolt.host" "directory?" (lambda (p) (if (file-directory? p) #t #f)))
-(def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n))) (if v v jolt-nil))))
+;; jolt.host/getenv is defined in rt.ss, not here — the compiler image reads it
+;; as it loads, which is before this file (see the comment there).
 
 ;; --- filesystem primitives (jolt.host) --------------------------------------
 ;; jolt.deps did its filesystem work by shelling out: `mkdir -p`, `mv`, `rm -f`,

@@ -177,6 +177,39 @@
            :jvm "false"
            :jolt "true"}
    :note "Numeric-category-blind value equality; a deep = property, not a cheap fix. Verified against Clojure 1.12.5."}
+  ;; The two ##NaN rows the clojure-test-suite flags as arguably-undefined. Both
+  ;; were unreachable while jolt read :bb branches — the suite gates one behind
+  ;; #?@(:bb [] :default [...]) and writes the other's expectation per platform —
+  ;; so dropping :bb (#893) is what surfaced them.
+  {:category :numeric-model
+   :behavior "(not= ##NaN ##NaN)"
+   :jvm "false"
+   :jolt "true"
+   :check {:expr "(pr-str (not= ##NaN ##NaN))"
+           :jvm "\"false\""
+           :jolt "\"true\""}
+   :note "The JVM's own acknowledged bug (ask.clojure.org/index.php/14298): not= is (not (= x y)) everywhere except that = on two NaN doubles short-circuits on reference identity first, so not= answers false while = answers false too. jolt compares NaN by value in both directions, so (= ##NaN ##NaN) is false and (not= ##NaN ##NaN) is true — self-consistent, and what the clojure-test-suite's :default branch expects."}
+  {:category :numeric-model
+   :behavior "(= (list ##NaN) (list ##NaN))"
+   :jvm "true"
+   :jolt "false"
+   :check {:expr "(pr-str (= (list ##NaN) (list ##NaN)))"
+           :jvm "\"true\""
+           :jolt "\"false\""}
+   :note "Same root as the row above, seen through a collection. Util.equiv tests reference identity before value, and the JVM compiler hands both lists the SAME boxed Double for the ##NaN constant, so the elements are identical and the lists compare equal — clojure.org/guides/equality documents this as a surprise rather than a rule, and the clojure-test-suite calls it undefined behavior. jolt compares element values, so it answers false, which is what (= ##NaN ##NaN) already says."}
+  ;; The shortest decimal digits of Double/MIN_VALUE. Java's FloatingDecimal
+  ;; prints the smallest denormal as 4.9E-324; Chez's free-format printer, which
+  ;; is what format and str read a flonum's digits from, prints 5e-324 -- both
+  ;; round-trip to the same double, so both are shortest, and only this one
+  ;; value (one significant bit) has two shortest spellings.
+  {:category :numeric-model
+   :behavior "(format \"%.2e\" 4.9e-324)"
+   :jvm "\"4.90e-324\""
+   :jolt "\"5.00e-324\""
+   :check {:expr "(format \"%.2e\" 4.9e-324)"
+           :jvm "\"4.90e-324\""
+           :jolt "\"5.00e-324\""}
+   :note "Only Double/MIN_VALUE: every other double has one shortest digit string and the two printers agree on it. format's %e/%f/%g round those digits half up exactly as java.util.Formatter does."}
   ;; ex-info's data map is unchecked here. ExceptionInfo's constructor takes an
   ;; IPersistentMap, so a non-map is a ClassCastException on the JVM; jolt stores
   ;; whatever it is handed and ex-data reads it back. A superset: portable code
@@ -416,15 +449,15 @@
            :jvm "\"java.lang.module.ModuleFinder\""
            :jolt "\"nil\""}
    :note "resolve answers the narrower \"does this class exist here\" for feature detection (compliment gates its JDK9 scanner on it); a class the host models resolves to the class. The bare symbol still evaluates through the syntactic class model."}
-  ;; reader conditionals match :bb, ahead of :clj when the clause is listed first.
+  ;; :jolt is a reader feature, ahead of :clj when the clause is listed first.
   {:category :reader-model
-   :behavior "#?(:bb 1 :clj 2)"
-   :jvm "2 (:bb is not a JVM feature)"
+   :behavior "#?(:jolt 1 :clj 2)"
+   :jvm "2 (:jolt is not a JVM feature)"
    :jolt "1"
-   :check {:expr "(pr-str (read-string {:read-cond :allow} \"#?(:bb 1 :clj 2)\"))"
+   :check {:expr "(pr-str (read-string {:read-cond :allow} \"#?(:jolt 1 :clj 2)\"))"
            :jvm "\"2\""
            :jolt "\"1\""}
-   :note "jolt's feature set is {:jolt :bb :clj :default}, like babashka's {:bb :clj}. A library's :bb branch solves the same non-JVM problems jolt has (no reflection, no JVM-only classes) and is listed ahead of :clj precisely so a bb-like host takes it."}
+   :note "jolt's feature set is {:jolt :clj :default}. :jolt is how a .cljc library gives jolt its own branch; without one jolt reads :clj, the code path its clojure.lang.*/java.* shims target. :bb was in the set from 0.7.10 to 0.8.5 and was removed in #893: a :bb branch is written for babashka's host model, not jolt's."}
   ;; read-string of an empty string returns nil (JVM throws EOF).
   {:category :permissive
    :behavior "(read-string \"\")"
@@ -443,6 +476,15 @@
            :jvm "throws ArityException"
            :jolt "0"}
    :note "The overlay is variadic where the JVM's is fixed-arity. At arity 2 — every arity the JVM accepts — the wrapping result is identical, 64-bit edges included, so portable code is unaffected. Costs nothing on the hot path either: proven-long operands lower straight to jolt-uncadd2 (a left fold past 2 operands) and never reach the variadic overlay, which only serves value position."}
+  ;; defonce takes a docstring, as def does; the JVM's defonce is [name expr] only.
+  {:category :permissive
+   :behavior "(defonce name \"doc\" init) — the (def sym doc-string? init) shape, on defonce"
+   :jvm "throws ArityException — clojure.core/defonce is [name expr]"
+   :jolt "defines the var with :doc \"doc\" in its metadata"
+   :check {:expr "(do (defonce dv-defonce-doc \"d\" 1) (= \"d\" (:doc (meta #'dv-defonce-doc))))"
+           :jvm "throws ArityException"
+           :jolt "true"}
+   :note "Widening only, and in a direction no portable code can depend on: the three-form call is an arity error on the JVM, not a different meaning, so nothing that compiles there changes here. The parse is def's, not defn's — a lone string is the INIT ((defonce x \"s\") defs x to \"s\"), a string followed by one more form is the docstring. clojure.core's def takes no attr-map, so neither does this. ^meta on the name works either way and always did; only the docstring position was missing."}
   ;; distinct accepts any seqable, not just what nth can index.
   {:category :permissive
    :behavior "(distinct #{1 2 3}) or (distinct {:a 1}) — a coll that seqs but has no nth"
@@ -599,15 +641,6 @@
            :jvm "\"#inst \\\"2020-01-01T13:14:15.123000000-00:00\\\"\""
            :jolt "\"#inst \\\"2020-01-01T13:14:15.123-00:00\\\"\""}
    :note "One instant type, millisecond-based. read-instant-date and read-instant-calendar are exact."}
-  ;; ByteBuffer.slice() copies where the JVM shares the backing array.
-  {:category :host-model
-   :behavior "(.array (.slice buf)) after (.position buf 1)"
-   :jvm "the WHOLE shared backing array (slice is a view; .array ignores the offset)"
-   :jolt "just the sliced bytes (slice copies)"
-   :check {:expr "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 1) (count (.array (.slice b))))"
-           :jvm "4"
-           :jolt "3"}
-   :note "A HEAP buffer's state is #(backing position limit) with no array offset, so its slice cannot express \"0-based view into a shared backing\" and copies instead. Read paths — hexdumps, decoders — are unaffected; a write through such a slice does not propagate back. A DIRECT buffer (jolt.ffi/byte-buffer) does share, there being a real address to offset, and .array raises on it as it does on the JVM. Tracked as jolt-93c9."}
   ;; No classloaders. This is not a shim gap that could be filled — a classloader
   ;; is a JVM linkage concept, and jolt compiles ahead of time to native code with
   ;; no class-loading step to intercept. Surfaced running kaocha, whose dynapath
@@ -965,6 +998,40 @@
            :jvm ":threw"
            :jolt "\"([&form])\""}
    :note "[&form &env] and longer elide on both; that is pinned in the corpus (defn / implicit macro params)."}
+  ;; A byte array's store narrows an out-of-range integer the way Byte.byteValue()
+  ;; does. On the JVM only the CONSTRUCTOR narrows — (byte-array [200]) is -56 on
+  ;; both runtimes, Numbers.byte_array calls byteValue — while aset goes through
+  ;; RT.aset(byte[], int, byte), whose byte parameter the Reflector only accepts a
+  ;; Byte for; a Long, hinted or not, is "No matching method aset found taking 3
+  ;; args". jolt has one exact-integer type (:integer-box-model) and so cannot tell
+  ;; a Byte from a Long at the store; it applies the byteValue narrowing there too,
+  ;; in na-byte-of, the one place a value entering a byte array is narrowed. Every
+  ;; door in agrees — into-array, Arrays/fill, the untyped aset, and the hinted
+  ;; (aset ^bytes …) store jolt-baset, which falls back to that seam for anything
+  ;; but an in-range fixnum. test/chez/array-backing-test.ss pins the contract
+  ;; value for value; this entry records that the JVM does not share it. jolt-8eef.
+  {:category :permissive
+   :behavior "(aset (byte-array 2) 0 200) — an integer outside -128..127 stored into a byte array"
+   :jvm "throws IllegalArgumentException (No matching method aset found taking 3 args); same for (aset ^bytes a i (long 200))"
+   :jolt "stores the low 8 bits sign-folded, as Byte.byteValue() and (byte-array [200]) do: 200 -> -56, -129 -> 127"
+   :check {:expr "(let [a (byte-array 2)] (aset a 0 200) (aset a 1 -129) (vec a))"
+           :jvm "throws IllegalArgumentException"
+           :jolt "[-56 127]"}
+   :note "(byte 200) still throws on both — the CAST is checked, the byte-array STORE narrows. Portable code passes (byte v) or (unchecked-byte v) to aset and behaves identically here."}
+  ;; A flonum reaching an array store: jolt floors a non-integer INDEX (na-idx, for
+  ;; every array kind) and, for a byte array, truncates the VALUE toward zero before
+  ;; narrowing it (na-byte-of, the JVM's d2i then byteValue). The JVM's Reflector
+  ;; matches neither: int and byte parameters take no Double. Same seam and same
+  ;; reason as the row above; listed separately because the index half is not
+  ;; byte-specific.
+  {:category :permissive
+   :behavior "(aset (byte-array 3) 1.7 -1.9) — a flonum index and a flonum value at a byte-array store"
+   :jvm "throws IllegalArgumentException (No matching method aset found taking 3 args)"
+   :jolt "index floors to 1, value truncates toward zero to -1 and narrows: [0 -1 0]"
+   :check {:expr "(let [a (byte-array 3)] (aset a 1.7 -1.9) (vec a))"
+           :jvm "throws IllegalArgumentException"
+           :jolt "[0 -1 0]"}
+   :note "(aget a 1.7) floors the same way on jolt. The truncation is toward zero, not floor: (aset a 0 -1.9) stores -1, matching what (byte-array [-1.9]) builds on both runtimes."}
 ]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
@@ -1219,10 +1286,9 @@
    {:suite "numbers / unsigned string conversions", :label "past 64 bits it is a signed magnitude, not a wrap", :category :integer-box-model}
    {:suite "conformance / numeric pass", :label "literal-init loop var + bignum-literal stays generic (exact)", :category :numeric-model}
 
-   ;; jolt takes :bb reader branches, and babashka code asks (satisfies? Class x)
-   ;; where its JVM branch asks instance?; jolt answers instance? there. The JVM
-   ;; raises on the class form (satisfies? wants a protocol map), so certify
-   ;; buckets the row :jvm-raises.
+   ;; Ported code asks (satisfies? clojure.lang.IObj x) where the shape it means
+   ;; is instance?; jolt answers instance? there. The JVM raises on the class form
+   ;; (satisfies? wants a protocol map), so certify buckets the row :jvm-raises.
    ;; The two-argument SimpleDateFormat takes a LOCALE ID STRING on jolt (the
    ;; :date-names extension point's key); the JVM's second argument is a Locale,
    ;; so it has no matching constructor and raises.

@@ -7,6 +7,7 @@
 # in jolt-core, so any drift fails CI. Regenerate after an intended change:
 #   grep -rhoE --include='*.ss' 'def-var! "jolt.host" "[^"]+"' host/ \
 #     | sed -E 's/.*"jolt.host" "([^"]+)".*/\1/' | LC_ALL=C sort -u
+add-reader-features!
 add-shutdown-hook
 allow-unresolved-vars?
 as-subvec
@@ -34,11 +35,13 @@ condition-message
 cpu-nanos
 current-memory-bytes
 current-fiber
+ctx-for-ns
 deftype-ctor-class
 delete-file!
 delete-tree!
 directory?
 dispatch-macros
+embed-plan
 enable-trace!
 entry-at
 escape-fn?
@@ -119,6 +122,7 @@ gc-real-nanos
 getenv
 host-class-name?
 host-intern!
+identity-hash
 image-add-after-restore-hook!
 image-add-before-dump-hook!
 image-dump-world!
@@ -154,11 +158,15 @@ make-thread-local
 map-entry
 mark-spliced!
 maximum-memory-bytes
+reset-maximum-memory-bytes!
+gc-trip-bytes
 mkdirs!
 monitor-enter
 monitor-exit
 mono-nanos
 munge-name
+ns-loaded?
+ns-shaped-name?
 park-until-interrupt
 pop
 protocol-key-of
@@ -196,6 +204,7 @@ set-default-zone-provider!
 set-dispatch-macro!
 set-field!
 set-instant-ctor!
+ns-source
 set-source-roots!
 set-static-field!
 set-var!

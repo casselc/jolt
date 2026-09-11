@@ -1,12 +1,12 @@
-# The current aspect epoch is replayed directly onto the published v0.8.3
-# release. See docs/aspect-compiler-epochs/v0.8.3-2026-09.md for the immutable
-# old-to-new map from the preceding v0.8.1 epoch.
-schema=1
+# The aspect root remains attached to v0.8.3; the current upstream release is
+# merged into that append-only line. See the v0.8.6 epoch record.
+schema=2
 canonical_branch=integration/aspects
 upstream_repository=https://github.com/jolt-lang/jolt.git
-upstream_release=v0.8.3
 upstream_base_commit=343f730922cf16fafe673b466cedcdcfe0596854
-upstream_release_commit=343f730922cf16fafe673b466cedcdcfe0596854
-upstream_tree=39ba588512ec3c970db3a708393426199bd88520
+upstream_base_tree=39ba588512ec3c970db3a708393426199bd88520
+upstream_release=v0.8.6
+upstream_release_commit=f3041a0e32ba0db1b92bd69b8ecb7b40f8b2e115
+upstream_tree=21490693b24ad8fc86f4e37ec01489d876dc4994
 aspect_root_commit=eaf4ae8588feaf88bfba7a727d50d08d7ee5945a
-verified_ancestor=efeeeb0580bfed731d977b405a796af2d479595c
+verified_ancestor=3d4b7d0a702238229871a141ab42ac4bb4c3ced0

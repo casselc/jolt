@@ -160,9 +160,11 @@ check '(->> (range 10) (filter even?) (map (fn [x] (* x x))) (reduce +))' '120'
 check '(let [{:keys [a b] :or {b 99}} {:a 1}] [a b])' '[1 99]'
 check '(map inc [1 2 3])' '(2 3 4)'
 check '(require [clojure.string :as s]) (s/upper-case "hello")' '"HELLO"'
-# reader conditionals match :bb ahead of :clj (like babashka); clause order wins
-check '#?(:bb :bb-branch :clj :clj-branch)' ':bb-branch'
+# the feature set is {:jolt :clj :default}; :bb is not in it, and a :jolt branch
+# placed before :clj is how a library overrides the JVM one. Clause order wins.
+check '#?(:bb :bb-branch :clj :clj-branch)' ':clj-branch'
 check '#?(:clj :clj-first :bb :bb-second)' ':clj-first'
+check '#?(:jolt :jolt-branch :clj :clj-branch)' ':jolt-branch'
 # -M with a bare script path runs it the way clojure.main does: the file loads,
 # the remaining args become *command-line-args* (jolt-s9zc).
 mfile_dir="$(mktemp -d)"
@@ -629,6 +631,83 @@ else
 fi
 rm -rf "$ex_dir"
 
+# The process ends when -main returns AND every non-daemon Thread the program
+# started has finished, as on the JVM; a daemon thread does not hold it open.
+# .setDaemon used to be accepted and ignored, and the process ended the moment
+# -main returned, so work handed to a started Thread was lost at exit.
+dm_dir="$(mktemp -d)"
+printf '(.start (Thread. (fn [] (Thread/sleep 300) (println "worker done"))))\n(println "main done")\n' > "$dm_dir/nd.clj"
+dm_out="$($jolt run "$dm_dir/nd.clj" 2>&1)"
+if [ "$dm_out" = "main done
+worker done" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a non-daemon thread should keep the process alive after -main returns"
+  echo "    got \`$(printf '%s' "$dm_out" | tr '\n' '|')\`"
+  fails=$((fails + 1))
+fi
+printf '(doto (Thread. (fn [] (Thread/sleep 5000) (println "DAEMON STILL ALIVE"))) (.setDaemon true) (.start))\n(println "main done")\n' > "$dm_dir/d.clj"
+dm_t0=$(date +%s)
+dm_out="$($jolt run "$dm_dir/d.clj" 2>&1)"
+dm_dt=$(( $(date +%s) - dm_t0 ))
+if [ "$dm_out" = "main done" ] && [ "$dm_dt" -lt 4 ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a daemon thread should not keep the process alive (took ${dm_dt}s, got \`$(printf '%s' "$dm_out" | tr '\n' '|')\`)"
+  fails=$((fails + 1))
+fi
+rm -rf "$dm_dir"
+
+# A report names a file the way jank does: ./ relative to the directory the
+# program was started from, ~/ under the home directory, else in full. A
+# ./-prefixed argument used to come back as ././x.clj, and an absolute path
+# under the current directory was printed whole.
+pp_dir="$(mktemp -d)"
+pp_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+printf '(throw (ex-info "boom" {}))\n' > "$pp_dir/x.clj"
+pp_out="$(cd "$pp_dir" && JOLT_PWD="$pp_dir" "$pp_jolt" run ./x.clj 2>&1)"
+if printf '%s' "$pp_out" | grep -q 'at \./x\.clj:1:1'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a ./-prefixed script should be reported as ./x.clj"
+  echo "    $(printf '%s' "$pp_out" | grep 'at ' | head -1)"
+  fails=$((fails + 1))
+fi
+pp_out="$(cd "$pp_dir" && JOLT_PWD="$pp_dir" "$pp_jolt" run "$pp_dir/x.clj" 2>&1)"
+if printf '%s' "$pp_out" | grep -q 'at \./x\.clj:1:1'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: an absolute script path under the current directory should be reported as ./x.clj"
+  echo "    $(printf '%s' "$pp_out" | grep 'at ' | head -1)"
+  fails=$((fails + 1))
+fi
+pp_home="$(mktemp -d "$HOME/.jolt-smoke-XXXXXX")"
+printf '(throw (ex-info "boom" {}))\n' > "$pp_home/y.clj"
+pp_out="$(cd "$pp_dir" && JOLT_PWD="$pp_dir" "$pp_jolt" run "$pp_home/y.clj" 2>&1)"
+if printf '%s' "$pp_out" | grep -q "at ~/$(basename "$pp_home")/y\.clj:1:1"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a script under the home directory should be reported as ~/…"
+  echo "    $(printf '%s' "$pp_out" | grep 'at ' | head -1)"
+  fails=$((fails + 1))
+fi
+rm -rf "$pp_dir" "$pp_home"
+
+# Starting jolt where there is no project and naming a namespace it cannot find
+# says so: the old report was only "Could not locate app/core", which reads as a
+# missing namespace when the real problem is the directory.
+np_dir="$(mktemp -d)"
+np_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+np_out="$(cd "$np_dir" && JOLT_PWD="$np_dir" "$np_jolt" run -m app.core 2>&1)"
+if printf '%s' "$np_out" | grep -q 'No project found in .* (no deps.edn or bb.edn)'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: run -m outside a project should say no project was found"
+  echo "    $(printf '%s' "$np_out" | head -1)"
+  fails=$((fails + 1))
+fi
+rm -rf "$np_dir"
+
 # A readiness registration must never be lost. jolt.io-poller drained its pending
 # registrations in two critical sections, so one landing in between was erased
 # before reaching the kqueue/epoll set and the fiber waiting on that fd never
@@ -1033,12 +1112,12 @@ else
 fi
 
 # A project root must not shadow a namespace Jolt provides as a host built-in.
-# Jolt's reader matches :bb, so a copy of babashka.fs pulled in as a dependency
-# is source written to be inert here (0.4.18 guards list-dir behind
-# `#?(:bb nil …)` and its list-dirs then fails to compile). A built binary
-# already resolves Jolt's copy first because install sources are embedded; this
-# asserts source mode answers the same file. The decoy would load fine on its
-# own — it is Jolt's copy winning that makes list-dir resolve.
+# A built binary already resolves Jolt's copy first because install sources are
+# embedded; this asserts source mode answers the same file, so a project that
+# happens to pull babashka.fs in as a dependency gets one babashka.fs and not
+# two. babashka does not let a classpath copy shadow a built-in either. The
+# decoy would load fine on its own — it is Jolt's copy winning that makes
+# list-dir resolve.
 bbs_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
 bbshadow="$(mktemp -d)"; mkdir -p "$bbshadow/src/babashka"
 printf '(ns babashka.fs)\n(def marker :decoy)\n' > "$bbshadow/src/babashka/fs.cljc"
@@ -1062,6 +1141,31 @@ if [ "$bbr_out" = '[true true]' ]; then
 else
   echo "  FAIL: :jolt/replaces did not reach the project's own babashka.fs"
   echo "    want \`[true true]\` got \`$bbr_out\`"
+  fails=$((fails + 1))
+fi
+
+# :jolt/features widens the reader-conditional set for the PROJECT's own source.
+# jolt does not match :bb (#893); a script ported from babashka whose :bb
+# branches are the ones its author wants asks for them here. Additive only, so
+# :clj still reads and the project's own :jolt branch still wins over both.
+printf '{:paths ["src"] :jolt/features [:bb]}\n' > "$bbshadow/deps.edn"
+rm -f "$bbshadow/src/babashka/fs.cljc"; rmdir "$bbshadow/src/babashka" 2>/dev/null
+feat_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '[#?(:bb :bb-branch :clj :clj-branch) #?(:jolt :jolt-first :bb :bb-second) (vec (sort (clojure.core/__reader-features)))]' 2>&1 | tail -1)"
+if [ "$feat_out" = '[:bb-branch :jolt-first ["bb" "clj" "default" "jolt"]]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: :jolt/features did not widen the reader feature set"
+  echo "    want \`[:bb-branch :jolt-first [\"bb\" \"clj\" \"default\" \"jolt\"]]\` got \`$feat_out\`"
+  fails=$((fails + 1))
+fi
+# ...and without the key, the same expression reads :clj.
+printf '{:paths ["src"]}\n' > "$bbshadow/deps.edn"
+nofeat_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '[#?(:bb :bb-branch :clj :clj-branch) (vec (sort (clojure.core/__reader-features)))]' 2>&1 | tail -1)"
+if [ "$nofeat_out" = '[:clj-branch ["clj" "default" "jolt"]]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: the default reader feature set is not {:jolt :clj :default}"
+  echo "    want \`[:clj-branch [\"clj\" \"default\" \"jolt\"]]\` got \`$nofeat_out\`"
   fails=$((fails + 1))
 fi
 rm -rf "$bbshadow"

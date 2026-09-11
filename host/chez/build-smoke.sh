@@ -209,6 +209,30 @@ if grep -q 'set-chez-ns! "jolt\.crypto"' "$out.build/flat.ss"; then
   echo "  FAIL: unreferenced lib provider jolt.crypto leaked into flat.ss"; exit 1
 fi
 
+# Closure identity in a BUILT binary, on the direct-linked release default.
+# Chez shares one closure object across every evaluation of a lambda with no free
+# variables; Clojure allocates a fresh fn each time, and malli.impl.regex depends
+# on the Clojure answer (its parked-continuation cache keys on validator
+# closures, so a shared :? epsilon branch collided two states, killed
+# backtracking and made m/validate answer false). The interpreter is not enough
+# evidence: the release default is --direct-link with whole-program inference,
+# which is where a capture the interpreter keeps could still be folded away.
+# The last line is the control — a CAPTURING fn always allocated, so a fix that
+# only papered over the non-capturing case would still show here.
+check_fnid() {  # check_fnid <binary> <label>
+  # announces itself: a check that is silent on success cannot be distinguished
+  # from one that never ran, and this one was briefly BOTH (defined below its
+  # first call site, which sh reports on stderr and then carries on past).
+  echo "build smoke: closure identity in $2"
+  got_fn="$(cd / && "$1" --fnid 2>&1)"
+  for line in 'fnid-same: false' 'fnid-set: 2' 'fnid-meta: [{:t 1} nil]' \
+              'fnid-call: 7' 'fnid-cap: false'; do
+    if ! printf '%s\n' "$got_fn" | grep -qxF "$line"; then
+      echo "  FAIL: closure identity in $2 — missing: $line"
+      echo "--- got ----"; echo "$got_fn"; exit 1
+    fi
+  done
+}
 # --no-direct-link opts back out of the release default: the app->app call must
 # NOT lower to a jv$ binding (stays var-routed, dynamically linked).
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then
@@ -217,6 +241,7 @@ fi
 if grep -q 'define jv\$app.util\$shout' "$out.nodl.build/flat.ss"; then
   echo "  FAIL: --no-direct-link still direct-linked the app->app call"; exit 1
 fi
+check_fnid "$out.nodl" "the --no-direct-link build"
 # and it IS var-routed there -- without this the check above would pass on a
 # build that emitted no reference to shout at all.
 if ! grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.nodl.build/flat.ss"; then
@@ -243,6 +268,49 @@ if ! printf '%s' "$got_rd" | grep -q '^redef: :patched$'    || ! printf '%s' "$g
   echo "  FAIL: ^:redef/:dynamic opt-out — want 'redef: :patched' and 'dyn: :bound' lines"
   echo "--- got ----"; echo "$got_rd"; exit 1
 fi
+
+check_fnid "$out" "the direct-linked release build"
+
+# The heap ceiling, in a BUILT binary. jolt bounds its heap at 25% of RAM by
+# default, the share the JVM's MaxRAMPercentage uses, because Chez has no -Xmx
+# and an unbounded heap means the kernel kills the process with no diagnostic at
+# all. Asserted here and not only under `jolt -e`: the install is emitted into
+# the APP launcher (build.ss), a separate site from jolt's own, and only a built
+# binary runs it.
+echo "build smoke: heap ceiling (default / override / off / OutOfMemoryError)"
+heap_max() { cd / && "$out" --heap 2>&1 | sed -n 's/^heap-max: //p'; }
+# default: a real ceiling was computed, i.e. RAM detection worked in the binary
+hm_def="$(heap_max)"
+case "$hm_def" in
+  ''|*[!0-9]*) echo "  FAIL: default ceiling not numeric: '$hm_def'"; exit 1 ;;
+esac
+if [ "$hm_def" = "9223372036854775807" ] || [ "$hm_def" -le 0 ] 2>/dev/null; then
+  echo "  FAIL: no default heap ceiling in a built binary (got $hm_def)"; exit 1
+fi
+# an explicit override is honoured exactly
+hm_512="$(JOLT_MAX_HEAP=512m heap_max)"
+if [ "$hm_512" != "536870912" ]; then
+  echo "  FAIL: JOLT_MAX_HEAP=512m gave $hm_512, want 536870912"; exit 1
+fi
+# off restores the pre-0.8.5 unbounded contract
+hm_off="$(JOLT_MAX_HEAP=off heap_max)"
+if [ "$hm_off" != "9223372036854775807" ]; then
+  echo "  FAIL: JOLT_MAX_HEAP=off gave $hm_off, want Long/MAX_VALUE"; exit 1
+fi
+# and exceeding one is an error the program can catch, not a SIGKILL. 256m, not
+# something smaller: a built binary's own baseline live heap is ~83MB here, and a
+# ceiling under that cannot be satisfied at all (checked separately below).
+hm_oom="$(cd / && JOLT_MAX_HEAP=256m "$out" --heap-oom 2>&1 | sed -n 's/^heap-oom: //p')"
+if [ "$hm_oom" != ":caught-oom" ]; then
+  echo "  FAIL: exceeding a 256m ceiling gave '$hm_oom', want :caught-oom"; exit 1
+fi
+# a ceiling below the runtime's own live heap is rejected AS a bad setting, named
+# as such, rather than failing somewhere inside namespace initialization
+hm_low="$(cd / && JOLT_MAX_HEAP=16m "$out" --heap 2>&1 | head -2)"
+case "$hm_low" in
+  *"smaller than the runtime's own live heap"*) : ;;
+  *) echo "  FAIL: a 16m ceiling should be refused with a clear message, got: $hm_low"; exit 1 ;;
+esac
 
 # A NAMED inner fn inside a spliced callee (jolt-pzos). Two claims:
 #  - the alpha-rename the splicer applies for hygiene (step-boom -> step-boom__ilN)
@@ -285,7 +353,7 @@ for frame in 'app\.util/deep-boom .*util\.clj:[0-9]' 'app\.util/mid-boom .*util\
 done
 # ...and in that order, innermost first — a backwards chain contains every frame
 # and would pass the per-frame loop above.
-if ! printf '%s' "$got_ts" | tr '\n' '~' | grep -qE 'deep-boom[^~]*~[^~]*mid-boom[^~]*~[^~]*-main'; then
+if ! printf '%s' "$got_ts" | tr '\n' '%' | grep -qE 'deep-boom[^%]*%[^%]*mid-boom[^%]*%[^%]*-main'; then
   echo "  FAIL: --tree-shake trace frames out of order"
   echo "--- got ----"; echo "$got_ts"; exit 1
 fi
@@ -396,6 +464,23 @@ if ! printf '%s' "$got_rl" | grep -q '^resloader: true true 1 true true$'; then
   echo "  FAIL: ClassLoader resource surface — want 'resloader: true true 1 true true'"
   echo "--- got ----"; echo "$got_rl"; exit 1
 fi
+
+# With no -o and JOLT_PWD unset -- the built jolt started in the project -- the
+# binary is named after the project DIRECTORY, not the entry namespace: "." is
+# resolved to the directory it stands for.
+echo "build smoke: default binary name from the project directory"
+nm_root="$(mktemp -d)"
+nm_app="$nm_root/named-app"
+cp -R "$app" "$nm_app"
+if ! (cd "$nm_app" && env -u JOLT_PWD "$joltabs" build -m app.core --dev >/dev/null 2>&1); then
+  echo "  FAIL: build with no -o and no JOLT_PWD exited non-zero"; exit 1
+fi
+if [ -x "$nm_app/target/debug/named-app" ]; then
+  echo "  - default name: ok (target/debug/named-app)"
+else
+  echo "  FAIL: expected target/debug/named-app, found: $(ls "$nm_app/target/debug" 2>/dev/null | tr '\n' ' ')"; exit 1
+fi
+rm -rf "$nm_root"
 
 # Portable embed: remove the build-time source tree and run from / — the
 # embedded resource must still resolve (contents baked as literals, not
@@ -856,6 +941,39 @@ if [ "$got_ord" != "ord: 42" ]; then
   echo "  FAIL: install-owned dep emitted after its caller — want 'ord: 42', got \`$got_ord\`"; exit 1
 fi
 
+# A live VALUE a macro put in its expansion has to reach the BINARY. jolt rebuilds
+# one as code rather than stashing it in a process-local table (jolt-l7tq), and
+# only a built binary proves that: a table would satisfy every in-process check
+# and then be empty in the app's own image. Both shapes here — a named fn, read
+# back through the var that roots it, and an anonymous literal with a real
+# capture, rebuilt from the source form and the captured value the fn-form
+# registry recorded.
+echo "build smoke: a macro-embedded live value reaches the binary"
+emb_app="$(mktemp -d)/emb-app"
+mkdir -p "$emb_app/src/ea"
+printf '{:paths ["src"]}\n' > "$emb_app/deps.edn"
+cat > "$emb_app/src/ea/lib.clj" <<'EMB_LIB_EOF'
+(ns ea.lib)
+(defmacro named-fn [] (deref #'clojure.core/memfn))
+(defn mk-adder [n] (fn [x] (+ x n)))
+(defmacro anon-fn [] (mk-adder 7))
+(def a (named-fn))
+(def b (anon-fn))
+EMB_LIB_EOF
+cat > "$emb_app/src/ea/core.clj" <<'EMB_EOF'
+(ns ea.core (:require [ea.lib :as lib]))
+(defn -main [& _] (println "emb:" (fn? lib/a) (lib/b 35)))
+EMB_EOF
+emb_out="$(dirname "$out")/emb-bin"
+if ! JOLT_PWD="$emb_app" "$jolt" build -m ea.core -o "$emb_out" >/dev/null 2>&1; then
+  echo "  FAIL: macro-embedded-value app build exited non-zero"; exit 1
+fi
+got_emb="$(cd / && "$emb_out" 2>&1)"
+rm -rf "$(dirname "$emb_app")"
+if [ "$got_emb" != "emb: true 42" ]; then
+  echo "  FAIL: embedded value did not reach the binary — want 'emb: true 42', got \`$got_emb\`"; exit 1
+fi
+
 # `build` behind a global option that re-dispatches the rest of the argv through
 # -main (-Sdeps '<edn>', -A:alias). The launcher has to load the build driver
 # before jolt.main runs and used to look for "build" at argv[0] only, so this
@@ -1172,4 +1290,80 @@ if [ "$got_atomic_a" != "$want" ] || [ "$got_atomic_b" != "$want" ] || [ "$got_a
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + atomic-runtime-cache)"
+# --boot picks how the boot image is encoded (jolt-lang/jolt#886): `fast` (the
+# default) is vfasl+LZ4, `small` is vfasl+gzip, `plain` skips vfasl entirely.
+# --no-vfasl is the spelling the issue asked for and aliases `--boot plain`.
+#
+# Checked by the ARTIFACT, not by a message — a build that quietly converted
+# anyway is exactly the failure `plain` exists to prevent — then by the ordering
+# of the three binaries' sizes, which is what says the codec really changed and
+# not just the filename, and finally by RUNNING each, since a binary that does
+# not boot is the other failure.
+echo "build smoke: --boot fast|small|plain"
+smallout="$(dirname "$out")/small-boot-bin"
+plainout="$(dirname "$out")/plain-boot-bin"
+envplainout="$(dirname "$out")/envplain-boot-bin"
+if ! JOLT_PWD="$app" "$joltabs" build -m app.core --boot small -o "$smallout" >/dev/null 2>&1; then
+  echo "  FAIL: --boot small build exited non-zero"; exit 1
+fi
+[ -f "$smallout.build/jolt.boot.vfasl" ] || { echo "  FAIL: --boot small produced no vfasl boot"; exit 1; }
+if ! JOLT_PWD="$app" "$joltabs" build -m app.core --boot plain -o "$plainout" >/dev/null 2>&1; then
+  echo "  FAIL: --boot plain build exited non-zero"; exit 1
+fi
+[ -f "$plainout.build/jolt.boot.vfasl" ] && { echo "  FAIL: --boot plain still converted the boot"; exit 1; }
+# --no-vfasl and JOLT_NO_VFASL are aliases for `--boot plain`; the env var
+# travels a different path than the flag, so it gets its own build.
+if ! JOLT_PWD="$app" JOLT_NO_VFASL=1 "$joltabs" build -m app.core -o "$envplainout" >/dev/null 2>&1; then
+  echo "  FAIL: JOLT_NO_VFASL build exited non-zero"; exit 1
+fi
+[ -f "$envplainout.build/jolt.boot.vfasl" ] && { echo "  FAIL: JOLT_NO_VFASL still converted the boot"; exit 1; }
+# the default still converts, or the `plain` checks above pass for the wrong
+# reason the day something stops emitting a vfasl boot at all.
+[ -f "$splitout.build/jolt.boot.vfasl" ] || { echo "  FAIL: the default build produced no vfasl boot"; exit 1; }
+# A gzip image is a third smaller than either of the others; if `small` merely
+# fell back to the LZ4 default this ordering is what catches it.
+sz_small=$(wc -c < "$smallout"); sz_fast=$(wc -c < "$splitout"); sz_plain=$(wc -c < "$plainout")
+if [ "$sz_small" -ge "$sz_fast" ] || [ "$sz_small" -ge "$sz_plain" ]; then
+  echo "  FAIL: --boot small ($sz_small) is not smaller than fast ($sz_fast) and plain ($sz_plain)"
+  exit 1
+fi
+# a bad value is rejected rather than silently building the default
+if JOLT_PWD="$app" "$joltabs" build -m app.core --boot nope -o "$plainout.bad" >/dev/null 2>&1; then
+  echo "  FAIL: --boot nope was accepted"; exit 1
+fi
+# An empty environment variable reads as UNSET. `bin/jolt` already treats
+# JOLT_NO_DEVCACHE that way, and a CI matrix leg that does not fill a value in
+# exports an empty one — which must not fail the build (JOLT_BOOT= used to, with
+# "must be fast, small or plain (got )") nor silently change it (JOLT_NO_VFASL=
+# used to force plain).
+emptybootout="$(dirname "$out")/emptyboot-bin"
+emptynvout="$(dirname "$out")/emptynv-bin"
+if ! JOLT_PWD="$app" JOLT_BOOT= "$joltabs" build -m app.core -o "$emptybootout" >/dev/null 2>&1; then
+  echo "  FAIL: an empty JOLT_BOOT failed the build"; exit 1
+fi
+[ -f "$emptybootout.build/jolt.boot.vfasl" ] || { echo "  FAIL: an empty JOLT_BOOT did not build the default"; exit 1; }
+if ! JOLT_PWD="$app" JOLT_NO_VFASL= "$joltabs" build -m app.core -o "$emptynvout" >/dev/null 2>&1; then
+  echo "  FAIL: an empty JOLT_NO_VFASL failed the build"; exit 1
+fi
+[ -f "$emptynvout.build/jolt.boot.vfasl" ] || { echo "  FAIL: an empty JOLT_NO_VFASL forced plain"; exit 1; }
+# Within one source the explicit --boot spelling beats the --no-vfasl alias, in
+# either order: a script that adds --boot small without dropping its old
+# --no-vfasl is the migration #886 is on, and it used to silently get `plain`.
+precout="$(dirname "$out")/prec-boot-bin"
+if ! JOLT_PWD="$app" "$joltabs" build -m app.core --no-vfasl --boot small -o "$precout" >/dev/null 2>&1; then
+  echo "  FAIL: --no-vfasl --boot small build exited non-zero"; exit 1
+fi
+[ -f "$precout.build/jolt.boot.vfasl" ] || { echo "  FAIL: --boot small lost to the --no-vfasl alias"; exit 1; }
+got_small="$(cd / && "$smallout" alpha bb ccc 2>&1)"
+got_plain="$(cd / && "$plainout" alpha bb ccc 2>&1)"
+got_envplain="$(cd / && "$envplainout" alpha bb ccc 2>&1)"
+if [ "$got_small" != "$want" ] || [ "$got_plain" != "$want" ] || [ "$got_envplain" != "$want" ]; then
+  echo "  FAIL: --boot binaries disagree with the reference output"
+  echo "--- want ---";        echo "$want"
+  echo "--- small ---";       echo "$got_small"
+  echo "--- plain ---";       echo "$got_plain"
+  echo "--- JOLT_NO_VFASL ---"; echo "$got_envplain"
+  exit 1
+fi
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + atomic-runtime-cache + boot-modes)"

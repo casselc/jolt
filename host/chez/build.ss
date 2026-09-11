@@ -534,7 +534,7 @@
 ;; from disk (running from a source checkout). build-jolt embeds every runtime
 ;; .ss the manifest inlines, so `build` never touches the filesystem for them.
 (define (bld-source-string path)
-  (let ((emb (hashtable-ref embedded-resources path #f)))
+  (let ((emb (embedded-resource-ref path)))
     (cond ((string? emb) emb)
           ;; source embeds are UTF-8 bytevectors since the heap-size work —
           ;; missing this arm sent the standalone binary's `build` to disk for
@@ -560,12 +560,23 @@
 
 (define (bld-file-lines path) (bld-string-lines (bld-source-string path)))
 
+;; Build-time diagnostic. The runtime manifest carries one startup-profile mark
+;; per ENTRY, so "host/chez/rt.ss" is a single 64ms line hiding the ~40 files it
+;; transitively loads — enough to say the runtime is expensive, not enough to say
+;; which part. JOLT_PROFILE_INLINE=1 at BUILD time emits a mark after each inlined
+;; file, turning that one line into a per-file breakdown. Off by default: a
+;; shipped binary carries the coarse set, and each mark costs a statistics call.
+(define bld-profile-inline? (and (getenv "JOLT_PROFILE_INLINE") #t))
+
 ;; Emit one line to OUT, recursively inlining a `(load ...)` of a repo file.
 (define (bld-inline-line line out depth)
   (when (> depth 50) (error 'jolt-build "load nesting too deep"))
   (let ((p (bld-load-path line)))
     (if p
-        (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+        (begin
+          (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+          (when bld-profile-inline?
+            (bld-emit-startup-profile-mark! out (string-append "inlined " p))))
         (begin (put-string out line) (put-string out "\n")))))
 
 ;; Inline the runtime manifest, dispatching on the manifest tags. core-strs (the
@@ -1756,7 +1767,12 @@
               "(sa-gc-trip-bytes!\n"
               "  (let ((trip (getenv \"JOLT_GC_TRIP_BYTES\"))\n"
               "        (default (* 16 1024 1024)))\n"
-              "    (if trip (or (string->number trip) default) default)))\n"))
+              "    (if trip (or (string->number trip) default) default)))\n"
+              ;; and a heap ceiling, so a built app fails with an
+              ;; OutOfMemoryError carrying a stack rather than being SIGKILLed
+              ;; by the kernel with nothing to read. Same contract as jolt's own
+              ;; launcher and as the JVM's MaxRAMPercentage default.
+              "(jolt-install-heap-ceiling!)\n"))
           (put-string out "(scheme-start\n  (lambda args\n")
           (bld-emit-startup-profile-mark! out "scheme-start begin")
           ;; Shutdown hooks (`:shutdown` on a jolt.process, jolt.host/
@@ -1820,6 +1836,9 @@
                             "              (let ((jolt-main-result (apply jolt-invoke (var-cell-root maincell) args)))\n"
                             "                " (bld-startup-profile-form "entry -main") "\n"
                             "                jolt-main-result))))))\n"
+                            ;; as the CLI: a non-daemon Thread the program started
+                            ;; keeps the process alive until it finishes
+                            "    (jolt-await-user-threads!)\n"
                             "    (exit 0)))\n")))
           (close-port out))
         (ei-mark! "write flat.ss")
@@ -2124,6 +2143,268 @@
           (when cache
             (bld-runtime-cache-publish! so cache))))))
 
+;; --- how the boot image is encoded: --boot (jolt-lang/jolt#886) -------------
+;; Three points on one curve, and the flag is ordered along it:
+;;
+;;   'fast    vfasl + LZ4   the default — the fastest start, the largest binary
+;;   'small   vfasl + gzip  still an image, but a third smaller than a PLAIN boot
+;;                          and still faster to start than one
+;;   'plain   no vfasl      the fasl stream 0.8.4 produced (`--no-vfasl`)
+;;
+;; A vfasl boot is an image of the loaded heap, so it starts fast and takes room;
+;; that cost is what jolt#886 hit, an iOS `--target tpb64l` build growing 7.6MB in
+;; the binary and ~5MB in the IPA. But the cost turns out to be mostly the
+;; CODEC's, not vfasl's. Measured over two apps and two machine types, binary
+;; size and warm start against the plain boot as the baseline:
+;;
+;;   hello, host ta6le        plain 25,919,203/495ms  lz4 +5.5%/249ms  gzip -35.7%/429ms
+;;   build-app, host ta6le    plain 26,062,746/502ms  lz4 +5.8%/250ms  gzip -35.5%/434ms
+;;   hello, target tpb64l     plain 24,873,035        lz4 +5.8%        gzip -38.1%
+;;
+;; So for a jolt app 'small beats 'plain on BOTH axes and 'plain is a floor
+;; nobody should want — which is why it stays available (a target that cannot
+;; vfasl at all still needs it) but is not what the size-conscious build should
+;; reach for. The ratios are a property of what is in the image, not of the
+;; machine: the same three encodings over Chez's own boots, which carry no jolt
+;; runtime, cost lz4 +37% and gain gzip only 3-4%, with gzip SLOWER than plain.
+;; Anything user-facing has to say measure your own app, not quote one ratio.
+;;
+;; The mode is resolved once, in jolt.main (CLI flag > deps.edn > JOLT_BOOT /
+;; JOLT_NO_VFASL > default) and passed down; nothing here re-reads the
+;; environment, so there is one precedence rule rather than two.
+(define bld-boot-mode (make-parameter 'fast))
+
+(define (bld-vfasl-disabled?) (eq? (bld-boot-mode) 'plain))
+
+;; --- the boot image's LZ4 ceiling -------------------------------------------
+;; A big enough compressed fasl entry cannot be read back by the Chez kernel when
+;; the entry is LZ4. c/new-io.c's S_bytevector_uncompress returns the
+;; decompressed length as `Sfixnum(r)` with `int r`, and Sfixnum is
+;; `((ptr)(uptr)((x)*8))` — the multiply happens in the argument's own type, so
+;; the product leaves 32 bits and the length check in c/fasl.c can never match.
+;; The load then dies inside Sbuild_heap with "uncompressed size N ... is smaller
+;; than expected size M", before a line of the binary's own code has run. The
+;; gzip arm of the same function hands zlib a uLong and has no such ceiling.
+;;
+;; WHERE the line falls is undefined behaviour, and it is not the same on every
+;; platform, because what the widening cast does with the top bit of an overflowed
+;; `int` is the C compiler's business. Both of these are Chez 10.4.1
+;; (test/chez/vfasl-ceiling-test.ss measures whichever one is in front of it):
+;;
+;;   sign-extended   a NEGATIVE length at 2^28    ceiling 2^28   ta6le, and the
+;;                   platform in jolt-lang/jolt#886 — its -222298112 is exactly
+;;                   314572800*8 wrapped to signed 32-bit and divided back by 8
+;;   zero-extended   a length of 0 at 2^29        ceiling 2^29   tarm64osx
+;;
+;; 2^28 is therefore jolt's FLOOR, not a measurement of the machine: at or below
+;; every ceiling seen, so nothing it leaves on LZ4 can fail to load. On a
+;; zero-extending platform an image between 2^28 and 2^29 is re-encoded when it
+;; did not have to be, which costs decompression speed and nothing else. That is
+;; the direction to be wrong in, and it is why nothing user-facing quotes a size.
+;;
+;; It is 0.8.5's vfasl boot that can reach the ceiling at all. A plain boot is
+;; one compressed entry per top-level form and its entries are kilobytes;
+;; vfasl-convert-file combines each input boot file into ONE entry, so the app
+;; half of a large program is a single image — jolt's own is 43MB, and a program
+;; six times that size stops booting rather than merely booting slowly.
+;;
+;; jolt cannot fix the kernel it links against (an installed Chez is the user's),
+;; so it keeps the image off the ceiling instead: measure the converted boot and
+;; re-encode with gzip when an LZ4 entry is over. Only the oversized build pays
+;; gzip's slower decompression, and it pays it in exchange for booting at all.
+;;
+;; A parameter rather than a constant for one reason: the fallback below is code
+;; that runs only for images no gate can afford to build, and that is exactly the
+;; code that rots. test/chez/vfasl-ceiling-test.ss lowers the ceiling and drives
+;; the whole path against a boot it can build in a second. Nothing in a build
+;; moves it.
+(define bld-lz4-image-ceiling (make-parameter (expt 2 28)))
+
+;; The largest uncompressed size any LZ4 entry of the boot file PATH declares, or
+;; 0 when it has none. #f when the bytes do not parse as the framing below, which
+;; a caller reads as "leave this boot alone" — a Chez whose fasl layout moved is
+;; not something to guess at.
+;;
+;; Framing, from ChezScheme s/strip.ss (read-entry) and c/fasl.c:
+;;   header entry  0 <7 more header bytes> <uptr version> <uptr machine> ( … )
+;;   object entry  <situation 35|36|37> <uptr size> <u8 codec> <u8 kind>
+;;                 codec 45 gzip / 46 lz4: <uptr uncompressed-size> <payload>
+;;                 codec 44 uncompressed:  <payload>
+;;                 SIZE counts the codec and kind bytes and everything after.
+;;   terminator    127
+;; A boot holds several headers — the one emit-boot-header writes, then the one
+;; each input boot carried — so a header is a thing to skip, not an end.
+(define (bld-boot-max-lz4-entry path)
+  (define (u8 p)
+    (let ((b (get-u8 p)))
+      (if (eof-object? b) (error 'bld-boot-max-lz4-entry "eof in boot file" path) b)))
+  ;; -> (values value bytes-read), the shape the SIZE arithmetic needs
+  (define (uptr p)
+    (let loop ((k (u8 p)) (n 0) (c 1))
+      (let ((n (+ (* n 128) (bitwise-and k #x7f))))
+        (if (= 0 (bitwise-and k #x80))
+            (values n c)
+            (loop (u8 p) n (+ c 1))))))
+  (define (skip-header! p)               ; the leading 0 is already consumed
+    (let loop ((i 1)) (when (< i 8) (u8 p) (loop (+ i 1))))
+    (uptr p)                             ; version
+    (uptr p)                             ; machine type
+    (u8 p)                               ; #\(
+    (let loop () (unless (= (u8 p) 41) (loop))))          ; through #\)
+  (define (skip! p n)
+    (when (< n 0) (error 'bld-boot-max-lz4-entry "negative entry size" path))
+    (set-port-position! p (+ (port-position p) n)))
+  (guard (e (#t #f))
+    (let ((p (open-file-input-port path)))
+      (guard (e (#t (close-port p) (raise e)))
+        (let loop ((biggest 0))
+          (let ((b (get-u8 p)))
+            (cond
+              ((eof-object? b) (close-port p) biggest)
+              ((= b 0) (skip-header! p) (loop biggest))          ; another header
+              ((= b 127) (loop biggest))                         ; terminator
+              ((or (= b 35) (= b 36) (= b 37))                   ; visit/revisit/both
+               (let-values (((size size-bytes) (uptr p)))
+                 (let ((codec (u8 p)))
+                   (u8 p)                                        ; kind: fasl|vfasl
+                   (cond
+                     ((or (= codec 45) (= codec 46))
+                      (let-values (((raw raw-bytes) (uptr p)))
+                        (skip! p (- size 2 raw-bytes))
+                        (loop (if (and (= codec 46) (> raw biggest)) raw biggest))))
+                     ((= codec 44)
+                      (skip! p (- size 2))
+                      (loop biggest))
+                     (else (error 'bld-boot-max-lz4-entry "unknown fasl codec" codec))))))
+              (else (error 'bld-boot-max-lz4-entry "unknown fasl entry type" b)))))))))
+
+;; Does BOOT hold an LZ4 entry the kernel could not read back? #f for a boot that
+;; does not parse: the status quo already works for every image under the
+;; ceiling, and re-encoding on a guess would be the riskier answer. It says so
+;; out loud, though — a silent "could not check" is how this bug would come back
+;; wearing the same unreadable Sbuild_heap death it wore the first time.
+(define (bld-boot-over-lz4-ceiling? boot)
+  (let ((biggest (bld-boot-max-lz4-entry boot)))
+    (cond ((not biggest) (bld-note-unscannable-boot! boot) #f)
+          (else (>= biggest (bld-lz4-image-ceiling))))))
+
+;; "at or over" rather than a size: where the kernel actually gives out is
+;; undefined behaviour and moves by platform (2^28 or 2^29 — see
+;; bld-lz4-image-ceiling), so the number jolt acts on is its own floor, not a
+;; property of the machine, and quoting it as one would be wrong.
+(define (bld-note-wide-boot!)
+  (display (string-append
+             "jolt build: note — the boot image is at or over Chez's "
+             "LZ4 fasl ceiling;\n"
+             "  re-encoding it with gzip (slower to decompress, but it loads)\n")))
+
+(define (bld-note-retry-wide!)
+  (display (string-append
+             "jolt build: note — the boot image could not be written as an LZ4 "
+             "vfasl entry;\n  retrying with gzip\n")))
+
+(define (bld-note-no-vfasl!)
+  (display (string-append
+             "jolt build: note — the boot could not be converted to a vfasl "
+             "image;\n  keeping the plain boot (slower to start, same "
+             "behaviour)\n")))
+
+(define (bld-note-unscannable-boot! boot)
+  (display (string-append
+             "jolt build: note — could not read the fasl entry headers of "
+             boot ";\n  leaving its codec alone. If a large binary dies in "
+             "Sbuild_heap reporting an\n  \"uncompressed size\", this is the "
+             "check that stopped covering it.\n")))
+
+;; Convert BOOT to vfasl at VBOOT in this process, answering whether VBOOT is
+;; usable. LZ4 first — it is the fast default and what every normal image wants —
+;; then gzip if the image cleared the ceiling. The second arm also covers the
+;; conversion FAILING outright, which is what an image whose COMPRESSED half
+;; clears the ceiling does: $bytevector-compress reports its length through the
+;; same overflowing Sfixnum, so the write end raises long before the read end
+;; would have.
+(define (bld-vfasl-convert! boot vboot)
+  (if (eq? (bld-boot-mode) 'small)
+      (sa-vfasl-convert-file boot vboot 'wide)   ; asked for gzip; no ceiling to hit
+      (if (and (sa-vfasl-convert-file boot vboot)
+               (not (bld-boot-over-lz4-ceiling? vboot)))
+          #t
+          (and (sa-vfasl-convert-file boot vboot 'wide)
+               (begin (bld-note-wide-boot!) #t)))))
+
+;; The conversion as a form for the fresh-Chez compile scripts, empty under
+;; 'plain. 'small sets the codec in that process the way sa-vfasl-convert-file's
+;; 'wide does in this one.
+;;
+;; GUARDED, and it removes a half-written VBOOT on the way out. Those scripts run
+;; under bld-system, which turns a non-zero exit into a dead build — so an
+;; unguarded conversion means a target that cannot vfasl, or an image too big to
+;; write as one entry, takes the whole build down instead of degrading to the
+;; plain boot the way the in-process path does. bld-vfasl-ensure! reads the
+;; presence of VBOOT as the verdict.
+(define (bld-vfasl-script-form boot vboot)
+  (if (bld-vfasl-disabled?)
+      ""
+      (string-append
+        (if (eq? (bld-boot-mode) 'small) "(compress-format 'gzip)\n" "")
+        "(guard (e (#t (when (file-exists? " (ei-str-lit vboot) ")\n"
+        "                (delete-file " (ei-str-lit vboot) "))))\n"
+        "  (vfasl-convert-file " (ei-str-lit boot) " " (ei-str-lit vboot) " '()))\n")))
+
+;; One conversion in a fresh Chez, guarded the same way, leaving VBOOT present
+;; only if it worked. CODEC is 'wide for gzip, anything else for the default.
+(define (bld-vfasl-run-convert! builddir boot vboot codec)
+  (when (file-exists? vboot) (delete-file vboot))
+  (let ((cs (string-append builddir "/vfasl-convert.ss")))
+    (let ((p (open-output-file cs 'replace)))
+      (put-string p
+        (string-append
+          "(import (chezscheme))\n"
+          (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
+          (if (eq? codec 'wide) "(compress-format 'gzip)\n" "")
+          "(guard (e (#t (when (file-exists? " (ei-str-lit vboot) ")\n"
+          "                (delete-file " (ei-str-lit vboot) "))))\n"
+          "  (vfasl-convert-file " (ei-str-lit boot) " " (ei-str-lit vboot) " '()))\n"))
+      (close-port p))
+    (bld-system (string-append bld-chez " --script '" cs "'"))))
+
+;; The fresh-Chez counterpart of bld-vfasl-convert!, and the same contract:
+;; answer whether VBOOT is usable, never raise for a boot that simply could not
+;; be imaged. The paths that convert inside their compile script (build-with-cc,
+;; build-shared, and so every cross build) have to convert there — $fasl-to-vfasl
+;; lays an image out for one machine, and a cross build needs the xpatch's
+;; constants — so by the time we get here the attempt has already been made and
+;; this only has to grade it:
+;;
+;;   nothing produced   the script's conversion raised. Retry under gzip, which
+;;                      is also the arm for an image whose COMPRESSED half
+;;                      clears the ceiling. Still nothing: keep the plain boot.
+;;   over the ceiling   re-encode with gzip, as bld-vfasl-convert! does.
+;;   otherwise          the LZ4 image stands.
+(define (bld-vfasl-ensure! builddir boot vboot)
+  (cond
+    ((not (file-exists? vboot))
+     (bld-note-retry-wide!)
+     (bld-vfasl-run-convert! builddir boot vboot 'wide)
+     (cond ((file-exists? vboot) #t)
+           (else (bld-note-no-vfasl!) #f)))
+    ((bld-boot-over-lz4-ceiling? vboot)
+     (bld-note-wide-boot!)
+     (bld-vfasl-run-convert! builddir boot vboot 'wide)
+     (cond ((file-exists? vboot) #t)
+           (else (bld-note-no-vfasl!) #f)))
+    (else #t)))
+
+;; jolt's OWN boot (build-jolt.ss), whose conversion is not guarded: a jolt build
+;; that cannot image its boot is a broken toolchain, not a user's app degrading,
+;; so this raises rather than quietly shipping a plain boot.
+(define (bld-vfasl-regzip! builddir boot vboot)
+  (when (bld-boot-over-lz4-ceiling? vboot)
+    (bld-note-wide-boot!)
+    (bld-vfasl-run-convert! builddir boot vboot 'wide)
+    (unless (file-exists? vboot)
+      (error 'jolt-build "gzip re-encode of the boot image failed" vboot))))
+
 ;; units: a list of (src so kind) compiled in order and loaded into the boot in
 ;; that order, so the runtime half's defines precede the app half's reads.
 ;;   'whole   — one unsplit flat file: kernel prologue + baked fingerprint, no cache
@@ -2162,6 +2443,23 @@
               (if petite-only? '() (list scheme))
               (map cadr units)))
     (ei-mark! "make-boot-file")
+    ;; vfasl: the same win jolt's own boot gets (build-jolt.ss) — the kernel loads
+    ;; a prebuilt image straight into the static generation instead of walking a
+    ;; fasl stream and allocating, and Sbuild_heap's Scompact_heap then has far
+    ;; less to compact. Best effort: sa-vfasl-convert-file answers #f rather than
+    ;; raising, and the plain boot that is already on disk stays the payload.
+    ;;
+    ;; NOT when cross-compiling. Unlike build-with-cc and build-shared, which run
+    ;; their conversion inside the fresh-Chez compile script and so inherit the
+    ;; xpatch's retargeted constants, this one runs in THIS process — the host's.
+    ;; $fasl-to-vfasl lays the image out for a specific machine, so converting a
+    ;; target's boot with host constants would produce a broken binary. A cross
+    ;; build keeps the plain boot.
+    (unless (or (bld-cross?) (bld-vfasl-disabled?))
+      (let ((vboot (string-append boot ".vfasl")))
+        (when (bld-vfasl-convert! boot vboot)
+          (set! boot vboot)
+          (ei-mark! "vfasl-convert"))))
     ;; The stub is the native launcher the boot is appended to. With no :static
     ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
     ;; natives it's re-linked here from the bundled kernel + launcher source so the
@@ -2224,6 +2522,50 @@
         "-I'" builddir "' '" lc "' '" lk "' -o '" out-path "' "
         native-link " " (bld-link-libs))))))
 
+;; --- boot-image prefetch (cold start) ---------------------------------------
+;; A binary that embeds its boot as a C array hands Chez a pointer into .data — a
+;; private, file-backed mapping the kernel demand-pages 4KB at a time as
+;; Sbuild_heap walks it — and nothing tells the kernel that the whole multi-MB
+;; range is about to be read in order. A cold jolt run reads 19.1MB of its 27.8MB
+;; binary before it prints anything, nearly all of it this boot. MADV_WILLNEED
+;; over the range, issued BEFORE Sscheme_init, lets that read overlap kernel init
+;; and the runtime image's top levels instead of being scheduled fault by fault
+;; behind them.
+;;
+;; It is a hint, and it buys nothing measurable on storage that is already
+;; bandwidth-bound — the A/B is in the commit that added this. What it targets is
+;; the opposite regime, a page-in bound by latency rather than throughput.
+;; Advisory in every sense: nothing checks the result, no platform has to
+;; implement it, and a failure costs the speedup and nothing else. Shared by the
+;; three C-array boot sites — jolt's own main (build-jolt.ss), `jolt build`'s cc
+;; executable, and --library. The appended-boot stub reads its boot through an fd
+;; rather than a mapping and carries the fadvise-shaped equivalent itself
+;; (stub/launcher.c).
+(define (bld-boot-prefetch-defn)
+  (string-append
+    "#include <stddef.h>\n"
+    "#if defined(__linux__) || defined(__APPLE__)\n"
+    "#include <stdint.h>\n"
+    "#include <sys/mman.h>\n"
+    "#include <unistd.h>\n"
+    "static void jolt_prefetch_boot(const void *p, size_t n) {\n"
+    "  long pagesize = sysconf(_SC_PAGESIZE);\n"
+    "  uintptr_t start, base;\n"
+    "  if (pagesize <= 0 || n == 0) return;\n"
+    "  /* madvise wants a page boundary; the array rarely starts on one. */\n"
+    "  start = (uintptr_t)p;\n"
+    "  base = start & ~(uintptr_t)(pagesize - 1);\n"
+    "  madvise((void *)base, n + (size_t)(start - base), MADV_WILLNEED);\n"
+    "}\n"
+    "#else\n"
+    "static void jolt_prefetch_boot(const void *p, size_t n) { (void)p; (void)n; }\n"
+    "#endif\n"))
+
+;; The call: the first statement of main / jolt_library_init, so the readahead is
+;; already in flight for everything that follows it.
+(define (bld-boot-prefetch-call)
+  "  jolt_prefetch_boot(jolt_boot, (size_t)jolt_boot_len);\n")
+
 ;; --- legacy cc link (dev bin/jolt): fresh Chez compile + xxd + cc ------------
 (define (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c native-link petite-only?)
   (display (string-append "jolt build: compiling " entry-ns " (" mode " mode)\n"))
@@ -2245,9 +2587,20 @@
           (if petite-only?
               ""
               (string-append (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "))
-          (ei-str-lit flat-so) ")\n"))
+          (ei-str-lit flat-so) ")\n"
+          ;; vfasl, in THIS script so a cross build gets the xpatch's retargeted
+          ;; constants the way make-boot-file above does — see build-jolt.ss.
+          ;; --boot decides the codec, or omits the conversion (jolt#886).
+          (bld-vfasl-script-form boot (string-append boot ".vfasl"))))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
+  ;; the converted boot is what gets embedded
+  ;; …and only switch to it if one actually exists: bld-vfasl-ensure! answers #f
+  ;; for a target that could not be imaged at all, and the plain boot is then
+  ;; what gets embedded.
+  (unless (bld-vfasl-disabled?)
+    (when (bld-vfasl-ensure! builddir boot (string-append boot ".vfasl"))
+      (set! boot (string-append boot ".vfasl"))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   ;; The xxd symbol is derived from the path; normalize to jolt_boot.
   (bld-system (string-append
@@ -2257,7 +2610,9 @@
     (put-string mc
       (string-append
         "#include \"scheme.h\"\n#include \"boot_data.h\"\n"
+        (bld-boot-prefetch-defn)
         "int main(int argc, char *argv[]) {\n"
+        (bld-boot-prefetch-call)
         "  Sscheme_init(0);\n"
         "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
         "  Sbuild_heap(0, 0);\n"
@@ -2293,6 +2648,7 @@
     "#include \"scheme.h\"\n"
     "#include <string.h>\n"
     "#include \"boot_data.h\"\n"
+    (bld-boot-prefetch-defn)
     "/* jolt_set_lookup_addr is called from the built library's scheme-start\n"
     "   handler (registered via Sforeign_symbol after Sbuild_heap) to hand the\n"
     "   stub the Scheme lookup callable's address. */\n"
@@ -2301,6 +2657,7 @@
     "void* jolt_lookup(const char* name) { return jolt_lookup_fn ? jolt_lookup_fn(name) : 0; }\n"
     "int jolt_library_init(int argc, char** argv) {\n"
     "  if (!argv) argc = 0;  /* Sscheme_start reads argv[0..argc-1]; a NULL argv means no args */\n"
+    (bld-boot-prefetch-call)
     "  Sscheme_init(0);\n"
     "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, (iptr)jolt_boot_len);\n"
     "  Sbuild_heap(0, 0);\n"
@@ -2336,9 +2693,17 @@
           "(make-boot-file " (ei-str-lit boot) " '()\n  "
           (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n  "
           (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
-          (ei-str-lit flat-so) ")\n"))
+          (ei-str-lit flat-so) ")\n"
+          ;; vfasl, as in build-with-cc and build-jolt.ss
+          (bld-vfasl-script-form boot (string-append boot ".vfasl"))))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
+  ;; …and only switch to it if one actually exists: bld-vfasl-ensure! answers #f
+  ;; for a target that could not be imaged at all, and the plain boot is then
+  ;; what gets embedded.
+  (unless (bld-vfasl-disabled?)
+    (when (bld-vfasl-ensure! builddir boot (string-append boot ".vfasl"))
+      (set! boot (string-append boot ".vfasl"))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   (bld-system (string-append
     "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "
@@ -2359,32 +2724,41 @@
       "-o '" out-path "' " native-link " " (bld-link-libs))))
   (display (string-append "jolt build: wrote " out-path "\n")))
 
-;; optional trailing (target target-pack): a Chez machine string + a prepared
-;; target pack dir when cross-compiling (jolt build --target). Absent/nil = host.
-(define (bld-opt-str opt i)
+;; Optional trailing values are target, target-pack, boot-mode, aspect-config.
+;; Older callers may stop at any prefix; absent values retain host/default/nil.
+(define (bld-opt-ref opt i)
   (let loop ((o opt) (i i))
     (cond ((or (null? o) (< i 0)) #f)
-          ((= i 0) (and (not (jolt-nil? (car o))) (jolt-str-render-one (car o))))
+          ((= i 0) (car o))
           (else (loop (cdr o) (- i 1))))))
+(define (bld-opt-str opt i)
+  (let ((v (bld-opt-ref opt i)))
+    (and v (not (jolt-nil? v)) (jolt-str-render-one v))))
+;; The boot mode as a symbol. Absent (a caller passing only the cross pair) or
+;; unrecognized reads as the default, so a bad value degrades to today's build
+;; rather than failing one; jolt.main is what rejects a typo, with a message.
+(define (bld-opt-boot-mode opt i)
+  (let ((s (bld-opt-str opt i)))
+    (cond ((equal? s "small") 'small)
+          ((equal? s "plain") 'plain)
+          (else 'fast))))
 (def-var! "jolt.host" "build-binary"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
-    (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1)))
+    (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
+                   (bld-boot-mode (bld-opt-boot-mode opt 2)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
                     natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #f
-                    (if (or (null? opt) (null? (cdr opt)) (null? (cddr opt)))
-                        jolt-nil
-                        (caddr opt))))
+                    (let ((v (bld-opt-ref opt 3))) (if v v jolt-nil))))
     jolt-nil))
 (def-var! "jolt.host" "build-library"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
-    (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1)))
+    (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
+                   (bld-boot-mode (bld-opt-boot-mode opt 2)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
                     natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t
-                    (if (or (null? opt) (null? (cdr opt)) (null? (cddr opt)))
-                        jolt-nil
-                        (caddr opt))))
+                    (let ((v (bld-opt-ref opt 3))) (if v v jolt-nil))))
     jolt-nil))
