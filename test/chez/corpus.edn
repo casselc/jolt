@@ -192,6 +192,13 @@
   ;; expression can read directly, so this row is the contract: the first write
   ;; lands, the second does not until the explicit flush.
   {:suite "io / flush on newline" :label "println reaches the stream under a writer" :expected "[\"x\\n\" \"x\\n\" \"x\\ny\\n\"]" :actual "(let [b (java.io.ByteArrayOutputStream.) w (java.io.OutputStreamWriter. b) a (do (binding [*out* w] (println \"x\")) (.toString b)) c (do (binding [*out* w *flush-on-newline* false] (println \"y\")) (.toString b)) d (do (.flush w) (.toString b))] [a c d])" :portability :jvm}
+  ;; OutputStreamWriter is the char-writer path used when libraries stream text
+  ;; to bytes. Appendable's ranged overload is [start,end), returns this, and
+  ;; validates the range before it reaches the output stream.
+  {:suite "io / OutputStreamWriter append" :label "append overloads preserve ranges, Unicode, and fluent identity" :expected "[true true true true true true true \"ABabcdefbcdõ😀\"]" :actual "(let [b (java.io.ByteArrayOutputStream.) w (java.io.OutputStreamWriter. b)] [(identical? w (.append w \"A\")) (identical? w (.append w \\B)) (identical? w (.append w \"abcdef\" 0 6)) (identical? w (.append w \"abcdef\" 2 2)) (identical? w (.append w (StringBuilder. \"abcdef\") 1 4)) (identical? w (.append w \"aõz\" 1 2)) (let [s \"😀\"] (identical? w (.append w s 0 (.length s)))) (do (.flush w) (.toString b))])" :portability :jvm}
+  {:suite "io / OutputStreamWriter append" :label "nil CharSequence uses Java's null text before range slicing" :expected "[true true \"nullul\"]" :actual "(let [b (java.io.ByteArrayOutputStream.) w (java.io.OutputStreamWriter. b)] [(identical? w (.append w nil)) (identical? w (.append w nil 1 3)) (do (.flush w) (.toString b))])" :portability :jvm}
+  {:suite "io / OutputStreamWriter append" :label "invalid append ranges use StringIndexOutOfBoundsException" :expected "[\"StringIndexOutOfBoundsException\" \"StringIndexOutOfBoundsException\" \"StringIndexOutOfBoundsException\"]" :actual "(mapv (fn [[start end]] (let [w (java.io.OutputStreamWriter. (java.io.ByteArrayOutputStream.))] (try (.append w \"abc\" start end) :no-throw (catch IndexOutOfBoundsException e (.getSimpleName (class e)))))) [[-1 1] [0 4] [2 1]])" :portability :jvm}
+  {:suite "io / OutputStreamWriter append" :label "close flushes appended text to the downstream stream" :expected "\"closed\"" :actual "(let [b (java.io.ByteArrayOutputStream.) w (java.io.OutputStreamWriter. b)] (.append w \"closed\") (.close w) (.toString b))" :portability :jvm}
   ;; A URL built with a URLStreamHandler reads through it, whatever its protocol:
   ;; openConnection is the handler's and openStream is that connection's
   ;; getInputStream, so slurp and io/reader both reach it. Selmer's

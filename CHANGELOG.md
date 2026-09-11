@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`OutputStreamWriter.append(csq, start, end)` writes only the requested
+  range.** Its `char-writer` host method ignored `start` and `end`, so streaming
+  writers such as `clojure.data.json` repeated whole strings instead of copying
+  their unescaped runs. It now shares the checked `[start,end)` path used by the
+  other `Appendable` implementations, including range exceptions and fluent
+  return identity.
+
 - **The timeout hot-path scaling gate no longer depends on the millisecond clock
   floor.** It now measures a larger workload with monotonic nanoseconds and
   verifies that the same gate rejects the former quadratic sorted-list insertion
