@@ -45,6 +45,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`OutputStreamWriter.append(csq, start, end)` writes only the requested
+  range.** Its `char-writer` host method ignored `start` and `end`, so streaming
+  writers such as `clojure.data.json` repeated whole strings instead of copying
+  their unescaped runs. It now shares the checked `[start,end)` path used by the
+  other `Appendable` implementations, including range exceptions and fluent
+  return identity.
+
+- **Interface-typed string builders keep their portable fallback without paying
+  generic method-dispatch cost for the built-in implementation.** Calls through
+  `CharSequence` and `Appendable` now use guarded direct arms for Jolt's
+  `StringBuilder`, including ranged append and `subSequence`, while arbitrary
+  interface implementations retain ordinary protocol dispatch. Receiver and
+  arguments are still evaluated exactly once in source order.
+
 - **The timeout hot-path scaling gate no longer depends on the millisecond clock
   floor.** It now measures a larger workload with monotonic nanoseconds and
   verifies that the same gate rejects the former quadratic sorted-list insertion

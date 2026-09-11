@@ -174,18 +174,28 @@
 ;; identifiers and constructor calls alone. A constructor in target position is the
 ;; one compound case, and it is bound to a let by emit-let before reaching here.
 ;;
-;; append's 3-arg (x, start, end) form and setLength/insert/delete are left to the
-;; generic path: they are not hot and the range checks are worth more than the
-;; nanoseconds.
+;; append's 3-arg (x, start, end) form shares append-text with the generic method
+;; table.  That keeps its rendering, range checks, and fluent return contract in
+;; one place while avoiding both method-table lookups and rest-argument vectors.
+;; setLength/insert/delete remain on the generic path.
 (defn- sb-direct-emit [m argc t args]
-  (let [a0 (first args)]
+  (let [a0 (first args) a1 (second args) a2 (nth args 2 nil)]
     (cond
-      (= m "append")    (when (= argc 1)
-                          (str "(begin (sb-append! " t " (render-piece " a0 ")) " t ")"))
+      (= m "append")    (cond
+                          (= argc 1)
+                          (str "(begin (sb-append! " t " (render-piece " a0 ")) " t ")")
+                          (= argc 3)
+                          (str "(begin (sb-append! " t " (append-range-text " a0
+                               " " a1 " " a2 ")) " t ")")
+                          :else nil)
       (= m "toString")  (when (= argc 0) (str "(sb-str " t ")"))
       (= m "length")    (when (= argc 0) (str "(->num (sb-length " t "))"))
       (= m "isEmpty")   (when (= argc 0) (str "(fx=? (sb-length " t ") 0)"))
       (= m "charAt")    (when (= argc 1) (str "(string-ref (sb-str " t ") (jolt->idx " a0 "))"))
+      (= m "subSequence")
+      (when (= argc 2)
+        (str "(let* ((_s (sb-str " t ")) (_a (jnum->exact " a0 ")) (_b (jnum->exact " a1
+             "))) (sb-range-check _s _a _b) (substring _s _a _b))"))
       :else nil)))
 
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
@@ -832,7 +842,8 @@
                   "str-index-of" "str-index-of-any" "str-replace-literal"
                   "java-string-hash" "java-symbol-hash"
                   "keyword-t-ns" "keyword-t-name"
-                  "sb-append!" "sb-str" "sb-length" "render-piece" "->num"
+                  "sb-append!" "sb-str" "sb-length" "sb-jhost?"
+                  "append-range-text" "sb-range-check" "jnum->exact" "render-piece" "->num"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
                   ;; devirt cached-desc lookup (emit-invoke ctor inlining).
@@ -2891,29 +2902,32 @@
       (supported-host-methods m)
       (str "(jolt-host-call " (chez-str-lit m) " " t
            (if (empty? args) "" (str " " (str/join " " args))) ")")
-      ;; An UNPROVEN receiver whose method has a string or keyword
+      ;; An UNPROVEN receiver whose method has a string, keyword, or StringBuilder
       ;; direct form: test the receiver's type at the site and take
       ;; that form, with the generic dispatch as the slow arm — the
-      ;; same open-code-the-fast-case shape the bit ops use. Strings
-      ;; and keywords are what library code calls .length/.charAt/
-      ;; .getName on without a hint, and the generic walk cost
+      ;; same open-code-the-fast-case shape the bit ops use. Strings, keywords,
+      ;; and interface-typed builders are what library code calls
+      ;; .length/.charAt/.getName/.append on without a concrete hint, and the
+      ;; generic walk cost
       ;; 60-135 ns per call against 3-11 for the direct form. The
       ;; receiver and args are bound once, in order, so nothing is
       ;; evaluated twice and the direct forms may splice `t` freely.
-      ;; A receiver of any other type behaves exactly as before.
+      ;; Any other CharSequence/Appendable implementation behaves as before.
       chez?
       (let [tt (fresh-label "_ht$")
             as (mapv (fn [_] (fresh-label "_ha$")) args)
             sd (string-direct-emit m (count as) tt as)
             kd (keyword-direct-emit m (count as) tt as)
+            bd (sb-direct-emit m (count as) tt as)
             generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
                          " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
-        (if (or sd kd)
+        (if (or sd kd bd)
           (str "(let* ((" tt " " t ")"
                (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
                ") (cond"
                (when sd (str " ((string? " tt ") " sd ")"))
                (when kd (str " ((keyword-t? " tt ") " kd ")"))
+               (when bd (str " ((sb-jhost? " tt ") " bd ")"))
                " (else " generic ")))")
           (str "(record-method-dispatch " t " " (chez-str-lit m)
                " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
