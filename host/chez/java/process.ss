@@ -1111,6 +1111,1055 @@
         (cons "descendants" (lambda (self)
           (apply jolt-vector (map make-proc-handle (proc-descendants (jhost-state self))))))))
 
+;; --- opt-in scoped process ownership (Linux) ----------------------------------
+;; The ProcessBuilder surface above is the JVM's: it owns ONE pid, destroy
+;; signals ONE pid, and nothing about it can guarantee a caller's timeout kills
+;; the work a child spawned — destroy-tree enumerates descendants and signals
+;; them one pid at a time, a snapshot racing the tree's own growth, and a child
+;; that ignores SIGTERM survives p/destroy indefinitely. This section is a
+;; separate, OPT-IN facility for the caller that wants the stronger contract:
+;; spawn into a process group jolt owns exclusively, and when the run times out
+;; (or the root exits leaving the group populated), TERM the WHOLE group, then
+;; KILL it, and return only once /proc confirms nothing live remains in the
+;; owned scope. Nothing above changes: unscoped semantics are exactly what they
+;; were, and this is reached only through jolt.host/process-scope-run.
+;;
+;; Linux-only by construction: the scope is a POSIX process group created with
+;; POSIX_SPAWN_SETPGROUP — 0x02 in glibc's spawn.h (probed) and musl's (musl
+;; git: include/spawn.h) — signalled with kill(-pgid, sig) (kill(2): a pid
+;; < -1 addresses every process in that group), and enumerated by scanning
+;; /proc/<pid>/stat whose fields after the last ')' are "state ppid pgrp ..."
+;; (probed: /proc/self/stat — pgrp is the 3rd token). A full new SESSION is
+;; deliberately not attempted: neither libc provides a posix_spawnattr_setsid
+;; setter (no such prototype or exported symbol here through glibc 2.43 —
+;; probed; musl's spawn.h defines only the macro). glibc 2.43's posix_spawn
+;; does honor the raw POSIX_SPAWN_SETSID bit (0x80, __USE_GNU-guarded —
+;; probed: a child spawned with the bit lands in its own session), but setting
+;; it means poking an opaque struct's flag word and the glibc FLOOR (2.26,
+;; amazonlinux:2) is unprobed, so the "distinct execution session" this
+;; facility creates is a distinct process GROUP in jolt's session, uniformly:
+;; the child's pgid is its own pid, jolt is not a member, and kill(-pgid) can
+;; never reach jolt or anything jolt spawned unscoped. A group also detaches
+;; the child from the terminal's foreground group, so ^C at a tty does not
+;; interrupt it — the controller's timeout is the only way it ends, which is
+;; the point of an owned scope.
+;;
+;; The argv boundary is DIRECT: posix_spawn execs the resolved program with the
+;; caller's argv — no /bin/sh, no shell quoting, no word splitting (the
+;; ProcessBuilder path above routes through `sh -c` to reuse its cd/env/
+;; redirect prefixes; here those are file actions and an explicit envp instead,
+;; so no launcher is involved at all). stdio defaults to /dev/null on all three
+;; streams: for a caller not requesting capture that means no pipes at all, so
+;; a child can never block on a full pipe buffer and forced termination is
+;; always prompt — byte-for-byte the behavior this facility has always had.
+;; Separately bounded stdout/stderr capture (below) is the one opt-in
+;; replacement: a requested stream gets a pipe DRAINED BY THE CONTROLLER LOOP
+;; ITSELF through poll(2), so the no-deadlock property survives — both ends
+;; drain in the same loop that polls waitpid, and the retained bytes stop
+;; growing at the caller's own byte cap.
+(define proc-sc-attr-init
+  (jolt-foreign-proc-safe "posix_spawnattr_init" '(void*) 'int))
+(define proc-sc-attr-destroy
+  (jolt-foreign-proc-safe "posix_spawnattr_destroy" '(void*) 'int))
+(define proc-sc-attr-setpgroup
+  (jolt-foreign-proc-safe "posix_spawnattr_setpgroup" '(void* int) 'int))
+;; glibc/musl declare the flags argument short; bound as int, which is
+;; ABI-identical on the SysV x86-64 and aarch64 ABIs (both pass the argument in
+;; a 32-bit slot; the callee reads the low 16 bits) and keeps to this file's
+;; existing type vocabulary.
+(define proc-sc-attr-setflags
+  (jolt-foreign-proc-safe "posix_spawnattr_setflags" '(void* int) 'int))
+(define proc-sc-fa-addopen
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addopen" '(void* int string int int) 'int))
+;; addchdir_np is glibc 2.29+/musl 1.1.24+; jolt's floor builds reach older
+;; glibc (amazonlinux:2 is 2.26), so the binding is runtime-resolved and a
+;; request that needs it fails closed with an error instead of silently
+;; spawning in the wrong directory.
+(define proc-sc-fa-addchdir
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addchdir_np" '(void* string) 'int))
+
+(define proc-sc-POSIX-SPAWN-SETPGROUP 2)  ; probed: glibc + musl spawn.h
+(define proc-sc-O-RDWR 2)                 ; fcntl.h: stable on every Linux arch
+
+;; poll(2), for the scoped run's capture drain (the capture section below owns
+;; the pollfd layout notes). Bound with the BLOCKING convention, like
+;; proc-c-read/proc-c-write: a wait bounded only by a timeout must be
+;; __collect_safe, and the pollfd array the call fills in lives in foreign
+;; memory. Defined here, ABOVE proc-scope-ok?, so the gate can require it.
+(define proc-sc-poll
+  (jolt-foreign-proc-blocking "poll" '(void* size_t int) 'int))
+;; POLLIN: 0x001 in glibc's and musl's poll.h on x86-64 and aarch64 alike
+;; (table knowledge; this facility is already Linux-x86-64/aarch64 shaped —
+;; see the ABI note on proc-sc-attr-setflags).
+(define proc-sc-POLLIN 1)
+
+;; Everything the facility needs, present. proc-c-spawn/proc-fa-init/... are
+;; shared with the unscoped path; the attr entry points and kill are ours.
+;; poll joins the gate because the capture drain is not machinery the facility
+;; can degrade around: without it the controller cannot drain its own pipes,
+;; and a spawn that can leak a wedged capture is worse than no spawn — fail
+;; closed instead. Off Linux (no /proc) the exported fn throws rather than
+;; guessing.
+(define proc-scope-ok?
+  (and (eq? (sa-os-family) 'linux)
+       proc-c-spawn proc-fa-init proc-fa-destroy proc-sc-fa-addopen
+       proc-sc-attr-init proc-sc-attr-destroy proc-sc-attr-setpgroup
+       proc-sc-attr-setflags proc-kill proc-waitpid proc-sc-poll #t))
+
+;; Program resolution with the SAME shape as proc-program-resolvable? above
+;; (absolute: file must exist; slash-bearing: against the child cwd; bare: PATH
+;; scan) but returning the resolved path, since the scoped spawn execs the path
+;; itself rather than handing a shell a quoted token. -> path string or #f.
+(define (proc-sc-resolve-program prog effective-dir)
+  (cond
+    ((= (string-length prog) 0) #f)
+    ((char=? (string-ref prog 0) #\/) (and (file-exists? prog) prog))
+    ((proc-has-slash? prog)
+     (let ((p (proc-path-join (or effective-dir (getenv "JOLT_PWD") ".") prog)))
+       (and (file-exists? p) p)))
+    (else
+      (let ((path (getenv "PATH")))
+        (let loop ((dirs (if path (str-literal-split path ":") '())))
+          (cond ((null? dirs) #f)
+                ;; the clause needs its own consequent: a bare
+                ;; ((file-exists? ...)) clause would evaluate to the TEST's
+                ;; value (#t), and #t handed to posix_spawn as the path is a
+                ;; foreign-call exception — the branch had never been taken
+                ;; with a hit before (every caller spelled /bin/sh), so the
+                ;; latent bug survived until a bare-name resolution succeeded.
+                ((and (> (string-length (car dirs)) 0)
+                      (file-exists? (proc-path-join (car dirs) prog)))
+                 (proc-path-join (car dirs) prog))
+                (else (loop (cdr dirs)))))))))
+
+;; One /proc pass answering BOTH ownership questions: which live processes are
+;; members of the owned group (pgrp == pgid), and which live processes descend
+;; from the root pid (ppid walk — catches a descendant that left the group via
+;; its own setsid while its parent link still names our tree). "Live" excludes
+;; Z (zombie) and X/x (dying): the process has terminated and can do nothing
+;; further; zombies that pid 1 has not reaped yet must not hold the confirm
+;; loop, and the root's own zombie is settled by waitpid afterwards. A process
+;; that escaped BOTH nets (setsid AND reparented through an exited
+;; intermediate) is unreachable by /proc topology — an inherent limit, and the
+;; same one proc-descendants has. Each read is guarded: a process is free to
+;; exit between the listing and the read. Returns (values members descendants).
+(define (proc-sc-scan root-pid pgid)
+  (let ((info (make-eqv-hashtable))     ; pid -> (state-char . pgrp)
+        (kids (make-eqv-hashtable)))    ; ppid -> (pid ...)
+    (for-each
+      (lambda (name)
+        (let ((pid (string->number name)))
+          (when (fixnum? pid)
+            (guard (e (#t #f))
+              (call-with-port (open-input-file (string-append "/proc/" name "/stat"))
+                (lambda (p)
+                  (let* ((s (get-string-all p))
+                         (rp (let scan ((i (- (string-length s) 1)))
+                               (cond ((< i 0) #f)
+                                     ((char=? (string-ref s i) #\)) i)
+                                     (else (scan (- i 1)))))))
+                    ;; comm can contain spaces and ')', so parse after the
+                    ;; LAST ')' exactly as proc-linux-ppid-map does. Tokens
+                    ;; start at state; ppid is 2nd, pgrp 3rd (probed).
+                    (when rp
+                      (let ((parts (filter (lambda (t) (> (string-length t) 0))
+                                           (str-literal-split
+                                             (substring s (+ rp 1) (string-length s)) " "))))
+                        (when (and (pair? parts) (pair? (cdr parts)) (pair? (cddr parts)))
+                          (let ((state (string-ref (car parts) 0))
+                                (ppid (string->number (cadr parts)))
+                                (pgrp (string->number (caddr parts))))
+                            (when (and (fixnum? ppid) (fixnum? pgrp))
+                              (hashtable-set! info pid (cons state pgrp))
+                              (hashtable-set! kids ppid
+                                (cons pid (hashtable-ref kids ppid '())))))))))))))))
+      (guard (e (#t '())) (directory-list "/proc")))
+    ;; let*: the members scan uses dead? from the sibling binding, which a
+    ;; parallel let would not make visible to initializers.
+    (let* ((live? (lambda (pid)
+                    (let ((c (hashtable-ref info pid #f)))
+                      (and c (not (memv (car c) '(#\Z #\X #\x)))))))
+           (dead? (lambda (c) (memv (car c) '(#\Z #\X #\x))))
+           (members
+            (let loop ((ps (vector->list (hashtable-keys info))) (acc '()))
+              (if (null? ps)
+                  acc
+                  (let ((c (hashtable-ref info (car ps) #f)))
+                    (loop (cdr ps)
+                          (if (and c (= (cdr c) pgid) (not (dead? c)))
+                              (cons (car ps) acc)
+                              acc)))))))
+      ;; Walk the ppid edges from the root, live-only, seen-set against cycles
+      ;; (pid reuse can, in principle, make the graph cyclic).
+      (let ((seen (make-eqv-hashtable)))
+        (let walk ((frontier (hashtable-ref kids root-pid '())) (acc '()))
+          (cond ((null? frontier) (values members (reverse acc)))
+                ((hashtable-ref seen (car frontier) #f) (walk (cdr frontier) acc))
+                (else
+                 (hashtable-set! seen (car frontier) #t)
+                 (walk (append (hashtable-ref kids (car frontier) '()) (cdr frontier))
+                       (if (live? (car frontier)) (cons (car frontier) acc) acc)))))))))
+
+;; (proc-sc-stat-entry pid) -> (state-char . ppid) | #f. One guarded read of
+;; /proc/<pid>/stat; #f covers every way a process can vanish underneath the
+;; read (exited, reaped, or the pid never existed).
+(define (proc-sc-stat-entry pid)
+  (guard (e (#t #f))
+    (call-with-port (open-input-file (string-append "/proc/" (number->string pid) "/stat"))
+      (lambda (p)
+        (let* ((s (get-string-all p))
+               (rp (let scan ((i (- (string-length s) 1)))
+                     (cond ((< i 0) #f)
+                           ((char=? (string-ref s i) #\)) i)
+                           (else (scan (- i 1)))))))
+          (and rp
+               (let ((parts (filter (lambda (t) (> (string-length t) 0))
+                                    (str-literal-split
+                                      (substring s (+ rp 1) (string-length s)) " "))))
+                 (and (pair? parts) (pair? (cdr parts))
+                      (let ((ppid (string->number (cadr parts))))
+                        (and (fixnum? ppid)
+                             (cons (string-ref (car parts) 0) ppid)))))))))))
+
+;; Live ppid chain from `pid` up to `ancestor`? THE revalidation for bare-pid
+;; kills: a pid recorded by an earlier scan may since have exited and been
+;; REUSED by an unrelated process, and killing that pid unconditionally could
+;; kill the newcomer. The chain is re-checked from /proc immediately before
+;; kill(2), confining the signal to a process that is still, provably, inside
+;; our tree. The check→kill window itself cannot be closed from userspace
+;; (only pidfd_send_signal closes it) — that residue is this facility's
+;; documented irreducible limitation. A descendant whose chain broke (an
+;; intermediate exited and it was reparented to init) fails the check and is
+;; NOT signalled — fail-closed: the survivor then surfaces in the confirm
+;; step's loud error instead of risking an innocent kill.
+(define (proc-sc-descendant-now? pid ancestor)
+  (let loop ((p pid) (hops 0))
+    (and (< hops 64)                            ; backstop; pid reuse cannot cycle
+         (let ((e (proc-sc-stat-entry p)))
+           (cond ((not e) #f)                   ; vanished: dead, or never ours
+                 ((= p ancestor) #t)
+                 ((memv (car e) '(#\Z #\X #\x)) #f)  ; dead: not ours to signal
+                 (else (loop (cdr e) (+ hops 1))))))))
+
+(define (proc-sc-kill-descendant! root-pid pid sig)
+  (when (proc-sc-descendant-now? pid root-pid)
+    (proc-kill pid sig)))
+
+;; The escalation ladder, scoped and evidence-honest:
+;;   1. one /proc scan says what the scope still holds;
+;;   2. a TERM wave — kill(-pgid) ONLY under a scan that just showed live
+;;      members. While ANY member is alive the pgid cannot be taken by a new
+;;      group (the kernel keeps the id hashed while a task references it as
+;;      its pgrp — table knowledge, not probed here), so a group signal sent
+;;      against a membered group is confined to the owned scope as far as
+;;      process group semantics permit. The scan→kill instant, in which the
+;;      last member could die and the id be reused, is the irreducible
+;;      PID/PGID-reuse residue — same one as above, only pidfd closes it.
+;;      Descendants that left the group (own setsid) get per-pid TERMs,
+;;      each revalidated against pid reuse;
+;;   3. a grace window for the wave to quiet the scope;
+;;   4. a KILL wave — same gating, same revalidation. Nothing less can clear
+;;      a tree that ignored TERM.
+;; kill(2) to a negative pid cannot hit jolt: jolt is not a member. A failing
+;; kill is not an error here (ESRCH: the scope emptied first — the race made
+;; visible); a kill failing for a real reason (EPERM against a setuid child
+;; that kept our pgid) shows up in the confirm step, named. Returns the
+;; STRONGEST signal with positive delivery evidence toward the owned scope —
+;; kill(2)'s own return decides (0 = a member existed to take it; -1/ESRCH =
+;; nothing was delivered) — or 0 when escalation was skipped because the
+;; scope was already quiet. The caller must not claim more than that: a root
+;; that in fact died of the earlier wave while the KILL wave merely reached
+;; another member still reports 128+9 in the unwaitable fallback; which wave
+;; killed the root is unknowable without pidfd, and 9 is the honest ceiling.
+(define (proc-sc-escalate! root-pid pgid grace-ms)
+  (call-with-values (lambda () (proc-sc-scan root-pid pgid))
+    (lambda (members descs)
+      (let ((sent
+              (if (and (pair? members) (zero? (proc-kill (- pgid) proc-SIGTERM)))
+                  proc-SIGTERM 0)))
+        (for-each (lambda (d) (proc-sc-kill-descendant! root-pid d proc-SIGTERM)) descs)
+        (let ((deadline (+ (jolt-mono-nanos) (* grace-ms 1000000))))
+          (let loop ((sent sent))
+            (call-with-values (lambda () (proc-sc-scan root-pid pgid))
+              (lambda (ms ds)
+                (cond ((and (null? ms) (null? ds)) sent)
+                      ((< (jolt-mono-nanos) deadline) (jolt-pause-ms 10) (loop sent))
+                      (else
+                       (let ((sent2
+                               (if (and (pair? ms) (zero? (proc-kill (- pgid) proc-SIGKILL)))
+                                   proc-SIGKILL sent)))
+                         (for-each (lambda (d) (proc-sc-kill-descendant! root-pid d proc-SIGKILL)) ds)
+                         sent2)))))))))))
+
+;; The waves were sent; the only honest way to know the scope is empty is to
+;; keep asking /proc until it agrees — and each pass ACTS on what the current
+;; scan shows rather than on the earlier waves' claims: a member can fork in
+;; the grace window and a wave delivered before the fork misses the child,
+;; which then shows up here as a fresh live member. Re-signalling uses the
+;; same confinement rules as the waves (group signal only under a scan that
+;; just showed members; per-pid kills revalidated). The one survivor no
+;; signal can move is uninterruptible sleep (D state): wait a bounded time,
+;; then fail LOUD — returning "cleaned up" while a descendant lives is
+;; precisely the false success this facility exists to make impossible.
+(define proc-sc-confirm-ms 5000)
+(define (proc-sc-confirm-empty! root-pid pgid)
+  (let ((deadline (+ (jolt-mono-nanos) (* proc-sc-confirm-ms 1000000))))
+    (let loop ()
+      (call-with-values (lambda () (proc-sc-scan root-pid pgid))
+        (lambda (members descendants)
+          (cond ((and (null? members) (null? descendants)) #t)
+                ((< (jolt-mono-nanos) deadline)
+                 (when (pair? members) (proc-kill (- pgid) proc-SIGKILL))
+                 (for-each (lambda (d) (proc-sc-kill-descendant! root-pid d proc-SIGKILL))
+                           descendants)
+                 (jolt-pause-ms 10) (loop))
+                (else
+                 (throw-jvm (quote java.lang.RuntimeException)
+                   (string-append "process-scope: survivors after SIGKILL (uninterruptible?): group "
+                     (proc-join " " (map number->string members))
+                     " descendants "
+                     (proc-join " " (map number->string descendants)))))))))))
+
+;; The root is jolt's direct child: reap it for the real status — waitpid's
+;; answer is the honest one and is what callers get whenever the reap succeeds.
+;; A root that reaps as unwaitable (ECHILD — something else got there, e.g. a
+;; SIGCHLD=SIG_IGN set after our restore) falls back to 128+sent-sig, where
+;; sent-sig is the strongest signal we have POSITIVE delivery evidence for
+;; toward the scope (0 when escalation was skipped outright). That fallback is
+;; an informed reconstruction, not a fact: which wave actually killed the root
+;; is unknowable from here. Bounded by the same cap as the confirm (the root
+;; is dead when this runs; the bound is a backstop, not an expectation).
+(define (proc-sc-reap-root pid sent-sig)
+  (let ((deadline (+ (jolt-mono-nanos) (* proc-sc-confirm-ms 1000000))))
+    (let loop ()
+      (call-with-values (lambda () (proc-waitpid-once pid #t))
+        (lambda (rc decoded err)
+          (cond (decoded decoded)
+                ((or (= rc 0) (= err proc-EINTR))
+                 (if (< (jolt-mono-nanos) deadline)
+                     (begin (jolt-pause-ms 5) (loop))
+                     (if (> sent-sig 0) (+ 128 sent-sig) 0)))
+                (else (if (> sent-sig 0) (+ 128 sent-sig) 0))))))))
+
+;; Fail-closed setup: EVERY posix_spawn attribute / file-action return code is
+;; checked BEFORE posix_spawn runs, and any failure aborts the spawn. The
+;; setflags call is the load-bearing one — if it failed silently the child
+;; would land in jolt's process group, every later kill(-pgid) would address a
+;; group that is not the scope (or nothing at all), and the ownership
+;; guarantee would be void while everything reported success. No scope
+;; operation may run ungrouped; a failed setup means no child exists.
+(define (proc-sc-check-rc! what rc)
+  (unless (= rc 0)
+    (throw-jvm (quote java.io.IOException)
+      (string-append "process-scope: " what " failed (rc " (number->string rc) ")"))))
+
+;; --- separately bounded stdout/stderr capture for the scoped run -------------
+;; :out-bytes / :err-bytes (independent positive byte caps) replace that
+;; stream's /dev/null file action with a pipe drained BY THE CONTROLLER LOOP
+;; itself, through poll(2) over a pollfd set rebuilt each iteration: one
+;; syscall covers both streams, no reader threads, no fibers, no port
+;; machinery. Level-triggered POLLIN before every read is what makes a BLOCKING
+;; read safe (POLLIN on a pipe read end guarantees at least one byte or EOF, so
+;; the read that follows cannot park — probed standalone: a readable pipe read
+;; of N returns what is there, an EOF'd one returns 0) and what makes a flood
+;; deadlock-free: both ends drain in the SAME loop, so a child flooding stdout
+;; can never stall the reading of stderr — the classic two-pipe deadlock. While
+;; data flows, poll returns immediately and the loop degenerates into a tight
+;; drain; when the pipes are quiet it waits the same ~10ms the waitpid cadence
+;; always used, so an idle capture costs nothing extra.
+;;
+;; Memory is bounded by the caller's own cap: captured bytes accumulate as
+;; chunks in a list that stops growing at the cap, and the cap REACHED is the
+;; ABORT condition — the run ends through the same TERM-wave/grace/KILL-wave/
+;; confirm-empty escalation a timeout ends through (see the overflow contract
+;; in proc-scope-run's doc). The kernel's per-pipe buffer (64K by default, a
+;; fixed non-growing allowance) is the only remainder, and a stream whose cap
+;; was reached is simply not read anymore, so a flood can hold neither heap
+;; nor the loop.
+;;
+;; POLLIN/proc-sc-poll are bound and documented above, with the other scoped
+;; capability bindings — the drain is part of proc-scope-ok?'s gate, so poll
+;; is never missing while a capture pipe exists. struct pollfd is
+;; {int fd; short events; short revents;} — 8 bytes on both ABIs, packed here
+;; with foreign-set! at stride 8. POLLERR (0x8) and POLLHUP (0x10) are drained
+;; like POLLIN: on a pipe read end all three surface as "read now, get bytes
+;; or EOF".
+(define proc-sc-cap-chunk 32768)
+
+;; The capture pipes: BLOCKING fds by design — every read is justified by a
+;; just-returned POLLIN, which on a pipe guarantees at least one byte or EOF,
+;; so nothing can park. No O_NONBLOCK and no fcntl: the child's dup2'd write
+;; end shares this open file description, and O_NONBLOCK here would make the
+;; CHILD's own writes see spurious EAGAIN — the exact hazard the mk-pipe
+;; comment in proc-spawn-fd-level describes from the other side.
+(define (proc-sc-mkpipe)
+  (let ((fds (sa-foreign-alloc 8)))
+    (if (= 0 (proc-c-pipe fds))
+        (let ((r (sa-foreign-ref 'int fds 0))
+              (w (sa-foreign-ref 'int fds 4)))
+          (sa-foreign-free fds)
+          (cons r w))
+        (begin
+          (sa-foreign-free fds)
+          (throw-jvm (quote java.io.IOException)
+            "process-scope: pipe: cannot allocate")))))
+
+;; capture state: #(rfd wfd bound chunks total done? clean-eof?)
+;;   rfd  — the parent's read end, -1 once closed
+;;   wfd  — the parent's write-end copy, alive only between pipe() and the
+;;          posix_spawn return that closes it (the child's copy is closed by
+;;          file actions after its dup2 onto 1/2)
+;;   bound — the caller's byte cap (exact positive integer)
+;;   chunks — captured bytevectors, most recent first
+;;   total  — bytes captured so far; invariant: (<= total bound)
+;;   done?  — stop polling this stream: EOF, read error, bound reached, closed
+;;   clean-eof? — a genuine 0-byte read was observed (the :complete evidence)
+(define (proc-sc-cap-make bound)      (vector -1 -1 bound '() 0 #f #f))
+(define (proc-sc-cap-rfd c)           (vector-ref c 0))
+(define (proc-sc-cap-wfd c)           (vector-ref c 1))
+(define (proc-sc-cap-bound c)         (vector-ref c 2))
+(define (proc-sc-cap-chunks c)        (vector-ref c 3))
+(define (proc-sc-cap-total c)         (vector-ref c 4))
+(define (proc-sc-cap-done? c)         (vector-ref c 5))
+(define (proc-sc-cap-clean-eof? c)    (vector-ref c 6))
+(define (proc-sc-cap-rfd! c v)        (vector-set! c 0 v))
+(define (proc-sc-cap-wfd! c v)        (vector-set! c 1 v))
+
+;; The bound was reached — truncation, and (mid-run) the overflow abort. Only
+;; ever asked of a REQUESTED capture; #f / an absent cap answers #f.
+(define (proc-sc-cap-overflow? c)
+  (and c (>= (proc-sc-cap-total c) (proc-sc-cap-bound c))))
+
+;; A requested stream whose pipe is still worth polling.
+(define (proc-sc-cap-live? c)
+  (and c (>= (proc-sc-cap-rfd c) 0) (not (proc-sc-cap-done? c))))
+
+;; Close the read end and retire the stream. Without a prior clean EOF this
+;; leaves the status at :partial — closing is how every non-EOF retirement
+;; (including the dynamic-wind cleanup on an exception) honestly lands there.
+(define (proc-sc-cap-close! c)
+  (when (>= (proc-sc-cap-rfd c) 0)
+    (proc-c-close (proc-sc-cap-rfd c))
+    (proc-sc-cap-rfd! c -1))
+  (vector-set! c 5 #t))
+
+;; Close BOTH ends of a capture's pipe — the fail-closed path for a spawn that
+;; never succeeded (pipe() or file-action failure, or posix_spawn error), when
+;; no run loop exists to own the read end. Idempotent: closed ends read -1.
+(define (proc-sc-cap-abort! c)
+  (when c
+    (when (>= (proc-sc-cap-wfd c) 0)
+      (proc-c-close (proc-sc-cap-wfd c))
+      (proc-sc-cap-wfd! c -1))
+    (proc-sc-cap-close! c)))
+
+;; One POLLIN-justified read into caller-owned foreign scratch (one scratch is
+;; shared by both streams; only one read is ever in flight). Never reads past
+;; (- bound total), so the cap cannot be exceeded by a chunk. Retires the
+;; stream on EOF (clean-eof? #t — the :complete evidence), on a non-EINTR read
+;; error (nothing here should produce one; retiring without the EOF flag
+;; reports :partial rather than claiming completeness), and on reaching the
+;; bound. EINTR leaves the stream live; the next poll re-reports it.
+(define (proc-sc-cap-drain! c scratch)
+  (let ((want (min proc-sc-cap-chunk
+                   (- (proc-sc-cap-bound c) (proc-sc-cap-total c)))))
+    (if (<= want 0)
+        (proc-sc-cap-close! c)                    ; defensive: a 0-byte read
+                                                  ; would misread as EOF
+        (let ((got (proc-c-read (proc-sc-cap-rfd c) scratch want)))
+          (cond
+            ((> got 0)
+             (let ((bv (make-bytevector got)))
+               (do ((i 0 (+ i 1)))
+                   ((= i got))
+                 (bytevector-u8-set! bv i (sa-foreign-ref 'unsigned-8 scratch i)))
+               (vector-set! c 3 (cons bv (proc-sc-cap-chunks c)))
+               (vector-set! c 4 (+ (proc-sc-cap-total c) got)))
+             (when (>= (proc-sc-cap-total c) (proc-sc-cap-bound c))
+               (proc-sc-cap-close! c)))
+            ((= got 0)
+             (vector-set! c 6 #t)                 ; genuine EOF: :complete
+             (proc-sc-cap-close! c))
+            ((= (proc-errno) proc-EINTR) #f)      ; interrupted: poll re-reports
+            (else (proc-sc-cap-close! c)))))))
+
+;; poll(2) over the live capture fds, then drain each readable one once.
+;; timeout-ms keeps the controller's waitpid cadence when the pipes are quiet.
+;; rc <= 0 (timeout or EINTR) is just "nothing readable" — the caller's loop
+;; re-checks its own deadline regardless.
+(define (proc-sc-poll-drain! caps scratch timeout-ms)
+  (let ((live (filter proc-sc-cap-live? caps)))
+    (unless (null? live)
+      (let ((arr (sa-foreign-alloc (* 8 (length live)))))
+        (do ((i 0 (+ i 1)) (cs live (cdr cs)))
+            ((null? cs))
+          (sa-foreign-set! 'int arr (* 8 i) (proc-sc-cap-rfd (car cs)))
+          (sa-foreign-set! 'short arr (+ (* 8 i) 4) proc-sc-POLLIN))
+        (let ((rc (proc-sc-poll arr (length live) timeout-ms)))
+          (when (> rc 0)
+            (do ((i 0 (+ i 1)) (cs live (cdr cs)))
+                ((null? cs))
+              (unless (= 0 (bitwise-and
+                             (sa-foreign-ref 'short arr (+ (* 8 i) 6))
+                             #x19))              ; POLLIN|POLLERR|POLLHUP
+                (proc-sc-cap-drain! (car cs) scratch)))))
+        (sa-foreign-free arr)))))
+
+;; After the scope is confirmed empty, every writer the nets caught is dead,
+;; so EOF on a still-open capture pipe is DECIDABLE: drain what the kernel
+;; still holds — and what a TERMed writer flushed on the way out — bounded in
+;; TIME. A writer that escaped both nets could hold the pipe open forever; the
+;; honest answer for a stream that never reached EOF is :partial, not a hang.
+(define proc-sc-drain-budget-ms 500)
+(define (proc-sc-final-drain! caps scratch)
+  (let ((deadline (+ (jolt-mono-nanos) (* proc-sc-drain-budget-ms 1000000))))
+    (let loop ()
+      (when (and (< (jolt-mono-nanos) deadline)
+                 (exists proc-sc-cap-live? caps))
+        (proc-sc-poll-drain! caps scratch 50)
+        (loop)))))
+
+;; chunks -> one bytevector; total is the exact byte count, so the result
+;; never exceeds the caller's cap.
+(define (proc-sc-cap-bytes c)
+  (let ((out (make-bytevector (proc-sc-cap-total c) 0)))
+    (let loop ((i 0) (bs (reverse (proc-sc-cap-chunks c))))
+      (if (null? bs)
+          out
+          (let* ((bv (car bs)) (m (bytevector-length bv)))
+            (bytevector-copy! bv 0 out i m)
+            (loop (+ i m) (cdr bs)))))))
+
+;; What each status MEANS, exactly:
+;;   truncated — the byte bound was reached. Capture stopped there and, when
+;;               that happened before the run otherwise ended, ENDED the run as
+;;               an overflow abort. Whether the stream held exactly the bound
+;;               or more is NOT distinguished — proc-sc-cap-drain! never reads
+;;               past the bound to find out, because finding out would mean
+;;               either exceeding the cap or parking past the abort decision.
+;;   complete  — EOF was observed before the bound was reached: every writer
+;;               closed the pipe, so the string is the stream's ENTIRE output.
+;;   partial   — the run ended with neither: data may be missing because a
+;;               writer escaped the scope's nets and still holds the pipe open,
+;;               or the final drain's time budget ran out. The string is a
+;;               PREFIX of the stream, never more.
+(define (proc-sc-cap-status c)
+  (cond ((proc-sc-cap-overflow? c) "truncated")
+        ((proc-sc-cap-clean-eof? c) "complete")
+        (else "partial")))
+
+;; Lossy UTF-8 decode of the captured bytes: every valid sequence passes
+;; through; anything invalid — bad lead byte, bad or missing continuation,
+;; overlong form, surrogate, > #x10FFFF, or a valid-looking sequence truncated
+;; by the end of the capture — becomes one U+FFFD per invalid byte. The result
+;; is INERT data for the caller: returned, never evaluated, and no exception
+;; an adversarial writer can provoke. (Chez's own utf8->string ERRORS on
+;; invalid input — exactly the behavior a capture API cannot have.)
+(define proc-sc-FFFD (integer->char #xFFFD))
+(define (proc-sc-utf8->string-lossy bv)
+  (let ((n (bytevector-length bv)))
+    (let loop ((i 0) (rev '()))
+      (if (= i n)
+          (list->string (reverse rev))
+          (let* ((b0 (bytevector-u8-ref bv i))
+                 (b  (lambda (k) (bytevector-u8-ref bv (+ i k))))
+                 (ok2? (and (< (+ i 1) n) (<= #x80 (b 1) #xBF)))
+                 (ok3? (and ok2? (< (+ i 2) n) (<= #x80 (b 2) #xBF)))
+                 (ok4? (and ok3? (< (+ i 3) n) (<= #x80 (b 3) #xBF))))
+            (cond
+              ((< b0 #x80)
+               (loop (+ i 1) (cons (integer->char b0) rev)))
+              ((<= #xC2 b0 #xDF)                       ; C0/C1: overlong
+               (if ok2?
+                   (loop (+ i 2)
+                         (cons (integer->char
+                                 (+ (* (- b0 #xC0) #x40) (- (b 1) #x80)))
+                               rev))
+                   (loop (+ i 1) (cons proc-sc-FFFD rev))))
+              ((<= #xE0 b0 #xEF)
+               (if (and ok3?
+                        (or (> b0 #xE0) (>= (b 1) #xA0))   ; E0 A0..: not overlong
+                        (or (< b0 #xED) (< (b 1) #xA0)))  ; not ED A0..: no surrogate
+                   (loop (+ i 3)
+                         (cons (integer->char
+                                 (+ (* (- b0 #xE0) #x1000)
+                                    (* (- (b 1) #x80) #x40)
+                                    (- (b 2) #x80)))
+                               rev))
+                   (loop (+ i 1) (cons proc-sc-FFFD rev))))
+              ((<= #xF0 b0 #xF4)                       ; F5..: > #x10FFFF
+               (if (and ok4?
+                        (or (> b0 #xF0) (>= (b 1) #x90))  ; F0 90..: not overlong
+                        (or (< b0 #xF4) (<= (b 1) #x8F))) ; F4 <= ..8F
+                   (loop (+ i 4)
+                         (cons (integer->char
+                                 (+ (* (- b0 #xF0) #x40000)
+                                    (* (- (b 1) #x80) #x1000)
+                                    (* (- (b 2) #x80) #x40)
+                                    (- (b 3) #x80)))
+                               rev))
+                   (loop (+ i 1) (cons proc-sc-FFFD rev))))
+              (else (loop (+ i 1) (cons proc-sc-FFFD rev)))))))))
+
+;; The result rows for one stream: the inert string and its status, keyed
+;; :out/:out-status (or :err/:err-status). An UNREQUESTED stream contributes
+;; NOTHING — the /dev/null default is visible in the return SHAPE (no :out key
+;; at all), not just in the child's file descriptors.
+(define (proc-sc-cap-rows cap+nm)
+  (let ((c (car cap+nm)) (nm (cdr cap+nm)))
+    (if c
+        (list (jolt-keyword nm)
+              (proc-sc-utf8->string-lossy (proc-sc-cap-bytes c))
+              (jolt-keyword (string-append nm "-status"))
+              (jolt-keyword (proc-sc-cap-status c)))
+        '())))
+
+;; The structured request, a Clojure map:
+;;   :cmd           required — argv vector of strings; exec'd DIRECTLY, no
+;;                  Jolt-created shell (posix_spawn execs the resolved program
+;;                  with the caller's argv; env/cwd are an explicit envp and a
+;;                  file action, not shell prefixes)
+;;   :timeout-ms    required — controller timeout; escalation starts when the
+;;                  root has not exited by then
+;;   :term-grace-ms optional — how long the TERM wave gets before KILL (200)
+;;   :dir           optional — child cwd (needs addchdir_np; error if absent)
+;;   :env           optional — map of strings; REPLACES the environment
+;;                  (ProcessBuilder.environment semantics); absent = inherit
+;;   :out-bytes     optional — separately bounded stdout capture: a positive
+;;                  integer BYTE cap (integral value: a fraction like 2.5 or a
+;;                  non-number throws IllegalArgumentException — it is never
+;;                  silently truncated). Present = a pipe replaces that
+;;                  stream's /dev/null and the bytes come back in :out;
+;;                  absent = the /dev/null default exactly as before, and no
+;;                  :out key in the result at all.
+;;   :err-bytes     optional — the stderr twin; the two caps are independent
+;;                  and neither influences the other's stream, and the same
+;;                  integral-value requirement applies.
+;; Returns {:pid p :exit code :timed-out bool} — plus, per REQUESTED stream,
+;; {:out "…" :out-status :complete|:truncated|:partial} and/or the :err pair
+;; (see proc-sc-cap-status for exactly what each status means). The strings
+;; are INERT data: a lossy UTF-8 decode of the captured bytes (invalid
+;; sequences become U+FFFD, never an exception), returned and never evaluated.
+;;
+;; CAPTURE OVERFLOW CONTRACT: a stream whose captured bytes reach its cap is
+;; truncated and the run ENDS — the same TERM wave, grace, KILL wave and
+;; /proc confirm a timeout runs, with the same no-live-scope guarantee on
+;; return — but :timed-out stays FALSE, because the controller clock did not
+;; fire; the overflowing stream's :truncated status is what says why. The cap
+;; is honored exactly (at most :out-bytes bytes retained), and whether the
+;; stream held exactly the cap or more is deliberately not distinguished. A
+;; timeout that fires first wins, statuses and all.
+;;
+;; The rest of the guarantee is unchanged: when the call returns, the owned
+;; scope holds nothing live — the root has exited AND been reaped (or its
+;; status reconstructed per proc-sc-reap-root) and /proc shows no live member
+;; of the group and no live descendant — and that guarantee is not
+;; conditional on the timeout, on an overflow, or on a clean exit. The
+;; capture pipes are drained by the same controller loop that polls waitpid,
+;; so a flood on one stream can neither wedge the run on a full pipe nor
+;; starve the other stream's drain. Exceptions, by design: survivors of
+;; SIGKILL in D state throw rather than return (capture fds are closed on the
+;; way out), and a failed posix_spawn setup throws before any child exists
+;; (proc-sc-check-rc!) so no scope operation can ever run ungrouped.
+(define (proc-scope-run req)
+  (unless proc-scope-ok?
+    (throw-jvm (quote UnsupportedOperationException)
+      "process-scope: requires Linux with posix_spawn process-group and poll(2) support"))
+  (let ((get (lambda (k d) (jolt-get-dispatch req k d))))
+    (let ((cmd-raw (get (jolt-keyword "cmd") #f))
+          (timeout-ms (get (jolt-keyword "timeout-ms") #f))
+          (grace-ms (get (jolt-keyword "term-grace-ms") 200))
+          (dir (get (jolt-keyword "dir") #f))
+          (env-map (get (jolt-keyword "env") #f))
+          (out-bytes (get (jolt-keyword "out-bytes") #f))
+          (err-bytes (get (jolt-keyword "err-bytes") #f)))
+      (unless (and cmd-raw (not (jolt-nil? cmd-raw)))
+        (throw-jvm (quote IllegalArgumentException)
+          "process-scope: :cmd (argv vector of strings) is required"))
+       (let ((cmd (map jolt-str-render-one (seq->list (jolt-seq cmd-raw))))
+             ;; A capture request is a positive byte cap; #f / nil = not
+             ;; requested. Anything else fails closed BEFORE anything is
+             ;; spawned. The value must be INTEGRAL: jnum->exact truncates, so
+             ;; routing through it would silently floor a fraction (2.5 -> a
+             ;; 2-byte cap) — the exact conversion is checked for integrality
+             ;; instead, and a fractional bound is a caller error.
+             (cap-n (lambda (who v)
+                      (if (or (not v) (jolt-nil? v))
+                          #f
+                          (let ((n (guard (e (#t #f)) (exact (jolt-need-num v)))))
+                            (if (and (integer? n) (> n 0)) n
+                                (throw-jvm (quote IllegalArgumentException)
+                                  (string-append "process-scope: " who
+                                    " must be a positive integer byte bound"))))))))
+        (when (null? cmd)
+          (throw-jvm (quote IllegalArgumentException)
+            "process-scope: :cmd must not be empty"))
+        (unless (and timeout-ms (> (jnum->exact timeout-ms) 0))
+          (throw-jvm (quote IllegalArgumentException)
+            "process-scope: :timeout-ms (positive milliseconds) is required"))
+        (let ((timeout-n (jnum->exact timeout-ms))
+              (grace-n (max 0 (jnum->exact grace-ms)))
+              (dir-s (and dir (not (jolt-nil? dir)) (jolt-str-render-one dir)))
+              (out-n (cap-n ":out-bytes" out-bytes))
+              (err-n (cap-n ":err-bytes" err-bytes)))
+          (when (and dir-s (not proc-sc-fa-addchdir))
+            (throw-jvm (quote UnsupportedOperationException)
+              "process-scope: :dir needs posix_spawn_file_actions_addchdir_np (glibc 2.29+)"))
+          (let* ((eff-dir (if dir-s (project-relative dir-s) (proc-effective-dir #f)))
+                 (prog (jolt-str-render-one (car cmd)))
+                 (path (proc-sc-resolve-program prog eff-dir)))
+            (unless path
+              (throw-jvm (quote java.io.IOException)
+                (string-append "process-scope: cannot run program \""
+                               prog "\": error=2, No such file or directory")))
+            (proc-ensure-reapable!)
+            ;; argv[0] is the caller's own spelling (what ps shows), exactly as
+            ;; ProcessBuilder passes cmdarray through; only the exec PATH is
+            ;; the resolved one. envp NULL = inherit, no marshalling needed.
+            ;; The env pairs render FIRST — jolt-str-render-one on a bad map
+            ;; value can throw, and nothing foreign is allocated yet.
+            (let* ((env-pairs (and env-map (not (jolt-nil? env-map))
+                                   (map (lambda (e)
+                                          (string-append
+                                            (jolt-str-render-one (jolt-nth e 0)) "="
+                                            (jolt-str-render-one (jolt-nth e 1))))
+                                        (seq->list (jolt-seq env-map)))))
+                   (argv (proc-marshal-argv cmd))
+                   (envp (and env-pairs (proc-marshal-argv env-pairs)))
+                   (out-cap (and out-n (proc-sc-cap-make out-n)))
+                   (err-cap (and err-n (proc-sc-cap-make err-n)))
+                   ;; the REQUESTED captures, absent ones simply left out
+                   (caps (append (if out-cap (list out-cap) '())
+                                 (if err-cap (list err-cap) '())))
+                   (fa (sa-foreign-alloc 128))
+                   ;; glibc's posix_spawnattr_t is 336 bytes (probed:
+                   ;; sizeof — two 128-byte sigsets plus fields); musl's is
+                   ;; the same shape (its spawn.h shows flags/pgrp + two
+                   ;; sigset_t + sched fields + pad). 512 covers both with
+                   ;; margin; init writes the real size, destroy reads it.
+                   (attr (sa-foreign-alloc 512))
+                   (pidbuf (sa-foreign-alloc 8))
+                   ;; --- interruption, and the one way out of a live scope ------
+                   ;; The controller's loop can be cut short two ways, neither
+                   ;; at a moment this file chooses: cooperatively, per round,
+                   ;; through the thread-interrupt box (jolt-interrupt-poll-
+                   ;; check! — the same per-round check the interruptible
+                   ;; blocking waits use), and asynchronously, from under
+                   ;; jolt.host/run-interruptible, whose borrowed-timer escape
+                   ;; (jolt-run-interruptible) aborts the computation at an
+                   ;; arbitrary safe point — anywhere between a successful
+                   ;; spawn and the loop's decision. A raw escape used to reach
+                   ;; nothing but the fd closes: the owned group, TERM-
+                   ;; resistant members included, survived as a leak and the
+                   ;; root as a zombie. So every exit now funnels through ONE
+                   ;; dynamic-wind whose after-part runs the SAME
+                   ;; TERM->grace->KILL->confirm-empty ladder (settle!) before
+                   ;; anything — the result, the survivors error, or the
+                   ;; interruption — reaches the caller. Wind order IS the
+                   ;; guarantee: this frame sits inside whatever borrow wraps
+                   ;; the call, so its after-part has finished by the time the
+                   ;; borrow throws "Evaluation interrupted". The root's pid is
+                   ;; armed in scope-pid as the FIRST act of a successful
+                   ;; spawn, so the wind can key its cleanup on "a child
+                    ;; exists" from that instruction onward. The read+arm runs
+                    ;; under masked interrupts at the spawn's return (see the
+                    ;; with-interrupts-disabled region below), so a pending
+                    ;; escape fires only AFTER the box is written: the
+                    ;; post-spawn arming window is closed, not merely narrow.
+                    (scope-pid (box #f))  ; #f until a child exists
+                    (settled? (box #f))   ; settle! has run TO COMPLETION
+                    (settle-threw? (box #f)) ; a settle! attempt ended in a
+                                              ; throw; the ladder is retired
+                    (sent-box (box 0))    ; strongest evidenced signal, for
+                                          ; proc-sc-reap-root's fallback
+                    (scratch (sa-foreign-alloc proc-sc-cap-chunk)))
+              (let* ((settle!
+                       ;; The ladder, ONCE per run, shared by every ending.
+                       ;; Memoized on COMPLETION, not entry: an escape
+                       ;; truncating a half-escalated scope finds settled?
+                       ;; still #f, so the wind's after-part re-runs the
+                       ;; ladder to its end — a truncation is not a throw,
+                       ;; and re-running is safe by construction (every wave
+                       ;; is gated on a fresh /proc scan; confirm on an
+                       ;; emptied scope is one no-op pass). A THROW latches
+                       ;; settle-threw? instead: a ladder that blew up
+                       ;; (confirm-empty's D-state survivors) is never
+                       ;; restarted — it would only blow up again — and the
+                       ;; exception is preserved by the caller of this
+                       ;; closure (finish! lets it propagate; the wind's
+                       ;; after-part re-raises its own after cleanup).
+                       (lambda ()
+                         (unless (or (unbox settled?) (unbox settle-threw?))
+                           ;; the clause RE-RAISES: a Chez guard clause that
+                           ;; only sets the latch would RETURN the box value
+                           ;; and swallow the survivors error whole — the
+                           ;; caller would get a result map as if the scope
+                           ;; had emptied (verified by probe: guard's value
+                           ;; substitutes for the throw unless (raise e)
+                           ;; ends the clause).
+                           (guard (e (#t (set-box! settle-threw? #t) (raise e)))
+                             (let ((root (unbox scope-pid)))
+                               (when root
+                                 (set-box! sent-box
+                                   (proc-sc-escalate! root root grace-n))
+                                 (proc-sc-confirm-empty! root root)
+                                 (proc-sc-final-drain! caps scratch))
+                               (set-box! settled? #t))))))
+                     (finish!
+                      ;; shared exit path: the ladder, then the answer. decoded
+                      ;; is the reaped status when the root was waited;
+                      ;; otherwise proc-sc-reap-root reconstructs it from the
+                      ;; strongest evidenced signal. timed-out? is STRICTLY the
+                      ;; controller clock — an overflow abort passes #f and the
+                      ;; :truncated status says why.
+                      (lambda (decoded timed-out?)
+                        (settle!)
+                        (apply jolt-hash-map
+                          (append
+                            (list (jolt-keyword "pid") (unbox scope-pid)
+                                  (jolt-keyword "exit")
+                                  (or decoded
+                                      (proc-sc-reap-root (unbox scope-pid)
+                                        (unbox sent-box)))
+                                  (jolt-keyword "timed-out") timed-out?)
+                            (apply append
+                              (map proc-sc-cap-rows
+                                (list (cons out-cap "out")
+                                      (cons err-cap "err")))))))))
+                (dynamic-wind
+                  (lambda () #f)
+                  (lambda ()
+                    (let ((pid
+                      ;; pipe() through posix_spawn under the same exclusion
+                      ;; the unscoped fd-level spawn uses: a capture pipe is
+                      ;; exactly the no-pipe2()/O_CLOEXEC window that mutex
+                     ;; exists to close (see proc-spawn-fd-mutex above).
+                     ;; spawned? flips only on a successful posix_spawn; the
+                     ;; dynamic-wind after-part uses it to fail CLOSED on
+                     ;; every earlier throw (pipe() under fd exhaustion, a
+                     ;; failed file action) — no run loop will ever exist to
+                     ;; close those pipes, so the after-part closes them.
+                     (let ((spawned? (box #f)))
+                       (jolt-with-mutex proc-spawn-fd-mutex
+                         (dynamic-wind
+                           (lambda () #f)
+                           (lambda ()
+                             (when out-cap
+                               (let ((p (proc-sc-mkpipe)))
+                                 (proc-sc-cap-rfd! out-cap (car p))
+                                 (proc-sc-cap-wfd! out-cap (cdr p))))
+                             (when err-cap
+                               (let ((p (proc-sc-mkpipe)))
+                                 (proc-sc-cap-rfd! err-cap (car p))
+                                 (proc-sc-cap-wfd! err-cap (cdr p))))
+                             (proc-sc-check-rc! "posix_spawn_file_actions_init" (proc-fa-init fa))
+                             ;; stdin is /dev/null ALWAYS — the capture
+                             ;; contract has no stdin side.
+                             (proc-sc-check-rc! "posix_spawn_file_actions_addopen (stdin)"
+                               (proc-sc-fa-addopen fa 0 "/dev/null" proc-sc-O-RDWR 0))
+                             ;; stdout: the capture pipe's write end, or the
+                             ;; /dev/null default for callers not requesting it
+                             (if out-cap
+                                 (begin
+                                   (proc-sc-check-rc! "posix_spawn_file_actions_adddup2 (stdout)"
+                                     (proc-fa-dup2 fa (proc-sc-cap-wfd out-cap) 1))
+                                   (proc-sc-check-rc! "posix_spawn_file_actions_addclose (stdout)"
+                                     (proc-fa-close fa (proc-sc-cap-wfd out-cap)))
+                                   (proc-sc-check-rc! "posix_spawn_file_actions_addclose (stdout read end)"
+                                     (proc-fa-close fa (proc-sc-cap-rfd out-cap))))
+                                 (proc-sc-check-rc! "posix_spawn_file_actions_addopen (stdout)"
+                                   (proc-sc-fa-addopen fa 1 "/dev/null" proc-sc-O-RDWR 0)))
+                             (if err-cap
+                                 (begin
+                                   (proc-sc-check-rc! "posix_spawn_file_actions_adddup2 (stderr)"
+                                     (proc-fa-dup2 fa (proc-sc-cap-wfd err-cap) 2))
+                                   (proc-sc-check-rc! "posix_spawn_file_actions_addclose (stderr)"
+                                     (proc-fa-close fa (proc-sc-cap-wfd err-cap)))
+                                   (proc-sc-check-rc! "posix_spawn_file_actions_addclose (stderr read end)"
+                                     (proc-fa-close fa (proc-sc-cap-rfd err-cap))))
+                                 (proc-sc-check-rc! "posix_spawn_file_actions_addopen (stderr)"
+                                   (proc-sc-fa-addopen fa 2 "/dev/null" proc-sc-O-RDWR 0)))
+                             (when dir-s
+                               (proc-sc-check-rc! "posix_spawn_file_actions_addchdir_np"
+                                 (proc-sc-fa-addchdir fa dir-s)))
+                             (proc-sc-check-rc! "posix_spawnattr_init" (proc-sc-attr-init attr))
+                             (proc-sc-check-rc! "posix_spawnattr_setpgroup" (proc-sc-attr-setpgroup attr 0))
+                             (proc-sc-check-rc! "posix_spawnattr_setflags (POSIX_SPAWN_SETPGROUP)"
+                               (proc-sc-attr-setflags attr proc-sc-POSIX-SPAWN-SETPGROUP))
+                             (let ((rc (jolt-with-empty-sigmask
+                                         (lambda ()
+                                            (proc-c-spawn pidbuf path fa attr
+                                              (car argv) (if envp (car envp) 0))))))
+                                ;; A child exists as of posix_spawn's return, and
+                                ;; the guard is armed as the FIRST act — under
+                                ;; MASKED interrupts, which closes the post-spawn
+                                ;; arming window outright. Every instruction
+                                ;; between the kernel-side child creation and the
+                                ;; armed box is either inside the (uninterruptible
+                                ;; by polling) foreign call or this disabled
+                                ;; region; Chez holds a pending timer across
+                                ;; disabled interrupts and delivers it at the
+                                ;; enable — the delivery-on-enable rule the fiber
+                                ;; scheduler itself relies on (fibers.ss,
+                                ;; jolt-adjust-interrupts!) — so an escape pending
+                                ;; anywhere in the window fires with scope-pid
+                                ;; already set, and its unwind runs the ladder.
+                                ;; The region cannot park, allocate, or throw:
+                                ;; one memory read, one test, one box store.
+                                (with-interrupts-disabled
+                                  (when (= rc 0)
+                                    (set-box! scope-pid
+                                      (sa-foreign-ref 'int pidbuf 0))))
+                                (let ((p (sa-foreign-ref 'int pidbuf 0)))
+                                  (if (= rc 0)
+                                      (begin
+                                       ;; (scope-pid was armed in the masked
+                                       ;; region above — nothing further to do
+                                       ;; for the guard here.)
+                                       ;; An escape in the window before the
+                                       ;; write-end closes below leaves the
+                                       ;; parent's copies open; the guard's
+                                       ;; after-part closes both ends
+                                       ;; (proc-sc-cap-abort!), and the drain
+                                       ;; honestly reports :partial.
+                                        ;; the parent keeps ONLY the read ends:
+                                       ;; its own write-end copies close now,
+                                       ;; inside the excluded window — held any
+                                       ;; longer, EOF on the read side would
+                                       ;; never become decidable.
+                                       (when out-cap
+                                         (proc-c-close (proc-sc-cap-wfd out-cap))
+                                         (proc-sc-cap-wfd! out-cap -1))
+                                       (when err-cap
+                                         (proc-c-close (proc-sc-cap-wfd err-cap))
+                                         (proc-sc-cap-wfd! err-cap -1))
+                                       (set-box! spawned? #t)
+                                       p)
+                                     (begin
+                                       ;; failed spawn: no run loop will own
+                                       ;; these pipes — close every end we made
+                                       (proc-sc-cap-abort! out-cap)
+                                       (proc-sc-cap-abort! err-cap)
+                                       (throw-jvm (quote java.io.IOException)
+                                         (string-append "process-scope: posix_spawn failed (errno "
+                                                        (number->string rc) ")")))))))
+                           (lambda ()
+                             ;; an EARLIER throw (pipe/file-action failure)
+                             ;; never reaches the spawn's own cleanup — the
+                             ;; pipes close here instead. After a successful
+                             ;; spawn the wfds are -1 and the rfds belong to
+                             ;; the run loop, so this is a no-op there.
+                              (unless (unbox spawned?)
+                                (proc-sc-cap-abort! out-cap)
+                                (proc-sc-cap-abort! err-cap))
+                              (proc-fa-destroy fa) (proc-sc-attr-destroy attr)
+                              (sa-foreign-free fa) (sa-foreign-free attr)
+                              (sa-foreign-free pidbuf)
+                              (proc-free-argv argv)
+                               (when envp (proc-free-argv envp))))))))
+                      ;; The group is the scope and its id is the root's pid: pgroup 0
+                      ;; + SETPGROUP makes the child its own group leader before exec
+                      ;; (probed), so no grandchild can pre-date the group the way a
+                      ;; parent-side setpgid race would allow — settle! addresses every
+                      ;; wave to (root . root).
+                      (let ((deadline (+ (jolt-mono-nanos) (* timeout-n 1000000))))
+                        (let loop ()
+                          ;; Cooperatively interruptible per round, the same check the
+                          ;; interruptible blocking waits use: the throw unwinds this wind,
+                          ;; whose after-part finishes the ladder before the interruption
+                          ;; reaches the caller.
+                          (jolt-interrupt-poll-check! "process-scope-run")
+                          (call-with-values (lambda () (proc-waitpid-once pid #t))
+                            (lambda (rc decoded err)
+                              (cond
+                                ;; root exited on its own — the scope may still hold its
+                                ;; workers; escalation is a no-op when it does not (the entry
+                                ;; scan finds nothing to signal).
+                                (decoded (finish! decoded #f))
+                                ;; timed out: TERM the group, grace, KILL, confirm. sent is the
+                                ;; strongest signal DELIVERY was evidenced for — 0 if the scope
+                                ;; quieted before any wave landed, and the unwaitable-root
+                                ;; fallback claims no more than that.
+                                ((and (>= (jolt-mono-nanos) deadline)
+                                      (or (= rc 0) (= err proc-EINTR)))
+                                 (finish! #f #t))
+                                ;; ECHILD before any exit we saw: someone else reaped the root
+                                ;; (SIGCHLD=SIG_IGN set after our restore). The scope answer is
+                                ;; the same.
+                                ((and (< rc 0) (not (= err proc-EINTR)))
+                                 (finish! #f #f))
+                                ;; capture overflow: the SAME escalation and the SAME
+                                ;; no-live-scope confirmation a timeout gets — but the clock did
+                                ;; not fire, so :timed-out stays false and the overflowing
+                                ;; stream's :truncated says why.
+                                ((or (proc-sc-cap-overflow? out-cap)
+                                      (proc-sc-cap-overflow? err-cap))
+                                 (finish! #f #f))
+                                (else
+                                  ;; the wait step doubles as the drain step: poll the live capture
+                                  ;; pipes with the same 10ms cadence (level-triggered readiness turns
+                                  ;; a flood into a tight drain loop), or take the plain pause there
+                                  ;; always was when no capture is live.
+                                  (if (exists proc-sc-cap-live? caps)
+                                       (proc-sc-poll-drain! caps scratch 10)
+                                       (jolt-pause-ms 10))
+                                  (loop)))))))))
+                  (lambda ()
+                     ;; A PARK is not an exit — the same jolt-park-unwinding? seam
+                     ;; load-namespace* and the object monitor use (loader.ss: cleanup
+                     ;; belonging to the real exit does not run on a park). On a fiber
+                     ;; this loop parks EVERY quiet round (jolt-pause-ms below, or the
+                     ;; scheduler parks it at a preemption between syscalls), and settle!
+                     ;; parks in its grace/confirm waits; an unguarded after-part fires at
+                     ;; each of those, killing the live scope and freeing the scratch and
+                     ;; capture fds the resumed run still uses — a double free, observed
+                     ;; as glibc "double free or corruption" from a scoped run on a go
+                     ;; block. REAL exits — normal return, a raise (the cooperative
+                     ;; InterruptedException, the survivors error), and
+                     ;; run-interruptible's escape — answer #f and clean up. No cheap park
+                     ;; can strand this wind either: nothing under it is jolt-emitted
+                     ;; code, so every park it reaches falls back to a capture park, which
+                     ;; rewinds the frame and keeps the winder on the chain — the real
+                     ;; exit still runs this after-part.
+                     (unless (jolt-park-unwinding?)
+                       (let ((pending #f))
+                         ;; ONE attempt, in a guard: a settle that already ran and THREW
+                         ;; (from finish! — D-state survivors) is retired by the settle-threw?
+                         ;; latch and no-ops here rather than re-running a blown ladder; the
+                         ;; only ladders this can still run are a first attempt (interruption /
+                         ;; async escape) or the completion re-run of an escape-TRUNCATED one
+                         ;; (no throw involved). A fresh throw out of that attempt is stashed,
+                         ;; not propagated — not yet.
+                         (guard (e (#t (set! pending e)))
+                           (let ((root (unbox scope-pid)))
+                             (when root
+                               (settle!)
+                               ;; An interrupted run still owes the root its waitpid: the one
+                               ;; artifact a confirmed-empty scope can leave behind is the root's
+                               ;; own zombie, and the answer is discarded — what follows this
+                               ;; unwind is the interruption, not a result map. On the paths that
+                               ;; answered, finish! has reaped already and this is one ECHILD
+                               ;; no-op.
+                               (proc-sc-reap-root root (unbox sent-box)))))
+                         ;; CLEANUP IS UNCONDITIONAL once past the park guard: a throwing
+                         ;; ladder (the survivors error — a D-state or EPERM survivor the
+                         ;; confirm step could not clear) must not leak the capture fds or the
+                         ;; scratch on its way out. abort! rather than close!: a run cut
+                         ;; short between pipe() and a successful spawn — or in the window
+                         ;; before the parent's write-end copies closed — can still be holding
+                         ;; the write end.
+                         (for-each proc-sc-cap-abort! caps)
+                         (sa-foreign-free scratch)
+                         ;; Only now does a throw from THIS after-part's own attempt
+                         ;; propagate — AFTER cleanup — replacing the interruption with the
+                         ;; survivor error, the louder and worse piece of news. A throw
+                         ;; already in flight from finish! never entered the guard above; it
+                         ;; simply continues past this wind, original condition intact.
+                         (when pending (raise pending))
+                     ))))))))))))
+
+(def-var! "jolt.host" "process-scope-run" proc-scope-run)
+
 ;; --- CompletableFuture (Process.onExit().thenRun(f)) -------------------------
 ;; A minimal one-shot: thenRun spawns a thread that waits for the process to exit
 ;; and then runs the callback. Enough for babashka's :shutdown / :exit-fn hooks.
