@@ -616,6 +616,13 @@ static types, and the raw 64-bit ops bottom out at the Chez bignum floor
 (~20× a native long, substrate-inherent). A native SplitMix C/FFI shim would give
 the PRNG ~27× but is the only path that needs C.
 
+`interface_interop.clj` is a separate causal matrix for portable helpers typed
+to `CharSequence` and `Appendable`. It compares those helpers with otherwise
+identical concrete-hinted helpers for string scanning, one-argument append, and
+range append. Each round runs A/B/B/A and prints every monotonic-clock sample;
+compile the same source with exact base and candidate compilers. Its header has
+the Jolt and JVM commands.
+
 ## Running
 
 ```sh

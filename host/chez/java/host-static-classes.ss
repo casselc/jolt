@@ -213,10 +213,12 @@
 
 ;; Appendable.append text: append(x) renders x; append(csq,start,end) appends the
 ;; subsequence csq[start,end) (data.json's writer appends string runs this way).
+(define (append-range-text x start end)
+  (substring (render-piece x) (jnum->exact start) (jnum->exact end)))
 (define (append-text x rest)
   (if (null? rest)
       (render-piece x)
-      (substring (render-piece x) (jnum->exact (car rest)) (jnum->exact (cadr rest)))))
+      (append-range-text x (car rest) (cadr rest))))
 
 ;; Every index-taking StringBuilder method reports the same way the JVM does.
 (define (sb-range-check s start end)
