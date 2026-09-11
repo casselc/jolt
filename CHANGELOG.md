@@ -712,6 +712,13 @@ rounds and reads flags the way `java.util.Formatter` does.
 
 ### Fixed
 
+- **`OutputStreamWriter.append(csq, start, end)` writes only the requested
+  range.** Its `char-writer` host method ignored `start` and `end`, so streaming
+  writers such as `clojure.data.json` repeated whole strings instead of copying
+  their unescaped runs. It now shares the checked `[start,end)` path used by the
+  other `Appendable` implementations, including range exceptions and fluent
+  return identity.
+
 - **Starting jolt where there is no project says so.** `jolt run -m app.core`
   from a subdirectory of a project, or from anywhere with no `deps.edn`, reported
   "Could not locate app/core" — a missing namespace, when the problem was the

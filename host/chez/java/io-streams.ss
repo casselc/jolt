@@ -351,7 +351,7 @@
                                  (if (>= (length rest) 2) (substring s (jnum->exact (car rest))
                                                                      (+ (jnum->exact (car rest)) (jnum->exact (cadr rest)))) s)))
                    jolt-nil))
-   (cons "append" (lambda (self x . rest) (put-string (char-writer-port self) (cw-text x)) self))
+   (cons "append" (lambda (self x . rest) (put-string (char-writer-port self) (append-text x rest)) self))
    (cons "newLine" (lambda (self) (put-char (char-writer-port self) #\newline) jolt-nil))
    (cons "flush" (lambda (self)
                    (flush-output-port (char-writer-port self))
