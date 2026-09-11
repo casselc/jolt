@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Shell completion includes the aspect compiler CLI.** The v0.8.6 completion
+  inventory now exposes `jolt aspects` and its `plan`, `explain`, and `manifest`
+  operations in zsh and bash instead of hiding the retained integration-only
+  command after the release merge.
 - **`OutputStreamWriter.append(csq, start, end)` writes only the requested
   range.** Its `char-writer` host method ignored `start` and `end`, so streaming
   writers such as `clojure.data.json` repeated whole strings instead of copying

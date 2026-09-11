@@ -34,6 +34,7 @@
    ["nrepl-server" "start an nREPL server (default 7888) for editors"]
    ["run"          "load a file, or run -m NS"]
    ["build"        "compile a standalone binary or shared library"]
+   ["aspects"      "plan, explain, or generate compiler aspects"]
    ["path"         "print the resolved source roots"]
    ["tasks"        "list the project's bb.edn/deps.edn :tasks"]
    ["completions"  "print a shell completion snippet"]
@@ -65,7 +66,7 @@
 ;; this set has to be the one main checks — a name here that main does not guard
 ;; would hide a task that actually runs.
 (def ^:private overridable
-  #{"run" "repl" "nrepl-server" "path" "build" "tasks" "completions"})
+  #{"run" "repl" "nrepl-server" "path" "build" "aspects" "tasks" "completions"})
 
 (defn task-lines
   "One line per listable task: `name<TAB>doc`, or the bare name when it has no
@@ -216,6 +217,9 @@
        "      (( CURRENT == 3 )) && _describe -t commands 'shell' \\\n"
        "        '(zsh:a\\ zsh\\ completion\\ function bash:a\\ bash\\ completion\\ function"
        " fish:a\\ fish\\ completion tasks:name/doc\\ lines\\ for\\ a\\ snippet)' ;;\n"
+       "    aspects)\n"
+       "      (( CURRENT == 3 )) && _describe -t commands 'operation' \\\n"
+       "        '(plan:print\\ selected\\ aspects explain:explain\\ a\\ build\\ report manifest:generate\\ or\\ check\\ a\\ manifest)' ;;\n"
        "    build)\n"
        "      _arguments '-m[entry namespace]:namespace:' '-o[output path]:output:_files' \\\n"
        "        '--opt[optimized build]' '--dev[development build]' \\\n"
@@ -301,6 +305,7 @@
        "    run) tasks=$(_jolt_cached_tasks | cut -f1)\n"
        "         COMPREPLY=( $(compgen -W \"-m -f --file --parallel $tasks\" -- \"$cur\") ) ;;\n"
        "    completions) COMPREPLY=( $(compgen -W \"zsh bash fish tasks\" -- \"$cur\") ) ;;\n"
+       "    aspects) COMPREPLY=( $(compgen -W \"plan explain manifest\" -- \"$cur\") ) ;;\n"
        "    build) COMPREPLY=( $(compgen -W \"-m -o --opt --dev --no-direct-link --dynamic\n"
        "                                     --tree-shake --boot --library --target --target-pack\" -- \"$cur\") ) ;;\n"
        "    tasks|path|version|help|repl) ;;\n"
