@@ -57,7 +57,34 @@
              "warning: ~a member ~a/~a registered twice with different values\n"
              kind class member)))
 
-(define (register-class-statics! name members)  ; members: list of (str . val/proc)
+;; The host's own boot-time registrations (io.ss, host-static-classes.ss, …), the
+;; statics counterpart of host-class-ctors-tbl. Together they are what "the
+;; runtime provides this class" means: register-class-provider! refuses a claim on
+;; a class already in the tables, and at declaration time — jolt.deps, before any
+;; library code runs — the only entries there are these. Both spellings, because a
+;; claim is tested under both (class-spellings).
+(define host-class-statics-tbl (make-hashtable string-hash string=?))
+
+(define (register-class-statics! name members)
+  (hashtable-set! host-class-statics-tbl name #t)
+  (hashtable-set! host-class-statics-tbl (short-class-name name) #t)
+  (class-statics-merge! name members))
+
+;; Would register-class-provider! refuse a :jolt/provides claim on this class?
+;; Answered from the HOST tables and not the live ones: a class ANOTHER library
+;; registered is still free to be declared — nothing has claimed it — and a
+;; registration that just landed must not make itself the reason.
+(define (runtime-provides-class? name)
+  (let ((short (short-class-name name)))
+    (and (or (hashtable-ref host-class-statics-tbl name #f)
+             (hashtable-ref host-class-statics-tbl short #f)
+             (hashtable-ref host-class-ctors-tbl name #f)
+             (hashtable-ref host-class-ctors-tbl short #f))
+         #t)))
+
+;; The merge itself: also the LIBRARY path (register-class-statics-owned!,
+;; extend-class!), which adds members without making the class the runtime's.
+(define (class-statics-merge! name members)  ; members: list of (str . val/proc)
   (let* ((short (short-class-name name))
          (h (or (hashtable-ref class-statics-tbl name #f)
                 (hashtable-ref class-statics-tbl short #f)
@@ -82,7 +109,15 @@
 
 (define (register-class-ctor! name proc)
   (hashtable-set! host-class-ctors-tbl name #t)
-  (hashtable-set! class-ctors-tbl name proc))
+  (class-ctor-set! name proc))
+
+;; The plain table write, for a ctor that is NOT the runtime coming to provide a
+;; host class: every deftype and defrecord binds (Name. …) through this table
+;; (protocols.ss), under its "ns.Name" tag AND its simple name. Recording those
+;; as the host's would make host-class-ctors-tbl — which is what
+;; runtime-provides-class? and the constructor-override warning read — answer
+;; yes for any class whose simple name a user type happens to share.
+(define (class-ctor-set! name proc) (hashtable-set! class-ctors-tbl name proc))
 
 ;; clojure.core/__register-class-ctor! lands here. Registering a class jolt does
 ;; not model is the intended use; REPLACING one it does is a process-wide
@@ -94,11 +129,58 @@
 ;; register-class-statics! reports a colliding static, so the cause is one env
 ;; var away instead of a bisect.
 (define (register-class-ctor-user! name proc)
-  (when (and (getenv "JOLT_DEBUG") (hashtable-ref host-class-ctors-tbl name #f))
-    (fprintf (current-error-port)
-             "warning: a library replaced the host constructor for ~a — every (~a. ...) in this process now builds its shim, including in namespaces that never asked for it\n"
-             name name))
-  (hashtable-set! class-ctors-tbl name proc))
+  ;; A constructor is one value, so there is no additive half to let through the
+  ;; way register-class-statics-user! does with members.
+  (cond
+    ((lib-pending-claimer name)
+     => (lambda (pending)
+          (provider-claim-hold! name pending '())
+          (lib-defer-registration! pending (lambda () (register-class-ctor-user! name proc)))))
+    ((lib-provider-owner-elsewhere name)
+     => (lambda (owner) (provider-claim-drop! name owner '())))
+    (else
+     (provider-claim-note! name)
+     (when (and (getenv "JOLT_DEBUG") (hashtable-ref host-class-ctors-tbl name #f))
+       (fprintf (current-error-port)
+                "warning: a library replaced the host constructor for ~a — every (~a. ...) in this process now builds its shim, including in namespaces that never asked for it\n"
+                name name))
+     (lib-note-provider-registration! name)
+     (hashtable-set! class-ctors-tbl name proc))))
+
+;; clojure.core/__register-class-statics! lands here — the statics counterpart of
+;; register-class-ctor-user!, and under the same provider guard. The host's own
+;; boot-time registrations go straight to register-class-statics! and are not
+;; subject to it: nothing has declared anything yet when they run.
+(define (register-class-statics-user! name members)
+  (let ((pending (lib-pending-claimer name)))
+    (if pending
+        ;; The claimer has not spoken yet, so there is nothing to compare this
+        ;; against — and letting it land would put an entry in the registry for a
+        ;; class whose provider has not loaded, which is exactly what stops the
+        ;; autoload from ever running (jolt#914). Hold it until the claim settles.
+        (begin (provider-claim-hold! name pending (map car members))
+               (lib-defer-registration!
+                pending (lambda () (register-class-statics-user! name members))))
+        (register-class-statics-owned! name members))))
+
+;; The claim on `name` has settled (or there never was one): what the class's
+;; provider registered is authority, everything else is additive or refused.
+(define (register-class-statics-owned! name members)
+  (let ((owner (lib-provider-owner-elsewhere name)))
+    (if owner
+        ;; A provider owns the members it registered, not the whole name. Adding a
+        ;; member its shim does not answer is the additive case extend-class! exists
+        ;; for and stays allowed; REPLACING one is the substitution that made
+        ;; resolution depend on load order, and that is what is refused.
+        (let* ((h (lookup-class class-statics-tbl name))
+               (taken (if h (filter (lambda (m) (hashtable-contains? h (car m))) members) '()))
+               (fresh (if h (filter (lambda (m) (not (hashtable-contains? h (car m)))) members) members)))
+          (when (pair? taken) (provider-claim-drop! name owner (map car taken)))
+          (when (pair? fresh) (class-statics-merge! name fresh)))
+        (begin
+          (provider-claim-note! name)
+          (lib-note-provider-registration! name)
+          (class-statics-merge! name members)))))
 
 (define (register-host-methods! tag members)
   (let ((h (or (hashtable-ref host-methods-tbl tag #f)
@@ -345,6 +427,116 @@
            (box #f))))
 (define lib-class-providers core-class-providers)
 
+;; ---- claim index: which claims have not had their chance yet ----------------
+;; One entry per SPELLING for the claims of providers that have not been
+;; autoloaded yet; entries leave the moment their provider is attempted. Two
+;; questions read it, and neither is on the hot path: which provider to autoload
+;; when a class reference MISSES (lib-try-autoload!), and whether a registration
+;; is about to squat on a class whose claimer has not spoken (lib-pending-claimer).
+;; The flag keeps the second one — asked once per registration — a boolean test
+;; when nothing is declared.
+(define lib-pending-claims-tbl (make-hashtable string-hash string=?))
+(define lib-any-pending-claims? #f)
+;; Autoload is one-shot per provider, and two threads reaching a claimed class at
+;; once must not both load the install namespace. The latch flip, the index purge
+;; and the held-registration list go under this mutex; the load itself does NOT,
+;; because an install namespace requires others and a nested autoload would
+;; deadlock on a non-recursive mutex.
+(define lib-claims-mu (make-mutex))
+(define (lib-claim-pending! p)
+  (for-each (lambda (c) (hashtable-set! lib-pending-claims-tbl c p)) (vector-ref p 2))
+  (set! lib-any-pending-claims? #t))
+(define (lib-claim-settled! p)
+  (for-each (lambda (c) (hashtable-delete! lib-pending-claims-tbl c)) (vector-ref p 2))
+  (set! lib-any-pending-claims? (> (hashtable-size lib-pending-claims-tbl) 0)))
+(for-each lib-claim-pending! core-class-providers)
+
+;; Registrations HELD because the class's declared provider has not loaded yet.
+;; Letting one land would put an entry in the registry for a class whose claimer
+;; has not spoken — and a registry HIT is exactly what stops the autoload, which
+;; is how resolution came to depend on compile order (jolt#914). They are replayed
+;; the moment the claim settles, through the same guard as any other registration:
+;; what the provider implements wins, what it left unanswered still lands. Keyed
+;; by provider, because the provider is what settles.
+(define lib-deferred-tbl (make-eq-hashtable))
+(define (lib-defer-registration! p thunk)
+  (jolt-with-mutex lib-claims-mu
+    (hashtable-set! lib-deferred-tbl p (cons thunk (hashtable-ref lib-deferred-tbl p '())))))
+;; Called for every settled claim, including one whose install namespace was off
+;; the source roots or raised: a provider that cannot deliver must not swallow
+;; somebody else's registration with it. Answers whether anything was held, which
+;; is a change to what the registry says and so a reason for the caller to retry.
+(define (lib-replay-deferred! p)
+  (let ((held (jolt-with-mutex lib-claims-mu
+                (let ((h (hashtable-ref lib-deferred-tbl p '())))
+                  (hashtable-delete! lib-deferred-tbl p)
+                  h))))
+    (for-each (lambda (t) (t)) (reverse held))
+    (pair? held)))
+
+;; The provider whose install namespace is loading on THIS thread, or #f. A
+;; provider registers its classes as its install namespace loads, and the
+;; registration guard (lib-provider-owner-elsewhere) has to tell that registration
+;; apart from another library squatting on the same class.
+;;
+;; Whoever LOADS an install namespace sets the mark (loader.ss load-namespace*,
+;; through lib-with-install-ns-mark) — not the autoload alone. A provider whose
+;; install namespace requires a SECOND provider's, which is how kmet reached
+;; jolt.crypto, registers that second provider's classes under a plain require;
+;; marking the whole load with the outer provider left the inner one's classes
+;; owned by nobody, so a later registration for a member it answers was accepted
+;; instead of dropped — jolt#914 one level down — and JOLT_DEBUG named the wrong
+;; namespace (jolt#926).
+(define lib-loading-provider (make-thread-parameter #f))
+
+(define (lib-provider-by-install-ns ns)
+  (let loop ((ps lib-class-providers))
+    (cond ((null? ps) #f)
+          ((string=? ns (vector-ref (car ps) 0)) (car ps))
+          (else (loop (cdr ps))))))
+
+;; Run `thunk` marked with the provider `ns` installs, if it installs one. A
+;; namespace that is NOT an install namespace leaves the mark alone rather than
+;; clearing it: a provider whose install! calls a helper namespace of its own is
+;; still that provider registering, and only another DECLARED provider is a
+;; different registrant.
+(define (lib-with-install-ns-mark ns thunk)
+  (let ((p (lib-provider-by-install-ns ns)))
+    (if p (parameterize ((lib-loading-provider p)) (thunk)) (thunk))))
+
+;; Classes a declared provider actually registered as its install namespace
+;; loaded. This is what the registration guard protects: a class whose provider
+;; has spoken for it is that provider's, and a later registration from anywhere
+;; else is dropped rather than allowed to win by being last (jolt#914). Filled at
+;; REGISTRATION time, not from the declaration, so a class a provider declares and
+;; never registers stays open — the declaration alone is not an implementation.
+(define lib-provider-owned-tbl (make-hashtable string-hash string=?))
+;; jolt.time.base and jolt.socket are the runtime's own BASE tier, and a base tier
+;; exists to be extended: jolt-lang/time declares only the formatting classes
+;; (DateTimeFormatter, ZoneId, ...) and adds a DateTimeFormatter arm to
+;; java.time.LocalDate/from, a class the base declares. That is the arrangement
+;; working, not a squat — the base ships the value types that must resolve with no
+;; dependency, and the library completes them.
+;;
+;; So what jolt ships claims a NAME, not the implementation of every member under
+;; it. RFC 0014's guard is about two DEPENDENCIES disagreeing over who implements a
+;; class (jolt#914), and the base tier is not one of them. Without this the tick
+;; suite lost five parse tests to "dropping a registration for LocalDate/from".
+(define (lib-core-provider? p) (and (memq p core-class-providers) #t))
+
+;; Every SPELLING of the class goes in, not just the one written: the statics
+;; table keys the fully-qualified and the simple name to ONE member table
+;; (register-class-statics!), so a registration under either spelling reaches the
+;; same members and both have to be covered.
+(define (lib-note-provider-registration! name)
+  (let ((p (lib-loading-provider)))
+    (when (and p (not (lib-core-provider? p)) (member name (vector-ref p 2)))
+      (let ((short (short-class-name name)))
+        (for-each (lambda (c)
+                    (when (string=? (short-class-name c) short)
+                      (hashtable-set! lib-provider-owned-tbl c p)))
+                  (vector-ref p 2))))))
+
 ;; Declared providers from the dependency graph, installed at startup by
 ;; jolt.deps. A claim on a class the runtime already IMPLEMENTS is refused: a
 ;; dependency does not get to redefine what String means, and the same posture is
@@ -368,9 +560,9 @@
                          (fold-left (lambda (a c) (if (string=? a "") c (string-append a ", " c)))
                                     "" taken)
                          ", which the runtime already provides.")))
-        (set! lib-class-providers
-              (append lib-class-providers
-                      (list (vector install-ns coordinate cs (box #f))))))))
+        (let ((p (vector install-ns coordinate cs (box #f))))
+          (set! lib-class-providers (append lib-class-providers (list p)))
+          (lib-claim-pending! p)))))
 
 ;; The Clojure-facing seam. jolt.deps calls this once per declared provider after
 ;; it resolves the dependency graph, before any user code compiles — which is the
@@ -392,16 +584,156 @@
 ;; on the source roots and raised while loading. 'failed is what separates a
 ;; dependency the caller forgot to declare from one that is declared and broken;
 ;; see unknown-class-message.
+(define (lib-load-provider! p)
+  ;; claim the load: whoever flips the latch from #f does it, everyone else sees
+  ;; a provider that has already had its chance and moves on.
+  (and (jolt-with-mutex lib-claims-mu
+         (and (not (unbox (vector-ref p 3)))
+              (begin (set-box! (vector-ref p 3) 'ok)
+                     (lib-claim-settled! p)
+                     #t)))
+       ;; The claim is settled from here whatever happens next, so registrations
+       ;; held against it are replayed on every exit — including the install
+       ;; namespace being off the roots, and the one that raises. A provider that
+       ;; cannot deliver leaves the class to whoever else registered it, which is
+       ;; what happened before the claim was honoured at all.
+       ;;
+       ;; Either half is a reason for the caller to look again, so the answer is
+       ;; their OR: a class can become resolvable through a replay alone.
+       (let* ((loaded (and (find-ns-file (vector-ref p 0))
+                           (begin (guard (c (#t (set-box! (vector-ref p 3) 'failed)
+                                                (lib-replay-deferred! p)
+                                                (raise c)))
+                                    ;; the mark comes from load-namespace* itself
+                                    ;; (lib-with-install-ns-mark), which is the
+                                    ;; only way it can also cover an install
+                                    ;; namespace reached by a plain require.
+                                    (load-namespace (vector-ref p 0)))
+                                  #t)))
+              (replayed (lib-replay-deferred! p)))
+         (or loaded replayed))))
+
+;; RFC 0014's resolution step: a class reference that MISSES the registry
+;; autoloads the provider that declares the class, and retries.
+;;
+;; A miss is enough because a claimed class cannot be a HIT before its claimer has
+;; loaded — register-class-provider! refuses a claim on a class the runtime
+;; already implements, and lib-pending-claimer holds any other library's
+;; registration until the claim settles. That is what makes resolution a property
+;; of the dependency graph rather than of compile order (jolt#914): the table hit
+;; that used to serve an undeclared registration — jolt.crypto registers an
+;; EC-only java.security.Signature while declaring only the symmetric classes —
+;; never forms, so the claimer still autoloads and still wins.
+;;
+;; Keeping it on the miss path is also what keeps it off the hot one: every
+;; static reference and every (Class. ...) would otherwise pay a lookup here, and
+;; jolt.time.base / jolt.socket leave a claim pending in almost every program, so
+;; there is no steady state in which that lookup goes away.
 (define (lib-try-autoload! class)
-  (let ((p (lib-provider-for class)))
-    (and p
-         (not (unbox (vector-ref p 3)))
-         (begin (set-box! (vector-ref p 3) 'ok)
-                (and (find-ns-file (vector-ref p 0))
-                     (begin (guard (c (#t (set-box! (vector-ref p 3) 'failed)
-                                          (raise c)))
-                              (load-namespace (vector-ref p 0)))
-                            #t))))))
+  (and lib-any-pending-claims?
+       (let ((p (hashtable-ref lib-pending-claims-tbl class #f)))
+         (and p (lib-load-provider! p)))))
+
+;; The provider that DECLARES this class and has not had its chance yet — meaning
+;; the registration about to happen is somebody else's, and must wait. #f when
+;; nothing claims the class, when the claim has already settled, or when this IS
+;; the claimer registering.
+(define (lib-pending-claimer name)
+  (and lib-any-pending-claims?
+       (let ((p (hashtable-ref lib-pending-claims-tbl name #f)))
+         (and p
+              (not (eq? p (lib-loading-provider)))
+              ;; An install namespace pulled in by a plain require rather than by
+              ;; the autoload carries no lib-loading-provider mark, and its own
+              ;; registrations must not be held against it.
+              (not (ns-dedup-loaded? (vector-ref p 0)))
+              p))))
+
+;; ---- the registration guard -------------------------------------------------
+;; A class a dependency DECLARES is that dependency's to implement, and RFC 0014
+;; already refuses two libraries claiming one class (jolt.deps host-class-providers)
+;; — so a claimed class has exactly one implementor and the only thing that can
+;; take it away is an undeclared side-effect registration from someone else's
+;; install!. That is what made resolution depend on compile order: whoever
+;; registered last decided what java.security.Signature meant, and who registered
+;; last depended on which namespace happened to compile first.
+;;
+;; So once the declared provider has registered a class member, a registration of
+;; that member from anywhere else is dropped. Loudly: the library asked for
+;; something it did not get, and the symptom otherwise shows up somewhere else
+;; entirely. Members the provider does NOT answer still go through — a shim with a
+;; gap in it is the case class-extensions.ss exists for, and a claim is authority
+;; over what the provider implements, not a reservation on the name.
+(define (lib-provider-owner-elsewhere name)
+  (let ((p (hashtable-ref lib-provider-owned-tbl name #f)))
+    (and p (not (eq? p (lib-loading-provider))) p)))
+
+;; One warning per class, not per registration: an install namespace registers
+;; the fully-qualified name, the simple name, and a constructor for the same
+;; class, and four copies of one message reads like four problems.
+(define lib-claim-warned-tbl (make-hashtable string-hash string=?))
+(define (claim-warn-once? tag name)
+  (let ((k (string-append tag "/" (short-class-name name))))
+    (and (not (hashtable-ref lib-claim-warned-tbl k #f))
+         (begin (hashtable-set! lib-claim-warned-tbl k #t) #t))))
+
+(define (provider-claim-drop! name owner members)
+  (when (claim-warn-once? "drop" name)
+    (fprintf (current-error-port)
+             "warning: dropping ~a — ~a declares that class (:jolt/provides, RFC 0014) and implements ~a; a library may only register the classes it declares\n"
+             (if (null? members)
+                 (string-append "a constructor registration for " name)
+                 (string-append "a registration for "
+                                (fold-left (lambda (a m)
+                                             (let ((one (string-append name "/" m)))
+                                               (if (string=? a "") one (string-append a ", " one))))
+                                           "" members)))
+             (or (vector-ref owner 1) (vector-ref owner 0))
+             (cond ((null? members) "it")
+                   ((null? (cdr members)) "that member")
+                   (else "those members")))))
+
+;; The same registration BEFORE the claimer has loaded costs nobody the class:
+;; it is held, the claimer autoloads on the first reference and registers, and
+;; whatever the claimer left unanswered lands after it. So this is a note, not the
+;; refusal provider-claim-drop! reports — but it is still a library registering a
+;; class it did not declare, which is the thing to fix at the source, so say so
+;; under JOLT_DEBUG the way the other registry diagnostics do.
+(define (provider-claim-hold! name pending members)
+  (when (and (getenv "JOLT_DEBUG") (claim-warn-once? "hold" name))
+    (fprintf (current-error-port)
+             "warning: holding ~a — ~a declares that class (:jolt/provides, RFC 0014) and has not loaded yet; it loads on the first reference to ~a, and what it does not implement is registered after it\n"
+             (if (null? members)
+                 (string-append "a constructor registration for " name)
+                 (string-append "a registration for "
+                                (fold-left (lambda (a m)
+                                             (let ((one (string-append name "/" m)))
+                                               (if (string=? a "") one (string-append a ", " one))))
+                                           "" members)))
+             (vector-ref pending 0) name)))
+
+;; The contract from the other side: an install namespace registering a class it
+;; does not declare. Nothing autoloads a provider for a class it never claimed, so
+;; whether that class resolves at all depends on what else happens to pull the
+;; namespace in first — which is how a reference to java.security.KeyPairGenerator
+;; reported "No dependency provides" in one namespace and answered an EC-only shim
+;; in the next (jolt#914).
+(define (provider-claim-note! name)
+  (when (getenv "JOLT_DEBUG")
+    (let ((self (lib-loading-provider)))
+      (when (and self (not (member name (vector-ref self 2)))
+                 ;; ...but not for a class the RUNTIME implements. There the
+                 ;; declaration the note asks for is refused ("which the runtime
+                 ;; already provides"), so the advice cannot be taken: registering
+                 ;; the members at install IS the route, and it is the additive
+                 ;; case class-extensions.ss exists for. Nothing autoloads for a
+                 ;; class that is already there either, so there is no order
+                 ;; dependence left to warn about (jolt#926).
+                 (not (runtime-provides-class? name))
+                 (claim-warn-once? "note" name))
+        (fprintf (current-error-port)
+                 "warning: ~a registers ~a without declaring it in :jolt/provides (RFC 0014); nothing autoloads ~a for a class it does not declare, so whether ~a resolves depends on what else pulls that namespace in\n"
+                 (vector-ref self 0) name (vector-ref self 0) name)))))
 
 ;; A provider that is on the source roots but raised while loading leaves the
 ;; class unregistered exactly like an undeclared dependency does — but the fix is
@@ -487,8 +819,10 @@
                     (or (class-instance-fallback class member)
                         (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member)))
                     v))
-              ;; class miss — autoload a provider (the java.time base, or a
-              ;; first-party library that installs the class) and retry once
+              ;; class miss — autoload the provider that declares the class (the
+              ;; java.time base, jolt.socket, or a library that installs it) and
+              ;; retry once. A claimed class cannot be a hit before its claimer
+              ;; has loaded, so the miss is where resolution belongs (jolt#914).
               (if (lib-try-autoload! class)
                   (host-static-ref class member)
                   (or (and (jch-known? class) (class-instance-fallback class member))
@@ -519,9 +853,8 @@
   (let ((ctor (lookup-class class-ctors-tbl class)))
     (cond
       (ctor (apply ctor args))
-      ;; the constructor may live in a not-yet-loaded provider (the java.time base,
-      ;; or a first-party library) — autoload and retry once before falling through
-      ;; to the var / no-ctor paths.
+      ;; the constructor may live in a provider that has not loaded yet — autoload
+      ;; and retry once before falling through to the var / no-ctor paths.
       ((lib-try-autoload! class) (apply host-new class args))
       ;; deftype/defrecord: the type name is bound as a VAR (the
       ;; make-deftype-ctor closure) in its defining ns, not a registered host class.
@@ -544,26 +877,122 @@
 ;; numeric tower: currentTimeMillis/nanoTime are exact longs (JVM).
 (define (->num x) x)
 (define (jnum->exact n) (exact (truncate (jolt-need-num n))))
-;; parse an integer string in radix; #f on failure
-(define (parse-int-str s radix)
-  (let ((n (string->number (str-trim (if (string? s) s (jolt-str-render-one s))) radix)))
-    (and n (integer? n) (->num n))))
-(define (parse-int-or-throw s radix what)
-  (or (parse-int-str s radix)
-      (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
-                    (string-append "For input string: \""
-                                   (if (string? s) s (jolt-str-render-one s)) "\"")))))
+;; ---- java.lang integer parsing ----------------------------------------------
+;; The grammar and the width check are java-int-parse (natives-num.ss), shared
+;; with clojure.core/parse-long, which is Long/valueOf with the throw caught.
+;; What lives HERE is the throw: the JVM's NumberFormatException, in the message
+;; the caller's own class uses.
+;;
+;; TYPE is the target integer type -- the same name its TYPE static carries --
+;; and is what makes a width check possible at all: every parser below is this
+;; one function at a different width, and a new one cannot be wired without
+;; saying which type it parses. The name used to be a free-form label for the
+;; error text alone, was "valueOf" for all four classes, and nothing checked the
+;; width, so Byte/parseByte answered 128 and Long/parseLong a bignum.
+;;
+;; The JVM has TWO out-of-range messages and jolt has to pick per type: Long and
+;; Integer reuse the ordinary "For input string:" one, Short and Byte have their
+;; own "Value out of range." A bad SHAPE is always the first, and both it and the
+;; range message name a radix other than 10 (Integer.parseInt appends "under
+;; radix N"; Short/Byte always spell "Radix:N").
+(define java-int-types
+  ;; name -> (min max value-out-of-range-message?); #f bounds is the unbounded
+  ;; parse, which is BigInteger's and clojure.core/bigint's.
+  (list (list "long"  -9223372036854775808 9223372036854775807 #f)
+        (list "int"   -2147483648          2147483647          #f)
+        (list "short" -32768               32767               #t)
+        (list "byte"  -128                 127                 #t)
+        (list "big"   #f                   #f                  #f)))
+
+(define (java-int-input-msg str radix)
+  (string-append "For input string: \"" str "\""
+                 (if (= radix 10) "" (string-append " under radix " (number->string radix)))))
+
+(define (parse-int-or-throw s radix type)
+  (let* ((str (if (string? s) s (jolt-str-render-one s)))
+         (row (assoc type java-int-types))
+         (v (java-int-parse str radix (cadr row) (caddr row))))
+    (if (symbol? v)
+        (jolt-throw
+         (jolt-host-throwable
+          "java.lang.NumberFormatException"
+          (cond
+            ((eq? v (quote radix))
+             (string-append "radix " (number->string radix)
+                            (if (< radix 2) " less than Character.MIN_RADIX"
+                                " greater than Character.MAX_RADIX")))
+            ((and (eq? v (quote range)) (cadddr row))
+             (string-append "Value out of range. Value:\"" str "\" Radix:"
+                            (number->string radix)))
+            (else (java-int-input-msg str radix)))))
+        (->num v))))
+
+;; Integer.decode(String) and its three siblings: the same grammar with a RADIX
+;; PREFIX in front of it -- 0x / 0X / # for hex, a bare leading 0 for octal,
+;; nothing for decimal -- and the sign OUTSIDE the prefix, as in "-0x1f". Not a
+;; fourth parser: strip the sign and the prefix, hand the digits to
+;; java-int-parse at the radix they named, and put the sign back. It was missing
+;; entirely, which is how it stayed out of the parse family's reach; adding it
+;; anywhere but here would have started that family over.
+;;
+;; The messages are Integer.decode's, which names the digits AFTER the prefix and
+;; the radix they resolved to -- (Integer/decode "08") is `For input string: "8"
+;; under radix 8`, not a complaint about "08" -- and, for the two narrow types, a
+;; range message of its own that quotes the value and the ORIGINAL string.
+(define (java-decode-split str)
+  ;; -> (values sign digits radix), digits after sign and prefix
+  (let* ((n (string-length str))
+         (c0 (and (fx>? n 0) (string-ref str 0)))
+         (neg? (eqv? c0 #\-))
+         (i (if (or neg? (eqv? c0 #\+)) 1 0)))
+    (cond
+      ((and (fx<=? (fx+ i 2) n)
+            (char=? (string-ref str i) #\0)
+            (memv (string-ref str (fx+ i 1)) (quote (#\x #\X))))
+       (values neg? (substring str (fx+ i 2) n) 16))
+      ((and (fx<? i n) (char=? (string-ref str i) #\#))
+       (values neg? (substring str (fx+ i 1) n) 16))
+      ((and (fx<? (fx+ i 1) n) (char=? (string-ref str i) #\0))
+       (values neg? (substring str (fx+ i 1) n) 8))
+      (else (values neg? (substring str i n) 10)))))
+
+(define (decode-or-throw s type)
+  (let ((str (if (string? s) s (jolt-str-render-one s))))
+    (if (fx=? 0 (string-length str))
+        (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException" "Zero length string"))
+        (let-values (((neg? digits radix) (java-decode-split str)))
+          (let* ((row (assoc type java-int-types))
+                 ;; unbounded first: the narrow types' range message quotes the
+                 ;; VALUE, so it has to exist before the width is applied.
+                 (mag (java-int-parse digits radix #f #f))
+                 (v (and (not (symbol? mag)) (if neg? (- mag) mag))))
+            (cond
+              ((symbol? mag)
+               (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
+                             ;; a sign with nothing after it reports the sign, as
+                             ;; decode's own retry with the re-attached sign does
+                             (java-int-input-msg (if (and neg? (fx=? 0 (string-length digits))) "-" digits)
+                                                 radix))))
+              ((and (>= v (cadr row)) (<= v (caddr row))) (->num v))
+              ((cadddr row)
+               (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
+                             (string-append "Value " (number->string v)
+                                            " out of range from input " str))))
+              (else
+               (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
+                             (java-int-input-msg digits radix))))))))))
 (define (char-code c) (if (char? c) (char->integer c) (jnum->exact c)))
 
-;; parse a double string (Double/parseDouble, (Double. s)); JVM accepts NaN /
-;; Infinity / decimal / scientific. #f on failure.
+;; Double/parseDouble, Float/parseFloat, Double/valueOf, (Double. s) — the
+;; floating half of parse-int-or-throw, and the same story: the grammar is
+;; java-double-parse (natives-num.ss), shared with clojure.core/parse-double,
+;; which is this method with the throw caught. It used to hand the string
+;; straight to string->number and so spoke Scheme, reading "#xff" as 255.0 and
+;; "1/2" as 0.5 — neither one a double on the JVM — while missing the hex
+;; significand form ("0x1fp0" is 31.0 there) that a Scheme reader has no
+;; spelling for. #f on failure.
 (define (parse-double-str s)
-  (let ((t (str-trim (if (string? s) s (jolt-str-render-one s)))))
-    (cond
-      ((or (string=? t "NaN") (string=? t "+NaN") (string=? t "-NaN")) +nan.0)
-      ((or (string=? t "Infinity") (string=? t "+Infinity")) +inf.0)
-      ((string=? t "-Infinity") -inf.0)
-      (else (let ((n (string->number t))) (and n (real? n) (exact->inexact n)))))))
+  (java-double-parse (if (string? s) s (jolt-str-render-one s))))
 (define (parse-double-or-throw s)
   (or (parse-double-str s)
       (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"

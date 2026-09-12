@@ -126,7 +126,24 @@ JOLT_BIN=target/release/jolt bench/run.sh   # a built jolt instead of bin/jolt
 bench/testcheck.sh           # the run-mode rows (test.check, 64-bit arithmetic)
 bench/startup.sh             # startup vs babashka; COLD=1 adds cold-page-cache runs
 bench/startup-phases.sh      # boot / dispatch / compile / run attribution
+bench/scorecard.clj          # render this README from README.tmpl + the two logs
 ```
+
+**This file is generated.** The scorecard table comes from one sitting's logs:
+
+```sh
+JOLT_BIN=target/release/jolt bench/run.sh > run.log
+JOLT_BIN=target/release/jolt bench/testcheck.sh > tc.log
+jolt run bench/scorecard.clj run.log tc.log --measured "Measured <date> on <machine>: jolt <version>, OpenJDK <v>, Chez <v>. …"
+```
+
+renders `bench/README.tmpl` (a Selmer template) into `bench/README.md`, sorted
+by ratio, and refuses a partial run — every bench in `run.sh --list` needs a row
+in the logs and a one-line description in the script. Edit the template, not
+this file. `COLD=1 bench/startup.sh` drops the binary from the page cache
+between reps with `bench/pagecache.clj` (`posix_fadvise` on Linux, `msync` on
+macOS, where the kernel only partly honours it; the resident bytes it prints
+beside each rep say how cold the run really was).
 
 `run.sh` builds each benchmark to a binary because jolt's optimizing passes
 (direct linking, inlining, scalar replacement, whole-program inference) fire

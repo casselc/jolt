@@ -229,17 +229,6 @@
 ;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
 ;; reporter validates it against the callsite table before splicing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
-;; The line to report for the INNERMOST frame. Inside a catch clause that is the
-;; line the throw came from, snapshotted on the way in; else the pair stashed at
-;; the raise. Never the live vreg — it can be stale between throws.
-(define (jolt-throw-line)
-  (let ((c (virtual-register jolt-vreg-catch-line)))
-    (if (pair? c)
-        (let ((l (cdr c))) (and (fixnum? l) (fx>? l 0) l))
-        (let ((s (jolt-throw-sitep)))
-          (if (pair? s)
-              (let ((l (cdr s))) (and (fixnum? l) (fx>? l 0) l))
-              #f)))))
 ;; The site pair ('ns/fn' . line) of the innermost call at the throw — the
 ;; catch-line snapshot when a handler is running, else the raise-time stash.
 ;; #f when unset. The reporter must validate this against the callsite table
@@ -289,10 +278,23 @@
 (define jolt-fn-callees-table (make-hashtable string-hash string=?))
 (define (jolt-callsite-key fqn line)
   (string-append fqn ":" (number->string line)))
+;; Membership is answered by a companion index, not by scanning the list being
+;; built. jolt-tail-entries is keyed by CALLEE, so its list is every tail site
+;; that reaches one function: (member entry cur) made registering n of them cost
+;; O(n^2). Small today — a release build emits 5 registrations — but the cost is
+;; in the number of tail sites in the program, which is not a number to leave
+;; quadratic. The stored value stays a plain list; readers are unchanged.
+(define jolt-table-seen (make-eq-hashtable))          ; tbl -> {(key . entry) -> #t}
+(define (jolt-table-seen-for tbl)
+  (or (hashtable-ref jolt-table-seen tbl #f)
+      (let ((h (make-hashtable equal-hash equal?)))
+        (hashtable-set! jolt-table-seen tbl h)
+        h)))
 (define (jolt-table-add! tbl key entry)
-  (let ((cur (hashtable-ref tbl key '())))
-    (unless (member entry cur)
-      (hashtable-set! tbl key (cons entry cur)))))
+  (let ((seen (jolt-table-seen-for tbl)) (k (cons key entry)))
+    (unless (hashtable-ref seen k #f)
+      (hashtable-set! seen k #t)
+      (hashtable-set! tbl key (cons entry (hashtable-ref tbl key '()))))))
 (define (jolt-register-callsite! fqn line callee tail?)
   (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
   (jolt-table-add! jolt-fn-callees-table fqn callee)
@@ -484,7 +486,22 @@
     ;; so a forward declaration is not a redefinition.
     (when (not (jolt-var-unbound? (var-cell-root c)))
       (hashtable-set! var-redefined-set (string-append ns "/" name) #t))
-    (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+    (var-root-set! c v) (var-cell-defined?-set! c #t) c))
+;; Linked vars — see host/chez/rt.ss var-root-set!. The Gambit seed is minted
+;; var-routed (gen-seed.ss sets no mint flags), so nothing links here yet; the
+;; funnel is mirrored so a def-var-linked! form loads if one ever arrives.
+(define var-linked-tbl (make-eq-hashtable))
+(define (var-root-set! c v)
+  (var-cell-root-set! c v)
+  (let ((l (hashtable-ref var-linked-tbl c #f)))
+    (when l ((cdr l) v))))
+(define (var-linked-symbol c)
+  (let ((l (hashtable-ref var-linked-tbl c #f)))
+    (and l (car l))))
+(define (def-var-linked! ns name sym v setter m)
+  (let ((c (if m (def-var-with-meta! ns name v m) (def-var-plain! ns name v))))
+    (hashtable-set! var-linked-tbl c (cons sym setter))
+    c))
 ;; A def whose form declared NO metadata — see host/chez/rt.ss def-var-plain!.
 (define (def-var-plain! ns name v)
   (let ((c (def-var! ns name v))) (var-cell-dynamic?-set! c #f) c))
@@ -851,10 +868,6 @@
           (readable? (string-append "#object[" cls " \"" (jolt-str-escape content) "\"]"))
           (else (string-append "#object[" cls " " content "]")))))
 
-;; readable? reaches only the #object[…] fallback: every other branch renders the
-;; same either way, and the readable printer handles the types that differ (string
-;; quoting, ##Inf) before it delegates here.
-(define (jolt-pr-str-base x) (jolt-pr-str-base/readable x #f))
 (define (jolt-pr-str-base/readable x readable?)
   (cond
     ((jolt-nil? x) "nil")
@@ -1286,6 +1299,9 @@
 ;; the anon-fn emission registers source forms for image closure capture — a
 ;; no-op keeps those calls inert, matching the image-off degradation.
 (define (image-register-fn-form! . _) #f)
+;; the source text a registration carries is (image-fn-form-src "..."): a
+;; bytevector constant on chez, an inert argument here
+(define (image-fn-form-src s) s)
 ;; chez's def-var! records the var name of a code value (a multimethod, a reify)
 ;; so a state image can write it as a reference. Gambit has no image, so the
 ;; registration is a no-op and nothing is ever a named code value.
@@ -1326,8 +1342,14 @@
 ;; this boot reads them back — no host interop), so definitions succeed.
 (define class-ctors-tbl (make-hashtable string-hash string=?))
 (define (register-class-ctor! tag ctor) (hashtable-set! class-ctors-tbl tag ctor))
+;; On Chez the two differ in whether the class is also recorded as one the host
+;; provides (java/host-static.ss); there is no such registry here, so a deftype's
+;; ctor takes the same write under the name protocols.ss calls.
+(define (class-ctor-set! tag ctor) (register-class-ctor! tag ctor))
+;; register-class-methods! is what host-vars.ss binds clojure.core/__register-class-methods!
+;; to. Without that binding the var is UNBOUND on this host, and jolt.socket and
+;; the eight jolt.time namespaces call it at load — they could not load at all.
 (define class-methods-tbl (make-hashtable string-hash string=?))
 (define (register-class-methods! tag methods) (hashtable-set! class-methods-tbl tag methods))
 (define instance-check-arms '())
 (define (register-instance-check-arm! h) (set! instance-check-arms (cons h instance-check-arms)))
-(define (register-instance-check! cls pred) #f)

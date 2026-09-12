@@ -126,6 +126,13 @@ from-shell
 leave echo" "$(inbb "$BB" echo)"
 
 # babashka.tasks/run invokes another task in-process
+# A project file is edn that carries CODE, so a task body's reader macros —
+# quote, deref, syntax-quote/unquote, #() — have to read. EDN refuses ' @ ` ~
+# outright, so reading these files with the edn reader breaks every one of them.
+check "reader macros in a bb.edn task body" "enter macros
+macros: 41 sym [1 7] [2 4]
+leave macros" "$(inbb "$BB" macros)"
+
 check "run" "enter nested
 before
 enter clean
@@ -211,6 +218,7 @@ esac
 # --- jolt's own deps.edn :tasks forms ----------------------------------------
 
 check "deps.edn string task"    "deps-only-hello"           "$(inbb "$DEPS" hello)"
+check "reader macros in a deps.edn task body" "macros: 41 sym [2 4]" "$(inbb "$DEPS" macros)"
 check "deps.edn :main-opts task" 'depsonly main ("z")'      "$(inbb "$DEPS" main z)"
 check "a :main-opts task consumes one --" 'depsonly main ("z" "--" "w")' "$(inbb "$DEPS" main -- z -- w)"
 
@@ -244,10 +252,39 @@ check ":override-builtin takes the command" "enter path
 overridden path
 leave path" "$(inbb "$BB" path)"
 # without it a task name that collides with a command does NOT take it: `both`
-# has no :override-builtin task, so `path` there is still the built-in
-case "$(inbb "$BOTH" path)" in
+# declares a `path` task that does not claim the name, so `path` there is still
+# the built-in
+out="$(inbb "$BOTH" path)"
+case "$out" in
   */test/chez/tasks/both/src*) check "no :override-builtin keeps the command" "yes" "yes" ;;
-  *) check "no :override-builtin keeps the command" "yes" "no" ;;
+  *) check "no :override-builtin keeps the command" "yes" "no ($out)" ;;
+esac
+case "$out" in
+  *not-the-builtin*) check "...and does not run the task" "no" "yes ($out)" ;;
+  *) check "...and does not run the task" "no" "no" ;;
+esac
+# …but it does not lose the name in silence. Without this the built-in answers as
+# if the task were not there — `jolt build` in a project with a `build` task
+# fails with "build needs an entry: -m NS", which reads like jolt dropped the
+# task (jolt-935). Both ways out of the collision are named.
+case "$out" in
+  *"warning: the task \`path\` is shadowed"*) check "a shadowed task is reported" "yes" "yes" ;;
+  *) check "a shadowed task is reported" "yes" "no ($out)" ;;
+esac
+case "$out" in
+  *"jolt run path"*":override-builtin"*) check "...naming both ways out" "yes" "yes" ;;
+  *) check "...naming both ways out" "yes" "no ($out)" ;;
+esac
+# The escape hatch the warning offers has to work, and the one that claims the
+# name must not be warned about.
+check "run <task> reaches a shadowed task" "not-the-builtin" "$(inbb "$BOTH" run path)"
+case "$(inbb "$BB" path)" in
+  *shadowed*) check "an :override-builtin task is not warned about" "quiet" "warned" ;;
+  *) check "an :override-builtin task is not warned about" "quiet" "quiet" ;;
+esac
+case "$(inbb "$BOTH" tasks)" in
+  *shadowed*) check "a command with no task of its name is quiet" "quiet" "warned" ;;
+  *) check "a command with no task of its name is quiet" "quiet" "quiet" ;;
 esac
 
 # --- errors ------------------------------------------------------------------

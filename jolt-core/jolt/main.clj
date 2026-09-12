@@ -182,7 +182,8 @@
                          (merge {:tool? *cli-tool?*
                                  :repro? *cli-repro?*
                                  :cp *cli-cp*
-                                 :trace? (contains? #{:tree :trace-file} *cli-report*)}
+                                 :trace? (contains? #{:tree :trace-file} *cli-report*)
+                                 :graph? (contains? #{:graph :outdated} *cli-report*)}
                                 opts))))
 
 ;; The resolution a task runs against: :tasks? lets a project's bb.edn
@@ -238,6 +239,10 @@
   (case *cli-report*
     :path     (print-roots resolved)
     :tree     (run! println (deps/dep-tree-lines (:trace resolved)))
+    ;; -Sgraph and -Soutdated render the same tree; only -Soutdated pays for the
+    ;; remote lookups that fill in the `-> VERSION` arrows.
+    :graph    (run! println (deps/dep-graph-lines resolved))
+    :outdated (run! println (deps/dep-graph-lines resolved (deps/dep-updates resolved)))
     :describe (print-describe (into *cli-aliases* aliases))
     ;; -Strace: the same trace -Stree renders, written beside the deps.edn it
     ;; describes (`clojure -Strace` drops it in the current directory; jolt's is
@@ -663,12 +668,28 @@
                      (deps/project-tasks (project-dir))))
       (print ((requiring-resolve 'jolt.completions/snippet) what "jolt")))))
 
+;; A task that shares a built-in's name but does not claim it loses the name, and
+;; the built-in then reports in its own terms: in a project whose deps.edn has a
+;; `build` task, `jolt build` fails with "build needs an entry: -m NS", which
+;; reads like jolt lost the task rather than like a collision. Name the collision
+;; before the command runs, and say both ways out of it (jolt-935).
+(defn- warn-shadowed-task! [cmd]
+  (binding [*out* *err*]
+    (println (str "warning: the task `" cmd "` is shadowed by jolt's built-in `"
+                  cmd "` command, which is what runs here."))
+    (println (str "         run the task with `jolt run " cmd
+                  "`, or give it the name by adding :override-builtin true to it."))))
+
 ;; babashka's :override-builtin — a task only displaces the jolt command of the
 ;; same name when it says so. Checked from the :tasks maps directly, so it costs
 ;; a small file read rather than loading the task runner on every command.
+;; A task that does not claim the name is warned about on the way past.
 (defn- builtin-overridden? [cmd]
   (let [t (get (deps/project-tasks (project-dir)) (symbol cmd))]
-    (boolean (and (map? t) (:override-builtin t)))))
+    (cond
+      (nil? t)                             false
+      (and (map? t) (:override-builtin t)) true
+      :else                                (do (warn-shadowed-task! cmd) false))))
 
  ;; build [-m NS | FILE] [-o OUT] [--opt | --dev] [--no-direct-link] — AOT-compile
  ;; the app into a standalone executable. Resolves deps + roots like `run`, then hands
@@ -899,9 +920,11 @@
             ;; is a now-redundant alias. ^:redef/^:dynamic defs always stay var-routed.
             no-dl?       (or (some #{"--no-direct-link"} flag-args) (false? (:direct-link build)))
             direct-link? (and (not (= mode "dev")) (not no-dl?))
-            ;; tree-shaking (drop library code not reachable from -main): --tree-shake
-            ;; or deps.edn :jolt/build {:tree-shake true}.
-            tree-shake? (boolean (or (some #{"--tree-shake"} flag-args) (:tree-shake build)))
+            ;; closed world (drop every def not reachable from -main, core included):
+            ;; --closed-world, or --tree-shake as it was first named, or deps.edn
+            ;; :jolt/build {:closed-world true} / {:tree-shake true}.
+            tree-shake? (boolean (or (some #{"--closed-world" "--tree-shake"} flag-args)
+                                     (:closed-world build) (:tree-shake build)))
             ;; how the boot image is encoded (jolt-lang/jolt#886), ordered from
             ;; fastest-to-start to smallest-on-disk:
             ;;   fast   vfasl + LZ4   the default
@@ -941,6 +964,15 @@
                           (throw (ex-info (str "--boot must be fast, small or plain (got " v ")")
                                           {:boot v})))
                         v)
+            ;; defs the project and its deps vouch never resolve vars at runtime
+            ;; in the built binary (deps.edn :jolt/tree-shake {:allow-dynamic […]},
+            ;; unioned by resolve-project): the shake skips them in its bail scan
+            ;; instead of keeping everything. Every build reads it: the compiler
+            ;; verdict (dce-needs-compiler?) runs the same bail scan, so a vouched
+            ;; resolve no longer keeps the compiler resident. A vouched eval still
+            ;; bails: the compiler image is direct-linked against the whole core
+            ;; and cannot run over a shaken one (dce.ss dce-bail-scan).
+            allow-dynamic (vec (:allow-dynamic resolved))
             ;; a shared library (callable from C/C++/Rust via jolt_library_init +
             ;; jolt_lookup) instead of an executable: --library.
             library? (some #{"--library"} flag-args)
@@ -962,8 +994,8 @@
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode aspect-config)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode aspect-config))))))
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic aspect-config)
+          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic aspect-config))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the
@@ -1021,7 +1053,7 @@
   (println "  FILE [args]            the same, with `run` left out — so a file whose")
   (println "                         first line is `#!/usr/bin/env jolt` runs as an")
   (println "                         executable script, with or without an extension")
-  (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--tree-shake] [--dynamic]")
+  (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--closed-world] [--dynamic]")
   (println "              [--boot fast|small|plain] [--library] [--target MACHINE --target-pack DIR]")
   (println "                         compile a standalone binary, or with --library a")
   (println "                         shared object an embedder dlopens and calls through")
@@ -1060,7 +1092,9 @@
   (println "Each takes the aliases around it, so -A:test -Spath and -Spath -M:test")
   (println "both report on the resolution that run would use:")
   (println "  -Spath                 print the resolved source roots")
-  (println "  -Stree                 print the dependency tree")
+  (println "  -Stree                 print the dependency tree, tools.deps format")
+  (println "  -Sgraph                print the dependency tree as an indented graph")
+  (println "  -Soutdated             the same graph, marking available updates")
   (println "  -Strace                write the dep expansion to trace.edn")
   (println "  -Sdescribe             print the environment as an edn map")
   (println "  -P                     fetch every dependency, then stop")
@@ -1080,16 +1114,18 @@
 
 ;; Argv forms that only add resolution context — which files to read, which
 ;; aliases to select, what to merge in — rather than doing something. A report
-;; option (-Spath / -Stree / -Sdescribe / -P) still lets these dispatch, since
+;; option (-Spath / -Stree / -Sgraph / -Soutdated / -Sdescribe / -P) still lets
+;; these dispatch, since
 ;; they change the answer, and skips everything else: a report runs no program.
 (defn- context-arg? [cmd]
   (boolean (and cmd (or (#{"-Sdeps" "-Scp" "-Srepro" "-Sforce" "-Sthreads" "-Sverbose"
-                           "-Spath" "-Stree" "-Strace" "-Sdescribe"} cmd)
+                           "-Spath" "-Stree" "-Sgraph" "-Soutdated" "-Strace"
+                           "-Sdescribe"} cmd)
                         (some #(str/starts-with? cmd %) ["-A" "-M" "-X" "-T" "-J"])))))
 
 (def ^:private report-opts
-  {"-Spath" :path, "-Stree" :tree, "-Strace" :trace-file,
-   "-Sdescribe" :describe, "-P" :prepare})
+  {"-Spath" :path, "-Stree" :tree, "-Sgraph" :graph, "-Soutdated" :outdated,
+   "-Strace" :trace-file, "-Sdescribe" :describe, "-P" :prepare})
 
 (defn -main [& args]
   (let [[cmd & more] args]
