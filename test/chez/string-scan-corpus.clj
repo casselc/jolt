@@ -40,28 +40,36 @@
 
 (def named
   {:empty-needle
-   [(.indexOf ^String "abc" "")
-    (.indexOf ^String "abc" "" -1)
-    (.indexOf ^String "abc" "" 3)
-    (.indexOf ^String "abc" "" 99)
-    (.indexOf ^String "" "" Integer/MAX_VALUE)]
+   [(.indexOf "abc" "")
+    (.indexOf "abc" "" -1)
+    (.indexOf "abc" "" 3)
+    (.indexOf "abc" "" 99)
+    (.indexOf "" "" Integer/MAX_VALUE)]
    :starts
-   [(.indexOf ^String "abcabc" "bc" Integer/MIN_VALUE)
-    (.indexOf ^String "abcabc" "bc" -1)
-    (.indexOf ^String "abcabc" "bc" 2)
-    (.indexOf ^String "abcabc" "bc" 6)
-    (.indexOf ^String "abcabc" "bc" Integer/MAX_VALUE)]
+   [(.indexOf "abcabc" "bc" Integer/MIN_VALUE)
+    (.indexOf "abcabc" "bc" -1)
+    (.indexOf "abcabc" "bc" 2)
+    (.indexOf "abcabc" "bc" 6)
+    (.indexOf "abcabc" "bc" Integer/MAX_VALUE)]
    :char-overload
-   [(.indexOf ^String "aλbλ" (int \u03bb))
-    (.indexOf ^String "aλbλ" (int \u03bb) 2)
-    (.indexOf ^String "aλbλ" (int \u03bb) Integer/MIN_VALUE)
-    (.indexOf ^String "aλbλ" (int \u03bb) Integer/MAX_VALUE)
-    (.indexOf ^String "abc" -1)
-    (.indexOf ^String "abc" 1114112)]
+   [(.indexOf "aλbλ" (int \u03bb))
+    (.indexOf "aλbλ" (int \u03bb) 2)
+    (.indexOf "aλbλ" (int \u03bb) Integer/MIN_VALUE)
+    (.indexOf "aλbλ" (int \u03bb) Integer/MAX_VALUE)
+    ;; Supplementary scalar values are one Jolt string position but two JVM
+    ;; UTF-16 units. These cases deliberately use a shared prefix index where
+    ;; both models have the same observable answer.
+    (.indexOf "a😀b" 128512)
+    (.indexOf "a😀b" 128512 2)
+    (.indexOf "abc" -1)
+    ;; Jolt strings cannot contain UTF-16 surrogate halves, so the shared
+    ;; observable result is a miss rather than an invalid scalar conversion.
+    (.indexOf "abc" 55296)
+    (.indexOf "abc" 1114112)]
    :unicode-scalar-values
-   [(.indexOf ^String "éλ日" "λ")
-    (.indexOf ^String "😀λ" "😀")
-    (.contains ^String "a😀b" "😀")]
+   [(.indexOf "éλ日" "λ")
+    (.indexOf "😀λ" "😀")
+    (.contains "a😀b" "😀")]
    :evaluation-order
    (let [seen (atom [])
          result (.indexOf ^String (do (swap! seen conj :receiver) "abc")
