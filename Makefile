@@ -98,7 +98,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke effects \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling lazyscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling lazyscaling stringscancorpus \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -159,7 +159,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling stringscancorpus depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -339,6 +339,16 @@ interruptnest:
 # namespace compile (wide and shallow). Opt-in, NOT part of make ci.
 dynbench:
 	@sh bench/dyn-binding/run.sh
+
+# Portable String.indexOf characterization (jolt-aspect-packs #125). The JVM
+# and jolt run the same deterministic named + generated corpus;
+# byte-for-byte output equality is the semantic oracle. Timing stays opt-in in
+# bench/string-scans.clj and is deliberately not a CI threshold.
+stringscancorpus:
+	@sh test/chez/string-scan-corpus.sh
+
+stringscanbench:
+	@bin/jolt bench/string-scans.clj
 
 # Fibers R6 (jolt-nvpr.7): the :thread vs :fiber benchmark harness. Opt-in and
 # NOT part of the gate — benchmarks do not belong in CI. Runs each measurement
