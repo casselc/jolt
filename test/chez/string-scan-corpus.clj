@@ -51,6 +51,13 @@
     (.indexOf "abcabc" "bc" 2)
     (.indexOf "abcabc" "bc" 6)
     (.indexOf "abcabc" "bc" Integer/MAX_VALUE)]
+   :one-char-string-needle
+   [(.indexOf "abc" "a")
+    (.indexOf "abc" "c" 1)
+    (.indexOf "abc" "z")
+    (.indexOf "a" "a")
+    (.indexOf "abc" "a" -7)
+    (.indexOf "abc" "c" 99)]
    :char-overload
    [(.indexOf "aλbλ" (int \u03bb))
     (.indexOf "aλbλ" (int \u03bb) 2)
