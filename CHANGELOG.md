@@ -10,20 +10,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `jolt build` can select instrumentation aspect manifests and one or more
-  ordered providers, including explicit per-provider role filters. The
-  compiler wraps resolved call sites and fixed-arity function entries while
-  preserving one application execution, application results, exceptions, and
-  deterministic provider order and reporting.
+  ordered providers, including explicit per-provider role filters when
+  consumers intentionally cover different parts of one manifest. The compiler
+  wraps exact resolved call sites and
+  fixed-arity function entries before optimization. Each provider can observe
+  evaluated arguments or explicitly replace them while the compiler still
+  guarantees one application execution, fail-open instrumentation, and
+  preservation of application results and exceptions. Provider order is part
+  of the deterministic build identity and match report. The report publishes
+  only after the output artifact succeeds, and builds without an aspect
+  selection remain unchanged. Runtime join points include a deterministic,
+  build-scoped site identity and the corresponding report-compatible site
+  descriptor so independent consumers can correlate the same woven operation.
 - An explicitly enabled, test-only `:control-v1` aspect contract can replace an
   operation's return or exception, skip it, or invoke it once with replacement
-  arguments. `proceed` remains limited to its owner thread, fiber, and dynamic
-  extent.
-- Aspect packages can publish named preset resources, and `jolt aspects plan`,
-  `explain`, and `manifest --check` provide bounded static inspection and drift
-  detection.
-- Libraries can derive provider-neutral manifests from compiler annotations on
-  fixed-arity definitions and resolved `jolt.aspects/at` calls without adding
-  runtime wrappers to plain builds.
+  arguments. `proceed` is limited to its owner thread and fiber and to the
+  advice call's dynamic extent; builds must opt in with
+  `:allow-control-aspects true`.
+- Aspect packages can publish named preset resources that expand to ordinary
+  manifest and provider selections. `jolt aspects plan` prints the deterministic
+  static selection, and `jolt aspects explain` can add a validated build report
+  without accepting stale identities or unbounded report data.
+- Libraries can derive their provider-neutral manifest from compiler
+  annotations. Definition metadata declares fixed-arity entry join points, and
+  `jolt.aspects/at` marks one resolved call without adding a runtime wrapper to
+  plain builds. `jolt aspects manifest --check` detects drift between source
+  annotations and the published EDN resource.
 
 - **`jolt -Sgraph` prints the dependency tree as a graph, and `-Soutdated`
   marks the updates available for it.** `-Stree` renders the tools.deps trace —
@@ -101,11 +113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The maintained aspect compiler has a documented canonical integration
-  branch, machine-readable upstream provenance, and offline and live identity
-  verification.
-- Interface-typed `OutputStreamWriter.append` calls avoid generic dispatch and
-  ranged substring allocation while retaining arbitrary `Appendable` fallback.
+- The maintained aspect compiler now has a documented canonical integration
+  branch, a machine-readable upstream provenance lock, and offline plus live
+  release-identity verification in CI.
+- **Interface-typed `OutputStreamWriter.append` calls avoid generic dispatch and
+  ranged substring allocation.** A guarded `char-writer` arm now writes
+  `Appendable` text ranges directly to the transcoded output port while keeping
+  receiver/argument evaluation order, fluent identity, range exceptions, and
+  arbitrary `Appendable` fallback unchanged.
 
 ### Performance
 
@@ -263,18 +278,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Shell completion includes `jolt aspects` and its `plan`, `explain`, and
-  `manifest` operations after an upstream release merge.
-- `OutputStreamWriter.append(csq, start, end)` writes only the requested range
-  and retains range exceptions and fluent identity.
-- Interface-typed `StringBuilder` calls use guarded direct `CharSequence` and
-  `Appendable` arms while arbitrary implementations retain generic dispatch.
-- The aspect timeout hot-path gate uses monotonic nanoseconds and rejects the
-  former quadratic insertion shape.
-- Runtime FASL cache entries publish by atomic rename, preventing concurrent
-  cold builds from observing partial or interleaved cache artifacts.
-- Alias-qualified namespaced maps remain deferred during build dependency scans
-  and strict during ordinary reads.
+- **Shell completion includes the aspect compiler CLI.** The v0.8.6 completion
+  inventory now exposes `jolt aspects` and its `plan`, `explain`, and `manifest`
+  operations in zsh and bash instead of hiding the retained integration-only
+  command after the release merge.
+- **`OutputStreamWriter.append(csq, start, end)` writes only the requested
+  range.** Its `char-writer` host method ignored `start` and `end`, so streaming
+  writers such as `clojure.data.json` repeated whole strings instead of copying
+  their unescaped runs. It now shares the checked `[start,end)` path used by the
+  other `Appendable` implementations, including range exceptions and fluent
+  return identity.
+
+- **Interface-typed string builders keep their portable fallback without paying
+  generic method-dispatch cost for the built-in implementation.** Calls through
+  `CharSequence` and `Appendable` now use guarded direct arms for Jolt's
+  `StringBuilder`, including ranged append and `subSequence`, while arbitrary
+  interface implementations retain ordinary protocol dispatch. Receiver and
+  arguments are still evaluated exactly once in source order.
+
+- **The timeout hot-path scaling gate no longer depends on the millisecond clock
+  floor.** It now measures a larger workload with monotonic nanoseconds and
+  verifies that the same gate rejects the former quadratic sorted-list insertion
+  shape.
+
+- Runtime FASL cache entries are published by atomic rename, so parallel cold
+  builds cannot read a partially written or interleaved cache artifact.
+
+- **`jolt build` accepts an alias-qualified namespaced map before the namespace
+  has loaded.** The dependency scanner reads every top-level form before it
+  evaluates the file's `ns` declaration. Scan mode already preserved an
+  unresolved `::alias/keyword` until the real load installed the alias, but
+  `#::alias{:key value}` still tried to resolve it immediately and failed with
+  `Unknown auto-resolved namespace alias`. This prevented a self-contained
+  application using `clojure.core.async.flow` from building because flow's
+  implementation uses `:as-alias flow` and `#::flow{...}`. Namespaced maps now
+  use the same scan-only placeholder rule as auto-resolved keywords; ordinary
+  reads remain strict.
 
 - **The first match on a large alternation no longer takes seconds (or never
   finishes).** A 50-branch union with two unbounded `.*` branches — a retry
