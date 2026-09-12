@@ -67,7 +67,7 @@ if [ -f "$lock" ] && git -C "$root" rev-parse --verify HEAD >/dev/null 2>&1; the
     release="$(lock_value upstream_release)"
     base="$(lock_value upstream_base_commit)"
     aspect_root="$(lock_value aspect_root_commit)"
-    [ "$schema" = 1 ] || [ "$schema" = 2 ] || {
+    [ "$schema" = 1 ] || [ "$schema" = 2 ] || [ "$schema" = 3 ] || {
       echo "tools/version.sh: unsupported aspect integration lock schema: $schema" >&2
       exit 1
     }
@@ -101,10 +101,12 @@ if [ -f "$lock" ] && git -C "$root" rev-parse --verify HEAD >/dev/null 2>&1; the
       exit 1
     }
     # Schema 1 replay epochs count from the aspect root's historical base.
-    # Schema 2 merge epochs count from the current merged upstream release,
-    # excluding the old aspect-line history reachable through the other parent.
+    # Schema 2 and 3 merge epochs count from the current merged upstream
+    # release, excluding the old aspect-line history reachable through the
+    # other parent. Schema 3's extra base anchors provenance, not version
+    # distance, so its counting rule is unchanged.
     distance_base="$base"
-    if [ "$schema" = 2 ]; then
+    if [ "$schema" = 2 ] || [ "$schema" = 3 ]; then
       release_commit="$(lock_value upstream_release_commit)"
       git -C "$root" merge-base --is-ancestor "$release_commit" HEAD || {
         echo "tools/version.sh: locked upstream release is not merged" >&2
