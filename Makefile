@@ -98,7 +98,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke effects \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling lazyscaling stringscancorpus \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling lazyscaling stringscancorpus stringscanbench \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -112,7 +112,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status aspectsmoke \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
-        fibersbench dynbench \
+        fibersbench dynbench stringscancorpus stringscanbench \
         fibersresidue
 
 default:: build

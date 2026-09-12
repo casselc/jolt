@@ -14,7 +14,7 @@
                      (recur (inc i) (+ acc (long (f))))))
         elapsed (- (now-ns) started)
         rate (/ (* (double chars) iterations 1000000000.0) elapsed)]
-    (printf "%-30s %10.1f Mchars/s  %8.2f ms  checksum=%d%n"
+    (printf "%-30s %10.1f Mchars/s  %8.2f ms  checksum=%d\n"
             label (/ rate 1000000.0) (/ elapsed 1000000.0) checksum)))
 
 (def payload
@@ -22,6 +22,14 @@
 
 (def iterations 2000)
 
+;; The short controls expose fixed dispatch/range-normalization regressions
+;; that a long absent scan could hide.
+(measure "indexOf char short hit" 8 (* iterations 20)
+         #(.indexOf "abcdefg!" (int \!)))
+(measure "indexOf string short hit" 8 (* iterations 20)
+         #(.indexOf "abcdefg!" "!"))
+;; This exact int-character overload is the new data.json StringPBR scanner
+;; shape. The one-character String case exercises the complementary route.
 (measure "indexOf char absent" (count payload) iterations
          #(.indexOf ^String payload (int \~)))
 (measure "indexOf 1-char string absent" (count payload) iterations
