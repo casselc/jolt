@@ -197,6 +197,25 @@
              "))) (sb-range-check _s _a _b) (substring _s _a _b))"))
       :else nil)))
 
+;; Direct emission for Appendable.append when an UNPROVEN receiver turns out to
+;; be Jolt's OutputStreamWriter (`char-writer`). data.json writes every
+;; unescaped run through the three-argument overload; generic record dispatch
+;; allocates an argument vector and append-range-text materializes a substring.
+;; Fixed-arity runtime helpers instead write the rendered string, or its checked
+;; range, straight to the transcoded output port.
+;;
+;; There is deliberately no proven-target stamp for this implementation. An
+;; ^Appendable may be any implementation, so host-call-emit binds receiver and
+;; arguments once in source order, guards this arm, and retains record dispatch.
+(defn- cw-direct-emit [m argc t args]
+  (let [a0 (first args) a1 (second args) a2 (nth args 2 nil)]
+    (when (= m "append")
+      (cond
+        (= argc 1) (str "(begin (cw-append-one! " t " " a0 ") " t ")")
+        (= argc 3) (str "(begin (cw-append-range! " t " " a0
+                           " " a1 " " a2 ") " t ")")
+        :else nil))))
+
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
 ;; state — the mode flags, the direct-link name registries, the record-ctor shape
 ;; registry, the gensym counter and the per-site cache cells — lives on it, read
@@ -875,7 +894,7 @@
                   ;; for any .method not in supported-host-methods).
                   "record-method-dispatch"
                   ;; proven-target interop natives (string-direct-emit,
-                  ;; keyword-direct-emit, sb-direct-emit). These are bare heads a
+                  ;; keyword-direct-emit, sb-direct-emit, cw-direct-emit). These are bare heads a
                   ;; user local could shadow and the "jolt-" prefix net does not
                   ;; catch them, so they are enumerated per the invariant above:
                   ;; (let [str-trim (fn [_] :shadowed)] (.trim ^String s)) would
@@ -885,6 +904,7 @@
                   "java-string-hash" "java-symbol-hash"
                   "keyword-t-ns" "keyword-t-name"
                   "sb-append!" "sb-str" "sb-length" "sb-jhost?"
+                  "char-writer?" "cw-append-one!" "cw-append-range!"
                   "append-range-text" "sb-range-check" "jnum->exact" "render-piece" "->num"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
@@ -3016,15 +3036,17 @@
             sd (string-direct-emit m (count as) tt as)
             kd (keyword-direct-emit m (count as) tt as)
             bd (sb-direct-emit m (count as) tt as)
+            wd (cw-direct-emit m (count as) tt as)
             generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
                          " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
-        (if (or sd kd bd)
+        (if (or sd kd bd wd)
           (str "(let* ((" tt " " t ")"
                (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
                ") (cond"
                (when sd (str " ((string? " tt ") " sd ")"))
                (when kd (str " ((keyword-t? " tt ") " kd ")"))
                (when bd (str " ((sb-jhost? " tt ") " bd ")"))
+               (when wd (str " ((char-writer? " tt ") " wd ")"))
                " (else " generic ")))")
           (str "(record-method-dispatch " t " " (chez-str-lit m)
                " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
