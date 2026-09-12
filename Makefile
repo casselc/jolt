@@ -102,6 +102,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
+  deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa \
   narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
@@ -159,12 +160,12 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
-  smoke tracesmoke errorreport errorkinds buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
+  smoke tracesmoke errorreport errorkinds buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke testbincurrentsmoke aspectintegrationcheck \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
@@ -652,6 +653,17 @@ scifunctional: testbin
 cts: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" bash host/chez/cts.sh
 
+# The loader conformance suite: the twelve cases that specify jolt.loader (roots
+# per context, isolation, delegation policy, unload). Baselined like certify —
+# a case that regresses fails, and a case that starts passing fails until the
+# baseline records it, so nothing green quietly goes red again.
+#
+# Through the BUILT binary, like cts and the other CLI gates: a loader that only
+# works against the source tree is not a loader, and jolt.loader ships in the
+# stdlib fasl, so the binary is the arrangement the cases have to hold under.
+loaderconf: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/loaderconf.sh
+
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 # The widths gate covers the exact scalar vocabulary across both halves of the
@@ -961,6 +973,44 @@ readmecheck:
 # current reality; the R10 end state is the two target-owned files.
 portcheck:
 	@sh host/chez/portability-check.sh
+
+# The two hand-mirrored host file pairs (chez/rt.ss <-> gambit/rt-core.ss and the
+# two hasheq.ss) must not drift: a procedure defined in BOTH has to be identical
+# unless mirror-drift-allowlist.txt records the split as deliberate. Everything
+# else the hosts share is generated and gated by its own generator check; these
+# two pairs were kept in step by hand with nothing watching. Compares read
+# DATA, so reformatting is not drift, and a stale allowlist line fails too.
+mirrordrift:
+	@sh host/chez/mirror-drift-check.sh
+
+mirrordrift-regen:
+	@sh host/chez/mirror-drift-check.sh --regen
+
+# host/chez/regex-dfa.ss is a COPY of one vendored irregex procedure with two
+# deliberate changes. Fails when the submodule's original has moved on, so a
+# vendor bump cannot leave jolt shadowing a stale copy in silence.
+regexdfacheck:
+	@sh host/chez/regex-dfa-check.sh
+
+regexdfacheck-regen:
+	@sh host/chez/regex-dfa-check.sh --regen
+
+# The DFA work budget itself (#945): the pattern that took ~5s / never finished
+# takes the backtracker, a small one still gets a DFA, and the two engines agree
+# on every match. Deterministic — which engine a pattern got — not a clock.
+regexdfa:
+	@$(CHEZ) --script test/chez/regex-dfa-test.ss
+
+# Top-level host procedures nothing calls. A definition whose last caller went
+# away is still compiled into every binary and still copied forward into the
+# Gambit half by gen-records.ss — four of the first batch were dead in BOTH
+# copies for exactly that reason. Counts a name referenced when it appears as a
+# token anywhere OUTSIDE a comment, string bodies included (the backend emits
+# calls as text), or when an identifier inside a string literal is its stem and
+# the tail is all digits: (str "jolt-ffi-varargs-proc" k) reaches proc0..proc3,
+# and a gate without that rule would have deleted every varargs FFI binding.
+deadhost:
+	@sh host/chez/dead-host-check.sh
 
 census:
 	@sh host/chez/portability-check.sh --census

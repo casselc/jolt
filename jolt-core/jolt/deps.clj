@@ -167,9 +167,21 @@
                                      missed)))
             {:unresolved (mapv #(select-keys % [:coord :version :detail]) missed)}))))
 
+;; A project file is edn that also carries CODE: a :tasks body is a form jolt
+;; evaluates, and the ones people write are full of reader macros —
+;; (run 'clean), (require '[app.core]), @(future …), a `~ template. So the
+;; reader here is the source one with *read-eval* off, which is what babashka
+;; reads a bb.edn with and the only reader that takes those.
+;;
+;; clojure.edn cannot: EDN has no quote and no deref, and refuses ' @ ` ~
+;; outright. It only appeared to work while jolt's edn mode still honored the
+;; source reader macros, and the moment that seam was made strict (#905) a task
+;; body holding an @ stopped reading at all. *read-eval* false is the piece
+;; worth keeping from the edn reading — a project file must not evaluate
+;; anything at READ time.
 (defn- read-edn [path]
   (when (file-exists? path)
-    (try (edn/read-string (slurp path))
+    (try (binding [*read-eval* false] (read-string (slurp path)))
          (catch :default e
            (throw (ex-info (str path ": " (ex-message e)) {:path path :error e}))))))
 
@@ -503,6 +515,28 @@
           (if (http/fetch (str repo "/" relative) target)
             target
             (recur (rest repos))))))))
+
+(defn- mvn-http-host
+  "The host map grenadine.repo asks for: an in-memory GET. jolt's downloader
+  writes an artifact to a path — that is the right shape for a jar and the
+  wrong one for maven-metadata.xml, which is a few KB nobody wants on disk, so
+  this fetches to a temp file and reads it back.
+
+  :bytes->utf8 is `identity` because the read already decoded: slurp returns the
+  text, and the contract only requires that (:bytes->utf8 host) turn whatever
+  (:http-get host) put in :body into a string."
+  []
+  {:http-get
+   (fn [url]
+     (let [target (str (tmp-dir) "/jolt-mvn-meta-"
+                       (System/currentTimeMillis) "-" (rand-int 100000) ".xml")
+           result (http/fetch* url target)]
+       (try
+         (if (= :ok (:outcome result))
+           {:status 200 :body (slurp target)}
+           {:status (or (:status result) 404)})
+         (finally (rm-f target)))))
+   :bytes->utf8 identity})
 
 (defn- pom-text
   "Return a POM as text, sharing the standard Maven repository with tools.deps."
@@ -946,10 +980,10 @@
 ;; Dependencies are resolved as a TREE (resolve-deps' BFS, which visits each
 ;; coordinate once) and then reconciled into a definitive, de-duplicated set —
 ;; one place, not ad-hoc per call site. dedup-by keeps the first item per key,
-;; order preserved; it dedups both source roots (by path) and native libraries
-;; (by identity), so an app pulling two libs that declare the same shared object
-;; (e.g. libcrypto via both http-client and the ring adapter) includes and loads
-;; it ONCE.
+;; order preserved; it dedups source roots (by path), native libraries (by
+;; identity) and the :allow-dynamic list (by name), so an app pulling two libs
+;; that declare the same shared object (e.g. libcrypto via both http-client and
+;; the ring adapter) includes and loads it ONCE.
 (defn- dedup-by [key xs]
   (second (reduce (fn [[seen acc] x]
                     (let [k (key x)]
@@ -990,12 +1024,24 @@
          (into [(str install-ns) (when lib (str lib))] (map str classes)))
        (:jolt/provides edn)))
 
+(defn- allow-dynamic-entries
+  "The defs a deps.edn vouches never resolve vars at runtime in a built binary
+  — :jolt/tree-shake {:allow-dynamic [ns/name …]} — as \"ns/name\" strings, the
+  shape the build driver's bail scan (dce.ss) keys on. Symbols are the
+  documented form; a string is taken as written. Nothing else is validated
+  here: an entry that names no def is inert, and the bail diagnostic prints the
+  exact key for the sites that remain, so a misspelling corrects itself on the
+  next build rather than needing a checker of its own."
+  [edn]
+  (mapv str (:allow-dynamic (:jolt/tree-shake edn))))
+
 (defn resolve-deps
   "Expand a deps map through the tools.deps expansion engine, then collect the
   selected libraries' source roots, :jolt/native and :jolt/provides declarations
   in stable first-inclusion order. Returns {:roots [...] :natives [...]
-  :min-versions [...] :provides [...] :prep [...] :libs {lib coord}} — :libs is
-  the tools.deps lib map (selected coordinate per library).
+  :allow-dynamic [...] :min-versions [...] :provides [...] :prep [...]
+  :libs {lib coord}} — :libs is the tools.deps lib map (selected coordinate per
+  library).
 
   `opts` carries the alias-combined coordinate maps applied at every node like
   tools.deps: :override-deps replaces a lib's coordinate wherever it appears
@@ -1004,7 +1050,7 @@
   :trace — {:log [node …] :vmap version-map}, the tools.deps trace shape, which
   dep-tree-lines renders and trace-edn-string writes out."
   ([deps base-dir] (resolve-deps deps base-dir nil))
-  ([deps base-dir {:keys [override-deps default-deps trace?]}]
+  ([deps base-dir {:keys [override-deps default-deps trace? graph?]}]
    ;; A nested resolve-deps inherits the outer atom, so the summary is printed
    ;; ONCE by whichever frame created it rather than once per level.
    (let [outermost? (nil? *unresolvable*)]
@@ -1027,6 +1073,14 @@
              :trace? trace?
              :on-warning expansion-warning})
            libmap (:libs expansion)
+           ;; The SELECTED-edge graph -Sgraph renders: parent -> child over the
+           ;; coordinates that won, which is a different question from :trace,
+           ;; whose log carries every decision including the losing ones.
+           ;; coord-deps is the same procurement the expansion just did and
+           ;; shares its *procure-memo*, so walking it again re-fetches nothing.
+           graph (when graph?
+                   ((requiring-resolve 'grenadine.tree/dependency-graph)
+                    top libmap ext/coord-deps))
            infos (keep (fn [lib]
                          (when-let [coord (get libmap lib)]
                            (let [info (ext/coord-info lib coord)]
@@ -1049,6 +1103,13 @@
                                 (map #(assoc % :jolt.deps/root root)
                                      (:jolt/native edn)))
                               infos))
+        ;; The defs each dep vouches never resolve vars at runtime in a built
+        ;; binary (:jolt/tree-shake {:allow-dynamic […]}). A LIBRARY is the
+        ;; natural declarer — spec.alpha knows its `res` only qualifies a symbol
+        ;; for a description and its `dynaload` sits behind a delay — and it
+        ;; ships the list once for every app that uses it, the way :jolt/native
+        ;; ships a shared library.
+        :allow-dynamic (vec (mapcat (fn [{:keys [edn]}] (allow-dynamic-entries edn)) infos))
         ;; Each dep's declared jolt floor, as [lib version] — checked by
         ;; resolve-project against the running runtime. A LIBRARY is the common
         ;; declarer: it knows which jolt its FFI bindings or host shims need, and
@@ -1066,7 +1127,11 @@
         ;; caller warns with the lib names.
         :prep (vec (keep (fn [{:keys [lib edn]}] (when (:deps/prep-lib edn) lib)) infos))
         :libs libmap
-        :trace (:trace expansion)})))))
+        :trace (:trace expansion)
+        ;; The edges -Sgraph renders. Their labels come from :libs above, which
+        ;; is the mediated map — a library reached through two parents is
+        ;; labelled with the version that won.
+        :graph graph})))))
 
 ;; --- resolved-roots cache (.jolt/cpcache) -----------------------------------
 ;; tools.deps calls this .cpcache: the resolved classpath keyed on a content
@@ -1388,9 +1453,10 @@
   deps) and the result is written. The cache is OFF when JOLT_AOT_CACHE is off
   (the dev bin/jolt posture) or when trace? is set — a trace is a one-off query
   (-Stree/-Strace), not the resolution a run reuses, so it never caches and a
-  cached run never serves one. Emits the JOLT_DEBUG-gated hit/miss lines."
+  cached run never serves one. graph? is off for the same reason: a cached
+  basis carries no :graph, and -Sgraph would silently print nothing. Emits the JOLT_DEBUG-gated hit/miss lines."
   [project-dir deps alias-kws repro? opts]
-  (if (and (cpcache-enabled?) (not (:trace? opts)))
+  (if (and (cpcache-enabled?) (not (:trace? opts)) (not (:graph? opts)))
     (let [proj-bytes (or (slurp-quiet (str project-dir "/deps.edn")) "")
           skip-user? (or repro? (getenv "JOLT_NO_USER_DEPS"))
           user-path (user-deps-path)
@@ -1464,6 +1530,80 @@
                       (get by-parent path)))]
       (vec (walk [] 0)))))
 
+(defn- graph-label
+  "How -Sgraph names a node: the same one-line coordinate summary -Stree
+  prints, so the two renderings never disagree about what a version is."
+  [libs lib]
+  (if-let [coord (get libs lib)]
+    (ext/coord-summary lib coord)
+    (str lib)))
+
+(defn dep-graph-lines
+  "Render the SELECTED dependency graph as an indented tree, the shape
+  grenadine's --expand prints:
+
+    ├── babashka/process 0.6.25
+    │   └── babashka/fs 0.5.34 (already shown)
+    └── rewrite-clj/rewrite-clj 1.1.49
+
+  A library is expanded once — a later parent shows it `(already shown)` rather
+  than repeating the subtree — and a coordinate that reaches itself is marked
+  `(cycle)` instead of recurring forever. This answers \"what does the program
+  depend on\", where -Stree answers \"how did the resolution get here\", so the
+  losing candidates -Stree marks `X` are simply absent.
+
+  `updates` is an optional lib -> newer-version map; each entry appends
+  ` -> VERSION` to its line (-Soutdated supplies it, -Sgraph does not)."
+  ([resolved] (dep-graph-lines resolved nil))
+  ([{:keys [graph libs]} updates]
+   (if (nil? graph)
+     []
+     ((requiring-resolve 'grenadine.tree/lines)
+      graph
+      (fn [lib]
+        (str (graph-label libs lib)
+             (when-let [v (get updates lib)] (str " -> " v))))))))
+
+;; The remote half of -Soutdated. Only a :mvn coordinate has a version to
+;; compare — a git dep is pinned to a sha and a :local/root to a directory, so
+;; neither has a \"newer\" to report and both are simply printed as they are.
+;;
+;; A lookup that fails leaves the library unannotated rather than failing the
+;; command: -Soutdated over a dependency set that includes one unreachable
+;; repository should still report the rest, the way `grenadine --current` does.
+;; The warning goes to stderr so the tree itself still pipes.
+(defn dep-updates
+  "For each selected Maven library, the newest release available from the
+  configured repositories when it is newer than the selected version. Returns a
+  lib -> version string map; libraries with no update are absent."
+  [{:keys [graph libs mvn-repos]}]
+  (let [visible? (requiring-resolve 'grenadine.tree/visible?)
+        latest-version (requiring-resolve 'grenadine.repo/latest-version)
+        visible (when graph
+                  (filter visible?
+                          (distinct (concat (:roots graph)
+                                            (mapcat val (:children graph))))))]
+    (reduce
+     (fn [acc lib]
+       (let [coord (get libs lib)
+             current (:mvn/version coord)]
+         (if-not current
+           acc
+           ;; latest-version answers the version STRING, and THROWS when no
+           ;; release is found — it is not a nil-returning lookup.
+           (let [latest (try (latest-version {:group (mvn-group lib)
+                                              :artifact (name lib)}
+                                             {:host (mvn-http-host)
+                                              :repos mvn-repos})
+                             (catch :default e
+                               (warn "cannot determine the latest version of " lib
+                                     ": " (ex-message e))
+                               nil))]
+             (if (and latest (grenadine.version/newer? latest current))
+               (assoc acc lib latest)
+               acc)))))
+     {} visible)))
+
 (defn trace-edn-string
   "The trace as the edn text of `jolt -Strace`'s trace.edn: {:log [node …]
   :vmap {…}}, one expansion decision per line so the file can be read by eye as
@@ -1520,8 +1660,10 @@
 
 (defn resolve-project
   "Resolve `project-dir`'s deps.edn with the selected alias keywords. Returns
-  {:roots [...] :main-opts [...] :tasks {...} :natives [...]}; :natives are the
-  project's + deps' :jolt/native shared-library declarations.
+  {:roots [...] :main-opts [...] :tasks {...} :natives [...] :allow-dynamic [...]};
+  :natives are the project's + deps' :jolt/native shared-library declarations,
+  :allow-dynamic the project's + deps' :jolt/tree-shake {:allow-dynamic […]}
+  entries as \"ns/name\" strings.
 
   :jolt/min-version, declared by the project or by any dependency, is the oldest
   jolt that entry works on; a runtime below it raises here rather than running
@@ -1550,7 +1692,7 @@
   ([project-dir] (resolve-project project-dir []))
   ([project-dir alias-kws] (resolve-project project-dir alias-kws nil))
   ([project-dir alias-kws extra-edn] (resolve-project project-dir alias-kws extra-edn nil))
-  ([project-dir alias-kws extra-edn {:keys [tool? repro? trace? cp tasks?]}]
+  ([project-dir alias-kws extra-edn {:keys [tool? repro? trace? graph? cp tasks?]}]
    (let [deps-edn (read-deps-file (str project-dir "/deps.edn"))
          bb-edn (read-bb-file (str project-dir "/bb.edn"))
          ;; with no deps.edn, bb.edn stands in as the project config
@@ -1603,8 +1745,8 @@
           ;; from there. tools.deps' --skip-cp draws the line in the same place:
           ;; the merged edn and argmap, without calc-basis.
           {dep-roots :roots dep-natives :natives dep-provides :provides
-           prep-libs :prep dep-trace :trace
-           dep-min-versions :min-versions}
+           prep-libs :prep dep-trace :trace dep-graph :graph dep-libs :libs
+           dep-min-versions :min-versions dep-allow-dynamic :allow-dynamic}
           (when-not cp
             (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo edn)]
                                          (abspath project-dir r))
@@ -1612,7 +1754,8 @@
               (resolve-deps-cached project-dir all-deps alias-kws repro?
                                    {:override-deps (:override-deps argmap)
                                     :default-deps (:default-deps argmap)
-                                    :trace? trace?})))
+                                    :trace? trace?
+                                    :graph? graph?})))
          ;; The floor is checked AFTER resolution, so a dep's own declaration is
          ;; in hand — a library is the natural declarer, since it knows which
          ;; jolt its bindings need and the app pulling it in does not. The
@@ -1656,6 +1799,12 @@
                          (concat (map #(assoc % :jolt.deps/root project-dir)
                                       (:jolt/native edn))
                                  dep-natives))
+      ;; the project's own vouched-for defs first, then every dep's, deduped —
+      ;; `jolt build --tree-shake` hands the union to the bail scan. The
+      ;; project's list is where an app allows a site in a library that has
+      ;; not shipped its own list yet.
+      :allow-dynamic (dedup-by identity
+                               (concat (allow-dynamic-entries edn) dep-allow-dynamic))
       ;; declared host-class providers (RFC 0014), the project's own first: a
       ;; project may supply a class itself rather than take a library's.
       :provides (host-class-providers (concat (provides-entries edn nil) dep-provides))
@@ -1674,6 +1823,12 @@
       :features (mapv #(if (keyword? %) (name %) (str %)) (:jolt/features edn))
       ;; the expansion trace, when it was asked for (-Stree renders it)
       :trace dep-trace
+      ;; the selected-edge graph and its coordinates (-Sgraph renders these),
+      ;; with the repositories the resolution used — -Soutdated asks those for
+      ;; a newer version, and *mvn-repos* is bound only around the expansion.
+      :graph dep-graph
+      :libs dep-libs
+      :mvn-repos (mvn-repo-urls edn)
       ;; nREPL middleware a library contributes (jolt.nrepl composes them over its
       ;; built-in handler) — symbols resolving to a middleware fn or a vector of them.
       :nrepl-middleware (:nrepl/middleware edn)})))

@@ -3,12 +3,14 @@
 #
 # Fixture projects live in test/chez/deps-alias/: `app` selects aliases over two
 # local libs that define the same namespace at different "versions" (liba/libb),
-# a third lib (libc), and a stand-in jolt.time lib for the roots-autoload gate.
+# a third lib (libc), a stand-in jolt.time lib for the roots-autoload gate, and
+# provclaim/provsquat/provgone for RFC 0014 provider resolution.
 # Asserts the tools.deps alias args-map keys jolt supports — :extra-deps /
 # :extra-paths / :override-deps / :default-deps / :replace-deps / :replace-paths
 # / :main-opts — plus multi-alias combination rules, alias visibility in `path`,
 # -A composing with -M, an undeclared alias warning and being skipped, the
-# java.time library autoload from the source roots, and the tools.deps CLI
+# java.time library autoload from the source roots, load-order-independent
+# :jolt/provides resolution, and the tools.deps CLI
 # surface: -X/-T exec, -Sdeps, the report options (-Spath / -Stree / -Strace /
 # -Sdescribe / -P), -Scp, -Srepro, -Sverbose, the accepted-and-ignored options,
 # the user deps.edn chain, :local/root jars, :git/tag + short sha, and git cache
@@ -48,6 +50,10 @@ runfull() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>&1; }
 # be able to displace. runall keeps every line (a tree, a describe map).
 runout() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>/dev/null | tail -1; }
 runall() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>/dev/null; }
+# stdout+stderr with the registry diagnostics on — the RFC 0014 notes are
+# JOLT_DEBUG-only, and a note that fires where its advice cannot be taken is as
+# much a defect as a missing one.
+rundebug() { JOLT_PWD="$APP" JOLT_QUIET=1 JOLT_DEBUG=1 "$JOLT" "$@" 2>&1; }
 
 # baseline: project deps only
 check "project dep resolves (liba)" "liba A" "$(run run -m appver)"
@@ -199,6 +205,56 @@ case "$out" in
   *) check "-Stree indents a transitive dep" "child under parent" "$out" ;;
 esac
 
+# -Sgraph — the same resolution as -Stree, rendered as the indented graph
+# grenadine's --expand prints. It answers "what does this depend on", where
+# -Stree answers "how did the resolution get here", so the losing candidates
+# -Stree marks `X` are absent and a shared library is expanded once.
+out="$(runall -Sgraph)"
+case "$out" in
+  *"── local/liba "*) check "-Sgraph prints the top dep" ok ok ;;
+  *) check "-Sgraph prints the top dep" "a branch naming local/liba" "$out" ;;
+esac
+out="$(runall -A:dev -Sgraph)"
+case "$out" in
+  *"── local/libc "*) check "-Sgraph sees the alias's deps" ok ok ;;
+  *) check "-Sgraph sees the alias's deps" "local/libc in the graph" "$out" ;;
+esac
+# a transitive dep hangs under the dep that pulled it in, indented by the
+# connector rather than by -Stree's two spaces
+out="$(JOLT_PWD="$tmp/treeproj" JOLT_QUIET=1 "$JOLT" -Sgraph 2>/dev/null)"
+case "$out" in
+  *"── local/treeparent "*"
+    └── local/treechild "*) check "-Sgraph indents a transitive dep" ok ok ;;
+  *) check "-Sgraph indents a transitive dep" "child under parent" "$out" ;;
+esac
+# A library reached twice is expanded ONCE: the second parent shows it marked
+# rather than repeating the subtree, which is what keeps a wide graph readable.
+mkdir -p "$tmp/gshare/src"
+printf '{:paths ["src"] :deps {local/treeparent {:local/root "../treeparent"}\n
+                               local/treechild {:local/root "../treechild"}}}\n' \
+  > "$tmp/gshare/deps.edn"
+out="$(JOLT_PWD="$tmp/gshare" JOLT_QUIET=1 "$JOLT" -Sgraph 2>/dev/null)"
+case "$out" in
+  *"local/treechild "*"(already shown)"*) check "-Sgraph expands a shared dep once" ok ok ;;
+  *) check "-Sgraph expands a shared dep once" "treechild marked (already shown)" "$out" ;;
+esac
+# -Stree is NOT the same rendering — the two answer different questions and the
+# tools.deps one is what `clojure -Stree` prints, so it stays byte-for-byte.
+case "$(runall -Stree)" in
+  *"──"*) check "-Stree keeps the tools.deps format" "no box-drawing connectors" "$(runall -Stree)" ;;
+  *) check "-Stree keeps the tools.deps format" ok ok ;;
+esac
+# Both take the aliases around them, like every other report option. Compared
+# against the EXPECTED text rather than against each other: two empty outputs
+# are equal, so an -Sgraph that printed nothing would pass a side-by-side.
+before="$(runall -A:dev -Sgraph | tr '\n' ' ' | sed 's/ $//')"
+after="$(runall -Sgraph -A:dev | tr '\n' ' ' | sed 's/ $//')"
+case "$before" in
+  *"── local/libc "*) check "-Sgraph takes the aliases after it" ok ok ;;
+  *) check "-Sgraph takes the aliases after it" "local/libc in the graph" "$before" ;;
+esac
+check "-Sgraph takes the aliases before it" "$before" "$after"
+
 # accepted-and-ignored options don't change the answer or fail
 check "-Sforce is accepted" "$(runout path)" "$(runout -Sforce -Spath)"
 check "-Sthreads N is accepted" "$(runout path)" "$(runout -Sthreads 4 -Spath)"
@@ -309,6 +365,109 @@ esac
 case "$(printf '%s' "$out" | head -1)" in
   *jolt-lang/*) check "library miss names no library" "no library named" "$(printf '%s' "$out" | head -1)" ;;
   *) check "library miss names no library" ok ok ;;
+esac
+
+# RFC 0014 provider resolution is a property of the GRAPH, not of compile order
+# (jolt#914). provclaim declares java.security.Signature; provsquat declares
+# javax.crypto.Mac and its install namespace registers Signature too, without
+# declaring it. Autoloading a provider only on a registry MISS meant the
+# undeclared registration pre-empted the claimer whenever the Mac reference came
+# first — same deps.edn, two answers, and no diagnostic. Both orders must resolve
+# Signature to the library that declares it.
+check "the declared provider resolves a claimed class" "claimer-sig:SHA256withECDSA" \
+      "$(run -A:prov run -m appprovsig)"
+out="$(runall -A:prov run -m appprovmac)"
+check "a squatting registration does not pre-empt the claimer" \
+      "squatter-mac:HmacSHA256 claimer-sig:SHA256withECDSA claimer-sig:SHA256withECDSA claimer-sig-ctor squatter-extra" \
+      "$(printf '%s' "$out" | tr '\n' ' ' | sed 's/ $//')"
+# ...and in the other order, where the claimer is already loaded when the
+# squatter's install namespace runs, the late registration is dropped rather than
+# allowed to win by being last.
+# The last line is the additive half: a MEMBER the provider's shim does not
+# answer is not a substitution and still registers, the same posture
+# class-extensions.ss takes. The claim is authority over what the provider
+# implements, not a reservation on the name.
+check "a late squatting registration does not take the class over" \
+      "claimer-sig:a squatter-mac:b claimer-sig:c squatter-extra" \
+      "$(runall -A:prov run -m appprovboth | tr '\n' ' ' | sed 's/ $//')"
+# The drop is reported: the library asked for something it did not get, and the
+# symptom would otherwise surface somewhere else entirely.
+out="$(runfull -A:prov run -m appprovboth)"
+case "$out" in
+  *"dropping a registration for java.security.Signature"*)
+    check "the dropped registration is reported" ok ok ;;
+  *) check "the dropped registration is reported" "a warning naming the dropped class" \
+           "$(printf '%s' "$out" | head -2)" ;;
+esac
+# The guard is about classes ANOTHER dependency declares. A provider's own
+# declared class still resolves to it.
+check "a provider still registers what it declares" "squatter-mac:HmacSHA256" \
+      "$(run -A:prov run -m appprovsquat)"
+# The runtime's own base tier is EXTENDED, not owned: jolt.time.base declares
+# java.time.Instant and implements parse, and jolt-lang/time adds a
+# DateTimeFormatter arm to members exactly like it. Treating a shipped provider's
+# claim as authority over the library that completes it cost the tick suite five
+# parse tests to "dropping a registration for LocalDate/from". What jolt ships
+# claims the NAME; RFC 0014's guard is about two DEPENDENCIES disagreeing.
+check "a library registers over the base tier" \
+      "claimer-sig:x claimer-instant" \
+      "$(runall -A:prov run -m appprovbase | tr '\n' ' ' | sed 's/ $//')"
+# Holding a registration is a wait for the claimer, not a veto. provgone declares
+# java.security.KeyPairGenerator and ships no install namespace, so its claim
+# settles without ever registering anything — and provsquat's held registration for
+# that class has to be released rather than lost with the provider.
+check "a provider that never loads releases what it held" \
+      "squatter-mac:HmacSHA256 squatter-kpg:RSA" \
+      "$(runall -A:prov run -m appprovgone | tr '\n' ' ' | sed 's/ $//')"
+
+# A provider reached from ANOTHER provider's install namespace is still its own
+# (jolt#926). provnest declares javax.crypto.Cipher and requires provinner.install,
+# which declares and registers java.security.KeyFactory. Marking the whole load
+# with the OUTER provider left KeyFactory owned by nobody, so the app's squatting
+# registration was accepted instead of dropped — jolt#914 one level down.
+check "a nested provider owns the class it declares" \
+      "outer-cipher:AES inner-kf:RSA" \
+      "$(runall -A:prov2 run -m appprovnest | tr '\n' ' ' | sed 's/ $//')"
+out="$(rundebug -A:prov2 run -m appprovnest)"
+case "$out" in
+  *"provnest.install registers java.security.KeyFactory"*)
+    check "the nested registration is not blamed on the outer provider" \
+          "no note naming provnest.install" \
+          "$(printf '%s' "$out" | grep 'without declaring it' | head -1)" ;;
+  *) check "the nested registration is not blamed on the outer provider" ok ok ;;
+esac
+
+# The undeclared-registration note is advice: declare the class in :jolt/provides.
+# It fires for a class nothing implements and nothing declares...
+# ...even when a user type in the same process happens to share its simple name:
+# a deftype writes the host ctor table, a defrecord that table AND the statics
+# one (its `create`), and both are keyed under the bare name as well as the
+# qualified one, so recording either as the RUNTIME's would silence the note for
+# an unrelated class. KeyStore is preceded by a deftype and MessageDigest by a
+# defrecord, so the ctor half of that fails on its own.
+out="$(rundebug -A:prov run -m appprovsquat)"
+case "$out" in
+  *"registers java.security.KeyStore without declaring it"*)
+    check "an undeclared registration is reported" ok ok ;;
+  *) check "an undeclared registration is reported" "a note naming java.security.KeyStore" \
+           "$(printf '%s' "$out" | grep 'without declaring it' | head -1)" ;;
+esac
+case "$out" in
+  *"registers java.security.MessageDigest without declaring it"*)
+    check "a user type of the same simple name does not silence the note" ok ok ;;
+  *) check "a user type of the same simple name does not silence the note" \
+           "a note naming java.security.MessageDigest" \
+           "$(printf '%s' "$out" | grep 'MessageDigest' | head -1)" ;;
+esac
+# ...and not for one the RUNTIME implements, where register-class-provider! refuses
+# the claim the note asks for and extending the class member by member at install
+# is the only route there is (jolt#926).
+case "$out" in
+  *"java.util.Base64 without declaring it"*)
+    check "no note where the declaration would be refused" \
+          "no note naming java.util.Base64" \
+          "$(printf '%s' "$out" | grep 'without declaring it' | head -1)" ;;
+  *) check "no note where the declaration would be refused" ok ok ;;
 esac
 
 # io/resource answers an ABSOLUTE file: URL for a file on a source root, like the

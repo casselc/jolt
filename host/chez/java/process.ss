@@ -43,10 +43,13 @@
 (define proc-libc-signal (jolt-foreign-proc-safe "signal" '(int void*) 'void*))
 ;; errno, to tell a waitpid that was merely interrupted (EINTR — retry) from one
 ;; that can never succeed (ECHILD — the child is gone, retrying is an infinite
-;; loop). Both spellings of the location accessor: Darwin/BSD, then glibc/musl.
+;; loop). All three spellings of the location accessor: Darwin/BSD, glibc/musl,
+;; then bionic (Android — __errno_location does not exist there, and leaving it
+;; out reads every error as 0, so an EINTR retry never fires).
 (define proc-errno-loc
   (or (jolt-foreign-proc-safe "__error" '() 'void*)
-      (jolt-foreign-proc-safe "__errno_location" '() 'void*)))
+      (jolt-foreign-proc-safe "__errno_location" '() 'void*)
+      (jolt-foreign-proc-safe "__errno" '() 'void*)))
 (define (proc-errno)
   (if proc-errno-loc (guard (e (#t 0)) (sa-foreign-ref 'int (proc-errno-loc) 0)) 0))
 
@@ -340,7 +343,6 @@
   (let ((h (make-hashtable string-hash string=?)))
     (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) (proc-child-env-pairs))
     (make-jhost "jolt-env-map" h)))
-(define (proc-env-map? x) (and (jhost? x) (string=? (jhost-tag x) "jolt-env-map")))
 (define (proc-env-map-pairs em)
   (let ((h (jhost-state em)))
     (vector->list
@@ -366,7 +368,6 @@
 ;; state: #(cmd env-map dir redir-in redir-out redir-err merge-err?)
 (define (make-proc-builder cmd)
   (make-jhost "process-builder" (vector cmd #f #f #f #f #f #f)))
-(define (proc-builder? x) (and (jhost? x) (string=? (jhost-tag x) "process-builder")))
 (define (proc-pb-cmd st)         (vector-ref (jhost-state st) 0))
 (define (proc-pb-env st)         (vector-ref (jhost-state st) 1))
 (define (proc-pb-dir st)         (vector-ref (jhost-state st) 2))
@@ -499,6 +500,15 @@
 (define proc-c-spawn (jolt-foreign-proc-safe "posix_spawn" '(void* string void* void* void* void*) 'int))
 (define proc-c-read  (jolt-foreign-proc-blocking "read"  '(int void* size_t) 'ssize_t))
 (define proc-c-write (jolt-foreign-proc-blocking "write" '(int void* size_t) 'ssize_t))
+
+;; posix_spawn_file_actions_addclosefrom_np(fa, 3): one file action that closes
+;; every descriptor at or above 3 in the child, after the dup2s below have put
+;; the pipes on 0/1/2. glibc 2.34+ and Solaris have it (glibc lowers it to a
+;; single close_range(2) syscall); older glibcs — jolt's release binary is built
+;; for a floor well below 2.34 — and macOS do not, which is what
+;; proc-close-inherited-fds! falls back for.
+(define proc-fa-closefrom
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addclosefrom_np" '(void* int) 'int))
 
 ;; What posix_spawn-with-pipes needs, and nothing more. The R8 fiber-parking
 ;; extension's own bindings (fcntl, errno) are gated separately by
@@ -698,6 +708,73 @@
 ;; posix_spawn.
 (define proc-spawn-fd-mutex (make-mutex))
 
+;; --- the child gets its own stdio and nothing else ---------------------------
+;; A descriptor with no file action IS the parent's descriptor, and posix_spawn
+;; hands the child EVERY one of them: the source files jolt has open, its nREPL
+;; listener, a socket a library is serving on. The JVM's child gets the three
+;; stdio streams and nothing else, and the difference is load-bearing rather
+;; than cosmetic. A child holding a copy of a listening socket keeps that port
+;; BOUND after the parent closes it, for as long as the child lives — and an
+;; ORPHANED child (parent killed by a test runner's per-namespace timeout, say)
+;; holds it for as long as IT lives, so the next run cannot bind the port at all
+;; (jolt-fhv, #910: "bind failed on port 54603" behind curl children aged hours).
+;;
+;; Two ways to say "and close the rest", in preference order:
+;;
+;;   1. posix_spawn_file_actions_addclosefrom_np(fa, 3), added LAST so it runs
+;;      after the dup2s have put the pipes on 0/1/2. One action, one
+;;      close_range(2) in the child, and no window at all: the set it closes is
+;;      decided in the child, after this process can no longer add to it.
+;;   2. Where that entry does not resolve — macOS, and every glibc below 2.34,
+;;      which is most of the range jolt's released Linux binary targets —
+;;      enumerate this process's own open descriptors (/proc/self/fd on Linux,
+;;      /dev/fd on macOS/BSD) and add one addclose per fd. The snapshot is taken
+;;      in the PARENT, so a descriptor another thread opens between the listing
+;;      and the spawn is still inherited; proc-spawn-fd-mutex serialises spawns
+;;      against each other, not against the rest of the program. That residual
+;;      window is one this file cannot close without the syscall in 1, and it is
+;;      a far smaller one than inheriting the whole table.
+;;
+;; Each enumerated fd is confirmed open with fcntl(F_GETFD) before its action is
+;; added, because an addclose of an already-closed fd is a file action that
+;; FAILS, and a failed file action means the child exits 127 instead of exec'ing
+;; (glibc forgives one below the fd limit; POSIX does not require it to). The
+;; listing is itself served by an open directory descriptor which is gone again
+;; by the time directory-list returns, so the snapshot always contains at least
+;; one such fd. Without a working fcntl there is nothing to confirm with and the
+;; fallback declines rather than risk a spawn that cannot exec — that is today's
+;; inheritance, which is the honest degradation here.
+(define proc-F-GETFD 1)        ; macOS + Linux
+(define (proc-fd-live? fd)
+  (and proc-fcntl-get (>= (proc-fcntl-get fd proc-F-GETFD) 0)))
+(define (proc-open-fd-dir)
+  (let loop ((ds '("/proc/self/fd" "/dev/fd")))
+    (cond ((null? ds) #f)
+          ((guard (e (#t #f)) (file-directory? (car ds))) (car ds))
+          (else (loop (cdr ds))))))
+
+;; Tier 1 is the only tier a machine with a new enough glibc would ever run, so
+;; the gate could not see tier 2 at all. JOLT_NO_SPAWN_CLOSEFROM=1 makes this
+;; process take the enumeration path, and test/chez/process-test.clj re-runs the
+;; inheritance case in a child jolt with it set.
+(define (proc-closefrom-disabled?)
+  (let ((v (getenv "JOLT_NO_SPAWN_CLOSEFROM"))) (and v (not (string=? v "")) #t)))
+
+;; `keep` names the fds that already have a close action of their own (the
+;; pipe ends), so the fallback does not add a second one and fail it.
+(define (proc-close-inherited-fds! fa keep)
+  (if (and proc-fa-closefrom (not (proc-closefrom-disabled?)))
+      (proc-fa-closefrom fa 3)
+      (let ((dir (proc-open-fd-dir)))
+        (when (and dir proc-fcntl-get)
+          (for-each
+            (lambda (name)
+              (let ((fd (string->number name)))
+                (when (and fd (integer? fd) (exact? fd) (>= fd 3)
+                           (not (memv fd keep)) (proc-fd-live? fd))
+                  (proc-fa-close fa fd))))
+            (guard (e (#t '())) (directory-list dir)))))))
+
 ;; Spawn `/bin/sh -c sh-cmd` with fd-level stdio: an inherited stream gets no
 ;; file action (the child keeps the parent's descriptor); the rest get pipes.
 ;; Returns (values stdin-port stdout-port stderr-port pid), #f for inherited
@@ -760,6 +837,12 @@
                     (proc-fa-close fa (cdr out-p)) (proc-fa-close fa (car out-p)))
         (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
                     (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
+        ;; LAST of the file actions, so the dup2s above have already moved the
+        ;; child's ends onto 0/1/2 by the time everything else goes.
+        (proc-close-inherited-fds!
+          fa (append (if in-p  (list (car in-p)  (cdr in-p))  '())
+                     (if out-p (list (car out-p) (cdr out-p)) '())
+                     (if err-p (list (car err-p) (cdr err-p)) '())))
         (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
                (envp (proc-marshal-argv
                       (map (lambda (p) (string-append (car p) "=" (cdr p)))
@@ -802,7 +885,6 @@
 (define (proc-p-stderr-is st)  (vector-ref (jhost-state st) 2))
 (define (proc-p-pid st)        (vector-ref (jhost-state st) 3))
 (define (proc-p-exit-box st)   (vector-ref (jhost-state st) 4))
-(define (proc-p-cmd st)        (vector-ref (jhost-state st) 5))
 (define (proc-p-mutex st)      (vector-ref (jhost-state st) 6))
 (define (proc-p-stdout-port st) (vector-ref (jhost-state st) 7))
 (define (proc-p-stdin-port st)  (vector-ref (jhost-state st) 8))
@@ -810,7 +892,6 @@
 ;; The 128+signal status of a signal WE sent, if any — the one recoverable answer
 ;; when the child turns out to be unwaitable (see proc-lost-status).
 (define (proc-p-signalled st)  (vector-ref (jhost-state st) 10))
-(define (proc-process? x) (and (jhost? x) (string=? (jhost-tag x) "process")))
 
 ;; ProcessBuilder.start resolves the program before spawning and throws
 ;; IOException("…No such file or directory") when it can't be found; our shell

@@ -266,7 +266,11 @@ dependencies, like any other run.
 
 A built-in command wins a name it shares with a file — `jolt build` is always the
 compiler — which is what `-f` is for. A task loses to one: a file on disk is what
-`jolt greet` means when the project also has a `greet` task.
+`jolt greet` means when the project also has a `greet` task. A task loses to a
+command too, unless it claims the name with `:override-builtin true` — and when
+one does lose, jolt says so, because the command answering in a project that
+declares the task otherwise reads like the task went missing. `jolt run greet`
+reaches the task either way.
 
 Startup is jolt's boot floor — the runtime and compiler image are instantiated on
 every run, which measures ~0.17s against babashka's ~0.01s on the same machine. A
@@ -418,27 +422,51 @@ jolt build -m myapp.core -o myapp   # compile myapp.core's -main into ./myapp
 ./myapp arg1 arg2                   # runs anywhere; args reach -main
 ```
 
-Modes trade dynamism for speed: the default (release) build uses the proven code
-generator; `--opt` also runs the inference + inlining + scalar-replacement passes
-over the closed-world program; `--dev` is unoptimized. Numeric code unboxes to
-raw flonum/fixnum machine ops when types are proven — by whole-program inference,
-by JVM-style `^double`/`^long` hints, or by `(double x)`/`(long x)` casts where
-inference can't see. See
+Three modes trade dynamism for speed. The default (release) build direct-links
+and inlines your app's defs over a direct-linked `clojure.core`, runs
+whole-program inference, and drops the compiler when nothing in the program
+can reach `eval`; `--dev` (or `--no-direct-link`) keeps every app var
+redefinable; `--closed-world` also prunes every def `-main` cannot reach.
+Numeric code unboxes to raw flonum/fixnum machine ops when types are proven —
+by whole-program inference, by JVM-style `^double`/`^long` hints, or by
+`(double x)`/`(long x)` casts where inference can't see. See
 [Building & Running](https://jolt-lang.github.io/docs/building-and-deps.html#typed-arithmetic-and-inference).
 
-Two opt-in closed-world flags cut dispatch cost and binary size:
-
 ```bash
-jolt build -m myapp.core --direct-link   # app->app calls bind directly (no var lookup)
-jolt build -m myapp.core --tree-shake    # ship only code reachable from -main
+jolt build -m myapp.core --closed-world  # ship only code reachable from -main
 ```
 
-`--tree-shake` walks the call graph across your app, its libraries, and
+`--closed-world` (`--tree-shake` is the older spelling, still accepted) walks
+the call graph across your app, its libraries, and
 `clojure.core`, drops everything unreachable from `-main`, and typically removes
 1–2 MB. It stays sound by bailing out — keeping everything, and naming the
 library responsible — when reachable code resolves vars by name at runtime
 (`eval`/`resolve`/`ns-resolve`/…). See
 [RFC 0007](https://jolt-lang.github.io/docs/rfc/0007-compilation-modes-and-binary-output.html).
+
+When the site it names is dead in a built binary and you can say why — spec's
+`res` only qualifies a symbol for a description, spec.gen's `dynaload` sits
+behind a `delay` nothing forces — a `deps.edn` can vouch for it and the shake
+proceeds past it, keeping nothing extra:
+
+```clojure
+:jolt/tree-shake {:allow-dynamic [clojure.spec.alpha/res
+                                  clojure.spec.gen.alpha/dynaload]}
+```
+
+The key is read from the app's `deps.edn` and from every library's, and
+unioned, so a library ships its list once for every app that uses it. The bail
+message ends with the exact line to paste for the sites that remain; paste
+what it prints, because the def to name is the one the lookup ended up in
+after inlining, which may be the caller of the fn that wrote it. An allowed
+def is skipped by the compiler-image check too: a lookup vouched never to run
+needs no compiler.
+
+Vouching wrongly does not fail the build — it moves the failure into the
+binary, where the lookup sees only what the shake kept. A `resolve` of a def
+the shake dropped answers `nil` where the unshaken binary answers the var, and
+that one is silent; an `eval` raises, because the compiler image it needed was
+dropped on the same vouch. Name a site only when you can say why it is dead.
 
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the
@@ -809,7 +837,7 @@ The C side `dlopen`s it, calls `jolt_library_init` once, then resolves each
 entry by name with `jolt_lookup` and casts to its type;
 [Native Interop](https://jolt-lang.github.io/docs/native-interop.html) has the
 full example, the type keywords (the same ones `foreign-fn` uses), and the
-threading limits. The same `--opt`/`--dev`/`--direct-link`/`--tree-shake` flags
+threading limits. The same `--opt`/`--dev`/`--direct-link`/`--closed-world` flags
 apply, and the same Chez kernel development files + C compiler are required to
 link.
 

@@ -267,8 +267,13 @@
 ;; clojure.lang.RT/iter: an Iterator over any seqable — the same jiterator
 ;; (.iterator coll) dispatches to. orchard/inspect.analytics walks collections
 ;; through it.
-(register-class-statics! "RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
-(register-class-statics! "clojure.lang.RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
+;; One procedure for both spellings, like nextID below: the two names share ONE
+;; member table (register-class-statics! mirrors the FQN to the short name), so a
+;; fresh closure per spelling re-registers the member with a different value and
+;; JOLT_DEBUG reports the runtime's own boot as registry drift.
+(define (rt-iter coll) (make-jiterator (jolt-seq coll)))
+(register-class-statics! "RT" (list (cons "iter" rt-iter)))
+(register-class-statics! "clojure.lang.RT" (list (cons "iter" rt-iter)))
 
 ;; clojure.lang.RT/REQUIRE_LOCK — the JVM's `static final Object REQUIRE_LOCK`.
 ;; Nothing inside require takes it; it is the AGREED lock a caller holds around a
@@ -464,8 +469,9 @@
         (cons "bitCount" (lambda (n) (->num (bitwise-bit-count (bitwise-and (jnum->exact n) long-mask64)))))
         (cons "numberOfLeadingZeros" (lambda (n) (->num (long-nlz n))))
         (cons "reverse" (lambda (n) (->num (long-reverse n))))
-        (cons "parseLong" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "parseLong")))
-        (cons "valueOf" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "valueOf")))
+        (cons "parseLong" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "long")))
+        (cons "decode" (lambda (s) (decode-or-throw s "long")))
+        (cons "valueOf" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "long")))
         (cons "compare" (lambda (x y) (let ((a (jnum->exact x)) (b (jnum->exact y)))
                                         (->num (cond ((< a b) -1) ((> a b) 1) (else 0))))))
         ;; toHexString/toOctalString/toBinaryString are UNSIGNED (the value's 64-bit
@@ -485,8 +491,9 @@
         (cons "TYPE" "int")
         (cons "valueOf" (lambda (x . r)
                           (if (number? x) (->num x)
-                              (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "valueOf"))))
-        (cons "parseInt" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "parseInt")))
+                              (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "int"))))
+        (cons "parseInt" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "int")))
+        (cons "decode" (lambda (x) (decode-or-throw x "int")))
         ;; Integer.compare(int, int): -1/0/1 exactly, not an arbitrary sign value.
         (cons "compare" (lambda (x y) (let ((a (jnum->exact x)) (b (jnum->exact y)))
                                         (->num (cond ((< a b) -1) ((> a b) 1) (else 0))))))
@@ -509,8 +516,9 @@
 (register-class-statics! "Byte"
   (list (cons "TYPE" "byte")
         (cons "MAX_VALUE" (->num 127)) (cons "MIN_VALUE" (->num -128))
-        (cons "valueOf" (lambda (x . r) (->num (if (number? x) x (parse-int-or-throw x 10 "valueOf")))))
-        (cons "parseByte" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "parseByte")))
+        (cons "valueOf" (lambda (x . r) (->num (if (number? x) x (parse-int-or-throw x 10 "byte")))))
+        (cons "parseByte" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "byte")))
+        (cons "decode" (lambda (x) (decode-or-throw x "byte")))
         ;; interpret the low 8 bits as unsigned (0..255): a signed byte -1 -> 255.
         (cons "toUnsignedLong" (lambda (x) (->num (bitwise-and (jnum->exact x) #xFF))))
         (cons "toUnsignedInt" (lambda (x) (->num (bitwise-and (jnum->exact x) #xFF))))
@@ -518,8 +526,9 @@
 (register-class-statics! "Short"
   (list (cons "TYPE" "short")
         (cons "MAX_VALUE" (->num 32767)) (cons "MIN_VALUE" (->num -32768))
-        (cons "valueOf" (lambda (x . r) (->num (if (number? x) x (parse-int-or-throw x 10 "valueOf")))))
-        (cons "parseShort" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "parseShort")))
+        (cons "valueOf" (lambda (x . r) (->num (if (number? x) x (parse-int-or-throw x 10 "short")))))
+        (cons "parseShort" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "short")))
+        (cons "decode" (lambda (x) (decode-or-throw x "short")))
         (cons "toString" (lambda (x . r) (number->string (jnum->exact x))))))
 
 
@@ -751,7 +760,6 @@
           (set! out (cons sep out)))
         (set! out (cons (string (string-ref digs i)) out)) (loop (+ i 1))))
     (apply string-append (if neg "-" "") (reverse out))))
-(define (group-int-str s) (group-int-str* s ","))
 (define (nf-format self x)
   (let* ((cur (nf-currency-of self))
          (cfield (lambda (name dflt)
@@ -838,6 +846,48 @@
                         (cons "getCurrencyInstance" nf-currency-instance))))
   (register-class-statics! "NumberFormat" nf-statics)
   (register-class-statics! "java.text.NumberFormat" nf-statics))
+
+;; ---- java.text.Normalizer ----------------------------------------------------
+;; Unicode normalization: identifier comparison, path equality on filesystems
+;; that store decomposed accents, and search/fuzzy matching all go through it.
+;; Chez implements all four Unicode normalization forms natively, so this is a
+;; direct dispatch on the Form constant rather than a table of its own.
+;;
+;; Form is an enum, and jolt models an enum constant the way TimeUnit does: a
+;; jhost carrying its name, so (str Normalizer$Form/NFC) is "NFC" as on the JVM
+;; and (= f Normalizer$Form/NFC) compares the one interned constant. The
+;; constants are registered under the binary name (Normalizer$Form), which is
+;; how the analyzer spells a nested class; registering the FQN registers the
+;; short name with it.
+(define (normalizer-form? x) (and (jhost? x) (string=? (jhost-tag x) "normalizer-form")))
+(define (normalizer-form-name f) (vector-ref (jhost-state f) 0))
+(define normalizer-form-constants
+  (map (lambda (nm) (cons nm (make-jhost "normalizer-form" (vector nm))))
+       '("NFC" "NFD" "NFKC" "NFKD")))
+(register-str-render! normalizer-form? normalizer-form-name)
+(register-host-methods! "normalizer-form"
+  (list (cons "name" normalizer-form-name)
+        (cons "toString" normalizer-form-name)))
+;; The JVM's normalize(CharSequence, Form) rejects a null form with an NPE and
+;; has no other failure mode. A form that is not one of the four constants can
+;; only come from jolt code that built one by hand, so it names itself in the
+;; message rather than reading as a missing method.
+(define (normalizer-normalize s form)
+  (let ((str (jolt-str-render-one s))
+        (nm (if (normalizer-form? form) (normalizer-form-name form) (jolt-str-render-one form))))
+    (cond ((string=? nm "NFC")  (string-normalize-nfc str))
+          ((string=? nm "NFD")  (string-normalize-nfd str))
+          ((string=? nm "NFKC") (string-normalize-nfkc str))
+          ((string=? nm "NFKD") (string-normalize-nfkd str))
+          (else (throw-jvm (quote IllegalArgumentException)
+                           (string-append "Normalizer/normalize: not a Normalizer.Form: " nm))))))
+(register-class-statics! "java.text.Normalizer"
+  (list (cons "normalize" normalizer-normalize)
+        (cons "isNormalized"
+              (lambda (s form)
+                (let ((str (jolt-str-render-one s)))
+                  (string=? str (normalizer-normalize str form)))))))
+(register-class-statics! "java.text.Normalizer$Form" normalizer-form-constants)
 
 ;; Class.forName: an array descriptor ("[C") is its own class token; a class Jolt
 ;; can back (registered statics/ctor, or a java.*/clojure.* core class) yields a

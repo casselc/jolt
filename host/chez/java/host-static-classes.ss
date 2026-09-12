@@ -833,8 +833,31 @@
 ;; compare their unboxed values. Keep that closed distinction in the cell
 ;; instead of making the shared CAS path guess from the values it contains (or
 ;; calling a stored, potentially generic comparator while the mutex is held).
+;; One jhost SHAPE serves all four, but each reports its own JVM class, so the
+;; tag has to carry the kind: (class (AtomicLong. 1)) is AtomicLong, not a
+;; placeholder, and only the two numeric ones answer true to (instance? Number x).
+;; Same reason the two ThreadLocal storage shims carry separate tags — a caller
+;; asks which one it holds with instance?. The kind stays in the state as well:
+;; the CAS and conversion paths switch on it, and reading a symbol beats parsing
+;; the tag string back.
+(define (atomic-tag-for kind)
+  (case kind
+    ((integer) "atomic-integer")
+    ((long) "atomic-long")
+    ((boolean) "atomic-boolean")
+    (else "atomic-reference")))
+(define atomic-tags '("atomic-integer" "atomic-long" "atomic-boolean" "atomic-reference"))
+;; A jhost is a nongenerative record, so an atomic written into a jolt image
+;; travels with its tag STRING, and this build still reads image formats 2 to 7.
+;; Every atomic dumped before the tag split carries the old shared "atomic", and
+;; a tag with no method table answers no method at all — the restored cell would
+;; be inert. Registering the same table under it keeps those images working
+;; exactly as they did: the methods read the kind out of the state, and an old
+;; atomic reports :object to (class x) there, as it always has (there is one FQN
+;; per tag, and the old tag names four classes).
+(define atomic-legacy-tag "atomic")
 (define (make-atomic init kind)
-  (make-jhost "atomic" (vector (box init) (make-mutex) kind)))
+  (make-jhost (atomic-tag-for kind) (vector (box init) (make-mutex) kind)))
 (define (atomic-box self) (vector-ref (jhost-state self) 0))
 (define (atomic-lock self) (vector-ref (jhost-state self) 1))
 (define (atomic-kind self) (vector-ref (jhost-state self) 2))
@@ -894,7 +917,9 @@
             '("AtomicLong" "java.util.concurrent.atomic.AtomicLong"))
   (for-each (lambda (n) (register-class-ctor! n bool-ctor))
             '("AtomicBoolean" "java.util.concurrent.atomic.AtomicBoolean")))
-(register-host-methods! "atomic"
+;; The four tags share ONE method table — the methods read the kind out of the
+;; state, so nothing here is per-class.
+(let ((atomic-methods
   (list (cons "get" (lambda (self) (unbox (atomic-box self))))
         ;; Serialization of the plain set method against read-modify-write
         ;; methods is a separate concern. Preserve its current write boundary
@@ -939,7 +964,9 @@
               (jolt-unchecked-int (unbox (atomic-box self)))
               (jnum->exact (unbox (atomic-box self))))))
         (cons "longValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
-        (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self)))))))
+        (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self))))))))
+  (for-each (lambda (t) (register-host-methods! t atomic-methods))
+            (cons atomic-legacy-tag atomic-tags)))
 ;; java.util.Collections/synchronizedMap|List|Set wrap a collection for
 ;; thread-safe access. The shared-heap HashMap/ArrayList shims already serialize
 ;; individual ops adequately for these uses, so the wrapper returns its argument.
@@ -1091,8 +1118,11 @@
         (cons "reset" (lambda (self) (sr-pos! self (vector-ref (jhost-state self) 2)) jolt-nil))
         (cons "skip" (lambda (self n) (let ((n (jnum->exact n)))
                                         (sr-pos! self (min (string-length (sr-s self)) (+ (sr-pos self) n))) (->num n))))
-        ;; readLine: the next line without its terminator (\n or \r\n), nil at EOF —
-        ;; what line-seq drives over a BufferedReader.
+        ;; readLine: the next line without its terminator, nil at EOF — what
+        ;; line-seq drives over a BufferedReader. \n, \r and \r\n all end a line,
+        ;; which is java.io.BufferedReader's rule; a LONE \r used to be carried
+        ;; into the line, so text written by a classic-Mac-era tool read as one
+        ;; enormous line.
         (cons "readLine"
           (lambda (self)
             (let ((s (sr-s self)) (p (sr-pos self)) (len (string-length (sr-s self))))
@@ -1102,8 +1132,21 @@
                       ((>= i len) (sr-pos! self len) (substring s p len))
                       ((char=? (string-ref s i) #\newline)
                        (sr-pos! self (+ i 1))
-                       (substring s p (if (and (> i p) (char=? (string-ref s (- i 1)) #\return)) (- i 1) i)))
+                       (substring s p i))
+                      ((char=? (string-ref s i) #\return)
+                       (sr-pos! self (if (and (< (+ i 1) len) (char=? (string-ref s (+ i 1)) #\newline))
+                                         (+ i 2)
+                                         (+ i 1)))
+                       (substring s p i))
                       (else (scan (+ i 1)))))))))
+        ;; lines: the rest of the input one readLine at a time — what
+        ;; (BufferedReader. (StringReader. s)) hands back on the JVM, and
+        ;; BufferedReader over jolt's own readers IS the wrapped reader.
+        (cons "lines" (lambda (self)
+                        (let loop ((acc '()))
+                          (let ((l (record-method-dispatch self "readLine" jolt-nil)))
+                            (if (jolt-nil? l) (list->cseq (reverse acc)) (loop (cons l acc)))))))
+        (cons "ready" (lambda (self) #t))
         (cons "close" (lambda (self) jolt-nil))))
 
 ;; ---- PushbackReader ---------------------------------------------------------
@@ -1319,7 +1362,7 @@
 (define (bigint-ctor v . r)
   (if (and (pair? r) (jolt-array? (car r)))
       (bigint-from-magnitude v (car r))
-      (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
+      (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "big")))
 (register-class-ctor! "BigInteger" bigint-ctor)
 (register-class-ctor! "java.math.BigInteger" bigint-ctor)
 (register-class-ctor! "MapEntry" (lambda (k v) (make-map-entry k v)))
@@ -1470,27 +1513,38 @@
     (let loop ((l lst) (i 0)) (if (null? l) bv (begin (bytevector-u8-set! bv i (car l)) (loop (cdr l) (+ i 1)))))))
 (register-class-statics! "URLEncoder" (list (cons "encode" url-encode)))
 (register-class-statics! "URLDecoder" (list (cons "decode" url-decode)))
-;; Charset/forName yields the canonical name STRING (not an opaque object) so it
-;; threads straight into (.getBytes s cs) / (String. bytes cs), which take a name.
-;; defaultCharset is likewise the canonical name string ("UTF-8" — jolt's I/O is
-;; UTF-8 throughout), so it threads into the same name-taking APIs as forName.
-(register-class-statics! "Charset"
-  (list (cons "forName" (lambda (nm) (jolt-str-render-one nm)))
-        (cons "defaultCharset" (lambda () "UTF-8"))))
+;; Charset is registered further down, under the qualified name — which mirrors
+;; to the short one — and answers with a charset OBJECT (charset-for-name, which
+;; validates the name and carries the encoding). A second short-name registration
+;; stood here answering with the canonical name string, and was overwritten member
+;; for member by that one: dead, and JOLT_DEBUG reported the overwrite as drift
+;; between two host files.
 
 ;; ---- Base64 (RFC 4648) ------------------------------------------------------
 ;; One codec, two alphabets: basic (+/) and URL-safe (-_), section 5 of the RFC.
-;; An encoder/decoder jhost carries (vector alphabet pad?) as its state, so
-;; getUrlEncoder/getUrlDecoder and .withoutPadding are the SAME tags with
+;; An encoder jhost carries (vector alphabet pad? line-width line-sep) and a
+;; decoder (vector alphabet pad? mime?), so getUrlEncoder/getUrlDecoder,
+;; getMimeEncoder/getMimeDecoder and .withoutPadding are the SAME tags with
 ;; different state — .withoutPadding returns a fresh encoder, like the JDK's
 ;; (whose encoders are immutable), and each decoder rejects the other
 ;; alphabet's chars because b64-char-val searches only its own alphabet.
+;;
+;; The MIME pair is the other half of RFC 2045: the encoder breaks its output
+;; into lines and the decoder IGNORES every character outside the alphabet, which
+;; is what makes a PEM/PKCS#8 body — wrapped at 64 columns, newlines and all —
+;; decodable at all. The basic decoder refuses those line breaks, so it is no
+;; substitute, and every PEM-reading path (JWT, service-account login) failed on
+;; the first decode without them (#955).
 (define b64-alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 (define b64url-alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
-(define (b64-self-alphabet self)
-  (let ((st (jhost-state self))) (if (vector? st) (vector-ref st 0) b64-alphabet)))
-(define (b64-self-pad? self)
-  (let ((st (jhost-state self))) (if (vector? st) (vector-ref st 1) #t)))
+(define (b64-state-ref self i dflt)
+  (let ((st (jhost-state self)))
+    (if (and (vector? st) (> (vector-length st) i)) (vector-ref st i) dflt)))
+(define (b64-self-alphabet self) (b64-state-ref self 0 b64-alphabet))
+(define (b64-self-pad? self) (b64-state-ref self 1 #t))
+(define (b64-self-width self) (b64-state-ref self 2 0))
+(define (b64-self-sep self) (b64-state-ref self 3 ""))
+(define (b64-self-mime? self) (b64-state-ref self 2 #f))
 (define (->bytevector x)
   (cond ((bytevector? x) x)
         ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) (na-bytearray->bv x))
@@ -1512,9 +1566,29 @@
             (loop (+ i 3)))))))
 (define (b64-char-val c alphabet)
   (let loop ((i 0)) (cond ((= i 64) (throw-jvm 'IllegalArgumentException "Base64: illegal character")) ((char=? (string-ref alphabet i) c) i) (else (loop (+ i 1))))))
-(define (b64-decode x alphabet)
+(define (b64-in-alphabet? c alphabet)
+  (let loop ((i 0)) (cond ((= i 64) #f) ((char=? (string-ref alphabet i) c) #t) (else (loop (+ i 1))))))
+;; Break encoded output into lines of `width` characters joined by `sep`, with no
+;; separator after the last one — the JDK's MIME shape. A width of 0 (every
+;; non-MIME encoder, and getMimeEncoder with a non-positive length) wraps nothing.
+(define (b64-wrap-lines s width sep)
+  (let ((len (string-length s)))
+    (if (or (<= width 0) (= 0 (string-length sep)) (<= len width))
+        s
+        (let loop ((i 0) (out '()))
+          (if (>= i len)
+              (apply string-append (reverse out))
+              (let ((j (min len (+ i width))))
+                (loop j (cons (substring s i j) (if (null? out) out (cons sep out))))))))))
+(define (b64-decode x alphabet mime?)
   (let* ((str (let ((s (if (string? x) x (utf8->string (->bytevector x)))))
-                (list->string (filter (lambda (c) (not (char=? c #\=))) (string->list s)))))
+                (list->string (filter (lambda (c)
+                                        (and (not (char=? c #\=))
+                                             ;; a MIME decoder discards everything
+                                             ;; outside the alphabet; the basic one
+                                             ;; hands it to b64-char-val, which throws.
+                                             (or (not mime?) (b64-in-alphabet? c alphabet))))
+                                      (string->list s)))))
          (out '()) (acc 0) (bits 0))
     (for-each (lambda (c)
                 (set! acc (bitwise-ior (bitwise-arithmetic-shift-left acc 6) (b64-char-val c alphabet)))
@@ -1528,17 +1602,48 @@
 ;; (signed elements, seqable, bytes?) — they used to hand back a raw Chez bytevector,
 ;; which no collection dispatcher knows, so (vec (.decode dec s)) threw "Don't know
 ;; how to create ISeq from" and every caller had to route it through String. first.
+(define (b64-encoded self bs)
+  (b64-wrap-lines (b64-encode bs (b64-self-alphabet self) (b64-self-pad? self))
+                  (b64-self-width self) (b64-self-sep self)))
 (register-host-methods! "b64-encoder"
-  (list (cons "encode" (lambda (self bs) (na-bv->bytearray (string->utf8 (b64-encode bs (b64-self-alphabet self) (b64-self-pad? self))))))
-        (cons "encodeToString" (lambda (self bs) (b64-encode bs (b64-self-alphabet self) (b64-self-pad? self))))
-        (cons "withoutPadding" (lambda (self) (make-jhost "b64-encoder" (vector (b64-self-alphabet self) #f))))))
+  (list (cons "encode" (lambda (self bs) (na-bv->bytearray (string->utf8 (b64-encoded self bs)))))
+        (cons "encodeToString" b64-encoded)
+        (cons "withoutPadding"
+              (lambda (self) (make-jhost "b64-encoder"
+                               (vector (b64-self-alphabet self) #f
+                                       (b64-self-width self) (b64-self-sep self)))))))
 (register-host-methods! "b64-decoder"
-  (list (cons "decode" (lambda (self s) (na-bv->bytearray (b64-decode s (b64-self-alphabet self)))))))
+  (list (cons "decode" (lambda (self s)
+                         (na-bv->bytearray (b64-decode s (b64-self-alphabet self) (b64-self-mime? self)))))))
+;; getMimeEncoder(lineLength, lineSeparator): the JDK rounds the length DOWN to a
+;; multiple of 4 (so a line never splits a 4-character group), treats a
+;; non-positive length as "no line separator at all", and refuses a separator
+;; containing a character of the base64 alphabet — which would make the output
+;; undecodable by its own decoder.
+(define b64-mime-width 76)
+(define b64-mime-sep "\r\n")
+(define (b64-mime-encoder width sep)
+  (let ((w (* 4 (quotient (max 0 width) 4)))
+        (sep (if (string? sep) sep (utf8->string (->bytevector sep)))))
+    (let loop ((i 0))
+      (cond ((= i (string-length sep))
+             (make-jhost "b64-encoder" (vector b64-alphabet #t w sep)))
+            ((or (char=? (string-ref sep i) #\=) (b64-in-alphabet? (string-ref sep i) b64-alphabet))
+             (throw-jvm 'IllegalArgumentException
+                        (string-append "Illegal base64 line separator character 0x"
+                                       (number->string (char->integer (string-ref sep i)) 16))))
+            (else (loop (+ i 1)))))))
 (register-class-statics! "Base64"
-  (list (cons "getEncoder" (lambda () (make-jhost "b64-encoder" (vector b64-alphabet #t))))
-        (cons "getDecoder" (lambda () (make-jhost "b64-decoder" (vector b64-alphabet #t))))
-        (cons "getUrlEncoder" (lambda () (make-jhost "b64-encoder" (vector b64url-alphabet #t))))
-        (cons "getUrlDecoder" (lambda () (make-jhost "b64-decoder" (vector b64url-alphabet #t))))))
+  (list (cons "getEncoder" (lambda () (make-jhost "b64-encoder" (vector b64-alphabet #t 0 ""))))
+        (cons "getDecoder" (lambda () (make-jhost "b64-decoder" (vector b64-alphabet #t #f))))
+        (cons "getUrlEncoder" (lambda () (make-jhost "b64-encoder" (vector b64url-alphabet #t 0 ""))))
+        (cons "getUrlDecoder" (lambda () (make-jhost "b64-decoder" (vector b64url-alphabet #t #f))))
+        (cons "getMimeEncoder"
+              (lambda args
+                (if (null? args)
+                    (make-jhost "b64-encoder" (vector b64-alphabet #t b64-mime-width b64-mime-sep))
+                    (b64-mime-encoder (jnum->exact (car args)) (cadr args)))))
+        (cons "getMimeDecoder" (lambda () (make-jhost "b64-decoder" (vector b64-alphabet #t #t))))))
 
 ;; ---- java.util.regex.Pattern ------------------------------------------------
 ;; Pattern/compile returns a jolt-regex value (regex-t), so str/replace, re-find,
@@ -1589,22 +1694,37 @@
                ((string=? method-name "flags") (rx-inline-flags (regex-t-source obj)))
                (else (dispatch-miss obj method-name rest))))
         ;; java.util.regex.Matcher: .matches (anchored whole-region), .find
-        ;; (next match), .group [n], .groupCount.
+        ;; (next match, or the next at-or-after an index), .group [n],
+        ;; .groupCount, and the region controls .region / .regionStart /
+        ;; .regionEnd / .reset.
         ((jolt-matcher? obj)
          (cond ((string=? method-name "matches") (jolt-matcher-matches obj))
                ((string=? method-name "lookingAt") (jolt-matcher-looking-at obj))
-               ((string=? method-name "find") (not (jolt-nil? (jolt-re-find obj))))
+               ;; .find() resumes at the scan cursor; .find(from) resets and
+               ;; scans from `from`.
+               ((string=? method-name "find")
+                (if (pair? rest)
+                    (jolt-matcher-find-from obj (jnum->exact (car rest)))
+                    (not (jolt-nil? (jolt-re-find obj)))))
                ((string=? method-name "group") (apply jolt-matcher-group obj rest))
                ((string=? method-name "groupCount") (jolt-matcher-group-count obj))
+               ((string=? method-name "region")
+                (jolt-matcher-region obj (jnum->exact (car rest)) (jnum->exact (cadr rest))))
+               ((string=? method-name "regionStart") (matcher-t-rstart obj))
+               ((string=? method-name "regionEnd") (matcher-t-rend obj))
+               ;; .reset(cs) — a new input on the same pattern — is not modelled;
+               ;; only the no-argument reset, which is the one region and
+               ;; find(int) are defined in terms of.
+               ((and (string=? method-name "reset") (null? rest)) (matcher-reset! obj))
                ;; start/end of the last successful find (whole match, or group n)
                ((string=? method-name "start")
                 (let ((mm (matcher-t-last obj)))
                   (if mm (irregex-match-start-index mm (if (pair? rest) (jnum->exact (car rest)) 0))
-                      (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "No match available")))))
+                      (jolt-matcher-no-match))))
                ((string=? method-name "end")
                 (let ((mm (matcher-t-last obj)))
                   (if mm (irregex-match-end-index mm (if (pair? rest) (jnum->exact (car rest)) 0))
-                      (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "No match available")))))
+                      (jolt-matcher-no-match))))
                (else (dispatch-miss obj method-name rest))))
         (else 'pass)))))
 
@@ -1625,7 +1745,7 @@
 (def-var! "clojure.core" "__register-class-ctor!"
   (lambda (name proc) (register-class-ctor-user! name proc) jolt-nil))
 (def-var! "clojure.core" "__register-class-statics!"
-  (lambda (name members) (register-class-statics! name (jmap->static-alist members)) jolt-nil))
+  (lambda (name members) (register-class-statics-user! name (jmap->static-alist members)) jolt-nil))
 
 ;; ---- tagged-table method dispatch + pluggable instance? --------------------
 ;; A jolt library can build stateful host objects with (jolt.host/tagged-table
@@ -2116,6 +2236,22 @@
         (cons "isAssignableFrom" (lambda (self other)
                                    (let ((ka (class-key self)) (kb (class-key other)))
                                      (if (and ka kb (jch-isa? kb ka)) #t #f))))
+        ;; Class.cast: the JVM's checked narrowing — the value back when it is
+        ;; already an instance, a ClassCastException otherwise. A reflective
+        ;; interpreter casts every argument to its parameter type before the
+        ;; call (SCI's box-arg does), and jolt reports every parameter as
+        ;; Object, where the cast IS the identity. Without an arm the lookup fell
+        ;; through to resolving the class by name, which raised for a name no
+        ;; provider supplies (java.lang.Object) — every interpreted call failed
+        ;; there before reaching the method.
+        (cons "cast" (lambda (self o)
+                       (if (instance-check self o)
+                           o
+                           (throw-jvm
+                            'ClassCastException
+                            (string-append "class " (jclass-jvm-name (jolt-class o))
+                                           " cannot be cast to class "
+                                           (jclass-jvm-name self))))))
         (cons "getConstructors" (lambda (self) (class-constructors self)))
         (cons "getDeclaredConstructors" (lambda (self) (class-constructors self)))
         ;; getModifiers: the JVM bitmask, derived from the class graph (jolt has
@@ -2281,7 +2417,15 @@
         (cons "invokeInstanceMethod"
               (lambda (target method args)
                 (record-method-dispatch target (jolt-str-render-one method)
-                                        (list->cseq (reflect-args args)))))))
+                                        (list->cseq (reflect-args args)))))
+        ;; The two companions a reflective caller reaching a member through
+        ;; getMethods (java/natives-array.ss) needs. prepRet unboxes a primitive
+        ;; return on the JVM; jolt reports Object for every return type, so the
+        ;; value passes through. getAsMethodOfAccessibleBase opens a member
+        ;; declared by a non-public class; jolt's members carry no accessibility
+        ;; state to open, and its classes are public, so the member stands.
+        (cons "prepRet" (lambda (c ret) ret))
+        (cons "getAsMethodOfAccessibleBase" (lambda (c m target) m))))
 ;; A deftype/defrecord type token answers every java.lang.Class method, through
 ;; the SAME table (class inst) uses — records-dispatch.ss owns the token arm and
 ;; loads before this file, so it calls back through here. Returns a one-element
@@ -2480,16 +2624,20 @@
                (r (modulo u bound)))
           (if (<= (- u r) (- 2147483648 bound)) (->num r) (loop))))))
 
+;; (SecureRandom. seed) is accepted and the seed ignored: the JVM's seeded ctor
+;; SUPPLEMENTS entropy rather than replacing it, so ignoring it cannot make the
+;; output weaker than the caller asked for. There is no state either way, so one
+;; procedure serves the constructor and both getInstance forms — and both
+;; spellings, which share one member table: a fresh closure per spelling
+;; re-registers the member with a different value, and JOLT_DEBUG then reports the
+;; runtime's own boot as registry drift.
+(define (sr-new . args) (make-jhost "securerandom" #f))
 (for-each
   (lambda (nm)
-    (register-class-ctor! nm
-      ;; (SecureRandom. seed) is accepted and the seed ignored: the JVM's seeded
-      ;; ctor SUPPLEMENTS entropy rather than replacing it, so ignoring it cannot
-      ;; make the output weaker than the caller asked for.
-      (lambda args (make-jhost "securerandom" #f)))
+    (register-class-ctor! nm sr-new)
     (register-class-statics! nm
-      (list (cons "getInstance" (lambda args (make-jhost "securerandom" #f)))
-            (cons "getInstanceStrong" (lambda args (make-jhost "securerandom" #f))))))
+      (list (cons "getInstance" sr-new)
+            (cons "getInstanceStrong" sr-new))))
   '("SecureRandom" "java.security.SecureRandom"))
 
 (register-host-methods! "securerandom"
@@ -2897,7 +3045,11 @@
         (cons "displayName" (lambda (c) (charset-name c)))
         (cons "toString" (lambda (c) (charset-name c)))
         (cons "newEncoder" (lambda (c) (make-jhost "charset-encoder" (vector c))))
-        (cons "newDecoder" (lambda (c) (make-jhost "charset-decoder" (vector c))))
+        ;; #(charset malformed-action unmappable-action replacement) — the
+        ;; JVM's defaults are REPORT for both actions and U+FFFD for the
+        ;; replacement. The methods that read these live in charset-coding.ss,
+        ;; which loads after this file (it needs ByteBuffer).
+        (cons "newDecoder" (lambda (c) (make-jhost "charset-decoder" (vector c #f #f "\xFFFD;"))))
         (cons "canEncode" (lambda (c) #t))
         (cons "equals" (lambda (c o) (and (jhost? o) (string=? (jhost-tag o) "charset")
                                           (string=? (charset-name c) (charset-name o)))))))

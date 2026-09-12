@@ -68,6 +68,27 @@
   ;; the class graph answers modifiers for a name it models; one it does not
   ;; reports PUBLIC alone rather than claiming non-finality it cannot know
   {:suite "reflect-member-model" :expr "(.getModifiers (Class/forName \"java.lang.Thread\"))" :expected "1"}
+  ;; Class.cast is the checked narrowing a reflective caller uses to hand a
+  ;; method its (Object) parameter type; without it the lookup fell through to
+  ;; resolving the class by name, which raised for java.lang.Object.
+  {:suite "reflect-member-model" :expr "(.cast java.lang.Object \"x\")" :expected "\"x\""}
+  {:suite "reflect-member-model" :expr "(try (.cast java.lang.String 42) (catch ClassCastException _ :cce))" :expected ":cce"}
+  ;; Reflector/getMethods answers the reflective interpretation of a method call:
+  ;; the members a class enumerates when it has them, and a name-dispatch member
+  ;; when its methods are a cond over the receiver (String, the collections) —
+  ;; which is what an interpreted call needs and what a getMethods-only caller
+  ;; cannot get from the member model above.
+  {:suite "reflect-member-model" :expr "(let [ms (clojure.lang.Reflector/getMethods String 1 \"indexOf\" false)] [(.size ms) (.getName (.get ms 0))])" :expected "[1 \"indexOf\"]"}
+  {:suite "reflect-member-model" :expr "(.canAccess (.get (clojure.lang.Reflector/getMethods String 1 \"indexOf\" false) 0) \"x\")" :expected "true"}
+  ;; a static resolves through the same lookup, and a zero-parameter one is
+  ;; invoked the way sci.impl.reflector invokes it: a nil argument array
+  {:suite "reflect-member-model" :expr "(.invoke (.get (clojure.lang.Reflector/getMethods Math 1 \"max\" true) 0) nil (into-array Object [2 3]))" :expected "3"}
+  {:suite "reflect-member-model" :expr "(pos? (.invoke (.get (clojure.lang.Reflector/getMethods System 0 \"currentTimeMillis\" true) 0) nil nil))" :expected "true"}
+  ;; a name the class does not have still answers a member: dispatch reports it
+  ;; at the call, with the method named, instead of an empty list
+  {:suite "reflect-member-model" :expr "(try (.invoke (.get (clojure.lang.Reflector/getMethods String 0 \"noSuch\" false) 0) \"x\" nil) (catch Exception e (boolean (re-find #\"noSuch\" (ex-message e)))))" :expected "true"}
+  ;; Util/sneakyThrow: the rethrow a reflective invoke ends every call with
+  {:suite "reflect-member-model" :expr "(try (clojure.lang.Util/sneakyThrow (ex-info \"boom\" {})) (catch Exception e (ex-message e)))" :expected "\"boom\""}
   ;; clojure.reflect over the same registries: the reference JavaReflector is a
   ;; thin layer on getDeclaredFields/Methods/Constructors + getModifiers + bases,
   ;; so the port is the reference apart from the member-set model above.
@@ -88,6 +109,20 @@
   {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (ifn? (requiring-resolve 'clojure.repl/demunge)))" :expected "true"}
   {:suite "special-form precedence" :expr "(do (ns sftest (:refer-clojure :exclude [def])) (defmacro def [n v] :shadowed) (clojure.core/defn ff [] 99) (ff))" :expected "99"}
   {:suite "special-form precedence" :expr "(do (set! (. clojure.lang.RT checkSpecAsserts) true) clojure.lang.RT/checkSpecAsserts)" :expected "true"}
+  ;; Agent.dispatch(fn, args, exec) is the one method on the reference types that
+  ;; is a jolt SUPERSET rather than a match, so it is a unit row and not a corpus
+  ;; one: jolt runs one serialized worker per agent, so the executor argument has
+  ;; nothing to select and is accepted and ignored, where the JVM needs a real
+  ;; Executor (given null it answers the agent and silently never runs the
+  ;; action). jolt has no Agent/pooledExecutor to name, so no common row exists.
+  {:suite "agent-interop" :label "dispatch enqueues the action and answers the agent" :expr "(let [ag (agent 1)] [(identical? ag (.dispatch ag + (seq [10 100]) nil)) (do (await ag) @ag)])" :expected "[true 111]"}
+  {:suite "agent-interop" :label "dispatch with no args is a plain send" :expr "(let [ag (agent 1)] (.dispatch ag inc (seq []) nil) (await ag) @ag)" :expected "2"}
+  ;; This is a unit row rather than a corpus one because it is deterministic on
+  ;; jolt alone: jolt's await drains the queue AND clears running? before it
+  ;; returns, so the count is exactly 0 after it, while the JVM's await can
+  ;; return with its own wait action still queued and answer 1 under load. The
+  ;; portable half — a fresh agent, never sent to — is a corpus row.
+  {:suite "agent-interop" :label "getQueueCount counts the actions still pending" :expr "(let [ag (agent 0)] (await ag) (.getQueueCount ag))" :expected "0"}
   {:suite "atomwatch" :expr "(let [a (atom 0) seen (atom 0)] (add-watch a :k (fn [k r o n] (reset! seen 1))) (reset! a 5) @seen)" :expected "1"}
   {:suite "atomwatch" :expr "(let [a (atom 0) seen (atom 0)] (add-watch a :k (fn [k r o n] (swap! seen inc))) (remove-watch a :k) (reset! a 5) @seen)" :expected "0"}
   {:suite "atomwatch" :expr "(let [a (atom 0) log (atom [])] (add-watch a :k (fn [k r o n] (swap! log conj [o n]))) (reset! a 1) (reset! a 2) @log)" :expected "[[0 1] [1 2]]"}
@@ -224,6 +259,23 @@
   {:suite "sdf" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"EEEE, dd-MMM-yy HH:mm:ss zzz\") \"Sunday, 23-Sep-12 11:52:50 GMT\"))" :expected "1348401170000"}
   {:suite "sdf" :expr "(.getTime (.parse (doto (java.text.SimpleDateFormat. \"EEE MMM d HH:mm:ss yyyy\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) \"Sun Sep 23 11:52:50 2012\"))" :expected "1348401170000"}
   {:suite "sdf" :expr "(let [f (java.text.SimpleDateFormat. \"yyyy-MM-dd\")] (.format f (.parse f \"2023-07-15\")))" :expected "\"2023-07-15\""}
+  ;; format's %t / %T name conversions and the zone they read. Core carries no
+  ;; java.util.Locale (RFC 0008), so the month, day and am/pm names are ROOT's —
+  ;; the same choice SimpleDateFormat's name directives make, and the same
+  ;; documented divergence from a machine-locale JVM, which is why these are unit
+  ;; rows and not corpus ones. The zone is the one the rest of the date layer
+  ;; reads: a Calendar's own, else the machine default. jolt-c90
+  {:suite "format-datetime" :expr "[(format \"%tB\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))) (format \"%tb\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))) (format \"%th\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))]" :expected "[\"Feb\" \"Feb\" \"Feb\"]"}
+  {:suite "format-datetime" :expr "[(format \"%tA\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))) (format \"%ta\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))]" :expected "[\"Fri\" \"Fri\"]"}
+  {:suite "format-datetime" :expr "[(format \"%tp\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))) (format \"%Tp\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))]" :expected "[\"pm\" \"PM\"]"}
+  {:suite "format-datetime" :expr "(format \"%tp\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"Asia/Tokyo\"))))" :expected "\"am\""}
+  {:suite "format-datetime" :expr "(format \"%tr\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :expected "\"11:31:30 PM\""}
+  {:suite "format-datetime" :expr "(format \"%tc\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :expected "\"Fri Feb 13 23:31:30 UTC 2009\""}
+  {:suite "format-datetime" :expr "(format \"%Tc\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :expected "\"FRI FEB 13 23:31:30 UTC 2009\""}
+  {:suite "format-datetime" :expr "(format \"%tZ\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :expected "\"UTC\""}
+  {:suite "format-datetime" :expr "(format \"%tB\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 0) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :expected "\"Jan\""}
+  {:suite "format-datetime" :expr "(let [d (java.util.Date. 1234567890123)] (= (format \"%tF %tT\" d d) (.format (java.text.SimpleDateFormat. \"yyyy-MM-dd HH:mm:ss\") d)))" :expected "true"}
+  {:suite "format-datetime" :expr "(let [d (java.util.Date. 1234567890123)] (= (format \"%tz\" d) (.format (java.text.SimpleDateFormat. \"Z\") d)))" :expected "true"}
   {:suite "reader" :expr "(let [r (-> \"foo bar baz\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (slurp r)])" :expected "[foo \" bar baz\"]"}
   {:suite "reader" :expr "(let [r (-> \"(+ 1 2) 99\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (read r)])" :expected "[(+ 1 2) 99]"}
   ;; A namespaced-map prefix ends at the namespace token.  Ordinary reader
@@ -563,6 +615,98 @@
   {:suite "ioreader" :expr "(let [log (atom [])] (with-open [a {:close (fn [] (swap! log conj :outer))} b {:close (fn [] (swap! log conj :inner))}] :r) (deref log))" :expected "[:inner :outer]"}
   {:suite "ioreader" :expr "(with-open [c {:close (fn [] nil) :v 5}] (:v c))" :expected "5"}
   {:suite "ioreader" :expr "(do (defrecord RC [log] java.io.Closeable (close [_] (swap! log conj :closed))) (let [log (atom [])] (with-open [r (->RC log)] :body) @log))" :expected "[:closed]"}
+
+  ;; --- line terminators (gh-948) ----------------------------------------------
+  ;; readLine / lines / read-line / with-in-str / line-seq all end a line on a
+  ;; newline, a carriage return, or the pair, and none of the three is part of the
+  ;; line. The byte-decoding readers used Chez get-line, which splits on newline
+  ;; alone, so every CRLF line came back with its CR still on it and an HTTP
+  ;; header loop never recognized its own blank terminator line.
+  {:suite "crlf" :expr "(let [r (java.io.BufferedReader. (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"a\\r\\nb\\nc\\rd\" \"UTF-8\"))))] [(.readLine r) (.readLine r) (.readLine r) (.readLine r) (.readLine r)])" :expected "[\"a\" \"b\" \"c\" \"d\" nil]"}
+  {:suite "crlf" :expr "(vec (iterator-seq (.iterator (.lines (java.io.BufferedReader. (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"a\\r\\nb\\r\\n\" \"UTF-8\"))))))))" :expected "[\"a\" \"b\"]"}
+  {:suite "crlf" :expr "(binding [*in* (java.io.BufferedReader. (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"x\\r\\n\" \"UTF-8\"))))] (read-line))" :expected "\"x\""}
+  {:suite "crlf" :expr "(with-in-str \"x\\r\\n\" (read-line))" :expected "\"x\""}
+  {:suite "crlf" :expr "(with-in-str \"a\\r\\nb\\nc\\rd\" [(read-line) (read-line) (read-line) (read-line) (read-line)])" :expected "[\"a\" \"b\" \"c\" \"d\" nil]"}
+  {:suite "crlf" :expr "(line-seq (java.io.BufferedReader. (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"a\\r\\nb\\nc\\rd\" \"UTF-8\")))))" :expected "(\"a\" \"b\" \"c\" \"d\")"}
+  {:suite "crlf" :expr "(let [r (java.io.BufferedReader. (java.io.StringReader. \"a\\r\\nb\\rc\\nd\"))] [(.readLine r) (.readLine r) (.readLine r) (.readLine r)])" :expected "[\"a\" \"b\" \"c\" \"d\"]"}
+  ;; the newline of a CRLF is owed to the NEXT read, never peeked for: a reader
+  ;; over a pipe must not block waiting to find out whether one follows.
+  {:suite "crlf" :expr "(let [r (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"ab\\r\\ncd\" \"UTF-8\")))] [(.readLine r) (char (.read r)) (char (.read r)) (.read r)])" :expected "[\"ab\" \\c \\d -1]"}
+
+  ;; --- a Reader jolt did not build (gh-952) -----------------------------------
+  ;; io/reader refused a reify/proxy java.io.Reader outright, and the
+  ;; BufferedReader constructor handed one straight back, so the result had no
+  ;; readLine and no close. Both now go through a delegating adapter.
+  {:suite "ioreader / user Reader" :expr "(do (require (quote [clojure.java.io :as io])) (slurp (io/reader (let [p (atom 0) s \"hi\\r\\nthere\"] (reify java.io.Reader (read [_ cbuf off len] (let [i @p] (if (>= i (count s)) -1 (do (aset cbuf off (.charAt s i)) (reset! p (inc i)) 1)))))))))" :expected "\"hi\\r\\nthere\""}
+  {:suite "ioreader / user Reader" :expr "(let [src (let [p (atom 0) s \"hi\\r\\nthere\"] (reify java.io.Reader (read [_ cbuf off len] (let [i @p] (if (>= i (count s)) -1 (do (aset cbuf off (.charAt s i)) (reset! p (inc i)) 1)))))) b (java.io.BufferedReader. src)] [(identical? src b) (.getName (class b)) (instance? java.io.BufferedReader b) (.readLine b) (.readLine b) (.readLine b) (.close b)])" :expected "[false \"java.io.BufferedReader\" true \"hi\" \"there\" nil nil]"}
+  {:suite "ioreader / user Reader" :expr "(do (require (quote [clojure.java.io :as io])) (line-seq (io/reader (proxy [java.io.Reader] [] (read [cbuf off len] -1)))))" :expected ""}
+
+  ;; a byte[] is a ByteArrayInputStream read as UTF-8, as on the JVM; it used to
+  ;; fall through to the seq arm and read as the text of its element values.
+  {:suite "ioreader / user Reader" :expr "(do (require (quote [clojure.java.io :as io])) [(vec (line-seq (io/reader (.getBytes \"a\\r\\nb\" \"UTF-8\")))) (slurp (io/reader (.getBytes \"é\" \"UTF-8\")))])" :expected "[[\"a\" \"b\"] \"é\"]"}
+  ;; BufferedReader over jolt's own StringReader is the StringReader, so it has
+  ;; to answer .lines and .ready itself.
+  {:suite "ioreader / user Reader" :expr "(let [r (java.io.BufferedReader. (java.io.StringReader. \"l1\\r\\nl2\\r\\n\"))] [(.ready r) (vec (.lines r))])" :expected "[true [\"l1\" \"l2\"]]"}
+
+  ;; --- java.text.Normalizer (gh-953) ------------------------------------------
+  ;; The class symbol resolved while every member threw "no dependency provides".
+  ;; Chez implements all four Unicode normalization forms, so they are real here.
+  {:suite "normalizer" :expr "(java.text.Normalizer/normalize \"é\" java.text.Normalizer$Form/NFC)" :expected "\"é\""}
+  {:suite "normalizer" :expr "[(vec (map int (java.text.Normalizer/normalize \"é\" java.text.Normalizer$Form/NFD))) (vec (map int (java.text.Normalizer/normalize \"é\" java.text.Normalizer$Form/NFC)))]" :expected "[[101 769] [233]]"}
+  {:suite "normalizer" :expr "[(java.text.Normalizer/normalize \"ﬁ\" java.text.Normalizer$Form/NFKC) (str java.text.Normalizer$Form/NFKD) (.getName (class java.text.Normalizer$Form/NFC))]" :expected "[\"fi\" \"NFKD\" \"java.text.Normalizer$Form\"]"}
+  {:suite "normalizer" :expr "[(java.text.Normalizer/isNormalized \"é\" java.text.Normalizer$Form/NFC) (java.text.Normalizer/isNormalized \"é\" java.text.Normalizer$Form/NFC)]" :expected "[true false]"}
+
+  ;; --- CharsetDecoder / CodingErrorAction (gh-946) ----------------------------
+  ;; CodingErrorAction had no provider and the decoder's method table held only
+  ;; .charset, so the documented way to decode a stream a chunk at a time could
+  ;; not be written. The third row is that idiom: a 3-byte character split across
+  ;; two chunks must survive the split, which is what compact() carries over.
+  {:suite "charset-decoder" :expr "[(str java.nio.charset.CodingErrorAction/REPLACE) (.getName (class java.nio.charset.CodingErrorAction/REPORT)) (str java.nio.charset.CoderResult/UNDERFLOW)]" :expected "[\"REPLACE\" \"java.nio.charset.CodingErrorAction\" \"UNDERFLOW\"]"}
+  {:suite "charset-decoder" :expr "(str (.decode (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) (java.nio.ByteBuffer/wrap (byte-array [104 105]))))" :expected "\"hi\""}
+  {:suite "charset-decoder" :expr "(let [d (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\"))] [(str (.malformedInputAction d)) (str (.unmappableCharacterAction d)) (str (.malformedInputAction (.onMalformedInput d java.nio.charset.CodingErrorAction/IGNORE)))])" :expected "[\"REPORT\" \"REPORT\" \"IGNORE\"]"}
+  {:suite "charset-decoder" :expr "(let [d (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) in (java.nio.ByteBuffer/allocate 16) out (java.nio.CharBuffer/allocate 16) sb (StringBuilder.)] (doseq [chunk [[97 -30] [-126 -84 98]]] (.put in (byte-array chunk)) (.flip in) (let [r (.decode d in out false)] (.append sb (str (.flip out))) (.clear out) (.compact in) (assert (.isUnderflow r)))) (.flip in) (.decode d in out true) (.append sb (str (.flip out))) (str sb))" :expected "\"a€b\""}
+  {:suite "charset-decoder" :expr "(let [d (doto (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) (.onMalformedInput java.nio.charset.CodingErrorAction/REPLACE))] (str (.decode d (java.nio.ByteBuffer/wrap (byte-array [104 -1 105])))))" :expected "\"h�i\""}
+  {:suite "charset-decoder" :expr "(try (str (.decode (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) (java.nio.ByteBuffer/wrap (byte-array [104 -1 105])))) (catch java.nio.charset.CharacterCodingException e (.getName (class e))))" :expected "\"java.nio.charset.MalformedInputException\""}
+  {:suite "charset-decoder" :expr "[(str (.decode (.newDecoder (java.nio.charset.Charset/forName \"ISO-8859-1\")) (java.nio.ByteBuffer/wrap (byte-array [-27 -28])))) (str (.decode (.newDecoder (java.nio.charset.Charset/forName \"UTF-16BE\")) (java.nio.ByteBuffer/wrap (.getBytes \"hé\" \"UTF-16BE\"))))]" :expected "[\"åä\" \"hé\"]"}
+  {:suite "charset-decoder" :expr "(let [b (java.nio.CharBuffer/allocate 8)] (.put b \"ab\") (.put b \\c) [(.position b) (str (.flip b)) (.remaining b) (.getName (class b))])" :expected "[3 \"abc\" 3 \"java.nio.CharBuffer\"]"}
+
+
+  ;; --- regex line terminators (gh-956) ----------------------------------------
+  ;; Java's terminator set for DOT, ^ and $ is \n, \r, \r\n, NEL, LS and PS, and
+  ;; (?d) UNIX_LINES is what narrows it to \n. jolt mapped those onto irregex ops
+  ;; whose set is \n only and accepted (?d) as a no-op, so it behaved as if
+  ;; UNIX_LINES were always on: DOT crossed a \r, (?m)^ did not match after one,
+  ;; and a CRLF header read with (.*) kept its \r. A CRLF is ONE terminator, so
+  ;; neither anchor may sit between the \r and the \n — the fourth row of each
+  ;; group is that case.
+  {:suite "regex / line terminators" :expr "(let [nel (str (char 0x85)) ls (str (char 0x2028)) ps (str (char 0x2029))] [(re-find #\"a.b\" \"a\\rb\") (re-find #\"a.b\" \"a\\nb\") (re-find #\"a.b\" (str \"a\" nel \"b\")) (re-find #\"a.b\" (str \"a\" ls \"b\")) (re-find #\"a.b\" (str \"a\" ps \"b\")) (re-find #\"a.b\" \"a\\tb\") (re-find #\"(?s)a.b\" \"a\\rb\")])" :expected "[nil nil nil nil nil \"a\\tb\" \"a\\rb\"]"}
+  {:suite "regex / line terminators" :expr "[(re-find #\"(?m)^b\" \"a\\rb\") (re-find #\"(?m)^b\" \"a\\r\\nb\") (re-find #\"(?m)^b\" (str \"a\" (char 0x85) \"b\")) (re-find #\"(?m)^\\nb\" \"a\\r\\nb\")]" :expected "[\"b\" \"b\" \"b\" nil]"}
+  {:suite "regex / line terminators" :expr "[(re-find #\"(?m)a$\" \"a\\rb\") (re-find #\"(?m)a$\" \"a\\r\\nb\") (re-find #\"(?m)\\r$\" \"a\\r\\nb\") (re-find #\"a$\" \"a\\r\") (re-find #\"a$\" \"a\\r\\n\") (re-find #\"a$\" \"a\\rb\") (re-find #\"a\\Z\" \"a\\r\") (re-find #\"a\\z\" \"a\\r\")]" :expected "[\"a\" \"a\" nil \"a\" \"a\" nil \"a\" nil]"}
+  {:suite "regex / line terminators" :expr "(re-find #\"(?m)^(.*)$\" \"GET / HTTP/1.1\\r\\nHost: x\\r\\n\")" :expected "[\"GET / HTTP/1.1\" \"GET / HTTP/1.1\"]"}
+  {:suite "regex / line terminators" :expr "(clojure.string/split \"a\\r\\nb\\r\\nc\" #\"(?m)$\")" :expected "[\"a\" \"\\r\\nb\" \"\\r\\nc\"]"}
+  ;; (?d) restores the narrow set, which is what it means on the JVM — every row
+  ;; above that differs from jolt's old answer agrees again under it.
+  {:suite "regex / line terminators" :expr "[(re-find #\"(?d)a.b\" \"a\\rb\") (re-find #\"(?d)(?m)^b\" \"a\\rb\") (re-find #\"(?d)(?m)a$\" \"a\\rb\") (re-find #\"(?d)a$\" \"a\\r\") (re-find #\"(?d)a$\" \"a\\n\")]" :expected "[\"a\\rb\" nil nil nil \"a\"]"}
+  ;; A resumed scan is not a fresh input: ^ anchors at the ORIGIN, not at the
+  ;; cursor, and (?m)^ does not match at the end of input. Both follow from
+  ;; irx-search-from passing the two positions separately (host/chez/regex.ss).
+  {:suite "regex / line terminators" :expr "[(re-seq #\"^abc\" \"abcabc\") (clojure.string/replace \"abcabc\" #\"^abc\" \"-\") (re-seq #\"(?m)^\" \"a\\nb\\n\")]" :expected "[(\"abc\") \"-abc\" (\"\" \"\")]"}
+  ;; The positions an anchor matches at, read off a Matcher — java.util.regex's
+  ;; own rules at the edges: a non-multiline $ (and \Z) does not match between
+  ;; the halves of a final CRLF; multiline ^ never matches at the end of input,
+  ;; so it matches nowhere on "" and once on "a\n"; and (?d) keeps both rules.
+  {:suite "regex / line terminators" :expr "(let [pos (fn [re s] (let [m (re-matcher re s)] (loop [acc []] (if (.find m) (recur (conj acc (.start m))) acc))))] [(pos #\"$\" \"ab\\r\\n\") (pos #\"\\Z\" \"ab\\r\\n\") (pos #\"$\" \"ab\\r\") (pos #\"$\" \"ab\\n\\n\") (pos #\"(?d)$\" \"ab\\n\")])" :expected "[[2 4] [2 4] [2 3] [3 4] [2 3]]"}
+  {:suite "regex / line terminators" :expr "(let [pos (fn [re s] (let [m (re-matcher re s)] (loop [acc []] (if (.find m) (recur (conj acc (.start m))) acc))))] [(pos #\"(?m)^\" \"\") (pos #\"(?m)^\" \"a\\n\") (pos #\"(?m)^\" \"a\\r\\nb\") (pos #\"(?md)^\" \"a\\n\\n\") (re-matches #\"(?m)^$\" \"\")])" :expected "[[] [0] [0 3] [0 2] nil]"}
+
+  ;; --- Base64 MIME encoder/decoder (gh-955) -----------------------------------
+  ;; Four of the JDK's six Base64 statics were here; the MIME pair was not, and
+  ;; the basic decoder is no substitute because it rejects the line breaks a
+  ;; MIME/PEM body carries. The MIME encoder wraps at 76 characters with CRLF and
+  ;; the MIME decoder discards every character outside the alphabet.
+  {:suite "base64 / mime" :expr "(let [p \"The quick brown fox jumps over the lazy dog. \" s (apply str (repeat 10 p)) e (.encodeToString (java.util.Base64/getMimeEncoder) (.getBytes s \"UTF-8\"))] [(every? #(<= (count %) 76) (clojure.string/split e #\"\\r\\n\")) (> (count (clojure.string/split e #\"\\r\\n\")) 1) (= s (String. (.decode (java.util.Base64/getMimeDecoder) e))) (= e (.encodeToString (java.util.Base64/getEncoder) (.getBytes s \"UTF-8\")))])" :expected "[true true true false]"}
+  {:suite "base64 / mime" :expr "[(String. (.decode (java.util.Base64/getMimeDecoder) \"aGVs\\r\\nbG8=\")) (String. (.decode (java.util.Base64/getMimeDecoder) \"aG Vs\\tbG8=\")) (try (String. (.decode (java.util.Base64/getDecoder) \"aGVs\\r\\nbG8=\")) (catch IllegalArgumentException e :threw))]" :expected "[\"hello\" \"hello\" :threw]"}
+  {:suite "base64 / mime" :expr "[(.encodeToString (java.util.Base64/getMimeEncoder 8 (.getBytes \"\\n\")) (.getBytes \"hello world\" \"UTF-8\")) (.encodeToString (java.util.Base64/getMimeEncoder 7 (.getBytes \"\\n\")) (.getBytes \"hello world\" \"UTF-8\")) (.encodeToString (java.util.Base64/getMimeEncoder 0 (.getBytes \"\\n\")) (.getBytes \"hello world\" \"UTF-8\"))]" :expected "[\"aGVsbG8g\\nd29ybGQ=\" \"aGVs\\nbG8g\\nd29y\\nbGQ=\" \"aGVsbG8gd29ybGQ=\"]"}
+  {:suite "base64 / mime" :expr "[(try (java.util.Base64/getMimeEncoder 8 (.getBytes \"A\")) :no-throw (catch IllegalArgumentException e :threw)) (.encodeToString (java.util.Base64/getMimeEncoder) (byte-array 0)) (.getName (class (java.util.Base64/getMimeDecoder))) (.encodeToString (.withoutPadding (java.util.Base64/getEncoder)) (.getBytes \"hi\" \"UTF-8\"))]" :expected "[:threw \"\" \"java.util.Base64$Decoder\" \"aGk\"]"}
   {:suite "javastatic" :expr "(Math/sqrt 16)" :expected "4.0"}
   {:suite "javastatic" :expr "(Math/abs -3)" :expected "3"}
   {:suite "javastatic" :expr "(Math/max 2 7)" :expected "7"}
@@ -713,8 +857,10 @@
   ;; whatever file the literal sits in. An ordinary read still positions its lists.
   {:suite "reader-macros" :expr "[(meta (nth (read-string \"#$\\\"a ~(inc x)\\\"\") 2)) (some? (:line (meta (read-string \"(inc x)\"))))]" :expected "[nil true]"}
   ;; edn is a closed grammar with no user extension point, so the table is not
-  ;; consulted there and #$ stays the unreadable tag it always was.
-  {:suite "reader-macros" :expr "(try (clojure.edn/read-string \"#$\\\"a\\\"\") :no-throw (catch Exception e (ex-message e)))" :expected "\"No reader function for tag $\""}
+  ;; consulted there. Nor does #$ fall through to the tagged-literal arm: the
+  ;; reference dispatches a tag on a LETTER only, and answers "No dispatch macro"
+  ;; for anything else — verified against Clojure 1.12.5.
+  {:suite "reader-macros" :expr "(try (clojure.edn/read-string \"#$\\\"a\\\"\") :no-throw (catch Exception e (ex-message e)))" :expected "\"No dispatch macro for: $\""}
   ;; the two registration tiers: the default reads the next form and hands it to
   ;; the fn, :raw hands the fn the source and an index and takes back [form end].
   {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\% (fn [f] (list (quote clojure.core/vector) f f))) (load-string \"#%(+ 1 2)\"))" :expected "[3 3]"}
@@ -847,6 +993,9 @@
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (= :end (e0/read-string {:eof :end} \"\")))" :expected "true"}
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (= [:custom 5] (e0/read-string {:readers {(quote custom) (fn [v] [:custom v])}} \"#custom 5\")))" :expected "true"}
   {:suite "reader" :expr "(do (require (quote clojure.edn)) (= {:a 1 :b 2} (clojure.edn/read-string \"{:a 1\\n :b 2}\")))" :expected "true"}
+  ;; a QUOTED tagged literal keeps its tag's namespace: emit-quoted rendered the
+  ;; tag as one bare symbol "foo/bar" (backend_scheme.clj), so (namespace (:tag ..)) was nil
+  {:suite "reader" :expr "(let [t '#foo/bar {:a 1}] [(namespace (:tag t)) (name (:tag t)) (:form t)])" :expected "[\"foo\" \"bar\" {:a 1}]"}
   ;; atomic spit: a throwing render (or failed write) leaves the original file
   ;; intact — deliberately STRONGER than the JVM, whose spit truncates first.
   {:suite "atomic-spit" :expr "(let [f (java.io.File/createTempFile \"spt\" \".t\")] (spit f \"ok\") (try (spit f (reify Object (toString [_] (throw (ex-info \"b\" {}))))) (catch Exception _ nil)) (let [r (slurp f)] (.delete f) r))" :expected "\"ok\""}

@@ -10,6 +10,37 @@
   {:suite "host-interop / Matcher anchoring" :label "lookingAt re-anchors at the region start after a find" :expected "[true true \"abb\"]" :actual "(let [m (re-matcher #\"ab+\" \"abbXabb\")] [(.find m) (.lookingAt m) (.group m)])" :portability :jvm}
   {:suite "host-interop / Matcher anchoring" :label "lookingAt is a prefix match, find is not" :expected "[false true \"abb\"]" :actual "(let [m (re-matcher #\"ab+\" \"Xabb\")] [(.lookingAt m) (.find m) (.group m)])" :portability :jvm}
   {:suite "host-interop / Matcher anchoring" :label "a matched region is consumed, so a following find sees nothing" :expected "[true \"abb\" false]" :actual "(let [m (re-matcher #\"ab+\" \"abb\")] [(.matches m) (.group m) (.find m)])" :portability :jvm}
+  ;; .find(int) and .region(int,int): the scan-position and region controls. The
+  ;; int used to be dropped from .find, so the anchored-scan idiom
+  ;; (.find m i) + (= (.start m) i) only ever matched at index 0, and .region did
+  ;; not exist at all. jolt-nku, jolt-c2m
+  {:suite "host-interop / Matcher find from an index" :label "find(int) scans from at-or-after the index" :expected "[true 4 6]" :actual "(let [m (re-matcher #\"ab\" \"xxabab\")] [(.find m 3) (.start m) (.end m)])" :portability :jvm}
+  {:suite "host-interop / Matcher find from an index" :label "find(int) at the end of the input finds nothing" :expected "false" :actual "(let [m (re-matcher #\"ab\" \"xxabab\")] (.find m 6))" :portability :jvm}
+  {:suite "host-interop / Matcher find from an index" :label "an index past the input is out of bounds" :expected "\"Illegal start index\"" :actual "(try (.find (re-matcher #\"ab\" \"xxabab\") 7) (catch IndexOutOfBoundsException e (.getMessage e)))" :portability :jvm}
+  {:suite "host-interop / Matcher find from an index" :label "a negative index is out of bounds" :expected "\"Illegal start index\"" :actual "(try (.find (re-matcher #\"ab\" \"xxabab\") -1) (catch IndexOutOfBoundsException e (.getMessage e)))" :portability :jvm}
+  {:suite "host-interop / Matcher find from an index" :label "find(int) RESETS, so find(0) re-finds the first match" :expected "[true 2 true 2]" :actual "(let [m (re-matcher #\"ab\" \"xxabab\")] [(.find m) (.start m) (.find m 0) (.start m)])" :portability :jvm}
+  {:suite "host-interop / Matcher find from an index" :label "the scan cursor continues from the index match" :expected "[true 1 true 2 false]" :actual "(let [m (re-matcher #\"a\" \"aaa\")] [(.find m 1) (.start m) (.find m) (.start m) (.find m)])" :portability :jvm}
+  {:suite "host-interop / Matcher find from an index" :label "a ^-anchored pattern cannot match past index 0" :expected "false" :actual "(let [m (re-matcher #\"^ab\" \"xxabab\")] (.find m 2))" :portability :jvm}
+  {:suite "host-interop / Matcher find from an index" :label "the anchored-scan idiom finds the code AT an index" :expected "[true \"345\"]" :actual "(let [m (re-matcher #\"\\d+\" \"a12b345\")] [(and (.find m 4) (= (.start m) 4)) (.group m)])" :portability :jvm}
+  {:suite "host-interop / Matcher find from an index" :label "and reports no match when nothing starts there" :expected "false" :actual "(let [m (re-matcher #\"\\d+\" \"a12b345\")] (and (.find m 3) (= (.start m) 3)))" :portability :jvm}
+  {:suite "host-interop / Matcher find from an index" :label ".start after a failed find(int) is an IllegalStateException" :expected "[false \"No match found\"]" :actual "(let [m (re-matcher #\"z\" \"ab\")] [(.find m 1) (try (.start m) (catch IllegalStateException e (.getMessage e)))])" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "the default region is the whole input" :expected "[0 3]" :actual "(let [m (re-matcher #\"a\" \"bab\")] [(.regionStart m) (.regionEnd m)])" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "region confines the scan" :expected "[1 true 1]" :actual "(let [m (re-matcher #\"a\" \"ba\")] [(.regionStart (.region m 1 2)) (.find m) (.start m)])" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "region reports its own bounds" :expected "[1 2]" :actual "(let [m (doto (re-matcher #\"a\" \"bab\") (.region 1 2))] [(.regionStart m) (.regionEnd m)])" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "a match outside the region is not found" :expected "false" :actual "(let [m (doto (re-matcher #\"b\" \"bab\") (.region 1 2))] (.find m))" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "region returns the matcher, so it doto/threads" :expected "true" :actual "(let [m (re-matcher #\"a\" \"bab\")] (identical? m (.region m 1 2)))" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "^ and $ anchor at the region edges" :expected "[true true]" :actual "[(.find (doto (re-matcher #\"^a\" \"bab\") (.region 1 2))) (.find (doto (re-matcher #\"a$\" \"bab\") (.region 1 2)))]" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label ".matches is the whole REGION, not the whole input" :expected "true" :actual "(let [m (doto (re-matcher #\"a\" \"bab\") (.region 1 2))] (.matches m))" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label ".lookingAt anchors at the region start" :expected "true" :actual "(let [m (doto (re-matcher #\"a\" \"bab\") (.region 1 2))] (.lookingAt m))" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "a greedy match stops at the region end" :expected "[true \"aa\"]" :actual "(let [m (doto (re-matcher #\"a+\" \"baaab\") (.region 1 3))] [(.find m) (.group m)])" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "the region is walked match by match" :expected "[true 3 true 5 false]" :actual "(let [m (doto (re-matcher #\"a\" \"xaxaxa\") (.region 2 6))] [(.find m) (.start m) (.find m) (.start m) (.find m)])" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "groups inside a region carry absolute indices" :expected "[true \"a\" \"b\" 3]" :actual "(let [m (doto (re-matcher #\"(a)(b)\" \"xxab\") (.region 1 4))] [(.find m) (.group m 1) (.group m 2) (.start m 2)])" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "re-find honors the region" :expected "\"a\"" :actual "(re-find (doto (re-matcher #\"a\" \"bab\") (.region 1 2)))" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "reset clears the region" :expected "[0 3 true 1]" :actual "(let [m (doto (re-matcher #\"a\" \"bab\") (.region 1 2))] (.reset m) [(.regionStart m) (.regionEnd m) (.find m) (.start m)])" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "reset returns the matcher" :expected "true" :actual "(let [m (re-matcher #\"a\" \"bab\")] (identical? m (.reset m)))" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "a start out of bounds names start, an end out of bounds names end" :expected "[\"start\" \"end\"]" :actual "(let [m (re-matcher #\"a\" \"bab\")] [(try (.region m -1 2) (catch IndexOutOfBoundsException e (.getMessage e))) (try (.region m 0 9) (catch IndexOutOfBoundsException e (.getMessage e)))])" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "start after end is out of bounds" :expected "\"start > end\"" :actual "(try (.region (re-matcher #\"a\" \"bab\") 2 1) (catch IndexOutOfBoundsException e (.getMessage e)))" :portability :jvm}
+  {:suite "host-interop / Matcher region" :label "find(int) clears the region too" :expected "[true 0 3]" :actual "(let [m (doto (re-matcher #\"b\" \"bab\") (.region 1 2))] [(.find m 0) (.start m) (.regionEnd m)])" :portability :jvm}
   {:suite "host-interop / PersistentList-create" :label "a created list is list?" :expected "true" :actual "(list? (clojure.lang.PersistentList/create [1 2 3]))" :portability :jvm}
   {:suite "host-interop / PersistentList-create" :label "an empty created list is list?" :expected "true" :actual "(list? (clojure.lang.PersistentList/create []))" :portability :jvm}
   {:suite "host-interop / PersistentList-create" :label "created list agrees with a literal on list?/seq?/class" :expected "[true true true]" :actual "(let [c (clojure.lang.PersistentList/create [1 2 3])] [(= (list? c) (list? (quote (1 2 3)))) (seq? c) (= c (quote (1 2 3)))])" :portability :jvm}
@@ -387,6 +418,8 @@
   {:suite "io / spit and writer on a URL" :label "io/writer and io/output-stream through a file: URL" :expected "[\"ww\" \"oo\"]" :actual "(let [f (java.io.File/createTempFile \"writerurl\" \".txt\") u (.toURL f) g (java.io.File/createTempFile \"ostreamurl\" \".txt\") v (.toURL g)] (with-open [w (clojure.java.io/writer u)] (.write w \"ww\")) (with-open [o (clojure.java.io/output-stream v)] (.write o (.getBytes \"oo\"))) [(slurp f) (slurp g)])" :portability :common}
   {:suite "io / spit and writer on a URL" :label "spit :append through a URL" :expected "\"ab\"" :actual "(let [f (java.io.File/createTempFile \"spitappend\" \".txt\") u (.toURL f)] (spit u \"a\") (spit u \"b\" :append true) (slurp f))" :portability :common}
   {:suite "io / spit and writer on a URL" :label "a non-file URL is refused with the JVM's message" :expected "[\"Can not write to non-file URL <http://example.com/x>\" \"Can not write to non-file URL <http://example.com/x>\" \"Can not write to non-file URL <http://example.com/x>\"]" :actual "(let [u (java.net.URL. \"http://example.com/x\") m (fn [f] (try (f) :no-throw (catch IllegalArgumentException e (ex-message e))))] [(m (fn [] (spit u \"y\"))) (m (fn [] (clojure.java.io/writer u))) (m (fn [] (clojure.java.io/output-stream u)))])" :portability :common}
+  {:suite "io / File.toURI" :label "a path with characters illegal in a URI is quoted, not rejected" :expected "[\"file:/tmp/a%20b\" \"file:/tmp/a%25b\" \"file:/tmp/a%5Bb%5D\" \"file:/tmp/\\u00e4\"]" :actual "(mapv (fn [s] (str (.toURI (java.io.File. s)))) [\"/tmp/a b\" \"/tmp/a%b\" \"/tmp/a[b]\" \"/tmp/\\u00e4\"])" :portability :jvm}
+  {:suite "io / File.toURI" :label "an existing directory's URI and URL end in a slash, a file's does not" :expected "[true true false false]" :actual "(let [d (java.io.File. (str (System/getProperty \"java.io.tmpdir\") \"/joltdir\" (System/currentTimeMillis))) _ (.mkdirs d) f (java.io.File/createTempFile \"nodir\" \".t\") r [(.endsWith (str (.toURI d)) \"/\") (.endsWith (str (.toURL d)) \"/\") (.endsWith (str (.toURI f)) \"/\") (.endsWith (str (.toURI (java.io.File. (str d \"/gone\")))) \"/\")]] (.delete d) (.delete f) r)" :portability :jvm}
   ;; invokeAll / invokeAny were absent from the executor-service rows. invokeAll
   ;; BLOCKS until every task is done and returns their futures (a failure lives
   ;; in its future); invokeAny returns the first success and raises only when all fail.
@@ -586,6 +619,15 @@
   {:suite "interop / Arrays" :label "equals on byte arrays" :expected "true" :actual "(java.util.Arrays/equals (byte-array [1 2 3]) (byte-array [1 2 3]))" :portability :jvm}
   {:suite "interop / Arrays" :label "equals on unequal byte arrays" :expected "false" :actual "(java.util.Arrays/equals (byte-array [1 2]) (byte-array [1 9]))" :portability :jvm}
   {:suite "interop / URI" :label "URI/create static factory" :expected "\"x.com\"" :actual "(.getHost (java.net.URI/create \"http://x.com/p\"))" :portability :jvm}
+  {:suite "interop / URI" :label "the ctor validates: an illegal character in the authority throws" :expected "\"Illegal character in authority at index 11: https://not a url\"" :actual "(try (java.net.URI. \"https://not a url\") :no-throw (catch java.net.URISyntaxException e (ex-message e)))" :portability :jvm}
+  {:suite "interop / URI" :label "URI/create rewraps the checked exception as IllegalArgumentException" :expected "\"Illegal character in authority at index 11: https://not a url\"" :actual "(try (java.net.URI/create \"https://not a url\") :no-throw (catch IllegalArgumentException e (ex-message e)))" :portability :jvm}
+  {:suite "interop / URI" :label "the offending component is named, per component" :expected "[\"Illegal character in path at index 14: http://h.com/a b\" \"Illegal character in query at index 18: http://h.com/p?a=b c\" \"Illegal character in fragment at index 17: http://h.com/p#fr ag\" \"Illegal character in scheme name at index 0: 1http://x\" \"Malformed escape pair at index 14: http://h.com/a%zz\" \"Expected authority at index 7: http://\"]" :actual "(mapv (fn [s] (try (java.net.URI. s) :no-throw (catch java.net.URISyntaxException e (ex-message e)))) [\"http://h.com/a b\" \"http://h.com/p?a=b c\" \"http://h.com/p#fr ag\" \"1http://x\" \"http://h.com/a%zz\" \"http://\"])" :portability :jvm}
+  {:suite "interop / URI" :label "a registry-based authority parses, and has no host or port" :expected "[[\"h_c.com\" nil -1] [\"h.com:xx\" nil -1] [\"1.2.3.4.5\" nil -1] [\"-h.com\" nil -1]]" :actual "(mapv (fn [s] (let [u (java.net.URI. s)] [(.getAuthority u) (.getHost u) (.getPort u)])) [\"http://h_c.com/p\" \"http://h.com:xx/p\" \"http://1.2.3.4.5/p\" \"http://-h.com/p\"])" :portability :jvm}
+  {:suite "interop / URI" :label "a character above 0x80 is legal unescaped, so it is not an error" :expected "[\"h.com\" \"/\\u00e4\"]" :actual "(let [u (java.net.URI. \"http://h.com/\\u00e4\")] [(.getHost u) (.getRawPath u)])" :portability :jvm}
+  {:suite "interop / URI" :label "an IPv6 literal host keeps its brackets, a malformed one throws" :expected "[[\"[::1]\" 8080] \"IPv6 address too short at index 8: http://[bad]/p\"]" :actual "[(let [u (java.net.URI. \"http://[::1]:8080/p\")] [(.getHost u) (.getPort u)]) (try (java.net.URI. \"http://[bad]/p\") :no-throw (catch java.net.URISyntaxException e (ex-message e)))]" :portability :jvm}
+  {:suite "interop / URI" :label "an opaque URI has no path, only a scheme-specific part" :expected "[\"mailto\" nil nil \"a@b.com\"]" :actual "(let [u (java.net.URI. \"mailto:a@b.com\")] [(.getScheme u) (.getPath u) (.getAuthority u) (.getRawSchemeSpecificPart u)])" :portability :jvm}
+  {:suite "interop / URI" :label "an empty authority ahead of a path is allowed" :expected "[nil \"/tmp/x\"]" :actual "(let [u (java.net.URI. \"file:///tmp/x\")] [(.getAuthority u) (.getPath u)])" :portability :jvm}
+  {:suite "interop / URI" :label "URISyntaxException is a checked Exception" :expected "[\"java.net.URISyntaxException\" \"Illegal character in scheme name at index 1: a b:c\"]" :actual "(try (java.net.URI. \"a b:c\") :no-throw (catch Exception e [(.getName (class e)) (ex-message e)]))" :portability :jvm}
   {:suite "interop / Thread" :label "start + join runs the thunk" :expected "7" :actual "(let [a (atom 0) t (Thread. (fn [] (reset! a 7)))] (.start t) (.join t) (deref a))" :portability :jvm}
   {:suite "interop / CountDownLatch" :label "countDown to zero, await returns" :expected "0" :actual "(let [l (java.util.concurrent.CountDownLatch. 1)] (.countDown l) (.await l) (.getCount l))" :portability :jvm}
   {:suite "interop / SoftReference" :label "get returns the referent" :expected ":v" :actual "(.get (java.lang.ref.SoftReference. :v))" :portability :jvm}
@@ -742,6 +784,19 @@
   {:suite "destructure / keyword args (& {:keys})" :label "fn kwargs + fixed" :expected "[0 5]" :actual "(do (defn g [x & {:keys [a]}] [x a]) (g 0 :a 5))" :portability :common}
   {:suite "destructure / keyword args (& {:keys})" :label "fn kwargs :or" :expected "9" :actual "(do (defn h [& {:keys [a] :or {a 9}}] a) (h))" :portability :common}
   {:suite "destructure / keyword args (& {:keys})" :label "fn kwargs trailing map" :expected "7" :actual "(do (defn k [& {:keys [a]}] a) (k {:a 7}))" :portability :common}
+  ;; A map pattern over a fn's seq rest takes the args pairwise, and destmap*
+  ;; special-cases a rest of exactly ONE element: that element IS the map, whatever
+  ;; it is. So (f 1 {:a 2}) passes a map, and a stray (f 1 :a) looks keys up in a
+  ;; keyword — answering nil, not throwing. Only a longer odd rest is an error, and
+  ;; only a seq is coerced at all: a vector init destructures as itself.
+  {:suite "destructure / keyword args (& {:keys})" :label "a lone trailing non-map arg IS the map, so its keys read as nil" :expected "[1 nil :a]" :actual "(do (defn kw1 [x & {:keys [a] :as m}] [x a m]) (kw1 1 :a))" :portability :common}
+  {:suite "destructure / keyword args (& {:keys})" :label "an unpaired arg after a pair throws" :expected ":threw" :actual "(do (defn kw2 [x & {:keys [a]}] [x a]) (try (kw2 1 :a 2 :b) (catch Throwable _ :threw)))" :portability :common}
+  {:suite "destructure / keyword args (& {:keys})" :label "a lone nil arg is a nil map, not an empty one" :expected "[1 nil nil]" :actual "(do (defn kw3 [x & {:keys [a] :as m}] [x a m]) (kw3 1 nil))" :portability :common}
+  {:suite "destructure / keyword args (& {:keys})" :label "a lone vector arg is the map itself, not a pair" :expected "[1 nil [:a 2]]" :actual "(do (defn kw4 [x & {:keys [a] :as m}] [x a m]) (kw4 1 [:a 2]))" :portability :common}
+  {:suite "destructure / keyword args (& {:keys})" :label "a vector init is not a kwargs seq" :expected "[nil [:a 1]]" :actual "(let [{:keys [a] :as m} [:a 1]] [a m])" :portability :common}
+  {:suite "destructure / keyword args (& {:keys})" :label "a trailing map wins over the pairs" :expected "[1 3]" :actual "(do (defn kw5 [x & {:keys [a]}] [x a]) (kw5 1 :a 2 {:a 3}))" :portability :common}
+  {:suite "destructure / keyword args (& {:keys})" :label "a repeated kwarg takes the last value" :expected "[1 2]" :actual "(do (defn kw6 [x & {:keys [a]}] [x a]) (kw6 1 :a 1 :a 2))" :portability :common}
+  {:suite "destructure / keyword args (& {:keys})" :label "no kwargs at all is a nil map" :expected "[1 nil nil]" :actual "(do (defn kw7 [x & {:keys [a] :as m}] [x a m]) (kw7 1))" :portability :common}
   {:suite "destructure / fn params & loop" :label "fn vector param" :expected "7" :actual "((fn [[a b]] (+ a b)) [3 4])" :portability :common}
   {:suite "destructure / fn params & loop" :label "fn map param" :expected "30" :actual "((fn [{:keys [x y]}] (* x y)) {:x 5 :y 6})" :portability :common}
   {:suite "destructure / fn params & loop" :label "fn :or param" :expected "7" :actual "((fn [{:keys [x] :or {x 7}}] x) {})" :portability :common}
@@ -2466,6 +2521,89 @@
   {:suite "numbers / parse fns (1.11)" :label "parse-long empty nil" :expected "nil" :actual "(parse-long \"\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-long junk nil" :expected "nil" :actual "(parse-long \"12ab\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-long throws" :expected :throws :actual "(parse-long 42)" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long max long" :expected "9223372036854775807" :actual "(parse-long \"9223372036854775807\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long min long" :expected "-9223372036854775808" :actual "(parse-long \"-9223372036854775808\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long over max nil" :expected "nil" :actual "(parse-long \"9223372036854775808\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long under min nil" :expected "nil" :actual "(parse-long \"-9223372036854775809\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long +over max nil" :expected "nil" :actual "(parse-long \"+9223372036854775808\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long far over nil" :expected "nil" :actual "(parse-long \"99999999999999999999999999\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long zero-padded max" :expected "9223372036854775807" :actual "(parse-long \"0009223372036854775807\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long zero-padded over nil" :expected "nil" :actual "(parse-long \"018446744073709551616\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long overflow is not some?" :expected "false" :actual "(some? (parse-long \"9223372036854775808\"))" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long overflow has no class" :expected "nil" :actual "(class (parse-long \"9223372036854775808\"))" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long in range is a Long" :expected "java.lang.Long" :actual "(class (parse-long \"9223372036854775807\"))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects an exponent" :expected "nil" :actual "(try (Long/parseLong \"1e3\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects a decimal point" :expected "nil" :actual "(try (Long/parseLong \"5.0\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects a #x radix prefix" :expected "nil" :actual "(try (Long/parseLong \"#xff\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseInt rejects a #o radix prefix" :expected "nil" :actual "(try (Integer/parseInt \"#o17\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects leading space" :expected "nil" :actual "(try (Long/parseLong \" 5\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects trailing space" :expected "nil" :actual "(try (Long/parseLong \"5 \") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong takes a leading plus" :expected "5" :actual "(Long/parseLong \"+5\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong max long" :expected "9223372036854775807" :actual "(Long/parseLong \"9223372036854775807\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong past max throws" :expected :throws :actual "(Long/parseLong \"9223372036854775808\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Long/valueOf past max throws" :expected :throws :actual "(Long/valueOf \"9223372036854775808\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseInt max int" :expected "2147483647" :actual "(Integer/parseInt \"2147483647\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseInt past max throws" :expected :throws :actual "(Integer/parseInt \"2147483648\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Integer/valueOf past max throws" :expected :throws :actual "(Integer/valueOf \"2147483648\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseShort max short" :expected "32767" :actual "(Short/parseShort \"32767\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseShort past max throws" :expected :throws :actual "(Short/parseShort \"32768\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseByte min byte" :expected "-128" :actual "(Byte/parseByte \"-128\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseByte past min throws" :expected :throws :actual "(Byte/parseByte \"-129\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Byte/valueOf past max throws" :expected :throws :actual "(Byte/valueOf \"128\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "(Long. s) past max throws" :expected :throws :actual "(Long. \"9223372036854775808\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "(Integer. s) past max throws" :expected :throws :actual "(Integer. \"2147483648\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix 16" :expected "255" :actual "(Long/parseLong \"ff\" 16)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix 36 is case-blind" :expected "1295" :actual "(Long/parseLong \"ZZ\" 36)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix 16 past max throws" :expected :throws :actual "(Long/parseLong \"8000000000000000\" 16)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseInt radix 16 past max throws" :expected :throws :actual "(Integer/parseInt \"80000000\" 16)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix below MIN_RADIX throws" :expected :throws :actual "(Long/parseLong \"5\" 1)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix above MAX_RADIX throws" :expected :throws :actual "(Long/parseLong \"5\" 37)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "long range message is the input-string one" :expected "\"For input string: \\\"9223372036854775808\\\"\"" :actual "(try (Long/parseLong \"9223372036854775808\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "short range message names the value" :expected "\"Value out of range. Value:\\\"32768\\\" Radix:10\"" :actual "(try (Short/parseShort \"32768\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "byte range message names the value" :expected "\"Value out of range. Value:\\\"128\\\" Radix:10\"" :actual "(try (Byte/parseByte \"128\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "a non-ten radix is named in the message" :expected "\"For input string: \\\"zz\\\" under radix 16\"" :actual "(try (Long/parseLong \"zz\" 16) (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "radix 1 is named as below MIN_RADIX" :expected "\"radix 1 less than Character.MIN_RADIX\"" :actual "(try (Long/parseLong \"5\" 1) (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode hex 0x" :expected "31" :actual "(Integer/decode \"0x1f\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode hex 0X" :expected "31" :actual "(Integer/decode \"0X1F\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode hex #" :expected "31" :actual "(Integer/decode \"#1f\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode octal" :expected "15" :actual "(Integer/decode \"017\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode decimal" :expected "10" :actual "(Integer/decode \"10\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode zero" :expected "0" :actual "(Integer/decode \"0\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode signs the prefixed value" :expected "-31" :actual "(Integer/decode \"-0x1f\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode takes a leading plus" :expected "31" :actual "(Integer/decode \"+0x1f\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Long/decode max long" :expected "9223372036854775807" :actual "(Long/decode \"0x7fffffffffffffff\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Long/decode past max throws" :expected :throws :actual "(Long/decode \"0x8000000000000000\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Short/decode max short" :expected "32767" :actual "(Short/decode \"#7fff\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Byte/decode past max throws" :expected :throws :actual "(Byte/decode \"0x80\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode rejects a bad octal digit" :expected :throws :actual "(Integer/decode \"08\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode rejects leading space" :expected :throws :actual "(Integer/decode \" 5\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode names the post-prefix digits and radix" :expected "\"For input string: \\\"8\\\" under radix 8\"" :actual "(try (Integer/decode \"08\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode of the empty string says so" :expected "\"Zero length string\"" :actual "(try (Integer/decode \"\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "narrow decode range message quotes the input" :expected "\"Value 128 out of range from input 0x80\"" :actual "(try (Byte/decode \"0x80\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "bigint is not width-checked" :expected "9223372036854775808N" :actual "(bigint \"9223372036854775808\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "BigInteger takes the same grammar" :expected :throws :actual "(java.math.BigInteger. \"1e3\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble rejects a #x radix prefix" :expected :throws :actual "(Double/parseDouble \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble rejects a ratio" :expected :throws :actual "(Double/parseDouble \"1/2\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble rejects a #b radix prefix" :expected :throws :actual "(Double/parseDouble \"#b101\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseFloat rejects a #x radix prefix" :expected :throws :actual "(Float/parseFloat \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "Double/valueOf rejects a #x radix prefix" :expected :throws :actual "(Double/valueOf \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "(Double. s) rejects a #x radix prefix" :expected :throws :actual "(Double. \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double rejects a #x radix prefix" :expected "nil" :actual "(parse-double \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble takes a hex significand" :expected "31.0" :actual "(Double/parseDouble \"0x1fp0\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble hex with a fraction" :expected "3.0" :actual "(Double/parseDouble \"0x1.8p1\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble signs a hex significand" :expected "-31.0" :actual "(Double/parseDouble \"-0x1fp0\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double takes a hex significand" :expected "31.0" :actual "(parse-double \"0x1fp0\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double hex with a fraction" :expected "3.0" :actual "(parse-double \"0x1.8p1\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "a hex integer is not a double" :expected "nil" :actual "(parse-double \"0x1f\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double signed NaN is NaN" :expected "true" :actual "(Double/isNaN (parse-double \"-NaN\"))" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double takes +Infinity" :expected "##Inf" :actual "(parse-double \"+Infinity\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double keeps -Infinity" :expected "##-Inf" :actual "(parse-double \"-Infinity\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble trims, unlike the integers" :expected "1.5" :actual "(Double/parseDouble \" 1.5 \")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble takes a d suffix" :expected "1.5" :actual "(Double/parseDouble \"1.5d\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble takes an f suffix" :expected "1.5" :actual "(Double/parseDouble \"1.5f\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double takes an exponent and a suffix" :expected "150.0" :actual "(parse-double \"1.5e2d\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble saturates rather than failing" :expected "##Inf" :actual "(Double/parseDouble \"1e400\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "lowercase infinity is not a double" :expected "nil" :actual "(parse-double \"infinity\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double" :expected "1.5" :actual "(parse-double \"1.5\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double int" :expected "4.0" :actual "(parse-double \"4\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double sci" :expected "1500.0" :actual "(parse-double \"1.5e3\")" :portability :common}
@@ -3003,8 +3141,44 @@
   {:suite "regex / \\p property classes" :label "P{N} negation" :expected "\"abc\"" :actual "(re-matches #\"^\\P{N}+$\" \"abc\")" :portability :common}
   {:suite "regex / \\p property classes" :label "inside class" :expected "\"a-1_b\"" :actual "(re-matches #\"^[\\p{N}\\p{L}_-]+$\" \"a-1_b\")" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Lu}/p{Ll}" :expected "\"aB\"" :actual "(re-matches #\"^\\p{Ll}\\p{Lu}$\" \"aB\")" :portability :common}
+  ;; the JVM's rule: a Unicode CATEGORY name is the real category over every
+  ;; codepoint, a POSIX name (Alpha, Digit, Upper, Punct, Alnum) is ASCII
+  {:suite "regex / \\p property classes" :label "p{L} is letters, not every non-ASCII char (#941)" :expected "[\"a\" \"é\" \"漢\"]" :actual "(re-seq #\"\\p{L}\" \"aé漢→\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "a class over p{L}p{N} drops an arrow (#941)" :expected "\"a  b\"" :actual "(clojure.string/replace \"a → b\" #\"[^\\p{L}\\p{N}\\s_-]\" \"\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Alpha} is ASCII" :expected "[\"a\"]" :actual "(re-seq #\"\\p{Alpha}\" \"aé\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Digit} is ASCII" :expected "[\"1\"]" :actual "(re-seq #\"\\p{Digit}\" \"1٣\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Lu} beyond Latin-1" :expected "[\"É\" \"Ω\" \"B\"]" :actual "(re-seq #\"\\p{Lu}\" \"aÉΩB\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Ll} beyond Latin-1" :expected "\"ω\"" :actual "(re-find #\"\\p{Ll}\" \"ω\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Upper} stays ASCII" :expected "nil" :actual "(re-find #\"\\p{Upper}\" \"Ω\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Alnum} stays ASCII" :expected "nil" :actual "(re-find #\"\\p{Alnum}\" \"é\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Nd} is decimal digits, p{N} every number" :expected "[\"٣\" nil \"Ⅻ\"]" :actual "[(re-find #\"\\p{Nd}\" \"٣\") (re-find #\"\\p{Nd}\" \"Ⅻ\") (re-find #\"\\p{N}\" \"Ⅻ\")]" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{P} is Unicode punctuation, p{Punct} ASCII" :expected "[\"¿\" nil nil]" :actual "[(re-find #\"\\p{P}\" \"¿\") (re-find #\"\\p{Punct}\" \"¿\") (re-find #\"\\p{P}\" \"→\")]" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Ps}/p{Pe} are the open/close categories" :expected "[nil \"«\" \"」\"]" :actual "[(re-find #\"\\p{Ps}\" \"«\") (re-find #\"\\p{P}\" \"«\") (re-find #\"\\p{Pe}\" \"」\")]" :portability :common}
+  {:suite "regex / \\p property classes" :label "javaUpperCase/javaLowerCase are Unicode" :expected "[\"Ω\" \"ω\"]" :actual "[(re-find #\"\\p{javaUpperCase}\" \"Ω\") (re-find #\"\\p{javaLowerCase}\" \"ω\")]" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Z} space" :expected "\"  \"" :actual "(re-matches #\"(?u)^[\\s\\p{Z}]+$\" \"  \")" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Ps}/p{Pe}" :expected "\"(x)\"" :actual "(re-matches #\"^\\p{Ps}x\\p{Pe}$\" \"(x)\")" :portability :common}
+  ;; An escape means the same thing in a bare pattern and inside a character class
+  ;; unless Java says otherwise, and there are exactly three places it does: \b is
+  ;; a word boundary outside a class and a COMPILE ERROR inside one, \R is a
+  ;; linebreak outside and an error inside, and back-references are legal only
+  ;; outside. Everything else — \a \e \t \n \r \f, \cX, octal, \x, \u, \p — is one
+  ;; decoder's job. It used to be two hand-kept copies and they had drifted: \a was
+  ;; in the bare-pattern copy only, so [\a] matched the letter a instead of BEL.
+  {:suite "regex / escapes in and out of a character class" :label "\\a is BEL in both contexts" :expected "[true false true false]" :actual "[(boolean (re-find #\"[\\a]\" (str (char 7)))) (boolean (re-find #\"[\\a]\" \"a\")) (boolean (re-find #\"\\a\" (str (char 7)))) (boolean (re-find #\"\\a\" \"a\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\e is ESC in both contexts" :expected "[true false true false]" :actual "[(boolean (re-find #\"[\\e]\" (str (char 27)))) (boolean (re-find #\"[\\e]\" \"e\")) (boolean (re-find #\"\\e\" (str (char 27)))) (boolean (re-find #\"\\e\" \"e\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\cX is the control character in both contexts" :expected "[true false true false]" :actual "[(boolean (re-find #\"[\\cA]\" (str (char 1)))) (boolean (re-find #\"[\\cA]\" \"c\")) (boolean (re-find #\"\\cA\" (str (char 1)))) (boolean (re-find #\"\\cA\" \"c\"))]" :portability :common}
+  ;; \cX is x XOR 64 applied to the RAW next character, so a lowercase letter is
+  ;; not folded first: \ca is 97 xor 64 = 33, not \cA's 1.
+  {:suite "regex / escapes in and out of a character class" :label "\\c@ \\cZ \\ca are xor-64 of the raw char" :expected "[true true true]" :actual "[(boolean (re-find #\"\\c@\" (str (char 0)))) (boolean (re-find #\"\\cZ\" (str (char 26)))) (boolean (re-find #\"\\ca\" (str (char 33))))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "a dangling \\c is a pattern error" :expected :throws :actual "(re-find (re-pattern \"a\\\\c\") \"x\")" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\t \\n \\r \\f inside a class" :expected "[true true false]" :actual "[(boolean (re-find #\"[\\t\\n\\r\\f]\" (str (char 9)))) (boolean (re-find #\"[\\t\\n\\r\\f]\" (str (char 12)))) (boolean (re-find #\"[\\t\\n\\r\\f]\" \"t\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "octal, \\x and \\u inside a class" :expected "[true false true false true false]" :actual "[(boolean (re-find #\"[\\0101]\" \"A\")) (boolean (re-find #\"[\\0101]\" \"0\")) (boolean (re-find #\"[\\x41]\" \"A\")) (boolean (re-find #\"[\\x41]\" \"x\")) (boolean (re-find #\"[\\u0041]\" \"A\")) (boolean (re-find #\"[\\u0041]\" \"u\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "a class unions its escaped members" :expected "[true true true false]" :actual "(mapv (fn [s] (boolean (re-find #\"[\\a\\e\\f]\" s))) [(str (char 7)) (str (char 27)) (str (char 12)) \"a\"])" :portability :common}
+  ;; The three deliberate differences. \b as a backspace inside a class is PERL,
+  ;; not Java: java.util.regex rejects the pattern outright.
+  {:suite "regex / escapes in and out of a character class" :label "\\b is a word boundary outside a class" :expected "[true false]" :actual "[(boolean (re-find #\"\\bcd\" \"ab cd\")) (boolean (re-find #\"\\bcd\" \"abcd\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\b inside a class is a pattern error" :expected :throws :actual "(re-find (re-pattern \"[\\\\b]\") \"x\")" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\R is a linebreak outside a class and an error inside" :expected "[true :threw]" :actual "[(boolean (re-find #\"\\R\" \"\\n\")) (try (re-find (re-pattern \"[\\\\R]\") \"x\") :no-throw (catch java.util.regex.PatternSyntaxException e :threw))]" :portability :common}
   {:suite "regex / \\p property classes" :label "(?u) accepted" :expected "\"hi\"" :actual "(re-matches #\"(?u)^hi$\" \"hi\")" :portability :common}
   {:suite "regex / \\p property classes" :label "unknown class throws" :expected :throws :actual "(re-pattern \"\\p{Greek}\")" :portability :common}
   {:suite "regex / Pattern statics & String regex methods" :label "Pattern/compile is a regex" :expected "true" :actual "(regex? (Pattern/compile \"a.c\"))" :portability :jvm}
@@ -4075,6 +4249,7 @@
   {:suite "format / scientific" :label "%.2e rounds to the precision" :expected "\"1.23e+04\"" :actual "(format \"%.2e\" 12345.678)" :portability :common}
   {:suite "format / scientific" :label "%g below 1e-4 is scientific" :expected "\"1.23400e-05\"" :actual "(format \"%g\" 0.00001234)" :portability :common}
   {:suite "format / scientific" :label "%.3g at 10^precision is scientific" :expected "\"1.23e+03\"" :actual "(format \"%.3g\" 1234.5)" :portability :common}
+  {:suite "format / scientific" :label "%.4g below 10^precision is fixed (#903)" :expected "\"12.21\"" :actual "(format \"%.4g\" 12.21)" :portability :common}
   {:suite "format / scientific" :label "%e of a negative" :expected "\"-5.000000e-01\"" :actual "(format \"%e\" -0.5)" :portability :common}
   {:suite "format / scientific" :label "%e honours width" :expected "\"  5.00e+00|\"" :actual "(format \"%10.2e|\" 5.0)" :portability :common}
   {:suite "format / scientific" :label "%e of an integer is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%e\" 5) (catch Exception e (class e)))" :portability :common}
@@ -4118,6 +4293,11 @@
   {:suite "format / rounding and flags" :label "%(e parenthesizes a negative" :expected "\"(1.000000e+00)\"" :actual "(format \"%(e\" -1.0)" :portability :common}
   {:suite "format / rounding and flags" :label "%,d groups" :expected "\"1,234,567\"" :actual "(format \"%,d\" 1234567)" :portability :common}
   {:suite "format / rounding and flags" :label "%,.2f groups the integer part" :expected "\"1,234.50\"" :actual "(format \"%,.2f\" 1234.5)" :portability :common}
+  ;; the , flag on %g groups the MANTISSA, so it is a no-op once %g picks
+  ;; scientific notation -- the JVM appends the exponent after the grouping pass
+  ;; and "%,.1g" of 1234.5 is "1e+03", never "1e,+03".
+  {:suite "format / rounding and flags" :label "%,g groups the fixed branch" :expected "\"1,234,567.000\"" :actual "(format \"%,.10g\" 1234567.0)" :portability :common}
+  {:suite "format / rounding and flags" :label "%,g leaves the scientific exponent alone" :expected "[\"1e+03\" \"1E+06\"]" :actual "[(format \"%,.1g\" 1234.5) (format \"%,.1G\" 1000000.0)]" :portability :common}
   ;; a BigDecimal formats from its own digits; the argument types are the JVM's
   {:suite "format / rounding and flags" :label "%f of a BigDecimal" :expected "\"1.500000\"" :actual "(format \"%f\" 1.5M)" :portability :common}
   {:suite "format / rounding and flags" :label "%.2f of a BigDecimal rounds half up" :expected "\"1.01\"" :actual "(format \"%.2f\" 1.005M)" :portability :common}
@@ -4131,6 +4311,97 @@
   ;; there: emit-quoted had no arm for it, so (first '[1.5M]) was an opaque
   ;; reader object that was = to nothing.
   {:suite "format / rounding and flags" :label "a quoted 1.5M is a BigDecimal" :expected "[java.math.BigDecimal true]" :actual "[(class (first (quote [1.5M]))) (= 1.5M (first (quote [1.5M])))]" :portability :common}
+  ;; The rest of java.util.Formatter's surface: a precision TRUNCATES a general
+  ;; conversion, the # flag prefixes a radix one, %[N]$ and %< pick the argument,
+  ;; %h is a hashCode in hex, %a a hexadecimal float and %t a date-time. A flag
+  ;; or precision a conversion cannot take is the JVM's refusal, not a silent
+  ;; drop, so the exception classes are part of the contract. jolt-c90
+  {:suite "format / precision on the general conversions" :label "%.3s truncates" :expected "\"abc\"" :actual "(format \"%.3s\" \"abcdef\")" :portability :common}
+  {:suite "format / precision on the general conversions" :label "%.0s is empty" :expected "\"\"" :actual "(format \"%.0s\" \"abcdef\")" :portability :common}
+  {:suite "format / precision on the general conversions" :label "precision and width together" :expected "\"     abc|\"" :actual "(format \"%8.3s|\" \"abcdef\")" :portability :common}
+  {:suite "format / precision on the general conversions" :label "left-justified precision" :expected "\"abc     |\"" :actual "(format \"%-8.3s|\" \"abcdef\")" :portability :common}
+  {:suite "format / precision on the general conversions" :label "a truncated nil is still \"null\"" :expected "\"nul\"" :actual "(format \"%.3s\" nil)" :portability :common}
+  {:suite "format / precision on the general conversions" :label "%.2b truncates" :expected "\"tr\"" :actual "(format \"%.2b\" true)" :portability :common}
+  {:suite "format / precision on the general conversions" :label "%.3S truncates then upcases" :expected "\"ABC\"" :actual "(format \"%.3S\" \"abcdef\")" :portability :common}
+  {:suite "format / precision on the general conversions" :label "precision on %d is refused" :expected "java.util.IllegalFormatPrecisionException" :actual "(try (format \"%.2d\" 5) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / precision on the general conversions" :label "precision on %x is refused" :expected "java.util.IllegalFormatPrecisionException" :actual "(try (format \"%.2x\" 255) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / precision on the general conversions" :label "precision on %c is refused" :expected "java.util.IllegalFormatPrecisionException" :actual "(try (format \"%.2c\" 97) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / precision on the general conversions" :label "which is an IllegalFormatException" :expected ":ife" :actual "(try (format \"%.2d\" 5) (catch java.util.IllegalFormatException e :ife))" :portability :common}
+  {:suite "format / the # alternate form" :label "%#x prefixes 0x" :expected "\"0xff\"" :actual "(format \"%#x\" 255)" :portability :common}
+  {:suite "format / the # alternate form" :label "%#X prefixes 0X" :expected "\"0XFF\"" :actual "(format \"%#X\" 255)" :portability :common}
+  {:suite "format / the # alternate form" :label "%#o prefixes 0" :expected "\"010\"" :actual "(format \"%#o\" 8)" :portability :common}
+  {:suite "format / the # alternate form" :label "%#o of zero" :expected "\"00\"" :actual "(format \"%#o\" 0)" :portability :common}
+  {:suite "format / the # alternate form" :label "the prefix counts toward the width" :expected "\"      0xff|\"" :actual "(format \"%#10x|\" 255)" :portability :common}
+  {:suite "format / the # alternate form" :label "zeros pad between the prefix and the digits" :expected "\"0x000000ff\"" :actual "(format \"%#010x\" 255)" :portability :common}
+  {:suite "format / the # alternate form" :label "left-justified with a prefix" :expected "\"0xff      |\"" :actual "(format \"%-#10x|\" 255)" :portability :common}
+  {:suite "format / the # alternate form" :label "# on %d is refused" :expected "java.util.FormatFlagsConversionMismatchException" :actual "(try (format \"%#d\" 5) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / the # alternate form" :label "# on %s is refused" :expected "java.util.FormatFlagsConversionMismatchException" :actual "(try (format \"%#s\" \"ab\") (catch Exception e (class e)))" :portability :common}
+  {:suite "format / the # alternate form" :label "# on %g is refused" :expected "java.util.FormatFlagsConversionMismatchException" :actual "(try (format \"%#g\" 1.0) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / the # alternate form" :label "# on %f and %e is a no-op" :expected "[\"1.000000\" \"1.000000e+00\"]" :actual "[(format \"%#f\" 1.0) (format \"%#e\" 1.0)]" :portability :common}
+  {:suite "format / the # alternate form" :label ", on %e is refused" :expected "java.util.FormatFlagsConversionMismatchException" :actual "(try (format \"%,e\" 1.0) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / the # alternate form" :label "( on %s is refused" :expected "java.util.FormatFlagsConversionMismatchException" :actual "(try (format \"%(s\" \"a\") (catch Exception e (class e)))" :portability :common}
+  {:suite "format / the # alternate form" :label "+ and space are the SIGNED conversions only" :expected "[java.util.FormatFlagsConversionMismatchException java.util.FormatFlagsConversionMismatchException]" :actual "[(try (format \"%+s\" \"a\") (catch Exception e (class e))) (try (format \"% b\" true) (catch Exception e (class e)))]" :portability :common}
+  {:suite "format / the # alternate form" :label "+ on the unsigned radix conversions is refused" :expected "[java.util.FormatFlagsConversionMismatchException java.util.FormatFlagsConversionMismatchException]" :actual "[(try (format \"%+x\" 5) (catch Exception e (class e))) (try (format \"%+o\" 5) (catch Exception e (class e)))]" :portability :common}
+  {:suite "format / the # alternate form" :label "+ on %d %f %e %g %a is the sign" :expected "[\"+5\" \"+5.000000\" \"+5.000000e+00\" \"+5.00000\" \"+0x1.4p2\"]" :actual "[(format \"%+d\" 5) (format \"%+f\" 5.0) (format \"%+e\" 5.0) (format \"%+g\" 5.0) (format \"%+a\" 5.0)]" :portability :common}
+  {:suite "format / argument index" :label "%1$s repeats one argument" :expected "\"x x\"" :actual "(format \"%1$s %1$s\" \"x\")" :portability :common}
+  {:suite "format / argument index" :label "an index reorders" :expected "\"b a\"" :actual "(format \"%2$s %1$s\" \"a\" \"b\")" :portability :common}
+  {:suite "format / argument index" :label "an index does not advance the ordinary cursor" :expected "\"a a\"" :actual "(format \"%s %1$s\" \"a\" \"b\")" :portability :common}
+  {:suite "format / argument index" :label "index 0 is refused" :expected "java.util.IllegalFormatArgumentIndexException" :actual "(try (format \"%0$s\" \"a\") (catch Exception e (class e)))" :portability :common}
+  {:suite "format / argument index" :label "an index past the arguments is missing" :expected "java.util.MissingFormatArgumentException" :actual "(try (format \"%3$s\" \"a\") (catch Exception e (class e)))" :portability :common}
+  {:suite "format / argument index" :label "flags and precision apply to an indexed directive" :expected "\"abc     |\"" :actual "(format \"%1$-8.3s|\" \"abcdef\")" :portability :common}
+  {:suite "format / argument index" :label "%<s reuses the previous argument" :expected "\"a a\"" :actual "(format \"%s %<s\" \"a\")" :portability :common}
+  {:suite "format / argument index" :label "a leading %<s has no previous argument" :expected "java.util.MissingFormatArgumentException" :actual "(try (format \"%<s\" \"a\") (catch Exception e (class e)))" :portability :common}
+  {:suite "format / argument index" :label "%<s after an index reuses that one" :expected "\"b b\"" :actual "(format \"%2$s %<s\" \"a\" \"b\")" :portability :common}
+  {:suite "format / argument index" :label "a two-digit index" :expected "\"ten\"" :actual "(format \"%10$s\" 1 2 3 4 5 6 7 8 9 \"ten\")" :portability :common}
+  {:suite "format / argument index" :label "a missing argument with no index" :expected "java.util.MissingFormatArgumentException" :actual "(try (format \"%s\") (catch Exception e (class e)))" :portability :common}
+  {:suite "format / argument index" :label "an unterminated directive" :expected "java.util.UnknownFormatConversionException" :actual "(try (format \"abc%\") (catch Exception e (class e)))" :portability :common}
+  {:suite "format / argument index" :label "%% takes a width" :expected "[\"    %\" \"%    |\"]" :actual "[(format \"%5%\") (format \"%-5%|\")]" :portability :common}
+  {:suite "format / argument index" :label "a width on %n is refused" :expected "java.util.IllegalFormatWidthException" :actual "(try (format \"a%5nb\") (catch Exception e (class e)))" :portability :common}
+  {:suite "format / %h hashcode" :label "%h is the hashCode in hex" :expected "\"17862\"" :actual "(format \"%h\" \"abc\")" :portability :common}
+  {:suite "format / %h hashcode" :label "%h agrees with .hashCode" :expected "true" :actual "(= (format \"%h\" \"hello\") (Integer/toHexString (.hashCode \"hello\")))" :portability :common}
+  {:suite "format / %h hashcode" :label "%H upcases the hex digits" :expected "\"394E80\"" :actual "(format \"%H\" \"zzzz\")" :portability :common}
+  {:suite "format / %h hashcode" :label "%h of nil" :expected "\"null\"" :actual "(format \"%h\" nil)" :portability :common}
+  {:suite "format / %h hashcode" :label "%h takes a width" :expected "\"     17862|\"" :actual "(format \"%10h|\" \"abc\")" :portability :common}
+  {:suite "format / %h hashcode" :label "%.2h truncates" :expected "\"17\"" :actual "(format \"%.2h\" \"abc\")" :portability :common}
+  {:suite "format / %h hashcode" :label "# on %h is refused" :expected "java.util.FormatFlagsConversionMismatchException" :actual "(try (format \"%#h\" \"abc\") (catch Exception e (class e)))" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a of one" :expected "\"0x1.0p0\"" :actual "(format \"%a\" 1.0)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a of zero" :expected "[\"0x0.0p0\" \"-0x0.0p0\"]" :actual "[(format \"%a\" 0.0) (format \"%a\" -0.0)]" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a strips trailing mantissa zeros" :expected "\"0x1.ffp7\"" :actual "(format \"%a\" 255.5)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%A upcases" :expected "\"0X1.FFP7\"" :actual "(format \"%A\" 255.5)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a of a value with a full mantissa" :expected "\"0x1.999999999999ap-4\"" :actual "(format \"%a\" 0.1)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a of a subnormal stays denormalized" :expected "\"0x0.0000000000001p-1022\"" :actual "(format \"%a\" 4.9E-324)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a of Double/MAX_VALUE" :expected "\"0x1.fffffffffffffp1023\"" :actual "(format \"%a\" 1.7976931348623157E308)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a of NaN and the infinities" :expected "[\"NaN\" \"Infinity\" \"-Infinity\"]" :actual "[(format \"%a\" ##NaN) (format \"%a\" ##Inf) (format \"%a\" ##-Inf)]" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "a precision pads to exactly that many digits" :expected "\"0x1.00p0\"" :actual "(format \"%.2a\" 1.0)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "a precision past 13 zero-pads" :expected "\"0x1.999999999999a0000000p-4\"" :actual "(format \"%.20a\" 0.1)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "a precision rounds half to even down" :expected "\"0x1.0p0\"" :actual "(format \"%.1a\" 1.03125)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "a precision rounds half to even up" :expected "\"0x1.2p0\"" :actual "(format \"%.1a\" 1.09375)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "a round that carries raises the exponent" :expected "\"0x1.0p1\"" :actual "(format \"%.1a\" 1.9999)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "a precision NORMALIZES a subnormal" :expected "\"0x1.0p-1074\"" :actual "(format \"%.1a\" 4.9E-324)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "precision 0 is one digit" :expected "\"0x1.ap-4\"" :actual "(format \"%.0a\" 0.1)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a takes width and the sign flags" :expected "[\"             0x1.0p0|\" \"+0x1.0p0\" \" 0x1.0p0\"]" :actual "[(format \"%20a|\" 1.0) (format \"%+a\" 1.0) (format \"% a\" 1.0)]" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a zero-pads after the 0x" :expected "\"0x01.0p0\"" :actual "(format \"%08a\" 1.0)" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a of an integer is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%a\" 5) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / %a hexadecimal float" :label "%a of a BigDecimal is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%a\" 1.5M) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / %a hexadecimal float" :label ", on %a is refused" :expected "java.util.FormatFlagsConversionMismatchException" :actual "(try (format \"%,a\" 1.0) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / %t date-time" :label "%tF is the ISO date" :expected "\"2009-02-13\"" :actual "(format \"%tF\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :portability :common}
+  {:suite "format / %t date-time" :label "%tT is the 24-hour time" :expected "\"23:31:30\"" :actual "(format \"%tT\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :portability :common}
+  {:suite "format / %t date-time" :label "%tR drops the seconds" :expected "\"23:31\"" :actual "(format \"%tR\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :portability :common}
+  {:suite "format / %t date-time" :label "%tD is the US short date" :expected "\"02/13/09\"" :actual "(format \"%tD\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :portability :common}
+  {:suite "format / %t date-time" :label "the hour conversions" :expected "[\"23\" \"11\" \"23\" \"11\"]" :actual "(let [c (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))] [(format \"%tH\" c) (format \"%tI\" c) (format \"%tk\" c) (format \"%tl\" c)])" :portability :common}
+  {:suite "format / %t date-time" :label "minutes, seconds, millis and nanos" :expected "[\"31\" \"30\" \"123\" \"123000000\"]" :actual "(let [c (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))] [(format \"%tM\" c) (format \"%tS\" c) (format \"%tL\" c) (format \"%tN\" c)])" :portability :common}
+  {:suite "format / %t date-time" :label "the date fields" :expected "[\"2009\" \"09\" \"20\" \"02\" \"13\" \"13\" \"044\"]" :actual "(let [c (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))] [(format \"%tY\" c) (format \"%ty\" c) (format \"%tC\" c) (format \"%tm\" c) (format \"%td\" c) (format \"%te\" c) (format \"%tj\" c)])" :portability :common}
+  {:suite "format / %t date-time" :label "epoch seconds and millis" :expected "[\"1234567890\" \"1234567890123\"]" :actual "(let [c (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))] [(format \"%ts\" c) (format \"%tQ\" c)])" :portability :common}
+  {:suite "format / %t date-time" :label "%tz is the numeric offset" :expected "\"+0000\"" :actual "(format \"%tz\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :portability :common}
+  {:suite "format / %t date-time" :label "a Calendar is read on ITS zone" :expected "[\"2009-02-14\" \"08:31:30\" \"+0900\"]" :actual "(let [c (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"Asia/Tokyo\")))] [(format \"%tF\" c) (format \"%tT\" c) (format \"%tz\" c)])" :portability :common}
+  {:suite "format / %t date-time" :label "%T upcases the whole rendering" :expected "\"2009-02-13\"" :actual "(format \"%TF\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :portability :common}
+  {:suite "format / %t date-time" :label "%tF of nil" :expected "\"null\"" :actual "(format \"%tF\" nil)" :portability :common}
+  {:suite "format / %t date-time" :label "a non-date argument names the SUB-conversion" :expected "[java.util.IllegalFormatConversionException \"F != java.lang.String\"]" :actual "(try (format \"%tF\" \"x\") (catch Exception e [(class e) (.getMessage e)]))" :portability :common}
+  {:suite "format / %t date-time" :label "%t takes a width" :expected "[\"          2009-02-13|\" \"2009-02-13          |\"]" :actual "[(format \"%20tF|\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))) (format \"%-20tF|\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))]" :portability :common}
+  {:suite "format / %t date-time" :label "a precision on %t is refused" :expected "java.util.IllegalFormatPrecisionException" :actual "(try (format \"%.3tF\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / %t date-time" :label "# on %t is refused" :expected "java.util.FormatFlagsConversionMismatchException" :actual "(try (format \"%#tF\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / %t date-time" :label "an unknown sub-conversion" :expected "java.util.UnknownFormatConversionException" :actual "(try (format \"%tw\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\")))) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / %t date-time" :label "an indexed date directive renders twice" :expected "\"2009-02-13 23:31:30\"" :actual "(format \"%1$tF %1$tT\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 1234567890123) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :portability :common}
   ;; supers of a root class is nil, not #{}; declare marks the var :declared.
   {:suite "reflection / supers" :label "supers of Object is nil" :expected "nil" :actual "(supers Object)" :portability :common}
   {:suite "vars / declare" :label "declare sets :declared on the var" :expected "true" :actual "(do (declare dq3) (:declared (meta (var dq3))))" :portability :common}
@@ -4725,6 +4996,41 @@
   {:suite "interop / instance? on host interfaces" :label "getFirst/getLast on an empty collection raise NoSuchElementException" :expected "[:nse :nse]" :actual "[(try (.getFirst []) (catch java.util.NoSuchElementException e :nse)) (try (.getLast (list)) (catch java.util.NoSuchElementException e :nse))]" :portability :jvm}
   {:suite "interop / instance? on host interfaces" :label "a persistent collection refuses the java.util mutators with UnsupportedOperationException" :expected "[:uoe :uoe :uoe :uoe :uoe :uoe :uoe]" :actual "(let [f (fn [t] (try (t) (catch UnsupportedOperationException e :uoe)))] [(f (fn [] (.add [1] 2))) (f (fn [] (.addFirst [1] 0))) (f (fn [] (.removeLast [1]))) (f (fn [] (.add (list 1) 2))) (f (fn [] (.set [1] 0 2))) (f (fn [] (.add #{} 1))) (f (fn [] (.remove (map inc [1]) 0)))])" :portability :jvm}
   {:suite "interop / instance? on host interfaces" :label "ArrayList has the SequencedCollection methods" :expected "[1 2 [0 1] [2 [1]]]" :actual "(let [a (doto (java.util.ArrayList.) (.add 1) (.add 2)) b (doto (java.util.ArrayList.) (.add 1)) c (doto (java.util.ArrayList.) (.add 1) (.add 2))] [(.getFirst a) (.getLast a) (do (.addFirst b 0) (vec b)) [(.removeLast c) (vec c)]])" :portability :jvm}
+  ;; A java.util mutator name is not a method until its ARITY matches: List/set
+  ;; is set(int,E), so a one-argument (.set [1 2] 9) matches nothing on the JVM
+  ;; and is its "No matching method" IllegalArgumentException, not the
+  ;; UnsupportedOperationException an immutable collection answers to a mutator it
+  ;; really has. jolt refused every one it merely SPELLED, at any arity, which put
+  ;; those calls out of reach of a (catch IllegalArgumentException ...). And the
+  ;; interfaces differ by receiver: a vector / list / seq is a java.util.List and
+  ;; a SequencedCollection, a set (sorted or not) is a plain java.util.Set, so the
+  ;; positional overloads, the four ends and List's bulk ops exist on the first
+  ;; and are a miss on the second -- for the accessors getFirst / getLast /
+  ;; reversed as much as for the mutators. jolt-8oa
+  {:suite "interop / java.util mutator arity" :label "set(int,E) has no one-argument arity" :expected ":iae" :actual "(try (.set [1 2] 9) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "set(int,E) at two arguments is refused" :expected ":uoe" :actual "(try (.set [1 2] 0 9) :no-throw (catch UnsupportedOperationException _ :uoe))" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "add has no zero-argument arity" :expected ":iae" :actual "(try (.add [1 2]) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "add(E) and add(int,E) are both refused" :expected "[:uoe :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe))) [(fn [] (.add [1 2] 9)) (fn [] (.add [1 2] 0 9))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "addAll(Collection) and addAll(int,Collection) are both refused" :expected "[:uoe :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe))) [(fn [] (.addAll [1 2] [9])) (fn [] (.addAll [1 2] 0 [9]))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "clear takes no argument" :expected "[:uoe :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe) (catch IllegalArgumentException _ :iae))) [(fn [] (.clear [1 2])) (fn [] (.clear [1 2] 9))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "the SequencedCollection ends take one and none" :expected "[:uoe :iae :uoe :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe) (catch IllegalArgumentException _ :iae))) [(fn [] (.addFirst [1 2] 9)) (fn [] (.addFirst [1 2] 0 9)) (fn [] (.removeLast [1 2])) (fn [] (.removeLast [1 2] 9))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "removeFirst on an empty list is NoSuchElement, not a refusal" :expected "[:nsee :nsee :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch java.util.NoSuchElementException _ :nsee) (catch UnsupportedOperationException _ :uoe))) [(fn [] (.removeFirst [])) (fn [] (.removeLast (list))) (fn [] (.removeFirst [1 2]))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "removeIf on an empty collection removed nothing" :expected "[false false :uoe]" :actual "[(.removeIf [] odd?) (.removeIf #{} odd?) (try (.removeIf [1 2] odd?) :no-throw (catch UnsupportedOperationException _ :uoe))]" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "sort and replaceAll on an empty list do nothing" :expected "[nil nil :uoe]" :actual "[(.sort [] compare) (.replaceAll [] inc) (try (.sort [1 2] compare) :no-throw (catch UnsupportedOperationException _ :uoe))]" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "a set is a java.util.Set and no more: the List-only names miss" :expected "[:iae :iae :iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.set #{1 2} 0 9)) (fn [] (.sort #{1 2} compare)) (fn [] (.replaceAll #{1 2} inc)) (fn [] (.addFirst #{1 2} 9)) (fn [] (.removeLast #{1 2})) (fn [] (.add #{1 2} 0 9))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "a set still refuses Collection's own mutators" :expected "[:uoe :uoe :uoe :uoe :uoe :uoe :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe))) [(fn [] (.add #{1 2} 9)) (fn [] (.addAll #{1 2} [9])) (fn [] (.clear #{1 2})) (fn [] (.remove #{1 2} 1)) (fn [] (.removeAll #{1 2} [1])) (fn [] (.retainAll #{1 2} [1])) (fn [] (.removeIf #{1 2} odd?))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "a sorted set answers exactly as a hash set does" :expected "[:uoe :uoe :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe) (catch IllegalArgumentException _ :iae))) [(fn [] (.add (sorted-set 1 2) 9)) (fn [] (.clear (sorted-set 1 2))) (fn [] (.sort (sorted-set 1 2) compare)) (fn [] (.removeFirst (sorted-set 1 2)))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "a seq and a lazy seq are java.util.List too" :expected "[:uoe :uoe :iae :uoe :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe) (catch IllegalArgumentException _ :iae))) [(fn [] (.add (seq [1 2]) 9)) (fn [] (.set (seq [1 2]) 0 9)) (fn [] (.set (seq [1 2]) 9)) (fn [] (.add (cons 1 [2]) 9)) (fn [] (.removeFirst (range 2)))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "SequencedCollection accessors are List-only" :expected "[:iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.getFirst #{1 2})) (fn [] (.getLast #{1 2})) (fn [] (.reversed #{1 2})) (fn [] (.getFirst (sorted-set 1 2)))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "...and still answer on a list" :expected "[1 2 [2 1] 3]" :actual "[(.getFirst [1 2]) (.getLast [1 2]) (vec (.reversed [1 2])) (.getFirst (list 3 4))]" :portability :jvm}
+  ;; The two cells jolt does NOT match, and deliberately: LazySeq.reify() returns
+  ;; a MUTABLE (new ArrayList(this)) where ASeq.reify() wraps it in
+  ;; Collections.unmodifiableList, so List's default sort and replaceAll -- both
+  ;; of which go through listIterator() -- mutate a throwaway copy and silently
+  ;; succeed on a LAZY seq while refusing on every other seq. jolt refuses on all
+  ;; of them; see the :upstream-quirk entry in known-divergences.edn.
+  {:suite "interop / java.util mutator arity" :label "sort on a lazy seq is refused, not silently discarded" :expected ":uoe" :actual "(try (.sort (map identity [3 1 2]) compare) :no-throw (catch UnsupportedOperationException _ :uoe))" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "replaceAll on a lazy seq is refused, not silently discarded" :expected ":uoe" :actual "(try (.replaceAll (map identity [3 1 2]) inc) :no-throw (catch UnsupportedOperationException _ :uoe))" :portability :jvm}
   {:suite "interop / String & StringBuilder char ops" :label "String from char-array slice" :expected "\"abc\"" :actual "(String. (char-array [\\a \\b \\c \\d]) 0 3)" :portability :jvm}
   {:suite "interop / String & StringBuilder char ops" :label "str of StringBuilder" :expected "\"hi\"" :actual "(let [sb (StringBuilder.)] (.append sb \"hi\") (str sb))" :portability :jvm}
   {:suite "interop / String & StringBuilder char ops" :label "append subsequence" :expected "\"bcd\"" :actual "(let [sb (StringBuilder.)] (.append sb \"abcde\" 1 4) (.toString sb))" :portability :jvm}
@@ -4837,6 +5143,10 @@
   {:suite "interop / uri equality" :label "URIs are value-equal and usable as set members" :expected "[true true]" :actual "[(= (java.net.URI. \"/\") (java.net.URI. \"/\")) (= #{(java.net.URI. \"/\")} #{(java.net.URI. \"/\")})]" :portability :jvm}
   {:suite "stdlib / clojure.walk" :label "macroexpand-all expands a form" :expected "true" :actual "(do (require (quote clojure.walk)) (seq? (clojure.walk/macroexpand-all (quote (when true 1)))))" :portability :common}
   {:suite "regex / re-seq zero-width" :label "a zero-width match advances by one without repeating" :expected "[\"a\" \"\" \"a\" \"\"]" :actual "(vec (re-seq #\"a*\" \"aba\"))" :portability :common}
+  ;; split resumes after the match it found, not one past where it started
+  ;; looking: a lookahead match ahead of the search start was re-found and
+  ;; emitted a spurious empty segment (#940)
+  {:suite "regex / re-seq zero-width" :label "a zero-width lookahead split resumes after the match (#940)" :expected "[\"a\" \"Xb\" \"X\" \"Xc\" \"Xd\"]" :actual "(clojure.string/split \"aXbXXcXd\" #\"(?=X)\")" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "conj onto a rest-derived seq prepends" :expected "true" :actual "(= [9 2 3] (vec (conj (rest [1 2 3]) 9)))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "conj onto a lazy-seq prepends" :expected "true" :actual "(= [9 1 2] (vec (conj (lazy-seq (list 1 2)) 9)))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "into over a conj'd rest-seq" :expected "true" :actual "(= [0 2 3] (into [] (conj (rest [1 2 3]) 0)))" :portability :common}
@@ -5088,6 +5398,95 @@
   {:suite "iref / watches" :label "vars are watchable: root changes notify (alter-var-root, def)" :expected "[[1 2] [2 5]]" :actual "(do (def vw-x 1) (def vw-log (atom [])) (add-watch (var vw-x) :w (fn [k r o n] (swap! vw-log conj [o n]))) (alter-var-root (var vw-x) inc) (def vw-x 5) (deref vw-log))" :portability :common}
   {:suite "iref / watches" :label "add-watch returns the var; a validator gates the var root" :expected "[true :ise]" :actual "(do (def vv-y 1) [(= (var vv-y) (add-watch (var vv-y) :k (fn [a b c d] nil))) (do (set-validator! (var vv-y) pos?) (try (alter-var-root (var vv-y) -) (catch IllegalStateException _ :ise)))])" :portability :common}
   {:suite "iref / watches" :label "agent watches fire on state change" :expected "[0 1]" :actual "(let [ag (agent 0) p (promise)] (add-watch ag :w (fn [k r o n] (deliver p [o n]))) (send ag inc) (deref p 2000 :timeout))" :portability :common}
+  ;; clojure.lang.ARef's watch/validator METHODS, the interop door onto the same
+  ;; seam clojure.core/add-watch uses. Every one of these reference types was
+  ;; already an IRef by class, but the methods reported "No matching method
+  ;; addWatch found taking 2 args for class clojure.lang.Atom" — a library that
+  ;; reaches the seam through interop could not watch anything. clojure.lang has
+  ;; no IWatchable interface: getWatches/addWatch/removeWatch are declared on
+  ;; IRef and implemented in ARef, which is why one arm serves atom/ref/var/agent
+  ;; and a Volatile (an IDeref, not an IRef) still has no such method.
+  {:suite "iref / ARef interop methods" :label "addWatch registers a watch that fires on a real mutation" :expected "[[0 1] [1 9]]" :actual "(let [a (atom 0) log (atom [])] (.addWatch a :k (fn [k r o n] (swap! log conj [o n]))) (swap! a inc) (reset! a 9) (deref log))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "addWatch answers the reference itself" :expected "true" :actual "(let [a (atom 0)] (identical? a (.addWatch a :k (fn [k r o n] nil))))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "getWatches on an unwatched reference is an empty map, not nil" :expected "[true 0]" :actual "(let [a (atom 0)] [(map? (.getWatches a)) (count (.getWatches a))])" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "getWatches keys every registered watch" :expected "#{:x :y}" :actual "(let [a (atom 0)] (.addWatch a :x (fn [k r o n] nil)) (.addWatch a :y (fn [k r o n] nil)) (set (keys (.getWatches a))))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "getWatches values are the callbacks themselves" :expected "true" :actual "(let [a (atom 0) f (fn [k r o n] nil)] (.addWatch a :x f) (identical? f (get (.getWatches a) :x)))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "removeWatch answers the reference and drops just that key" :expected "[true [:y]]" :actual "(let [a (atom 0)] (.addWatch a :x (fn [k r o n] nil)) (.addWatch a :y (fn [k r o n] nil)) [(identical? a (.removeWatch a :x)) (keys (.getWatches a))])" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "interop and clojure.core/add-watch share one watch list" :expected "[#{:core :interop} [:core]]" :actual "(let [a (atom 0)] (add-watch a :core (fn [k r o n] nil)) (.addWatch a :interop (fn [k r o n] nil)) [(set (keys (.getWatches a))) (do (remove-watch a :interop) (keys (.getWatches a)))])" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "notifyWatches fires the watches without touching the value" :expected "[7 [[:old :new]]]" :actual "(let [a (atom 7) log (atom [])] (.addWatch a :k (fn [k r o n] (swap! log conj [o n]))) (.notifyWatches a :old :new) [(deref a) (deref log)])" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "notifyWatches is void" :expected "nil" :actual "(let [a (atom 0)] (.addWatch a :k (fn [k r o n] nil)) (.notifyWatches a 1 2))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "setValidator is void and getValidator answers the fn" :expected "[nil true]" :actual "(let [a (atom 2) f (fn [v] (even? v))] [(.setValidator a f) (identical? f (.getValidator a))])" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "setValidator rejects a reference already holding an invalid value" :expected ":ise" :actual "(try (.setValidator (atom 1) even?) (catch IllegalStateException _ :ise))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "a validator installed through interop gates a later reset!" :expected "[:ise 2]" :actual "(let [a (atom 2)] (.setValidator a even?) [(try (reset! a 3) (catch IllegalStateException _ :ise)) (deref a)])" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "getValidator with none installed is nil" :expected "true" :actual "(nil? (.getValidator (atom 0)))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "a ref's watch fires at commit through the interop method" :expected "[[0 4]]" :actual "(let [r (ref 0) log (atom [])] (.addWatch r :k (fn [k rr o n] (swap! log conj [o n]))) (dosync (ref-set r 4)) (deref log))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "a var's watch fires on a root change through the interop method" :expected "[[1 2]]" :actual "(do (def aw-v 1) (def aw-log (atom [])) (.addWatch (var aw-v) :k (fn [k r o n] (swap! aw-log conj [o n]))) (alter-var-root (var aw-v) inc) (deref aw-log))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "an agent's watch fires on a send through the interop method" :expected "[0 1]" :actual "(let [ag (agent 0) p (promise)] (.addWatch ag :k (fn [k r o n] (deliver p [o n]))) (send ag inc) (deref p 2000 :timeout))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "every watchable reference type answers the same surface" :expected "[[[:k] true] [[:k] true] [[:k] true] [[:k] true]]" :actual "(do (def gw-x 1) (mapv (fn [r] (.addWatch r :k (fn [k rr o n] nil)) [(keys (.getWatches r)) (nil? (.getValidator r))]) [(atom 0) (ref 0) (var gw-x) (agent 0)]))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "a non-reference receiver has no addWatch" :expected ":iae" :actual "(try (.addWatch [1 2] :k (fn [k r o n] nil)) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "a volatile is not watchable" :expected ":iae" :actual "(try (.addWatch (volatile! 1) :k (fn [k r o n] nil)) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "a wrong-arity call is not a method" :expected ":iae" :actual "(try (.addWatch (atom 0) :k) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
+  {:suite "iref / ARef interop methods" :label "a deftype's own IRef methods win over the reference arm" :expected "[true {:mine true} :mine-validator true]" :actual "(do (deftype AW1 [] clojure.lang.IRef (addWatch [this k f] this) (removeWatch [this k] this) (getWatches [this] {:mine true}) (setValidator [this f] nil) (getValidator [this] :mine-validator) (deref [this] 1)) (let [t (AW1.)] [(identical? t (.addWatch t :k nil)) (.getWatches t) (.getValidator t) (identical? t (.removeWatch t :k))]))" :portability :jvm}
+  ;; The interface each reference type declares BELOW ARef, reached as METHODS.
+  ;; IDeref is the shared root (get() and the four getAs* bridges are DEFAULT
+  ;; methods on it, so every deref-able reference carries them, and the
+  ;; two-argument deref belongs to IBlockingDeref alone -- a promise and a future
+  ;; have it, an agent and a delay do not); then IAtom/IAtom2 for an atom, the
+  ;; transaction and history surface for a ref, and the error/queue/restart
+  ;; surface for an agent. Each bottoms out in the same native the clojure.core
+  ;; fn of that meaning is bound to, so a mutation through interop validates and
+  ;; notifies watches exactly as swap! and ref-set do.
+  {:suite "iref / IAtom interop methods" :label "atom .deref" :expected "41" :actual "(.deref (atom 41))" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .get" :expected "41" :actual "(.get (atom 41))" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap/1" :expected "[2 2]" :actual "(let [a (atom 1)] [(.swap a inc) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap/2" :expected "[11 11]" :actual "(let [a (atom 1)] [(.swap a + 10) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap/3" :expected "[111 111]" :actual "(let [a (atom 1)] [(.swap a + 10 100) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap/4-with-seq" :expected "[11111 11111]" :actual "(let [a (atom 1)] [(.swap a + 10 100 (seq [1000 10000])) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .reset" :expected "[9 9]" :actual "(let [a (atom 1)] [(.reset a 9) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .compareAndSet" :expected "[true false 2]" :actual "(let [a (atom 1)] [(.compareAndSet a 1 2) (.compareAndSet a 1 3) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swapVals/1" :expected "[[1 2] 2]" :actual "(let [a (atom 1)] [(vec (.swapVals a inc)) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swapVals/2" :expected "[[1 11] 11]" :actual "(let [a (atom 1)] [(vec (.swapVals a + 10)) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swapVals/4" :expected "[[1 1111] 1111]" :actual "(let [a (atom 1)] [(vec (.swapVals a + 10 100 (seq [1000]))) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .resetVals" :expected "[[1 9] 9]" :actual "(let [a (atom 1)] [(vec (.resetVals a 9)) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap validator" :expected "[:ise 2]" :actual "(let [a (atom 2 :validator even?)] [(try (.swap a inc) (catch IllegalStateException _ :ise)) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom mutators notify" :expected "[[1 2] [2 9] [9 10] [10 11] [11 0]]" :actual "(let [a (atom 1) log (atom [])] (add-watch a :k (fn [k r o n] (swap! log conj [o n]))) (.swap a inc) (.reset a 9) (.compareAndSet a 9 10) (.swapVals a inc) (.resetVals a 0) (deref log))" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "get on every IDeref" :expected "[1 2 3 4 5 6 7 8]" :actual "(mapv (fn [x] (.get x)) [(atom 1) (ref 2) (agent 3) (volatile! 4) (delay 5) (doto (promise) (deliver 6)) (future 7) (reduced 8)])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "deref on every IDeref" :expected "[1 2 3 4 5 6 7 8]" :actual "(mapv (fn [x] (.deref x)) [(atom 1) (ref 2) (agent 3) (volatile! 4) (delay 5) (doto (promise) (deliver 6)) (future 7) (reduced 8)])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "getAs bridges" :expected "[7 7 7.0 true false]" :actual "(let [a (atom 7)] [(.getAsInt a) (.getAsLong a) (.getAsDouble a) (.getAsBoolean a) (.getAsBoolean (atom nil))])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "getAsInt truncates" :expected "3" :actual "(.getAsInt (atom 3.9))" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "blocking .deref timeout" :expected ":to" :actual "(.deref (promise) 50 :to)" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "blocking .deref on a delay" :expected ":iae" :actual "(try (.deref (delay 1) 50 :to) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .deref" :expected "41" :actual "(.deref (ref 41))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .set in a txn" :expected "[5 5]" :actual "(let [r (ref 1)] [(dosync (.set r 5)) (deref r)])" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .set outside a txn" :expected ":ise" :actual "(try (.set (ref 1) 5) :no-throw (catch IllegalStateException _ :ise))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .alter" :expected "[111 111]" :actual "(let [r (ref 1)] [(dosync (.alter r + (seq [10 100]))) (deref r)])" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .commute" :expected "[11 11]" :actual "(let [r (ref 1)] [(dosync (.commute r + (seq [10]))) (deref r)])" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .touch is void" :expected "nil" :actual "(let [r (ref 1)] (dosync (.touch r)))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref history knobs" :expected "[0 10 0 2 7]" :actual "(let [r (ref 1)] [(.getMinHistory r) (.getMaxHistory r) (.getHistoryCount r) (do (.setMinHistory r 2) (.getMinHistory r)) (do (.setMaxHistory r 7) (.getMaxHistory r))])" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .setMinHistory returns the ref" :expected "true" :actual "(let [r (ref 1)] (identical? r (.setMinHistory r 3)))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .trimHistory is void" :expected "nil" :actual "(.trimHistory (ref 1))" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .deref" :expected "41" :actual "(.deref (agent 41))" :portability :jvm}
+  ;; A fresh agent, never sent to: the only queue depth that is not a race to
+  ;; observe. (await ag) then .getQueueCount is NOT -- await can return with its
+  ;; own wait action still on the queue, so the JVM answers 1 under load where it
+  ;; answers 0 idle, which is what CI caught. jolt's await drains the queue AND
+  ;; clears running? before it returns, so the awaited form is deterministic
+  ;; there and is a unit row instead.
+  {:suite "iref / Agent interop methods" :label "agent .getQueueCount on a fresh agent" :expected "0" :actual "(.getQueueCount (agent 0))" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .getQueueCount answers an integer" :expected "true" :actual "(int? (.getQueueCount (agent 0)))" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .getError" :expected "nil" :actual "(.getError (agent 1))" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent error mode/handler are void" :expected "[nil :continue nil true]" :actual "(let [ag (agent 1)] [(.setErrorMode ag :continue) (.getErrorMode ag) (.setErrorHandler ag (fn [a e] nil)) (fn? (.getErrorHandler ag))])" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .restart answers the state" :expected "[true 5 5 true]" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (loop [i 0] (when (and (nil? (agent-error ag)) (< i 500)) (Thread/sleep 10) (recur (inc i)))) [(some? (.getError ag)) (.restart ag 5 true) (deref ag) (nil? (.getError ag))])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "var .deref and .get" :expected "[3 3]" :actual "(do (def pv 3) [(.deref (var pv)) (.get (var pv))])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "a wrong arity is not a method" :expected "[:iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.swap (atom 1))) (fn [] (.reset (atom 1) 1 2)) (fn [] (.set (ref 1) 1 2)) (fn [] (.touch (ref 1) 1))])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "a non-reference has none of them" :expected "[:iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.swap [1] inc)) (fn [] (.getQueueCount [1])) (fn [] (.deref [1])) (fn [] (.resetVals [1] 2))])" :portability :jvm}
+  ;; ...and the same three natives seen through their clojure.core door: these
+  ;; answered the AGENT, which threads but is not what the JVM evaluates to --
+  ;; Agent.setErrorMode/setErrorHandler are void and restart answers the new
+  ;; state, so clear-agent-errors (restart-agent over the current state) does too.
+  {:suite "conformance / agents" :label "restart-agent answers the new state, not the agent" :expected "5" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (loop [i 0] (when (and (nil? (agent-error ag)) (< i 500)) (Thread/sleep 10) (recur (inc i)))) (restart-agent ag 5))" :portability :jvm}
+  {:suite "conformance / agents" :label "clear-agent-errors answers the state it restarted with" :expected "1" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (loop [i 0] (when (and (nil? (agent-error ag)) (< i 500)) (Thread/sleep 10) (recur (inc i)))) (clear-agent-errors ag))" :portability :jvm}
+  {:suite "conformance / agents" :label "set-error-mode! and set-error-handler! are void" :expected "[nil nil]" :actual "(let [ag (agent 1)] [(set-error-mode! ag :continue) (set-error-handler! ag (fn [a e] nil))])" :portability :jvm}
   {:suite "iref / meta" :label "alter-meta! works on atoms" :expected "{:x 1 :y 2}" :actual "(let [a (atom 1 :meta {:x 1})] (alter-meta! a assoc :y 2))" :portability :common}
   {:suite "casts / checked narrow" :label "doubles range-check themselves, then truncate" :expected "[1 1 3 1 \\a 0]" :actual "[(byte 1.1) (short 1.9) (int 3.7) (long 1.5) (char 97.5) (long ##NaN)]" :portability :common}
   {:suite "casts / checked narrow" :label "out-of-range values throw IllegalArgumentException" :expected "[:iae :iae :iae :iae :iae :iae :iae]" :actual "[(try (byte 128) (catch IllegalArgumentException _ :iae)) (try (byte 127.000001) (catch IllegalArgumentException _ :iae)) (try (short 40000) (catch IllegalArgumentException _ :iae)) (try (int 2147483647.000001) (catch IllegalArgumentException _ :iae)) (try (char -1) (catch IllegalArgumentException _ :iae)) (try (char 1114112) (catch IllegalArgumentException _ :iae)) (try (long 1e300) (catch IllegalArgumentException _ :iae))]" :portability :common}
@@ -6257,6 +6656,25 @@
   ;; identityHashCode of nil is 0 on the JVM — it is the one input with no object
   ;; to identify. jolt answered the nil sentinel's own id.
   {:suite "host-interop / identity hash" :label "identityHashCode of nil is 0" :expected "0" :actual "(System/identityHashCode nil)" :portability :jvm}
+  ;; A shim value reports its JVM class through ONE registry: the jhost tag -> FQN
+  ;; map in class-hierarchy.ss, whose supers the class graph then walks for
+  ;; instance?. A shim with methods and no row answers the :object placeholder to
+  ;; (class x) and false to every instance? question, which is silent — the value
+  ;; still works, it just is not the class it claims to be. These rows pin the
+  ;; classes that had methods and no row.
+  {:suite "host-interop / class of a shim value" :label "Thread/currentThread reports java.lang.Thread" :expected "[\"java.lang.Thread\" true true]" :actual "(let [t (Thread/currentThread)] [(.getName (class t)) (instance? java.lang.Thread t) (instance? java.lang.Runnable t)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "the four atomics report their own classes" :expected "[\"java.util.concurrent.atomic.AtomicLong\" \"java.util.concurrent.atomic.AtomicInteger\" \"java.util.concurrent.atomic.AtomicBoolean\" \"java.util.concurrent.atomic.AtomicReference\"]" :actual "(mapv (fn [x] (.getName (class x))) [(java.util.concurrent.atomic.AtomicLong. 1) (java.util.concurrent.atomic.AtomicInteger. 1) (java.util.concurrent.atomic.AtomicBoolean. true) (java.util.concurrent.atomic.AtomicReference. nil)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "only the numeric atomics are Numbers" :expected "[true true false false]" :actual "(mapv (fn [x] (instance? java.lang.Number x)) [(java.util.concurrent.atomic.AtomicLong. 1) (java.util.concurrent.atomic.AtomicInteger. 1) (java.util.concurrent.atomic.AtomicBoolean. true) (java.util.concurrent.atomic.AtomicReference. nil)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "a ReentrantLock is a Lock" :expected "[\"java.util.concurrent.locks.ReentrantLock\" true]" :actual "(let [l (java.util.concurrent.locks.ReentrantLock.)] [(.getName (class l)) (instance? java.util.concurrent.locks.Lock l)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "a CountDownLatch reports its class" :expected "\"java.util.concurrent.CountDownLatch\"" :actual "(.getName (class (java.util.concurrent.CountDownLatch. 1)))" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "a SecureRandom is a Random" :expected "[\"java.security.SecureRandom\" \"java.util.Random\" true]" :actual "(let [r (java.security.SecureRandom.) p (java.util.Random. 1)] [(.getName (class r)) (.getName (class p)) (instance? java.util.Random r)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "Optional and StringTokenizer report their classes" :expected "[\"java.util.Optional\" \"java.util.StringTokenizer\" true]" :actual "(let [s (java.util.StringTokenizer. \"a b\")] [(.getName (class (java.util.Optional/of 1))) (.getName (class s)) (instance? java.util.Enumeration s)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "Base64's encoder and decoder report their nested classes" :expected "[\"java.util.Base64$Encoder\" \"java.util.Base64$Decoder\"]" :actual "[(.getName (class (java.util.Base64/getEncoder))) (.getName (class (java.util.Base64/getDecoder)))]" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "Runtime reports java.lang.Runtime" :expected "\"java.lang.Runtime\"" :actual "(.getName (class (Runtime/getRuntime)))" :portability :jvm}
+  ;; NumberFormat/getInstance hands back a DecimalFormat on the JVM, and jolt's one
+  ;; numberformat shim is only ever built by those statics, so it reports the class
+  ;; a caller actually receives rather than the abstract one it was asked for.
+  {:suite "host-interop / class of a shim value" :label "NumberFormat/getInstance is a DecimalFormat and a NumberFormat" :expected "[\"java.text.DecimalFormat\" true true]" :actual "(let [n (java.text.NumberFormat/getInstance)] [(.getName (class n)) (instance? java.text.NumberFormat n) (instance? java.text.Format n)])" :portability :jvm}
   ;; cond-> expands to the reference's shape: ONE let with g rebound per step,
   ;; each step delegating to -> rather than inlining the call itself. jolt built a
   ;; nest of let* forms with a fresh symbol per step and threaded by hand, so a
@@ -6285,4 +6703,44 @@
   ;; (host/chez/script-smoke.sh runs the executable-script end of it).
   {:suite "reader / shebang line" :label "a #! line reads as nothing, so a script's first line is a comment" :expected "42" :actual "(read-string \"#!/usr/bin/env jolt\\n42\")" :portability :common}
   {:suite "reader / shebang line" :label "and it comments to end of line anywhere, not only at the start of input" :expected "[1 3]" :actual "(read-string \"[1 #! two\\n 3]\")" :portability :common}
+
+  ;; EDN has no reader macros, and @ ` ~ are refused there rather than ending the
+  ;; token they sit in: "garbage!@" used to read as `garbage!` with the rest of the
+  ;; input silently dropped (#905). Where the reference dispatches readNumber — a
+  ;; digit, or a sign in front of one — the character joins the token instead and
+  ;; the failure is an invalid NUMBER naming the whole run, so both wordings and
+  ;; both throwable classes are pinned here.
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "a trailing @ after a token throws instead of truncating the read" :expected "\"Invalid constituent character: @\"" :actual "(do (require (quote [clojure.edn :as en1])) (try (en1/read-string \"garbage!@\") (catch RuntimeException e (.getMessage e))))" :portability :common}
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "an @ mid-token throws, rather than dropping everything from it on" :expected "\"Invalid constituent character: @\"" :actual "(do (require (quote [clojure.edn :as en2])) (try (en2/read-string \"a@b\") (catch RuntimeException e (.getMessage e))))" :portability :common}
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "a token that starts like a number takes the @ in and fails as a number" :expected "\"Invalid number: 1@\"" :actual "(do (require (quote [clojure.edn :as en3])) (try (en3/read-string \"1@\") (catch NumberFormatException e (.getMessage e))))" :portability :common}
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "@ where a form should start is a leading-character error, not a deref form" :expected "\"Invalid leading character: @\"" :actual "(do (require (quote [clojure.edn :as en4])) (try (en4/read-string \"@foo\") (catch RuntimeException e (.getMessage e))))" :portability :common}
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "` and ~ are non-constituent on the same terms" :expected "[\"Invalid constituent character: ~\" \"Invalid leading character: `\"]" :actual "(do (require (quote [clojure.edn :as en5])) (mapv (fn [s] (try (en5/read-string s) (catch RuntimeException e (.getMessage e)))) [\"a~b\" \"`foo\"]))" :portability :common}
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "a keyword's token is judged the same way" :expected "\"Invalid constituent character: @\"" :actual "(do (require (quote [clojure.edn :as en6])) (try (en6/read-string \":kw@\") (catch RuntimeException e (.getMessage e))))" :portability :common}
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "and so is a token inside a collection" :expected "\"Invalid constituent character: @\"" :actual "(do (require (quote [clojure.edn :as en7])) (try (en7/read-string \"[a@]\") (catch RuntimeException e (.getMessage e))))" :portability :common}
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "a character literal's name is a token too" :expected "\"Invalid constituent character: @\"" :actual "(do (require (quote [clojure.edn :as en8])) (try (en8/read-string \"\\\\a@\") (catch RuntimeException e (.getMessage e))))" :portability :common}
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "an @ after a DELIMITED form is ordinary trailing junk, and still ignored" :expected "{:a 1}" :actual "(do (require (quote [clojure.edn :as en9])) (en9/read-string \"{:a 1}@\"))" :portability :common}
+  {:suite "clojure.edn / non-constituent @ ` ~" :label "the source reader is untouched — there @ ends the token and derefs" :expected "[\"garbage!\" \"(clojure.core/deref foo)\"]" :actual "[(str (read-string \"garbage!@\")) (str (read-string \"@foo\"))]" :portability :common}
+
+  ;; EDN's dispatch table is CLOSED — #{ #_ #^ #< #: ## and a tagged literal are
+  ;; all of it — so every dispatch character the clojure reader adds is refused
+  ;; there. #( #" and #? used to read as a fn form, a regex and a conditional,
+  ;; inventing values edn cannot express; #! and #= were already refused, one arm
+  ;; at a time, which is why this is now one gate.
+  {:suite "clojure.edn / closed dispatch table" :label "the dispatch characters edn does not have" :expected "[\"No dispatch macro for: (\" \"No dispatch macro for: \\\"\" \"No dispatch macro for: '\" \"No dispatch macro for: ?\"]" :actual "(do (require (quote [clojure.edn :as ed1])) (mapv (fn [s] (try (ed1/read-string s) (catch RuntimeException e (.getMessage e)))) [\"#(inc 1)\" \"#\\\"re\\\"\" \"#'foo\" \"#?(:clj 1)\"]))" :portability :common}
+  {:suite "clojure.edn / closed dispatch table" :label "the ones it does have still read" :expected "(quote [#{1} 2 x {:a/b 1} ##Inf])" :actual "(do (require (quote [clojure.edn :as ed2])) [(ed2/read-string \"#{1}\") (ed2/read-string \"#_1 2\") (ed2/read-string \"#^{:m 1} x\") (ed2/read-string \"#:a{:b 1}\") (ed2/read-string \"##Inf\")])" :portability :common}
+  ;; ' is a reader macro in SOURCE only: EdnReader has no quote and does not end
+  ;; a token on it, so 'foo there is a symbol whose name starts with a quote.
+  {:suite "clojure.edn / closed dispatch table" :label "a leading quote is part of the symbol, not a quote form" :expected "[true \"'foo\"]" :actual "(do (require (quote [clojure.edn :as ed3])) (let [v (ed3/read-string \"'foo\")] [(symbol? v) (name v)]))" :portability :common}
+  {:suite "clojure.edn / closed dispatch table" :label "the source reader still quotes" :expected "(quote (quote foo))" :actual "(read-string \"'foo\")" :portability :common}
+  ;; #<…> is what a Java toString prints; neither reader takes it back. jolt read
+  ;; it as a tagged literal whose tag ran to end of input.
+  {:suite "clojure.edn / closed dispatch table" :label "#< is unreadable in both readers" :expected "[\"Unreadable form\" \"Unreadable form\"]" :actual "(do (require (quote [clojure.edn :as ed4])) (mapv (fn [f] (try (f) (catch RuntimeException e (.getMessage e)))) [(fn [] (ed4/read-string \"#<foo>\")) (fn [] (read-string \"#<foo>\"))]))" :portability :common}
+
+  ;; The 1-arity (edn/read reader) drained the reader and handed the string to
+  ;; the CORE read-string — the source reader, which resolves ::kw, takes #(…)
+  ;; and #=, and ends a token at an @. It reads through clojure.edn/read-string
+  ;; now, so the seam is the same one read-string uses, end of input included.
+  {:suite "clojure.edn / read over a reader" :label "the same non-constituent rejection as read-string" :expected "\"Invalid constituent character: @\"" :actual "(do (require (quote [clojure.edn :as er1])) (try (er1/read (java.io.PushbackReader. (java.io.StringReader. \"garbage!@\"))) (catch RuntimeException e (.getMessage e))))" :portability :jvm}
+  {:suite "clojure.edn / read over a reader" :label "an auto-resolved keyword is not edn" :expected "\"Invalid token: ::kw\"" :actual "(do (require (quote [clojure.edn :as er2])) (try (er2/read (java.io.PushbackReader. (java.io.StringReader. \"::kw\"))) (catch RuntimeException e (.getMessage e))))" :portability :jvm}
+  {:suite "clojure.edn / read over a reader" :label "end of input is an error without an :eof option, and the option's value with one" :expected "[\"EOF while reading\" :end]" :actual "(do (require (quote [clojure.edn :as er3])) [(try (er3/read (java.io.PushbackReader. (java.io.StringReader. \"\"))) (catch RuntimeException e (.getMessage e))) (er3/read {:eof :end} (java.io.PushbackReader. (java.io.StringReader. \"\")))])" :portability :jvm}
 ]

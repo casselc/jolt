@@ -51,6 +51,7 @@ grenadine.lock
 grenadine.repo
 grenadine.runtime
 grenadine.source
+grenadine.tree
 jolt.completions
 jolt.continuations
 jolt.fibers
@@ -65,6 +66,7 @@ jolt.infix.math.constants
 jolt.infix.math.core
 jolt.infix.math.trig
 jolt.io-poller
+jolt.loader
 jolt.nrepl
 jolt.parser
 jolt.parser.basic
