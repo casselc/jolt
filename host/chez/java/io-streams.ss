@@ -342,6 +342,18 @@
 (define (char-writer-downstream self)
   (let ((st (jhost-state self))) (and (> (vector-length st) 1) (vector-ref st 1))))
 (define (cw-text x) (if (number? x) (string (integer->char (jnum->exact x))) (jolt-str-render-one x)))
+;; Appendable's fixed-arity hot path. Keep rendering and range validation shared
+;; between record dispatch and the compiler's guarded char-writer arm, but let a
+;; range write directly from its source instead of allocating a substring for
+;; every data.json run.
+(define (cw-append-one! self x)
+  (put-string (char-writer-port self) (render-piece x)))
+(define (cw-append-range! self x start end)
+  (let* ((s (render-piece x))
+         (a (jnum->exact start))
+         (b (jnum->exact end)))
+    (sb-range-check s a b)
+    (put-string (char-writer-port self) s a (- b a))))
 (register-host-methods! "char-writer"
   (list
    (cons "write" (lambda (self x . rest)
@@ -351,7 +363,11 @@
                                  (if (>= (length rest) 2) (substring s (jnum->exact (car rest))
                                                                      (+ (jnum->exact (car rest)) (jnum->exact (cadr rest)))) s)))
                    jolt-nil))
-   (cons "append" (lambda (self x . rest) (put-string (char-writer-port self) (append-text x rest)) self))
+   (cons "append" (lambda (self x . rest)
+                    (if (null? rest)
+                        (cw-append-one! self x)
+                        (cw-append-range! self x (car rest) (cadr rest)))
+                    self))
    (cons "newLine" (lambda (self) (put-char (char-writer-port self) #\newline) jolt-nil))
    (cons "flush" (lambda (self)
                    (flush-output-port (char-writer-port self))

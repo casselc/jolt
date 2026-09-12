@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The maintained aspect compiler now has a documented canonical integration
   branch, a machine-readable upstream provenance lock, and offline plus live
   release-identity verification in CI.
+- **Interface-typed `OutputStreamWriter.append` calls avoid generic dispatch and
+  ranged substring allocation.** A guarded `char-writer` arm now writes
+  `Appendable` text ranges directly to the transcoded output port while keeping
+  receiver/argument evaluation order, fluent identity, range exceptions, and
+  arbitrary `Appendable` fallback unchanged.
 
 ### Fixed
 

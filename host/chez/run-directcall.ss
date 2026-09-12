@@ -128,14 +128,19 @@
 
 (let ((e (emit-dl "(def ifaceappend (fn [^Appendable out ^CharSequence s] (.append out s) (.append out s 1 3) out))")))
   (gate-check "^Appendable tests for a StringBuilder" (gate-sub? e "(sb-jhost? _ht$") #t)
+  (gate-check "^Appendable also tests for an OutputStreamWriter" (gate-sub? e "(char-writer? _ht$") #t)
   (gate-check "one-arg append uses the direct builder primitive" (gate-sub? e "(sb-append! _ht$") #t)
   (gate-check "range append shares append-range-text" (gate-sub? e "(append-range-text _ha$") #t)
+  (gate-check "writer range append writes directly without a substring" (gate-sub? e "(cw-append-range! _ht$") #t)
   (gate-check "^Appendable retains arbitrary-implementation fallback" (gate-sub? e "record-method-dispatch") #t)
   (run-emit e)
   (gate-check "StringBuilder append is fluent and range-correct"
               (ev "(.toString (user/ifaceappend (StringBuilder.) \"abcd\"))") "abcdbc")
   (gate-check "a non-StringBuilder Appendable reaches record dispatch"
               (ev "(.toString (user/ifaceappend (java.io.StringWriter.) \"abcd\"))") "abcdbc")
+  (gate-check "OutputStreamWriter takes the guarded direct arm"
+              (ev "(let [b (java.io.ByteArrayOutputStream.) w (java.io.OutputStreamWriter. b)] (user/ifaceappend w \"abcd\") (.flush w) (.toString b))")
+              "abcdbc")
   (gate-check "range errors still throw through the guarded direct arm"
               (raises? (lambda () (ev "(user/ifaceappend (StringBuilder.) \"a\")"))) #t))
 
