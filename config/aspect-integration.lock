@@ -1,12 +1,13 @@
 # The aspect root remains attached to v0.8.3; the current upstream release is
-# merged into that append-only line. See the v0.8.6 epoch record.
-schema=2
+# merged into that append-only line. See the v0.8.6 retag epoch record.
+schema=3
 canonical_branch=integration/aspects
 upstream_repository=https://github.com/jolt-lang/jolt.git
 upstream_base_commit=343f730922cf16fafe673b466cedcdcfe0596854
 upstream_base_tree=39ba588512ec3c970db3a708393426199bd88520
 upstream_release=v0.8.6
-upstream_release_commit=f3041a0e32ba0db1b92bd69b8ecb7b40f8b2e115
+upstream_release_base_commit=2017f1518a14ee64c8665e6d92571397da092a14
+upstream_release_commit=c2a494272cf82785ec8803426b495366000de572
 upstream_tree=21490693b24ad8fc86f4e37ec01489d876dc4994
 aspect_root_commit=eaf4ae8588feaf88bfba7a727d50d08d7ee5945a
 verified_ancestor=3d4b7d0a702238229871a141ab42ac4bb4c3ced0

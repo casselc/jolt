@@ -182,6 +182,37 @@ got="$("$script" "$epoch_repo")"
 [ "$got" = "v0.8.3-4-g$join_sha" ] ||
   fail "epoch join distance: got '$got', want 'v0.8.3-4-g$join_sha' (all reachable: $reachable_distance)"
 
+# Schema 3 retains the historical aspect-root base while anchoring a rewritten
+# live release lineage at a tree-equivalent base. The version consumer must not
+# accept that schema while ignoring its new lineage field.
+live_base="$(printf 'live-base\n' | eg commit-tree "$epoch_tree" -p "$historical_tip")"
+live_release="$(printf 'live-release\n' | eg commit-tree "$epoch_tree" -p "$live_base")"
+schema3_join="$(printf 'schema3-join\n' | eg commit-tree "$epoch_tree" \
+  -p "$epoch_join" -p "$live_release")"
+eg checkout -q --detach "$schema3_join"
+cat > "$epoch_repo/config/aspect-integration.lock" <<EOF
+schema=3
+upstream_release=v0.8.6
+upstream_base_commit=$epoch_base
+upstream_base_tree=$epoch_tree
+upstream_release_base_commit=$live_base
+upstream_release_commit=$live_release
+aspect_root_commit=$epoch_root
+EOF
+eg add config/aspect-integration.lock
+eg commit -q -m schema3-lock
+schema3_sha="$(eg rev-parse --short HEAD)"
+got="$("$script" "$epoch_repo")"
+[ "$got" = "v0.8.6-2-g$schema3_sha" ] ||
+  fail "schema 3 distance: got '$got', want 'v0.8.6-2-g$schema3_sha'"
+sed -i '/^upstream_release_base_commit=/d' "$epoch_repo/config/aspect-integration.lock"
+if "$script" "$epoch_repo" >"$tmp/schema3-missing.out" 2>"$tmp/schema3-missing.err"; then
+  fail "schema 3 lock without its release-lineage base unexpectedly succeeded"
+fi
+grep -q 'invalid aspect integration lock key: upstream_release_base_commit' \
+  "$tmp/schema3-missing.err" ||
+  fail "schema 3 missing release-lineage base did not fail at the named key"
+
 # (h) every consumer goes through the script; none re-derives it inline
 for f in bin/jolt host/chez/build-jolt.ss tools/testbin-current.sh \
          .github/workflows/release.yml; do
