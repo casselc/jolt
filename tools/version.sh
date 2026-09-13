@@ -67,7 +67,7 @@ if [ -f "$lock" ] && git -C "$root" rev-parse --verify HEAD >/dev/null 2>&1; the
     release="$(lock_value upstream_release)"
     base="$(lock_value upstream_base_commit)"
     aspect_root="$(lock_value aspect_root_commit)"
-    [ "$schema" = 1 ] || [ "$schema" = 2 ] || {
+    [ "$schema" = 1 ] || [ "$schema" = 2 ] || [ "$schema" = 3 ] || {
       echo "tools/version.sh: unsupported aspect integration lock schema: $schema" >&2
       exit 1
     }
@@ -101,11 +101,52 @@ if [ -f "$lock" ] && git -C "$root" rev-parse --verify HEAD >/dev/null 2>&1; the
       exit 1
     }
     # Schema 1 replay epochs count from the aspect root's historical base.
-    # Schema 2 merge epochs count from the current merged upstream release,
-    # excluding the old aspect-line history reachable through the other parent.
+    # Schema 2 and 3 merge epochs count from the current merged upstream
+    # release, excluding the old aspect-line history reachable through the
+    # other parent. Schema 3's extra base anchors provenance, not version
+    # distance, so its counting rule is unchanged.
     distance_base="$base"
-    if [ "$schema" = 2 ]; then
+    if [ "$schema" = 2 ] || [ "$schema" = 3 ]; then
       release_commit="$(lock_value upstream_release_commit)"
+      if [ "${#release_commit}" -ne 40 ]; then
+        echo "tools/version.sh: invalid locked upstream release commit" >&2
+        exit 1
+      fi
+      case "$release_commit" in
+        *[!0-9a-f]*)
+          echo "tools/version.sh: invalid locked upstream release commit" >&2
+          exit 1 ;;
+      esac
+      if [ "$schema" = 3 ]; then
+        release_base="$(lock_value upstream_release_base_commit)"
+        base_tree_lock="$(lock_value upstream_base_tree)"
+        if [ "${#release_base}" -ne 40 ] || [ "${#base_tree_lock}" -ne 40 ]; then
+          echo "tools/version.sh: invalid locked release-lineage base" >&2
+          exit 1
+        fi
+        case "$release_base$base_tree_lock" in
+          *[!0-9a-f]*)
+            echo "tools/version.sh: invalid locked release-lineage base" >&2
+            exit 1 ;;
+        esac
+        release_base_tree="$(git -C "$root" rev-parse --verify "$release_base^{tree}" 2>/dev/null)" || {
+          echo "tools/version.sh: locked release-lineage base is absent" >&2
+          exit 1
+        }
+        historical_base_tree="$(git -C "$root" rev-parse --verify "$base^{tree}" 2>/dev/null)" || {
+          echo "tools/version.sh: locked historical base tree is absent" >&2
+          exit 1
+        }
+        [ "$historical_base_tree" = "$base_tree_lock" ] &&
+          [ "$release_base_tree" = "$base_tree_lock" ] || {
+          echo "tools/version.sh: locked release-lineage base tree mismatch" >&2
+          exit 1
+        }
+        git -C "$root" merge-base --is-ancestor "$release_base" "$release_commit" || {
+          echo "tools/version.sh: locked release does not descend from its tree-equivalent base" >&2
+          exit 1
+        }
+      fi
       git -C "$root" merge-base --is-ancestor "$release_commit" HEAD || {
         echo "tools/version.sh: locked upstream release is not merged" >&2
         exit 1

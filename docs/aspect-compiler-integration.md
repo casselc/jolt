@@ -16,18 +16,18 @@ that append-only line, preserving both histories:
 | --- | --- |
 | Published v0.8.3 release commit | `343f730922cf16fafe673b466cedcdcfe0596854` |
 | Published v0.8.3 tree | `39ba588512ec3c970db3a708393426199bd88520` |
-| Published v0.8.6 release commit | `f3041a0e32ba0db1b92bd69b8ecb7b40f8b2e115` |
+| Current published v0.8.6 release commit | `c2a494272cf82785ec8803426b495366000de572` |
 | Published v0.8.6 tree | `21490693b24ad8fc86f4e37ec01489d876dc4994` |
 | First replayed aspect compiler commit | `eaf4ae8588feaf88bfba7a727d50d08d7ee5945a` |
 | Initial replayed verified ancestor | `efeeeb0580bfed731d977b405a796af2d479595c` |
 
 `config/aspect-integration.lock` is the machine-readable copy of these facts.
-Schema 2 distinguishes the immutable base beneath the first aspect commit from
-the current upstream release merged later. The verifier checks both trees, the
-root-parent relation, stable upstream ancestry, and that the checked revision
-contains both the verified aspect line and the recorded release. Its online mode
-separately proves that the live release tag still resolves to the recorded
-commit and tree.
+Schema 3 distinguishes the immutable base beneath the first aspect commit from
+its tree-equivalent commit on a rewritten upstream release lineage. The
+verifier checks the root-parent relation, equal base trees, release ancestry on
+that live lineage, and that the checked revision contains both the verified
+aspect line and the recorded release. Its online mode separately proves that
+the live release tag still resolves to the recorded commit and tree.
 
 `tools/version.sh` also consumes the lock when `HEAD` descends from the recorded
 aspect root. It reports the locked upstream release plus the commit distance
@@ -46,6 +46,8 @@ CI skip a revision outside the aspect lineage; the dedicated canonical workflow
 sets it to `1` and fails closed instead.
 
 The current immutable record is
+[`docs/aspect-compiler-epochs/v0.8.6-retag-2026-09.md`](aspect-compiler-epochs/v0.8.6-retag-2026-09.md).
+The original v0.8.6 publication record remains in
 [`docs/aspect-compiler-epochs/v0.8.6-2026-09.md`](aspect-compiler-epochs/v0.8.6-2026-09.md).
 The preceding v0.8.3 replay and v0.8.1 rewritten-tag history remain in
 [`docs/aspect-compiler-epochs/v0.8.3-2026-09.md`](aspect-compiler-epochs/v0.8.3-2026-09.md)

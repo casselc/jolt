@@ -1104,6 +1104,7 @@ testbincurrentsmoke:
 
 aspectintegrationcheck:
 	@bash test/aspect-integration-provenance-smoke.sh
+	@bash test/aspect-integration-provenance-schema3-smoke.sh
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
 # The oracle version is READ from the committed profile, which certify.clj also

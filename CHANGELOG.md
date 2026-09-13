@@ -278,6 +278,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The aspect integration provenance lock now follows the current upstream
+  `v0.8.6` tag commit after an upstream history rewrite. The old and new release
+  commits have the same tree; a history-only merge preserves the append-only
+  aspect line while making the live release lineage independently verifiable.
+
 - **Shell completion includes the aspect compiler CLI.** The v0.8.6 completion
   inventory now exposes `jolt aspects` and its `plan`, `explain`, and `manifest`
   operations in zsh and bash instead of hiding the retained integration-only
