@@ -113,6 +113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One-character `String.indexOf` needles use the direct character scanner.**
+  The fast path avoids calling the substring matcher at every candidate
+  position while preserving multi-character search semantics. The character
+  scan reuses the portable checked character loop. Public and internal start
+  indexes are normalized and clamped before fixnum/string operations, including
+  extreme bignums. The integer-character overload now returns `-1`
+  rather than attempting an invalid character conversion for out-of-range
+  integers and surrogate halves absent from Jolt strings.
 - The maintained aspect compiler now has a documented canonical integration
   branch, a machine-readable upstream provenance lock, and offline plus live
   release-identity verification in CI.

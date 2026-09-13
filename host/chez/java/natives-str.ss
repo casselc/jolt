@@ -147,29 +147,58 @@
     (cond ((fx=? j nlen) #t)
           ((char=? (string-ref s (fx+ si j)) (string-ref needle j)) (loop (fx+ j 1)))
           (else #f))))
+(define (str-scan-start from slen)
+  ;; Public String calls arrive through jolt->idx, but clojure.core/str-find is
+  ;; also a callable runtime var. Convert that raw entry once, then clamp before
+  ;; any fixnum/string operation: an extreme bignum must not leak into fx+.
+  (let ((i (if (fixnum? from) from (jnum->exact from))))
+    (cond ((not (fixnum? i)) (if (< i 0) 0 slen))
+          ((fx<=? i 0) 0)
+          ((fx>=? i slen) slen)
+          (else i))))
+(define (str-char-index-from s c start slen)
+  ;; START is normalized once by the public/internal entry point. Keep this
+  ;; portable checked loop as the shared implementation for int, char, and
+  ;; one-character String needles.
+  (let loop ((i start))
+    (cond ((fx>=? i slen) -1)
+          ((char=? (string-ref s i) c) i)
+          (else (loop (fx+ i 1))))))
+(define (str-index-of-from s needle start slen)
+  (let ((nlen (string-length needle)))
+    ;; A one-character String needle is the ordinary delimiter/header scan case.
+    ;; Route it through the character scan rather than call the substring
+    ;; matcher once at every candidate position. The multi-character matching
+    ;; algorithm stays intact; its end test is rearranged to avoid an
+    ;; overflow-prone addition.
+    (if (fx=? nlen 1)
+        (str-char-index-from s (string-ref needle 0) start slen)
+        (let ((last-start (fx- slen nlen)))
+          (let loop ((i start))
+            (cond ((fx>? i last-start) -1)
+                  ((char-by-char-match? s i needle nlen) i)
+                  (else (loop (fx+ i 1)))))))))
 (define (str-index-of s needle from)
-  (let ((nlen (string-length needle)) (slen (string-length s)))
-    (let loop ((i (max 0 from)))
-      (cond ((fx>? (fx+ i nlen) slen) -1)
-            ((char-by-char-match? s i needle nlen) i)
-            (else (loop (fx+ i 1)))))))
-;; single-char search with no needle allocation — (.indexOf s (int 59)) used to
-;; build a 1-char string through number->exact->truncate->integer->char->string
-;; per call (~160ns); honeysql's suspicious? transducer does two per entity.
-(define (str-char-index s c from)
-  (let ((n (string-length s)))
-    (let loop ((i (max 0 from)))
-      (cond ((fx>=? i n) -1)
-            ((char=? (string-ref s i) c) i)
-            (else (loop (fx+ i 1)))))))
+  (let ((slen (string-length s)))
+    (str-index-of-from s needle (str-scan-start from slen) slen)))
 ;; a needle that is a char code (fixnum) or a char scans directly
+;; with no needle allocation. (.indexOf s (int 59)) used to build a 1-char
+;; string through number->exact->truncate->integer->char->string per call.
 (define (str-index-of-any s needle from)
-  (cond ((fixnum? needle)
-         (if (and (fx>=? needle 0) (fx<=? needle #x10FFFF))
-             (str-char-index s (integer->char needle) from)
-             (str-index-of s (str-needle needle) from)))
-        ((char? needle) (str-char-index s needle from))
-        (else (str-index-of s (str-needle needle) from))))
+  (let* ((slen (string-length s))
+         (start (str-scan-start from slen)))
+    (cond ((number? needle)
+           (let ((cp (jnum->exact needle)))
+             ;; Java String.indexOf(int) returns -1 for values outside Unicode's
+             ;; code-point range. Surrogate halves are not values in jolt's
+             ;; documented scalar string model, so they are misses here too.
+             (if (and (fixnum? cp)
+                      (fx>=? cp 0) (fx<=? cp #x10FFFF)
+                      (not (and (fx>=? cp #xD800) (fx<=? cp #xDFFF))))
+                 (str-char-index-from s (integer->char cp) start slen)
+                 -1)))
+          ((char? needle) (str-char-index-from s needle start slen))
+          (else (str-index-of-from s (str-needle needle) start slen)))))
 (define (str-last-index-of s needle)
   (let ((nlen (string-length needle)) (slen (string-length s)))
     (let loop ((i (fx- slen nlen)) (found -1))
