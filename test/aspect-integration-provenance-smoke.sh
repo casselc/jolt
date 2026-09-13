@@ -3,7 +3,8 @@ set -euo pipefail
 export GIT_TERMINAL_PROMPT=0
 export GIT_ASKPASS=
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
+script_root="$(cd "$(dirname "$0")/.." && pwd)"
+root="${ASPECT_INTEGRATION_ROOT:-$script_root}"
 lock="${ASPECT_INTEGRATION_LOCK:-$root/config/aspect-integration.lock}"
 fail() { echo "aspect-integration-provenance: $*" >&2; exit 1; }
 
