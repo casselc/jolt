@@ -412,6 +412,47 @@
 (define (jolt-str-strip s left? right?) (str-strip s left? right?))
 (define (jolt-str-to-char-array s) (na-char-array s))
 (define (jolt-str-get-bytes s cs) (na-byte-array (charset-encode-bv s cs)))
+;; String.getChars validates the complete source and destination ranges before
+;; writing anything.  Keep that validation here, shared by generic dispatch and
+;; the compiler's proven-String direct form, then copy against the char-array's
+;; vector backing without repeating ja-set!'s kind/bounds checks per character.
+;;
+;; The ordering is observable: an invalid source range wins over a nil
+;; destination, while a valid (including empty) source range with a nil
+;; destination raises NullPointerException.  Only enter the loop after every
+;; check succeeds, so destination-range failures cannot leave a copied prefix.
+(define (jolt-str-get-chars! s src-begin src-end dst dst-begin)
+  (let* ((src-begin (jolt->idx src-begin))
+         (src-end (jolt->idx src-end))
+         (dst-begin (jolt->idx dst-begin))
+         (src-length (string-length s)))
+    (when (or (< src-begin 0) (> src-end src-length) (> src-begin src-end))
+      (throw-jvm 'StringIndexOutOfBoundsException
+                  (string-append "begin " (number->string src-begin)
+                                 ", end " (number->string src-end)
+                                 ", length " (number->string src-length))))
+    (when (jolt-nil? dst)
+      (throw-jvm 'NullPointerException "dst"))
+    (unless (and (jolt-array? dst) (eq? (jolt-array-kind dst) 'char))
+      (throw-jvm 'ClassCastException "dst is not a char array"))
+    (let* ((backing (jolt-array-vec dst))
+           (dst-length (vector-length backing))
+           (copy-length (- src-end src-begin)))
+      ;; Subtraction after separately checking dst-begin avoids an overflowing
+      ;; dst-begin + copy-length validation expression.
+      (when (or (< dst-begin 0) (> dst-begin dst-length)
+                (> copy-length (- dst-length dst-begin)))
+        (throw-jvm 'StringIndexOutOfBoundsException
+                    (string-append "offset " (number->string dst-begin)
+                                   ", count " (number->string copy-length)
+                                   ", length " (number->string dst-length))))
+      ;; Successful bounds checks prove both counters are fixnums: they are
+      ;; bounded by the fixnum string/vector lengths.
+      (let loop ((i src-begin) (j dst-begin))
+        (when (sa-ufx<? i src-end)
+          (sa-uvector-set! backing j (string-ref s i))
+          (loop (sa-ufx+ i 1) (sa-ufx+ j 1))))
+      jolt-nil)))
 (define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
 (define (jolt-str-replace-all s pat repl) (irregex-replace/all (str-irx pat) s repl))
 (define (jolt-str-replace-first s pat repl) (irregex-replace (str-irx pat) s repl))
@@ -550,14 +591,8 @@
     ((string=? method "getSimpleName") (jolt-str-simple-name s))
     ;; .getChars srcBegin srcEnd dst dstBegin — copy s[srcBegin,srcEnd) into the
     ;; char-array dst at dstBegin (used by buffered readers, e.g. data.json).
-    ((string=? method "getChars")
-     (let ((src-begin (jolt->idx (arg 0))) (src-end (jolt->idx (arg 1)))
-           (dst (arg 2)) (dst-begin (jolt->idx (arg 3))))
-       (let loop ((i src-begin) (j dst-begin))
-         (when (fx<? i src-end)
-           (ja-set! dst j (string-ref s i))
-           (loop (fx+ i 1) (fx+ j 1)))))
-     jolt-nil)
+    ((and (string=? method "getChars") (fx=? (length rest) 4))
+     (jolt-str-get-chars! s (arg 0) (arg 1) (arg 2) (arg 3)))
     ((string=? method "subSequence") (jolt-str-sub-sequence s (arg 0) (arg 1)))
     ;; Class.isArray over a class-name string: array classes are "[…" (e.g. "[C").
     ((string=? method "isArray") (and (fx>? (string-length s) 0) (char=? (string-ref s 0) #\[)))

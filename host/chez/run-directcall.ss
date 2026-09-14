@@ -24,6 +24,7 @@
 (define numeric-annotate (var-deref "jolt.passes.numeric" "annotate"))
 (define emit-top-form    (var-deref "jolt.backend-scheme" "emit-top-form"))
 (define set-direct-link! (var-deref "jolt.backend-scheme" "set-direct-link!"))
+(define set-target!      (var-deref "jolt.backend-scheme" "set-target!"))
 (define seed-callable?   (var-deref "jolt.host" "seed-callable?"))
 (define U ((var-deref "jolt.passes.types" "new-unit")))
 ((var-deref "jolt.backend-scheme" "set-emit-unit!") U)
@@ -101,6 +102,42 @@
   (gate-check "unhinted .charAt takes the direct form" (gate-sub? e "(string-ref _ht$") #t)
   (run-emit e)
   (gate-check "unhinted .charAt on a string answers" (call "usecharat" "abc" 1) #\b))
+(let ((e (emit-dl "(def copychars (fn [^String s dst] (.getChars s 1 4 dst 1) dst))")))
+  (gate-check "proven String .getChars uses the shared validated copy"
+              (gate-sub? e "(jolt-str-get-chars! s 1 4 dst 1)") #t)
+  (gate-check "proven String .getChars has no generic dispatch"
+              (gate-sub? e "record-method-dispatch") #f)
+  (run-emit e)
+  (gate-check "proven String .getChars copies the requested range"
+              (ja-equal? (call "copychars" "abcd" (na-char-array "xxxxx"))
+                         (na-char-array "xbcdx")) #t))
+(let ((e (emit-dl "(def copychars-unhinted (fn [s dst] (.getChars s 0 2 dst 1) dst))")))
+  (gate-check "unhinted .getChars guards the shared validated copy"
+              (gate-sub? e "(jolt-str-get-chars! _ht$") #t)
+  (gate-check "unhinted .getChars retains arbitrary receiver fallback"
+              (gate-sub? e "record-method-dispatch") #t)
+  (run-emit e)
+  (gate-check "unhinted String .getChars copies through the guarded arm"
+              (ja-equal? (call "copychars-unhinted" "abcd" (na-char-array "xxxx"))
+                         (na-char-array "xabx")) #t))
+(let ((e (emit-dl "(def getchars-wrong-arity (fn [s dst] (.getChars s 0 1 dst 0 :extra)))")))
+  (gate-check "wrong-arity getChars emits no four-argument direct helper"
+              (gate-sub? e "jolt-str-get-chars!") #f)
+  (gate-check "wrong-arity getChars retains generic dispatch"
+              (gate-sub? e "record-method-dispatch") #t)
+  (run-emit e)
+  (gate-check "wrong-arity getChars raises instead of ignoring an extra argument"
+              (raises? (lambda () (call "getchars-wrong-arity" "a" (na-char-array 1)))) #t))
+;; Gambit does not yet implement Java char arrays or String.getChars. Its target
+;; must retain the existing generic unsupported dispatch, never emit a Chez-only
+;; native name into a Gambit artifact.
+(set-target! (keyword #f "gambit"))
+(let ((e (emit-dl "(def gambit-copychars (fn [^String s dst] (.getChars s 0 1 dst 0)))")))
+  (gate-check "Gambit emits no Chez-only getChars helper"
+              (gate-sub? e "jolt-str-get-chars!") #f)
+  (gate-check "Gambit preserves generic unsupported getChars dispatch"
+              (gate-sub? e "record-method-dispatch") #t))
+(set-target! (keyword #f "chez"))
 (let ((e (emit-dl "(def usename (fn [k] (.getName k)))")))
   (gate-check "unhinted .getName tests for a keyword" (gate-sub? e "(keyword-t? _ht$") #t)
   (gate-check "unhinted .getName takes the keyword direct form" (gate-sub? e "(keyword-t-name _ht$") #t)
@@ -112,10 +149,33 @@
 ;; receiver and args are evaluated once each, in order
 (ev "(def calls (atom []))")
 (ev "(defn note [v] (swap! calls conj v) v)")
+(ev "(defn note-as [tag v] (swap! calls conj tag) v)")
 (let ((e (emit-dl "(def order (fn [] (.indexOf (note \"hello\") (note \"l\"))))")))
   (run-emit e)
   (gate-check "guarded site evaluates receiver then args once" (call "order") 2)
   (gate-check "...in source order" (jolt=2 (ev "@user/calls") (jolt-vector "hello" "l")) #t))
+(let ((e (emit-dl "(def getchars-order (fn [] (reset! calls []) (let [dst (char-array 4)] (.getChars (note-as :receiver \"abcd\") (note-as :begin 3) (note-as :end 2) (note-as :dst dst) (note-as :offset 0)))))")))
+  (run-emit e)
+  (gate-check "guarded getChars preserves receiver/argument evaluation before validation failure"
+              (raises? (lambda () (call "getchars-order"))) #t)
+  (gate-check "guarded getChars evaluates receiver and all four arguments once in source order"
+              (jolt=2 (ev "@user/calls")
+                       (jolt-vector (keyword #f "receiver") (keyword #f "begin")
+                                    (keyword #f "end") (keyword #f "dst")
+                                    (keyword #f "offset"))) #t))
+(let ((e (emit-dl "(def getchars-proven-order (fn [] (reset! calls []) (let [^String s (note-as :receiver \"abcd\") dst (char-array 4)] (.getChars s (note-as :begin 3) (note-as :end 2) (note-as :dst dst) (note-as :offset 0)))))")))
+  (gate-check "proven getChars keeps the direct helper"
+              (gate-sub? e "jolt-str-get-chars!") #t)
+  (gate-check "proven getChars has no generic dispatch"
+              (gate-sub? e "record-method-dispatch") #f)
+  (run-emit e)
+  (gate-check "proven getChars evaluates its receiver binding and arguments before validation failure"
+              (raises? (lambda () (call "getchars-proven-order"))) #t)
+  (gate-check "proven getChars evaluates receiver binding and all arguments once in source order"
+              (jolt=2 (ev "@user/calls")
+                       (jolt-vector (keyword #f "receiver") (keyword #f "begin")
+                                    (keyword #f "end") (keyword #f "dst")
+                                    (keyword #f "offset"))) #t))
 
 ;; Truthful interface hints stay guarded: String/StringBuilder take the direct
 ;; arm, while another implementation keeps record dispatch. The interface tag

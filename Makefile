@@ -103,7 +103,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa \
-  narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  getchars getcharsperf narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
@@ -867,6 +867,7 @@ narrow:
 # family lowered to its helpers, case on interned constants (run-directcall.ss).
 directcall:
 	@$(CHEZ) --script host/chez/run-directcall.ss
+	@$(CHEZ) --script test/chez/string-getchars-test.ss
 
 # Array-mode maps are one flat k/v slot vector (PersistentArrayMap), their
 # transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
@@ -1386,3 +1387,13 @@ printperf:
 # the default gate free of timing. See the script header.
 sbperf:
 	@$(CHEZ) --script test/chez/string-builder-perf.ss
+
+# String.getChars validates both ranges before mutation and bypasses the checked
+# generic array store in its copy loop. The timing characterization stays manual.
+getchars:
+	@$(CHEZ) --script test/chez/string-getchars-test.ss
+
+getcharsperf:
+	@$(CHEZ) --script test/chez/string-getchars-perf.ss
+
+.PHONY: getchars getcharsperf

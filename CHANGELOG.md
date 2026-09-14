@@ -286,6 +286,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`String.getChars` validates once and copies directly into `char[]`.** Chez
+  now checks the complete source and destination ranges before mutation, so a
+  destination overflow cannot leave a copied prefix. Generic interop and the
+  proven-`String` compiler path share the same native helper, whose inner loop
+  writes the validated backing vector without repeating array kind and bounds
+  checks for every character. Gambit retains its existing unsupported generic
+  dispatch until its Java char-array surface exists.
+
 - The aspect integration provenance lock now follows the current upstream
   `v0.8.6` tag commit after an upstream history rewrite. The old and new release
   commits have the same tree; a history-only merge preserves the append-only

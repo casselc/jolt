@@ -70,7 +70,7 @@
 ;; routes to str-starts-with?/str-ends-with?, which throw the JVM's NPE/CCE
 ;; instead of the generic arm's Scheme type error.
 (defn- string-direct-emit [m argc t args]
-  (let [a0 (first args) a1 (second args)]
+  (let [a0 (first args) a1 (second args) a2 (nth args 2 nil) a3 (nth args 3 nil)]
     (cond
       (= m "length")      (when (= argc 0) (str "(string-length " t ")"))
       (= m "toString")    (when (= argc 0) t)
@@ -112,6 +112,8 @@
       (= m "getBytes")             (cond (= argc 0) (str "(jolt-str-get-bytes " t " \"utf-8\")")
                                          (= argc 1) (str "(jolt-str-get-bytes " t " " a0 ")")
                                          :else nil)
+      (= m "getChars")             (when (= argc 4)
+                                      (str "(jolt-str-get-chars! " t " " a0 " " a1 " " a2 " " a3 ")"))
       (= m "matches")              (when (= argc 1) (str "(jolt-str-matches? " t " " a0 ")"))
       (= m "replaceAll")           (when (= argc 2) (str "(jolt-str-replace-all " t " " a0 " " a1 ")"))
       (= m "replaceFirst")         (when (= argc 2) (str "(jolt-str-replace-first " t " " a0 " " a1 ")"))
@@ -3108,13 +3110,29 @@
         chez? (not= :gambit (target))
         t (or (:sited-target node) (emit (:target node)))
         args (or (:sited-args node) (map emit (:args node)))
-        direct (when chez?
-                 (or (when (= :str (:target-type node))
-                       (string-direct-emit m (count args) t args))
-                     (when (= :kw (:target-type node))
-                       (keyword-direct-emit m (count args) t args))
-                     (when (= :sb (:target-type node))
-                       (sb-direct-emit m (count args) t args))))]
+        direct-form (when chez?
+                      (or (when (= :str (:target-type node))
+                            (string-direct-emit m (count args) t args))
+                          (when (= :kw (:target-type node))
+                            (keyword-direct-emit m (count args) t args))
+                          (when (= :sb (:target-type node))
+                            (sb-direct-emit m (count args) t args))))
+        ;; A proven-String call normally emits its direct form immediately. Chez
+        ;; evaluates procedure operands in an unspecified order, however, and
+        ;; getChars has four independently effectful arguments whose Java/Clojure
+        ;; left-to-right evaluation is observable even when range validation will
+        ;; throw. Reuse the compiler's ordinary ordered-call seam for this new
+        ;; direct arm. A traced tail site already handed us ordered/sited operands,
+        ;; and the unproven guarded path below always binds every operand with
+        ;; let*, so neither needs another wrapper.
+        direct (if (and direct-form (= m "getChars") (= :str (:target-type node))
+                        (nil? (:sited-target node)))
+                 (ordered-call (cons (:target node) (:args node))
+                               (vec (cons t args))
+                               (fn [operands]
+                                 (string-direct-emit m (dec (count operands))
+                                                     (first operands) (rest operands))))
+                 direct-form)]
     (cond
       direct direct
       (supported-host-methods m)
