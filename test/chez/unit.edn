@@ -1811,7 +1811,9 @@
   {:suite "core.async close ownership" :expr "(do (require '[clojure.core.async :as a]) (let [order (atom []) xf (fn [rf] (fn ([] (rf)) ([result] (swap! order conj :complete) (rf result)) ([result input] (swap! order conj input) (rf result input)))) c (a/chan 1 xf) _ (a/>!! c :buffered) done (promise) _ (a/put! c :pending #(deliver done %)) _ (a/close! c) before [@order (deref done 25 :pending)] values [(a/<!! c) (a/<!! c) (a/<!! c)]] [before values (deref done 1000 :timed-out) @order]))" :expected "[[[:buffered] :pending] [:buffered :pending nil] true [:buffered :pending :complete]]"}
   ;; Reducer abort claims/removes the put it is stepping before aborting later
   ;; owners. Both callbacks still complete true exactly once, but :third never
-  ;; reaches the already-reduced xrf and its completion arity runs once.
+  ;; reaches the already-reduced xrf. Jolt deliberately runs completion once;
+  ;; JVM core.async 1.9.865 runs it during abort/close and again when the final
+  ;; closed-channel take observes an empty buffer (all other values below match).
   {:suite "core.async close ownership" :expr "(do (require '[clojure.core.async :as a]) (let [steps (atom []) completes (atom 0) callbacks (atom {:second [] :third []}) xf (fn [rf] (fn ([] (rf)) ([result] (swap! completes inc) (rf result)) ([result input] (swap! steps conj input) (let [r (rf result input)] (if (= input :second) (reduced r) r))))) c (a/chan 1 xf) _ (a/>!! c :first) _ (a/put! c :second #(swap! callbacks update :second conj %)) _ (a/put! c :third #(swap! callbacks update :third conj %)) before [@steps @completes @callbacks] values [(a/<!! c) (a/<!! c) (a/<!! c)] settled (loop [n 100] (if (every? #(= [true] %) (vals @callbacks)) true (if (zero? n) false (do (Thread/sleep 5) (recur (dec n))))))] [before values settled @steps @completes @callbacks]))" :expected "[[[:first] 0 {:second [], :third []}] [:first :second nil] true [:first :second] 1 {:second [true], :third [true]}]"}
   ;; io-thread is the FIBER carrier (jolt-579): the three names pick the three
   ;; things — thread an OS thread, io-thread a fiber, go the CPS pass — and

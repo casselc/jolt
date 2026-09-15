@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete `true` exactly once. Puts begun after close still complete `false`.
   Transducing channels deliberately defer their completion arity until these
   owned inputs drain, rather than completing the reducer ahead of accepted work.
+  On reducer-triggered abort Jolt also invokes completion exactly once; JVM
+  core.async 1.9.865 invokes it once during abort/close and again when a later
+  closed-channel take observes the drained buffer. Values, reducer steps, and
+  pending-put callback results otherwise agree.
 
 ### Added
 
