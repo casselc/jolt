@@ -20,6 +20,9 @@
 ;;   6. N fibers and M threads on one channel, every value delivered exactly once
 ;;      (fiber-takers/thread-putters, and fiber-putters/thread-takers)
 ;;   7. a closed channel wakes both kinds of waiter
+;;   7c/d. close retains pre-close pending puts at capacity 0 and behind a buffer
+;;   7e. an alts put cannot mistake a stale cap-0 taker count for readiness
+;;   7f/g. pair claims are atomic and a shared alts handler cannot pair with itself
 ;;   8. no deadlock: a fiber parks on a channel while another fiber on the same
 ;;      carrier is putting (the notify pairing path)
 ;;   9. offer! completes against a parked fiber taker (the ac-try-give! clause)
@@ -269,6 +272,104 @@
 (wait-until (lambda () (not (eq? t7-val 'unset))) 5.0 "thread woke with nil")
 (ok "7b. thread woke with nil" (eq? t7-val jolt-nil))
 (ok "7b. closing fiber done" (eq? (jolt-fiber-state f7b) 'done))
+
+;; --- 7c. close preserves pre-close pending puts ------------------------------
+;; Direct regressions for aspect-packs #14. The capacity-zero shape is the
+;; witness minimized from Hegel seed 8913624566314636767; the buffered FIFO
+;; shape is the ownership loss seen by the deterministic woven scenario.
+(printf "\n== 7c. close preserves capacity-zero pending put ==\n")
+(define ch7c (jolt-async-chan))
+(define f7c (sa-fiber-spawn (lambda () (jolt-fiber->! ch7c 70))))
+(sa-fiber-run-all)
+(ok "7c. putter parked before close" (eq? (jolt-fiber-state f7c) 'parked))
+(ok "7c. one pending owner before close" (= (length (async-chan-alt-putters ch7c)) 1))
+(jolt-async-close! ch7c)
+(ok "7c. close retains pending owner" (= (length (async-chan-alt-putters ch7c)) 1))
+(ok "7c. pending value drains after close" (eq? (jolt-async-take ch7c) 70))
+(sa-fiber-run-all)
+(ok "7c. accepted put completes true" (eq? (jolt-fiber-result f7c) #t))
+(ok "7c. closed channel is empty after drain" (eq? (jolt-async-take ch7c) jolt-nil))
+
+(printf "\n== 7d. close preserves buffered pending FIFO ==\n")
+(define ch7d (jolt-async-chan 1))
+(jolt-async-give ch7d 71)
+(define f7d (sa-fiber-spawn (lambda () (jolt-fiber->! ch7d 72))))
+(sa-fiber-run-all)
+(ok "7d. full buffer parks later put" (eq? (jolt-fiber-state f7d) 'parked))
+(jolt-async-close! ch7d)
+(ok "7d. buffered value drains first" (eq? (jolt-async-take ch7d) 71))
+(ok "7d. pending value drains second" (eq? (jolt-async-take ch7d) 72))
+(sa-fiber-run-all)
+(ok "7d. accepted buffered put completes true" (eq? (jolt-fiber-result f7d) #t))
+(ok "7d. closed channel yields nil after FIFO" (eq? (jolt-async-take ch7d) jolt-nil))
+
+;; A rendezvous value can be queued while the taker that admitted it has not yet
+;; decremented takew. That stale readiness witness cannot admit a second value:
+;; the queued value must drain first and the alts put must remain an owned waiter.
+(printf "\n== 7e. queued rendezvous blocks a second alts put ==\n")
+(define ch7e (jolt-async-chan))
+(async-chan-takew-set! ch7e 1)
+(ok "7e. first rendezvous value admitted" (eq? (ac-try-give! ch7e 73) 'ok))
+(ok "7e. first value is queued while taker remains counted"
+    (and (= (ac-qlen ch7e) 1) (= (async-chan-takew ch7e) 1)))
+(define f7e
+  (sa-fiber-spawn
+   (lambda () (jolt-async-do-alts (jolt-vector (jolt-vector ch7e 74)) #t))))
+(sa-fiber-run-all)
+(ok "7e. second alts put parks instead of reporting false success"
+    (and (eq? (jolt-fiber-state f7e) 'parked)
+         (= (length (async-chan-alt-putters ch7e)) 1)))
+(async-chan-takew-set! ch7e 0)
+(ok "7e. queued value drains first" (eq? (ac-poll! ch7e) 73))
+(ok "7e. parked alts value drains second" (eq? (ac-poll! ch7e) 74))
+(sa-fiber-run-all)
+(define r7e (jolt-fiber-result f7e))
+(ok "7e. alts reports the committed put exactly once"
+    (and (eq? (pvec-nth-d r7e 0 jolt-nil) #t)
+         (eq? (pvec-nth-d r7e 1 jolt-nil) ch7e)
+         (null? (async-chan-alt-putters ch7e))
+         (ac-qempty? ch7e)))
+
+;; Model the losing timeout at the exact commit boundary: its claim happens
+;; before the channel attempts the two-handler rendezvous. The putter must remain
+;; active and registered, then complete normally when a real take arrives.
+(printf "\n== 7f. losing taker claim cannot consume the putter claim ==\n")
+(define ch7f (jolt-async-chan))
+(define p7f (alt-handler-alloc))
+(define t7f (alt-handler-alloc))
+(async-chan-alt-putters-set! ch7f (list (cons p7f 75)))
+(async-chan-alt-takers-set! ch7f (list t7f))
+(ok "7f. timeout-side claim wins first" (alt-claim! t7f))
+(ac-notify! ch7f)
+(ok "7f. failed pair leaves putter active and owned"
+    (and (alt-active? p7f)
+         (= (length (async-chan-alt-putters ch7f)) 1)
+         (null? (async-chan-alt-takers ch7f))))
+(ok "7f. later real take receives the undropped value" (eq? (ac-poll! ch7f) 75))
+(ok "7f. putter reports success with no leaked registration"
+    (and (eq? (ac-handler-await p7f) #t)
+         (null? (async-chan-alt-putters ch7f))))
+
+;; A mixed `[ch value]` + `ch` alts call shares one handler. It is not its own
+;; rendezvous peer; another port must win or a genuinely distinct operation must
+;; arrive.
+(printf "\n== 7g. shared alts handler cannot rendezvous with itself ==\n")
+(define ch7g (jolt-async-chan))
+(define h7g (alt-handler-alloc))
+(async-chan-alt-putters-set! ch7g (list (cons h7g 76)))
+(async-chan-alt-takers-set! ch7g (list h7g))
+(ac-notify! ch7g)
+(ok "7g. self pair commits neither side"
+    (and (alt-active? h7g)
+         (= (length (async-chan-alt-putters ch7g)) 1)
+         (= (length (async-chan-alt-takers ch7g)) 1)
+         (ac-qempty? ch7g)))
+(alt-claim! h7g) ; model a different port winning
+(ac-notify! ch7g)
+(ok "7g. winner cleanup leaves no registration or value"
+    (and (null? (async-chan-alt-putters ch7g))
+         (null? (async-chan-alt-takers ch7g))
+         (ac-qempty? ch7g)))
 
 ;; --- 8. no deadlock: a fiber parks while a sibling on the same carrier puts ---
 ;; f8a parks as an alt-taker; f8b's >! registers as an alt-putter and the

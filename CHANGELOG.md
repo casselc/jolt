@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `clojure.core.async/close!` now preserves puts admitted before close, matching
+  JVM core.async ownership: capacity-zero rendezvous and buffered pending values
+  drain in FIFO order and their blocking, callback, and `alts!` put operations
+  complete `true` exactly once. Puts begun after close still complete `false`.
+  Transducing channels deliberately defer their completion arity until these
+  owned inputs drain, rather than completing the reducer ahead of accepted work.
+  On reducer-triggered abort Jolt also invokes completion exactly once; JVM
+  core.async 1.9.865 invokes it once during abort/close and again when a later
+  closed-channel take observes the drained buffer. Values, reducer steps, and
+  pending-put callback results otherwise agree.
+
 ### Added
 
 - `jolt build` can select instrumentation aspect manifests and one or more

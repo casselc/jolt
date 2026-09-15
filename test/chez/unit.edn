@@ -1751,10 +1751,18 @@
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c1 (a/chan 1) c2 (a/chan 1)] (a/>!! c1 :a) (a/>!! c2 :b) (let [[v p] (a/alts!! [c1 c2] :priority true)] [v (if (= p c1) :c1 :c2)])))" :expected "[:a :c1]"}
   ;; 7. close! wakes parked alts take with nil
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) f (future (a/alts!! [c (a/timeout 3000)]))] (Thread/sleep 50) (a/close! c) (let [[v p] @f] (and (nil? v) (= p c)))))" :expected "true"}
-  ;; 8. close! wakes parked alts put with false
-  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) f (future (a/alts!! [[c :v]]))] (Thread/sleep 50) (a/close! c) (let [[v p] @f] [v (= p c)])))" :expected "[false true]"}
+  ;; 8. A parked alts put registered before close survives and is consumed by a
+  ;; later take; only puts initiated after close fail.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a] '[jolt.scheme :as s]) (let [c (a/chan) f (future (a/alts!! [[c :v]])) registered? (loop [n 100] (if (pos? (s/call \"length\" (s/call \"async-chan-alt-putters\" c))) true (if (zero? n) false (do (Thread/sleep 5) (recur (dec n)))))) _ (a/close! c) value (a/<!! c) r (deref f 1000 :timed-out)] [registered? value (when (vector? r) [(first r) (= c (second r))]) (a/<!! c) (a/offer! c :late)]))" :expected "[true :v [true true] nil false]"}
   ;; 9. transducer chan works through alts put
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc))] (a/alts!! [[c 1]]) (a/<!! c)))" :expected "2"}
+  ;; A cap-0 channel can have a queued rendezvous value while its awakened taker
+  ;; is still counted. That count is not readiness for a second alts put: the
+  ;; second value must register, survive, and drain after the queued value.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a] '[jolt.scheme :as s]) (let [c (a/chan) _ (s/call \"async-chan-takew-set!\" c 1) queued? (a/offer! c :queued) f (future (a/alts!! [[c :later]] :priority true)) registered? (loop [n 100] (if (pos? (s/call \"length\" (s/call \"async-chan-alt-putters\" c))) true (if (zero? n) false (do (Thread/sleep 5) (recur (dec n)))))) _ (s/call \"async-chan-takew-set!\" c 0) first-value (a/poll! c) [second-value second-port] (a/alts!! [c (a/timeout 3000)] :priority true) r (deref f 1000 :timed-out)] [queued? registered? first-value second-value (= second-port c) (when (vector? r) [(first r) (= c (second r))]) (a/poll! c)]))" :expected "[true true :queued :later true [true true] nil]"}
+  ;; The put and take specs share one alts handler and cannot satisfy each other.
+  ;; The timeout wins, no spurious success/exception occurs, and no value leaks.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) t (a/timeout 25) [v p] (a/alts!! [[c :self] c t] :priority true)] [(nil? v) (= p t) (a/poll! c)]))" :expected "[true true nil]"}
   ;; Validate every put before any ready operation can mutate channel state.
   ;; JVM core.async throws while leaving :kept available; validating only as
   ;; each candidate is attempted consumes the earlier ready take first.
@@ -1788,6 +1796,25 @@
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1)] (try (a/>!! c nil) :no-throw (catch IllegalArgumentException e (ex-message e)))))" :expected "\"Can't put nil on channel\""}
   ;; Stage B — pending rendezvous put parks until consumed (does NOT complete on close)
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) p (future (a/>!! c :v))] (Thread/sleep 50) (a/close! c) [(a/<!! c) @p]))" :expected "[:v true]"}
+  ;; aspect-packs #14 / Hegel seed 8913624566314636767: a capacity-zero
+  ;; callback put owns its FIFO slot before put! returns. Public close preserves
+  ;; that token; the callback completes true only when a later take consumes it.
+  {:suite "core.async close ownership" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) done (promise) accepted (a/put! c :pending #(deliver done %)) _ (a/close! c) before (deref done 25 :pending) value (a/<!! c) completed (deref done 1000 :timed-out)] [accepted before value completed (a/<!! c)]))" :expected "[true :pending :pending true nil]"}
+  ;; The buffered witness retains every pre-close put in admission order. JVM
+  ;; core.async 1.9.865 likewise leaves the callback pending after close with no
+  ;; take, then drains the buffered and parked values in order; MMC.close! does
+  ;; not call its reducer-only abort path. A new fast path must not jump ahead of
+  ;; either pending owner after room is freed.
+  {:suite "core.async close ownership" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1) _ (a/>!! c :buffered) b (promise) c-done (promise) _ (a/put! c :b #(deliver b %)) _ (a/put! c :c #(deliver c-done %)) _ (a/close! c) before [(deref b 25 :pending) (deref c-done 25 :pending)] values [(a/<!! c) (a/<!! c) (a/<!! c) (a/<!! c)]] [before values (deref b 1000 :timed-out) (deref c-done 1000 :timed-out)]))" :expected "[[:pending :pending] [:buffered :b :c nil] true true]"}
+  ;; aspect-packs #14 / Hegel seed 1352611841870532432: close must not run a
+  ;; transformed channel's completion arity ahead of a pending owned input.
+  {:suite "core.async close ownership" :expr "(do (require '[clojure.core.async :as a]) (let [order (atom []) xf (fn [rf] (fn ([] (rf)) ([result] (swap! order conj :complete) (rf result)) ([result input] (swap! order conj input) (rf result input)))) c (a/chan 1 xf) _ (a/>!! c :buffered) done (promise) _ (a/put! c :pending #(deliver done %)) _ (a/close! c) before [@order (deref done 25 :pending)] values [(a/<!! c) (a/<!! c) (a/<!! c)]] [before values (deref done 1000 :timed-out) @order]))" :expected "[[[:buffered] :pending] [:buffered :pending nil] true [:buffered :pending :complete]]"}
+  ;; Reducer abort claims/removes the put it is stepping before aborting later
+  ;; owners. Both callbacks still complete true exactly once, but :third never
+  ;; reaches the already-reduced xrf. Jolt deliberately runs completion once;
+  ;; JVM core.async 1.9.865 runs it during abort/close and again when the final
+  ;; closed-channel take observes an empty buffer (all other values below match).
+  {:suite "core.async close ownership" :expr "(do (require '[clojure.core.async :as a]) (let [steps (atom []) completes (atom 0) callbacks (atom {:second [] :third []}) xf (fn [rf] (fn ([] (rf)) ([result] (swap! completes inc) (rf result)) ([result input] (swap! steps conj input) (let [r (rf result input)] (if (= input :second) (reduced r) r))))) c (a/chan 1 xf) _ (a/>!! c :first) _ (a/put! c :second #(swap! callbacks update :second conj %)) _ (a/put! c :third #(swap! callbacks update :third conj %)) before [@steps @completes @callbacks] values [(a/<!! c) (a/<!! c) (a/<!! c)] settled (loop [n 100] (if (every? #(= [true] %) (vals @callbacks)) true (if (zero? n) false (do (Thread/sleep 5) (recur (dec n))))))] [before values settled @steps @completes @callbacks]))" :expected "[[[:first] 0 {:second [], :third []}] [:first :second nil] true [:first :second] 1 {:second [true], :third [true]}]"}
   ;; io-thread is the FIBER carrier (jolt-579): the three names pick the three
   ;; things — thread an OS thread, io-thread a fiber, go the CPS pass — and
   ;; jolt.host/fiber? is the runtime's own answer, the same read <! dispatches on.
