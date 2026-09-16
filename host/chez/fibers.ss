@@ -403,9 +403,6 @@
            (vector 'carrier carrier-id 'fiber fiber-id
                    'state state 'queued queued?))))
 
-(define (jolt-fiber-invariant! where f message)
-  (jolt-fiber-invariant-raise! (jolt-fiber-invariant-status! where f message)))
-
 ;; The status form lets raw-lock queue paths defer reporting until after unlock;
 ;; other transition sites use the raising wrapper directly.
 (define (jolt-fiber-transition/status! f kind new-state)
