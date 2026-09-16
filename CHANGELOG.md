@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- An opt-in bounded Quint fiber-handoff specification separates park commitment,
+  early wakes, carrier ownership, and pending publication. Deterministic scenarios
+  and sampled checks include a deliberately broken early-enqueue control; these
+  checks are not exhaustive verification or a substitute for runtime tests.
+
 - `jolt build` can select instrumentation aspect manifests and one or more
   ordered providers, including explicit per-provider role filters when
   consumers intentionally cover different parts of one manifest. The compiler

@@ -1387,3 +1387,12 @@ printperf:
 # the default gate free of timing. See the script header.
 sbperf:
 	@$(CHEZ) --script test/chez/string-builder-perf.ss
+
+# Opt-in bounded scheduler specification checks; never invokes Apalache.
+QUINT ?= quint
+.PHONY: fiber-handoff-model
+fiber-handoff-model:
+	$(QUINT) typecheck spec/fiber_handoff.qnt
+	$(QUINT) typecheck spec/fiber_handoff_test.qnt
+	$(QUINT) test spec/fiber_handoff_test.qnt --max-samples 1 --seed 137
+	$(QUINT) run spec/fiber_handoff_test.qnt --invariant safety --witnesses readyQueuedFiberOwned earlyPending publishedOnce pendingDiscarded dequeued dispatched parkCommitted returned closed lateWoken yielded preempted finished cleaned doneReached deadReached capturedPark smPark --max-samples 10000 --max-steps 25 --seed 137 --verbosity 1
