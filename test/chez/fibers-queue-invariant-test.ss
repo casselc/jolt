@@ -139,6 +139,44 @@
          (not (jolt-fiber-park-handoff? terminal-handoff-f))
          (not (jolt-fiber-wake-pending? terminal-handoff-f))))
 
+(printf "\n== condition-variable park seam handoff ==\n")
+;; Route through jolt-cv-wait itself, but interpose only in this test after its
+;; real condition-park commit.  The OS thread's resume is joined before the
+;; helper returns, which deterministically forces the commit-to-switch window
+;; that an ordinary condition waker reaches nondeterministically after taking
+;; the waitable mutex.  The decision flag stands in for the state that such a
+;; waker changes under that mutex; thread-join publishes it before the retake.
+(define real-jolt-fiber-park-commit! jolt-fiber-park-commit!)
+(define cv-seam-ready? (box #f))
+(define cv-seam-result (box #f))
+(set! jolt-fiber-park-commit!
+  (lambda (f kind)
+    (real-jolt-fiber-park-commit! f kind)
+    (when (eq? kind 'condition-park)
+      (thread-join
+        (fork-thread
+          (lambda ()
+            (set-box! cv-seam-ready? #t)
+            (sa-fiber-resume f)))))))
+(define cv-seam-f
+  (sa-fiber-spawn
+    (lambda ()
+      (let ((mu (make-mutex)) (cv (make-condition)))
+        (set-box! cv-seam-result
+                  (jolt-cv-wait
+                    mu cv #f
+                    (lambda (timed-out?)
+                      (if (unbox cv-seam-ready?) 'woke jolt-cv-again))))
+        'condition-seam-done))))
+(sa-fiber-run-all)
+(set! jolt-fiber-park-commit! real-jolt-fiber-park-commit!)
+(ok "the real condition-variable seam survives a pre-switch OS-thread wake"
+    (and (eq? 'woke (unbox cv-seam-result))
+         (eq? 'done (jolt-fiber-state cv-seam-f))
+         (not (jolt-fiber-queued? cv-seam-f))
+         (not (jolt-fiber-park-handoff? cv-seam-f))
+         (not (jolt-fiber-wake-pending? cv-seam-f))))
+
 ;; A promise-shaped handoff. Completion and commit-to-park are serialized by
 ;; one mutex, matching the contract used by promise deref and Ebb's first-park
 ;; gates without depending on either library in this host-level regression.
