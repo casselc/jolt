@@ -468,6 +468,9 @@
 ;; --- char output (Writer) ---------------------------------------------------
 (define (char-writer-port self) (vector-ref (jhost-state self) 0))
 (define (char-writer? x) (and (jhost? x) (string=? (jhost-tag x) "char-writer")))
+;; Exact StringWriter, not the broader writer-jhost? family.
+(define (string-writer? x)
+  (and (jhost? x) (string=? (jhost-tag x) "writer")))
 ;; Every jhost on the CHARACTER side of the io split, the mirror of reader-jhost?:
 ;; char-writer here, and StringWriter / *out* / io/writer-of-a-file over in io.ss
 ;; and host-static-classes.ss. A print-stream is deliberately absent -- it is a

@@ -148,6 +148,7 @@
 (let ((e (emit-dl "(def ifaceappend (fn [^Appendable out ^CharSequence s] (.append out s) (.append out s 1 3) out))")))
   (gate-check "^Appendable tests for a StringBuilder" (gate-sub? e "(sb-jhost? _ht$") #t)
   (gate-check "^Appendable also tests for an OutputStreamWriter" (gate-sub? e "(char-writer? _ht$") #t)
+  (gate-check "^Appendable also tests exactly StringWriter" (gate-sub? e "(string-writer? _ht$") #t)
   (gate-check "one-arg append uses the direct builder primitive" (gate-sub? e "(sb-append! _ht$") #t)
   (gate-check "range append shares append-range-text" (gate-sub? e "(append-range-text _ha$") #t)
   (gate-check "writer range append writes directly without a substring" (gate-sub? e "(cw-append-range! _ht$") #t)
@@ -155,13 +156,45 @@
   (run-emit e)
   (gate-check "StringBuilder append is fluent and range-correct"
               (ev "(.toString (user/ifaceappend (StringBuilder.) \"abcd\"))") "abcdbc")
-  (gate-check "a non-StringBuilder Appendable reaches record dispatch"
+  (gate-check "StringWriter uses its own guarded append arm"
               (ev "(.toString (user/ifaceappend (java.io.StringWriter.) \"abcd\"))") "abcdbc")
   (gate-check "OutputStreamWriter takes the guarded direct arm"
               (ev "(let [b (java.io.ByteArrayOutputStream.) w (java.io.OutputStreamWriter. b)] (user/ifaceappend w \"abcd\") (.flush w) (.toString b))")
               "abcdbc")
   (gate-check "range errors still throw through the guarded direct arm"
               (raises? (lambda () (ev "(user/ifaceappend (StringBuilder.) \"a\")"))) #t))
+
+
+;; Receiver and every argument are evaluated once, in source order.
+(run-emit (emit-dl "(def sw-order-one (fn [w calls] (.append (do (swap! calls conj :receiver) w) (do (swap! calls conj :value) \"x\"))))"))
+(run-emit (emit-dl "(def sw-order-range (fn [w calls] (.append (do (swap! calls conj :receiver) w) (do (swap! calls conj :value) \"abcd\") (do (swap! calls conj :start) 1) (do (swap! calls conj :end) 3))))"))
+(gate-check "StringWriter one-arg evaluation order and return identity"
+  (ev "(let [w (StringWriter.) calls (atom []) result (user/sw-order-one w calls)] (= [true [:receiver :value] \"x\"] [(identical? w result) @calls (.toString w)]))")
+  #t)
+(gate-check "StringWriter range evaluation order and return identity"
+  (ev "(let [w (StringWriter.) calls (atom []) result (user/sw-order-range w calls)] (= [true [:receiver :value :start :end] \"bc\"] [(identical? w result) @calls (.toString w)]))")
+  #t)
+(gate-check "StringWriter semantic comparator rejects wrong argument order"
+  (ev "(let [w (StringWriter.) calls (atom []) result (user/sw-order-range w calls)] (= [true [:receiver :value :end :start] \"bc\"] [(identical? w result) @calls (.toString w)]))")
+  #f)
+(let ((e (emit-dl "(def sw-not-builder (fn [^Appendable out] (.length out) (.subSequence out 0 1)))")))
+  (gate-check "nonappend emits no StringWriter builder-method guard" (gate-sub? e "string-writer?") #f)
+  (gate-check "nonappend keeps method fallback" (gate-sub? e "record-method-dispatch") #t))
+(gate-check "arbitrary Appendable remains a real fallback"
+  (ev "(let [calls (atom []) out (reify java.lang.Appendable (append [this value] (swap! calls conj value) this))] (.append ^Appendable out \"fallback\") (= [\"fallback\"] @calls))")
+  #t)
+(gate-check "StringWriter nil, char, empty range and scalar Unicode"
+  (ev "(let [^Appendable w (StringWriter.)] (.append w nil) (.append w \\newline) (.append w \"abcd\" 2 2) (.append w \"漢😀\") (.toString w))")
+  "null\n漢😀")
+;; Exact family parity against the EXISTING generic method, not merely raised?.
+(define (sw-error-family thunk)
+  (guard (e (#t (jolt-class-name (jolt-unwrap-throw e))))
+    (thunk) "NO-ERROR"))
+(let* ((w (ev "(StringWriter.)"))
+       (generic (sw-error-family (lambda () (record-method-dispatch w "append" (jolt-vector "a" 1 3)))))
+       (direct (sw-error-family (lambda () (ev "(user/ifaceappend (StringWriter.) \"a\")")))))
+  (gate-check "generic invalid range actually errors" (string=? generic "NO-ERROR") #f)
+  (gate-check "StringWriter invalid range retains EXACT generic error family" direct generic))
 
 ;; ---- the unchecked family --------------------------------------------------
 (let ((e (emit-dl "(def uadd (fn [a b] (unchecked-add a b)))")))
