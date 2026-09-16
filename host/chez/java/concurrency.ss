@@ -1203,7 +1203,7 @@
                    (condition-broadcast (vector-ref m monitor-i-cv))
                    fs)
                  '()))))
-      (for-each sa-fiber-resume wake))))
+      (for-each (lambda (f) (jolt-fiber-resume/source f 'monitor)) wake))))
 
 ;; The enter happens OUTSIDE the dynamic-wind, and the exit asks whether this is a
 ;; real exit. Both halves matter and neither is the obvious spelling.
