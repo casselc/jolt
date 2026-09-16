@@ -206,9 +206,11 @@
 ;;
 ;;   NO WAKEUP CAN BE LOST, because registering and committing to 'parked both
 ;;   happen under the same mu the waker must take. A resume landing in the window
-;;   between the release and the switch finds the fiber 'parked, moves it to
-;;   'ready and enqueues it; the switch then stores its continuation and the
-;;   carrier dispatches it. A preemption in that window is refused, because
+;;   between the release and the switch finds the fiber 'parked and records a
+;;   pending wake; only after the switch gives ownership back does the carrier
+;;   move it to 'ready and enqueue it. Publishing before ownership is transferred
+;;   lets unwind code mutate a queue-owned fiber (jolt-137). A preemption in the
+;;   window is refused, because
 ;;   jolt-fiber-preempt-handler refuses to preempt a fiber that is not 'running —
 ;;   which is why this needs no interrupt disable of its own.
 ;;
@@ -341,9 +343,10 @@
 ;; condition that may be true for only one of them, so exactly one of them getting
 ;; the wake is not something the waker can decide.
 ;;
-;; Resuming while mu is held is deliberate and safe. sa-fiber-resume only enqueues,
-;; on the resumed fiber's own carrier, taking that carrier's run-queue mutex, which
-;; is last in the order. The resumed fiber's retake will block on mu for as long as
+;; Resuming while mu is held is deliberate and safe. sa-fiber-resume only records
+;; a pending wake or enqueues on the resumed fiber's own carrier, taking that
+;; carrier's run-queue mutex, which is last in the order. The resumed fiber's
+;; retake will block on mu for as long as
 ;; this critical section lasts — and no longer, because a lock in this runtime can
 ;; no longer be held across a park at all, so every holder of mu is running and
 ;; releases in bounded time.
@@ -502,7 +505,7 @@
                  ((jolt-current-fiber)
                   => (lambda (f)
                        (jolt-cv-register! cv f)
-                       (jolt-fiber-state-set! f 'parked)
+                       (jolt-fiber-park-commit! f 'condition-park)
                        jolt-lock-parked))
                  (else
                   (if deadline

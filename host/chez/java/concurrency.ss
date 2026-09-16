@@ -1081,7 +1081,7 @@
     (if f
         (begin
           (vector-set! m monitor-i-fibers (cons f (vector-ref m monitor-i-fibers)))
-          (jolt-fiber-state-set! f 'parked)
+          (jolt-fiber-park-commit! f 'monitor-park)
           jolt-lock-parked)
         (begin
           (jolt-condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))

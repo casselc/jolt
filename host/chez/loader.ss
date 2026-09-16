@@ -1695,7 +1695,7 @@
         (begin
           (hashtable-set! ldr-fiber-waiters name
                           (cons f (hashtable-ref ldr-fiber-waiters name '())))
-          (jolt-fiber-state-set! f 'parked)
+          (jolt-fiber-park-commit! f 'loader-park)
           jolt-lock-parked)
         (begin
           ;; sliced so the deadline is checked even when no wakeup ever comes;

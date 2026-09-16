@@ -317,6 +317,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-preempt-test.ss
 	@$(CHEZ) --script test/chez/fibers-lock-test.ss
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
+	@JOLT_FIBER_TRACE_LIMIT=64 $(CHEZ) --script test/chez/fibers-queue-invariant-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own

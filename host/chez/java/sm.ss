@@ -95,10 +95,11 @@
 ;; dispatches wrongly on either. Neither order is safe on its own. What makes it
 ;; safe is R0(d): the fiber is pinned to its carrier and ONLY that carrier's
 ;; thread dequeues it, so the carrier executing this sequence cannot also be
-;; dispatching it. A cross-thread sa-fiber-resume landing mid-sequence only flips
-;; 'parked to 'ready and enqueues. Anything that gave a second thread the right to
-;; run this fiber — a manual sa-fiber-run-all against a live pool is the one way
-;; in — breaks the park, not just the counters.
+;; dispatching it. A cross-thread sa-fiber-resume landing before scheduler
+;; ownership records a pending wake; the carrier publishes it after this escape.
+;; Anything that gave a second thread the right to run this fiber — a manual
+;; sa-fiber-run-all against a live pool is the one way in — breaks the park, not
+;; just the counters.
 (define (jolt-sm-park! f resume)
   ;; unreachable, both ops check before they touch the channel; kept because this
   ;; is the point the invariant is actually load-bearing
@@ -136,17 +137,16 @@
 ;; exactly as jolt-fiber-waiter-wait! does it: a deliver that beat the commit is
 ;; seen here and the resume runs inline instead of parking.
 ;; The commit and the park that follows it are ONE non-preemptible region. A
-;; timer landing between them finds the fiber already marked 'parked, sets it
-;; back to 'ready and enqueues it, and then the park runs anyway — so the fiber
-;; is on the run queue AND parked, gets dispatched, and returns from its park
-;; with an empty mailbox. jolt-sm-park! clears the region as it escapes; the
-;; no-park path exits it here.
+;; timer landing between them finds the fiber already marked 'parked, records a
+;; pending wake, and lets the carrier publish it only after the park escape.
+;; jolt-sm-park! clears the interrupt region as it escapes; the no-park path exits
+;; it here.
 (define (jolt-sm-commit! f h resume)
   (disable-interrupts)
   (let* ((park? (jolt-with-mutex (alt-handler-wmu h)
                   (if (vector-ref (alt-handler-mailbox h) 0)
                       #f
-                      (begin (jolt-fiber-state-set! f 'parked) #t)))))
+                      (begin (jolt-fiber-park-commit! f 'sm-commit-park) #t)))))
     (if park?
         (jolt-sm-park! f resume)
         (begin (enable-interrupts) (resume)))))
