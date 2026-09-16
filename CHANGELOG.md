@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Fiber condition-variable wakes that arrive after a park commit but before
+  control returns to the carrier now remain pending until the carrier owns the
+  parked fiber. The carrier then performs the `parked` to `ready` enqueue once,
+  while terminal cleanup drops an obsolete wake without resurrecting the
+  fiber. This prevents a still-running fiber from being published on its ready
+  queue and later mutating queue-owned state. Opt-in bounded scheduler tracing
+  records metadata-only queue/state transitions and reports violations at the
+  causal transition.
 - `clojure.core.async/close!` now preserves puts admitted before close, matching
   JVM core.async ownership: capacity-zero rendezvous and buffered pending values
   drain in FIFO order and their blocking, callback, and `alts!` put operations

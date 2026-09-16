@@ -18,11 +18,9 @@
 ;; commit ("set 'parked") happens under the SAME wmu that alt-deliver! writes
 ;; the mailbox and resumes under. A deliver that beat the commit is seen by the
 ;; commit's mailbox check (no park, no capture); one that follows it observes
-;; 'parked and enqueues. The capture+switch happens after releasing the wmu and
-;; never re-consults the fiber state — the resume's 'ready flip only means
-;; "already on the queue", and the one-shot continuation is set before the
-;; switch, so run-all picks it up correctly whether it was enqueued before or
-;; after the capture.
+;; 'parked and records a pending wake. The capture+switch happens after releasing
+;; the wmu; only after the carrier regains ownership does it publish that wake as
+;; 'ready and enqueue the fiber. A later delivery enqueues normally.
 ;;
 ;; The channel mutex is released before the park, always — never yield while
 ;; holding it (the R3 invariant; a fiber that parks holding the channel mutex
@@ -201,7 +199,7 @@
            (jolt-with-mutex (alt-handler-wmu h)
              (if (vector-ref (alt-handler-mailbox h) 0)
                  #f
-                 (begin (jolt-fiber-state-set! f 'parked) #t)))))
+                 (begin (jolt-fiber-park-commit! f 'channel-commit-park) #t)))))
       (when park?
         (jolt-fiber-bump-chan-parks! f)
         (jolt-fiber-to-scheduler! f))
@@ -294,7 +292,7 @@
 (def-var! "jolt.host" "fiber-park-commit!"
   (lambda ()
     (disable-interrupts)
-    (jolt-fiber-state-set! (jolt-current-fiber) 'parked)))
+    (jolt-fiber-park-commit! (jolt-current-fiber) 'host-commit-park)))
 ;; jolt-fiber-to-scheduler! takes the fiber (it clears the current-fiber vreg
 ;; before capturing, so the record has to be passed in, not read afterwards).
 (def-var! "jolt.host" "fiber-to-scheduler!"
