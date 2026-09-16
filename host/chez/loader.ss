@@ -1802,7 +1802,7 @@
     (let ((fs (hashtable-ref ldr-fiber-waiters name '())))
       (unless (null? fs)
         (hashtable-delete! ldr-fiber-waiters name)
-        (for-each sa-fiber-resume fs)))
+        (for-each (lambda (f) (jolt-fiber-resume/source f 'loader)) fs)))
     (condition-broadcast ldr-load-cv)))
 
 ;; The dynamic-wind before thunk below: the claim must be ours. On first entry it is,

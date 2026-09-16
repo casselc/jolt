@@ -353,7 +353,8 @@
 (define (jolt-cv-wake! cv)
   (condition-broadcast cv)
   (let ((fs (jolt-cv-take-waiters! cv)))
-    (unless (null? fs) (for-each sa-fiber-resume fs))))
+    (unless (null? fs)
+      (for-each (lambda (f) (jolt-fiber-resume/source f 'condition)) fs))))
 
 ;; (jolt-cv-signal-one! cv) — wake exactly ONE thread waiting on cv, with mu held.
 ;;

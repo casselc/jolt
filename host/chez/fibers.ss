@@ -82,8 +82,9 @@
           (mutable queued?)
           (mutable park-handoff?)
           (mutable wake-pending?)
+          (mutable pending-wake-source)
           (mutable diag-id))
-  (nongenerative jolt-fiber-v7))
+  (nongenerative jolt-fiber-v8))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -326,29 +327,69 @@
 ;; Opt in with JOLT_FIBER_TRACE_LIMIT=N. Each carrier owns its ring and trace
 ;; mutex, so diagnostics do not serialize unrelated carrier queues. A ring
 ;; contains scheduler metadata only: a carrier-local sequence, carrier/fiber ids,
-;; transition kind, old/new state, and queue membership before/after. It never
-;; retains a thunk, continuation, result, exception, dynamic slice, or application
-;; value. N is clamped so a production diagnostic cannot grow without bound.
+;; transition kind, old/new state, queue membership before/after, a bounded
+;; queue-link/continuation classification, handoff flags, and a fixed wake-source
+;; label. It never retains a fiber/carrier pointer, queue link, thunk,
+;; continuation, result, exception, dynamic slice, or application value. N is
+;; clamped so a production diagnostic cannot grow without bound.
 (define jolt-fiber-trace-limit
   (let ((s (getenv "JOLT_FIBER_TRACE_LIMIT")))
     (and s
          (let ((n (string->number s)))
            (if (and (integer? n) (> n 0)) (min 4096 n) 256)))))
-(define (jolt-fiber-trace! f kind old-state new-state queued-before queued-after)
+(define (jolt-fiber-queue-link-class f)
+  (let ((next (jolt-fiber-next f)))
+    (cond ((not next) 'clear)
+          ((eq? next f) 'self)
+          (else 'linked))))
+
+;; Do not let a future internal caller accidentally turn an application value
+;; into diagnostic data. Only this closed vocabulary can enter the ring or the
+;; pending-wake field; every unknown label is reduced to 'other.
+(define (jolt-fiber-wake-source-class source)
+  (if (memq source '(unspecified condition loader async monitor process
+                     poller timer cancellation test multiple other))
+      source
+      'other))
+
+;; This describes scheduler-owned control shape without retaining or rendering
+;; either the captured continuation or the state-machine step procedure.
+(define (jolt-fiber-continuation-class f)
+  (cond ((jolt-fiber-k f) 'captured)
+        ((procedure? (jolt-fiber-sm f)) 'state-machine-step)
+        ((eq? (jolt-fiber-sm f) 'running) 'state-machine-running)
+        ((jolt-fiber-sm f) 'state-machine-other)
+        (else 'none)))
+
+(define (jolt-fiber-pending-source-class f)
+  (or (jolt-fiber-pending-wake-source f) 'none))
+
+(define (jolt-fiber-trace! f kind old-state new-state queued-before queued-after
+                           . maybe-wake-source)
   (let ((c (jolt-fiber-carrier f)))
     (when (jolt-carrier-trace-ring c)
+      (let ((wake-source
+             (jolt-fiber-wake-source-class
+               (if (null? maybe-wake-source) 'unspecified
+                   (car maybe-wake-source)))))
       (jolt-lock! (jolt-carrier-trace-mu c))
       (jolt-carrier-trace-seq-set! c (+ 1 (jolt-carrier-trace-seq c)))
       (vector-set! (jolt-carrier-trace-ring c) (jolt-carrier-trace-pos c)
         (vector (jolt-carrier-trace-seq c)
               (jolt-carrier-diag-id (jolt-fiber-carrier f))
               (jolt-fiber-diag-id f)
-              kind old-state new-state queued-before queued-after))
+              kind old-state new-state queued-before queued-after
+              (jolt-fiber-queue-link-class f)
+              (jolt-fiber-park-handoff? f)
+              (jolt-fiber-wake-pending? f)
+              wake-source
+              (jolt-fiber-pending-source-class f)
+              (jolt-fiber-continuation-class f)))
       (jolt-carrier-trace-pos-set!
         c (mod (+ (jolt-carrier-trace-pos c) 1) jolt-fiber-trace-limit))
       (jolt-carrier-trace-count-set!
         c (min jolt-fiber-trace-limit (+ (jolt-carrier-trace-count c) 1)))
-      (jolt-unlock! (jolt-carrier-trace-mu c)))))
+      (jolt-unlock! (jolt-carrier-trace-mu c))))))
 
 (define (jolt-fiber-trace-snapshot c)
   (if (not (jolt-carrier-trace-ring c))
@@ -369,50 +410,76 @@
           (jolt-unlock! (jolt-carrier-trace-mu c))
           out))))
 
-(define (jolt-fiber-invariant-status! where f message)
+(define (jolt-fiber-invariant-status! where f message . maybe-wake-source)
+  (let ((wake-source
+         (jolt-fiber-wake-source-class
+           (if (null? maybe-wake-source) 'unspecified
+               (car maybe-wake-source)))))
   (jolt-fiber-trace! f where (jolt-fiber-state f) (jolt-fiber-state f)
-                     (jolt-fiber-queued? f) (jolt-fiber-queued? f))
-  ;; The carrier is retained only on this bounded call stack so reporting can
-  ;; snapshot its private ring after a raw queue lock has been released. The
-  ;; printable fields below contain scheduler coordinates, never application data.
-  (vector (jolt-fiber-carrier f) where message
+                     (jolt-fiber-queued? f) (jolt-fiber-queued? f)
+                     wake-source)
+  ;; Snapshot while the caller still has the fiber. The returned status is
+  ;; entirely bounded metadata, so the deferred reporter never retains a raw
+  ;; carrier/fiber/queue pointer while a raw queue lock is being released.
+  (vector where message
           (jolt-carrier-diag-id (jolt-fiber-carrier f))
-          (jolt-fiber-diag-id f) (jolt-fiber-state f) (jolt-fiber-queued? f)))
+          (jolt-fiber-diag-id f) (jolt-fiber-state f) (jolt-fiber-queued? f)
+          (jolt-fiber-queue-link-class f)
+          (jolt-fiber-park-handoff? f)
+          (jolt-fiber-wake-pending? f)
+          wake-source
+          (jolt-fiber-pending-source-class f)
+          (jolt-fiber-continuation-class f)
+          (jolt-fiber-trace-snapshot (jolt-fiber-carrier f)))))
 
 (define (jolt-fiber-invariant-raise! status)
-  (let ((c (vector-ref status 0))
-        (where (vector-ref status 1))
-        (message (vector-ref status 2))
-        (carrier-id (vector-ref status 3))
-        (fiber-id (vector-ref status 4))
-        (state (vector-ref status 5))
-        (queued? (vector-ref status 6)))
-    (let ((events (jolt-fiber-trace-snapshot c)))
+  (let ((where (vector-ref status 0))
+        (message (vector-ref status 1))
+        (carrier-id (vector-ref status 2))
+        (fiber-id (vector-ref status 3))
+        (state (vector-ref status 4))
+        (queued? (vector-ref status 5))
+        (queue-link (vector-ref status 6))
+        (handoff? (vector-ref status 7))
+        (pending? (vector-ref status 8))
+        (wake-source (vector-ref status 9))
+        (pending-source (vector-ref status 10))
+        (continuation (vector-ref status 11))
+        (events (vector-ref status 12)))
       (fprintf (current-error-port)
-               "JOLT_FIBER_INVARIANT where=~a carrier=~a fiber=~a state=~a queued=~a trace-count=~a\n"
-               where carrier-id fiber-id state queued? (length events))
+               "JOLT_FIBER_INVARIANT where=~a carrier=~a fiber=~a state=~a queued=~a queue-link=~a handoff=~a pending=~a wake-source=~a pending-source=~a continuation=~a trace-count=~a\n"
+               where carrier-id fiber-id state queued? queue-link handoff?
+               pending? wake-source pending-source continuation (length events))
       (for-each
         (lambda (e)
           (fprintf (current-error-port)
-                   "JOLT_FIBER_EVENT seq=~a carrier=~a fiber=~a kind=~a old=~a new=~a queued-before=~a queued-after=~a\n"
+                   "JOLT_FIBER_EVENT seq=~a carrier=~a fiber=~a kind=~a old=~a new=~a queued-before=~a queued-after=~a queue-link=~a handoff=~a pending=~a wake-source=~a pending-source=~a continuation=~a\n"
                    (vector-ref e 0) (vector-ref e 1) (vector-ref e 2)
                    (vector-ref e 3) (vector-ref e 4) (vector-ref e 5)
-                   (vector-ref e 6) (vector-ref e 7)))
-        events))
+                   (vector-ref e 6) (vector-ref e 7) (vector-ref e 8)
+                   (vector-ref e 9) (vector-ref e 10) (vector-ref e 11)
+                   (vector-ref e 12) (vector-ref e 13)))
+        events)
     (error where message
            (vector 'carrier carrier-id 'fiber fiber-id
-                   'state state 'queued queued?))))
+                   'state state 'queued queued? 'queue-link queue-link
+                   'handoff handoff? 'pending pending?
+                   'wake-source wake-source 'pending-source pending-source
+                   'continuation continuation))))
 
 ;; The status form lets raw-lock queue paths defer reporting until after unlock;
 ;; other transition sites use the raising wrapper directly.
-(define (jolt-fiber-transition/status! f kind new-state)
+(define (jolt-fiber-transition/status! f kind new-state . maybe-wake-source)
   (let ((old-state (jolt-fiber-state f))
-        (queued? (jolt-fiber-queued? f)))
+        (queued? (jolt-fiber-queued? f))
+        (wake-source (if (null? maybe-wake-source) 'unspecified
+                         (car maybe-wake-source))))
     (if (and queued? (not (eq? new-state 'ready)))
-        (jolt-fiber-invariant-status! kind f "queued fiber cannot leave ready state")
+        (jolt-fiber-invariant-status! kind f "queued fiber cannot leave ready state"
+                                      wake-source)
         (begin
           (jolt-fiber-state-set! f new-state)
-          (jolt-fiber-trace! f kind old-state new-state queued? queued?)
+          (jolt-fiber-trace! f kind old-state new-state queued? queued? wake-source)
           #f))))
 
 (define (jolt-fiber-transition! f kind new-state)
@@ -428,7 +495,9 @@
   (let ((c (jolt-fiber-carrier f)))
     (jolt-lock! (jolt-carrier-mu c))
     (let ((status (jolt-fiber-transition/status! f kind 'parked)))
-      (unless status (jolt-fiber-park-handoff?-set! f #t))
+      (unless status
+        (jolt-fiber-park-handoff?-set! f #t)
+        (jolt-fiber-trace! f 'park-handoff-open 'parked 'parked #f #f))
       (jolt-unlock! (jolt-carrier-mu c))
       (when status (jolt-fiber-invariant-raise! status)))))
 
@@ -584,7 +653,9 @@
 ;; An invariant failure is returned as bounded scheduler metadata, not raised
 ;; here: every caller holds the raw carrier mutex, whose explicit unlock an
 ;; exception would bypass. The public wrappers unlock first, then report/raise.
-(define (jolt-fiber-enqueue!/locked c f cause)
+(define (jolt-fiber-enqueue!/locked c f cause . maybe-wake-source)
+  (let ((wake-source (if (null? maybe-wake-source) 'unspecified
+                         (car maybe-wake-source))))
   ;; First enqueue assigns a carrier-local id under the queue mutex already held
   ;; by every caller. Trace-disabled spawns therefore acquire no diagnostic lock.
   (unless (jolt-fiber-diag-id f)
@@ -592,11 +663,14 @@
     (jolt-carrier-next-fiber-id-set! c (+ 1 (jolt-carrier-next-fiber-id c))))
   (cond
     ((jolt-fiber-queued? f)
-     (jolt-fiber-invariant-status! cause f "fiber enqueued while already queued"))
+     (jolt-fiber-invariant-status! cause f "fiber enqueued while already queued"
+                                   wake-source))
     ((jolt-fiber-next f)
-     (jolt-fiber-invariant-status! cause f "unqueued fiber retained a queue link"))
+     (jolt-fiber-invariant-status! cause f "unqueued fiber retained a queue link"
+                                   wake-source))
     ((not (eq? (jolt-fiber-state f) 'ready))
-     (jolt-fiber-invariant-status! cause f "only a ready fiber may be enqueued"))
+     (jolt-fiber-invariant-status! cause f "only a ready fiber may be enqueued"
+                                   wake-source))
     (else
      (if (jolt-carrier-tail c)
          (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
@@ -605,8 +679,9 @@
                 (jolt-carrier-head-set! c f)
                 (jolt-carrier-tail-set! c f)))
      (jolt-fiber-queued?-set! f #t)
-     (jolt-fiber-trace! f cause (jolt-fiber-state f) (jolt-fiber-state f) #f #t)
-     #f)))
+     (jolt-fiber-trace! f cause (jolt-fiber-state f) (jolt-fiber-state f) #f #t
+                        wake-source)
+     #f))))
 
 (define (jolt-fiber-enqueue! c f cause)
   (jolt-lock! (jolt-carrier-mu c))
@@ -781,6 +856,33 @@
                (enable-interrupts))          ; balance, see sa-fiber-yield
         (error 'jolt-fiber-park! "park called outside a fiber"))))
 
+;; Internal wake paths attach one of the closed diagnostic source labels. The
+;; adapter seam below deliberately stays one-argument and supplies 'unspecified,
+;; preserving the public contract and preventing caller values from entering
+;; scheduler diagnostics.
+(define (jolt-fiber-resume/source f source)
+  (let ((source (jolt-fiber-wake-source-class source))
+        (c (jolt-fiber-carrier f)))
+    (jolt-lock! (jolt-carrier-mu c))
+    (let ((status #f))
+      (when (eq? (jolt-fiber-state f) 'parked)
+        (if (jolt-fiber-park-handoff? f)
+            (let ((old-source (jolt-fiber-pending-wake-source f)))
+              (jolt-fiber-wake-pending?-set! f #t)
+              (jolt-fiber-pending-wake-source-set!
+                f (cond ((not old-source) source)
+                        ((eq? old-source source) source)
+                        (else 'multiple)))
+              (jolt-fiber-trace! f 'resume-pending 'parked 'parked #f #f
+                                 source))
+            (set! status
+                  (or (jolt-fiber-transition/status!
+                        f 'resume-ready 'ready source)
+                      (jolt-fiber-enqueue!/locked
+                        c f 'resume-enqueue source)))))
+      (jolt-unlock! (jolt-carrier-mu c))
+      (when status (jolt-fiber-invariant-raise! status)))))
+
 ;; (sa-fiber-resume f) -> void. Make a PARKED fiber runnable again. During the
 ;; park-to-scheduler handoff it records a pending wake; afterward it enqueues on
 ;; the fiber's own carrier, never another's. A no-op when the fiber is
@@ -801,19 +903,7 @@
 ;; holding it across the decision closes no cycle and costs an acquire the
 ;; enqueue was going to pay anyway.
 (define (sa-fiber-resume f)
-  (let ((c (jolt-fiber-carrier f)))
-    (jolt-lock! (jolt-carrier-mu c))
-    (let ((status
-           (and (eq? (jolt-fiber-state f) 'parked)
-                (if (jolt-fiber-park-handoff? f)
-                    (begin
-                      (jolt-fiber-wake-pending?-set! f #t)
-                      (jolt-fiber-trace! f 'resume-pending 'parked 'parked #f #f)
-                      #f)
-                    (or (jolt-fiber-transition/status! f 'resume-ready 'ready)
-                        (jolt-fiber-enqueue!/locked c f 'resume-enqueue))))))
-      (jolt-unlock! (jolt-carrier-mu c))
-      (when status (jolt-fiber-invariant-raise! status)))))
+  (jolt-fiber-resume/source f 'unspecified))
 
 ;; Called by the carrier only after a park/finish escape has returned to the
 ;; scheduler. It closes the pre-switch ownership window under the same queue
@@ -825,14 +915,23 @@
     (let ((status #f))
       (when (jolt-fiber-park-handoff? f)
         (jolt-fiber-park-handoff?-set! f #f)
+        (jolt-fiber-trace! f 'park-handoff-close
+                           (jolt-fiber-state f) (jolt-fiber-state f)
+                           (jolt-fiber-queued? f) (jolt-fiber-queued? f)
+                           (or (jolt-fiber-pending-wake-source f) 'unspecified))
         (when (jolt-fiber-wake-pending? f)
-          (jolt-fiber-wake-pending?-set! f #f)
-          (when (eq? (jolt-fiber-state f) 'parked)
-            (set! status
-                  (or (jolt-fiber-transition/status!
-                        f 'pending-resume-ready 'ready)
-                      (jolt-fiber-enqueue!/locked
-                        c f 'pending-resume-enqueue))))))
+          (let ((source (jolt-fiber-pending-wake-source f)))
+            (jolt-fiber-wake-pending?-set! f #f)
+            (jolt-fiber-pending-wake-source-set! f #f)
+            (if (eq? (jolt-fiber-state f) 'parked)
+                (set! status
+                      (or (jolt-fiber-transition/status!
+                            f 'pending-resume-ready 'ready source)
+                          (jolt-fiber-enqueue!/locked
+                            c f 'pending-resume-enqueue source)))
+                (jolt-fiber-trace! f 'pending-wake-drop
+                                   (jolt-fiber-state f) (jolt-fiber-state f)
+                                   #f #f source)))))
       (jolt-unlock! (jolt-carrier-mu c))
       (when status (jolt-fiber-invariant-raise! status)))))
 
@@ -851,7 +950,7 @@
               (make-jolt-dslice (jolt-slice-stack-param)
                                 (jolt-slice-ns-param)
                                 #f)
-              c #f '() 0 #f #f #f #f)))
+              c #f '() 0 #f #f #f #f #f)))
       (jolt-fiber-enqueue! c f 'spawn-enqueue)
       f)))
 
@@ -1022,8 +1121,9 @@
       ;;              because the commit did. So it escapes neither queued nor
       ;;              'parked, and sa-fiber-resume (which acts only on 'parked) is a
       ;;              silent no-op for the rest of the process.
-      ;;   'ready     the same window, one step later: the wake arrived first, so the
-      ;;              fiber is on the run queue AND still running. Enqueueing it
+      ;;   'ready     yield/preempt committed an enqueue and the switch has not
+      ;;              finished: the fiber is queued AND still executing toward
+      ;;              switch. Early park wakes now stay pending instead. Enqueueing it
       ;;              again is not a duplicate, it is a cycle — see
       ;;              jolt-fiber-enqueue!/locked, which writes f.next := f when f is
       ;;              the sole entry and leaves the carrier dispatching it forever.
@@ -1317,8 +1417,14 @@
         (let ((r (guard (e (#t (jolt-fiber-dead! f e)))
                     ((jolt-fiber-thunk f)))))
           (jolt-fiber-done! f r)))))
-    (else (error 'jolt-fiber-run "fiber in unexpected state"
-                 (jolt-fiber-state f)))))
+    (else
+     ;; Fail at dispatch with the same bounded metadata-only report used by
+     ;; queue/state invariants. In particular this classifies, but never
+     ;; retains or renders, a captured continuation or pending SM step.
+     (jolt-fiber-invariant-raise!
+       (jolt-fiber-invariant-status!
+         'dispatch f "fiber in unexpected state"
+         (or (jolt-fiber-pending-wake-source f) 'unspecified))))))
 
 ;; Completion paths: settle the fiber's payload, PUBLISH the terminal state
 ;; (jolt-fiber-finish!, which also runs the monitors), clear the current-fiber vreg

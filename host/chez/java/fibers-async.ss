@@ -129,7 +129,8 @@
 ;; async.ss (loaded before fibers.ss) never forward-references a fiber
 ;; primitive. Installed here, after both files are loaded; no channel op can
 ;; run before the boot finishes loading, so the hook is always live in use.
-(set! jolt-fiber-wake-fn sa-fiber-resume)
+(set! jolt-fiber-wake-fn
+  (lambda (f) (jolt-fiber-resume/source f 'async)))
 
 ;; --- R4: go on fibers, and alts! as a wait set (epic jolt-nvpr.5) -------------
 ;;
@@ -266,8 +267,8 @@
 ;; discipline is exactly the channel waiters':
 ;;   - the 'parked commit (fiber-park-commit!) and the wake's state read inside
 ;;     sa-fiber-resume are serialized by the CALLER's lock — for the poller
-;;     that is its table lock, a new leaf in the lock chain (nothing the
-;;     fiber-park path does takes the run-queue mutex; the poller's wake runs
+;;     that is its table lock, a new leaf in the lock chain (park commit takes
+;;     the carrier mutex last while the table lock is held; the poller's wake runs
 ;;     sa-fiber-resume AFTER releasing the table lock, so pm -> carrier-mu and
 ;;     the channel chain wmu -> carrier-mu share no cycle).
 ;;   - fiber-to-scheduler! runs OUTSIDE that lock (a fiber that parks holding
@@ -300,7 +301,8 @@
     (jolt-fiber-to-scheduler! (jolt-current-fiber))
     ;; balances fiber-park-commit!'s disable, on resume — see jolt-fiber-park!.
     (enable-interrupts)))
-(def-var! "jolt.host" "fiber-resume" sa-fiber-resume)
+(def-var! "jolt.host" "fiber-resume"
+  (lambda (f) (jolt-fiber-resume/source f 'poller)))
 ;; Unguarded full collect for the R8 gate: System/gc swallows Chez's
 ;; "cannot collect when multiple threads are active" refusal (the JVM-faithful
 ;; guarded no-op), but the gate must SEE that refusal when the poller's blocking
