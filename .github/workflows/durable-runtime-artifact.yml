@@ -1,0 +1,174 @@
+name: durable runtime artifact
+
+# This is a selected capability artifact, not the normal branch gate.
+# Changing this workflow does not change the compiler source built below.
+# The filtered canonical push produces an artifact after reviewed workflow
+# changes merge. Dispatch is available only when GitHub registers the workflow;
+# the fork's default branch is main, not integration/aspects.
+on:
+  push:
+    branches: [integration/aspects]
+    paths: [.github/workflows/durable-runtime-artifact.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: durable-runtime-artifact
+  cancel-in-progress: false
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      COMPILER_SOURCE: aea91781bbab68bf174fef4a689bb00dcf834ded
+      CHEZ: /opt/chez/bin/chez
+      JOLT_NO_USER_DEPS: "1"
+    defaults:
+      run:
+        shell: bash
+        working-directory: compiler
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: casselc/jolt
+          ref: aea91781bbab68bf174fef4a689bb00dcf834ded
+          path: compiler
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify selected source and recorded integration provenance
+        env:
+          ASPECT_INTEGRATION_REQUIRE: "1"
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$COMPILER_SOURCE"
+          test -z "$(git status --porcelain)"
+          bash test/aspect-integration-provenance-smoke.sh
+          bash test/aspect-integration-provenance-smoke.sh --check-upstream
+
+      # Same source-built PIC Chez setup as tests.yml, needed by build-lib-smoke.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev default-jdk rlwrap
+
+      - name: Cache Chez Scheme
+        id: cache-chez
+        uses: actions/cache@v4
+        with:
+          path: /opt/chez
+          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off-pic
+
+      - name: Build Chez Scheme from source
+        if: steps.cache-chez.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
+          cd /tmp/chez-src
+          ./configure --installprefix=/opt/chez --threads --disable-x11 CFLAGS+=-fPIC
+          make -j"$(nproc)"
+          sudo make install
+          sudo chown -R "$USER" /opt/chez
+
+      - name: Select and verify Chez 10.4.1
+        run: |
+          set -euo pipefail
+          printf '#!/bin/sh\nexec /opt/chez/bin/scheme "$@"\n' > /opt/chez/bin/chez
+          chmod +x /opt/chez/bin/chez
+          echo '/opt/chez/bin' >> "$GITHUB_PATH"
+          test "$(/opt/chez/bin/chez --version 2>&1)" = '10.4.1'
+
+      - name: Install Clojure certification oracle
+        run: |
+          set -euo pipefail
+          curl --fail --retry 5 --retry-delay 10 --retry-all-errors -L -o linux-install.sh \
+            https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+          head -1 linux-install.sh | grep -q '^#!'
+          sudo bash linux-install.sh
+          echo 'JAVA_CMD=/usr/lib/jvm/default-java/bin/java' >> "$GITHUB_ENV"
+          echo 'JAVA_HOME=/usr/lib/jvm/default-java' >> "$GITHUB_ENV"
+
+      - name: Full compiler gate and shared standalone build
+        env:
+          JOLT_REQUIRE_BUILDLIB: "1"
+        run: make CHEZ=/opt/chez/bin/chez -j"$(nproc)" -Oline test
+
+      - name: Require exact ranged-append capability
+        run: |
+          set -euo pipefail
+          timeout 30s target/release/jolt -Srepro -e '
+            (let [out (java.io.ByteArrayOutputStream.)
+                  writer (java.io.OutputStreamWriter. out "UTF-8")]
+              (.append writer "abc" 1 2)
+              (.flush writer)
+              (assert (= [98] (vec (.toByteArray out))))
+              (println :ranged-append-capability-pass))'
+
+      - name: Verify built source remains unchanged
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$COMPILER_SOURCE"
+          git diff --exit-code
+          git diff --cached --exit-code
+          # Build caches may be untracked; tracked source and submodule commits
+          # must still match the selected source, including nested modules.
+          submodules="$(git submodule status --recursive)"
+          if grep -E '^[+-U]' <<< "$submodules"; then exit 1; fi
+          git submodule foreach --recursive 'git diff --exit-code && git diff --cached --exit-code'
+
+      - name: Package binary and allowlisted build provenance
+        env:
+          WORKFLOW_SOURCE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p ../runtime-artifact
+          cp target/release/jolt ../runtime-artifact/jolt
+          {
+            printf 'schema=1\nrepository=casselc/jolt\n'
+            printf 'compiler_source=%s\n' "$COMPILER_SOURCE"
+            printf 'compiler_tree=%s\n' "$(git rev-parse HEAD^{tree})"
+            printf 'workflow_source=%s\n' "$WORKFLOW_SOURCE"
+            printf 'workflow_path=.github/workflows/durable-runtime-artifact.yml\n'
+            printf 'run_id=%s\nrun_attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'runner_os=%s\nrunner_arch=%s\nimage_os=%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "$ImageOS"
+            printf 'image_version=%s\n' "${ImageVersion:-unavailable}"
+            printf 'chez_version=%s\n' "$(/opt/chez/bin/chez --version 2>&1)"
+            printf 'chez_sha256=%s\n' "$(sha256sum /opt/chez/bin/scheme | cut -d ' ' -f 1)"
+            printf 'cc_version=%s\n' "$(cc --version | head -1)"
+            printf 'cc_sha256=%s\n' "$(sha256sum "$(readlink -f "$(command -v cc)")" | cut -d ' ' -f 1)"
+            printf 'build_command=make CHEZ=/opt/chez/bin/chez -j(nproc) -Oline test\n'
+            printf 'chez_configure=--threads --disable-x11 CFLAGS+=-fPIC\n'
+            printf 'require_buildlib=1\n'
+            printf 'binary_version=%s\n' "$(target/release/jolt --version)"
+            printf 'binary_sha256=%s\n' "$(sha256sum target/release/jolt | cut -d ' ' -f 1)"
+            printf 'gate=pass\nranged_append_ascii=98\n'
+            printf 'submodules_begin\n'
+            git submodule status --recursive
+            printf 'submodules_end\n'
+          } > ../runtime-artifact/build-manifest.txt
+          (cd ../runtime-artifact && sha256sum jolt build-manifest.txt > SHA256SUMS)
+
+      - name: Upload immutable capability runtime
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: durable-runtime-aea91781-linux-x64
+          path: runtime-artifact/
+          if-no-files-found: error
+          retention-days: 90
+
+      # Artifact availability is temporary, not a permanent fork release.
+      # Consumers must fail closed if this pinned artifact expires and rotate
+      # only after reviewing/qualifying a new run and digest. ZIP downloads lose
+      # executable mode: consumers verify bytes first, then chmod the binary.
+
+      - name: Record artifact identity for pinned consumers
+        env:
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.artifact.outputs.artifact-digest }}
+        run: |
+          printf 'Compiler source: `%s`\n\nWorkflow source: `%s`\n\nRun: `%s` attempt `%s`\n\nArtifact ID: `%s`\n\nArtifact SHA256: `%s`\n' \
+            "$COMPILER_SOURCE" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"

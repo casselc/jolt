@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A narrowly triggered capability-runtime artifact workflow builds one frozen,
+  reviewed compiler source with the full Chez 10.4.1 gate and checks byte-exact writer
+  ranges before publishing its binary and build provenance. Consumers can pin
+  the immutable artifact independently of the workflow revision; ordinary
+  branch tests still test their actual source unchanged. Artifact production
+  runs when reviewed workflow changes reach the canonical integration branch,
+  not for every compiler change.
+
 - An opt-in bounded Quint fiber-handoff specification separates park commitment,
   early wakes, carrier ownership, and pending publication. Deterministic scenarios
   and sampled checks include a deliberately broken early-enqueue control; these
