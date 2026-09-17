@@ -918,7 +918,7 @@
                   "java-string-hash" "java-symbol-hash"
                   "keyword-t-ns" "keyword-t-name"
                   "sb-append!" "sb-str" "sb-length" "sb-jhost?"
-                  "char-writer?" "cw-append-one!" "cw-append-range!"
+                  "char-writer?" "string-writer?" "cw-append-one!" "cw-append-range!"
                   "append-range-text" "sb-range-check" "jnum->exact" "render-piece" "->num"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
@@ -3138,9 +3138,11 @@
             kd (keyword-direct-emit m (count as) tt as)
             bd (sb-direct-emit m (count as) tt as)
             wd (cw-direct-emit m (count as) tt as)
+            ;; StringWriter shares APPEND only, never builder-only methods.
+            swd (when (= m "append") (sb-direct-emit m (count as) tt as))
             generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
                          " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
-        (if (or sd kd bd wd)
+        (if (or sd kd bd wd swd)
           (str "(let* ((" tt " " t ")"
                (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
                ") (cond"
@@ -3148,6 +3150,7 @@
                (when kd (str " ((keyword-t? " tt ") " kd ")"))
                (when bd (str " ((sb-jhost? " tt ") " bd ")"))
                (when wd (str " ((char-writer? " tt ") " wd ")"))
+               (when swd (str " ((string-writer? " tt ") " swd ")"))
                " (else " generic ")))")
           (str "(record-method-dispatch " t " " (chez-str-lit m)
                " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
