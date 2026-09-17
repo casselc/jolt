@@ -1,6 +1,6 @@
 name: durable runtime artifact
 
-# This is a selected capability artifact, not the normal branch gate.
+# These are selected, paired capability artifacts, not the normal branch gate.
 # Changing this workflow does not change the compiler source built below.
 # The filtered canonical push produces an artifact after reviewed workflow
 # changes merge. Dispatch is available only when GitHub registers the workflow;
@@ -20,10 +20,27 @@ concurrency:
 
 jobs:
   runtime:
+    name: runtime (${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      # Never run two full compiler gates concurrently or cancel the other
+      # source's evidence when one element fails.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include:
+          - label: baseline
+            compiler_source: 09a2baac9714f98b994473f64fd239f431a9fffb
+            compiler_tree: 4c2fb3c2b00fe085ce3920a1de558c65d3b8f979
+            artifact_name: durable-runtime-09a2baac-linux-x64
+          - label: string-writer
+            compiler_source: c5d444e4d074767f507fe86b203b6dde6c309fc5
+            compiler_tree: 555b5a9d9745be2a9f34041022c5376db5eb41f0
+            artifact_name: durable-runtime-c5d444e4-linux-x64
     env:
-      COMPILER_SOURCE: aea91781bbab68bf174fef4a689bb00dcf834ded
+      COMPILER_SOURCE: ${{ matrix.compiler_source }}
+      COMPILER_TREE: ${{ matrix.compiler_tree }}
       CHEZ: /opt/chez/bin/chez
       JOLT_NO_USER_DEPS: "1"
     defaults:
@@ -34,7 +51,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: casselc/jolt
-          ref: aea91781bbab68bf174fef4a689bb00dcf834ded
+          ref: ${{ matrix.compiler_source }}
           path: compiler
           fetch-depth: 0
           submodules: recursive
@@ -46,6 +63,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$COMPILER_SOURCE"
+          test "$(git rev-parse HEAD^{tree})" = "$COMPILER_TREE"
           test -z "$(git status --porcelain)"
           bash test/aspect-integration-provenance-smoke.sh
           bash test/aspect-integration-provenance-smoke.sh --check-upstream
@@ -111,6 +129,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$COMPILER_SOURCE"
+          test "$(git rev-parse HEAD^{tree})" = "$COMPILER_TREE"
           git diff --exit-code
           git diff --cached --exit-code
           # Build caches may be untracked; tracked source and submodule commits
@@ -155,7 +174,7 @@ jobs:
         id: artifact
         uses: actions/upload-artifact@v4
         with:
-          name: durable-runtime-aea91781-linux-x64
+          name: ${{ matrix.artifact_name }}
           path: runtime-artifact/
           if-no-files-found: error
           retention-days: 90
