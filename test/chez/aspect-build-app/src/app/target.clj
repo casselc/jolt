@@ -4,7 +4,13 @@
   (println (str "operation " x))
   (if (= x "throw")
     (throw (ex-info "application failure" {:kind :application}))
-    (str x "!")))
+    (let [^Appendable writer (java.io.StringWriter.)
+          text (str x "!")]
+      ;; Existing plain/woven/control/multi-provider expectations stay identical.
+      ;; Both append overloads execute INSIDE the selected operation/proceed.
+      (.append writer text 0 (count text))
+      (.append writer "")
+      (.toString writer))))
 
 (defn ^{:jolt.aspects/id :test/callback-entry
         :jolt.aspects/role :test/entry-around}

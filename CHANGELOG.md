@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Compile both `StringWriter.append` overloads through an exact-receiver guarded
+  direct arm, preserving fluent return identity, argument evaluation order,
+  Unicode and existing invalid-range behavior. Other receivers and methods retain
+  generic dispatch; selected aspect advice remains intact. Re-minted Chez and
+  cross-minted Gambit seeds include the updated compiler lowering.
 - Fiber condition-variable wakes that arrive after a park commit but before
   control returns to the carrier now remain pending until the carrier owns the
   parked fiber. The carrier then performs the `parked` to `ready` enqueue once,
