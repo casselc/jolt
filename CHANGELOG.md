@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Produce a serial pair of immutable hosted compiler artifacts for the reviewed
+  pre-StringWriter baseline and StringWriter integration source. Each retains
+  full compiler, standalone-library, seed fixed-point and provenance gates.
+  This enables matched qualification; it does not repin consumers or claim a
+  measured performance improvement.
+
 - A narrowly triggered capability-runtime artifact workflow builds one frozen,
   reviewed compiler source with the full Chez 10.4.1 gate and checks byte-exact writer
   ranges before publishing its binary and build provenance. Consumers can pin
