@@ -43,6 +43,14 @@ jobs:
             compiler_source: 1326bf5dddfe5a55b91420f2016ccbbcea7de422
             compiler_tree: 4076427391d1d0f78530f61b320c3f638eff629d
             artifact_name: durable-runtime-1326bf5d-linux-x64
+          # This source contains the direct hinted-short-array read lowering.
+          # Keep it a separate immutable capability artifact so downstream
+          # JSON benchmarks can prove that their decoder hint is executable,
+          # rather than merely resolved in source.
+          - label: shorts-aget-direct
+            compiler_source: bf8a5dde7bebb5658d218e9757ab1df0aa9c3b95
+            compiler_tree: 206fe5b4e539dc26ea5a8665aee3bb4ca7943834
+            artifact_name: durable-runtime-bf8a5dde-linux-x64
     env:
       COMPILER_SOURCE: ${{ matrix.compiler_source }}
       COMPILER_TREE: ${{ matrix.compiler_tree }}

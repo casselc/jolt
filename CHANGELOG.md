@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add an immutable capability-runtime artifact for the reviewed
+  `bf8a5dde` direct hinted-short-array read lowering. Downstream consumers may
+  use its provenance to qualify a separately tested decoder optimization; the
+  artifact itself makes no JSON or Durable throughput claim.
 - Retain the historical paired compiler artifacts and add a fixed option-aware
   build artifact from the reviewed CLI integration source. Its explicit
   `-Srepro build` check runs the generated image and rejects matching output
