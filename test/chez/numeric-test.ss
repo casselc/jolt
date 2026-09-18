@@ -25,6 +25,18 @@
       (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
 (define (ev s) (jolt-compile-eval s "u"))
 
+;; A `^shorts` receiver is an array hint, not a scalar `^short` hint.  short[]
+;; shares jolt-vaget's existing backing-dispatch contract with int[]/long[]:
+;; its elements may come from an old boxed image or its current fxvector backing,
+;; so the result deliberately does not acquire a numeric result kind.
+(let ((e (emitf "u" "(fn* ([^shorts a ^long i] (aget a i)))")))
+  (ok "^shorts aget lowers to jolt-vaget" (has? e "(jolt-vaget a i)"))
+  (ok "^shorts aget does not retain generic jolt-nth" (not (has? e "(jolt-nth"))))
+;; A scalar short hint cannot assert that a receiver is short[].  It must not
+;; accidentally select the array helper merely because its spelling shares a root.
+(let ((e (emitf "u" "(fn* ([^short a i] (aget a i)))")))
+  (ok "^short scalar hint does not select jolt-vaget" (not (has? e "(jolt-vaget"))))
+
 ;; --- emission: ^double -> fl-ops, ^long -> long-ops ---
 (let ((e (emitf "u" "(fn* ([^double a ^double b] (+ (* a a) (* b b))))")))
   (ok "double + lowers to fl+" (has? e "(#3%fl+"))

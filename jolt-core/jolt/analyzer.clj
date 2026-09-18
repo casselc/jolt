@@ -280,13 +280,13 @@
 ;;   :doubles  the UNBOXED flvector-ref/-set! path — a double/float array's backing
 ;;             is a Chez flvector, so an element reads back a proven :double.
 ;;             floats share the flvector kind.
-;;   :longs :ints :bytes :objects
+;;   :longs :ints :shorts :bytes :objects
 ;;             the kind's own backing (fxvector/bytevector/vector) read direct, but
 ;;             no result type (it can widen past a fixnum) and no jolt-nth walk.
 (defn- tag->akind [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
     (cond (= s "doubles") :doubles (= s "floats") :doubles
-          (= s "longs") :longs (= s "ints") :ints
+          (= s "longs") :longs (= s "ints") :ints (= s "shorts") :shorts
           (= s "bytes") :bytes (= s "objects") :objects
           :else nil)))
 (defn- ahint-of [ctx sym]
@@ -304,7 +304,7 @@
 ;; be defined later or in another namespace, so "unknown here" is not "wrong".
 (def ^:private inert-prim-tags
   #{"float" "boolean" "char" "byte" "short"
-    "chars" "booleans" "shorts"})
+    "chars" "booleans"})
 (defn- dead-hint-of [ctx sym]
   (let [m (form-sym-meta sym)
         t (when m (get m :tag))
@@ -567,7 +567,7 @@
         arity (if (seq (:phints pp)) (assoc arity :phints (:phints pp)) arity)
         ;; numeric param hints (name -> :long/:double) for jolt.passes.numeric.
         arity (if (seq (:nhints pp)) (assoc arity :nhints (:nhints pp)) arity)
-        ;; array param hints (name -> :doubles/:longs/:ints/:bytes/:objects) for
+        ;; array param hints (name -> :doubles/:longs/:ints/:shorts/:bytes/:objects) for
         ;; jolt.passes.numeric: aget/aset over them lower to the unboxed flvector
         ;; path (:doubles) or the boxed-vector one (the rest).
         arity (if (seq (:ahints pp)) (assoc arity :ahints (:ahints pp)) arity)
