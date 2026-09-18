@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Retain the historical paired compiler artifacts and add a fixed option-aware
+  build artifact from the reviewed CLI integration source. Its explicit
+  `-Srepro build` check runs the generated image and rejects matching output
+  with exit7 using the same acceptance predicate. Full compiler, PIC library,
+  seed and provenance gates remain mandatory; no consumer repin or performance
+  qualification is implied.
 - Produce a serial pair of immutable hosted compiler artifacts for the reviewed
   pre-StringWriter baseline and StringWriter integration source. Each retains
   full compiler, standalone-library, seed fixed-point and provenance gates.
