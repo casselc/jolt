@@ -379,9 +379,14 @@
   (cond
     ((null? args) #f)
     ((string=? (car args) "build") #t)
-    ((string=? (car args) "-Sdeps")
+    ;; These exact context flags redispatch without consuming an operand.
+    ((member (car args) '("-Srepro" "-Sverbose" "-Sforce"))
+     (jolt-cli-build-cmd? (cdr args)))
+    ;; Never scan an operand as a command, or cddr a missing operand.
+    ((member (car args) '("-Sdeps" "-Scp" "-Sthreads"))
      (and (pair? (cdr args)) (jolt-cli-build-cmd? (cddr args))))
-    ((and (>= (string-length (car args)) 2) (string=? (substring (car args) 0 2) "-A"))
+    ((and (>= (string-length (car args)) 2)
+          (member (substring (car args) 0 2) '("-A" "-J")))
      (jolt-cli-build-cmd? (cdr args)))
     (else #f)))
 

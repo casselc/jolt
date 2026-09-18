@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Prepare the standalone build driver behind supported context flags, including
+  `-Srepro`, `-Sverbose`, `-Sforce`, `-Scp`, `-Sthreads`, dependency/alias options,
+  and ignored `-J` compatibility tokens. Non-build commands avoid loading the
+  driver, and option operands remain distinct from commands. Nested `-M`
+  main-options builds remain a separate, unqualified case.
 - Compile both `StringWriter.append` overloads through an exact-receiver guarded
   direct arm, preserving fluent return identity, argument evaluation order,
   Unicode and existing invalid-range behavior. Other receivers and methods retain

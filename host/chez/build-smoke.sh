@@ -1062,6 +1062,58 @@ if ! JOLT_PWD="$app" "$jolt" -Sdeps '{}' build -m app.core -o "$sdeps_out" >/dev
 fi
 [ -x "$sdeps_out" ] || { echo "  FAIL: \`-Sdeps '{}' build\` produced no executable"; exit 1; }
 
+# The host scanner and jolt.main must agree about global option boundaries.
+# Exercise real build+execute through the selected standalone and uncached
+# checkout driver, not only a predicate mock. The old scanner fails at the
+# first -Srepro case with an unbound jolt.host/build-binary.
+scanner_deps='{:aliases {:scanner {}} :scanner/command "build"}'
+scanner_cp="$app/src:$app/src-provider:$app/resources"
+scanner_image_ok() {
+  [ "$1" = 0 ] && [ "$2" = "$want" ]
+}
+# Causal exit-status control: identical expected output cannot mask exit 7.
+scanner_bad_got="$(sh -c 'printf "%s\n" "$1"; exit 7' scanner-control "$want")"
+scanner_bad_exit=$?
+[ "$scanner_bad_exit" = 7 ] && ! scanner_image_ok "$scanner_bad_exit" "$scanner_bad_got" || { echo "  FAIL: option scanner accepted nonzero image exit"; exit 1; }
+for scanner_driver in "$jolt" bin/jolt; do
+  for scanner_order in bare deps alias repro verbose force threads cp jvm combined reordered; do
+    case "$scanner_order" in
+      bare) set -- ;;
+      deps) set -- -Sdeps "$scanner_deps" ;;
+      alias) set -- -Sdeps "$scanner_deps" -A:scanner ;;
+      repro) set -- -Srepro ;;
+      verbose) set -- -Sverbose ;;
+      force) set -- -Sforce ;;
+      threads) set -- -Sthreads 1 ;;
+      cp) set -- -Scp "$scanner_cp" ;;
+      jvm) set -- -J-Xmx64m ;;
+      combined) set -- -Srepro -Sforce -Sthreads 1 -Scp "$scanner_cp" -Sdeps "$scanner_deps" -A:scanner -J-Xmx64m ;;
+      reordered) set -- -Sdeps "$scanner_deps" -A:scanner -Scp "$scanner_cp" -J-Xmx64m -Sthreads 1 -Sforce -Srepro ;;
+    esac
+    scanner_out="$(dirname "$out")/scanner-$scanner_order-bin"
+    echo "build smoke: option scanner $scanner_driver $scanner_order"
+    if ! JOLT_NO_DEVCACHE=1 JOLT_PWD="$app" "$scanner_driver" "$@" build -m app.core -o "$scanner_out" >"$scanner_out.log" 2>&1; then
+      echo "  FAIL: option scanner build $scanner_order"; exit 1
+    fi
+    [ -x "$scanner_out" ] || { echo "  FAIL: option scanner produced no image"; exit 1; }
+    scanner_got="$(cd / && "$scanner_out" alpha bb ccc 2>&1)"
+    scanner_run_exit=$?
+    scanner_image_ok "$scanner_run_exit" "$scanner_got" || { echo "  FAIL: option scanner image exit/output"; exit 1; }
+  done
+  # Look up an optional driver var without compiling a reference to a var
+  # that legitimately does not exist. Absence and an unbound var both mean no
+  # prepared driver. A real bound sentinel must fail the SAME predicate.
+  # Keep these tiny receipts outside the broad smoke's success/failure cleanup.
+  scanner_control_root="$(mktemp -d /tmp/jolt-build-scanner-control.XXXXXXXX)" || exit 1
+  JOLT_NO_DEVCACHE=1 JOLT_PWD="$app" "$scanner_driver" -Srepro -Sforce -Sthreads build -Scp "$scanner_cp" -Sdeps "$scanner_deps" -A:scanner -J-Xmx64m -e '(defn scanner-no-driver? [v] (or (nil? v) (not (bound? v)))) (def scanner-bound-sentinel :sentinel) (when (scanner-no-driver? (ns-resolve *ns* (quote scanner-bound-sentinel))) (System/exit 1)) (println :build-scanner-bound-sentinel-rejected) (let [host (find-ns (quote jolt.host)) v (when host (ns-resolve host (quote build-binary)))] (when-not (scanner-no-driver? v) (System/exit 1))) (println :build-scanner-nonbuild)' > "$scanner_control_root/stdout" 2> "$scanner_control_root/stderr"
+  scanner_nonbuild_exit=$?
+  printf '%s\n' "$scanner_nonbuild_exit" > "$scanner_control_root/child.exit"
+  echo "build smoke: scanner control receipt $scanner_control_root"
+  [ "$scanner_nonbuild_exit" = 0 ] && [ "$(grep -Fxc ':build-scanner-bound-sentinel-rejected' "$scanner_control_root/stdout")" = 1 ] && [ "$(grep -Fxc ':build-scanner-nonbuild' "$scanner_control_root/stdout")" = 1 ] || { echo "  FAIL: option scanner non-build/operand boundary"; exit 1; }
+done
+# -M may select :main-opts and is not a simple host-level prefix. Its nested
+# build behavior is a separate unqualified gate, not covered by this matrix.
+
 # Everything above builds through $jolt, which the make target points at the
 # prebuilt binary. Build through bin/jolt too, so the driver a developer actually
 # runs stays gated here and not only as a side effect of devbootsmoke's
