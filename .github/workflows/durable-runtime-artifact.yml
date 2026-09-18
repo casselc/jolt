@@ -1,6 +1,7 @@
 name: durable runtime artifact
 
-# These are selected, paired capability artifacts, not the normal branch gate.
+# These are selected capability artifacts, not the normal branch gate. Historical
+# paired baseline/StringWriter records remain unchanged beside the option-aware arm.
 # Changing this workflow does not change the compiler source built below.
 # The filtered canonical push produces an artifact after reviewed workflow
 # changes merge. Dispatch is available only when GitHub registers the workflow;
@@ -38,6 +39,10 @@ jobs:
             compiler_source: c5d444e4d074767f507fe86b203b6dde6c309fc5
             compiler_tree: 555b5a9d9745be2a9f34041022c5376db5eb41f0
             artifact_name: durable-runtime-c5d444e4-linux-x64
+          - label: option-aware-build
+            compiler_source: 1326bf5dddfe5a55b91420f2016ccbbcea7de422
+            compiler_tree: 4076427391d1d0f78530f61b320c3f638eff629d
+            artifact_name: durable-runtime-1326bf5d-linux-x64
     env:
       COMPILER_SOURCE: ${{ matrix.compiler_source }}
       COMPILER_TREE: ${{ matrix.compiler_tree }}
@@ -125,6 +130,47 @@ jobs:
               (assert (= [98] (vec (.toByteArray out))))
               (println :ranged-append-capability-pass))'
 
+      - name: Require option-aware standalone AOT capability
+        if: matrix.label == 'option-aware-build'
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          mkdir "$work/src" "$work/cache"
+          mkdir "$work/src/option_aware"
+          printf '{:paths ["src"]}\n' > "$work/deps.edn"
+          printf '%s\n' '(ns option-aware.core)' \
+            '(defn -main [& args] (println "option-aware-aot-ok") (System/exit (if (seq args) 7 0)))' \
+            > "$work/src/option_aware/core.clj"
+          set +e
+          JOLT_PWD="$work" JOLT_CACHE_DIR="$work/cache" JOLT_NO_DEVCACHE=1 \
+            timeout --kill-after=5s 180s target/release/jolt -Srepro build \
+            -m option-aware.core -o "$work/app" > "$work/build.stdout" 2> "$work/build.stderr"
+          build_rc=$?
+          set -e
+          test "$build_rc" = 0
+          test -f "$work/app" && test -x "$work/app"
+          printf 'option-aware-aot-ok\n' > "$work/want"
+          image_accepted() {
+            test "$1" = 0 && cmp -s "$work/want" "$2" && test ! -s "$3"
+          }
+          set +e
+          timeout --kill-after=5s 30s "$work/app" > "$work/image.stdout" 2> "$work/image.stderr"
+          image_rc=$?
+          timeout --kill-after=5s 30s "$work/app" --wrong-exit \
+            > "$work/control.stdout" 2> "$work/control.stderr"
+          control_rc=$?
+          set -e
+          image_accepted "$image_rc" "$work/image.stdout" "$work/image.stderr"
+          test "$control_rc" = 7
+          cmp -s "$work/want" "$work/control.stdout"
+          test ! -s "$work/control.stderr"
+          if image_accepted "$control_rc" "$work/control.stdout" "$work/control.stderr"; then
+            echo 'FAIL: option-aware AOT oracle accepted the same output with exit7' >&2
+            exit 1
+          fi
+          printf ':option-aware-aot-capability-pass build0 image0 same-output-control7-rejected\n'
+
       - name: Verify built source remains unchanged
         run: |
           set -euo pipefail
@@ -164,6 +210,9 @@ jobs:
             printf 'binary_version=%s\n' "$(target/release/jolt --version)"
             printf 'binary_sha256=%s\n' "$(sha256sum target/release/jolt | cut -d ' ' -f 1)"
             printf 'gate=pass\nranged_append_ascii=98\n'
+            if [ '${{ matrix.label }}' = option-aware-build ]; then
+              printf 'option_repro_build=pass\noption_repro_image=pass\noption_repro_wrong_exit=7\n'
+            fi
             printf 'submodules_begin\n'
             git submodule status --recursive
             printf 'submodules_end\n'
