@@ -81,6 +81,21 @@
     "(let [a (long-array 2)] (aset a 1 Long/MAX_VALUE) ((fn [^longs x ^long i] (aget x i)) a 1))"
     "9223372036854775807")
 
+;; --- hinted short reads are observationally the generic read ----------------
+;; `jolt-vaget` dispatches on the backing rather than trusting the tag.  These
+;; rows make the newly admitted ^shorts spelling prove that promise: signed
+;; limits, non-fixnum indexes, bounds faults and a lying hint all retain the
+;; generic aget result or exception class.
+(is "hinted short reads retain signed limits and fractional index coercion"
+    "(let [a (short-array [-32768 -1 0 32767]) plain (fn [i] (aget a i)) hinted (fn [^shorts x i] (aget x i))] [(mapv plain [0 1 3 2.9]) (mapv #(hinted a %) [0 1 3 2.9])])"
+    "[[-32768 -1 32767 0] [-32768 -1 32767 0]]")
+(is "hinted short reads match generic exception classes"
+    "(let [a (short-array [7]) observe (fn [f i] (try [:value (f i)] (catch Throwable e [:throws (.getSimpleName (class e))]))) plain (fn [i] (aget a i)) hinted (fn [i] ((fn [^shorts x j] (aget x j)) a i))] [(mapv #(observe plain %) [-1 1 nil (*' Long/MAX_VALUE 2)]) (mapv #(observe hinted %) [-1 1 nil (*' Long/MAX_VALUE 2)])])"
+    "[[[:throws ArrayIndexOutOfBoundsException] [:throws ArrayIndexOutOfBoundsException] [:throws NullPointerException] [:throws ArrayIndexOutOfBoundsException]] [[:throws ArrayIndexOutOfBoundsException] [:throws ArrayIndexOutOfBoundsException] [:throws NullPointerException] [:throws ArrayIndexOutOfBoundsException]]]")
+(is "a lying short-array hint still reads the receiver's real backing"
+    "(let [plain (fn [a] (aget a 1)) hinted (fn [^shorts a] (aget a 1))] [[(plain (long-array [3 9])) (hinted (long-array [3 9]))] [(plain (object-array [:a :b])) (hinted (object-array [:a :b]))]])"
+    "[[9 9] [:b :b]]")
+
 ;; --- a BOXED array of a typed kind (what a pre-backings image restores) -------
 ;; Built here the way the fasl reader would hand one back: the record with a
 ;; plain vector in it. Nothing may notice.

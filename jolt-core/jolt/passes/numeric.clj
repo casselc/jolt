@@ -86,7 +86,7 @@
 ;; whose flvector the :fl-aget/:fl-aset path unboxes AND types. :bytes reads here
 ;; but writes through jolt-baset, which owns the signed-8-bit narrowing (see the
 ;; aset clauses in an-invoke).
-(def ^:private boxed-akinds #{:longs :ints :bytes :objects})
+(def ^:private boxed-akinds #{:longs :ints :shorts :bytes :objects})
 (def ^:private boxed-aset-kinds #{:longs :ints :objects})
 
 ;; --- operand classification -------------------------------------------------
@@ -268,7 +268,7 @@
                    (or (= ikind :long)
                        (and (int-lit? inode) (fixnum-lit? (get inode :val))))
                    (assoc :fl-idx-long true))])
-      ;; (aget ^longs/^ints/^bytes/^objects a i) -> the direct backing read
+      ;; (aget ^longs/^ints/^shorts/^bytes/^objects a i) -> the direct backing read
       ;; (jolt-vaget), skipping jolt-nth's index nil-check, coercion and
       ;; pvec/string/cseq/record dispatch walk. NO result kind: an int/long array
       ;; widens past the fixnum range, so an element is not provably a fixnum.

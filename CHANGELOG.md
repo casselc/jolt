@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Truthfully hinted `(aget ^shorts a i)` now uses the existing direct array-read
+  helper, avoiding generic collection dispatch while retaining the ordinary
+  backing, index-coercion, and exception behavior. A scalar `^short` hint still
+  does not imply a short-array receiver.
 - Prepare the standalone build driver behind supported context flags, including
   `-Srepro`, `-Sverbose`, `-Sforce`, `-Scp`, `-Sthreads`, dependency/alias options,
   and ignored `-J` compatibility tokens. Non-build commands avoid loading the

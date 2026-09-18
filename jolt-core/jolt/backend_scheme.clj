@@ -2725,7 +2725,7 @@
                     (or hv (str "(jolt-array-vec " (first as) ")"))
                     " " (second as) " " v ") " v ")"))
              (str "(jolt-flaset " (str/join " " as) ")")))))
-      ;; (aget ^longs/^ints/^bytes/^objects a i) and its aset twin. A boxed backing
+      ;; (aget ^longs/^ints/^shorts/^bytes/^objects a i) and its aset twin. A boxed backing
       ;; cannot unbox, so there is no inline form and no hoisted vector — the win is
       ;; skipping jolt-nth's dispatch walk, which the call already gets.
       (:v-aget node) (order-args (fn [as] (str "(jolt-vaget " (str/join " " as) ")")))
