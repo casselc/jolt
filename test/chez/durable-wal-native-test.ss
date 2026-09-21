@@ -27,13 +27,17 @@
             ((string=? (substring s i (+ i m)) sub) #t)
             (else (loop (+ i 1)))))))
 
-(ok "compiler lowers a proven String host-call directly"
-    ;; The analyzer separately owns the proof that stamps :target-type :str.
-    ;; This test deliberately checks only that typed String calls select the
-    ;; private primitive; generic record-method dispatch remains unmodified.
-    (let ((backend (read-file-string "jolt-core/jolt/backend_scheme.clj")))
-      (and (contains? backend "(= m \"toDurableWalBytes\")")
-           (contains? backend "(jolt-str-durable-wal-bytes "))))
+(define (emit-source source)
+  (let-values (((f j) (rdr-read-form source 0 (string-length source))))
+    (ei-compile-form (make-analyze-ctx "user") f #f)))
+
+(ok "compiler lowers a proven String receiver directly"
+    (contains? (emit-source "(.toDurableWalBytes \"x\")")
+               "(jolt-str-durable-wal-bytes \"x\")"))
+(ok "unproven receiver retains ordinary dispatch"
+    (let ((emitted (emit-source "((fn [x] (.toDurableWalBytes x)) \"x\")")))
+      (and (contains? emitted "record-method-dispatch")
+           (not (contains? emitted "jolt-str-durable-wal-bytes")))))
 (ok "empty SQL has exact framing"
     (equal? (durable-bytes "") (ascii "{\"sql\":\"\"}\n")))
 (ok "quote slash and backslash use canonical short escapes"

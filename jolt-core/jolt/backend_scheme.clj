@@ -3140,7 +3140,14 @@
       chez?
       (let [tt (fresh-label "_ht$")
             as (mapv (fn [_] (fresh-label "_ha$")) args)
-            sd (string-direct-emit m (count as) tt as)
+            ;; Durable WAL bytes are deliberately unlike the ordinary String
+            ;; methods in this table: they are a private compiler/runtime
+            ;; capability, not a method dynamically available on every runtime
+            ;; String.  Only the proven :target-type :str arm above may lower
+            ;; it.  Keep unproven receivers on record-method-dispatch so a
+            ;; consumer must explicitly select this compiler pair.
+            sd (when (not= m "toDurableWalBytes")
+                 (string-direct-emit m (count as) tt as))
             kd (keyword-direct-emit m (count as) tt as)
             bd (sb-direct-emit m (count as) tt as)
             wd (cw-direct-emit m (count as) tt as)
