@@ -112,6 +112,12 @@
       (= m "getBytes")             (cond (= argc 0) (str "(jolt-str-get-bytes " t " \"utf-8\")")
                                          (= argc 1) (str "(jolt-str-get-bytes " t " " a0 ")")
                                          :else nil)
+      ;; Narrow, internal Durable V1 record encoder.  It only lowers after the
+      ;; compiler has proven the receiver is String; otherwise normal dispatch
+      ;; remains intact.  Consumers capability-gate this compiler/runtime pair
+      ;; and retain their portable data.json path when it is unavailable.
+      (= m "toDurableWalBytes")     (when (= argc 0)
+                                      (str "(jolt-str-durable-wal-bytes " t ")"))
       (= m "matches")              (when (= argc 1) (str "(jolt-str-matches? " t " " a0 ")"))
       (= m "replaceAll")           (when (= argc 2) (str "(jolt-str-replace-all " t " " a0 " " a1 ")"))
       (= m "replaceFirst")         (when (= argc 2) (str "(jolt-str-replace-first " t " " a0 " " a1 ")"))

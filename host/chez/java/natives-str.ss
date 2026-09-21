@@ -412,6 +412,51 @@
 (define (jolt-str-strip s left? right?) (str-strip s left? right?))
 (define (jolt-str-to-char-array s) (na-char-array s))
 (define (jolt-str-get-bytes s cs) (na-byte-array (charset-encode-bv s cs)))
+
+;; Private compiler primitive for the Durable V1 one-field WAL record.  Its
+;; output is exactly {"sql":<JSON string>} followed by LF.  Keep this narrow:
+;; it is neither a public String method contract nor a generic JSON encoder.
+;; The Durable release oracle fixes the emitted spelling: short JSON escapes,
+;; lowercase \u hex, escaped slash, and surrogate-pair spelling for astral
+;; scalar values.  The portable data.json path remains the fallback selected
+;; by consumers that have not explicitly capability-gated this compiler pair.
+(define durable-wal-prefix (bytevector #x7b #x22 #x73 #x71 #x6c #x22 #x3a #x22))
+(define durable-wal-suffix (bytevector #x22 #x7d #x0a))
+
+(define (durable-wal-put-hex4! port n)
+  (define (hex-digit x) (if (< x 10) (+ 48 x) (+ 87 x)))
+  (put-u8 port 92) (put-u8 port 117)
+  (put-u8 port (hex-digit (bitwise-and (bitwise-arithmetic-shift-right n 12) #xf)))
+  (put-u8 port (hex-digit (bitwise-and (bitwise-arithmetic-shift-right n 8) #xf)))
+  (put-u8 port (hex-digit (bitwise-and (bitwise-arithmetic-shift-right n 4) #xf)))
+  (put-u8 port (hex-digit (bitwise-and n #xf))))
+
+(define (jolt-str-durable-wal-bytes s)
+  (call-with-values open-bytevector-output-port
+    (lambda (port extract)
+      (put-bytevector port durable-wal-prefix)
+      (let loop ((i 0) (n (string-length s)))
+        (unless (= i n)
+          (let ((cp (char->integer (string-ref s i))))
+            (cond
+              ((= cp 34) (put-bytevector port (bytevector 92 34)))
+              ((= cp 92) (put-bytevector port (bytevector 92 92)))
+              ((= cp 47) (put-bytevector port (bytevector 92 47)))
+              ((= cp 8)  (put-bytevector port (bytevector 92 98)))
+              ((= cp 12) (put-bytevector port (bytevector 92 102)))
+              ((= cp 10) (put-bytevector port (bytevector 92 110)))
+              ((= cp 13) (put-bytevector port (bytevector 92 114)))
+              ((= cp 9)  (put-bytevector port (bytevector 92 116)))
+              ((or (< cp 32) (>= cp 128))
+               (if (<= cp #xffff)
+                   (durable-wal-put-hex4! port cp)
+                   (let ((supplementary (- cp #x10000)))
+                     (durable-wal-put-hex4! port (+ #xd800 (quotient supplementary #x400)))
+                     (durable-wal-put-hex4! port (+ #xdc00 (modulo supplementary #x400))))))
+              (else (put-u8 port cp)))
+            (loop (+ i 1) n))))
+      (put-bytevector port durable-wal-suffix)
+      (na-byte-array (extract)))))
 (define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
 (define (jolt-str-replace-all s pat repl) (irregex-replace/all (str-irx pat) s repl))
 (define (jolt-str-replace-first s pat repl) (irregex-replace (str-irx pat) s repl))
