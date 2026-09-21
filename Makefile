@@ -96,7 +96,7 @@ export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke effects \
+  aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke durablewalnative effects \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling lazyscaling stringscancorpus stringscanbench \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
@@ -116,6 +116,11 @@ JOLT-TARGETS-NEEDING-DEPS := \
         fibersresidue
 
 default:: build
+
+# Narrow compiler/runtime contract for the private Durable V1 WAL byte primitive.
+# It is deliberately not part of the generic JSON conformance surface.
+durablewalnative:
+	@$(CHEZ) --script test/chez/durable-wal-native-test.ss
 
 # Honor an explicit Chez or install the pinned toolchain, initialize every
 # vendored dependency, and enforce Jolt's threaded-runtime requirement.
