@@ -174,6 +174,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that caller alone. Verified by mutation: dropping either declaration bails
   the shaking fixture. `run-dce-refs.ss` pins the semantics on a synthetic
   graph, including that an unreachable allowed def is still pruned. (#890)
+### Performance
+
+- A private, compiler-gated Durable WAL byte primitive can emit the fixed V1
+  `{"sql": ...}\n` record without intermediate string rendering. It is selected
+  only for capability-selected calls whose receiver the compiler has proven is
+  a `String`; ordinary or unproven dispatch is unchanged, and portable
+  `data.json` encoding remains the fallback.
 
 ### Changed
 
