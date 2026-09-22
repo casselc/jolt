@@ -193,6 +193,23 @@
       (= m "charAt")    (when (= argc 1) (str "(string-ref (sb-str " t ") (jolt->idx " a0 "))"))
       :else nil)))
 
+;; clojure.data.json's public write-str creates a concrete StringWriter, then
+;; passes it to JSONWriter helpers as ^Appendable. The interface annotation is
+;; correct: callers may supply an arbitrary Appendable. On Chez the usual
+;; concrete receiver is nevertheless the `writer` jhost, so the unproven
+;; receiver path below guards this lowering at runtime and otherwise keeps the
+;; ordinary record-method dispatch.
+(defn- string-writer-direct-emit [m argc t args]
+  (let [a0 (first args) a1 (second args) a2 (nth args 2 nil)]
+    (cond
+      (= m "append")
+      (case argc
+        1 (str "(begin (sb-append! " t " (append-text " a0 " '())) " t ")")
+        3 (str "(begin (sb-append! " t " (append-text " a0 " (jolt-list " a1 " " a2 "))) " t ")")
+        nil)
+      (= m "toString") (when (= argc 0) (str "(sb-str " t ")"))
+      :else nil)))
+
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
 ;; state — the mode flags, the direct-link name registries, the record-ctor shape
 ;; registry, the gensym counter and the per-site cache cells — lives on it, read
@@ -903,8 +920,9 @@
                   ;; record/reify protocol-method dispatch (:host-call fallback
                   ;; for any .method not in supported-host-methods).
                   "record-method-dispatch"
-                  ;; proven-target interop natives (string-direct-emit,
-                  ;; keyword-direct-emit, sb-direct-emit). These are bare heads a
+                  ;; direct interop natives (string-direct-emit,
+                  ;; keyword-direct-emit, sb-direct-emit, string-writer-direct-emit).
+                  ;; These are bare heads a
                   ;; user local could shadow and the "jolt-" prefix net does not
                   ;; catch them, so they are enumerated per the invariant above:
                   ;; (let [str-trim (fn [_] :shadowed)] (.trim ^String s)) would
@@ -913,7 +931,8 @@
                   "str-index-of" "str-index-of-any" "str-replace-literal"
                   "java-string-hash" "java-symbol-hash"
                   "keyword-t-ns" "keyword-t-name"
-                  "sb-append!" "sb-str" "sb-length" "sb-piece" "->num"
+                  "sb-append!" "sb-str" "sb-length" "sb-piece"
+                  "append-text" "string-writer?" "->num"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
                   ;; devirt cached-desc lookup (emit-invoke ctor inlining).
@@ -3258,14 +3277,16 @@
             as (mapv (fn [_] (fresh-label "_ha$")) args)
             sd (string-direct-emit m (count as) tt as)
             kd (keyword-direct-emit m (count as) tt as)
+            wd (string-writer-direct-emit m (count as) tt as)
             generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
                          " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
-        (if (or sd kd)
+        (if (or sd kd wd)
           (str "(let* ((" tt " " t ")"
                (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
                ") (cond"
                (when sd (str " ((string? " tt ") " sd ")"))
                (when kd (str " ((keyword-t? " tt ") " kd ")"))
+               (when wd (str " ((string-writer? " tt ") " wd ")"))
                " (else " generic ")))")
           (str "(record-method-dispatch " t " " (chez-str-lit m)
                " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))

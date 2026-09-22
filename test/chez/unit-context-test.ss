@@ -78,6 +78,16 @@
       (ok "per-unit gensym: the emitted form actually uses a gensym label"
           (contains? ea "fnrec1")))))
 
+;; An Appendable-typed StringWriter is deliberately unproven to the type pass.
+;; The compiler must bind it once, guard only the concrete writer tag, use the
+;; native list constructor for the range arguments, and retain generic dispatch.
+(set-emit-unit! (new-unit))
+(let ((e (emit-form "app" "(let [^Appendable out (identity (StringWriter.))] (.append out \"abcd\" 1 3))")))
+  (ok "unproven Appendable lowering guards StringWriter" (contains? e "(string-writer? _ht$"))
+  (ok "unproven Appendable lowering uses append-text" (contains? e "(append-text _ha$"))
+  (ok "unproven Appendable lowering uses jolt-list" (contains? e "(jolt-list _ha$"))
+  (ok "unproven Appendable lowering retains generic fallback" (contains? e "record-method-dispatch")))
+
 (set-emit-unit! #f)
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

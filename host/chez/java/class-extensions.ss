@@ -187,7 +187,7 @@
 ;; sites that did not — one method with two behaviours in the same program.
 ;; Refuse the registration rather than ship that split.
 ;;
-;; The refusal covers any class one of them INHERITS from, not just the three
+;; The refusal covers any class one of them INHERITS from, not just the listed
 ;; names: overriding java.lang.CharSequence/length or java.lang.Object/toString
 ;; would reach a proven String receiver by the same graph walk class-ext-find
 ;; uses. Asking the graph rather than listing the ancestors is what keeps the two
@@ -199,7 +199,7 @@
 ;; shadowed.
 (define class-ext-direct-emit-classes
   '("java.lang.String" "clojure.lang.Keyword" "java.lang.StringBuilder"
-    "java.lang.StringBuffer"))
+    "java.lang.StringBuffer" "java.io.StringWriter"))
 
 (define (class-ext-check-override! cls)
   (let loop ((cs class-ext-direct-emit-classes))
