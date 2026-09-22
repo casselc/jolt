@@ -88,6 +88,12 @@
   (ok "unproven Appendable lowering uses jolt-list" (contains? e "(jolt-list _ha$"))
   (ok "unproven Appendable lowering retains generic fallback" (contains? e "record-method-dispatch")))
 
+(set-emit-unit! (new-unit))
+(let ((e (emit-form "app" "(let [^Appendable out (identity (StringWriter.))] (.toString out))")))
+  (ok "unproven StringWriter toString guards the concrete writer" (contains? e "(string-writer? _ht$"))
+  (ok "unproven StringWriter toString uses sb-str" (contains? e "(sb-str _ht$"))
+  (ok "unproven StringWriter toString retains generic fallback" (contains? e "record-method-dispatch")))
+
 (set-emit-unit! #f)
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
