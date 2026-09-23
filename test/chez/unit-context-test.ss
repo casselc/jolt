@@ -85,7 +85,7 @@
 (let ((e (emit-form "app" "(let [^Appendable out (identity (StringWriter.))] (.append out \"abcd\" 1 3))")))
   (ok "unproven Appendable lowering guards StringWriter" (contains? e "(string-writer? _ht$"))
   (ok "unproven Appendable lowering uses append-text" (contains? e "(append-text _ha$"))
-  (ok "unproven Appendable lowering uses jolt-list" (contains? e "(jolt-list _ha$"))
+  (ok "unproven Appendable lowering uses native rest list" (contains? e "(list _ha$"))
   (ok "unproven Appendable lowering retains generic fallback" (contains? e "record-method-dispatch")))
 
 (set-emit-unit! (new-unit))

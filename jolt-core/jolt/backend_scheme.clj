@@ -205,7 +205,10 @@
       (= m "append")
       (case argc
         1 (str "(begin (sb-append! " t " (append-text " a0 " '())) " t ")")
-        3 (str "(begin (sb-append! " t " (append-text " a0 " (jolt-list " a1 " " a2 "))) " t ")")
+        ;; append-text is a Chez helper whose rest parameter is a native Scheme
+        ;; list.  jolt-list builds a Clojure persistent list, which looks right
+        ;; in a rendered form but is not pair?/cdr-compatible at runtime.
+        3 (str "(begin (sb-append! " t " (append-text " a0 " (list " a1 " " a2 "))) " t ")")
         nil)
       (= m "toString") (when (= argc 0) (str "(sb-str " t ")"))
       :else nil)))
