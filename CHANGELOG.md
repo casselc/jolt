@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- Add a private, String-only Durable V1 WAL JSONL byte encoder on Chez. Its
+  compiler fast path is guarded by a proven String receiver; consumers select
+  it only after exact parity with the portable encoder, and unproven receivers
+  retain ordinary method dispatch.
+
 ## [0.8.10] - 2026-09-19
 
 A short window with one wrong-answer bug in it. A built binary typed a

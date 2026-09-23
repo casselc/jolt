@@ -112,6 +112,10 @@
       (= m "getBytes")             (cond (= argc 0) (str "(jolt-str-get-bytes " t " \"utf-8\")")
                                          (= argc 1) (str "(jolt-str-get-bytes " t " " a0 ")")
                                          :else nil)
+      ;; This private Durable V1 encoder is available only on a proven String.
+      ;; Consumers retain their portable path unless byte parity is confirmed.
+      (= m "toDurableWalBytes")     (when (= argc 0)
+                                      (str "(jolt-str-durable-wal-bytes " t ")"))
       (= m "matches")              (when (= argc 1) (str "(jolt-str-matches? " t " " a0 ")"))
       (= m "replaceAll")           (when (= argc 2) (str "(jolt-str-replace-all " t " " a0 " " a1 ")"))
       (= m "replaceFirst")         (when (= argc 2) (str "(jolt-str-replace-first " t " " a0 " " a1 ")"))
@@ -932,7 +936,7 @@
                   ;; otherwise emit a call to the local.
                   "str-trim" "str-needle" "str-starts-with?" "str-ends-with?"
                   "str-index-of" "str-index-of-any" "str-replace-literal"
-                  "java-string-hash" "java-symbol-hash"
+                  "java-string-hash" "java-symbol-hash" "jolt-str-durable-wal-bytes"
                   "keyword-t-ns" "keyword-t-name"
                   "sb-append!" "sb-str" "sb-length" "sb-piece"
                   "append-text" "string-writer?" "->num"
@@ -3278,7 +3282,10 @@
       chez?
       (let [tt (fresh-label "_ht$")
             as (mapv (fn [_] (fresh-label "_ha$")) args)
-            sd (string-direct-emit m (count as) tt as)
+            ;; Unproven receivers must use ordinary dispatch, not the private
+            ;; String-only capability.
+            sd (when (not= m "toDurableWalBytes")
+                 (string-direct-emit m (count as) tt as))
             kd (keyword-direct-emit m (count as) tt as)
             wd (string-writer-direct-emit m (count as) tt as)
             generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
