@@ -1273,8 +1273,9 @@
 ;; reconstructs the map's INSERTION order, pmap-fold visits an array-mode map's
 ;; slots from the last pair to the first; a hash-mode map visits HAMT order (its
 ;; iteration order is unspecified, so reverse-of-HAMT is equivalent and matches
-;; prior behaviour). Use pmap-fold-fwd when building a value directly in
-;; iteration order.
+;; prior behaviour). pmap-fold-fwd preserves array-map insertion order, but
+;; retains node-fold's HAMT order. Use pmap-fold-seq-order when callback effects
+;; must follow the actual seq view, including hash-collision buckets.
 (define (pmap-fold m proc acc)
   (let ((root (pmap-root m)))
     (if (hnode? root)
@@ -1282,8 +1283,8 @@
         (let loop ((i (fx- (vector-length root) 2)) (acc acc))
           (if (fx<? i 0) acc
               (loop (fx- i 2) (proc (sa-uvector-ref root i) (sa-uvector-ref root (sa-ufx+ i 1)) acc)))))))
-;; visit entries in iteration (insertion) order — for code that builds a new map /
-;; ordered value directly rather than via cons-accumulation.
+;; Visit array-map entries in insertion order; hash maps retain node-fold order.
+;; Kept for callers that build maps rather than observe seq-order effects.
 (define (pmap-fold-fwd m proc acc)
   (let ((root (pmap-root m)))
     (if (hnode? root)
@@ -1292,6 +1293,34 @@
           (let loop ((i 0) (acc acc))
             (if (sa-ufx>=? i n) acc
                 (loop (sa-ufx+ i 2) (proc (sa-uvector-ref root i) (sa-uvector-ref root (sa-ufx+ i 1)) acc))))))))
+
+;; Raw Scheme fold over a persistent pmap: proc receives (key value acc), once
+;; per entry, in exactly the order of (jolt-seq m). pmap-view-seq fills backward
+;; through pmap-fold, so invert BOTH node-fold's descending child traversal and
+;; its forward collision-bucket traversal. Do not run proc backward then reverse
+;; a result: proc may write to a sink, raise, or otherwise expose visit order.
+;; No map-entry or whole-map seq/vector is built. Reverse buckets use stack
+;; proportional to the bucket length; the ordinary HAMT depth is bounded.
+;; Empty maps return acc unchanged. This internal fold is not reduced-aware.
+(define (pmap-fold-seq-order m proc acc)
+  (let ((root (pmap-root m)))
+    (if (not (hnode? root))
+        (pmap-fold-fwd m proc acc)
+        (let walk ((node root) (acc acc))
+          (let ((arr (hnode-arr node)))
+            (let loop ((i 0) (acc acc))
+              (if (fx=? i (vector-length arr)) acc
+                  (let* ((child (vector-ref arr i))
+                         (next
+                           (cond
+                             ((hnode? child) (walk child acc))
+                             ((hcoll? child)
+                              (let backward ((al (hcoll-alist child)))
+                                (if (null? al) acc
+                                    (let ((next (backward (cdr al))))
+                                      (proc (caar al) (cdar al) next)))))
+                             (else (proc (car child) (cdr child) acc)))))
+                    (loop (fx+ i 1) next)))))))))
 
 ;; --- constructors -------------------------------------------------------------
 ;; map LITERAL ctor ({...}): RT.map/canBePAM — array map up to 8 entries, up to

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Add the internal Chez `pmap-fold-seq-order` helper: visit persistent-map keys
+  and values in the actual seq order, including full-hash collision buckets,
+  without materializing a whole-map entry sequence. Callback effects occur in
+  that order; existing map folds and public collection semantics are unchanged.
+
 - Avoid a redundant byte-buffer copy for Chez String.getBytes and private WAL
   output by transferring exclusively owned fresh storage. ByteArrayOutputStream
   snapshots retain one isolation copy instead of two; public array constructors

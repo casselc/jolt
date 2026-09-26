@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine mvnh
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
-  protoret accfix pic narrow directlink directcall durablewalnative arraymap arraybacking unitcontext numeric oparity mathfl flarr \
+  protoret accfix pic narrow directlink directcall durablewalnative arraymap mapseqfold arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
@@ -940,6 +940,11 @@ directcall:
 # transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
 arraymap:
 	@$(CHEZ) --script test/chez/arraymap-test.ss
+
+# Raw map fold: callback effects match seq order, including full-hash buckets.
+.PHONY: mapseqfold
+mapseqfold:
+	@$(CHEZ) --script test/chez/map-seq-fold-test.ss
 
 # Array backings: which Chez vector type each element kind stores its elements
 # in (fxvector / bytevector / flvector / boxed vector), the fixnum-range
