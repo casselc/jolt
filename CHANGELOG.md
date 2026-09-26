@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Avoid a staging allocation and copy when `jolt.ffi/write-array` copies a
+  complete bytevector-backed byte array to foreign memory. The destination
+  still receives an independent synchronous copy; slices, range checks and
+  legacy array backings keep their existing behavior.
+
 - Avoid a redundant byte-buffer copy for Chez String.getBytes and private WAL
   output by transferring exclusively owned fresh storage. ByteArrayOutputStream
   snapshots retain one isolation copy instead of two; public array constructors

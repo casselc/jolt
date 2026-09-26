@@ -694,6 +694,7 @@ loaderconf: testbin
 # vocabulary, layout-shaped read and write, places, and the typed array moves.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+	@$(CHEZ) --script test/chez/ffi-write-array-direct-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-layout-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
