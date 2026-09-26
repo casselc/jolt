@@ -1955,12 +1955,28 @@
              (and (fixnum? mask) (fxlogbit? 2 mask))))
       f
       (lambda (a b) (jolt-invoke f a b))))
+(define (hsc-register-eq! pred handler)
+  (let ((p (hsc-callback2 pred)) (h (hsc-callback2 handler)))
+    (register-eq-arm! (lambda (a b) (jolt-truthy? (p a b)))
+                      (lambda (a b) (jolt-truthy? (h a b)))))
+  jolt-nil)
+;; Optional final :host-table is an explicit representation contract, not a
+;; purity inference: outside that domain NO user callback runs, even if its
+;; body/Var helpers could have effects or later return true there. Legacy
+;; arities remain unrestricted. Validate before probes or registry mutation.
+(define (hsc-host-table-domain! who domain)
+  (unless (eq? domain (keyword #f "host-table"))
+    (throw-jvm 'IllegalArgumentException
+      (string-append who " domain must be :host-table"))))
 (def-var! "clojure.core" "__register-eq!"
-  (lambda (pred handler)
-    (let ((p (hsc-callback2 pred)) (h (hsc-callback2 handler)))
-      (register-eq-arm! (lambda (a b) (jolt-truthy? (p a b)))
-                        (lambda (a b) (jolt-truthy? (h a b)))))
-    jolt-nil))
+  (case-lambda
+    ((pred handler) (hsc-register-eq! pred handler))
+    ((pred handler domain)
+     (hsc-host-table-domain! "__register-eq!" domain)
+     (let ((p (hsc-callback2 pred)))
+       (hsc-register-eq!
+         (lambda (a b) (and (or (htable? a) (htable? b)) (p a b)))
+         handler)))))
 (def-var! "clojure.core" "__register-hash!"
   (lambda (pred handler)
     (register-hash-arm! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
@@ -1998,17 +2014,26 @@
 (define (jt-jolt-strs->list v)
   (let loop ((s (jolt-seq v)) (acc '()))
     (if (jolt-nil? s) (reverse acc) (loop (jolt-seq (jolt-rest s)) (cons (jolt-first s) acc)))))
+(define (hsc-register-class! pred class-fn tags-fn)
+  (let* ((pred (hsc-callback1 pred))
+         (class-fn (hsc-callback1 class-fn))
+         (tags-fn (hsc-callback1 tags-fn))
+         (p (lambda (x) (jolt-truthy? (pred x)))))
+    (register-class-arm! p (lambda (x) (class-fn x)))
+    (set! jt-user-value-tags-arms
+          (append jt-user-value-tags-arms
+                  (list (cons p (lambda (x) (jt-jolt-strs->list (tags-fn x))))))))
+  jolt-nil)
+;; The same opt-in gates both class and protocol-tag predicates. In-domain
+;; callbacks retain their live dispatch, truthiness and existing arm order.
 (def-var! "clojure.core" "__register-class!"
-  (lambda (pred class-fn tags-fn)
-    (let* ((pred (hsc-callback1 pred))
-           (class-fn (hsc-callback1 class-fn))
-           (tags-fn (hsc-callback1 tags-fn))
-           (p (lambda (x) (jolt-truthy? (pred x)))))
-      (register-class-arm! p (lambda (x) (class-fn x)))
-      (set! jt-user-value-tags-arms
-            (append jt-user-value-tags-arms
-                    (list (cons p (lambda (x) (jt-jolt-strs->list (tags-fn x))))))))
-    jolt-nil))
+  (case-lambda
+    ((pred class-fn tags-fn) (hsc-register-class! pred class-fn tags-fn))
+    ((pred class-fn tags-fn domain)
+     (hsc-host-table-domain! "__register-class!" domain)
+     (let ((p (hsc-callback1 pred)))
+       (hsc-register-class! (lambda (x) (and (htable? x) (p x)))
+                            class-fn tags-fn)))))
 
 ;; values that carry metadata (mirrors jolt-with-meta's set in natives-meta.ss).
 (define (hsc-imeta? x)

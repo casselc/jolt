@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Add an optional final `:host-table` domain to Chez `__register-eq!` and
+  `__register-class!`. Opted-in registrations suppress callbacks outside the
+  declared representation (either operand for equality); this includes effects
+  from rebindable callback helpers. Existing arities remain unrestricted, and
+  unknown domains fail before registration. The time library opts in for its
+  table-backed equality and class callbacks; other seams are unchanged.
+
 - Avoid per-call argument-list allocation for ordinary procedure callbacks in
   Chez equality and class registrations. Callback order, truthiness, exceptions,
   and dynamic/nonprocedure callable dispatch retain their existing behavior.
