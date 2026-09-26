@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Index live protocol implementations by protocol/method/type for Chez host
+  dispatch, resolving the first two keys once per host-tag walk. Preserve tag
+  callback order, extension precedence, record/reify paths, and synchronized
+  registration visibility without caching resolved functions or misses.
+
 - Add the internal Chez `pmap-fold-seq-order` helper: visit persistent-map keys
   and values in the actual seq order, including full-hash collision buckets,
   without materializing a whole-map entry sequence. Callback effects occur in

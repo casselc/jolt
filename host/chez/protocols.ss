@@ -110,6 +110,43 @@
 (define (tmi-entries type-tag method)
   (let ((mi (hashtable-ref type-method-index type-tag #f)))
     (if mi (hashtable-ref mi method '()) '())))
+
+;; The same live registrations, indexed protocol -> method -> type-tag -> fn.
+;; Host dispatch fixes protocol/method before walking a value's ordered tags;
+;; this avoids re-hashing those two keys for every candidate type. This is NOT
+;; a resolved-method cache: every candidate probes its current entry, and no
+;; answer or miss is retained across dispatches. In particular it does not rely
+;; on jolt-proto-epoch, which register-protocol-method bumps BEFORE its writes.
+;; All creation/mutation/scanning is under rec-tbl-mu, as for type-method-index;
+;; single-key reads have the same unlocked strong-table contract. Empty method
+;; tables remain published, so removal/re-registration never replaces a leaf
+;; a concurrent resolver is reading. Only actual methods enter this index, not
+;; the extend/inline marker entries in type-registry.
+(define protocol-method-index (make-hashtable string-hash string=?))
+(define (pmi-add!/locked type-tag proto method fn)
+  (let* ((methods (or (hashtable-ref protocol-method-index proto #f)
+                      (let ((h (make-hashtable string-hash string=?)))
+                        (hashtable-set! protocol-method-index proto h) h)))
+         (types (or (hashtable-ref methods method #f)
+                    (let ((h (make-hashtable string-hash string=?)))
+                      (hashtable-set! methods method h) h))))
+    (hashtable-set! types type-tag fn)))
+(define (protocol-method-types proto method)
+  (let ((methods (hashtable-ref protocol-method-index proto #f)))
+    (and methods (hashtable-ref methods method #f))))
+;; Cold removal paths visit leaves under the registry lock. No callback here
+;; runs during dispatch or while invoking a user implementation.
+(define (pmi-for-each-types/locked proc)
+  (vector-for-each
+    (lambda (proto)
+      (let ((methods (hashtable-ref protocol-method-index proto #f)))
+        (vector-for-each
+          (lambda (method) (proc (hashtable-ref methods method #f)))
+          (hashtable-keys methods))))
+    (hashtable-keys protocol-method-index)))
+(define (pmi-forget-type!/locked type-tag)
+  (pmi-for-each-types/locked
+    (lambda (types) (hashtable-delete! types type-tag))))
 ;; Prune both tables together. The per-case harnesses (run-corpus.ss/run-unit.ss)
 ;; drop every type a case defined; pruning the tree alone would leave this index
 ;; answering for types that no longer exist, so the two are pruned through one
@@ -128,6 +165,7 @@
     (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
     (hashtable-delete! type-registry type-tag)
     (hashtable-delete! type-method-index type-tag)
+    (pmi-forget-type!/locked type-tag)
     (hashtable-delete! type-class-memo type-tag)
     (hashtable-delete! clone-registry type-tag)))
 
@@ -140,13 +178,40 @@
     (lambda (k)
       (unless (keep? k)
         (hashtable-delete! type-registry k)
-        (hashtable-delete! type-method-index k)))
+        (hashtable-delete! type-method-index k)
+        ;; A later keep? callback can dispatch on an already rejected type.
+        ;; Remove its reverse entries now, before invoking that next callback.
+        (jolt-with-mutex rec-tbl-mu (pmi-forget-type!/locked k))))
     (hashtable-keys type-registry))
   ;; a tag can reach a derived table without reaching the tree only if they ever
   ;; diverge; sweep both on the same rule so a leak cannot outlive the prune.
   (vector-for-each
-    (lambda (k) (unless (keep? k) (hashtable-delete! type-method-index k)))
+    (lambda (k)
+      (unless (keep? k)
+        (hashtable-delete! type-method-index k)
+        (jolt-with-mutex rec-tbl-mu (pmi-forget-type!/locked k))))
     (hashtable-keys type-method-index))
+  ;; Harness pruning is quiescent, like the existing tree/index sweeps above.
+  ;; Sweep this index independently too, so an orphan cannot outlive the prune.
+  (let ((snapshots
+          (jolt-with-mutex rec-tbl-mu
+            (let ((out '()))
+              (pmi-for-each-types/locked
+                (lambda (types)
+                  (set! out (cons (cons types (hashtable-keys types)) out))))
+              out))))
+    (for-each
+      (lambda (entry)
+        ;; keep? is caller code: like the original sweeps, call it OUTSIDE the
+        ;; registry mutex. This does not make pruning concurrent-registration
+        ;; safe; its existing harness callers still own a quiescent registry.
+        (vector-for-each
+          (lambda (tag)
+            (unless (keep? tag)
+              (jolt-with-mutex rec-tbl-mu
+                (hashtable-delete! (car entry) tag))))
+          (cdr entry)))
+      snapshots))
   (vector-for-each
     (lambda (k) (unless (keep? k) (hashtable-delete! type-class-memo k)))
     (hashtable-keys type-class-memo)))
@@ -189,7 +254,8 @@
                    (let ((h (make-hashtable string-hash string=?))) (hashtable-set! ti proto h) h))))
       (hashtable-set! pi method fn)
       ;; the by-method index of the same impl, inside the same critical section
-      (tmi-add! type-tag proto method fn)))
+      (tmi-add! type-tag proto method fn)
+      (pmi-add!/locked type-tag proto method fn)))
   ;; mirror onto the type's descriptor ptable (record types only — a host tag
   ;; like "String"/"Object" has no desc). A re-def invalidated the old desc's
   ;; ptable (set it to #f), and this call populates the new desc's ptable.
@@ -919,6 +985,18 @@
                                 (let ((n (guard (e (#t #f)) (jolt-class-name obj))))
                                   (if (string? n) n "?"))))))
 
+;; Keep tag production BEFORE index lookup: __register-class! installs library
+;; predicates/tag callbacks in value-host-tags, and a callback may register the
+;; very first implementation while producing these tags. Do not memoize even a
+;; missing protocol/method table before that callback or across calls.
+(define (protocol-resolve-host proto-name method-name obj)
+  (let* ((tags (value-host-tags obj))
+         (types (protocol-method-types proto-name method-name)))
+    (let loop ((tags tags))
+      (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
+            ((and types (hashtable-ref types (car tags) #f)))
+            (else (loop (cdr tags)))))))
+
 ;; protocol-resolve: the impl procedure for obj — by record type tag, a reify's
 ;; instance-local method, or the protocol's extended impls over obj's host tags.
 ;; Raises if none implements the method. The dispatchN entry points apply it
@@ -939,15 +1017,8 @@
               ;; not implemented on the reify — fall back to the protocol's
               ;; extended impls over the reify's host tags (e.g. an Object/default
               ;; extension). malli reifies some protocols and leans on the default.
-              (let loop ((tags (value-host-tags obj)))
-                (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
-                      ((find-protocol-method (car tags) proto-name method-name))
-                      (else (loop (cdr tags))))))))
-    (else
-     (let loop ((tags (value-host-tags obj)))
-       (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
-             ((find-protocol-method (car tags) proto-name method-name))
-             (else (loop (cdr tags))))))))
+              (protocol-resolve-host proto-name method-name obj))))
+    (else (protocol-resolve-host proto-name method-name obj))))
 ;; Fixed-arity entry points the protocol-method shims call: no rest-list, no seq
 ;; round-trip — apply the resolved impl directly. defprotocol emits one clause per
 ;; declared arity that calls the matching dispatchN.
