@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Recover OutputStreamWriter.append CharSequence range and null-text semantics
+  on the cumulative runtime; reuse the shared Appendable renderer/slicer rather
+  than writing the entire source for every selected run.
+
 - Avoid a redundant byte-buffer copy for Chez String.getBytes and private WAL
   output by transferring exclusively owned fresh storage. ByteArrayOutputStream
   snapshots retain one isolation copy instead of two; public array constructors

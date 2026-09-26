@@ -794,7 +794,9 @@
                                  (if (>= (length rest) 2) (substring s (jnum->exact (car rest))
                                                                      (+ (jnum->exact (car rest)) (jnum->exact (cadr rest)))) s)))
                    jolt-nil))
-   (cons "append" (lambda (self x . rest) (put-string (char-writer-port self) (cw-text x)) self))
+   ;; Appendable uses CharSequence [start,end), including null's "null" text.
+   ;; Reuse the shared renderer/slicer; write(int) remains separate above.
+   (cons "append" (lambda (self x . rest) (put-string (char-writer-port self) (append-text x rest)) self))
    (cons "newLine" (lambda (self) (put-char (char-writer-port self) #\newline) jolt-nil))
    (cons "flush" (lambda (self)
                    (flush-output-port (char-writer-port self))
