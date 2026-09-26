@@ -884,6 +884,7 @@ arraymap:
 # widening, and that a boxed array of a typed kind still behaves.
 arraybacking:
 	@$(CHEZ) --script test/chez/array-backing-test.ss
+	@$(CHEZ) --script test/chez/owned-byte-results-test.ss
 
 # Direct-linking emission: a closed-world build binds top-level app defs to jv$
 # Scheme bindings and routes app->app calls/refs to them, skipping var-deref +

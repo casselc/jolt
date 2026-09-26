@@ -282,7 +282,8 @@
                            (else (close-port (out-stream-port self)))))
                    jolt-nil))
    (cons "connect" (lambda (self other) (pipe-connect! self other) jolt-nil))
-   (cons "toByteArray" (lambda (self) (na-byte-array (bytevector-copy (baos-bytes self)))))
+   ;; Retain one snapshot copy: baos-bytes remains owned by the stream.
+   (cons "toByteArray" (lambda (self) (na-byte-array (baos-bytes self))))
    (cons "size" (lambda (self) (->num (bytevector-length (baos-bytes self)))))
    (cons "reset" (lambda (self) (baos-bytes self) (vector-set! (jhost-state self) 2 (make-bytevector 0)) jolt-nil))
    (cons "toString" (lambda (self . cs) (decode-bytevector (baos-bytes self)

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Avoid a redundant byte-buffer copy for Chez String.getBytes and private WAL
+  output by transferring exclusively owned fresh storage. ByteArrayOutputStream
+  snapshots retain one isolation copy instead of two; public array constructors
+  and borrowed buffers keep their copying behavior.
+
 - Truthfully hinted `(aget ^shorts a i)` now uses the existing direct array-read
   helper, avoiding generic collection dispatch while retaining the ordinary
   backing, index-coercion, and exception behavior. A scalar `^short` hint still
