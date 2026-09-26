@@ -1921,10 +1921,30 @@
 ;; eq, an integer for hash/compare, a string for str/pr). pred should be cheap
 ;; and return false for values it doesn't own — it runs on the slow path of every
 ;; =/hash/compare/print.
+;; A captured procedure's accepted arities cannot change. Select it once rather
+;; than allocating jolt-invoke's rest list on every callback. Keep every other
+;; callable on the ORIGINAL dispatcher: lookup-shaped IFns must still consult
+;; invocation-prefix arms, and wrong arity must throw when called, not here.
+;; Large arities can produce a bignum mask. The original dispatcher uses
+;; fxlogbit?, so preserve its invocation-time failure instead of rejecting a
+;; registration eagerly (even when the mask also accepts this small arity).
+(define (hsc-callback1 f)
+  (if (and (procedure? f)
+           (let ((mask (procedure-arity-mask f)))
+             (and (fixnum? mask) (fxlogbit? 1 mask))))
+      f
+      (lambda (a) (jolt-invoke f a))))
+(define (hsc-callback2 f)
+  (if (and (procedure? f)
+           (let ((mask (procedure-arity-mask f)))
+             (and (fixnum? mask) (fxlogbit? 2 mask))))
+      f
+      (lambda (a b) (jolt-invoke f a b))))
 (def-var! "clojure.core" "__register-eq!"
   (lambda (pred handler)
-    (register-eq-arm! (lambda (a b) (jolt-truthy? (jolt-invoke pred a b)))
-                      (lambda (a b) (jolt-truthy? (jolt-invoke handler a b))))
+    (let ((p (hsc-callback2 pred)) (h (hsc-callback2 handler)))
+      (register-eq-arm! (lambda (a b) (jolt-truthy? (p a b)))
+                        (lambda (a b) (jolt-truthy? (h a b)))))
     jolt-nil))
 (def-var! "clojure.core" "__register-hash!"
   (lambda (pred handler)
@@ -1965,11 +1985,14 @@
     (if (jolt-nil? s) (reverse acc) (loop (jolt-seq (jolt-rest s)) (cons (jolt-first s) acc)))))
 (def-var! "clojure.core" "__register-class!"
   (lambda (pred class-fn tags-fn)
-    (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
-      (register-class-arm! p (lambda (x) (jolt-invoke class-fn x)))
+    (let* ((pred (hsc-callback1 pred))
+           (class-fn (hsc-callback1 class-fn))
+           (tags-fn (hsc-callback1 tags-fn))
+           (p (lambda (x) (jolt-truthy? (pred x)))))
+      (register-class-arm! p (lambda (x) (class-fn x)))
       (set! jt-user-value-tags-arms
             (append jt-user-value-tags-arms
-                    (list (cons p (lambda (x) (jt-jolt-strs->list (jolt-invoke tags-fn x))))))))
+                    (list (cons p (lambda (x) (jt-jolt-strs->list (tags-fn x))))))))
     jolt-nil))
 
 ;; (instance? clojure.lang.IFoo x) for the core clojure.lang interfaces libraries
