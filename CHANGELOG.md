@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Avoid per-call argument-list allocation for ordinary procedure callbacks in
+  Chez equality and class registrations. Callback order, truthiness, exceptions,
+  and dynamic/nonprocedure callable dispatch retain their existing behavior.
+
 - Avoid a staging allocation and copy when `jolt.ffi/write-array` copies a
   complete bytevector-backed byte array to foreign memory. The destination
   still receives an independent synchronous copy; slices, range checks and
