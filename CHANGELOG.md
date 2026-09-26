@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Avoid a redundant byte-buffer copy for Chez String.getBytes and private WAL
+  output by transferring exclusively owned fresh storage. ByteArrayOutputStream
+  snapshots retain one isolation copy instead of two; public array constructors
+  and borrowed buffers keep their copying behavior.
+
 - Add a private, String-only Durable V1 WAL JSONL byte encoder on Chez. Its
   compiler fast path is guarded by a proven String receiver; consumers select
   it only after exact parity with the portable encoder, and unproven receivers

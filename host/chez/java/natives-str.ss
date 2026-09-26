@@ -518,7 +518,9 @@
 (define (jolt-str-last-index-of s needle) (str-last-index-of s (str-needle needle)))
 (define (jolt-str-strip s left? right?) (str-strip s left? right?))
 (define (jolt-str-to-char-array s) (na-char-array s))
-(define (jolt-str-get-bytes s cs) (na-byte-array (charset-encode-bv s cs)))
+(define (jolt-str-get-bytes s cs)
+  ;; All charset branches produce fresh storage, relinquished by this call.
+  (na-owned-bv->bytearray (charset-encode-bv s cs)))
 
 ;; Private compiler primitive for the Durable V1 one-field SQL WAL record.
 ;; The library selects it only after confirming parity with portable data.json.
@@ -558,7 +560,8 @@
               (else (put-u8 port cp)))
             (loop (+ i 1) n))))
       (put-bytevector port durable-wal-suffix)
-      (na-byte-array (extract)))))
+      ;; Extraction produces private storage; this port is never reused.
+      (na-owned-bv->bytearray (extract)))))
 (define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
 (define (jolt-str-replace-all s pat repl) (irregex-replace/all (str-irx pat) s repl))
 (define (jolt-str-replace-first s pat repl) (irregex-replace (str-irx pat) s repl))

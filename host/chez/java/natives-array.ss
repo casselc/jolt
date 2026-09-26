@@ -448,6 +448,10 @@
 ;; that the two carriers agree on representation; the copy stays because the
 ;; caller's bytevector is usually a buffer it goes on writing into.
 (define (na-bv->bytearray bv) (make-jolt-array (bytevector-copy bv) 'byte))
+;; INTERNAL ownership transfer: BV must be fresh, exclusively owned storage.
+;; The producer relinquishes every mutable alias; the returned byte array is
+;; its sole owner. Never use this for borrowed buffers or public constructors.
+(define (na-owned-bv->bytearray bv) (make-jolt-array bv 'byte))
 ;; (byte-array n [init]) | (byte-array coll). Also coerces the host's OTHER byte
 ;; carrier — a Chez bytevector (what the charset encoders produce) — and a string's
 ;; UTF-8 bytes, so bytevector and byte-array interconvert across interop seams.
