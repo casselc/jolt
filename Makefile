@@ -745,6 +745,7 @@ loaderconf: testbin
 # words rather than leave to Chez's expander.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
+	@$(CHEZ) --script test/chez/ffi-write-array-direct-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-layout-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"

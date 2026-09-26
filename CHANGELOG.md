@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Avoid a staging allocation and copy when `jolt.ffi/write-array` copies a
+  complete bytevector-backed byte array to foreign memory. The destination
+  still receives an independent synchronous copy; slices, range checks and
+  legacy array backings keep their existing behavior.
+
 - Add the internal Chez `pmap-fold-seq-order` helper: visit persistent-map keys
   and values in the actual seq order, including full-hash collision buckets,
   without materializing a whole-map entry sequence. Callback effects occur in
