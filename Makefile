@@ -167,7 +167,7 @@ install: build
 CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling stringscancorpus depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
-  hasheq narrowhash \
+  hasheq narrowhash callbackbridges \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
@@ -267,6 +267,11 @@ selfhost:
 # Value-model unit tests (nil/truthiness/collections on Chez).
 values:
 	@$(CHEZ) --script test/chez/values-test.ss
+
+# Registration-time callback adapters retain invocation and equality semantics.
+.PHONY: callbackbridges
+callbackbridges:
+	@$(CHEZ) --script test/chez/callback-bridges-test.ss
 
 # The hash engine's VALUES, pinned to JVM Clojure. hasheq.ss gets tuned for speed
 # (its 32-bit leaf helpers are macros so they inline), and a tuning pass that
