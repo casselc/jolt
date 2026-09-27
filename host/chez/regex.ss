@@ -118,6 +118,39 @@
                   entry)))
           (lambda () (jolt-unlock! regex-cache-mutex))))))
 
+;; irregex's exact-repeat backtracker builds its body closures during every
+;; match. Expand small repeats of a single character/class at compile time.
+;; Never duplicate captures or alter variable/lazy repetition. Bound total
+;; expansion and keep the backtracker: switching to DFA would change search
+;; alternation priority even when whole-string matching agrees.
+(define (regex-static-repeats sre)
+  (let ((budget 4096) (changed? #f))
+    (define (class-size body)
+      (cond
+        ((char? body) 1)
+        ((and (list? body) (pair? body)
+              (memq (car body) '(/ or & - ~)))
+         (let loop ((xs (cdr body)) (size 1))
+           (if (null? xs) size
+               (let ((child-size (class-size (car xs))))
+                 (and child-size (loop (cdr xs) (+ size child-size)))))))
+        (else #f)))
+    (define (walk x)
+      (cond
+        ((and (list? x) (= (length x) 4) (eq? (car x) '**)
+              (integer? (cadr x)) (exact? (cadr x))
+              (<= 1 (cadr x) 128) (equal? (cadr x) (caddr x))
+              (let ((size (class-size (cadddr x)))) (and size (<= size 33))))
+         (let* ((body (cadddr x)) (n (cadr x))
+                (cost (* n (class-size body))))
+           (if (> cost budget) x
+               (begin
+                 (set! budget (- budget cost)) (set! changed? #t)
+                 (cons 'seq (make-list n body))))))
+        ((pair? x) (cons (walk (car x)) (walk (cdr x))))
+        (else x)))
+    (let ((expanded (walk sre))) (values expanded changed?))))
+
 ;; the built engine for source, compiling once on first demand. A capturing
 ;; pattern gets irregex's BACKTRACKING matcher (see the engine note above); a
 ;; group-free one keeps the fast DFA. An engine-build failure on an SRE the
@@ -134,13 +167,15 @@
               (let ((entry (hashtable-ref regex-cache source #f)))
                 (if (and entry (eq? (vector-ref entry 0) 'irx))
                     (vector-ref entry 1)
-                    (let* ((sre (vector-ref entry 1)) (opts (vector-ref entry 2))
-                           (irx (guard (e (#t (regex-syntax-error source e)))
-                                  (if (vector-ref entry 3)
-                                      (apply irregex sre 'backtrack opts)
-                                      (apply irregex sre opts)))))
-                      (hashtable-set! regex-cache source (vector 'irx irx))
-                      irx))))
+                    (let-values (((sre expanded?)
+                                  (regex-static-repeats (vector-ref entry 1))))
+                      (let* ((opts (vector-ref entry 2))
+                             (irx (guard (e (#t (regex-syntax-error source e)))
+                                    (if (or expanded? (vector-ref entry 3))
+                                        (apply irregex sre 'backtrack opts)
+                                        (apply irregex sre opts)))))
+                        (hashtable-set! regex-cache source (vector 'irx irx))
+                        irx)))))
             (lambda () (jolt-unlock! regex-cache-mutex)))))))
 
 (define (jolt-regex source)

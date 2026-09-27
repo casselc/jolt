@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Compile small exact character/class repetitions once in the Chez regex
+  backtracker, avoiding per-match closure construction. Expansion is bounded;
+  captures, variable/lazy repetition and search alternation priority are retained.
+
 - Add an internal Chez protocol method-resolution site for callers that repeatedly
   resolve the same protocol/method. Bounded immutable snapshots reuse methods for
   actual graph-owned host tags while retaining live tag callbacks, registration
