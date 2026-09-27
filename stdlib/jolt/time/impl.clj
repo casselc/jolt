@@ -106,9 +106,13 @@
    :jolt.time/clock "java.time.Clock"})
 
 (defn- install-seams! []
+  ;; Our values are host tables. Explicitly suppress eq/class callbacks for
+  ;; other representations, including effects from rebound jt?/type-of helpers.
+  ;; In-domain predicates and all other registration seams remain live.
   (__register-eq!
    (fn [a b] (or (jt? a) (jt? b)))
-   (fn [a b] (boolean (and (same-type? a b) ((:eq (spec-of a)) a b)))))
+   (fn [a b] (boolean (and (same-type? a b) ((:eq (spec-of a)) a b))))
+   :host-table)
   (__register-hash! jt? (fn [v] ((:hash (spec-of v)) v)))
   ;; java.time values have no reader literal, so pr renders the same as str
   ;; (time-literals layers #time/… readable printing on top separately).
@@ -133,6 +137,7 @@
   (__register-class!
    jt?
    (fn [x] (get type->class (type-of x) "java.lang.Object"))
-   (fn [x] (conj (vec (:classes (spec-of x))) "java.io.Serializable" "Serializable"))))
+   (fn [x] (conj (vec (:classes (spec-of x))) "java.io.Serializable" "Serializable"))
+   :host-table))
 
 (defonce ^:private installed (install-seams!))
