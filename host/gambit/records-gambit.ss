@@ -1362,21 +1362,38 @@
     (hashtable-delete! clone-registry type-tag)))
 
 (define (prune-type-registry! keep?)
-  (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+  (jolt-with-mutex
+    rec-tbl-mu
+    (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1)))
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
-        (hashtable-delete! type-registry k)
-        (hashtable-delete! type-method-index k)))
-    (hashtable-keys type-registry))
+        (jolt-with-mutex
+          rec-tbl-mu
+          (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+          (hashtable-delete! type-registry k)
+          (hashtable-delete! type-method-index k))))
+    (jolt-with-mutex rec-tbl-mu (hashtable-keys type-registry)))
   (vector-for-each
     (lambda (k)
-      (unless (keep? k) (hashtable-delete! type-method-index k)))
-    (hashtable-keys type-method-index))
+      (unless (keep? k)
+        (jolt-with-mutex
+          rec-tbl-mu
+          (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+          (hashtable-delete! type-method-index k))))
+    (jolt-with-mutex
+      rec-tbl-mu
+      (hashtable-keys type-method-index)))
   (vector-for-each
     (lambda (k)
-      (unless (keep? k) (hashtable-delete! type-class-memo k)))
-    (hashtable-keys type-class-memo)))
+      (unless (keep? k)
+        (jolt-with-mutex
+          rec-tbl-mu
+          (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+          (hashtable-delete! type-class-memo k))))
+    (jolt-with-mutex
+      rec-tbl-mu
+      (hashtable-keys type-class-memo))))
 
 (define jolt-proto-epoch 0)
 
@@ -1992,6 +2009,80 @@
           (protocol-miss-throw proto-name method-name obj))
          ((find-protocol-method (car tags) proto-name method-name))
          (else (loop (cdr tags))))))))
+
+(define (make-protocol-method-site proto-name method-name)
+  (let ((proto (string-copy proto-name))
+        (method (string-copy method-name))
+        (cache #f))
+    (lambda (obj)
+      (if (or (jrec? obj) (reified-methods obj))
+          (protocol-resolve proto method obj)
+          (let* ((ge jch-graph-epoch)
+                 (tags (value-host-tags obj))
+                 (snapshot cache))
+            (memory-order-acquire)
+            (let ((hit (and snapshot
+                            (fx= ge jch-graph-epoch)
+                            (fx= ge (vector-ref snapshot 1))
+                            (fx= jolt-proto-epoch (vector-ref snapshot 0))
+                            (assq tags (vector-ref snapshot 2)))))
+              (if hit
+                  (cdr hit)
+                  (let* ((owned? (and (fx= ge jch-graph-epoch)
+                                      (graph-owned-tags? tags)))
+                         (f (jolt-with-mutex
+                              rec-tbl-mu
+                              (let* ((pe jolt-proto-epoch)
+                                     (f (let loop ((ts tags))
+                                          (cond
+                                            ((null? ts) #f)
+                                            ((find-protocol-method
+                                               (car ts)
+                                               proto
+                                               method))
+                                            (else (loop (cdr ts)))))))
+                                (when (and f
+                                           owned?
+                                           (fx= ge jch-graph-epoch)
+                                           (fx= pe jolt-proto-epoch))
+                                  (let* ((current cache)
+                                         (entries (if (and current
+                                                           (fx= pe
+                                                                (vector-ref
+                                                                  current
+                                                                  0))
+                                                           (fx= ge
+                                                                (vector-ref
+                                                                  current
+                                                                  1)))
+                                                      (vector-ref
+                                                        current
+                                                        2)
+                                                      '())))
+                                    (unless (assq tags entries)
+                                      (let ((next (vector
+                                                    pe
+                                                    ge
+                                                    (cons
+                                                      (cons tags f)
+                                                      (if (< (length
+                                                               entries)
+                                                             8)
+                                                          entries
+                                                          (let take ((es entries)
+                                                                     (n 7))
+                                                            (if (zero? n)
+                                                                '()
+                                                                (cons
+                                                                  (car es)
+                                                                  (take
+                                                                    (cdr es)
+                                                                    (- n
+                                                                       1))))))))))
+                                        (memory-order-release)
+                                        (set! cache next)))))
+                                f))))
+                    (or f (protocol-miss-throw proto method obj))))))))))
 
 (define (protocol-dispatch1 proto-name method-name obj)
   ((protocol-resolve proto-name method-name obj) obj))

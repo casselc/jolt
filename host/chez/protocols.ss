@@ -135,21 +135,35 @@
   ;; a registry change like any other to the caches keyed on the epoch (the
   ;; PICs, satisfies?'s memo): a tag a later definition reuses must not find a
   ;; pruned type's answer
-  (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+  (jolt-with-mutex rec-tbl-mu
+    (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1)))
+  ;; keep? retains its three traversal phases and runs OUTSIDE the lock. It may
+  ;; dispatch or register methods itself. A cache filled during that callback
+  ;; must be invalidated by the ensuing deletion, not only by the initial bump.
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
-        (hashtable-delete! type-registry k)
-        (hashtable-delete! type-method-index k)))
-    (hashtable-keys type-registry))
+        (jolt-with-mutex rec-tbl-mu
+          (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+          (hashtable-delete! type-registry k)
+          (hashtable-delete! type-method-index k))))
+    (jolt-with-mutex rec-tbl-mu (hashtable-keys type-registry)))
   ;; a tag can reach a derived table without reaching the tree only if they ever
   ;; diverge; sweep both on the same rule so a leak cannot outlive the prune.
   (vector-for-each
-    (lambda (k) (unless (keep? k) (hashtable-delete! type-method-index k)))
-    (hashtable-keys type-method-index))
+    (lambda (k)
+      (unless (keep? k)
+        (jolt-with-mutex rec-tbl-mu
+          (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+          (hashtable-delete! type-method-index k))))
+    (jolt-with-mutex rec-tbl-mu (hashtable-keys type-method-index)))
   (vector-for-each
-    (lambda (k) (unless (keep? k) (hashtable-delete! type-class-memo k)))
-    (hashtable-keys type-class-memo)))
+    (lambda (k)
+      (unless (keep? k)
+        (jolt-with-mutex rec-tbl-mu
+          (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+          (hashtable-delete! type-class-memo k))))
+    (jolt-with-mutex rec-tbl-mu (hashtable-keys type-class-memo))))
 ;; Global protocol epoch: bumped on EVERY register-protocol-method. A per-site
 ;; inline cache (the PIC the back end emits) tags itself with the epoch at
 ;; populate time; a later extension (a new bump) invalidates it so a cached
@@ -948,6 +962,70 @@
        (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
              ((find-protocol-method (car tags) proto-name method-name))
              (else (loop (cdr tags))))))))
+
+;; A reusable method-resolution site for host values. This is NOT a type/stock
+;; method shortcut: value-host-tags (including every live user predicate) runs
+;; once per dispatch, BEFORE consulting the cache. Records and reify instances
+;; retain protocol-resolve's descriptor/instance-local precedence unchanged.
+;;
+;; Each snapshot is #(protocol-epoch graph-epoch ((tags . impl) ...)), with at
+;; most eight entries. The vector, list and pairs are never mutated after their
+;; single-reference publication; no shared mutable hashtable is read on hits.
+;; Only graph-owned tag lists are retained, not user-created/mutable per-call
+;; lists. A graph mutation replaces its owned lists and changes its epoch.
+;;
+;; A miss walks and fills under rec-tbl-mu: registration bumps the epoch BEFORE
+;; writing its tables, so an unlocked resolve followed by an epoch stamp would
+;; otherwise preserve a stale method under the new epoch. All method removals,
+;; including pruning, use that same lock. Hits may select the old method while
+;; an extension overlaps, as ordinary dispatch does; an extension completed
+;; before the next dispatch invalidates that snapshot. No callbacks, tag
+;; production, method invocation or error formatting run under this lock.
+(define (make-protocol-method-site proto-name method-name)
+  (let ((proto (string-copy proto-name)) (method (string-copy method-name))
+        (cache #f))
+    (lambda (obj)
+      (if (or (jrec? obj) (reified-methods obj))
+          (protocol-resolve proto method obj)
+          (let* ((ge jch-graph-epoch)
+                 (tags (value-host-tags obj))
+                 (snapshot cache))
+            (memory-order-acquire)
+            (let ((hit (and snapshot
+                            (fx= ge jch-graph-epoch)
+                            (fx= ge (vector-ref snapshot 1))
+                            (fx= jolt-proto-epoch (vector-ref snapshot 0))
+                            (assq tags (vector-ref snapshot 2)))))
+              (if hit
+                  (cdr hit)
+                  (let* ((owned? (and (fx= ge jch-graph-epoch)
+                                     (graph-owned-tags? tags)))
+                         (f (jolt-with-mutex rec-tbl-mu
+                              (let* ((pe jolt-proto-epoch)
+                                     (f (let loop ((ts tags))
+                                          (cond ((null? ts) #f)
+                                                ((find-protocol-method (car ts) proto method))
+                                                (else (loop (cdr ts)))))))
+                                (when (and f owned? (fx= ge jch-graph-epoch)
+                                           (fx= pe jolt-proto-epoch))
+                                  (let* ((current cache)
+                                         (entries (if (and current
+                                                           (fx= pe (vector-ref current 0))
+                                                           (fx= ge (vector-ref current 1)))
+                                                      (vector-ref current 2) '())))
+                                    (unless (assq tags entries)
+                                      (let ((next (vector pe ge
+                                                    (cons (cons tags f)
+                                                      (if (< (length entries) 8)
+                                                          entries
+                                                          (let take ((es entries) (n 7))
+                                                            (if (zero? n) '()
+                                                                (cons (car es)
+                                                                  (take (cdr es) (- n 1))))))))))
+                                        (memory-order-release)
+                                        (set! cache next)))))
+                                f))))
+                    (or f (protocol-miss-throw proto method obj))))))))))
 ;; Fixed-arity entry points the protocol-method shims call: no rest-list, no seq
 ;; round-trip — apply the resolved impl directly. defprotocol emits one clause per
 ;; declared arity that calls the matching dispatchN.

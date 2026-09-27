@@ -186,7 +186,7 @@ install: build
 CI-GATES := submodules values recordinline corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
-  hasheq narrowhash callbackbridges callbackdomains \
+  hasheq narrowhash callbackbridges callbackdomains protocolsite \
   protoret accfix pic narrow directlink directcall durablewalnative arraymap mapseqfold arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
@@ -296,6 +296,11 @@ callbackbridges:
 .PHONY: callbackdomains
 callbackdomains:
 	@$(CHEZ) --script test/chez/callback-domains-test.ss
+
+# Host method sites retain live tags and publish only coherent bounded snapshots.
+.PHONY: protocolsite
+protocolsite:
+	@$(CHEZ) --script test/chez/protocol-method-site-test.ss
 
 # Record predicates/accessors/mutators/constructors are open-coded: the
 # define-record-type in scheme-adapter-runtime.ss binds them as syntax over the

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Add an internal Chez protocol method-resolution site for callers that repeatedly
+  resolve the same protocol/method. Bounded immutable snapshots reuse methods for
+  actual graph-owned host tags while retaining live tag callbacks, registration
+  invalidation, and record/reify dispatch. Registry misses and pruning mutations
+  share the registry lock; callbacks remain outside it. This is an experimental
+  mechanism, not a measured performance claim or a change to ordinary dispatch.
+
 - Add an optional final `:host-table` domain to Chez `__register-eq!` and
   `__register-class!`. Opted-in registrations suppress callbacks outside the
   declared representation (either operand for equality); this includes effects
