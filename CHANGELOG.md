@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Reuse private short-escape byte templates in the Chez Durable WAL encoder,
+  avoiding a tiny allocation per escaped character while preserving canonical
+  bytes and fresh result storage.
+
 - Compile small exact character/class repetitions once in the Chez regex
   backtracker, avoiding per-match closure construction. Expansion is bounded;
   captures, variable/lazy repetition and search alternation priority are retained.

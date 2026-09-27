@@ -535,7 +535,18 @@
   (put-u8 port (hex-digit (bitwise-and (bitwise-arithmetic-shift-right n 4) #xf)))
   (put-u8 port (hex-digit (bitwise-and n #xf))))
 
-(define (jolt-str-durable-wal-bytes s)
+(define jolt-str-durable-wal-bytes
+  ;; These private templates are read-only sources for synchronous port copies.
+  ;; Never expose them as a result: each call still extracts fresh owned storage.
+  (let ((quote-escape (bytevector 92 34))
+        (backslash-escape (bytevector 92 92))
+        (slash-escape (bytevector 92 47))
+        (backspace-escape (bytevector 92 98))
+        (formfeed-escape (bytevector 92 102))
+        (newline-escape (bytevector 92 110))
+        (return-escape (bytevector 92 114))
+        (tab-escape (bytevector 92 116)))
+  (lambda (s)
   (call-with-values open-bytevector-output-port
     (lambda (port extract)
       (put-bytevector port durable-wal-prefix)
@@ -543,14 +554,14 @@
         (unless (= i n)
           (let ((cp (char->integer (string-ref s i))))
             (cond
-              ((= cp 34) (put-bytevector port (bytevector 92 34)))
-              ((= cp 92) (put-bytevector port (bytevector 92 92)))
-              ((= cp 47) (put-bytevector port (bytevector 92 47)))
-              ((= cp 8)  (put-bytevector port (bytevector 92 98)))
-              ((= cp 12) (put-bytevector port (bytevector 92 102)))
-              ((= cp 10) (put-bytevector port (bytevector 92 110)))
-              ((= cp 13) (put-bytevector port (bytevector 92 114)))
-              ((= cp 9)  (put-bytevector port (bytevector 92 116)))
+              ((= cp 34) (put-bytevector port quote-escape))
+              ((= cp 92) (put-bytevector port backslash-escape))
+              ((= cp 47) (put-bytevector port slash-escape))
+              ((= cp 8)  (put-bytevector port backspace-escape))
+              ((= cp 12) (put-bytevector port formfeed-escape))
+              ((= cp 10) (put-bytevector port newline-escape))
+              ((= cp 13) (put-bytevector port return-escape))
+              ((= cp 9)  (put-bytevector port tab-escape))
               ((or (< cp 32) (>= cp 128))
                (if (<= cp #xffff)
                    (durable-wal-put-hex4! port cp)
@@ -561,7 +572,7 @@
             (loop (+ i 1) n))))
       (put-bytevector port durable-wal-suffix)
       ;; Extraction produces private storage; this port is never reused.
-      (na-owned-bv->bytearray (extract)))))
+      (na-owned-bv->bytearray (extract)))))))
 (define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
 (define (jolt-str-replace-all s pat repl) (irregex-replace/all (str-irx pat) s repl))
 (define (jolt-str-replace-first s pat repl) (irregex-replace (str-irx pat) s repl))

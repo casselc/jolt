@@ -50,5 +50,19 @@
 (ok "astral Unicode becomes a UTF-16 surrogate pair"
     (equal? (jvec->list (jolt-str-durable-wal-bytes "😀"))
             (ascii "{\"sql\":\"\\ud83d\\ude00\"}\n")))
+(let* ((sql "\"\\/\b\f\n\r\t")
+       (expected (jvec->list (jolt-str-durable-wal-bytes sql)))
+       (first (jolt-str-durable-wal-bytes sql))
+       (second (jolt-str-durable-wal-bytes sql)))
+  (na-aset-byte first 8 0)
+  (ok "mutating one output leaves another output unchanged"
+      (equal? (jvec->list second) expected))
+  (ok "mutating output cannot corrupt cached escape templates"
+      (equal? (jvec->list (jolt-str-durable-wal-bytes sql)) expected)))
+;; Source-shape guard for the measured cause; runtime ownership is checked above.
+;; This is not a timing or general allocation oracle. The old encoder fails it.
+(let ((source (call-with-input-file "host/chez/java/natives-str.ss" get-string-all)))
+  (ok "short escape writes do not allocate a bytevector per character"
+      (not (contains? source "(put-bytevector port (bytevector 92"))))
 (printf "durable-wal-native-test: ~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
