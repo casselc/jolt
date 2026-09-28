@@ -488,23 +488,19 @@
 (define eq-scalar-arm-snapshot (cons #f '()))
 (define (eq-extension-value? x)
   (not (or (procedure? x) (base-scalar? x))))
-(define register-eq-arm!
-  (case-lambda
-    ((pred handler)
-     (eq-arm-reject-fast-type! 'register-eq-arm! pred)
-     (set! jolt-eq-arms (cons (cons pred handler) jolt-eq-arms)))
-    ((pred handler domain)
-     (unless (eq? domain 'host-value)
-       (error 'register-eq-arm! "unknown equality domain" domain))
-     (let* ((guarded (lambda (a b)
-                       (and (or (eq-extension-value? a)
-                                (eq-extension-value? b)) (pred a b))))
-            (arm (cons guarded handler)))
-       (eq-arm-reject-fast-type! 'register-eq-arm! guarded)
-       (hashtable-set! eq-value-domain-arms arm #t)
-       (set! jolt-eq-arms (cons arm jolt-eq-arms))))))
+(define (register-eq-arm! pred handler)
+  (eq-arm-reject-fast-type! 'register-eq-arm! pred)
+  (set! jolt-eq-arms (cons (cons pred handler) jolt-eq-arms)))
 (define (register-value-eq-arm! pred handler)
-  (register-eq-arm! pred handler 'host-value))
+  ;; Trusted native callers explicitly declare their existing effective
+  ;; predicate owns a non-procedure/non-base-scalar representation. Public
+  ;; :host-table callers already supply their stricter guarded predicate.
+  ;; Keep that predicate unchanged: another guard on every full-registry walk
+  ;; erased the measured benefit. This is opt-in metadata, not inferred purity.
+  (eq-arm-reject-fast-type! 'register-value-eq-arm! pred)
+  (let ((arm (cons pred handler)))
+    (hashtable-set! eq-value-domain-arms arm #t)
+    (set! jolt-eq-arms (cons arm jolt-eq-arms))))
 (define (eq-scalar-arms registry)
   ;; Publish key and value together. Identity includes direct registry restore
   ;; by tests/winders, not just calls through the registration API. Capture the
