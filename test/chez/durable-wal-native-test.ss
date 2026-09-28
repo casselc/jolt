@@ -50,6 +50,22 @@
 (ok "astral Unicode becomes a UTF-16 surrogate pair"
     (equal? (jvec->list (jolt-str-durable-wal-bytes "😀"))
             (ascii "{\"sql\":\"\\ud83d\\ude00\"}\n")))
+(for-each
+  (lambda (n)
+    (let* ((prefix (make-string n #\a))
+           (input (string-append prefix "😀\"/\\\nβ"))
+           (expected (string-append "{\"sql\":\"" prefix
+                      "\\ud83d\\ude00\\\"\\/\\\\\\n\\u03b2\"}\n")))
+      (ok (format "chunk-boundary exact spelling after ~a ASCII scalars" n)
+          (equal? (jvec->list (jolt-str-durable-wal-bytes input)) (ascii expected)))))
+  '(0 1 340 341 342 4083 4084 4085 4095 4096 4097 8168 8192))
+(let* ((input (make-string 5000 #\a))
+       (first (jolt-str-durable-wal-bytes input))
+       (second (jolt-str-durable-wal-bytes input)))
+  (ja-set! first 0 0)
+  (ok "multi-chunk results retain independent owned storage"
+      (and (= 123 (ja-ref second 0))
+           (= (+ 5000 11) (ja-len second)))))
 (let* ((sql "\"\\/\b\f\n\r\t")
        (expected (jvec->list (jolt-str-durable-wal-bytes sql)))
        (first (jolt-str-durable-wal-bytes sql))

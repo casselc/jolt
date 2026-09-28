@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Batch the private Chez Durable WAL encoder's output into bounded blocks,
+  retaining canonical JSONL bytes and fresh result ownership without a second
+  input scan. Full Durable performance qualification is still pending.
+
 - Reuse private short-escape byte templates in the Chez Durable WAL encoder,
   avoiding a tiny allocation per escaped character while preserving canonical
   bytes and fresh result storage.
