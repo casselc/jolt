@@ -2628,7 +2628,9 @@
       ;; record satisfying the protocol via an Object/host-tag default). Fires only on
       ;; a monomorphic site (a megamorphic receiver joins to :any, no :devirt-type).
       ;; The receiver is bound once — it feeds both the resolve and the application.
-      (:devirt-type node)
+      ;; Inference proves receiver shape, not method-Var immutability. Open-world
+      ;; builds must read the live Var, including arbitrary invokable replacements.
+      (and (direct-link?) (:devirt-type node))
       (order-args (fn [as]
                      (let [r (fresh-label "_r$")
                           ;; a site whose impl has a contagion clone resolves the clone
@@ -2667,7 +2669,7 @@
       ;; so an extend-type at runtime can't strand a stale impl. Falls back to a
       ;; direct protocol-resolve (still the per-descriptor fast path) when not inside
       ;; a def. The receiver is bound once and feeds both the resolve and the apply.
-      (:proto node)
+      (and (direct-link?) (:proto node))
       (order-args (fn [as]
                     (let [r (fresh-label "_r$")
                           d (fresh-label "_d$")

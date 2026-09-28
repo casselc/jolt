@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Preserve live protocol-method Vars in `--no-direct-link` builds. Receiver
+  inference alone no longer bypasses a rebound method Var through PIC or
+  devirtualized dispatch. Default direct-linked release builds retain those
+  optimizations and their live protocol-extension invalidation.
+
 - Add the internal Chez `pmap-fold-seq-order` helper: visit persistent-map keys
   and values in actual seq order, including full-hash collision buckets,
   without materializing a whole-map entry sequence. Callback effects occur in

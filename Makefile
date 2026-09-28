@@ -103,7 +103,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa \
-  narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  narrow narrowhash numeric numwp oparity pic protoret protocolvar printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
@@ -168,7 +168,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   smoke tracesmoke errorreport errorkinds buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash callbackbridges callbackdomains \
-  protoret pic narrow directlink directcall arraymap mapseqfold arraybacking unitcontext numeric oparity mathfl flarr \
+  protoret pic narrow directlink protocolvar directcall arraymap mapseqfold arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke testbincurrentsmoke aspectintegrationcheck \
@@ -851,6 +851,10 @@ protoret:
 # runtime invalidates the cache (the epoch bump) so the new impl is served.
 pic:
 	@$(CHEZ) --script host/chez/run-pic.ss
+
+.PHONY: protocolvar
+protocolvar:
+	@$(CHEZ) --script test/chez/protocol-var-rebinding-test.ss
 
 # Under tracing, the tail-frame ring save/restore goes around calls that can push a
 # rib and nowhere else. A site lowering to inline Chez primitives (a proven aget is
