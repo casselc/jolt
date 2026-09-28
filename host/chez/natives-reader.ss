@@ -56,7 +56,7 @@
 
 ;; Register value-equality arm: two reader-conditionals are = when their form
 ;; and splicing? fields match.
-(register-eq-arm!
+(register-value-eq-arm!
   (lambda (a b) (or (jolt-reader-conditional-record? a) (jolt-reader-conditional-record? b)))
   (lambda (a b)
     (and (jolt-reader-conditional-record? a) (jolt-reader-conditional-record? b)

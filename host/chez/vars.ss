@@ -35,7 +35,7 @@
   (lambda (f args) (apply jolt-invoke (var-cell-root f) args)))
 
 ;; two var cells are = iff same ns/name (Clojure var identity).
-(register-eq-arm! (lambda (a b) (or (var-cell? a) (var-cell? b)))
+(register-value-eq-arm! (lambda (a b) (or (var-cell? a) (var-cell? b)))
                   (lambda (a b) (and (var-cell? a) (var-cell? b)
                                      (string=? (var-cell-ns a) (var-cell-ns b))
                                      (string=? (var-cell-name a) (var-cell-name b)))))
