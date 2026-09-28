@@ -168,7 +168,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   smoke tracesmoke errorreport errorkinds buildsmoke aspectsmoke buildlibsmoke staticnativesmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash callbackbridges callbackdomains \
-  protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
+  protoret pic narrow directlink directcall arraymap mapseqfold arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body effects dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke testbincurrentsmoke aspectintegrationcheck \
@@ -889,6 +889,11 @@ directcall:
 # transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
 arraymap:
 	@$(CHEZ) --script test/chez/arraymap-test.ss
+
+# Raw map fold: callback effects match seq order, including full-hash buckets.
+.PHONY: mapseqfold
+mapseqfold:
+	@$(CHEZ) --script test/chez/map-seq-fold-test.ss
 
 # Array backings: which Chez vector type each element kind stores its elements
 # in (fxvector / bytevector / flvector / boxed vector), the fixnum-range

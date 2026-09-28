@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add the internal Chez `pmap-fold-seq-order` helper: visit persistent-map keys
+  and values in actual seq order, including full-hash collision buckets,
+  without materializing a whole-map entry sequence. Callback effects occur in
+  that order; existing map folds and public collection semantics are unchanged.
+
 - Add an optional final `:host-table` domain to Chez `__register-eq!` and
   `__register-class!`. Opted-in registrations suppress callbacks outside the
   declared representation (either operand for equality); this includes effects
