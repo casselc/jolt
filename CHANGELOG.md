@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Keep unrestricted equality registrations in order while skipping explicitly
+  native-value registrations for mixed procedure/base-scalar comparisons.
+  Registry-identity snapshots retain legacy callbacks and invalidate on new
+  registrations or registry restores. Native-value registrations opt in to
+  suppression outside their domain; mixed constructor/Class equality remains.
+
 - Preserve live protocol-method Vars in `--no-direct-link` builds. Receiver
   inference alone no longer bypasses a rebound method Var through PIC or
   devirtualized dispatch. Default direct-linked release builds retain those

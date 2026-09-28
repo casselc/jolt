@@ -257,7 +257,7 @@
 ;; registry exists to prevent: (extend-protocol P java.nio.file.Path …) then
 ;; threw "No method" on a value whose (class …) said java.nio.file.Path.
 (register-str-render! nio-path? (lambda (p) (nio-path-str p)))
-(register-eq-arm! (lambda (a b) (and (nio-path? a) (nio-path? b)))
+(register-value-eq-arm! (lambda (a b) (and (nio-path? a) (nio-path? b)))
                   (lambda (a b) (string=? (nio-path-str a) (nio-path-str b))))
 (register-hash-arm! nio-path? (lambda (p) (string-hash (nio-path-str p))))
 
@@ -684,7 +684,7 @@
   (list (cons "toString" (lambda (self) (jhost-state self)))
         (cons "name"     (lambda (self) (jhost-state self)))))
 (register-str-render! pfp? (lambda (p) (jhost-state p)))
-(register-eq-arm! (lambda (a b) (and (pfp? a) (pfp? b))) (lambda (a b) (string=? (jhost-state a) (jhost-state b))))
+(register-value-eq-arm! (lambda (a b) (and (pfp? a) (pfp? b))) (lambda (a b) (string=? (jhost-state a) (jhost-state b))))
 (register-hash-arm! pfp? (lambda (p) (string-hash (jhost-state p))))
 
 ;; symlinks + hard links + chmod, via libc (jolt-foreign-proc-safe resolves the
@@ -1175,7 +1175,7 @@
   (and c-getpwuid (let ((pw (c-getpwuid uid))) (and (not (= 0 pw)) (nio-cstr-at (sa-foreign-ref 'iptr pw 0))))))
 ;; user-principal values compare and hash by name; getOwner honors NOFOLLOW.
 (define (nio-userprin? x) (and (jhost? x) (string=? (jhost-tag x) "user-principal")))
-(register-eq-arm! (lambda (a b) (and (nio-userprin? a) (nio-userprin? b)))
+(register-value-eq-arm! (lambda (a b) (and (nio-userprin? a) (nio-userprin? b)))
                   (lambda (a b) (string=? (jhost-state a) (jhost-state b))))
 (register-hash-arm! nio-userprin? (lambda (x) (string-hash (jhost-state x))))
 (define (nio-lstat-uid fp)

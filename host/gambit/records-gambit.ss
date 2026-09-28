@@ -819,7 +819,7 @@
     (string-append "#" (jch-munge-segments (jrec-tag r)) "{"
       (jolt-str-join-comma entry-strs) "}")))
 
-(register-eq-arm!
+(register-value-eq-arm!
   (lambda (a b) (or (jrec? a) (jrec? b)))
   (lambda (a b)
     (cond

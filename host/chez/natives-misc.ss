@@ -99,7 +99,7 @@
 (define (juuid-pr u) (string-append "#uuid \"" (juuid-s u) "\""))
 (register-pr-arm! juuid? juuid-pr)
 ;; two uuids are = iff same string.
-(register-eq-arm! (lambda (a b) (or (juuid? a) (juuid? b)))
+(register-value-eq-arm! (lambda (a b) (or (juuid? a) (juuid? b)))
                   (lambda (a b) (and (juuid? a) (juuid? b) (string=? (juuid-s a) (juuid-s b)))))
 
 ;; --- bigint / biginteger -----------------------------------------------------
@@ -135,7 +135,7 @@
 ;; two tagged literals are = iff same tag and (recursively) = form, like the JVM's
 ;; TaggedLiteral — so they work as map keys / set members. (jolt-hash already
 ;; hashes the fields structurally, so eq/hash stay consistent.)
-(register-eq-arm! (lambda (a b) (or (jtagged? a) (jtagged? b)))
+(register-value-eq-arm! (lambda (a b) (or (jtagged? a) (jtagged? b)))
                   (lambda (a b) (and (jtagged? a) (jtagged? b)
                                      (jolt=2 (jtagged-tag a) (jtagged-tag b))
                                      (jolt=2 (jtagged-form a) (jtagged-form b)))))

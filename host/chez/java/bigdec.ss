@@ -439,7 +439,7 @@
         (jbd-compare2 (jbd-coerce a) (jbd-coerce b)))))
 
 ;; equality: a bigdec equals only another bigdec, by value (matching (= 3M 3) = false).
-(register-eq-arm! (lambda (a b) (or (jbigdec? a) (jbigdec? b)))
+(register-value-eq-arm! (lambda (a b) (or (jbigdec? a) (jbigdec? b)))
                   (lambda (a b) (and (jbigdec? a) (jbigdec? b) (jbigdec=? a b))))
 
 ;; == value-equality across the tower — with a double both sides compare as
