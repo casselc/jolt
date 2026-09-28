@@ -55,5 +55,52 @@
     (equal? (durable-bytes "😀")
             (ascii "{\"sql\":\"\\ud83d\\ude00\"}\n")))
 
+(for-each
+  (lambda (n)
+    (let* ((prefix (make-string n #\a))
+           (input (string-append prefix "😀\"/\\\nβ"))
+           (expected (string-append "{\"sql\":\"" prefix
+                      "\\ud83d\\ude00\\\"\\/\\\\\\n\\u03b2\"}\n")))
+      (ok (format "chunk-boundary exact spelling after ~a ASCII scalars" n)
+          (equal? (durable-bytes input) (ascii expected)))))
+  ;; Appended suffix has six scalars: prefixes334/335/336 test n340/341/342.
+  '(0 1 334 335 336 340 341 342 4083 4084 4085 4095 4096 4097 8168 8192))
+(let* ((input (make-string 5000 #\a))
+       (first (jolt-str-durable-wal-bytes input))
+       (second (jolt-str-durable-wal-bytes input)))
+  (ja-set! first 0 0)
+  (ok "multi-chunk results retain independent owned storage"
+      (and (= 123 (ja-ref second 0)) (= (+ 5000 11) (ja-len second)))))
+
+;; Instrument the actual source form, not a hand-copied encoder. Do not alter
+;; runtime primitives or the production binding; only this test's private twin.
+(define port-write-count 0)
+(define (counted-put-bytevector . args)
+  (set! port-write-count (+ port-write-count 1))
+  (apply put-bytevector args))
+(define (counted-put-u8 port byte)
+  (set! port-write-count (+ port-write-count 1))
+  (put-u8 port byte))
+(define (instrument-form form)
+  (cond ((eq? form 'jolt-str-durable-wal-bytes) 'counted-wal-encoder)
+        ((eq? form 'put-bytevector) 'counted-put-bytevector)
+        ((eq? form 'put-u8) 'counted-put-u8)
+        ((pair? form) (cons (instrument-form (car form)) (instrument-form (cdr form))))
+        (else form)))
+(call-with-input-file "host/chez/java/natives-str.ss"
+  (lambda (port)
+    (let loop ((form (read port)))
+      (when (eof-object? form) (error 'wal-gate "encoder definition not found"))
+      (if (and (pair? form) (eq? (car form) 'define)
+               (eq? (if (pair? (cadr form)) (caadr form) (cadr form))
+                    'jolt-str-durable-wal-bytes))
+          (eval (instrument-form form) (interaction-environment))
+          (loop (read port))))))
+(let* ((input (make-string 10000 #\a)) (output (counted-wal-encoder input)))
+  (ok "instrumented twin retains byte-exact output"
+      (equal? (jvec->list output) (durable-bytes input)))
+  (ok "large ASCII WAL uses bounded block port writes, not one per scalar"
+      (<= port-write-count 10)))
+
 (printf "durable-wal-native-test: ~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
