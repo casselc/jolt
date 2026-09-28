@@ -98,13 +98,14 @@
       (guard (e (#t (eq? before jolt-eq-arms)))
         (register-eq-arm! numbers (lambda (a b) #t)) #f))
     (set! calls 0)
-    ;; An explicit domain restricts the effective predicate. Validating its
-    ;; raw callback would violate the opted-in no-callback-outside-domain rule.
-    (register-value-eq-arm! numbers (lambda (a b) #t))
-    (ok "effective native domain suppresses raw scalar registration probes" (= calls 3))
+    ;; Native annotations describe an already-owned representation. Public
+    ;; :host-table callbacks supply their existing guard before this helper.
+    (ok "native metadata still validates its effective predicate"
+      (guard (e (#t (eq? before jolt-eq-arms)))
+        (register-value-eq-arm! numbers (lambda (a b) #t)) #f))
     (set! calls 0)
     (ok "restricted raw scalar claim cannot change numeric equality" (not (jolt=2 1 2)))
-    (ok "numeric fast route invokes no restricted callbacks" (= calls 0))
+    (ok "numeric fast route invokes no rejected callbacks" (= calls 0))
     (let ((before jolt-eq-arms))
       (ok "effective domain still rejects runtime-owned collection claims"
         (guard (e (#t (eq? before jolt-eq-arms)))
