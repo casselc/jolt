@@ -368,8 +368,6 @@
 ;; probes. Keep legacy arm pairs intact for existing registry observers.
 (define eq-value-domain-arms (make-weak-eq-hashtable))
 (define eq-scalar-arm-snapshot (cons #f '()))
-(define (eq-extension-value? x)
-  (not (or (procedure? x) (base-scalar? x))))
 (define (register-eq-arm! pred handler)
   (eq-arm-reject-fast-type! 'register-eq-arm! pred)
   (set! jolt-eq-arms (cons (cons pred handler) jolt-eq-arms)))
