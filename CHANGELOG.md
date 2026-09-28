@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Batch the private Chez Durable WAL encoder's output into bounded blocks,
+  retaining canonical JSONL bytes and fresh result ownership without a second
+  input scan. This does not change the Durable persistence contract.
+
 - Keep unrestricted equality registrations in order while skipping explicitly
   native-value registrations for mixed procedure/base-scalar comparisons.
   Registry-identity snapshots retain legacy callbacks and invalidate on new
