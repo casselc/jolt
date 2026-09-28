@@ -128,10 +128,13 @@
 (define gsz  (anode "(def gsz (fn [s] (let [c (:cell s)] (if (some? c) (asz c) 0))))"))
 (define szuse (anode "(def szuse (fn [b] (+ (usz (mkslot b)) (gsz (mkslot b)))))"))
 (wp-infer! U (jolt-vector celldef slotdef mkslot usz gsz szuse))
+;; Receiver inference permits devirt only in the direct-linked release mode.
+((var-deref "jolt.backend-scheme" "set-direct-link!") #t)
 (define usz-e (emit (run-passes usz (make-analyze-ctx "user") U)))
 (gate-check "(f) nilable receiver does not devirt" (gate-sub? usz-e "devirt-resolve") #f)
 (define gsz-e (emit (run-passes gsz (make-analyze-ctx "user") U)))
 (gate-check "(f) narrowed non-nil receiver still devirts" (gate-sub? gsz-e "devirt-resolve") #t)
+((var-deref "jolt.backend-scheme" "set-direct-link!") #f)
 
 ;; === (c) conflicting join -> reads stay generic ================================
 ;; Box's :v: one ctor site passes a flonum, another a string -> join :any -> no unbox.

@@ -12,6 +12,7 @@
 
 (define analyze (var-deref "jolt.analyzer" "analyze"))
 (define emit    (var-deref "jolt.backend-scheme" "emit"))
+(define set-direct-link! (var-deref "jolt.backend-scheme" "set-direct-link!"))
 (define kw      (lambda (n) (keyword #f n)))
 
 (define (evals src) (jolt-compile-eval (string-append "(do " src ")") "user"))
@@ -30,7 +31,11 @@
   (let* ((ir (analyze (make-analyze-ctx "user") (jolt-ce-read (string-append "(area " recv ")"))))
          (dv (jolt-assoc ir (kw "devirt-type") type (kw "devirt-proto") "user/Shape"
                          (kw "devirt-method") "area")))
-    (emit dv)))
+    ;; This gate exercises release optimization, not open-world Var semantics.
+    (set-direct-link! #t)
+    (let ((emitted (emit dv)))
+      (set-direct-link! #f)
+      emitted)))
 
 (define (run-emit scm) (eval (read (open-input-string scm)) (interaction-environment)))
 
