@@ -63,7 +63,8 @@
                       "\\ud83d\\ude00\\\"\\/\\\\\\n\\u03b2\"}\n")))
       (ok (format "chunk-boundary exact spelling after ~a ASCII scalars" n)
           (equal? (durable-bytes input) (ascii expected)))))
-  '(0 1 340 341 342 4083 4084 4085 4095 4096 4097 8168 8192))
+  ;; Appended suffix has six scalars: prefixes334/335/336 test n340/341/342.
+  '(0 1 334 335 336 340 341 342 4083 4084 4085 4095 4096 4097 8168 8192))
 (let* ((input (make-string 5000 #\a))
        (first (jolt-str-durable-wal-bytes input))
        (second (jolt-str-durable-wal-bytes input)))
