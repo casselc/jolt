@@ -481,9 +481,41 @@
                            (eq-fast-probes)
                            "the jolt=2 / pmap-fast-get fast paths"))
 (define jolt-eq-arms '())
-(define (register-eq-arm! pred handler)
-  (eq-arm-reject-fast-type! 'register-eq-arm! pred)
-  (set! jolt-eq-arms (cons (cons pred handler) jolt-eq-arms)))
+;; Explicit native-value domains exclude pairs containing only procedures and
+;; base scalars. This is a registration contract, never a purity inference from
+;; probes. Keep legacy arm pairs intact for existing registry observers.
+(define eq-value-domain-arms (make-weak-eq-hashtable))
+(define eq-scalar-arm-snapshot (cons #f '()))
+(define (eq-extension-value? x)
+  (not (or (procedure? x) (base-scalar? x))))
+(define register-eq-arm!
+  (case-lambda
+    ((pred handler)
+     (eq-arm-reject-fast-type! 'register-eq-arm! pred)
+     (set! jolt-eq-arms (cons (cons pred handler) jolt-eq-arms)))
+    ((pred handler domain)
+     (unless (eq? domain 'host-value)
+       (error 'register-eq-arm! "unknown equality domain" domain))
+     (let* ((guarded (lambda (a b)
+                       (and (or (eq-extension-value? a)
+                                (eq-extension-value? b)) (pred a b))))
+            (arm (cons guarded handler)))
+       (eq-arm-reject-fast-type! 'register-eq-arm! guarded)
+       (hashtable-set! eq-value-domain-arms arm #t)
+       (set! jolt-eq-arms (cons arm jolt-eq-arms))))))
+(define (register-value-eq-arm! pred handler)
+  (register-eq-arm! pred handler 'host-value))
+(define (eq-scalar-arms registry)
+  ;; Publish key and value together. Identity includes direct registry restore
+  ;; by tests/winders, not just calls through the registration API. Capture the
+  ;; list at equality entry, matching the existing first-match walk semantics.
+  (let ((snapshot eq-scalar-arm-snapshot))
+    (if (eq? registry (car snapshot)) (cdr snapshot)
+        (let ((arms (filter (lambda (arm)
+                              (not (hashtable-ref eq-value-domain-arms arm #f)))
+                            registry)))
+          (set! eq-scalar-arm-snapshot (cons registry arms))
+          arms))))
 (define (jolt=2-base a b)
   (cond
     ((and (jolt-nil? a) (jolt-nil? b)) #t)
@@ -587,7 +619,10 @@
                ((and (char? a) (char? b)) (char=? a b))
                ((and (boolean? a) (boolean? b)) (eq? a b))
                (else #f)))
-        (else (let loop ((as jolt-eq-arms))
+        (else (let loop ((as (if (or (and (procedure? a) (base-scalar? b))
+                                     (and (procedure? b) (base-scalar? a)))
+                                 (eq-scalar-arms jolt-eq-arms)
+                                 jolt-eq-arms)))
                 (cond ((null? as) (jolt=2-base a b)) 
                       (((caar as) a b) ((cdar as) a b)) 
                       (else (loop (cdr as))))))))

@@ -241,7 +241,7 @@
 (define (sorted->plain x) (if (htable-sorted-map? x) (sorted-map->pmap x) (sorted-set->pset x)))
 ;; a sorted coll compares as its plain equivalent: normalize and re-dispatch (the
 ;; normalized values aren't sorted, so this arm won't re-match — the base compares).
-(register-eq-arm! (lambda (a b) (or (htable-sorted? a) (htable-sorted? b)))
+(register-value-eq-arm! (lambda (a b) (or (htable-sorted? a) (htable-sorted? b)))
                   (lambda (a b) (jolt=2 (if (htable-sorted? a) (sorted->plain a) a)
                                         (if (htable-sorted? b) (sorted->plain b) b))))
 ;; a sorted coll hashes as its plain equivalent (jolt-hash recurses through the base).

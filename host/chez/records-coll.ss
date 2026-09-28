@@ -12,7 +12,7 @@
 ;; core.cache's caches, which equiv to their backing map) compares through that
 ;; method, so (= cache {…}) works; a plain record has no equiv and falls back to
 ;; field-wise jrec=? (and a record is never = a plain map).
-(register-eq-arm! (lambda (a b) (or (jrec? a) (jrec? b)))
+(register-value-eq-arm! (lambda (a b) (or (jrec? a) (jrec? b)))
                   (lambda (a b)
                     (cond ((and (jrec? a) (jrec-cl a "equiv")) => (lambda (m) (if (jolt-truthy? (jolt-invoke m a b)) #t #f)))
                           ((and (jrec? b) (jrec-cl b "equiv")) => (lambda (m) (if (jolt-truthy? (jolt-invoke m b a)) #t #f)))

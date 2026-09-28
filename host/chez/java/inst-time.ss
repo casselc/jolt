@@ -337,7 +337,7 @@
           ((jolt=2 k kw-ms) (jinst-ms coll))
           (else d))))
 
-(register-eq-arm! (lambda (a b) (or (jinst? a) (jinst? b)))
+(register-value-eq-arm! (lambda (a b) (or (jinst? a) (jinst? b)))
                   (lambda (a b) (and (jinst? a) (jinst? b) (= (jinst-ms a) (jinst-ms b)))))
 
 (register-hash-arm! jinst? (lambda (x) (jolt-hash (jinst-ms x))))
@@ -356,7 +356,7 @@
 
 ;; java.sql.Date shim values (mk-sql-date jhosts) are equal by kind + epoch-ms.
 (define (time-jhost? x) (and (jhost? x) (member (jhost-tag x) '("sql-date")) #t))
-(register-eq-arm! (lambda (a b) (or (time-jhost? a) (time-jhost? b)))
+(register-value-eq-arm! (lambda (a b) (or (time-jhost? a) (time-jhost? b)))
                   (lambda (a b) (and (time-jhost? a) (time-jhost? b)
                                      (string=? (jhost-tag a) (jhost-tag b))
                                      (= (ms-of a) (ms-of b)))))
@@ -560,7 +560,7 @@
 ;; Two TimeZones with one id are equal and hash alike, as on the JVM (the JVM
 ;; also compares rules, which one id fixes here). The cached-offset slot is
 ;; never part of the comparison.
-(register-eq-arm! (lambda (a b) (or (timezone? a) (timezone? b)))
+(register-value-eq-arm! (lambda (a b) (or (timezone? a) (timezone? b)))
                   (lambda (a b) (and (timezone? a) (timezone? b) (string=? (tz-id a) (tz-id b)))))
 (register-hash-arm! timezone? (lambda (x) (jolt-hash (tz-id x))))
 (register-host-methods! "timezone"

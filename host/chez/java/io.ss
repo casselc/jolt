@@ -2958,7 +2958,7 @@
 ;; and hash already agreed, so two Files built from the same path compared equal
 ;; through the method and unequal through =, which is how ring's resource tests
 ;; read (not (= #object[java.io.File "…/foo.html"] #object[java.io.File "…/foo.html"])).
-(register-eq-arm! (lambda (a b) (or (jfile? a) (jfile? b)))
+(register-value-eq-arm! (lambda (a b) (or (jfile? a) (jfile? b)))
                   (lambda (a b) (and (jfile? a) (jfile? b)
                                      (string=? (jfile-path a) (jfile-path b)))))
 
@@ -2966,7 +2966,7 @@
 ;; serves explicit (.equals …)); hash matches so a URI works as a map key / set
 ;; member (ring/hiccup compare (URI. "/") values).
 (define (uri-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "uri")))
-(register-eq-arm! (lambda (a b) (or (uri-jhost? a) (uri-jhost? b)))
+(register-value-eq-arm! (lambda (a b) (or (uri-jhost? a) (uri-jhost? b)))
                   (lambda (a b) (and (uri-jhost? a) (uri-jhost? b)
                                      (string=? (uri-field a 'string) (uri-field b 'string)))))
 (register-hash-arm! uri-jhost? (lambda (x) (string-hash (uri-field x 'string))))

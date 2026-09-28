@@ -151,7 +151,7 @@
 ;; = compares jclass values by name (stable interning makes this eq?-level);
 ;; strings are no longer = to a jclass — class-key survives for internal
 ;; dispatch boundaries only (multimethod tables, catch dispatch, isa?).
-(register-eq-arm! (lambda (a b) (and (jclass? a) (jclass? b)))
+(register-value-eq-arm! (lambda (a b) (and (jclass? a) (jclass? b)))
                   (lambda (a b) (let ((ka (class-key a)) (kb (class-key b)))
                                   (and ka kb (string=? ka kb) #t))))
 ;; A deftype/defrecord TYPE TOKEN and (class inst) are the same Class object on
@@ -163,7 +163,7 @@
 ;; procedure-hash fast path nothing. Half of this pair alone would be worse than
 ;; neither — that is the shape that makes a hash container answer nil for a key it
 ;; contains.
-(register-eq-arm! (lambda (a b)
+(register-value-eq-arm! (lambda (a b)
                     (or (and (jclass? a) (procedure? b) (deftype-ctor-tag b) #t)
                         (and (jclass? b) (procedure? a) (deftype-ctor-tag a) #t)))
                   (lambda (a b) (let ((ka (class-key a)) (kb (class-key b)))

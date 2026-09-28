@@ -1955,10 +1955,12 @@
              (and (fixnum? mask) (fxlogbit? 2 mask))))
       f
       (lambda (a b) (jolt-invoke f a b))))
-(define (hsc-register-eq! pred handler)
+(define (hsc-register-eq! pred handler . domain)
   (let ((p (hsc-callback2 pred)) (h (hsc-callback2 handler)))
-    (register-eq-arm! (lambda (a b) (jolt-truthy? (p a b)))
-                      (lambda (a b) (jolt-truthy? (h a b)))))
+    (let ((pred (lambda (a b) (jolt-truthy? (p a b))))
+          (handler (lambda (a b) (jolt-truthy? (h a b)))))
+      (if (null? domain) (register-eq-arm! pred handler)
+          (register-value-eq-arm! pred handler))))
   jolt-nil)
 ;; Optional final :host-table is an explicit representation contract, not a
 ;; purity inference: outside that domain NO user callback runs, even if its
@@ -1976,7 +1978,7 @@
      (let ((p (hsc-callback2 pred)))
        (hsc-register-eq!
          (lambda (a b) (and (or (htable? a) (htable? b)) (p a b)))
-         handler)))))
+         handler 'host-value)))))
 (def-var! "clojure.core" "__register-hash!"
   (lambda (pred handler)
     (register-hash-arm! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
@@ -2524,7 +2526,7 @@
         (cons "toString" (lambda (o) (if (opt-present? o)
                                          (string-append "Optional[" (jolt-str-render-one (opt-value o)) "]")
                                          "Optional.empty")))))
-(register-eq-arm! (lambda (a b) (or (opt? a) (opt? b)))
+(register-value-eq-arm! (lambda (a b) (or (opt? a) (opt? b)))
                   (lambda (a b) (and (opt? a) (opt? b) (eq? (opt-present? a) (opt-present? b))
                                      (or (not (opt-present? a)) (jolt=2 (opt-value a) (opt-value b))))))
 
