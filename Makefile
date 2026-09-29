@@ -286,6 +286,7 @@ selfhost:
 # Value-model unit tests (nil/truthiness/collections on Chez).
 values:
 	@$(CHEZ) --script test/chez/values-test.ss
+	@$(CHEZ) --script test/chez/string-builder-materialize.ss
 
 # Registration-time callback adapters retain invocation and equality semantics.
 .PHONY: callbackbridges

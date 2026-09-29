@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Materialize Chez StringBuilder and StringWriter chunks directly into their
+  final positions, avoiding a second reversed chunk list. String contents,
+  retained read snapshots and append/reset behavior are unchanged. Durable
+  throughput qualification is still pending.
+
 - Batch the private Chez Durable WAL encoder's output into bounded blocks,
   retaining canonical JSONL bytes and fresh result ownership without a second
   input scan. Full Durable performance qualification is still pending.
