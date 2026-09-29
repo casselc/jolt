@@ -527,6 +527,19 @@
 (define durable-wal-prefix (bytevector #x7b #x22 #x73 #x71 #x6c #x22 #x3a #x22))
 (define durable-wal-suffix (bytevector #x22 #x7d #x0a))
 
+;; Private, read-only after initialization: 0 means an ordinary ASCII byte,
+;; 1 means a hex escape, and other values are the short-escape suffix byte.
+;; Non-ASCII scalars also use the hex path. Keep the exact default JSON spelling.
+(define durable-wal-ascii-escape
+  (let ((table (make-bytevector 128 0)))
+    (do ((cp 0 (fx+ cp 1))) ((fx= cp 32))
+      (bytevector-u8-set! table cp 1))
+    (for-each
+      (lambda (pair) (bytevector-u8-set! table (car pair) (cdr pair)))
+      '((34 . 34) (92 . 92) (47 . 47) (8 . 98) (12 . 102)
+        (10 . 110) (13 . 114) (9 . 116)))
+    table))
+
 (define (durable-wal-put-hex4! port n)
   (define (hex-digit x) (if (< x 10) (+ 48 x) (+ 87 x)))
   (put-u8 port 92) (put-u8 port 117)
@@ -562,24 +575,24 @@
            (loop i 0))
           (else
            (let* ((cp (char->integer (string-ref s i)))
-                  (short (case cp ((34) 34) ((92) 92) ((47) 47)
-                           ((8) 98) ((12) 102) ((10) 110) ((13) 114) ((9) 116)
-                           (else #f))))
+                  (escape (if (fx< cp 128)
+                              (bytevector-u8-ref durable-wal-ascii-escape cp)
+                              1)))
              (cond
-               (short
+               ((fx= escape 0)
+                (bytevector-u8-set! buffer at cp)
+                (loop (fx+ i 1) (fx+ at 1)))
+               ((not (fx= escape 1))
                 (bytevector-u8-set! buffer at 92)
-                (bytevector-u8-set! buffer (fx+ at 1) short)
+                (bytevector-u8-set! buffer (fx+ at 1) escape)
                 (loop (fx+ i 1) (fx+ at 2)))
-               ((or (fx< cp 32) (fx>= cp 128))
+               (else
                 (if (fx<= cp #xffff)
                     (begin (hex! at cp) (loop (fx+ i 1) (fx+ at 6)))
                     (let ((rest (fx- cp #x10000)))
                       (hex! at (fx+ #xd800 (fxquotient rest #x400)))
                       (hex! (fx+ at 6) (fx+ #xdc00 (fxmodulo rest #x400)))
-                      (loop (fx+ i 1) (fx+ at 12)))))
-               (else
-                (bytevector-u8-set! buffer at cp)
-                (loop (fx+ i 1) (fx+ at 1))))))))))))
+                      (loop (fx+ i 1) (fx+ at 12))))))))))))))
 (define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
 (define (jolt-str-replace-all s pat repl) (irregex-replace/all (str-irx pat) s repl))
 (define (jolt-str-replace-first s pat repl) (irregex-replace (str-irx pat) s repl))

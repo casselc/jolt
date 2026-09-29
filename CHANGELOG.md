@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Classify ASCII escapes with a private lookup table in the Chez Durable WAL
+  encoder. Preserve canonical bytes, bounded per-call scratch and fresh result
+  storage. Full Durable performance qualification remains pending.
+
 - Materialize Chez StringBuilder and StringWriter chunks directly into their
   final positions, avoiding a second reversed chunk list. String contents,
   retained read snapshots and append/reset behavior are unchanged. Durable
