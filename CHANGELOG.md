@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Zero-initialize Chez FFI allocations from a private bounded read-only block,
+  avoiding a full-sized managed zero buffer per native allocation. Preserve
+  zero-filled memory and existing allocation/free ownership. Durable throughput
+  and tail qualification remain pending.
+
 - Classify ASCII escapes with a private lookup table in the Chez Durable WAL
   encoder. Preserve canonical bytes, bounded per-call scratch and fresh result
   storage. Full Durable performance qualification remains pending.
