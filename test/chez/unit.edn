@@ -1,6 +1,6 @@
 [
-  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$.]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
-  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core\\$mm\\$\" s)))" :expected "true"}
+  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (@#'jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$./]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
+  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (@#'jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core/mm\\$\" s)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (java.security.SecureRandom.)] (int? (.nextInt r)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.)] (every? (fn [x] (and (>= x 0) (< x 10))) (repeatedly 500 (fn [] (.nextInt r 10)))))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.) b (byte-array 16)] (.nextBytes r b) [(alength b) (> (count (distinct (seq b))) 4)])" :expected "[16 true]"}
@@ -102,9 +102,12 @@
   {:suite "assert-args" :expr "(:private (meta #'clojure.core/assert-args))" :expected "true"}
   {:suite "assert-args" :expr "(:macro (meta #'clojure.core/assert-args))" :expected "true"}
   {:suite "assert-args" :expr "(seq? (@#'clojure.core/assert-args true \"x\"))" :expected "true"}
-  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m1 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok)) (eval '(aa-m1 [1])))" :expected ":ok"}
-  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m2 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok)) (try (eval '(aa-m2 (1))) (catch IllegalArgumentException e (boolean (re-find #\"aa-m2 requires a vector for its binding\" (ex-message e))))))" :expected "true"}
-  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m3 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\" (even? (count b)) \"an even number of forms in binding vector\") :ok)) (try (eval '(aa-m3 [1 2 3])) (catch IllegalArgumentException e (boolean (re-find #\"aa-m3 requires an even number of forms in binding vector\" (ex-message e))))))" :expected "true"}
+  ;; private, so outside clojure.core only @#' reaches it — a qualified use is the
+  ;; JVM's "not public" (jolt#1095); the rows below define their macros IN core.
+  {:suite "assert-args" :expr "(try (eval '(defmacro aa-m0 [b] (clojure.core/assert-args (vector? b) \"a vector\") :ok)) :compiled (catch Exception e (ex-message e)))" :expected "\"var: #'clojure.core/assert-args is not public\""}
+  {:suite "assert-args" :expr "(do (binding [*ns* (the-ns 'clojure.core)] (eval '(defmacro aa-m1 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok))) (eval '(clojure.core/aa-m1 [1])))" :expected ":ok"}
+  {:suite "assert-args" :expr "(do (binding [*ns* (the-ns 'clojure.core)] (eval '(defmacro aa-m2 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok))) (try (eval '(clojure.core/aa-m2 (1))) (catch IllegalArgumentException e (boolean (re-find #\"aa-m2 requires a vector for its binding\" (ex-message e))))))" :expected "true"}
+  {:suite "assert-args" :expr "(do (binding [*ns* (the-ns 'clojure.core)] (eval '(defmacro aa-m3 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\" (even? (count b)) \"an even number of forms in binding vector\") :ok))) (try (eval '(clojure.core/aa-m3 [1 2 3])) (catch IllegalArgumentException e (boolean (re-find #\"aa-m3 requires an even number of forms in binding vector\" (ex-message e))))))" :expected "true"}
   {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (clojure.repl/demunge \"my_ns$my_fn_QMARK_\"))" :expected "\"my-ns/my-fn?\""}
   {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (ifn? (requiring-resolve 'clojure.repl/demunge)))" :expected "true"}
   {:suite "special-form precedence" :expr "(do (ns sftest (:refer-clojure :exclude [def])) (defmacro def [n v] :shadowed) (clojure.core/defn ff [] 99) (ff))" :expected "99"}
@@ -605,12 +608,12 @@
   ;; existence made a read-only file report writable and every regular file
   ;; report executable, so a caller testing writability before a write took the
   ;; wrong branch and found out at the open.
-  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-ro.txt\") (spit \"/tmp/jolt-access-ro.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-ro.txt\" (fs/str->posix \"r--r--r--\")) (let [f (java.io.File. \"/tmp/jolt-access-ro.txt\")] [(.canRead f) (.canWrite f) (.canExecute f)]))" :expected "[true false false]"}
-  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-rwx.txt\") (spit \"/tmp/jolt-access-rwx.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-rwx.txt\" (fs/str->posix \"rwxr-xr-x\")) (let [f (java.io.File. \"/tmp/jolt-access-rwx.txt\")] [(.canRead f) (.canWrite f) (.canExecute f)]))" :expected "[true true true]"}
-  {:suite "io" :expr "(let [f (java.io.File. \"/tmp/jolt-access-absent-xyz\")] [(.canRead f) (.canWrite f) (.canExecute f)])" :expected "[false false false]"}
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-access-ro.txt\")] (fs/delete-if-exists p) (spit p \"x\") (fs/set-posix-file-permissions p (fs/str->posix \"r--r--r--\")) (let [f (java.io.File. p)] [(.canRead f) (.canWrite f) (.canExecute f)])))" :expected "[true false false]"}
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-access-rwx.txt\")] (fs/delete-if-exists p) (spit p \"x\") (fs/set-posix-file-permissions p (fs/str->posix \"rwxr-xr-x\")) (let [f (java.io.File. p)] [(.canRead f) (.canWrite f) (.canExecute f)])))" :expected "[true true true]"}
+  {:suite "io" :expr "(let [f (java.io.File. (str (System/getProperty \"java.io.tmpdir\") \"/jolt-access-absent-xyz\"))] [(.canRead f) (.canWrite f) (.canExecute f)])" :expected "[false false false]"}
   ;; java.nio.file.Files/isReadable etc. (what babashka.fs/readable? routes to)
   ;; answer from the same predicate, so the two spellings cannot disagree
-  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-ro2.txt\") (spit \"/tmp/jolt-access-ro2.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-ro2.txt\" (fs/str->posix \"r--r--r--\")) [(fs/readable? \"/tmp/jolt-access-ro2.txt\") (fs/writable? \"/tmp/jolt-access-ro2.txt\") (fs/executable? \"/tmp/jolt-access-ro2.txt\")])" :expected "[true false false]"}
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-access-ro2.txt\")] (fs/delete-if-exists p) (spit p \"x\") (fs/set-posix-file-permissions p (fs/str->posix \"r--r--r--\")) [(fs/readable? p) (fs/writable? p) (fs/executable? p)]))" :expected "[true false false]"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File (io/file \"/a/b\")))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File \"/a/b\"))" :expected "false"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (type (io/file \"/a\"))))" :expected "\"class java.io.File\""}
@@ -619,14 +622,44 @@
   {:suite "io" :expr "(do (require (quote [clojure.string :as s])) (boolean (some (fn [p] (s/ends-with? p \"README.md\")) (file-seq \".\"))))" :expected "true"}
   {:suite "io" :expr "(string? (slurp \"README.md\"))" :expected "true"}
   {:suite "io" :label "slurp accepts the IReader used by *in*" :expr "(with-in-str \"one\\ntwo\" (slurp *in*))" :expected "\"one\\ntwo\""}
-  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"hello\") (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"hello\""}
-  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"a\") (spit \"/tmp/jolt-io-test.txt\" \"b\" :append true) (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"ab\""}
+  {:suite "io" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-test.txt\")] (do (spit p \"hello\") (slurp p)))" :expected "\"hello\""}
+  {:suite "io" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-test.txt\")] (do (spit p \"a\") (spit p \"b\" :append true) (slurp p)))" :expected "\"ab\""}
+  ;; spit stages into a temp file and renames over the target, so OVERWRITING is
+  ;; the case that broke on Windows, where a rename onto an existing destination
+  ;; is refused (#1074): the second spit to any path failed, as did the first
+  ;; spit to a File/createTempFile target. The Windows half needs that platform
+  ;; (.github/workflows/tests.yml); these rows keep the POSIX half honest.
+  {:suite "io" :label "spit overwrites an existing file" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-overwrite.txt\")] (do (spit p \"first\") (spit p \"second\") (slurp p)))" :expected "\"second\""}
+  {:suite "io" :label "spit overwrites a file the runtime just created" :expr "(let [f (java.io.File/createTempFile \"jolt-spit\" \".txt\")] (spit f \"written\") (let [v (slurp f)] (.delete f) v))" :expected "\"written\""}
+  ;; The PATH-LIST separator is not the file separator. It is ":" here and ";" on
+  ;; Windows, where ":" is the drive suffix — babashka.fs/split-paths and
+  ;; fs/which read it, and answering ":" there cut every entry in half (#1074).
+  ;; The Windows rows are pinned in test/chez/win-platform-test.ss.
+  {:suite "io" :label "path.separator is the PATH-list separator" :expr "[(System/getProperty \"path.separator\") (System/getProperty \"file.separator\")]" :expected "[\":\" \"/\"]"}
+  {:suite "io" :expr "[java.io.File/pathSeparator java.io.File/pathSeparatorChar java.io.File/separator java.io.File/separatorChar]" :expected "[\":\" \\: \"/\" \\/]"}
+  {:suite "io" :expr "(get (System/getProperties) \"path.separator\")" :expected "\":\""}
+  {:suite "io" :label "split-paths reads the platform separator" :expr "(do (require (quote [babashka.fs :as fs])) (mapv str (fs/split-paths (str \"/a\" (System/getProperty \"path.separator\") \"/b\"))))" :expected "[\"/a\" \"/b\"]"}
+  ;; A Path's ROOT is the prefix that is not a segment. The shim had a POSIX-only
+  ;; one, so on Windows a drive path was a relative path whose first segment was
+  ;; "C:" — fs/absolute? false, getRoot nil, getParent off the drive letter
+  ;; (#1074). These rows are the POSIX half; win-platform-test.ss pins both.
+  {:suite "io" :label "a Path's root, parent and absoluteness" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (fs/path \"/a/b\")] [(fs/absolute? p) (str (.getRoot p)) (str (fs/parent p)) (.getNameCount p)]))" :expected "[true \"/\" \"/a\" 2]"}
+  {:suite "io" :label "the parent of a root is nil" :expr "(do (require (quote [babashka.fs :as fs])) [(fs/parent (fs/path \"/\")) (.getRoot (fs/path \"a/b\")) (fs/absolute? (fs/path \"a/b\"))])" :expected "[nil nil false]"}
+  ;; ".." cannot climb above a root, but survives above a relative path
+  {:suite "io" :label "normalize respects the root" :expr "(do (require (quote [babashka.fs :as fs])) (mapv (fn [x] (str (fs/normalize x))) [\"/a/../..\" \"/a/./b\" \"a/../../b\"]))" :expected "[\"/\" \"/a/b\" \"../b\"]"}
+  ;; java.io.tmpdir must name a directory that is actually there — it read only
+  ;; TMPDIR, which Windows does not set, and answered "/tmp" on any drive (#1074)
+  {:suite "io" :label "java.io.tmpdir names a real directory" :expr "(.isDirectory (java.io.File. (System/getProperty \"java.io.tmpdir\")))" :expected "true"}
+  {:suite "io" :label "createTempFile lands under java.io.tmpdir" :expr "(let [f (java.io.File/createTempFile \"jolt-tmpd\" \".txt\") v (.startsWith (.getPath f) (System/getProperty \"java.io.tmpdir\"))] (.delete f) v)" :expected "true"}
+  ;; File/listRoots enumerates the filesystem roots: one here, one per drive on
+  ;; Windows, where it used to answer "/" and enumerate nothing (#1074)
+  {:suite "io" :expr "(mapv str (java.io.File/listRoots))" :expected "[\"/\"]"}
   {:suite "io" :expr "(flush)" :expected ""}
   ;; .listFiles / file-seq keep the form of the path they were given, like the
   ;; JVM's new File(this, name) — a relative directory lists relative children.
   ;; They used to answer absolute paths, so a caller relativizing the result
   ;; against the directory it passed in (classpath scanning) got ../.. garbage.
-  {:suite "io" :expr "(do (.mkdirs (java.io.File. \"/tmp/jolt-ls-test/d\")) (spit \"/tmp/jolt-ls-test/d/a.txt\" \"x\") (with-out-str (print (mapv str (.listFiles (java.io.File. \"/tmp/jolt-ls-test/d\"))))))" :expected "\"[/tmp/jolt-ls-test/d/a.txt]\""}
+  {:suite "io" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-ls-test/d\")] (do (.mkdirs (java.io.File. d)) (spit (str d \"/a.txt\") \"x\") (with-out-str (print (mapv (fn [f] [(.isAbsolute f) (.getName f)]) (.listFiles (java.io.File. d)))))))" :expected "\"[[true a.txt]]\""}
   {:suite "io" :expr "(do (.mkdirs (java.io.File. \"target/jolt-ls-rel/sub\")) (spit \"target/jolt-ls-rel/sub/a.txt\" \"x\") (mapv str (file-seq (java.io.File. \"target/jolt-ls-rel\"))))" :expected "[\"target/jolt-ls-rel\" \"target/jolt-ls-rel/sub\" \"target/jolt-ls-rel/sub/a.txt\"]"}
   {:suite "io" :expr "(do (.mkdirs (java.io.File. \"target/jolt-ls-rel/sub\")) (mapv str (.listFiles (java.io.File. \"./target/jolt-ls-rel/\"))))" :expected "[\"./target/jolt-ls-rel/sub\"]"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (string? (slurp (io/file \"README.md\"))))" :expected "true"}
@@ -757,6 +790,31 @@
   {:suite "normalizer" :expr "[(java.text.Normalizer/normalize \"ﬁ\" java.text.Normalizer$Form/NFKC) (str java.text.Normalizer$Form/NFKD) (.getName (class java.text.Normalizer$Form/NFC))]" :expected "[\"fi\" \"NFKD\" \"java.text.Normalizer$Form\"]"}
   {:suite "normalizer" :expr "[(java.text.Normalizer/isNormalized \"é\" java.text.Normalizer$Form/NFC) (java.text.Normalizer/isNormalized \"é\" java.text.Normalizer$Form/NFC)]" :expected "[true false]"}
 
+  ;; --- java.text.Normalizer fast paths (gh-1066) -------------------------------
+  ;; normalize/isNormalized no longer rebuild every string through Chez: a
+  ;; per-character classification says which characters begin a normalization
+  ;; segment of their own, so already-normalized runs are copied (or, when the
+  ;; whole string is one, handed straight back) and only the stretches with no
+  ;; boundary reach the normalizer. The rows below are the three classes and the
+  ;; boundaries between them -- host/chez/java/text-normalize.ss.
+  ;; An input that needs no work is the SAME string, not a rebuilt equal one.
+  {:suite "normalizer" :expr "(let [s \"plain ascii\"] (identical? s (java.text.Normalizer/normalize s java.text.Normalizer$Form/NFKC)))" :expected "true"}
+  ;; inert runs, an expansion (fi) and a singleton (OHM SIGN -> OMEGA) interleaved
+  {:suite "normalizer" :expr "(java.text.Normalizer/normalize \"a\ufb01b\u2126c\" java.text.Normalizer$Form/NFKC)" :expected "\"afib\u03a9c\""}
+  ;; an unsafe stretch: the combining acute has no boundary before it, so it is
+  ;; normalized together with the character it belongs to and not on its own
+  {:suite "normalizer" :expr "(vec (map int (java.text.Normalizer/normalize \"ae\u0301b\" java.text.Normalizer$Form/NFC)))" :expected "[97 233 98]"}
+  ;; canonical ordering inside that stretch: dot-above (230) after dot-below (220)
+  {:suite "normalizer" :expr "(vec (map int (java.text.Normalizer/normalize \"q\u0307\u0323\" java.text.Normalizer$Form/NFC)))" :expected "[113 803 775]"}
+  ;; composes BACKWARD: a Hangul jamo and an Indic vowel sign each pull the
+  ;; starter before them into their segment. Splitting there is the miss the
+  ;; pinned table in text-normalize.ss exists to prevent (make normalizecheck).
+  {:suite "normalizer" :expr "[(vec (map int (java.text.Normalizer/normalize \"\u1100\u1161\u11a8\" java.text.Normalizer$Form/NFC))) (vec (map int (java.text.Normalizer/normalize \"\uac00\u11a8\" java.text.Normalizer$Form/NFC))) (vec (map int (java.text.Normalizer/normalize \"\u09c7\u09be\" java.text.Normalizer$Form/NFC)))]" :expected "[[44033] [44033] [2507]]"}
+  {:suite "normalizer" :expr "(vec (map int (java.text.Normalizer/normalize \"\uac01\" java.text.Normalizer$Form/NFD)))" :expected "[4352 4449 4520]"}
+  ;; isNormalized answers at the first character that disagrees, and says true
+  ;; for text it never has to normalize
+  {:suite "normalizer" :expr "[(java.text.Normalizer/isNormalized \"\ufb01 and the rest of a long ascii tail\" java.text.Normalizer$Form/NFKC) (java.text.Normalizer/isNormalized \"plain ascii\" java.text.Normalizer$Form/NFKC) (java.text.Normalizer/isNormalized \"\uac00\u11a8\" java.text.Normalizer$Form/NFC)]" :expected "[false true false]"}
+
   ;; --- CharsetDecoder / CodingErrorAction (gh-946) ----------------------------
   ;; CodingErrorAction had no provider and the decoder's method table held only
   ;; .charset, so the documented way to decode a stream a chunk at a time could
@@ -874,6 +932,51 @@
   {:suite "javastatic" :expr "(let [r (java.io.PushbackReader. (java.io.StringReader. \"ab\"))] [(.read r) (.read r)])" :expected "[97 98]"}
   {:suite "javastatic" :expr "(let [r (PushbackReader. (StringReader. \"ab\")) a (.read r)] (.unread r a) [a (.read r) (.read r)])" :expected "[97 97 98]"}
   {:suite "javastatic" :expr "(let [r (PushbackReader. (StringReader. \"a\"))] (.unread r \\x) [(.read r) (.read r)])" :expected "[120 97]"}
+  ;; PushbackReader.close() is in.close() — it closes the reader it WRAPS
+  ;; (jolt-lang/jolt#1109). It was a no-op, so `with-open` over a PushbackReader —
+  ;; the normal spelling, and the one clojure.core/read callers use — closed
+  ;; nothing at all and the wrapped reader's port stayed open for the life of the
+  ;; process. Only observable where the wrapped reader OWNS a handle: io/reader on
+  ;; a path answers a StringReader here, java.io.FileReader is the streaming one.
+  {:suite "pushback-close" :expr "(let [f (str (System/getProperty \"java.io.tmpdir\") \"/jolt-pbr-close.txt\") _ (spit f \"ab\") r (java.io.FileReader. f) p (java.io.PushbackReader. r)] (.read p) (.close p) (try (.read r) :not-closed (catch Throwable _ :closed)))" :expected ":closed"}
+  {:suite "pushback-close" :expr "(let [closed (atom false) r (reify java.io.Closeable (close [_] (reset! closed true) nil)) p (java.io.PushbackReader. r)] (.close p) @closed)" :expected "true"}
+  ;; ...and still after clojure.core/read has run over it (jolt-lang/jolt#1117):
+  ;; a form read drains the wrapped reader and swaps a StringReader over the
+  ;; unread tail into its place, and close used to close that swap, leaving the
+  ;; file open until a GC -- on Windows, an undeletable file. jolt.loader reads
+  ;; every source file this way.
+  {:suite "pushback-close" :expr "(let [f (str (System/getProperty \"java.io.tmpdir\") \"/jolt-pbr-read-close.txt\") _ (spit f \"(a) (b)\") r (java.io.FileReader. f) p (java.io.PushbackReader. r)] [(read p) (do (.close p) (try (.read r) :not-closed (catch Throwable _ :closed)))])" :expected "[(a) :closed]"}
+  {:suite "pushback-close" :expr "(let [f (str (System/getProperty \"java.io.tmpdir\") \"/jolt-lnpbr-read-close.txt\") _ (spit f \"(a)\") r (java.io.FileReader. f)] (with-open [p (clojure.lang.LineNumberingPushbackReader. r)] (read p false nil)) (try (.read r) :not-closed (catch Throwable _ :closed)))" :expected ":closed"}
+  ;; the line-numbering subclass shares the table, so it delegates identically
+  {:suite "pushback-close" :expr "(let [closed (atom false) r (reify java.io.Closeable (close [_] (reset! closed true) nil)) p (clojure.lang.LineNumberingPushbackReader. r)] (.close p) @closed)" :expected "true"}
+  ;; ...but a wrapped value with NO close is still a no-op rather than a throw:
+  ;; clojure.core's *in* is a reify over IReader, which a JVM PushbackReader could
+  ;; never hold and which has no close to dispatch.
+  {:suite "pushback-close" :expr "(with-in-str \"x\" (do (.close (java.io.PushbackReader. *in*)) :ok))" :expected ":ok"}
+  ;; Files/isHidden is implementation-specific: the leading dot is the POSIX rule,
+  ;; and the DOS attribute is the Windows one (jolt-lang/jolt#1110). These are the
+  ;; POSIX half; the Windows rows are pinned over nio-hidden-for? in
+  ;; test/chez/win-path-test.ss, which is the only place a POSIX runner can reach
+  ;; them. A directory gets no exception on either platform.
+  {:suite "files-hidden" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-hidden-test\") _ (.mkdirs (java.io.File. d)) dot (str d \"/.dotted\") plain (str d \"/plain.clj\")] (spit dot \"x\") (spit plain \"x\") [(java.nio.file.Files/isHidden (java.nio.file.Paths/get dot (make-array String 0))) (java.nio.file.Files/isHidden (java.nio.file.Paths/get plain (make-array String 0)))])" :expected "[true false]"}
+  {:suite "files-hidden" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-hidden-test/.dotdir\")] (.mkdirs (java.io.File. d)) (java.nio.file.Files/isHidden (java.nio.file.Paths/get d (make-array String 0))))" :expected "true"}
+  ;; a path that does not exist answers false rather than raising
+  {:suite "files-hidden" :expr "(java.nio.file.Files/isHidden (java.nio.file.Paths/get \"no-such-file-here.txt\" (make-array String 0)))" :expected "false"}
+  ;; jolt.winsock is the one WSAStartup, shared by jolt.socket, jolt.nrepl and
+  ;; jolt.mvn-http — which used to carry two private copies between them and
+  ;; leave the socket shim with none, so every java.net socket failed on Windows
+  ;; while Maven resolution and nREPL worked (jolt-lang/jolt#1107). Off Windows it
+  ;; is a no-op that still answers, so every caller can say it on the way in.
+  {:suite "winsock" :expr "(do (require (quote jolt.winsock)) (jolt.winsock/ensure!))" :expected "true"}
+  {:suite "winsock" :expr "(do (require (quote jolt.winsock)) [(jolt.winsock/ensure!) (jolt.winsock/ensure!)])" :expected "[true true]"}
+  ;; The four socket numbers that differ by platform. Every one of them answered
+  ;; Linux's value on Windows, which is the other half of why no socket worked
+  ;; there — Winsock is BSD-shaped for all four, and MSG_NOSIGNAL in particular is
+  ;; not merely unnecessary there but an unknown flag that fails the send. A
+  ;; function of the platform, so the Windows row is pinned from this runner.
+  {:suite "winsock" :expr "(do (require (quote jolt.socket)) (jolt.socket/sock-consts-for false true))" :expected "{:sol-socket 65535, :so-reuse 4, :msg-nosignal 0, :fionread 1074030207}"}
+  {:suite "winsock" :expr "(do (require (quote jolt.socket)) (jolt.socket/sock-consts-for true false))" :expected "{:sol-socket 65535, :so-reuse 4, :msg-nosignal 0, :fionread 1074030207}"}
+  {:suite "winsock" :expr "(do (require (quote jolt.socket)) (jolt.socket/sock-consts-for false false))" :expected "{:sol-socket 1, :so-reuse 2, :msg-nosignal 16384, :fionread 21531}"}
   {:suite "javastatic" :expr "(BigInteger. \"123\")" :expected "123"}
   {:suite "javastatic" :expr "(let [m (HashMap. {:a 1 :b 2})] (.get m :b))" :expected "2"}
   {:suite "javastatic" :expr "(let [m (HashMap. {})] (.put m :x 1) (.put m :y 2) (.size m))" :expected "2"}
@@ -1106,6 +1209,27 @@
   {:suite "reader" :expr "(= :done (with-in-str \"\" (read *in* false :done)))" :expected "true"}
   {:suite "reader" :expr "(let [[v s] (with-in-str \"42 rest\" (read+string))] (and (= v 42) (string? s)))" :expected "true"}
   {:suite "reader" :expr "(= [1 2] (with-in-str \"1 2\" [(first (read+string)) (first (read+string))]))" :expected "true"}
+  ;; the 0-arities read *in* when it holds a HOST reader, as the 1-arities do
+  {:suite "reader" :expr "(binding [*in* (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(+ 1 2) :x\"))] [(read) (read)])" :expected "[(+ 1 2) :x]"}
+  {:suite "reader" :expr "(binding [*in* (java.io.PushbackReader. (java.io.StringReader. \"42\"))] (read))" :expected "42"}
+  {:suite "reader" :expr "(binding [*in* (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(+ 1 2)\"))] (read+string))" :expected "[(+ 1 2) \"(+ 1 2)\"]"}
+  ;; a (read) over a program's own Reader takes only the form: the queue-fed
+  ;; proxy below blocks like a terminal's stdin once its chunks run out, so a
+  ;; read that drained to end of input answered :timeout here. The last row is a
+  ;; proxy that does end, read through the same path.
+  {:suite "reader" :expr "(let [q (java.util.concurrent.LinkedBlockingQueue.) cur (atom (java.io.StringReader. \"\")) rd (proxy [java.io.Reader] [] (read ([] (let [c (.read @cur)] (if (neg? c) (do (reset! cur (java.io.StringReader. (.take q))) (.read @cur)) c))) ([b o n] (let [c (.read this)] (aset b o (char c)) 1))) (close [])) r (clojure.lang.LineNumberingPushbackReader. rd)] (.offer q \"(+ 1 2)\\n\") (deref (future (binding [*in* r] (read))) 2000 :timeout))" :expected "(+ 1 2)"}
+  {:suite "reader" :expr "(let [q (java.util.concurrent.LinkedBlockingQueue.) cur (atom (java.io.StringReader. \"\")) rd (proxy [java.io.Reader] [] (read ([] (let [c (.read @cur)] (if (neg? c) (do (reset! cur (java.io.StringReader. (.take q))) (.read @cur)) c))) ([b o n] (let [c (.read this)] (aset b o (char c)) 1))) (close [])) r (clojure.lang.LineNumberingPushbackReader. rd)] (.offer q \"(+ 1\\n\") (.offer q \"2) rest\\n\") (deref (future (binding [*in* r] [(read) (read-line)])) 2000 :timeout))" :expected "[(+ 1 2) \" rest\"]"}
+  {:suite "reader" :expr "(let [q (java.util.concurrent.LinkedBlockingQueue.) cur (atom (java.io.StringReader. \"\")) rd (proxy [java.io.Reader] [] (read ([] (let [c (.read @cur)] (if (neg? c) (do (reset! cur (java.io.StringReader. (.take q))) (.read @cur)) c))) ([b o n] (let [c (.read this)] (aset b o (char c)) 1))) (close [])) r (clojure.lang.LineNumberingPushbackReader. rd)] (.offer q \"#_ skip '\\n\") (.offer q \"foo \\\"a ) b\\\"\\n\") (deref (future [(read r) (read r)]) 2000 :timeout))" :expected "[(quote foo) \"a ) b\"]"}
+  {:suite "reader" :expr "(let [q (java.util.concurrent.LinkedBlockingQueue.) cur (atom (java.io.StringReader. \"\")) rd (proxy [java.io.Reader] [] (read ([] (let [c (.read @cur)] (if (neg? c) (do (reset! cur (java.io.StringReader. (.take q))) (.read @cur)) c))) ([b o n] (let [c (.read this)] (aset b o (char c)) 1))) (close [])) r (clojure.lang.LineNumberingPushbackReader. rd)] (.offer q \"(+ 1 2) x\\n\") (deref (future (binding [*in* r] (read+string))) 2000 :timeout))" :expected "[(+ 1 2) \"(+ 1 2)\"]"}
+  ;; a token ends at a terminating macro character, as the JVM's token read does:
+  ;; the read returns there instead of waiting for the bracket or the line
+  {:suite "reader" :expr "(let [q (java.util.concurrent.LinkedBlockingQueue.) cur (atom (java.io.StringReader. \"\")) rd (proxy [java.io.Reader] [] (read ([] (let [c (.read @cur)] (if (neg? c) (do (reset! cur (java.io.StringReader. (.take q))) (.read @cur)) c))) ([b o n] (let [c (.read this)] (aset b o (char c)) 1))) (close [])) r (clojure.lang.LineNumberingPushbackReader. rd)] (.offer q \"foo(bar\") (deref (future [(read r) (.read r)]) 2000 :timeout))" :expected "[foo 40]"}
+  {:suite "reader" :expr "(let [q (java.util.concurrent.LinkedBlockingQueue.) cur (atom (java.io.StringReader. \"\")) rd (proxy [java.io.Reader] [] (read ([] (let [c (.read @cur)] (if (neg? c) (do (reset! cur (java.io.StringReader. (.take q))) (.read @cur)) c))) ([b o n] (let [c (.read this)] (aset b o (char c)) 1))) (close [])) r (clojure.lang.LineNumberingPushbackReader. rd)] (.offer q \"foo;c\") (deref (future (read r)) 2000 :timeout))" :expected "foo"}
+  ;; read errors over a program's own Reader: the LNPR's ReaderException, and the
+  ;; reader moves past the bad token
+  {:suite "reader" :expr "(let [s (java.io.StringReader. \") 5\") r (clojure.lang.LineNumberingPushbackReader. (proxy [java.io.Reader] [] (read ([] (.read s)) ([b o n] (.read s b o n))) (close [])))] [(try (read r) (catch Exception e [(.getName (class e)) (.getMessage e)])) (read r)])" :expected "[[\"clojure.lang.LispReader$ReaderException\" \"java.lang.RuntimeException: Unmatched delimiter: )\"] 5]"}
+  {:suite "reader" :expr "(let [s (java.io.StringReader. \"\\n(+ 1\") r (clojure.lang.LineNumberingPushbackReader. (proxy [java.io.Reader] [] (read ([] (.read s)) ([b o n] (.read s b o n))) (close [])))] (try (read r) (catch Exception e (.getMessage e))))" :expected "\"java.lang.RuntimeException: EOF while reading, starting at line 2\""}
+  {:suite "reader" :expr "(let [s (java.io.StringReader. \"42\") r (clojure.lang.LineNumberingPushbackReader. (proxy [java.io.Reader] [] (read ([] (.read s)) ([b o n] (.read s b o n))) (close [])))] [(read r) (read r false :eof)])" :expected "[42 :eof]"}
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (= #{1 2} (e0/read-string \"#{1 2}\")))" :expected "true"}
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (uuid? (e0/read-string \"#uuid \\\"550e8400-e29b-41d4-a716-446655440000\\\"\")))" :expected "true"}
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (inst? (e0/read-string \"#inst \\\"2020-01-01T00:00:00Z\\\"\")))" :expected "true"}
@@ -1239,12 +1363,38 @@
   {:suite "str" :expr "[(String/copyValueOf (char-array \"hi\")) (String/copyValueOf (char-array \"abc\") 1 2) (String/valueOf (char-array \"abc\") 1 2)]" :expected "[\"hi\" \"bc\" \"bc\"]"}
   ;; A STATIC resolves by arity too. These are unit rows rather than corpus rows
   ;; because the JVM compiler rejects the call outright — there is no value for the
-  ;; oracle to source, only a compile error — but the runtime report is the JVM's,
-  ;; which for a static names no class.
-  {:suite "str" :expr "(try (String/valueOf (char-array \"abc\") 0) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method valueOf found taking 2 args\""}
+  ;; oracle to source, only a compile error — but the report is the compiler's,
+  ;; which names the class (Clojure 1.12.0: "No matching method valueOf found
+  ;; taking 2 args for class java.lang.String").
+  {:suite "str" :expr "(try (String/valueOf (char-array \"abc\") 0) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method valueOf found taking 2 args for class java.lang.String\""}
   {:suite "str" :expr "(try (String/valueOf 5 1 2) (catch ClassCastException e (.getMessage e)))" :expected "\"class java.lang.Long cannot be cast to class [C\""}
-  {:suite "javastatic" :expr "(try (System/getenv \"HOME\" 1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method getenv found taking 2 args\""}
+  {:suite "javastatic" :expr "(try (System/getenv \"HOME\" 1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method getenv found taking 2 args for class java.lang.System\""}
   {:suite "javastatic" :expr "(map? (System/getenv))" :expected "true"}
+  ;; A member that picks its overload out of a rest list states the JVM's
+  ;; arities (host-static.ss arity rows), so an extra argument is a miss, not a
+  ;; dropped value: each of these used to answer as if the last argument were
+  ;; not there (jolt#1020).
+  {:suite "javastatic" :expr "(mapv (fn [f] (try (f) (catch IllegalArgumentException e (.getMessage e)))) [#(Integer/parseInt \"1\" 10 3) #(Long/valueOf \"1\" 10 3) #(Long/toString 5 10 3) #(System/getProperty \"x\" \"d\" 1) #(Thread/sleep 1 0 1)])" :expected "[\"No matching method parseInt found taking 3 args for class java.lang.Integer\" \"No matching method valueOf found taking 3 args for class java.lang.Long\" \"No matching method toString found taking 3 args for class java.lang.Long\" \"No matching method getProperty found taking 3 args for class java.lang.System\" \"No matching method sleep found taking 3 args for class java.lang.Thread\"]"}
+  {:suite "javastatic" :expr "[(Integer/parseInt \"ff\" 16) (Long/toString 255 16) (System/getProperty \"jolt.no.such.prop\" \"d\")]" :expected "[255 \"ff\" \"d\"]"}
+  ;; java.lang.Math's entries coerce their operands through one wrapper, which
+  ;; used to hide their arity: an extra argument reached Chez's own arity error,
+  ;; naming an anonymous procedure. A proven-double operand takes the flonum
+  ;; lowering, which checks the JVM arity too.
+  {:suite "javastatic" :expr "(mapv (fn [f] (try (f) (catch IllegalArgumentException e (.getMessage e)))) [#(Math/abs 1 2) #(Math/max 1 2 3) #(Math/floor 4.5 1) #(Math/pow 2.0 3.0 4.0)])" :expected "[\"No matching method abs found taking 2 args for class java.lang.Math\" \"No matching method max found taking 3 args for class java.lang.Math\" \"No matching method floor found taking 2 args for class java.lang.Math\" \"No matching method pow found taking 3 args for class java.lang.Math\"]"}
+  ;; a java.lang.Class method is not a static of the class it describes: the dot
+  ;; form calls it on the class value, the static form is a miss
+  {:suite "javastatic" :expr "[(.getName Math) (try (Math/getName) (catch IllegalArgumentException e :miss))]" :expected "[\"java.lang.Math\" :miss]"}
+  ;; BigInteger.toString(radix), the overload jolt's single integer type takes:
+  ;; a radix outside 2..36 renders in base 10, as BigInteger does
+  {:suite "javastatic" :expr "[(.toString (biginteger 255) 16) (.toString (biginteger 255) 1) (.toString (biginteger 255) 37) (try (.toString 5.0 16) (catch IllegalArgumentException e :miss))]" :expected "[\"ff\" \"255\" \"255\" :miss]"}
+  ;; java.lang.Character's case maps and classification, char and int overloads
+  {:suite "javastatic" :expr "[(Character/toUpperCase \\a) (Character/toUpperCase 97) (Character/toUpperCase \\ß) (Character/toLowerCase (char 0x130)) (Character/toTitleCase (char 0x1C6)) (Character/toString 128512) (Character/isAlphabetic 97) (Character/isSpaceChar \\space) (Character/isISOControl (char 7)) (Character/compare \\a \\b) (Character/hashCode \\a) (Character/isJavaIdentifierStart \\$) (Character/isJavaIdentifierPart \\1) (Character/isJavaIdentifierStart \\1)]" :expected "[\\A 65 \\ß \\i \\ǅ \"😀\" true true true -1 97 true true false]"}
+  {:suite "javastatic" :expr "(try (Character/toString -1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"Not a valid Unicode code point: 0x-1\""}
+  ;; java.util.Objects
+  {:suite "javastatic" :expr "[(java.util.Objects/equals 1 1) (java.util.Objects/equals (int-array [1]) (int-array [1])) (java.util.Objects/deepEquals (int-array [1]) (int-array [1])) (java.util.Objects/hash (to-array [\"a\" nil 3])) (java.util.Objects/hashCode nil) (java.util.Objects/toString nil) (java.util.Objects/toString nil \"d\") (java.util.Objects/isNull nil) (java.util.Objects/nonNull nil) (java.util.Objects/requireNonNullElse nil 2) (java.util.Objects/compare 1 2 compare) (java.util.Objects/checkIndex 1 3)]" :expected "[true false true 123011 0 \"null\" \"d\" true false 2 -1 1]"}
+  {:suite "javastatic" :expr "(mapv (fn [f] (try (f) (catch Exception e [(.getSimpleName (class e)) (.getMessage e)]))) [#(java.util.Objects/requireNonNull nil) #(java.util.Objects/requireNonNull nil \"boom\") #(java.util.Objects/requireNonNullElse nil nil) #(java.util.Objects/checkIndex 5 3)])" :expected "[[\"NullPointerException\" nil] [\"NullPointerException\" \"boom\"] [\"NullPointerException\" \"defaultObj\"] [\"IndexOutOfBoundsException\" \"Index 5 out of bounds for length 3\"]]"}
+  ;; Arrays/asList is a fixed-size view of its array
+  {:suite "javastatic" :expr "(let [a (to-array [1 2 3]) l (java.util.Arrays/asList a)] (.set l 0 9) (aset a 2 7) [(vec l) (vec a) (.size l) (.getName (class l)) (count l) (try (.add l 4) (catch UnsupportedOperationException e :unsupported))])" :expected "[[9 2 7] [9 2 7] 3 \"java.util.Arrays$ArrayList\" 3 :unsupported]"}
   ;; the java.lang.Number surface resolves by arity as well; jolt has one integer
   ;; type, so the class it names is Long where the JVM names Integer
   {:suite "javastatic" :expr "(try (.intValue (int 5) 1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method intValue found taking 1 args for class java.lang.Long\""}
@@ -1411,6 +1561,22 @@
   {:suite "sbdirect" :expr "(StringBuffer. nil)" :expected :throws}
   ;; a PrintWriter over a StringBuffer forwards into the shared store
   {:suite "sbdirect" :expr "(let [b (StringBuffer.)] (binding [*out* (java.io.PrintWriter. b)] (print \"hi\")) (str b))" :expected "\"hi\""}
+  ;; a PrintWriter over a proxy java.io.Writer writes through the proxy's own
+  ;; write, not clojure.pprint's -write protocol (which a proxy doesn't implement)
+  {:suite "printwriter-proxy" :expr "(let [sb (StringBuilder.) w (proxy [java.io.Writer] [] (write ([x] (.append sb (str x))) ([b o n] (.append sb (subs (str b) o (+ o n))))) (flush []) (close [])) pw (java.io.PrintWriter. w)] (.write pw \"ab\") (binding [*out* pw] (print \"cd\")) (str sb))" :expected "\"abcd\""}
+  ;; PrintWriter calls a Writer target the way the JDK's does: text as write(s, 0,
+  ;; len) (all a java.io.Writer proxy has to define), a char as write(int), the line
+  ;; separator as write(String), and flush/close as the target's own
+  {:suite "printwriter-proxy" :expr "(let [sb (StringBuilder.) w (proxy [java.io.Writer] [] (write [b o n] (.append sb (subs (str b) o (+ o n)))) (flush []) (close [])) pw (java.io.PrintWriter. w)] (.write pw \"ab\") (.print pw \"cd\") (binding [*out* pw] (print \"ef\")) (str sb))" :expected "\"abcdef\""}
+  {:suite "printwriter-proxy" :expr "(let [log (atom []) w (proxy [java.io.Writer] [] (write ([x] (swap! log conj [1 (if (string? x) x (int x))])) ([b o n] (swap! log conj [3 (subs (str b) o (+ o n))]))) (flush [] (swap! log conj :flush)) (close [] (swap! log conj :close))) pw (java.io.PrintWriter. w)] (.write pw \"ab\") (.write pw (int \\c)) (.write pw \"xyz\" 1 1) (.print pw 42) (.append pw \\t) (.append pw \"0123\" 1 3) (.println pw \"ln\") (.flush pw) (.close pw) @log)" :expected "[[3 \"ab\"] [1 99] [3 \"y\"] [3 \"42\"] [1 116] [3 \"12\"] [3 \"ln\"] [1 \"\\n\"] :flush :close]"}
+  {:suite "printwriter-proxy" :expr "(let [f (str (java.io.File/createTempFile \"pwout\" \".txt\")) pw (java.io.PrintWriter. (clojure.java.io/writer f))] (.write pw \"hi\") (.flush pw) (let [a (slurp f)] (.println pw \"!\") (.close pw) [a (slurp f)]))" :expected "[\"hi\" \"hi!\\n\"]"}
+  {:suite "printwriter-proxy" :expr "(let [sw (java.io.StringWriter.) pw (java.io.PrintWriter. (java.io.PrintWriter. sw))] (.print pw 1) (.println pw :k) (.printf pw \"%s/%s\" (to-array [\"x\" \"y\"])) (.flush pw) (str sw))" :expected "\"1:k\\nx/y\""}
+  ;; pprint and cl-format write to any java.io.Writer base
+  {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (let [sw (java.io.StringWriter.)] (clojure.pprint/pprint {:a 1} sw) (str sw)))" :expected "\"{:a 1}\\n\""}
+  {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (with-out-str (clojure.pprint/pprint [1 2] *out*)))" :expected "\"[1 2]\\n\""}
+  {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (let [sw (java.io.StringWriter.)] (clojure.pprint/pprint {:a 1} (java.io.PrintWriter. sw)) (str sw)))" :expected "\"{:a 1}\\n\""}
+  {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (let [sw (java.io.StringWriter.)] (clojure.pprint/cl-format sw \"~a!\" 1) (str sw)))" :expected "\"1!\""}
+  {:suite "sbdirect" :expr "(let [bos (java.io.ByteArrayOutputStream.) ps (java.io.PrintStream. bos) r (.printf ps \"%d-%s\" (to-array [1 \"b\"]))] (.flush ps) [(str bos) (identical? r ps)])" :expected "[\"1-b\" true]"}
   {:suite "strdirect" :expr "(let [str-trim (fn [_] \"SHADOWED\")] (.trim \"  a  \"))" :expected "\"a\""}
   {:suite "type" :expr "(type 5)" :expected "java.lang.Long"}
   {:suite "type" :expr "(type 5.0)" :expected "java.lang.Double"}
@@ -1862,7 +2028,27 @@
   {:suite "core / PrintWriter-on" :expr "(let [sb (atom nil)] (let [w (PrintWriter-on (fn [s] (reset! sb s)) nil)] (.write w \"hi\") (.flush w)) @sb)" :expected "\"hi\""}
   {:suite "core / PrintWriter-on" :expr "(let [sb (atom nil)] (let [w (PrintWriter-on (fn [s] (reset! sb s)) nil)] (.write w \"a\") (.write w \"b\") (.flush w)) @sb)" :expected "\"ab\""}
   {:suite "core / print-simple" :expr "(with-out-str (print-simple {:a 1} *out*))" :expected "\"{:a 1}\""}
-  {:suite "core / StackTraceElement->vec" :expr "(vec (map StackTraceElement->vec (.getStackTrace (Thread/currentThread))))" :expected "[]"}
+  ;; java.util.SplittableRandom is SplitMix64 step for step; expectations read off
+  ;; the JVM for the same seeds (test.check checks its own port against it)
+  {:suite "splittable-random" :expr "(let [r (java.util.SplittableRandom. 42)] [(.nextLong r) (.nextInt r) (.nextDouble r) (.nextBoolean r)])" :expected "[-4767286540954276203 909395113 0.27860113025513866 true]"}
+  {:suite "splittable-random" :expr "(let [s (.split (java.util.SplittableRandom. 42))] (.nextLong s) [(.nextLong s 1000) (.nextLong s 5 17) (.nextLong s 1024) (.nextInt s 7) (.nextInt s -5 5) (.nextInt s 64)])" :expected "[790 9 22 4 -2 34]"}
+  {:suite "splittable-random" :expr "(let [t (java.util.SplittableRandom. -7)] [(.nextInt t (- Integer/MAX_VALUE 3)) (.nextLong t Long/MIN_VALUE Long/MAX_VALUE) (.nextLong t (- Long/MAX_VALUE 9)) (.nextDouble t 3.5) (.nextDouble t -2.0 2.0)])" :expected "[1812828221 8829294814793142954 8365612164934435592 0.557914739184063 0.26364036713027117]"}
+  {:suite "splittable-random" :expr "(try (.nextLong (java.util.SplittableRandom. 1) 5 5) (catch IllegalArgumentException e (ex-message e)))" :expected "\"bound must be greater than origin\""}
+  ;; a span that overflows to Infinity is drawn at half scale (RandomSupport);
+  ;; a non-finite end is a bad range; a draw that rounds up to a 0.0 bound steps
+  ;; down to -Double/MIN_VALUE (Math/nextDown); an int argument narrows like
+  ;; reflective dispatch's intValue, so 3000000000 arrives negative
+  {:suite "splittable-random" :expr "(let [r (java.util.SplittableRandom. 42)] [(.nextDouble r (- Double/MAX_VALUE) Double/MAX_VALUE) (.nextDouble r -1.0 Double/MAX_VALUE)])" :expected "[8.685190483839085E307 2.87469815467975E307]"}
+  {:suite "splittable-random" :expr "(mapv (fn [[o b]] (try (.nextDouble (java.util.SplittableRandom. 1) o b) (catch IllegalArgumentException e (ex-message e)))) [[0.0 ##Inf] [##-Inf 0.0] [##NaN 1.0] [0.0 ##NaN]])" :expected "[\"bound must be greater than origin\" \"bound must be greater than origin\" \"bound must be greater than origin\" \"bound must be greater than origin\"]"}
+  ;; a fn in evaluated def metadata (clojure.test's :test body) gets the same
+  ;; numeric inference as the init: (long …) is proven long and overflows like
+  ;; the JVM instead of promoting to a bignum
+  ;; a def name's metadata is walked for syntax-quote like the rest of the form
+  {:suite "def-meta-syntax-quote" :expr "(do (def ^{:test (fn [] '`clojure.core/map)} dmq-x 1) ((:test (meta (var dmq-x)))))" :expected "(quote clojure.core/map)"}
+  {:suite "def-meta-numeric" :expr "(do (def dmm-mi Long/MIN_VALUE) (def ^{:test (fn [] (* (long (/ dmm-mi 2)) 3))} dmm-x 1) (try ((:test (meta (var dmm-x)))) (catch ArithmeticException e :overflow)))" :expected ":overflow"}
+  {:suite "splittable-random" :expr "(let [r (java.util.SplittableRandom. 42)] (mapv (fn [_] (= (- Double/MIN_VALUE) (.nextDouble r (- Double/MIN_VALUE) 0.0))) (range 6)))" :expected "[true true true true true true]"}
+  {:suite "splittable-random" :expr "(let [r (java.util.SplittableRandom. 42)] [(try (.nextInt r 3000000000) (catch IllegalArgumentException e (ex-message e))) (try (.nextInt r -3000000000 5) (catch IllegalArgumentException e (ex-message e))) (.nextInt r 3.0e9) (.nextInt r 5.7) (.nextLong r 100000000000000000000N)])" :expected "[\"bound must be positive\" \"bound must be greater than origin\" 1901845031 1 2569641874231381929]"}
+  {:suite "core / StackTraceElement->vec" :expr "(StackTraceElement->vec (first (.getStackTrace (Thread/currentThread))))" :expected "[java.lang.Thread getStackTrace \"Thread.java\" -1]"}
   ;; an unbound var reads as a per-cell sentinel naming its var (JVM Var$Unbound
   ;; parity) on every read surface: a plain compiled read, var-get, and deref/@.
   {:suite "vars / unbound" :expr "(do (declare uv-a) (pr-str uv-a))" :expected "\"#object[clojure.lang.Var$Unbound 0 \\\"Unbound: #'user/uv-a\\\"]\""}
@@ -2003,7 +2189,7 @@
   {:suite "javastatic" :expr "(Math/getExponent 2.0)" :expected "1"}
   {:suite "javastatic" :expr "(Math/getExponent 0.0)" :expected "-1023"}
   ;; Stage D — executor awaitTermination blocks until workers drain
-  {:suite "concurrency" :expr "(do (require '[clojure.core.async :refer [<!!]]) (let [e (java.util.concurrent.Executors/newSingleThreadExecutor) c (java.util.concurrent.CountDownLatch. 1)] (.execute e (fn [] (.countDown c))) (.shutdown e) (.await c) (.awaitTermination e 5000) (.isTerminated e)))" :expected "true"}
+  {:suite "concurrency" :expr "(do (require '[clojure.core.async :refer [<!!]]) (let [e (java.util.concurrent.Executors/newSingleThreadExecutor) c (java.util.concurrent.CountDownLatch. 1)] (.execute e (fn [] (.countDown c))) (.shutdown e) (.await c) (.awaitTermination e 5000 java.util.concurrent.TimeUnit/MILLISECONDS) (.isTerminated e)))" :expected "true"}
   ;; Stage D — ReentrantLock reentrant lock/unlock + hold count
   {:suite "concurrency" :expr "(let [l (java.util.concurrent.locks.ReentrantLock.)] (.lock l) (.lock l) (let [locked (.isLocked l) held (.isHeldByCurrentThread l)] (.unlock l) (.unlock l) [locked held (.isLocked l)]))" :expected "[true true false]"}
   ;; Stage D — ReentrantLock tryLock
@@ -2047,8 +2233,10 @@
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'with-loading-context))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'add-doc-and-meta))" :expected "false"}
  ;; assert-args moved out of the JVM-only set: ported (see the assert-args suite)
- ;; because macro-heavy libraries reach it as @#'clojure.core/assert-args.
- {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'assert-args))" :expected "true"}
+ ;; because macro-heavy libraries reach it as @#'clojure.core/assert-args. It is
+ ;; private, so only the qualified name resolves outside clojure.core, as on the
+ ;; JVM ((resolve 'assert-args) is nil there).
+ {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'clojure.core/assert-args))" :expected "true"}
  ;; amap/areduce are NOT JVM-only: they are index loops over alength/aget/aset/
  ;; aclone, all of which jolt has, so they are implemented in the overlay.
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'amap))" :expected "true"}
@@ -2097,6 +2285,76 @@
                _  (Files/deleteIfExists d)]
            [sz ex mt cpsz mvsz (pos? sz)])))"
    :expected "[5 true 1000 5 5 true]"}
+  ;; file: URLs round trip (jolt-lang/jolt#1118): File.toURI percent-encodes, and
+  ;; the opener did not decode, so a path with a space could not be opened from
+  ;; the URL toURI gave for it; "file:///abs" is the JDK's other spelling.
+  {:suite "file-url" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt url sp\") f (str d \"/x.txt\")] (.mkdirs (java.io.File. d)) (spit f \"payload\") [(slurp (.toURL (.toURI (java.io.File. f)))) (slurp (clojure.java.io/as-url (java.io.File. f))) (slurp (str \"file://\" (.getAbsolutePath (java.io.File. f)))) (boolean (re-find #\"%20\" (str (.toURI (java.io.File. f)))))])" :expected "[\"payload\" \"payload\" \"payload\" true]"}
+  {:suite "file-url" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt url sp\") f (str d \"/x.txt\")] (.mkdirs (java.io.File. d)) (spit f \"payload\") (= (.getAbsolutePath (clojure.java.io/as-file (.toURL (.toURI (java.io.File. f))))) (.getAbsolutePath (java.io.File. f))))" :expected "true"}
+  ;; FileTime (jolt-lang/jolt#1119): from(Instant) looked up a Scheme inst-ms that
+  ;; does not exist, so fs/set-last-modified-time with an Instant raised "variable
+  ;; inst-ms is not bound"; from(long, TimeUnit) is the other JDK overload; and the
+  ;; value reported (class x) => :object.
+  {:suite "nio-filetime" :expr "(str (class (java.nio.file.attribute.FileTime/fromMillis 5)))" :expected "\"class java.nio.file.attribute.FileTime\""}
+  {:suite "nio-filetime" :expr "(instance? java.nio.file.attribute.FileTime (java.nio.file.attribute.FileTime/fromMillis 5))" :expected "true"}
+  {:suite "nio-filetime" :expr "(.toMillis (java.nio.file.attribute.FileTime/from (java.time.Instant/ofEpochMilli 1234)))" :expected "1234"}
+  {:suite "nio-filetime" :expr "(.toMillis (java.nio.file.attribute.FileTime/from 3 java.util.concurrent.TimeUnit/SECONDS))" :expected "3000"}
+  ;; a DIRECTORY's mtime, set from a number and from an Instant, read back to the
+  ;; millisecond. On Windows the CRT's _utime64 cannot open a directory at all, so
+  ;; the set was silently dropped there and kmet's stale-lock test could not
+  ;; back-date its lock directory.
+  {:suite "nio-filetime" :expr "(let [d (Files/createTempDirectory \"jft\" (into-array java.nio.file.attribute.FileAttribute []))] (Files/setLastModifiedTime d (java.nio.file.attribute.FileTime/fromMillis 1600000000123)) (let [a (.toMillis (Files/getLastModifiedTime d (into-array java.nio.file.LinkOption [])))] (Files/setLastModifiedTime d (java.nio.file.attribute.FileTime/from (java.time.Instant/ofEpochMilli 1500000000456))) (let [b (.toMillis (Files/getLastModifiedTime d (into-array java.nio.file.LinkOption [])))] (Files/delete d) [a b])))" :expected "[1600000000123 1500000000456]"}
+  ;; setAttribute of creationTime / lastAccessTime is not a way to set the mtime:
+  ;; the shim wrote every one of the three through to the mtime, so
+  ;; (fs/set-creation-time f t) moved the file's last-modified time.
+  {:suite "nio-filetime" :expr "(let [f (Files/createTempFile \"jfa\" \".txt\" (into-array java.nio.file.attribute.FileAttribute [])) lo (into-array java.nio.file.LinkOption [])] (Files/setLastModifiedTime f (java.nio.file.attribute.FileTime/fromMillis 1600000000000)) (Files/setAttribute f \"creationTime\" (java.nio.file.attribute.FileTime/fromMillis 5000000000) lo) (Files/setAttribute f \"basic:lastAccessTime\" (java.nio.file.attribute.FileTime/fromMillis 6000000000) lo) (let [m (.toMillis (Files/getLastModifiedTime f lo))] (Files/delete f) m))" :expected "1600000000000"}
+  ;; The three basic times are three times (jolt-ow0x): the access time is
+  ;; st_atime / ftLastAccessTime and is set without moving the mtime, whichever
+  ;; of the three reads asks for it.
+  {:suite "nio-filetime" :expr "(let [f (Files/createTempFile \"jfb\" \".txt\" (into-array java.nio.file.attribute.FileAttribute [])) lo (into-array java.nio.file.LinkOption [])] (Files/setLastModifiedTime f (java.nio.file.attribute.FileTime/fromMillis 1600000000000)) (Files/setAttribute f \"lastAccessTime\" (java.nio.file.attribute.FileTime/fromMillis 1100000000000) lo) (let [r [(.toMillis (Files/getAttribute f \"lastAccessTime\" lo)) (.toMillis (.lastAccessTime (Files/readAttributes f java.nio.file.attribute.BasicFileAttributes lo))) (.toMillis (get (Files/readAttributes f \"basic:lastAccessTime,lastModifiedTime\" lo) \"lastAccessTime\")) (.toMillis (Files/getLastModifiedTime f lo))]] (Files/delete f) r))" :expected "[1100000000000 1100000000000 1100000000000 1600000000000]"}
+  ;; The creation time is the birth time where the filesystem keeps one. macOS
+  ;; and Windows can also SET it; Linux cannot, and the JDK ignores the set
+  ;; there, so that half is asked only where it can be answered.
+  {:suite "nio-filetime" :expr "(let [f (Files/createTempFile \"jfc\" \".txt\" (into-array java.nio.file.attribute.FileAttribute [])) lo (into-array java.nio.file.LinkOption []) settable? (not (.startsWith (System/getProperty \"os.name\") \"Linux\"))] (Files/setLastModifiedTime f (java.nio.file.attribute.FileTime/fromMillis 1600000000000)) (Files/setAttribute f \"creationTime\" (java.nio.file.attribute.FileTime/fromMillis 1000000000000) lo) (let [c (.toMillis (Files/getAttribute f \"creationTime\" lo)) r [(if settable? (= c 1000000000000) (<= c (System/currentTimeMillis))) (= c (.toMillis (.creationTime (Files/readAttributes f java.nio.file.attribute.BasicFileAttributes lo)))) (.toMillis (Files/getLastModifiedTime f lo))]] (Files/delete f) r))" :expected "[true true 1600000000000]"}
+  ;; FileTime.toString is ISO-8601 in UTC with the fraction's trailing zeros
+  ;; dropped, and a year at or before 0 written astronomically less one, as
+  ;; FileTime renders it (not as Instant does). str goes through it too.
+  {:suite "nio-filetime" :expr "(mapv #(str (java.nio.file.attribute.FileTime/fromMillis %)) [0 1 1000000000100 1000000000123 -1 -62167219200000 -62198755199990 253402300800000])" :expected "[\"1970-01-01T00:00:00Z\" \"1970-01-01T00:00:00.001Z\" \"2001-09-09T01:46:40.1Z\" \"2001-09-09T01:46:40.123Z\" \"1969-12-31T23:59:59.999Z\" \"-0001-01-01T00:00:00Z\" \"-0002-01-01T00:00:00.01Z\" \"10000-01-01T00:00:00Z\"]"}
+  {:suite "nio-filetime" :expr "(.toString (java.nio.file.attribute.FileTime/fromMillis 1600000000000))" :expected "\"2020-09-13T12:26:40Z\""}
+  ;; A Path is normalized at construction like a File (UnixPath.normalizeAndCheck):
+  ;; separator runs collapse and a trailing one goes, so Paths.get("a//b/") and
+  ;; new File("a//b/") name one string. The Path kept the string as given.
+  {:suite "nio-path-normalize" :expr "[(mapv #(str (java.nio.file.Paths/get % (make-array String 0))) [\"/a//b\" \"a//b/\" \"//a\" \"a/./b\" \"/\" \"\"]) (str (java.nio.file.Paths/get \"a/\" (into-array String [\"/b/\" \"c\"]))) (str (.resolve (java.nio.file.Paths/get \"a/\" (make-array String 0)) \"b//c/\")) (= (java.nio.file.Paths/get \"a/b/\" (make-array String 0)) (java.nio.file.Paths/get \"a/b\" (make-array String 0)))]" :expected "[[\"/a/b\" \"a/b\" \"/a\" \"a/./b\" \"/\" \"\"] \"a/b/c\" \"a/b/c\" true]"}
+  ;; An exception names the path as the caller gave it, as the JDK does: Files
+  ;; and java.io resolve a relative path against user.dir before touching disk,
+  ;; and the message used that resolved string ("/home/me/proj/nope/x").
+  {:suite "io-error-paths" :expr "(let [p #(java.nio.file.Paths/get % (make-array String 0)) m (fn [f] (try (f) :ok (catch Exception e (.getMessage e))))] [(m #(Files/delete (p \"nope-jx/x\"))) (m #(Files/size (p \"nope-jx\"))) (m #(Files/readAllBytes (p \"nope-jx\"))) (m #(Files/createFile (p \"nope-jx/x\") (make-array java.nio.file.attribute.FileAttribute 0))) (m #(Files/move (p \"nope-jx\") (p \"nope-jy\") (make-array java.nio.file.CopyOption 0))) (m #(Files/setLastModifiedTime (p \"nope-jx\") (java.nio.file.attribute.FileTime/fromMillis 0)))])" :expected "[\"nope-jx/x\" \"nope-jx\" \"nope-jx\" \"nope-jx/x\" \"nope-jx\" \"nope-jx\"]"}
+  {:suite "io-error-paths" :expr "(let [m (fn [f] (try (f) :ok (catch Exception e (.getMessage e))))] [(m #(slurp \"nope-jx/x\")) (m #(slurp (java.io.File. \"nope-jx//x\"))) (m #(clojure.java.io/reader \"nope-jx/x\")) (m #(clojure.java.io/reader (clojure.java.io/file \"nope-jx/x\"))) (m #(clojure.java.io/input-stream \"nope-jx/x\")) (m #(spit \"nope-jx/x\" \"a\")) (m #(clojure.java.io/writer \"nope-jx/x\")) (m #(java.io.FileInputStream. \"nope-jx/x\"))])" :expected "[\"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\"]"}
+  ;; A link that could not be made raises the JDK's class: taken name, missing
+  ;; target, missing directory. createLink's message is "link -> existing". Both
+  ;; used to discard link(2)'s result and answer the path regardless.
+  {:suite "nio-links" :expr "(let [d (Files/createTempDirectory \"jln\" (into-array java.nio.file.attribute.FileAttribute [])) a (.resolve d \"a\") b (.resolve d \"b\") fa (into-array java.nio.file.attribute.FileAttribute []) nm (fn [f] (try (f) :made (catch Exception e [(last (clojure.string/split (.getName (class e)) #\"\\.\")) (clojure.string/replace (.getMessage e) (str d) \"D\")])))] (spit (str a) \"x\") (spit (str b) \"y\") (let [r [(nm #(Files/createLink b a)) (nm #(Files/createLink (.resolve d \"c\") (.resolve d \"missing\"))) (nm #(Files/createLink (.resolve d \"no/c\") a)) (nm #(Files/createSymbolicLink b a fa)) (nm #(Files/createSymbolicLink (.resolve d \"no/x\") a fa)) (do (Files/createLink (.resolve d \"ok\") a) (slurp (str (.resolve d \"ok\"))))]] (doseq [f (.listFiles (.toFile d))] (.delete f)) (Files/delete d) r))" :expected "[[\"FileAlreadyExistsException\" \"D/b -> D/a\"] [\"NoSuchFileException\" \"D/c -> D/missing\"] [\"NoSuchFileException\" \"D/no/c -> D/a\"] [\"FileAlreadyExistsException\" \"D/b\"] [\"NoSuchFileException\" \"D/no/x\"] \"x\"]"}
+  ;; fileKey is the (st_dev, st_ino) pair on POSIX, so two hard links to one file
+  ;; share it; Windows answers nil, as the JDK's provider does.
+  {:suite "nio-filetime" :expr "(let [lo (into-array java.nio.file.LinkOption []) f (Files/createTempFile \"jfk\" \".txt\" (into-array java.nio.file.attribute.FileAttribute [])) g (.resolveSibling f (str (.getFileName f) \".lnk\")) h (Files/createTempFile \"jfk\" \".txt\" (into-array java.nio.file.attribute.FileAttribute [])) k #(.fileKey (Files/readAttributes % java.nio.file.attribute.BasicFileAttributes lo))] (Files/createLink g f) (let [r (if (.startsWith (System/getProperty \"os.name\") \"Windows\") [(nil? (k f))] [(= (k f) (k g)) (not= (k f) (k h)) (= (hash (k f)) (hash (k g))) (boolean (re-matches #\"\\(dev=[0-9a-f]+,ino=[0-9]+\\)\" (str (k f)))) (= (str (k f)) (str (Files/getAttribute f \"fileKey\" lo)))])] (Files/delete g) (Files/delete f) (Files/delete h) (every? true? r)))" :expected "true"}
+  ;; A string source is named the way the java.io.File the JDK builds from it
+  ;; would name it: separator runs collapse and a trailing one goes.
+  {:suite "io-error-paths", :expr "(let [m (fn [f] (try (f) :ok (catch Exception e (.getMessage e))))] [(m #(slurp \"nope-jx//x\")) (m #(slurp \"nope-jx//x/\")) (m #(spit \"nope-jx//x\" \"a\")) (m #(clojure.java.io/reader \"nope-jx//x\")) (m #(clojure.java.io/writer \"nope-jx//x\")) (m #(clojure.java.io/input-stream \"nope-jx//x\")) (m #(clojure.java.io/output-stream \"nope-jx//x\")) (m #(java.io.FileInputStream. \"nope-jx//x\")) (m #(java.io.FileOutputStream. \"nope-jx//x\"))])", :expected "[\"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\" \"nope-jx/x (No such file or directory)\"]"}
+  ;; readAttributes honors NOFOLLOW_LINKS in both forms, like getAttribute: a
+  ;; link read as itself is a link, sized by its target string, with its own
+  ;; mtime and file key. It described the target and never said isSymbolicLink.
+  {:suite "nio-attr-nofollow", :expr "(let [fa (into-array java.nio.file.attribute.FileAttribute []) d (Files/createTempDirectory \"jra\" fa) f (.resolve d \"a\") l (.resolve d \"l\") lo (into-array java.nio.file.LinkOption [java.nio.file.LinkOption/NOFOLLOW_LINKS]) no (into-array java.nio.file.LinkOption [])] (spit (str f) \"x\") (Files/createSymbolicLink l f fa) (Files/setLastModifiedTime f (java.nio.file.attribute.FileTime/fromMillis 1600000000000)) (Files/setAttribute l \"lastModifiedTime\" (java.nio.file.attribute.FileTime/fromMillis 1500000000000) lo) (let [a (Files/readAttributes l java.nio.file.attribute.BasicFileAttributes lo) b (Files/readAttributes l java.nio.file.attribute.BasicFileAttributes no) m (Files/readAttributes l \"basic:*\" lo) n (Files/readAttributes l \"*\" no) r [[(.isSymbolicLink a) (.isRegularFile a) (.isDirectory a) (.isOther a) (= (.size a) (count (str f))) (.toMillis (.lastModifiedTime a)) (= (.fileKey a) (.fileKey b))] [(.isSymbolicLink b) (.isRegularFile b) (.size b) (.toMillis (.lastModifiedTime b))] [(get m \"isSymbolicLink\") (get m \"isRegularFile\") (.toMillis (get m \"lastModifiedTime\")) (= (get m \"fileKey\") (Files/getAttribute l \"fileKey\" lo))] [(get n \"isSymbolicLink\") (get n \"size\") (.toMillis (get n \"lastModifiedTime\"))]]] (Files/delete l) (Files/delete f) (Files/delete d) r))", :expected "[[true false false false true 1500000000000 false] [false true 1 1600000000000] [true false 1500000000000 true] [false 1 1600000000000]]"}
+  ;; A failed link keeps its errno, as UnixException does: EACCES is
+  ;; AccessDeniedException, anything unclassed carries strerror as the reason.
+  {:suite "nio-links", :expr "(let [fa (into-array java.nio.file.attribute.FileAttribute []) d (Files/createTempDirectory \"jle\" fa) nm (fn [f] (try (f) :made (catch Exception e [(last (clojure.string/split (.getName (class e)) #\"\\.\")) (clojure.string/replace (.getMessage e) (str d) \"D\")]))) sub (.resolve d \"sub\") ro (.resolve d \"ro\") a (.resolve d \"a\") perms #(Files/setPosixFilePermissions ro (java.nio.file.attribute.PosixFilePermissions/fromString %))] (Files/createDirectory sub fa) (Files/createDirectory ro fa) (spit (str a) \"x\") (perms \"r-xr-xr-x\") (let [r [(nm #(Files/createLink (.resolve d \"c\") sub)) (nm #(Files/createLink (.resolve ro \"c\") a)) (nm #(Files/createSymbolicLink (.resolve ro \"c\") a fa))]] (perms \"rwxr-xr-x\") (Files/delete a) (Files/delete ro) (Files/delete sub) (Files/delete d) r))", :expected "[[\"FileSystemException\" \"D/c -> D/sub: Operation not permitted\"] [\"AccessDeniedException\" \"D/ro/c -> D/a\"] [\"AccessDeniedException\" \"D/ro/c\"]]"}
+  ;; File.setReadable/setWritable/setExecutable/setReadOnly did not exist.
+  {:suite "io-file-perms", :expr "(let [f (java.io.File/createTempFile \"jsw\" \".txt\")] [(.setWritable f false) (.canWrite f) (.setWritable f true) (.canWrite f) (.setReadOnly f) (.canWrite f) (.setWritable f true false) (.setExecutable f true) (.canExecute f) (.setExecutable f false) (.canExecute f) (.setReadable f true) (.canRead f) (do (.delete f) (.setWritable f true))])", :expected "[true false true true true false true true true true false true true false]"}
+  ;; FileTime keeps the JDK's (value, unit): toString to the nanosecond,
+  ;; toMillis/to truncating from the unit (flooring from an Instant), equals and
+  ;; compareTo at full precision, hashCode as the Instant's.
+  {:suite "nio-filetime", :expr "(let [ns java.util.concurrent.TimeUnit/NANOSECONDS us java.util.concurrent.TimeUnit/MICROSECONDS F (fn [n u] (java.nio.file.attribute.FileTime/from n u))] [(mapv str [(F 1500 ns) (F -1500 ns) (F 123456789 us) (F 1600000000123456789 ns)]) (mapv #(.toMillis %) [(F 1500000 ns) (F -1500000 ns) (java.nio.file.attribute.FileTime/from (java.time.Instant/ofEpochSecond -1 500000000))]) (= (F 1000001 ns) (java.nio.file.attribute.FileTime/fromMillis 1)) (= (F 1000000 ns) (java.nio.file.attribute.FileTime/fromMillis 1)) (hash (java.nio.file.attribute.FileTime/fromMillis 1)) (.hashCode (F 1500 ns)) (hash (java.nio.file.attribute.FileTime/fromMillis -1)) (.hashCode (java.nio.file.attribute.FileTime/fromMillis 1600000000123)) (compare (F 1000001 ns) (java.nio.file.attribute.FileTime/fromMillis 1)) (.to (F 1999 ns) us) (.to (F -1999 ns) us) (.to (java.nio.file.attribute.FileTime/fromMillis Long/MAX_VALUE) ns) (.getNano (.toInstant (F 1500 ns)))])", :expected "[[\"1970-01-01T00:00:00.0000015Z\" \"1969-12-31T23:59:59.9999985Z\" \"1970-01-01T00:02:03.456789Z\" \"2020-09-13T12:26:40.123456789Z\"] [1 -1 -500] false true 51000000 76500 -590607552 -716934592 1 1 -1 9223372036854775807 1500]"}
+  ;; A file's times read and set to the nanosecond, and setting the mtime (Files
+  ;; or File.setLastModified) leaves the access time alone.
+  {:suite "nio-filetime", :expr "(let [ns java.util.concurrent.TimeUnit/NANOSECONDS F (fn [n] (java.nio.file.attribute.FileTime/from n ns)) f (Files/createTempFile \"jfn\" \".txt\" (into-array java.nio.file.attribute.FileAttribute [])) no (into-array java.nio.file.LinkOption [])] (Files/setLastModifiedTime f (F 1600000000123456789)) (Files/setAttribute f \"lastAccessTime\" (F 1100000000987654321) no) (Files/setLastModifiedTime f (F 1600000000123456789)) (.setLastModified (.toFile f) 1600000000123) (let [r [(str (Files/getLastModifiedTime f no)) (.toMillis (Files/getLastModifiedTime f no)) (.toMillis (Files/getAttribute f \"lastAccessTime\" no)) (Files/setLastModifiedTime f (F 1600000000123456789)) (= (Files/getLastModifiedTime f no) (java.nio.file.attribute.FileTime/fromMillis 1600000000123)) (str (.lastModifiedTime (Files/readAttributes f java.nio.file.attribute.BasicFileAttributes no)))]] (Files/delete f) (assoc r 3 :set)))", :expected "[\"2020-09-13T12:26:40.123Z\" 1600000000123 1100000000987 :set false \"2020-09-13T12:26:40.123456789Z\"]"}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44* 0) (set! *set-u44* 9))" :expected :throws}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44b* 0) [(binding [*set-u44b* 99] (set! *set-u44b* 42) *set-u44b*) *set-u44b*])" :expected "[42 0]"}
   {:suite "vars / binding dynamic" :expr "(do (def not-dyn-u44 0) (binding [not-dyn-u44 1] not-dyn-u44))" :expected :throws}
@@ -2315,11 +2573,63 @@
   ;; foreign-procedure (ffi lowering). A local shadowing these only clashes when
   ;; the def/ffi/var-cache form is emitted inside that local's scope.
   ;; munge-injective (compiler-review R2 stage 2). munge-name maps ' -> $P, # -> $H,
-  ;; and $ -> $$ (escape-first) so distinct Clojure locals get distinct Scheme ids.
+  ;; | -> $V, and $ -> $$ (escape-first) so distinct Clojure locals get distinct
+  ;; Scheme ids.
   ;; Pre-remint a' and a_PRIME_ both emit a_PRIME_ (old ' -> _PRIME_ substitution),
   ;; so (let [a' 1 a_PRIME_ 2] a') returned 2; post-remint a' emits a$P and returns 1.
   {:suite "munge-injective" :expr "(let [a' 1 a_PRIME_ 2] a')" :expected "1"}
   {:suite "munge-injective" :expr "(let [a' 1 a_PRIME_ 2] a_PRIME_)" :expected "2"}
+  {:suite "munge-injective" :expr "(let [| 1 $V 2] |)" :expected "1"}
+  {:suite "munge-injective" :expr "(let [| 1 $V 2] $V)" :expected "2"}
+  {:suite "munge-injective"
+   :expr "(do (defmacro ||| [x y] `(or ~x ~y)) (||| nil 7))"
+   :expected "7"}
+  ;; The reserved/emitted-name prefix is part of the same injectivity claim. It
+  ;; was a bare `_`, which a user can write: `if` and `_if` both emitted `_if`,
+  ;; so (let [if 1 _if 2] if) answered 2. The prefix is now the $R escape, which
+  ;; no unprefixed munge can start with (an unprefixed $ is always $$/$P/$H/$V/$U).
+  {:suite "munge-injective" :expr "(let [if 1 _if 2] if)" :expected "1"}
+  {:suite "munge-injective" :expr "(let [if 1 _if 2] _if)" :expected "2"}
+  {:suite "munge-injective" :expr "(let [lambda 1 _lambda 2] lambda)" :expected "1"}
+  {:suite "munge-injective" :expr "(let [keyword 1] ((fn [_keyword] keyword) 2))" :expected "1"}
+  {:suite "munge-injective" :expr "(let [if 1] ((fn [_if] if) 2))" :expected "1"}
+  ;; A Clojure symbol both Scheme readers take for a NUMBER: +i/-i, +inf.0 and
+  ;; friends, and a dot-leading or sign-dot-leading decimal. The reference reader
+  ;; yields symbols for all of these; emitted bare they were "invalid bound
+  ;; variable 0+1i" at compile time. Such a name takes the $R prefix too.
+  {:suite "munge-injective"
+   :expr "(let [+i 1 -i 2 .5 3 -.5 4 +.5e1 5 +inf.0 6 -inf.0 7 +nan.0 8 -NaN.0 9] [+i -i .5 -.5 +.5e1 +inf.0 -inf.0 +nan.0 -NaN.0])"
+   :expected "[1 2 3 4 5 6 7 8 9]"}
+  {:suite "munge-injective" :expr "((fn +i [] 1))" :expected "1"}
+  {:suite "munge-injective" :expr "(letfn [(-i [] 2)] (-i))" :expected "2"}
+  ;; near-misses stay bare identifiers on both hosts (a spare prefix would be
+  ;; harmless, but these pin that the common -name/+name shapes are untouched)
+  {:suite "munge-injective" :expr "(let [-invoke 1 +inc 2 -i0 3 .x 4 .. 5] [-invoke +inc -i0 .x ..])" :expected "[1 2 3 4 5]"}
+  ;; A symbol built with (symbol s) can hold any character at all. Every
+  ;; character that is not an identifier constituent on BOTH hosts (whitespace,
+  ;; controls, the reader delimiters " ( ) [ ] { } ; , ` \ and the non-ASCII
+  ;; White_Space chars Chez delimits on) escapes as $U<hex>$, so the emitted
+  ;; Scheme still reads as one identifier — and distinct names stay distinct: a
+  ;; backslash used to be swallowed by the reader, making a\b the same local as ab.
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a b\") 1] (symbol \"a b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a;b\") 1] (symbol \"a;b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a(b\") 1] (symbol \"a(b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a)b\") 1] (symbol \"a)b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\\"b\") 1] (symbol \"a\\\"b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a{b\") 1] (symbol \"a{b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a[b]\") 1] (symbol \"a[b]\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a,b\") 1] (symbol \"a,b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a`b\") 1] (symbol \"a`b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\tb\") 1] (symbol \"a\\tb\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\u00a0b\") 1] (symbol \"a\\u00a0b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\u2028b\") 1] (symbol \"a\\u2028b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\\\b\") 1 'ab 2] (symbol \"a\\\\b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\\\b\") 1 'ab 2] 'ab))" :expected "2"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a b\") 1 (symbol \"a\\u00a0b\") 2] (symbol \"a b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a b\") 1 (symbol \"a\\u00a0b\") 2] (symbol \"a\\u00a0b\")))" :expected "2"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"\") 1] (symbol \"\")))" :expected "1"}
+  ;; the same escapes at a fn's own name and its params, not just a let
+  {:suite "munge-injective" :expr "(eval (list (list 'fn (symbol \"f g\") [(symbol \"x y\")] (symbol \"x y\")) 3))" :expected "3"}
   ;; # reaches munge only as the reader's auto-gensym suffix on #() params
   ;; (p__1#) — a user can't write a #-named local (# is a dispatch char) — so the
   ;; # -> $H case is backend-only. Smoke-test that a #() still munges its gensym
@@ -2554,8 +2864,8 @@
   ;; a bad \\u escape is a proper reader error (ExceptionInfo), not a raw condition.
   {:suite "r8-reader" :expr "(try (read-string \":::foo\") (catch Throwable e :threw))" :expected ":threw"}
   {:suite "r8-reader" :expr "[(read-string \":foo:bar\") (read-string \":ns/foo\") (read-string \":ns//\")]" :expected "[:foo:bar :ns/foo :ns//]"}
-  {:suite "r8-reader" :expr "(try (read-string \"\\\\uABCG\") (catch clojure.lang.ExceptionInfo e :ex) (catch Throwable e :other))" :expected ":ex"}
-  {:suite "r8-reader" :expr "(try (read-string \"\\\"\\\\u041\\\"\") (catch clojure.lang.ExceptionInfo e :ex) (catch Throwable e :other))" :expected ":ex"}
+  {:suite "r8-reader" :expr "(try (read-string \"\\\\uABCG\") (catch IllegalArgumentException e :ex) (catch Throwable e :other))" :expected ":ex"}
+  {:suite "r8-reader" :expr "(try (read-string \"\\\"\\\\u041\\\"\") (catch IllegalArgumentException e :ex) (catch Throwable e :other))" :expected ":ex"}
   {:suite "r8-reader" :expr "[(int (read-string \"\\\\u0041\")) (count (read-string \"\\\"\\\\u0041\\\"\"))]" :expected "[65 1]"}
   {:suite "r7-lazyseq" :expr "(let [a (atom 0) s (lazy-seq (do (swap! a inc) [1]))] (doall (map deref (for [_ (range 8)] (future (doall s))))) @a)" :expected "1"}
   ;; single-threaded realization is memoized: the body/step runs exactly once no
@@ -3089,12 +3399,12 @@
   ;; a read-string that fails at run time is the program's execution error (the
   ;; reference's shape, minus the trace frame it names); the source reads are
   ;; the syntax errors
-  {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (try (read-string \"(\") (catch Throwable e e))))" :expected "\"Execution error (ExceptionInfo) at (REPL:1).\\nEOF while reading\\n\""}
+  {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (try (read-string \"(\") (catch Throwable e e))))" :expected "\"Execution error at (REPL:1).\\nEOF while reading\\n\""}
   {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (try (load-string \"(\") (catch Throwable e e))))" :expected "\"Syntax error reading source at (REPL:1:2).\\nEOF while reading\\n\""}
   ;; ...and repl files what ITS read raised under :read-source, as the
   ;; reference's does around LispReader$ReaderException: the hook sees the
-  ;; phase on a wrapper whose cause is the read diagnostic, with its position
-  {:suite "clojure.main" :expr "(do (require 'clojure.main) (let [seen (atom nil)] (binding [*ns* (create-ns 'replx)] (refer-clojure) (with-out-str (binding [*in* (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(\\n\"))] (clojure.main/repl :caught (fn [e] (reset! seen [(:clojure.error/phase (ex-data e)) (:phase (Throwable->map e)) (ex-message e) (ex-message (ex-cause e)) (clojure.main/err->msg e)])))))) @seen))" :expected "[:read-source :read-source nil \"EOF while reading\" \"Syntax error reading source at (REPL:2:1).\\nEOF while reading\\n\"]"}
+  ;; phase on a wrapper whose cause is that ReaderException, with its position
+  {:suite "clojure.main" :expr "(do (require 'clojure.main) (let [seen (atom nil)] (binding [*ns* (create-ns 'replx)] (refer-clojure) (with-out-str (binding [*in* (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(\\n\"))] (clojure.main/repl :caught (fn [e] (reset! seen [(:clojure.error/phase (ex-data e)) (:phase (Throwable->map e)) (ex-message e) (ex-message (ex-cause e)) (clojure.main/err->msg e)])))))) @seen))" :expected "[:read-source :read-source nil \"java.lang.RuntimeException: EOF while reading, starting at line 1\" \"Syntax error reading source at (REPL:2:1).\\nEOF while reading, starting at line 1\\n\"]"}
   {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (try (load-string \"(let [x] 1)\") (catch Throwable e e))))" :expected "\"Syntax error macroexpanding clojure.core/let at (REPL:1:1).\\nBad binding form, expected matched symbol expression pairs\\n\""}
   {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (ClassCastException. \"class java.lang.String cannot be cast to class java.lang.Number\")))" :expected "\"Execution error (ClassCastException) at (REPL:1).\\nclass java.lang.String cannot be cast to class java.lang.Number\\n\""}
   {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (clojure.lang.ArityException. 0 \"clojure.core//\")))" :expected "\"Execution error (ArityException) at (REPL:1).\\nWrong number of args (0) passed to: clojure.core//\\n\""}
@@ -3161,4 +3471,37 @@
   ;; ZipInputStream over a reify of java.io.InputStream (zip-entries.ss).
   {:suite "zip" :expr "(let [f (java.io.FileInputStream. \"test/chez/fixtures/zip/stored.zip\") inner (reify java.io.InputStream (read [_] (.read f)) (read [_ buf off len] (.read f buf off len)) (close [_] (.close f)))] (with-open [z (java.util.zip.ZipInputStream. inner)] (loop [acc []] (let [e (.getNextEntry z)] (if (nil? e) acc (recur (conj acc [(.getName e) (alength (.readAllBytes z))])))))))" :expected "[[\"a.txt\" 7] [\"b/\" 0] [\"b/random.bin\" 3000] [\"empty.txt\" 0]]"}
   {:suite "zip" :expr "(let [b (java.io.ByteArrayOutputStream.) data (.getBytes (apply str (repeat 50 \"sized \")) \"UTF-8\")] (with-open [z (java.util.zip.ZipOutputStream. b)] (.putNextEntry z (java.util.zip.ZipEntry. \"e.txt\")) (.write z data)) (let [bs (.toByteArray b) cen (loop [i 0] (if (and (= 80 (aget bs i)) (= 75 (aget bs (inc i))) (= 1 (aget bs (+ i 2))) (= 2 (aget bs (+ i 3)))) i (recur (inc i)))) f (java.io.File/createTempFile \"jolt-big\" \".zip\")] (dotimes [k 4] (aset-byte bs (+ cen 24 k) -1)) (try (with-open [o (java.io.FileOutputStream. f)] (.write o bs)) (let [p (str \"jar:file:\" (.getPath f) \"!/e.txt\") _ (jolt.host/reset-maximum-memory-bytes!) base (jolt.host/maximum-memory-bytes) whole (try (jolt.host/jar-entry-string p) (catch java.util.zip.ZipException e (.getMessage e))) peak (- (jolt.host/maximum-memory-bytes) base) streamed (with-open [zf (java.util.zip.ZipFile. f)] (let [e (.getEntry zf \"e.txt\")] [(.getSize e) (alength (.readAllBytes (.getInputStream zf e)))]))] [(.endsWith (str whole) \"invalid entry size (expected 4294967295 but got 300 bytes)\") (< peak 67108864) streamed]) (finally (.delete f)))))" :expected "[true true [4294967295 300]]" :doc "a central-directory size of 0xFFFFFFFF with no Zip64 block (a damaged or crafted jar) is checked against what the entry inflates to, never used to size an allocation: the whole-entry read refuses with the size it found, the peak heap stays under 64 MB (it was a 4 GiB bytevector plus a 4 GiB foreign buffer), and the entry's stream reads its real bytes as ZipFile's does"}
+  ;; The per-type and per-site caches instance?, record method lookup and (Name. …)
+  ;; construction read must follow the registries they cache. Each row caches an
+  ;; answer first, then changes what it was derived from.
+  {:suite "dispatch-caches" :expr "(load-string \"(ns uum.ns) (defprotocol Pum (pum [_])) (deftype Tum []) (def t (Tum.)) (def before (try (.pum t) (catch Exception _ :miss))) (extend-type Tum Pum (pum [_] 5)) [before (.pum t) (pum t)]\")" :expected "[:miss 5 5]"}
+  {:suite "dispatch-caches" :expr "(load-string \"(ns ueq.ns) (deftype Tq [a]) (def t (Tq. 1)) (def before (= t (Tq. 2))) (extend-type Tq clojure.lang.IPersistentCollection (equiv [_ o] true)) [before (= t (Tq. 2))]\")" :expected "[false true]"}
+  {:suite "dispatch-caches" :expr "(load-string \"(ns uic.ns) (defprotocol Pic (pic [_])) (deftype Tic []) (def t (Tic.)) (def before (satisfies? Pic t)) (extend-type Tic Pic (pic [_] 1)) [before (satisfies? Pic t) (instance? uic.ns.Pic t)]\")" :expected "[false true false]"}
+  {:suite "dispatch-caches" :expr "(do (clojure.core/__register-class-ctor! \"uctor.Foo\" (fn [& _] 1)) (defn uctor-mk [] (uctor.Foo.)) (let [a (uctor-mk) b (uctor-mk)] (clojure.core/__register-class-ctor! \"uctor.Foo\" (fn [& _] 2)) [a b (uctor-mk)]))" :expected "[1 1 2]"}
+  ;; instance?'s verdict memo (records-interop.ss instance-check-kind) must answer
+  ;; exactly what the plain arm walk answers, for every kind it memoizes and for
+  ;; hits and misses alike — asked twice, so the second pass reads the memo.
+  {:suite "dispatch-caches" :expr "(do (defprotocol Pmemo (pmemo [_])) (defrecord Rmemo [a] Pmemo (pmemo [_] 1)) (deftype Tmemo [a] clojure.lang.ILookup (valAt [_ k] k) (valAt [_ k d] d)) (let [walk (jolt.host/scheme-eval-string \"(lambda (tn v) (instance-check-walk (jolt-symbol #f tn) v))\") memo (jolt.host/scheme-eval-string \"(lambda (tn v) (instance-check (jolt-symbol #f tn) v))\") nsp (str (ns-name *ns*) \".\") vals [1 1.5 (bigint 1) 1/2 \"s\" :k 'sym \\c true nil [1] {:a 1} #{1} (list 1) () (map inc [1]) (first {:a 1}) (subvec [1 2] 0 1) (->Rmemo 1) (Tmemo. 1) (reify Pmemo (pmemo [_] 1)) (reify clojure.lang.IPersistentMap)] names [\"java.lang.Long\" \"Long\" \"java.lang.Number\" \"Comparable\" \"clojure.lang.BigInt\" \"java.lang.Double\" \"clojure.lang.Ratio\" \"java.lang.String\" \"CharSequence\" \"clojure.lang.Keyword\" \"clojure.lang.IFn\" \"clojure.lang.Symbol\" \"clojure.lang.IObj\" \"clojure.lang.IMeta\" \"clojure.lang.IPersistentVector\" \"clojure.lang.IPersistentMap\" \"clojure.lang.MapEntry\" \"java.util.Map$Entry\" \"clojure.lang.IEditableCollection\" \"clojure.lang.ISeq\" \"clojure.lang.Sequential\" \"clojure.lang.IPending\" \"clojure.lang.IRecord\" \"clojure.lang.ILookup\" \"clojure.lang.Associative\" \"clojure.lang.Counted\" (str nsp \"Pmemo\") (str nsp \"Rmemo\") (str nsp \"Tmemo\") \"java.lang.Class\" \"java.io.File\" \"java.util.Date\"] check (fn [] (vec (for [v vals n names :let [a (memo n v) b (walk n v)] :when (not= (boolean a) (boolean b))] [n v a b])))] [(check) (check)]))" :expected "[[] []]"}
+  ;; (class x) ignores :type metadata (the JVM's getClass); type honours it.
+  {:suite "dispatch-caches" :expr "(do (defrecord Rty [a]) (let [r (with-meta (->Rty 1) {:type :foo})] [(= (class r) (class (->Rty 1))) (type r)]))" :expected "[true :foo]"}
+  ;; no class arm may claim a value the (class x) fast path answers: the runtime's
+  ;; own arms, checked after boot, and a library's, refused as it registers
+  {:suite "dispatch-caches" :expr "((jolt.host/scheme-eval-string \"(lambda () (length (class-arms-claiming-fast-types)))\"))" :expected "0"}
+  ;; two deftype/record values are answered by jolt=2 ahead of the equality arms
+  ;; (records-coll.ss jrec-equiv=?): no arm registered before records.ss built its
+  ;; probe may claim the pair, and a library arm that does is refused
+  {:suite "dispatch-caches" :expr "((jolt.host/scheme-eval-string \"(lambda () (length (filter (lambda (arm) ((car arm) jrec-fast-type-probe jrec-fast-type-probe)) jolt-eq-arms)))\"))" :expected "0"}
+  {:suite "dispatch-caches" :expr "((jolt.host/scheme-eval-string \"(lambda () (guard (e (#t #t)) (eq-arm-reject-fast-type! 'probe (lambda (a b) (and (jrec? a) (jrec? b)))) #f))\"))" :expected "true"}
+  {:suite "dispatch-caches" :expr "(try (clojure.core/__register-class! (fn [x] (vector? x)) (fn [_] \"my.Vec\") (fn [_] [\"my.Vec\"])) :registered (catch Exception e :refused))" :expected ":refused"}
+  {:suite "dispatch-caches" :expr "(do (clojure.core/__register-class! (fn [x] (and (map? x) (= :uclass-probe (:uclass-kind x)) false)) (fn [_] \"my.Map\") (fn [_] [\"my.Map\"])) (class 1))" :expected "java.lang.Long"}
+  ;; an (instance? T x) site's cached answer must follow every change that can
+  ;; move it: a redefinition, a library arm arriving later, a varying T
+  {:suite "dispatch-caches" :expr "(load-string \"(ns uis1.ns) (defprotocol P (p [_])) (deftype T [] P (p [_] 1)) (defn chk [x] (instance? uis1.ns.P x)) (def a (chk (T.))) (def b (chk (T.))) (deftype T []) [a b (chk (T.)) (chk (T.))]\")" :expected "[true true false false]"}
+  {:suite "dispatch-caches" :expr "(load-string \"(ns uis2.ns) (defn chk [x] (instance? uis2.Thing x)) (def before [(chk :a) (chk :b)]) (clojure.core/__register-instance-check! (fn [cn v] (when (and (= cn \\\"uis2.Thing\\\") (keyword? v)) true))) [before (chk :a) (chk \\\"s\\\")]\")" :expected "[[false false] true false]"}
+  {:suite "dispatch-caches" :expr "(do (defn uis3-chk [c x] (instance? c x)) [(uis3-chk String \"s\") (uis3-chk Long \"s\") (uis3-chk String 1) (uis3-chk Long 1) (uis3-chk String \"t\")])" :expected "[true false false true true]"}
+  {:suite "dispatch-caches" :expr "(do (defn uis4-chk [x] [(instance? clojure.lang.IPersistentMap x) (instance? java.util.Map x) (instance? Object x)]) [(uis4-chk {}) (uis4-chk {}) (uis4-chk nil) (uis4-chk [])])" :expected "[[true true true] [true true true] [false false false] [false false true]]"}
+  ;; a library's class predicate may call map?/coll?/vector? on any value; on a
+  ;; deftype those used to ask instance?, which asked the predicate again — an
+  ;; unbounded recursion (hung 0.8.11) once the type had been redefined
+  {:suite "dispatch-caches" :expr "(do (clojure.core/__register-class! (fn [x] (and (map? x) (coll? x) (vector? x) false)) (fn [_] \"uhang.C\") (fn [_] [\"uhang.C\"])) (load-string \"(ns uhang.ns) (defprotocol P (p [_])) (deftype T [] P (p [_] 1)) (deftype T []) [(satisfies? P (T.)) (instance? uhang.ns.P (T.)) (map? (T.))]\"))" :expected "[false false false]"}
 ]

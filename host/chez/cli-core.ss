@@ -398,6 +398,15 @@
   ;; entries. Without it a hook registered from a worker would be invisible to a
   ;; System/exit here.
   (jolt-install-exit-handler!)
+  ;; …and take SIGTERM/SIGHUP/SIGINT over on the same thread, for the same reason
+  ;; it has to be this one: nothing but a thread itself can mask a signal in it,
+  ;; so a watcher armed later — on the first shutdown hook, which a dependency may
+  ;; register from a worker — would leave the PRIMORDIAL thread unmasked and the
+  ;; kernel would deliver here, to SIG_DFL or to Chez's keyboard-interrupt
+  ;; handler, with the hooks unrun either way. A JVM arms its signal dispatcher at
+  ;; startup and answers 128+signal with the hooks run whoever registered them;
+  ;; this is the point where jolt can do the same (concurrency.ss).
+  (jolt-arm-shutdown!)
   (guard (v (#t (jolt-report-uncaught v)))
     ;; Host faults (a condition raised outside jolt-throw) get their k / marks /
     ;; site captured HERE: a with-exception-handler runs before the stack
@@ -422,6 +431,23 @@
 
 (define (jolt-cli-dispatch cli-args prepare-build!)
     (cond
+      ;; --build-worker MANIFEST — internal: a `jolt build` compiling app units in
+      ;; parallel runs copies of itself with this (build.ss bld-run-jobs-parallel!).
+      ;; Ahead of everything else so a worker started in a project directory never
+      ;; resolves the project.
+      ((and (pair? cli-args) (string=? (car cli-args) "--build-worker") (pair? (cdr cli-args)))
+       (prepare-build!)
+       ((var-deref "jolt.host" "build-compile-worker") (cadr cli-args)))
+      ;; …and asks this first, so it never hands a worker argv to something that
+      ;; is not a jolt (under the dev launcher the process is a plain Chez).
+      ((and (pair? cli-args) (string=? (car cli-args) "--build-worker-probe"))
+       (display "jolt-build-worker\n"))
+      ;; --aot-worker MANIFEST — internal: the run-path AOT cache compiling its
+      ;; misses off the startup path (loader.ss aot-enqueue-compile!), spawned by
+      ;; a run whose launcher set jolt-standalone-binary. Ahead of project
+      ;; resolution, like --build-worker.
+      ((and (pair? cli-args) (string=? (car cli-args) "--aot-worker") (pair? (cdr cli-args)))
+       ((var-deref "jolt.host" "aot-compile-worker") (cadr cli-args)))
       ;; -e EXPR [args…] — evaluate one expression and print it (blank for nil).
       ;; Each top-level form is read, compiled, and evaled in sequence so each
       ;; form is visible to the next, matching JVM load semantics. The argv after

@@ -7,15 +7,18 @@
 # in jolt-core, so any drift fails CI. Regenerate after an intended change:
 #   grep -rhoE --include='*.ss' 'def-var! "jolt.host" "[^"]+"' host/ \
 #     | sed -E 's/.*"jolt.host" "([^"]+)".*/\1/' | LC_ALL=C sort -u
+add-immutable-roots!
 add-reader-features!
 add-shutdown-hook
 allow-unresolved-vars?
+aot-compile-worker
 as-subvec
 array-value?
 available-processors
 backtrace-string
 block-sigint
 build-binary
+build-compile-worker
 build-library
 bytes-allocated
 call-cc
@@ -42,6 +45,7 @@ delete-tree!
 directory?
 dispatch-macros
 embed-plan
+embedded-resource?
 enable-trace!
 entry-at
 escape-fn?
@@ -53,6 +57,8 @@ extension-value
 fiber-carrier-count
 fiber-carrier-count-set!
 fiber-instance?
+fiber-interrupt!
+fiber-masked
 fiber-monitor!
 fiber-park-commit!
 fiber-preempt-ticks
@@ -62,6 +68,7 @@ fiber-result
 fiber-spawn
 fiber-state
 fiber-to-scheduler!
+fiber-unmasked
 fiber-yield
 fiber?
 file-exists?
@@ -163,6 +170,7 @@ mark-spliced!
 maximum-memory-bytes
 reset-maximum-memory-bytes!
 gc-trip-bytes
+gc-old-growth-bytes
 mkdirs!
 monitor-enter
 monitor-exit

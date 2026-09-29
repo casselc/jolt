@@ -96,43 +96,49 @@
 ;; so adding a flavor above needs no second edit to keep them in step.
 (define sk-count        24)
 
-;; The cseq record (head tail forced? kind cvec ci crest lock meta, chez-cseq-v7)
-;; is defined in values.ss with the other collection layouts, ahead of every
+;; The cseq record (head tail kind meta, chez-cseq-v8) and its vector-backed
+;; subtype cseqv (+ cvec ci crest) are defined in values.ss with the other collection layouts, ahead of every
 ;; dispatcher.
 ;; A cell's tail is ONE published word: the thunk (a procedure or a lazy-src
-;; descriptor) until it is forced, #f for a vector-backed cell whose tail follows
+;; descriptor) or a lazy seq -- (cons x a-lazy-seq), which is the reference's Cons
+;; with a LazySeq _more -- until it is forced, #f for a vector-backed cell whose tail follows
 ;; from its own fields, and whatever the thunk answered after -- a cseq, jolt-nil,
 ;; or () from a producer whose result is empty (filter's, say; jolt-seq coerces
 ;; it at every use). Pending is therefore a type test on that word and realized
 ;; is its complement, so a reader that finds an answer there is done without a
 ;; lock on any thread: a single aligned word store cannot tear, and every read
-;; of what it points to is a dependent load. The forced? field mirrors the answer
-;; for the image (the layout is frozen) and is written after the tail; nothing
-;; decides from it. Macros, not procedures: this test is on the path of every
-;; element of every lazy chain, and a cseq -- the common answer -- is one check.
+;; of what it points to is a dependent load. While a thread runs a pending tail
+;; the word is a tail-claim holding it (cell-force-claimed!, below): pending too.
+;; Macros, not procedures: this test is on the path of every element of every
+;; lazy chain, and a cseq -- the common answer -- is one check.
 (define-syntax seq-tail-pending?
-  (syntax-rules () ((_ t) (let ((st t)) (or (procedure? st) (lazy-src? st) (not st))))))
+  ;; #f first: a vector-backed (chunked) cell's word, on every element of a walk
+  (syntax-rules () ((_ t) (let ((st t)) (or (not st) (procedure? st) (lazy-src? st) (jolt-lazyseq? st) (tail-claim? st))))))
 (define-syntax seq-tail-realized?
   (syntax-rules () ((_ t) (let ((st t)) (or (cseq? st) (not (seq-tail-pending? st)))))))
 (define-syntax cseq-forced?
   (syntax-rules () ((_ s) (seq-tail-realized? (cseq-tail s)))))
-;; the lock field's position, for the compare-and-swap that claims a cell
-;; (force-claimed!, below). Checked at load: a wrong index would corrupt a
+;; A running tail's claim: the pending word it replaced, the fiber or thread
+;; running it, and this process's token -- a claim that arrives in a state image
+;; belongs to a force that is not running, and is put back on the way to claiming.
+(define-record-type tail-claim (fields tail owner token) (nongenerative jolt-tail-claim-v1))
+;; the tail's position, for the compare-and-swap that claims a cell
+;; (cell-force-claimed!, below). Checked at load: a wrong index would corrupt a
 ;; neighbouring field silently.
-(define cseq-lock-index 7)
-(let ((c (make-cseq 'h 't #t 0 #f 0 #f #f jolt-nil)))
-  (unless (and (sa-record-cas! c cseq-lock-index #f 'probe)
-               (eq? (cseq-lock c) 'probe)
-               (not (sa-record-cas! c cseq-lock-index #f 'again))
-               (eq? (cseq-head c) 'h) (eq? (cseq-tail c) 't) (eq? (cseq-crest c) #f))
-    (error 'seq.ss "cseq-lock-index does not address the lock field")))
+(define cseq-tail-index 1)
+(let ((c (make-cseq 'h 't 0 jolt-nil)))
+  (unless (and (sa-record-cas! c cseq-tail-index 't 'probe)
+               (eq? (cseq-tail c) 'probe)
+               (not (sa-record-cas! c cseq-tail-index 't 'again))
+               (eq? (cseq-head c) 'h) (eqv? (cseq-kind c) 0))
+    (error 'seq.ss "cseq-tail-index does not address the tail field")))
 ;; tail already a seq. The /k variants take the flavor; the bare ones are the
 ;; generic cell, which is the overwhelming majority of call sites.
-(define (cseq-realized head tail) (make-cseq head tail #t sk-cons #f 0 #f #f jolt-nil))
-(define (cseq-realized/k head tail kind) (make-cseq head tail #t kind #f 0 #f #f jolt-nil))
-(define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk #f sk-cons #f 0 #f #f jolt-nil))
-(define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk #f kind #f 0 #f #f jolt-nil))
-(define (cseq-list head tail) (make-cseq head tail #t sk-list #f 0 #f #f jolt-nil))   ; a PersistentList node
+(define (cseq-realized head tail) (make-cseq head tail sk-cons jolt-nil))
+(define (cseq-realized/k head tail kind) (make-cseq head tail kind jolt-nil))
+(define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk sk-cons jolt-nil))
+(define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk kind jolt-nil))
+(define (cseq-list head tail) (make-cseq head tail sk-list jolt-nil))   ; a PersistentList node
 
 ;; --- a lazy cell's thunk, as DATA ---------------------------------------------
 ;; A thunk built in Scheme carries its captured values where nothing can read
@@ -171,7 +177,10 @@
 (define (lazy-src-force t) ((lazy-src-fn t) (lazy-src-a t) (lazy-src-b t)))
 ;; a cseq's unforced tail is either a thunk or a descriptor, same as a lazy
 ;; cell's. One record predicate on the force path, measured at no cost.
-(define (cseq-run-tail t) (if (lazy-src? t) (lazy-src-force t) (t)))
+(define (cseq-run-tail t)
+  (cond ((lazy-src? t) (lazy-src-force t))
+        ((jolt-lazyseq? t) (force-lazyseq t))
+        (else (t))))
 
 ;; forced tail of a seq whose own tail was not yet realized (jolt-rest)
 (define lz-rest
@@ -198,6 +207,20 @@
     (lambda (n end+step) (range-chunked n (car end+step) (cdr end+step) sk-repeat))))
 (define lz-iterate
   (register-lazy-src! 'iterate (lambda (f x) (jolt-iterate f (jolt-invoke1 f x)))))
+;; (repeat x) / (repeat n x): clojure.lang.Repeat, one lazy cell per element whose
+;; tail holds x and how many elements follow it (#f = unbounded), so a drop can
+;; skip ahead instead of walking (repeat-skip), as Repeat's IDrop does.
+(define lz-repeat-val
+  (register-lazy-src! 'repeat-val (lambda (x left) (repeat-cells x left))))
+(define (repeat-cells x n)            ; the first N elements (#f = all of them)
+  (if (and n (<= n 0))
+      jolt-empty-list
+      (cseq-lazy/k x (make-lazy-src lz-repeat-val x (and n (- n 1))) sk-repeat)))
+(define jolt-repeat
+  (case-lambda
+    ((x) (repeat-cells x #f))
+    ;; Repeat.create takes a long: a nil count throws, 2.7 is 2
+    ((n x) (repeat-cells x (jolt-long-cast n)))))
 (define lz-map-chunk
   (register-lazy-src! 'map-chunk
     (lambda (f s) (jolt-seq (map-seq f (jolt-seq (na-chunk-rest s)))))))
@@ -220,16 +243,26 @@
     (else (cseq-lazy (seq-first s) (make-lazy-src lz-take-walk (fx- n 1) s)))))
 (define lz-take-walk
   (register-lazy-src! 'take-walk (lambda (n s) (take-walk n (jolt-seq (seq-more s))))))
+;; How many elements a take/drop count steps over. clojure.core counts down with
+;; (dec n) while (pos? n), so a positive count is ceil(n) steps whatever its type:
+;; (take 1.5 xs) is two elements, (take 1/2 xs) one. Answers a fixnum, or 'all for
+;; a count no fixnum reaches (+inf.0, a bigint, 1e30) — the countdown never ends
+;; there, so a take takes everything. A count that is not a number is handed back
+;; unchanged, for the fixnum ops below to refuse as they always have.
+(define (take-drop-count n)
+  (cond ((fixnum? n) (if (fx<=? n 0) 0 n))
+        ((not (real? n)) n)
+        ((not (> n 0)) 0)                       ; zero, negative, NaN
+        ((and (flonum? n) (infinite? n)) 'all)
+        (else (let ((k (exact (ceiling n)))) (if (fixnum? k) k 'all)))))
 (define lz-take
   (register-lazy-src! 'take
     (lambda (n coll)
       (jolt-seq
-       (if (and (flonum? n) (infinite? n))
-           (if (> n 0.0) (jolt-seq coll) jolt-empty-list)
-           (let ((n (->idx n)))
-             (if (fx<=? n 0)
-                 jolt-empty-list                 ; (take 0 coll) must not seq its source
-                 (take-walk n (jolt-seq coll)))))))))
+       (let ((n (take-drop-count n)))
+         (cond ((eq? n 'all) (jolt-seq coll))
+               ((fx<=? n 0) jolt-empty-list)    ; (take 0 coll) must not seq its source
+               (else (take-walk n (jolt-seq coll)))))))))
 ;; clojure.core/list? — Clojure's (instance? IPersistentList x), which among the
 ;; seq flavors only PersistentList is.
 (define (cseq-list? s) (fx=? (cseq-kind s) sk-list))
@@ -257,7 +290,7 @@
 ;; pvec is a PersistentTreeMap$Seq that happens to be vector-backed. Keeping the
 ;; two independent is what lets the class answer stay right while the O(1)
 ;; count/chunk fast paths keep keying off cvec alone.
-(define (cseq-vec head v i kind) (make-cseq head #f #f kind v i #f #f jolt-nil))
+(define (cseq-vec head v i kind) (make-cseqv head #f kind jolt-nil v i #f))
 ;; A ChunkedCons cell over a standalone chunk pvec: head is chunk[i], walking
 ;; (seq-more) advances within the chunk and then continues into `rest`. `rest` is
 ;; the already-coerced after-chunk seq (cseq | jolt-nil | a jolt-lazyseq), held in
@@ -282,9 +315,9 @@
 ;; A ChunkedCons by default; `kind` lets a producer that chunks say what it really
 ;; is instead (a bounded range chunks, and is a LongRange).
 (define (cseq-chunked chunk i rest)
-  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f sk-chunked-cons chunk i rest #f jolt-nil))
+  (make-cseqv (pvec-nth-d chunk i jolt-nil) #f sk-chunked-cons jolt-nil chunk i rest))
 (define (cseq-chunked/k chunk i rest kind)
-  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f kind chunk i rest #f jolt-nil))
+  (make-cseqv (pvec-nth-d chunk i jolt-nil) #f kind jolt-nil chunk i rest))
 ;; The tail of a cvec-bearing cell. Two shapes share the field: a ChunkedCons
 ;; (crest set — cvec is a standalone <=32 chunk, and the after-chunk seq follows)
 ;; and a vector-backed index seq (crest #f — cvec is the whole backing vector).
@@ -304,13 +337,13 @@
             (if force? (jolt-seq cr) cr))
         (if (fx>=? i1 (pvec-count v))
             jolt-nil
-            (make-cseq (pvec-nth-d v i1 jolt-nil) #f #f (cseq-kind s) v i1 #f #f jolt-nil)))))
+            (make-cseqv (pvec-nth-d v i1 jolt-nil) #f (cseq-kind s) jolt-nil v i1 #f)))))
 (define (seq-first s) (cseq-head s))
 ;; --- forcing once, without a mutex per cell -----------------------------------
 ;; Reading a cell needs no lock (seq-tail-realized?, above). What still needs
-;; exclusion is running a tail thunk exactly once when two threads reach the
-;; same unforced cell together, and that is a CLAIM, not a lock: the forcing
-;; thread swaps the cell's lock field from #f to a claim, runs the thunk,
+;; exclusion is running a tail thunk exactly once when two forcers (threads, or
+;; fibers) reach the same unforced cell together, and that is a CLAIM, not a lock:
+;; the forcer swaps the cell's lock field from #f to a claim, runs the thunk,
 ;; publishes the tail, and swaps it back. Two compare-and-swaps and no mutex,
 ;; so a program with a million lazy cells and a thread allocates nothing for
 ;; them but the claim pair -- where a mutex per cell made every collection
@@ -318,60 +351,91 @@
 ;; process (a Chez mutex is a finalized object the collector visits: measured,
 ;; ~20x the cost of a vector its size).
 ;;
-;; A thread that finds a cell claimed by ANOTHER thread waits for the tail to
-;; appear: it spins a little, since a tail thunk is usually a few dozen
-;; nanoseconds of work, and then sleeps in growing steps up to a millisecond.
-;; Not a mutex, because a mutex can only make a thread wait if the runner held
-;; it across the thunk, and that acquire/release pair is what this design
-;; exists to avoid; not a condition variable, because waiting on one from a
-;; fiber is refused (locks.ss) and forcing a seq must never park. The runner
-;; counts the run as a held lock (jolt-locks-enter!) for exactly that reason:
-;; a fiber cannot park inside a tail thunk and cannot be preempted there, so a
-;; runner and a waiter are never fibers on the same carrier, and a waiter that
-;; sleeps only ever waits on a thread that is making progress. A thunk that
-;; reaches its OWN cell -- the claim is this thread's -- runs it again, which
-;; is the reference's reentrant monitor: an infinite recursion there, not a
-;; wait on itself. A thunk that raises leaves the tail pending and the claim
-;; released; the next forcer runs it again, as before.
+;; A forcer that finds a cell claimed by ANOTHER owner waits for the tail to
+;; appear. Not on a mutex, because a mutex can only make a waiter wait if the
+;; runner held it across the thunk, and that acquire/release pair is what this
+;; design exists to avoid.
 ;;
-;; The claim is (token . thread-id), with a token unique to THIS process: a
-;; cell that arrives from a state image carries whatever its lock field held
-;; when it was written -- a mutex, from a runtime that kept one per cell, or a
-;; claim of the process that was mid-force -- and neither is live. Anything in
-;; the field that is not this process's claim is stale and is cleared on the
-;; way to claiming.
+;; The owner is the FIBER when the forcer runs on one, and the thread otherwise
+;; (the loader's claims are keyed the same way, loader.ss ldr-load-ctx). Fibers
+;; multiplex a carrier's thread, so a thread-id claim would read a sibling fiber's
+;; claim as this forcer's own and walk into its half-run thunk. Keyed by fiber, a
+;; thunk may do what any other code does -- wait on a lock, sleep, take from a
+;; channel -- because a claim held across a park is still only its fiber's. That
+;; is the JVM's LazySeq, whose sval is a monitor held across whatever the thunk
+;; blocks on (jolt-lang/jolt#1142: an ordinary DB call inside (doall (map f xs))
+;; on a fiber failed whenever another fiber held the DB's lock). It is also why
+;; the claim's release is a jolt-finally-in winder (values.ss): a park is an
+;; escape that is not an exit, and must not give the claim up.
+;;
+;; A waiter waits in the way its context allows:
+;;   a thread       spins a little -- a tail thunk is usually a few dozen
+;;                  nanoseconds of work -- then sleeps in growing steps up to 1ms;
+;;   a fiber        gives its carrier away (locks.ss jolt-fiber-wait-turn!), since
+;;                  the runner may be a fiber on the SAME carrier that can only
+;;                  run once this one leaves;
+;;   a fiber that holds a counted lock cannot leave, so it waits like a thread
+;;                  -- which ends if the runner is anywhere but its own carrier.
+;;                  On its own carrier the runner can never run again, and that
+;;                  is raised rather than hung.
+;; A thunk that reaches its OWN cell -- the claim is this owner's -- runs it
+;; again, which is the reference's reentrant monitor: an infinite recursion
+;; there, not a wait on itself. A thunk that raises leaves the tail pending and
+;; the claim released; the next forcer runs it again, as before.
+;;
+;; The claim is (token . owner), with a token unique to THIS process: a cell
+;; that arrives from a state image carries whatever its lock field held when it
+;; was written -- a mutex, from a runtime that kept one per cell, or a claim of
+;; the process that was mid-force -- and neither is live. Anything in the field
+;; that is not this process's claim is stale and is cleared on the way to
+;; claiming.
 ;;
 ;; (force-claimed! cell get-lock L get-tail body): body re-reads the cell and
 ;; either delivers its published tail or, holding the claim, runs the thunk and
 ;; publishes. L is the lock field's index (sa-record-cas!).
-(define (force-pending? t) (or (procedure? t) (lazy-src? t)))
+;; force-walking marks a lazy seq whose own thunk has run while its walk is
+;; still going (lazy-bridge.ss lazyseq-realize!): pending to everyone but the
+;; walker, who reaches it only by reentry, so another forcer waits on the claim.
+(define force-walking (list 'lazyseq-walking))
+(define (force-pending? t) (or (procedure? t) (lazy-src? t) (jolt-lazyseq? t) (tail-claim? t) (eq? t force-walking)))
 (define force-claim-token (list 'forcing))
+(define (force-owner) (or (jolt-current-fiber) (get-thread-id)))
 (define (force-claimed! cell get-lock L get-tail body)
-  (let retry ((spins 0))
-    (let ((c (get-lock cell)))
-      (cond
-        ((not (force-pending? (get-tail cell))) (body))
-        ((not c)
-         (let ((claim (cons force-claim-token (get-thread-id))))
-           (if (sa-record-cas! cell L #f claim)
-               ;; A compare-and-swap orders nothing but its own word: the acquire
-               ;; makes every store the previous holder released visible to this
-               ;; thread's re-read of the tail, and the release orders the
-               ;; published tail before the claim clears -- without them the
-               ;; cleared claim can be seen ahead of the tail, a second forcer
-               ;; claims a cell that only looks pending, and its thunk runs twice.
-               (dynamic-wind
-                 (lambda () (jolt-locks-enter!) (memory-order-acquire))
-                 body
-                 (lambda () (jolt-locks-exit!) (memory-order-release) (sa-record-cas! cell L claim #f)))
-               (retry spins))))
-        ((and (pair? c) (eq? (car c) force-claim-token))
-         (if (eqv? (cdr c) (get-thread-id))
-             (body)                                     ; this thread's own claim: recursion
-             (begin (force-wait! spins) (retry (fx+ spins 1)))))
-        (else (sa-record-cas! cell L c #f) (retry spins))))))
-;; spin for the first hundred looks, then sleep 1us doubling to 1ms
-(define (force-wait! spins)
+  (let ((me (force-owner)))
+    (let retry ((spins 0))
+      (let ((c (get-lock cell)))
+        (cond
+          ((not (force-pending? (get-tail cell))) (body))
+          ((not c)
+           (let ((claim (cons force-claim-token me)))
+             (if (sa-record-cas! cell L #f claim)
+                 ;; A compare-and-swap orders nothing but its own word: the acquire
+                 ;; makes every store the previous holder released visible to this
+                 ;; owner's re-read of the tail, and the release orders the
+                 ;; published tail before the claim clears -- without them the
+                 ;; cleared claim can be seen ahead of the tail, a second forcer
+                 ;; claims a cell that only looks pending, and its thunk runs twice.
+                 (begin
+                   (memory-order-acquire)
+                   (dynamic-wind
+                     jolt-finally-in
+                     body
+                     (lambda () (memory-order-release) (sa-record-cas! cell L claim #f))))
+                 (retry spins))))
+          ((and (pair? c) (eq? (car c) force-claim-token))
+           (if (eqv? (cdr c) me)
+               (body)                                   ; this owner's own claim: recursion
+               (begin (force-wait! spins (cdr c)) (retry (fx+ spins 1)))))
+          (else (sa-record-cas! cell L c #f) (retry spins)))))))
+;; One round of waiting on a cell OWNER is running.
+(define (force-wait! spins owner)
+  (unless (jolt-fiber-wait-turn! spins)
+    (when (and (jolt-fiber? owner) (jolt-current-fiber)
+               (eq? (jolt-fiber-carrier owner) (jolt-fiber-carrier (jolt-current-fiber))))
+      (jolt-locks-assert-none! 'force-claimed!))
+    (force-sleep! spins)))
+;; the thread's wait: spin for the first hundred looks, then sleep 1us doubling to 1ms
+(define (force-sleep! spins)
   (when (fx>? spins 100)
     (let ((k (fx- spins 100)))
       (sleep (make-time 'time-duration (fxmin 1000000 (fxsll 1000 (fxmin k 10))) 0)))))
@@ -380,12 +444,18 @@
 ;; (ARM64). The mirror flag follows the word.
 (define (cseq-publish-tail! s r)
   (memory-order-release)
-  (cseq-tail-set! s r)
-  (cseq-forced-flag-set! s #t))
+  (cseq-tail-set! s r))
 
 (define (seq-more s)                  ; force the tail; returns a seq (cseq | jolt-nil)
+  ;; Kept this small on purpose: Chez inlines it into every walk (fold-rest-seq,
+  ;; jolt-next, the reduce loops), and it stops being inlined the moment the whole
+  ;; pending test is spelled out here -- adding one type to that test made apply
+  ;; over a range 1.10x slower. A realized cell, the answer on every step but the
+  ;; first, is the one check; the rest is out of line.
   (let ((t (cseq-tail s)))
-    (if (seq-tail-realized? t) t (seq-more-force s t))))
+    (if (cseq? t) t (seq-more-other s t))))
+(define (seq-more-other s t)
+  (if (seq-tail-pending? t) (seq-more-force s t) t))
 ;; The tail is a thunk, a descriptor, or #f. A cvec cell (#f) has no thunk: its
 ;; tail follows from its own fields, so it is COMPUTED rather than run, and needs
 ;; no exclusion -- two threads racing here build two equal cells and the later
@@ -398,17 +468,56 @@
 ;; unchanged at ~23 (going memo-free the way Clojure does took re-walks to ~42).
 (define (seq-more-force s t)
   (cond
+    ;; a lazy seq as the tail stays the tail: it memoizes its own answer, and the
+    ;; reference's Cons keeps its LazySeq _more after realizing it, so (rest s)
+    ;; is that same, now realized, lazy seq
+    ((jolt-lazyseq? t) (force-lazyseq t))
+    ((tail-claim? t) (cell-force-claimed! s))
     ((not jolt-mt?)
      (let ((r (if t (cseq-run-tail t) (cseq-cvec-more s #t))))
-       (cseq-tail-set! s r) (cseq-forced-flag-set! s #t) r))
+       (cseq-tail-set! s r) r))
     ((not t)
      (let ((r (cseq-cvec-more s #t))) (cseq-publish-tail! s r) r))
-    (else
-     (force-claimed! s cseq-lock cseq-lock-index cseq-tail
-       (lambda ()
-         (let ((t (cseq-tail s)))
-           (if (seq-tail-realized? t) t
-               (let ((r (cseq-run-tail t))) (cseq-publish-tail! s r) r))))))))
+    (else (cell-force-claimed! s))))
+;; Run a cell's pending tail once, among threads: the word itself is the claim. A
+;; forcer compare-and-swaps the pending word for a tail-claim carrying it, runs
+;; it, and swaps the answer in; a forcer that finds another's claim waits in the
+;; way its context allows (force-wait!, as for a lazy seq node); a claim of its
+;; own is reentry, which the reference's reentrant monitor runs again; a claim
+;; from another process (a state image) is stale and is put back. A tail that
+;; escapes -- raises, or a fiber leaves by a continuation that is not a park -- is
+;; put back as it was, so the next forcer runs it (jolt-finally-in: a park is not
+;; an exit, and keeps the claim). The claim lived in a lock field on every cell;
+;; in the word, it costs a cell nothing.
+(define (cell-force-claimed! s)
+  (let ((me (force-owner)))
+    (let retry ((spins 0))
+      (let ((w (cseq-tail s)))
+        (cond
+          ((tail-claim? w)
+           (cond ((not (eq? (tail-claim-token w) force-claim-token))
+                  (sa-record-cas! s cseq-tail-index w (tail-claim-tail w))
+                  (retry spins))
+                 ((eqv? (tail-claim-owner w) me) (cseq-run-tail (tail-claim-tail w)))
+                 (else (force-wait! spins (tail-claim-owner w)) (retry (fx+ spins 1)))))
+          ((not (seq-tail-pending? w)) w)
+          ((jolt-lazyseq? w) (force-lazyseq w))
+          ((not w) (let ((r (cseq-cvec-more s #t))) (cseq-publish-tail! s r) r))
+          (else
+           (let ((claim (make-tail-claim w me force-claim-token)))
+             (if (sa-record-cas! s cseq-tail-index w claim)
+                 (let ((done #f))
+                   (memory-order-acquire)
+                   (dynamic-wind
+                     jolt-finally-in
+                     (lambda ()
+                       (let ((r (cseq-run-tail w)))
+                         (memory-order-release)
+                         (sa-record-cas! s cseq-tail-index claim r)
+                         (set! done #t)
+                         r))
+                     (lambda () (unless done (sa-record-cas! s cseq-tail-index claim w)))))
+                 (retry spins)))))))))
 
 ;; The empty seq (Clojure's empty list ()), distinct from nil; the empty-list-t
 ;; record (one field, its metadata) is defined in values.ss. A metadata-bearing
@@ -538,8 +647,12 @@
 (define (jolt-seq x)
   (cond
     ((jolt-nil? x) jolt-nil)
-    ((empty-list-t? x) jolt-nil)
     ((cseq? x) x)
+    ;; a lazy seq is the next most common argument -- every lazy-seq body, every
+    ;; step of a keep or a tree-seq -- and reached through the arms it cost seven
+    ;; type tests and a closure call first (26% of a tree-seq walk, in jolt-seq)
+    ((jolt-lazyseq? x) (force-lazyseq x))
+    ((empty-list-t? x) jolt-nil)
     ((pvec? x) (vec->seq x 0))
     ;; array mode and hash mode are different classes on the JVM, the same split
     ;; (class …) already reports for the map itself. The view is vector-backed
@@ -607,6 +720,8 @@
       ((cseq-cvec s) (let ((m (cseq-cvec-more s #f)))
                        (if (jolt-nil? m) jolt-empty-list m)))
       ((cseq-forced? s) (let ((m (cseq-tail s))) (if (jolt-nil? m) jolt-empty-list m)))
+      ;; a pending tail that IS a lazy seq is the rest, as Cons.more() answers _more
+      ((jolt-lazyseq? (cseq-tail s)) (cseq-tail s))
       ;; A string seq's tail is a pure O(1) step to the next index of the same
       ;; string, so force it instead of wrapping a lazy-seq around it: (rest "abc")
       ;; is a StringSeq on the JVM, not a LazySeq, and there is no laziness to
@@ -659,8 +774,8 @@
 ;; The remainder is the test itself and is the price of the distinction.
 (define (jolt-cons x coll)
   (if (jolt-nil? coll)
-      (make-cseq x jolt-nil #t sk-list #f 0 #f #f jolt-nil)
-      (make-cseq x (jolt-seq coll) #t sk-cons #f 0 #f #f jolt-nil)))
+      (make-cseq x jolt-nil sk-list jolt-nil)
+      (make-cseq x (jolt-seq coll) sk-cons jolt-nil)))
 ;; Scheme list -> a jolt PersistentList. For (list …) and quoted list literals
 ;; (the emitter lowers '(a b) to (jolt-list a b)).
 (define (jolt-list . xs)
@@ -1266,7 +1381,7 @@
     ;; inline `invoke` method with the value itself as the leading `this`.
     ((and (jrec? f) (find-method-any-protocol (jrec-tag f) "invoke"))
      => (lambda (m) (apply jolt-invoke m f args)))
-    ((and (reified-methods f) (hashtable-ref (reified-methods f) "invoke" #f))
+    ((reify-method-ref f "invoke")
      => (lambda (m) (apply jolt-invoke m f args)))
     ;; host types registered as callable (promise delivers, …): consulted only
     ;; after every built-in case missed, so the hot dispatch pays nothing.
@@ -1814,19 +1929,80 @@
 ;; 625ns and 18.5ms when dropping a million elements. As with count, the step
 ;; loop re-checks per cell so a few plain cells in front of a vector-backed one
 ;; still reach the jump.
+;; The seq N (a fixnum) elements into seq S, or () when S runs out first.
+(define (drop-walk n s)
+  (let loop ((n n) (s s))
+    (cond
+      ((jolt-nil? s) jolt-empty-list)
+      ((fx<=? n 0) s)
+      ;; the jump keeps the seq's own flavor: an array map's seq dropped into is
+      ;; still a PersistentArrayMap$Seq, a vector's a ChunkedSeq
+      ((and (cseq-cvec s) (not (cseq-crest s)))
+       (let ((v (cseq-cvec s)) (i (fx+ (cseq-ci s) n)))
+         (if (fx>=? i (pvec-count v)) jolt-empty-list (vec->seq/k v i (cseq-kind s)))))
+      ((and (fx=? (cseq-kind s) sk-repeat) (repeat-skip s n)))
+      (else (loop (fx- n 1) (jolt-seq (seq-more s)))))))
+;; A Repeat cell N elements on, without walking: an unbounded repeat is the same
+;; seq at every position, and a bounded one just has fewer left. #f when the
+;; cell's tail has been forced already (its count is no longer at hand) — the
+;; walk then steps through the cells that exist.
+(define (repeat-skip s n)
+  (let ((t (cseq-tail s)))
+    (and (lazy-src? t)
+         (cond ((eq? (lazy-src-fn t) lz-repeat) s)            ; (range a b 0): unbounded
+               ((eq? (lazy-src-fn t) lz-repeat-val)
+                (let ((left (lazy-src-b t)))
+                  (if left
+                      (repeat-cells (cseq-head s) (- (+ left 1) n))
+                      s)))
+               (else #f)))))
+;; A count no fixnum reaches drops everything from a lazy source: the countdown
+;; never ends, so the source is walked to its end, realizing it as the JVM's
+;; step loop does.
 (define lz-drop
   (register-lazy-src! 'drop
-    (lambda (n coll)
+    (lambda (n0 coll)
      (jolt-seq
-      (let loop ((n (->idx n)) (s (jolt-seq coll)))
-        (cond
-          ((jolt-nil? s) jolt-empty-list)
-          ((fx<=? n 0) s)
-          ((and (cseq-cvec s) (not (cseq-crest s)))
-           (let ((v (cseq-cvec s)) (i (fx+ (cseq-ci s) n)))
-             (if (fx>=? i (pvec-count v)) jolt-empty-list (vec->seq v i))))
-          (else (loop (fx- n 1) (jolt-seq (seq-more s))))))))))
-(define (jolt-drop n coll) (jolt-make-lazy-src lz-drop n coll))
+      (let ((c (take-drop-count n0)))
+        (if (eq? c 'all)
+            (let loop ((s (jolt-seq coll)))
+              (if (jolt-nil? s) jolt-empty-list (loop (jolt-seq (seq-more s)))))
+            (drop-walk c (jolt-seq coll))))))))
+;; clojure.lang.IDrop — the colls Clojure 1.12's drop hands the count to, eagerly,
+;; getting back the coll's own kind of seq: PersistentVector and its ChunkedSeq,
+;; LongRange, Repeat, StringSeq, PersistentArrayMap and its Seq. Not Range, a
+;; subvec, a hash map or a plain list; those drop lazily. A subvec's seq is
+;; vector-backed here, but on the JVM it is APersistentVector$Seq, not IDrop.
+(define (idrop-coll? c)
+  (cond ((pvec? c) (not (jolt-subvec-view? c)))
+        ((cseq? c)
+         (let ((k (cseq-kind c)))
+           (or (and (fx=? k sk-chunked-seq)
+                    (not (and (cseq-cvec c) (jolt-subvec-view? (cseq-cvec c)))))
+               (fx=? k sk-long-range) (fx=? k sk-string-seq)
+               (fx=? k sk-arraymap-seq) (fx=? k sk-repeat))))
+        ((pmap? c) (pmap-array? c))
+        (else #f)))
+;; The count IDrop.drop(int) receives: a long passes as itself, anything else
+;; through Math/ceil, and the int cast refuses what does not fit — a long past
+;; Integer/MAX_VALUE is an overflow, a double past the long range out of range.
+(define (idrop-count n)
+  (if (range-long-arg? n)
+      (if (> n 2147483647) (throw-jvm 'ArithmeticException "integer overflow") n)
+      (let ((d (ceiling (inexact n))))
+        (cond ((> d 9.223372036854775807e18)
+               (throw-jvm 'java.lang.IllegalArgumentException
+                          (string-append "Value out of range for long: " (jolt-str-render-one d))))
+              ((> d 2147483647.0) (throw-jvm 'ArithmeticException "integer overflow"))
+              (else (exact d))))))
+(define (jolt-drop n coll)
+  (if (idrop-coll? coll)
+      (let ((s (jolt-seq coll)))
+        (if (jolt-pos? n)
+            (let ((k (idrop-count n)))
+              (if (jolt-nil? s) jolt-empty-list (drop-walk k s)))
+            (if (jolt-nil? s) jolt-empty-list s)))
+      (jolt-make-lazy-src lz-drop n coll)))
 
 ;; (iterate f x) — x, (f x), (f (f x)), … as ONE lazy cell per element.
 ;; The overlay spelling, (cons x (lazy-seq (iterate f (f x)))), costs two records
@@ -1875,26 +2051,50 @@
 ;; collection, which dominates when the inner colls are small (mapcat over
 ;; 2-element lists is the common shape).
 ;;
-;; An empty inner coll is skipped without emitting a cell, and the outer seq is
-;; advanced only at a boundary — so f runs once per inner collection, lazily,
-;; exactly as before.
+;; An empty inner coll is skipped without emitting a cell.
+;;
+;; The pending tail holds the REMAINING colls, never the outer cell of the coll
+;; being walked: that cell's first IS the coll, so holding it pinned every element
+;; of the walk -- the whole tree, for a tree-seq at its root (writ's prover held
+;; 9M cells, 3.8GB live, where the JVM held 256MB). The reference starts each coll
+;; as (cat (first zs) (next zs)), advancing the outer seq as the coll starts, and
+;; this does the same, which is also the reference's realization count.
+;;
+;; The LAST coll is returned as it is, not copied, as the reference's concat
+;; does, and it is what keeps nested concats linear: tree-seq nests one mapcat
+;; per level, so copying the last coll at every level cost each element its
+;; depth (a 4000-deep chain took 1.6s to walk against the JVM's 1ms).
 ;; outer/inner are top-level rather than a named let, so a cell's tail can name
 ;; them instead of closing over them (seq.ss lazy-src).
 (define (lazy-concat-outer s)
   (if (jolt-nil? s)
       jolt-empty-list
-      (lazy-concat-inner (jolt-seq (seq-first s)) s)))
-(define (lazy-concat-inner cur s)
+      (let ((cur (jolt-seq (seq-first s)))
+            (more (jolt-seq (seq-more s))))
+        (if (jolt-nil? more)
+            (if (jolt-nil? cur) jolt-empty-list cur)   ; last: share it
+            (lazy-concat-inner cur more)))))
+(define (lazy-concat-inner cur more)
   (if (jolt-nil? cur)
-      (lazy-concat-outer (jolt-seq (seq-more s)))      ; empty inner: skip, no cell
-      (cseq-lazy (seq-first cur) (make-lazy-src lz-concat-inner cur s))))
-(define lz-concat-inner
-  (register-lazy-src! 'concat-inner
-    (lambda (cur s)
+      (lazy-concat-outer more)                         ; empty inner: skip, no cell
+      (cseq-lazy (seq-first cur) (make-lazy-src lz-concat-more cur more))))
+(define lz-concat-more
+  (register-lazy-src! 'concat-more
+    (lambda (cur more)
       (let ((nx (jolt-seq (seq-more cur))))
         (if (jolt-nil? nx)
-            (lazy-concat-outer (jolt-seq (seq-more s)))   ; boundary
-            (lazy-concat-inner nx s))))))
+            (lazy-concat-outer more)                   ; boundary
+            (lazy-concat-inner nx more))))))
+;; A lazy source's arguments are image surface. 'concat-inner is the walk images
+;; of format 9 and older carry, whose second argument is the outer cell of the
+;; coll being walked rather than the colls after it; it restores into the walk
+;; above.
+(register-lazy-src! 'concat-inner
+  (lambda (cur s)
+    (let ((nx (jolt-seq (seq-more cur))))
+      (if (jolt-nil? nx)
+          (lazy-concat-outer (jolt-seq (seq-more s)))
+          (lazy-concat-inner nx (jolt-seq (seq-more s)))))))
 (define (lazy-concat-seq ss) (lazy-concat-outer (jolt-seq ss)))
 
 ;; (apply f a b ... coll): spread the trailing seqable into the call.
@@ -1937,14 +2137,20 @@
 ;; variadic core fn could carry more than 21 arguments.
 (define (jolt-apply-to-method f)
   (cond ((jrec? f) (find-method-any-protocol (jrec-tag f) "applyTo"))
-        ((reified-methods f) => (lambda (h) (hashtable-ref h "applyTo" #f)))
+        ((jreify? f) (reify-method-ref f "applyTo"))
         (else #f)))
 (define (jolt-apply f . args)
   (let* ((r (reverse args)) (tail (car r)) (fixed (reverse (cdr r)))
          (v (and (procedure? f) (variadic-fixed-arity-of f))))
     (cond
       ((eq? f jolt-concat)
-       (lazy-concat-seq (fold-right jolt-cons (jolt-seq tail) fixed)))
+       ;; the reference's RestFn.applyTo first measures the args against concat's
+       ;; two required ones (RT.boundedLength(args, 2)): three next() calls, so
+       ;; the fourth coll is realized before any element is asked for
+       (let ((s (fold-right jolt-cons (jolt-seq tail) fixed)))
+         (let walk ((x s) (i 0))
+           (when (and (fx<? i 3) (not (jolt-nil? x))) (walk (jolt-next x) (fx+ i 1))))
+         (lazy-concat-seq s)))
       ;; registered variadic: peel V+1 off fixed++tail, pass V + a boxed rest
       ((and v (jolt-peel (fx+ v 1) (fold-right cseq-realized (jolt-seq tail) fixed)))
        => (lambda (peeled)

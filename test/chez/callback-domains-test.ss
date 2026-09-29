@@ -28,6 +28,15 @@
       (lambda () (set! jolt-eq-arms eqs) (set! jolt-class-arms classes)
         (set! jt-user-value-tags-arms tags) (set! jolt-invoke-prefix-arms prefix)))))
 
+;; Preserve the new upstream class fast-path guard, including atomic rejection.
+(isolated (lambda ()
+  (let ((classes jolt-class-arms) (tags jt-user-value-tags-arms))
+    (ok "legacy class cannot claim runtime-owned strings"
+      (thrown (lambda () (register-class string? (lambda (x) "bad.Class")
+                          (lambda (x) (jolt-vector "bad.Class"))))))
+    (ok "rejected class registration preserves both registries"
+      (and (eq? classes jolt-class-arms) (eq? tags jt-user-value-tags-arms))))))
+
 ;; Reject before even invoking a callback, including equality's registration
 ;; probes. Namespaced keywords, strings, nil and false are NOT domain aliases.
 (for-each (lambda (bad)
@@ -102,10 +111,12 @@
     (set! trace '())
     (ok "legacy mixed procedure/string equality remains legal" (jolt=2 car "child"))
     (ok "legacy predicate/handler effects retained" (equal? '(legacy handler) (reverse trace)))
-    (register-class (lambda (x) (set! trace (cons 'class-p trace)) #t)
+    ;; Upstream 0.8.14 refuses library claims on runtime-owned class types.
+    ;; A raw Scheme vector is a non-table extension value, not a Jolt vector.
+    (register-class (lambda (x) (set! trace (cons 'class-p trace)) (vector? x))
       (lambda (x) "legacy.Class") (lambda (x) (jolt-vector "legacy.Class")))
     (set! trace '())
-    (ok "legacy tags still claim non-table" (equal? '("legacy.Class") (value-host-tags "child")))
+    (ok "legacy tags still claim non-table extension" (equal? '("legacy.Class") (value-host-tags (vector 'child))))
     (ok "legacy class predicate effect retained" (equal? '(class-p) (reverse trace))))))
 
 (isolated (lambda ()

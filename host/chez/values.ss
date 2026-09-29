@@ -123,16 +123,28 @@
 (define-record-type (pset %mk-pset pset?)
   (fields m (mutable hasheq) (mutable meta)) (nongenerative chez-pset-v3))
 
-;; seq cell (seq.ss): the head; the tail, ONE published word (see seq.ss
-;; seq-tail-realized?); the forced flag; the cell's kind (sk-* in seq.ss); the
-;; chunk fields cvec/ci/crest; the claim lock (slot 7, seq.ss cseq-lock-index,
-;; which is why `meta` comes last); and the cell's metadata, jolt-nil or a map --
-;; the _meta of a PersistentList node or a Cons (natives-meta.ss owns the slot;
-;; written only on a cell nobody else holds yet). chez-cseq-v6, without the meta
-;; slot, restores through state-image.ss's legacy arm.
+;; seq cell (seq.ss): the head; the tail, ONE published word (slot 1, see seq.ss
+;; seq-tail-realized?, which a claim compare-and-swaps); the cell's kind (sk-* in
+;; seq.ss); and its metadata, jolt-nil or a map -- the reference's Cons carries
+;; _meta too (natives-meta.ss owns the slot; written only on a cell nobody else
+;; holds yet). Four fields, 48 bytes: the reference's Cons is 32, and this was 80
+;; -- a forced? mirror for the image, a claim lock and three chunk fields on every
+;; cell of every seq, which writ's prover allocated half a terabyte of.
+;; A cell that walks a vector or a chunk is the cseqv subtype, carrying cvec, ci
+;; and crest (cseq-cvec and co. answer #f / 0 for a plain cell). chez-cseq-v7
+;; (head tail forced? kind cvec ci crest lock meta) and chez-cseq-v6 restore
+;; through state-image.ss's legacy arm.
 (define-record-type cseq
-  (fields head (mutable tail) (mutable forced? cseq-forced-flag cseq-forced-flag-set!) kind cvec ci crest (mutable lock) (mutable meta))
-  (nongenerative chez-cseq-v7))
+  (fields head (mutable tail) kind (mutable meta))
+  (nongenerative chez-cseq-v8))
+(define-record-type (cseqv make-cseqv cseqv?)
+  (parent cseq) (fields cvec ci crest)
+  (nongenerative chez-cseqv-v1) (sealed #t))
+;; Macros, so they inline as the record accessors they replace did: several sit
+;; on the step of every vector walk.
+(define-syntax cseq-cvec (syntax-rules () ((_ s) (let ((x s)) (and (cseqv? x) (cseqv-cvec x))))))
+(define-syntax cseq-ci (syntax-rules () ((_ s) (let ((x s)) (if (cseqv? x) (cseqv-ci x) 0)))))
+(define-syntax cseq-crest (syntax-rules () ((_ s) (let ((x s)) (and (cseqv? x) (cseqv-crest x))))))
 
 ;; The empty seq (Clojure's empty list ()), distinct from nil. Its one field is
 ;; its metadata, jolt-nil or a map (EmptyList extends Obj): a metadata-bearing ()
@@ -143,18 +155,17 @@
 (define-record-type empty-list-t (fields (mutable meta)) (nongenerative empty-list-v3))
 
 ;; deferred seq node (lazy-bridge.ss): `thunk` is the node's ONE published word
-;; (the thunk until the node is forced, then the seq or a lazyseq-fail); val,
-;; realized? and error? are mirrors written before it, for the image; `lock` is
-;; the claim lock (slot 4, which is why `meta` comes last); `meta` is LazySeq's
-;; _meta (natives-meta.ss owns the slot; written only on a node nobody else
-;; holds yet). jolt-lazyseq-v2, without the meta slot, restores through
+;; (the thunk until the node is forced, then the seq, the next node, or -- from an
+;; older image -- a lazyseq-fail); `val` what to run again if a force is cut short
+;; (lazyseq-take-call!), cleared once the answer is published; `lock` the claim
+;; lock (slot 2, lazy-bridge.ss jolt-lazyseq-lock-index); `meta` is LazySeq's
+;; _meta (natives-meta.ss owns the slot; written only on a node nobody else holds
+;; yet). jolt-lazyseq-v3 (thunk val realized? error? lock meta: two mirrors of the
+;; word, written for the image on every force) and v2 restore through
 ;; state-image.ss's legacy arm.
 (define-record-type jolt-lazyseq
-  (fields (mutable thunk) (mutable val)
-          (mutable realized? jolt-lazyseq-realized-flag jolt-lazyseq-realized-flag-set!)
-          (mutable error? jolt-lazyseq-error-flag jolt-lazyseq-error-flag-set!)
-          (mutable lock) (mutable meta))
-  (nongenerative jolt-lazyseq-v3))
+  (fields (mutable thunk) (mutable val) (mutable lock) (mutable meta))
+  (nongenerative jolt-lazyseq-v4))
 
 ;; deftype/defrecord instance base (records.ss): `desc` the type descriptor,
 ;; `ext` the extension map, `hasheq` the defrecord __hasheq slot generalized to
@@ -450,31 +461,36 @@
 ;; defined in hasheq.ss which loads after this file — the probes are evaluated
 ;; at registration time, when the whole runtime is loaded.
 (define (eq-fast-probes)
-  (list (cons 0 1) (cons 1.5 2.5)
-        (cons (keyword #f "a") (keyword #f "b"))
-        (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
-        (cons "s1" "s2")
-        ;; Two base scalars of DIFFERENT kinds, and nil against anything, are
-        ;; answered ahead of the walk too (jolt=2's base-scalar clause), so an
-        ;; arm that would claim such a pair is refused for the same reason. The
-        ;; JVM's Util.equiv has no extension point here either: a Keyword is
-        ;; never equal to a String, a Long never to a Double, nil only to nil.
-        ;; The number pairs cover the exactness-aware number clause that moved
-        ;; up with them (bignum and ratio pairs used to reach the arms).
-        (cons (keyword #f "a") "a") (cons "a" (jolt-symbol #f "a"))
-        (cons (keyword #f "a") jolt-nil) (cons jolt-nil 0) (cons jolt-nil "s")
-        (cons 1 2.5) (cons #t (keyword #f "a")) (cons #\a "a") (cons 0 #f)
-        (cons (expt 2 70) (expt 2 71)) (cons 1/2 1/3) (cons #\a #\b) (cons #t #f)
-        ;; jolt's own collection types, now answered ahead of the walk. All
-        ;; THREE that jolt=2 hoists must be probed — a hoisted type missing from
-        ;; here is one whose arms register happily and are then silently dead.
-        (cons (jolt-vector 1) (jolt-vector 2))
-        (cons (jolt-hash-map (keyword #f "a") 1) (jolt-hash-map (keyword #f "a") 2))
-        (cons (jolt-hash-set 1) (jolt-hash-set 2))
-        ;; procedures: fn equality is identity, answered ahead of the walk (a
-        ;; collision-bucket compare of fn-keyed map keys paid the whole arm
-        ;; walk per entry) — so no arm may claim one.
-        (cons car cdr)))
+  (append
+   (list (cons 0 1) (cons 1.5 2.5)
+         (cons (keyword #f "a") (keyword #f "b"))
+         (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
+         (cons "s1" "s2")
+         ;; Two base scalars of DIFFERENT kinds, and nil against anything, are
+         ;; answered ahead of the walk too (jolt=2's base-scalar clause), so an
+         ;; arm that would claim such a pair is refused for the same reason. The
+         ;; JVM's Util.equiv has no extension point here either: a Keyword is
+         ;; never equal to a String, a Long never to a Double, nil only to nil.
+         ;; The number pairs cover the exactness-aware number clause that moved
+         ;; up with them (bignum and ratio pairs used to reach the arms).
+         (cons (keyword #f "a") "a") (cons "a" (jolt-symbol #f "a"))
+         (cons (keyword #f "a") jolt-nil) (cons jolt-nil 0) (cons jolt-nil "s")
+         (cons 1 2.5) (cons #t (keyword #f "a")) (cons #\a "a") (cons 0 #f)
+         (cons (expt 2 70) (expt 2 71)) (cons 1/2 1/3) (cons #\a #\b) (cons #t #f)
+         ;; jolt's own collection types, now answered ahead of the walk. All
+         ;; THREE that jolt=2 hoists must be probed — a hoisted type missing from
+         ;; here is one whose arms register happily and are then silently dead.
+         (cons (jolt-vector 1) (jolt-vector 2))
+         (cons (jolt-hash-map (keyword #f "a") 1) (jolt-hash-map (keyword #f "a") 2))
+         (cons (jolt-hash-set 1) (jolt-hash-set 2))
+         ;; procedures: fn equality is identity, answered ahead of the walk (a
+         ;; collision-bucket compare of fn-keyed map keys paid the whole arm
+         ;; walk per entry) — so no arm may claim one.
+         (cons car cdr))
+   ;; two jrecs (jolt=2's jrec-pair=? clause). records.ss builds the probe after
+   ;; the earliest arms register; those are checked by the dispatch-caches unit
+   ;; row after boot instead (probe-if-available).
+   (probe-if-available (lambda () (cons jrec-fast-type-probe jrec-fast-type-probe)))))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
                            (lambda (probe) (pred (car probe) (cdr probe)))
@@ -598,6 +614,10 @@
         ;; EQUAL case); answering the unequal case here keeps a fn-keyed map's
         ;; bucket scan off the arm walk. The pair is in eq-fast-probes.
         ((and (procedure? a) (procedure? b)) #f)
+        ;; two deftype/record values: the record arm's own decision, answered
+        ;; ahead of the walk it sat at the end of (records-coll.ss jrec-equiv=?,
+        ;; loads later — runtime forward ref). The pair is in eq-fast-probes.
+        ((and (jrec? a) (jrec? b)) (jrec-equiv=? a b))
         ;; nil is equal only to nil (the eq? clause above answered that pair),
         ;; and two base scalars of different kinds are never equal. Both used to
         ;; reach jolt=2-base only AFTER every registered arm had been asked —

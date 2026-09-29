@@ -89,6 +89,33 @@
 (define (sa-total-memory-bytes)
   (current-memory-bytes))
 
+;; (sa-gc-reserve-ratio! r) -> void
+;; How much free memory the collector keeps from the OS after a collection, as a
+;; ratio of the memory in use (a nonnegative real): the rest it returns. Chez's
+;; heap-reserve-ratio, default 1.0 -- one free page kept for each page in use,
+;; which alone lets a process hold twice its data. The heap ceiling lowers it as
+;; the heap nears the limit (rt.ss). Contract: best effort. Degradation: a target
+;; that does not return memory ignores it.
+(define (sa-gc-reserve-ratio! r)
+  (heap-reserve-ratio (inexact r)))
+
+;; (sa-gc-tight! on?) -> void
+;; Collect TIGHT while ON?: objects already in the older generations are marked
+;; where they are rather than copied, so a collection needs little memory beyond
+;; what the heap already holds. Copying needs a second copy's worth of room for
+;; everything it moves -- a 100MB structure promoted by a scheduled collection
+;; carried a 150MB-live program 20MB past a 384MB ceiling. The price is
+;; fragmentation (more memory held over a long run: writ's prover peaked 2.3GB ->
+;; 2.8GB with it on throughout), so the heap ceiling turns it on only near the
+;; limit. Chez's in-place-minimum-generation at 2 (1 fragmented worse: 380MB for
+;; that program against 343MB), and back to the maximum generation, its default.
+;; Degradation: a target without the choice ignores it.
+(define sa-gc-tight-generation 2)
+(define (sa-gc-tight! on?)
+  (set! sa-young-tight? on?)
+  (in-place-minimum-generation
+    (if on? (min sa-gc-tight-generation (collect-maximum-generation)) (collect-maximum-generation))))
+
 ;; (sa-max-memory-bytes) -> exact integer
 ;; Peak heap bytes: the most the collector has held from the OS since the last
 ;; sa-reset-max-memory-bytes! (or since boot) -- the high-water mark behind
@@ -263,6 +290,16 @@
 (define (sa-file-mtime-ms path)
   (let ((t (file-modification-time path)))
     (+ (* (time-second t) 1000) (div (time-nanosecond t) 1000000))))
+
+;; (sa-file-size path) -> exact integer
+;; PATH's size in bytes. Contract: the size a reader of the whole file would
+;; see (a cache's byte budget reads it). Degradation: none — a file that cannot
+;; be opened raises, as the caller's other file operations would.
+(define (sa-file-size path)
+  (let ((p (open-file-input-port path)))
+    (let ((n (port-length p)))
+      (close-port p)
+      n)))
 
 ;; (sa-gc-trip-bytes! n) -> void
 ;; Set the allocation threshold at which a trip collection triggers — the
@@ -1001,6 +1038,11 @@
 (define (sa-make-boot-file out base-boots)
   (apply make-boot-file out '() base-boots))
 
+;; A conversion that fails part way leaves a truncated OUT, which a caller
+;; testing (file-exists? out) would take for a result; #f leaves no OUT.
+(define (sa-delete-partial! out)
+  (guard (e (#t #f)) (when (file-exists? out) (delete-file out))))
+
 ;; (sa-vfasl-convert-file in out [codec]) -> boolean
 ;; Rewrite the boot file IN to OUT in Chez's vfasl format: a prebuilt image of
 ;; what loading the fasl would have produced, laid out per space and loaded
@@ -1016,37 +1058,147 @@
 ;; argument; Chez has two, and 'wide picks gzip over LZ4, which is the whole
 ;; point: gzip has no 256MiB ceiling and LZ4 does.
 (define (sa-vfasl-convert-file in out . codec)
-  (guard (e (#t #f))
+  (guard (e (#t (sa-delete-partial! out) #f))
     (if (and (pair? codec) (eq? (car codec) 'wide))
         (parameterize ((compress-format 'gzip)) (vfasl-convert-file in out '()))
         (vfasl-convert-file in out '()))
     #t))
 
-;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
-;; Install a collection hook enforcing a heap ceiling, and answer whether the
-;; target could. On each collection the target performs its normal collection,
-;; then: above SOFT live bytes it forces a FULL collection — the one a
-;; generational collector defers, and the whole point under memory pressure —
-;; and if live bytes still exceed HARD it calls ON-EXCEEDED with that count.
+;; (sa-vfasl-convert-object-file in out [codec]) -> boolean
+;; The same conversion for ONE compiled object file rather than a whole boot:
+;; OUT keeps IN's object-file header instead of gaining a boot header, so it can
+;; follow a converted boot in the same image (a boot file is its inputs
+;; concatenated, and the kernel skips each input's header). This is what lets a
+;; build convert only what changed — the runtime prefix and each app unit are
+;; converted once and cached (build.ss). Output entries are compressed, as a
+;; whole-boot conversion's are. Same contract and degradation as above.
+(define (sa-vfasl-convert-object-file in out . codec)
+  (guard (e (#t (sa-delete-partial! out) #f))
+    (parameterize ((fasl-compressed #t)
+                   (compress-format (if (and (pair? codec) (eq? (car codec) 'wide))
+                                        'gzip
+                                        (compress-format))))
+      (vfasl-convert-file in out #f))
+    #t))
+
+;; (sa-gc-install-after-collect! maintain observe) -> boolean
+;; Hook every collection: the target performs its normal collection, then calls
+;; (MAINTAIN collect-full!) -- collect-full! collects EVERY generation now, the
+;; collection a generational collector defers; (collect-full! room) does it TIGHT
+;; (see sa-gc-tight!) within ROOM free bytes, in steps when the younger
+;; generations hold more than that (sa-collect-tight) -- and then
+;; (OBSERVE gc-ns elapsed-ns): how long the whole of this collection took,
+;; MAINTAIN's work included, and how long since the previous one ended, both
+;; monotonic nanoseconds. Answers whether the target could install the hook.
 ;;
-;; The policy lives in the caller (rt.ss jolt-install-heap-ceiling!): the
-;; thresholds, the message, and what ON-EXCEEDED does. This is only the seam
-;; that hooks collection, because doing that needs a target-specific native.
+;; The policy lives in the caller (rt.ss jolt-install-gc-policy!): the heap
+;; ceiling, when to collect the older generations, and the nursery size. This is
+;; only the seam that hooks collection, because doing that needs a target-specific
+;; native. Both run where the collect request is handled, with the world stopped:
+;; MAINTAIN may collect everything (collect-full!, and only that way: sa-gc-collect
+;; is the out-of-handler entry), both may read the heap (sa-bytes-allocated) and
+;; set the trip threshold (sa-gc-trip-bytes!); raising from either is how a
+;; ceiling or the GC overhead limit reports.
 ;;
-;; Contract: ON-EXCEEDED is called only when the heap genuinely cannot be
-;; brought under HARD, so raising from it is the expected use.
-;; Degradation: answer #f without installing anything. The ceiling is then
-;; unenforced, which is what every jolt before 0.8.5 did, and the caller
-;; reports maxMemory accordingly rather than promising a bound it lacks.
-(define (sa-gc-install-ceiling! soft hard on-exceeded)
-  (collect-request-handler
-    (lambda ()
-      (collect)
-      (when (> (bytes-allocated) soft)
-        (collect (collect-maximum-generation))
-        (when (> (bytes-allocated) hard)
-          (on-exceeded (bytes-allocated))))))
+;; Contract: both are called after each collection the target runs on its own
+;; schedule. Degradation: answer #f without installing anything. The caller then
+;; enforces no ceiling -- what every jolt before 0.8.5 did -- and keeps a fixed
+;; nursery, and reports maxMemory as unbounded rather than promising a bound it
+;; lacks.
+(define (sa-gc-install-after-collect! maintain observe)
+  (let ((last-end (sa-monotonic-ns))
+        (collect-full!
+          (case-lambda
+            (() (collect (collect-maximum-generation)))
+            ;; ROOM: #f for an ordinary full collection, else the free bytes the tight
+            ;; one has to work in
+            ((room)
+             (if room
+                 (let ((saved (in-place-minimum-generation)))
+                   (dynamic-wind
+                     (lambda () (in-place-minimum-generation (min saved sa-gc-tight-generation)))
+                     (lambda () (sa-collect-tight room))
+                     (lambda () (in-place-minimum-generation saved))))
+                 (collect (collect-maximum-generation)))))))
+    (collect-request-handler
+      (lambda ()
+        (let ((t0 (sa-monotonic-ns)))
+          (sa-collect-young!)
+          (maintain collect-full!)
+          (let ((t1 (sa-monotonic-ns)))
+            (observe (- t1 t0) (- t1 last-end))
+            (set! last-end t1))))))
   #t)
+;; A tight full collection within ROOM free bytes. Marking in place does not
+;; keep a tight collection from copying: Chez still copies a segment whose chunk
+;; is under a quarter used, or that was marked before and is now under three
+;; quarters live, and after a run of tight young collections that can be most of
+;; the younger generations. A copied object's source is freed only when its
+;; collection ends, so one (collect max) peaks at the heap in use plus everything
+;; it copies: the gcpolicy gate's forced case, with ~140MB in generations 1-3
+;; and none yet in the oldest, peaked at 322MB under a 256MB ceiling.
+;;
+;; So when the younger generations hold more than ROOM, collect them a step at a
+;; time first -- 1 into 2, 2 into 3, up to the one below the oldest -- and then
+;; everything into the oldest. A step frees its sources before the next copies,
+;; so the peak is the heap plus the largest step (269MB there). The steps are
+;; passes a single collection would not make, so they are only taken when the
+;; younger generations would not fit: once the oldest holds the compacted bulk,
+;; one collection copies little, and staging every forced collection ran that
+;; gate 1.15x slower.
+(define (sa-collect-tight room)
+  (let ((cmg (collect-maximum-generation)))
+    (when (> (let sum ((g 1) (n 0))
+               (if (fx< g cmg) (sum (fx+ g 1) (+ n (bytes-allocated g))) n))
+             room)
+      (let loop ((g 1))
+        (when (fx< g (fx- cmg 1))
+          (collect g (fx+ g 1))
+          (loop (fx+ g 1)))))
+    (collect cmg)))
+
+;; The collection the hook runs in place of Chez's (collect). Chez's schedule
+;; collects generation g every radix^g collections and otherwise only
+;; generation 0, promoting what survives into generation 1. That breeds
+;; nepotism in lazy seqs: the cell a walk is on when a collection comes is live,
+;; so it is promoted; the walk then realizes its tail, storing a young cell into
+;; it, and moves on. The promoted cell is dead, but its generation is not
+;; collected next time, so the write barrier's remembered set roots that young
+;; cell, and through it every cell realized since -- the whole window. Measured
+;; in bench/seqs: ~70% of every nursery survived (209k seq cells at 16MB, 0.8.12
+;; alike), every collection copied it, and the cost grew with the nursery, so
+;; the nursery policy's larger windows ran the bench 1.1-1.4x slower.
+;;
+;; So every collection takes generation 1 with it: (collect g 1 g+1) with g at
+;; least 1, where generation 0's survivors go to 1 and everything collected
+;; above that moves up one. The cell a walk was on last time is in generation 1
+;; and is collected with the rest, so nothing it points at survives through it.
+;; The price is that generation 1 is copied into 2 at every collection rather
+;; than every fourth: it only ever holds one window's survivors, and in
+;; practice cost nothing measurable (writ's prover: same time and GC time;
+;; bench/seqs 245ms -> 165ms against 0.8.12, the heap-churn gate 2.3s -> 2.1s
+;; and 404MB -> 320MB). The maximum generation is never on this schedule: the
+;; policy's own full collections take it (rt.ss, heap growth and the ceiling).
+;;
+;; Near a heap ceiling (sa-gc-tight!) the collection copies only generation 0,
+;; Chez's own: copying generation 1 as well needs room the ceiling may not have
+;; (the gcpolicy gate peaked 30% over a 256MB ceiling that way).
+(define sa-young-count 0)
+(define sa-young-tight? #f)
+(define (sa-collect-young!)
+  (set! sa-young-count (fx+ sa-young-count 1))
+  (if sa-young-tight?
+      (collect)
+      (let* ((cmg (collect-maximum-generation))
+             (radix (collect-generation-radix))
+             (g (let loop ((g (fx- cmg 1)))
+                  (if (or (fx<= g 1) (fx= 0 (modulo sa-young-count (expt radix g))))
+                      g
+                      (loop (fx- g 1))))))
+        (collect (fxmax 1 g) 1 (fxmin cmg (fx+ (fxmax 1 g) 1))))))
+(define (sa-monotonic-ns)
+  (let ((t (current-time 'time-monotonic)))
+    (+ (* (time-second t) 1000000000) (time-nanosecond t))))
 ;; (sa-gc-install-stall-watch! seconds on-stall) -> boolean
 ;; Make a stalled collection observable. Chez stops the world by rendezvous:
 ;; the thread whose allocation tripped runs $collect-rendezvous, and unless it
@@ -1231,7 +1383,29 @@
 ;; with no lock in the way and nothing allocated (seq.ss force-claimed!). A
 ;; system primitive here; a target whose records are vectors swaps the slot
 ;; under whatever makes that atomic for its threads.
-(define (sa-record-cas! r i old new) (#%$record-cas! r i old new))
+;;
+;; STRONG, and that is the whole of the definition below. Chez's $record-cas! is
+;; one ldxr/stxr attempt on AArch64 (s/arm64.ss asm-cas): the stxr fails
+;; whenever this core's exclusive monitor was cleared between the two — a
+;; context switch, or another core storing into the same reservation granule,
+;; which a store to the NEXT FIELD of the same record is — and the primitive
+;; then answers #f with the field still holding `old`. Every caller here reads
+;; #f as "somebody else got there first": compare-and-set! hands it straight to
+;; the program, force-claimed!'s release leaves a claim in place on it. Under
+;; load that was one refusal in a few hundred thousand on Apple silicon
+;; (test/chez/cas-test.ss counts them), and one connection in ~1400 served by
+;; nobody in ring-chez-adapter, whose worker took the refusal to mean another
+;; owner had the conn. x86's cmpxchg cannot fail this way, which is why it was
+;; only ever seen on the Mac. So: a #f is taken at its word only once the field
+;; is seen NOT holding `old`; while it still does, the attempt is repeated.
+;; The re-read is the plain field read the failure path already paid for, and
+;; the loop ends the instant either the swap lands or another writer moves the
+;; field.
+(define (sa-record-cas! r i old new)
+  (let retry ()
+    (cond ((#%$record-cas! r i old new) #t)
+          ((eq? (#%$record-ref r i) old) (retry))
+          (else #f))))
 
 ;; (sa-disable-count) -> how many nested disable-interrupts this thread is
 ;; inside; 0 when interrupts are on. Chez keeps it in the thread context, and
@@ -1272,6 +1446,15 @@
 ;; (vector-copy! from from-start to to-start count).
 (define (sa-vector-copy-range! to at from start end)
   (vector-copy! from start to at (fx- end start)))
+;; (sa-vector-copy v): a fresh copy of v. (sa-subvector v start end): a fresh
+;; copy of v[start, end), over Chez's (vector-copy v start count). The #%
+;; forms name the primitives themselves: the vendored irregex redefines
+;; vector-copy at top level as a one-argument loop, and in an app's runtime that
+;; definition is what a bare vector-copy reaches.
+(define (sa-vector-copy v) (#%vector-copy v))
+(define (sa-subvector v start end)
+  (#%vector-copy v start (fx- end start)))
+(define sa-vector-append #%vector-append)
 ;; (sa-string-copy-range! to at from start end): the same reorder over Chez's
 ;; (string-copy! from from-start to to-start count).
 (define (sa-string-copy-range! to at from start end)

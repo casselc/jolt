@@ -414,13 +414,62 @@
 (defn set-source-reg! [on] (reset! (:source-reg? (cur)) (boolean on)))
 (defn- source-reg? [] @(:source-reg? (cur)))
 
-;; A direct-link Scheme binding name for a var. The fqn maps to a unique identifier
-;; jv$<ns>$<name>; chars that break a Scheme identifier or the `$` separator are
-;; escaped so distinct vars never collide.
-(defn- dl-munge [s]
-  (-> s (str/replace "$" "_D_") (str/replace "#" "_H_") (str/replace "'" "_Q_")))
-(defn- dl-name [ns nm] (str "jv$" (dl-munge ns) "$" (dl-munge nm)))
+;; --- identifier munging ------------------------------------------------------
+;; Every Clojure name the emitter writes as a Scheme IDENTIFIER — a local, a
+;; param, a fn's letrec self-name, a direct-link binding — goes through
+;; munge-chars. A Clojure symbol can hold any character: the reader lets ' # |
+;; and $ through, and (symbol s) lets everything through, including the chars
+;; the Scheme reader takes as delimiters (a space, ; ( ) [ ] { } " , ` \) — an
+;; identifier emitted bare with one of those either fails to read, reads as two
+;; datums, or (a backslash, which Chez swallows) silently ALIASES a different
+;; name. The escape is INJECTIVE, so two distinct Clojure names never munge to
+;; one Scheme identifier: $ is the escape lead and is itself escaped FIRST
+;; ($$ = a literal $), then ' -> $P, # -> $H, | -> $V, and any other unsafe
+;; char -> $U<hex>$ (self-delimiting, so the codepoint width is free). Every $
+;; in the output therefore begins one of those tokens, and decoding is a plain
+;; left-to-right inverse. The same mapping runs at a binding and at every
+;; reference, so resolution stays consistent.
+;;
+;; The unsafe set was derived by probing both readers (Chez 10.4, Gambit 4.9),
+;; not from the standards: whitespace and controls (code < 33), the fourteen
+;; ASCII chars below, and the non-ASCII Unicode White_Space characters, which
+;; Chez's char-whitespace? delimits on while the reference reader lets them
+;; through (Java's isWhitespace excludes NBSP). test/chez/unit.edn
+;; munge-injective pins one row per class.
+(def ^:private munge-unsafe-ascii
+  ;; " # $ ' ( ) , ; [ \ ] ` { | }
+  #{34 35 36 39 40 41 44 59 91 92 93 96 123 124 125})
+(defn- munge-unicode-space? [cp]
+  (or (= cp 0x85) (= cp 0xA0) (= cp 0x1680)
+      (and (>= cp 0x2000) (<= cp 0x200A))
+      (= cp 0x2028) (= cp 0x2029) (= cp 0x202F) (= cp 0x205F) (= cp 0x3000)))
+(defn- munge-unsafe? [cp]
+  (or (< cp 33)
+      (contains? munge-unsafe-ascii cp)
+      (and (> cp 127) (munge-unicode-space? cp))))
+(defn- munge-char [cp]
+  (cond (= cp 36) "$$"
+        (= cp 39) "$P"
+        (= cp 35) "$H"
+        (= cp 124) "$V"
+        :else (str "$U" (format "%x" cp) "$")))
+(defn- munge-chars [s]
+  ;; a name with nothing to escape (nearly all of them) is returned as-is
+  (if (some (fn [c] (munge-unsafe? (int c))) s)
+    (apply str (map (fn [c] (let [cp (int c)] (if (munge-unsafe? cp) (munge-char cp) c))) s))
+    s))
+
+;; A direct-link Scheme binding name for a var: jv$ + the munged fqn (ns/name),
+;; the same identity the direct-link registry keys on (dl-fqn), so two distinct
+;; vars can never share a binding. It used to be jv$<ns>$<name> over per-part
+;; _D_/_H_/_Q_/_V_ substitutions — text a user can write, so (def _V_ …) and
+;; (def | …) bound the same jv$app$_V_ — and even with injective parts a $
+;; separator can be forged by an escape in the ns name (a$P + $ + Pc reads as
+;; a + $ + P$Pc). The / is a plain identifier char on both hosts. Nothing
+;; parses the shape back: the registry maps a binding to its (ns, name), and
+;; dce.ss / the jv$ shadow guard test only the prefix.
 (defn- dl-fqn [ns nm] (str ns "/" nm))
+(defn- dl-name [ns nm] (str "jv$" (munge-chars (dl-fqn ns nm))))
 (defn- direct-linkable? [ns nm]
   (and (direct-link?) (contains? @(:direct-link-defined (cur)) (dl-fqn ns nm))))
 ;; A direct-linked var whose value is a fn literal — its binding is a Scheme
@@ -428,11 +477,14 @@
 (defn- direct-link-fn? [ns nm]
   (contains? @(:direct-link-fns (cur)) (dl-fqn ns nm)))
 
-;; recur-target and the set of munged local names known to hold a procedure (a
-;; named fn's self-recursion name) are lexically scoped — dynamic vars so the
+;; recur-target and the munged local names known to hold a procedure (a named
+;; fn's self-recursion name) are lexically scoped — dynamic vars so the
 ;; recursion auto-restores them (no manual save/restore, no throw-leak).
+;; *known-procs* maps each such name to the fn's trace site (the name its frame
+;; carries: ns/name for a def's direct init, the registry label for a nested
+;; literal), so a call site inside it records the same name the frame reports.
 (def ^:dynamic *recur-target* nil)
-(def ^:dynamic *known-procs* #{})
+(def ^:dynamic *known-procs* {})
 ;; munged local name -> the Scheme name holding its backing flvector, for the
 ;; ^doubles PARAMS of the arities being emitted. emit-arity-clause binds one per
 ;; such param at entry ((_av$N (jolt-array-vec-of a))), and a proven aget/aset
@@ -442,12 +494,15 @@
 ;; nested arity's params, a catch binding) drops the name for its scope, so an
 ;; inner `a` bound to some other array never reads the outer one's vector.
 (def ^:dynamic *array-vecs* {})
-;; When set (in the :def emit path), fns are emitted with a qualified letrec
-;; binding (ns/name) so Chez reports a unique per-var frame name — no collisions
-;; across namespaces. Nested/anonymous fns ignore it (they never register).
+;; When set (in the :def emit path), the def's direct named init is emitted with
+;; a qualified letrec binding (ns/name) so Chez reports a unique per-var frame
+;; name — no collisions across namespaces — and that name is what the source
+;; registry keys the def's record on. A nested named literal is bound under its
+;; registry label instead (emit-fn), never under ns/name: that name is not
+;; unique per literal, and it reads as a var the namespace does not have.
 (def ^:dynamic *qualifying-ns* nil)
 ;; Set while emitting the init of a def whose value is an ANONYMOUS fn. Such a fn
-;; is emitted bare so the enclosing (define jv$ns$name …) names the procedure and
+;; is emitted bare so the enclosing (define jv$ns/name …) names the procedure and
 ;; its backtrace frame resolves; wrapping or re-binding it would drop that name.
 ;; emit-fn therefore skips its own variadic registration and emit-def-cached emits
 ;; the sibling (jolt-register-variadic! …) against the define's own binding.
@@ -533,9 +588,9 @@
 ;; The static callee fqn of a call site's fn head, or nil for a genuinely dynamic
 ;; callee (an arbitrary IFn through jolt-invoke — register nothing for that line).
 ;; :var — the var's fqn, matching the qualified name a source-registered frame
-;; reports; :local — a known procedure (self / a letrec-bound named fn): its
-;; qualified name, or the enclosing fn's *trace-site* for a self-call; :keyword /
-;; :coll / computed callees — nil.
+;; reports; :local — a known procedure (self / an enclosing named fn): the site
+;; its frame carries (*known-procs*), or the enclosing fn's *trace-site* for a
+;; self-call; :keyword / :coll / computed callees — nil.
 (defn- static-callee [fnode]
   (case (:op fnode)
     ;; The registered name must be the SAME form the callee's own *trace-site*
@@ -547,10 +602,8 @@
            (str (munge-name (:ns fnode)) "/" (munge-name (:name fnode)))
            (munge-name (:name fnode)))
     :local (let [nm (munge-name (:name fnode))]
-             (when (contains? *known-procs* nm)
-               (if (contains? *trace-self* nm)
-                 *trace-site*
-                 (if *qualifying-ns* (str (munge-name *qualifying-ns*) "/" nm) nm))))
+             (when-let [site (get *known-procs* nm)]
+               (if (contains? *trace-self* nm) *trace-site* site)))
     nil))
 ;; The def-emit sibling: one (jolt-register-callsite! …) per collected (line,
 ;; callee) entry, or "" when tracing is off / nothing collected — the seed mint
@@ -754,27 +807,68 @@
          (every? (fn [k] (and (= :const (:op k)) (keyword? (:val k)))) ks)
          (apply distinct? (map :val ks)))))
 
-(defn- emit-with-cells [emit-thunk]
-  (let [cells (atom [])
+;; The pool's bindings as flat `let` layers by dependency depth: layer 0 holds the
+;; constants that reference no other constant, layer k those whose deepest
+;; reference is in layer k-1. A pool is mostly keywords, symbols and var cells
+;; that reference nothing, so this is two or three layers.
+;;
+;; It was one let*, which Chez compiles as one nested scope per binding, and that
+;; is quadratic in the pool: 1600 bindings took 56 ms where the same bindings in a
+;; flat let took 10, 3200 took 230 against 36. A bare top-level fn has had a pool
+;; since the keyword re-intern fix, so a (fn [] …) holding 400 (is …) forms went
+;; from 850 ms to 1.4 s of Chez compile on output that had got SMALLER, and
+;; compilescaling's 1x->4x ratio climbed from 4.3 to 7 on CI. A reference to a
+;; label inside a string literal can only put an entry a layer too deep, which is
+;; still bound before everything that reads it.
+;;
+;; The labels are found by a string scan, not a regex: the compiler runs in
+;; profiles built without the regex group (gambitprofile).
+(defn- pool-label-refs [expr]
+  (let [n (count expr)]
+    (loop [from 0 acc []]
+      (if-let [i (str/index-of expr "_kc$" from)]
+        (let [j (loop [j (+ i 4)]
+                  (if (and (< j n) (let [c (nth expr j)] (and (>= (int c) 48) (<= (int c) 57))))
+                    (recur (inc j))
+                    j))]
+          (recur j (if (> j (+ i 4)) (conj acc (subs expr i j)) acc)))
+        acc))))
+
+(defn- pool-layers [consts]
+  (let [depth (volatile! {})]
+    (reduce (fn [layers [nm _ expr]]
+              (let [d (reduce (fn [d ref] (if-let [rd (get @depth ref)] (max d (inc rd)) d))
+                              0
+                              (pool-label-refs expr))]
+                (vswap! depth assoc nm d)
+                (update layers d (fnil conj []) (str "(" nm " " expr ")"))))
+            []
+            consts)))
+
+(defn- emit-with-scope [cells? emit-thunk]
+  (let [cells (when cells? (atom []))
         pool (atom {})
         ids (atom {})
         raw (binding [*cache-cells* cells
                       *const-pool* pool
                       *const-ids* ids]
               (emit-thunk))
-        ;; constants bind eagerly (value first); lazy cache cells start #f. Ordered
-        ;; by INSERTION so a constant that references an earlier one (a hoisted
-        ;; collection literal over its hoisted keywords) is bound after it; see
-        ;; hoist-const. Deterministic for a given emit, which is what the seed
-        ;; fixpoint needs.
-        consts (map (fn [p] (str "(" (first (val p)) " " (nth (val p) 2) ")"))
-                    (sort-by (comp second val) @pool))
-        lazies (map (fn [c] (str "(" c " #f)")) @cells)
-        binds  (concat consts lazies)]
-    (if (seq binds)
-      ;; let*, not let: the consts can depend on each other now.
-      (str "(let* (" (str/join " " binds) ") " raw ")")
+        ;; constants bind eagerly (value first); lazy cache cells start #f. Walked
+        ;; in INSERTION order, which is topological: a constant that references an
+        ;; earlier one (a hoisted collection literal over its hoisted keywords) was
+        ;; interned after it; see hoist-const. Deterministic for a given emit,
+        ;; which is what the seed fixpoint needs.
+        consts (map val (sort-by (comp second val) @pool))
+        layers (pool-layers consts)
+        layers (if (and cells (seq @cells))
+                 (update layers 0 (fnil into []) (map (fn [c] (str "(" c " #f)")) @cells))
+                 layers)]
+    (if (seq layers)
+      (reduce (fn [inner layer] (str "(let (" (str/join " " layer) ") " inner ")"))
+              raw
+              (rseq layers))
       raw)))
+(defn- emit-with-cells [emit-thunk] (emit-with-scope true emit-thunk))
 
 ;; A cache-cell scope for a top-level EXPRESSION (jolt-g3u). Without it the
 ;; collector exists only inside a def, so every var / protocol / ctor site in a
@@ -851,14 +945,28 @@
 (defn- top-form-repeats? [node]
   (node-tree-any? (fn [n] (contains? repeat-ops (:op n))) node))
 
+(defn- top-form-has-fn? [node]
+  (node-tree-any? (fn [n] (= :fn (:op n))) node))
+
+;; A fn literal in a bare top-level form gets the CONSTANT pool, not the cells.
+;; Such a form is how every deftype/defrecord method, every extend-type and
+;; extend-protocol impl, every defmethod body and every reify-in-a-registration
+;; reaches the runtime — code that runs on every call of the method — and without
+;; a pool each keyword literal in it re-interned per evaluation: a deftype method
+;; binds its fields with (__deftype-field this :f), so a type of eight fields paid
+;; eight intern lookups (a string hash each) on every method entry. core.logic's
+;; Substitutions is that type, and the lookups were a fifth of a propagation run.
+;; The pool is cheap where the cells are not: a hoisted keyword is one binding and
+;; one variable read in place of the (keyword …) call text, so the form Chez
+;; compiles barely grows — the 14% load cost measured above was the cells.
 (defn- emit-top-cells [node emit-thunk]
-  (if (and (var-cache?)
-           ;; never a def: the :def cases already wrap their INIT, which is the
-           ;; part that repeats. A def's remaining pieces run once.
-           (not= :def (:op node))
-           (top-form-repeats? node))
-    (emit-with-cells emit-thunk)
-    (emit-thunk)))
+  (cond
+    ;; never a def: the :def cases already wrap their INIT, which is the part
+    ;; that repeats. A def's remaining pieces run once.
+    (or (not (var-cache?)) (= :def (:op node))) (emit-thunk)
+    (top-form-repeats? node) (emit-with-cells emit-thunk)
+    (top-form-has-fn? node) (emit-with-scope false emit-thunk)
+    :else (emit-thunk)))
 
 ;; Scheme syntactic keywords. A jolt local with one of these names would, when
 ;; emitted verbatim, shadow the Scheme form in operator position (a local named
@@ -924,6 +1032,10 @@
                   ;; host interop (emit-invoke static call, :host-new,
                   ;; :host-static field ref).
                   "host-new" "host-static-call" "host-static-ref"
+                  ;; per-site caches: the static member site and the instance?
+                  ;; site, each with the constructor its hoisted cell calls
+                  "jolt-once-tag" "jolt-once-clear!" "host-static-ref-site" "host-static-proc-site" "host-static-site-make"
+                  "jolt-instance-site" "jolt-instance-site-make"
                   ;; record/reify protocol-method dispatch (:host-call fallback
                   ;; for any .method not in supported-host-methods).
                   "record-method-dispatch"
@@ -965,39 +1077,53 @@
                   "ftype-&ref" "ftype-pointer-address"}]
     (into from-registry helpers)))
 
-;; Most jolt names are already valid Scheme identifiers. The one that isn't is
-;; `#`, which jolt auto-gensyms use as a suffix (p1__0000X4# from #(...)) — `#`
-;; starts a datum in Scheme, so replace it with `_`. A name that collides with a
-;; Scheme keyword, a bare-emitted native op, or ANY runtime-emitted identifier
-;; (prefix "jolt-", "jv$", or in rt-emitted-names) is prefixed with `_` so it
-;; can never shadow the emitted form. The "jolt-"/"jv$" prefix rules are a
-;; safety net for identifiers added to the runtime that aren't yet in the
-;; registry — they catch future additions without manual enumeration.
+;; A munged name both Scheme readers would take for a NUMBER rather than an
+;; identifier. The reference reader yields SYMBOLS for +i, -i, +inf.0, -nan.0,
+;; .5, -.5 and the like (its number match needs a digit right after the sign),
+;; and emitted bare they abort compilation ("invalid bound variable 0+1i").
+;; Derived by probing both readers over the sign/dot-led tokens a symbol can
+;; start with: a number begins with a digit; with . and a digit; or with a sign
+;; and then a digit, a dot, a lone i, or inf.0/nan.0 in any case. A lone . is
+;; the pair dot, unreadable in a binding position. Over-approximates on purpose
+;; (+.. and +inf.0x are identifiers): a spare prefix costs nothing where a
+;; missed number is a reader error. The common -name/+name shapes (-invoke,
+;; +inc, -i0) are untouched. A digit-led name can only come from (symbol s).
+(defn- digit-char? [c] (let [cp (int c)] (and (>= cp 48) (<= cp 57))))
+(defn- number-lookalike? [s]
+  (let [n (count s) c0 (nth s 0) c1 (when (> n 1) (nth s 1))]
+    (or (digit-char? c0)
+        (and (= c0 \.) (or (nil? c1) (digit-char? c1)))
+        (and (or (= c0 \+) (= c0 \-))
+             (some? c1)
+             (or (digit-char? c1)
+                 (= c1 \.)
+                 (and (= n 2) (or (= c1 \i) (= c1 \I)))
+                 (and (or (= c1 \i) (= c1 \I) (= c1 \n) (= c1 \N))
+                      (let [r (str/lower-case (subs s 1))]
+                        (or (str/starts-with? r "inf.0") (str/starts-with? r "nan.0")))))))))
+
+;; The emitted identifier for a Clojure name: munge-chars (above), then a $R
+;; prefix on any name that would otherwise collide with something the emitter
+;; writes bare or the reader would not take as an identifier — a Scheme keyword
+;; (a local named `if` would turn the (if …) the back end emits into a call), a
+;; bare-emitted native op, ANY runtime-emitted identifier (rt-emitted-names, or
+;; the "jolt-"/"jv$" prefixes as a safety net for additions not yet in that
+;; registry), a number lookalike, or the empty name. The prefix is an escape
+;; token, not a plain `_`: a bare `_` is text a user can write, so `if` and
+;; `_if` both emitted `_if` and (let [if 1 _if 2] if) answered 2. No unprefixed
+;; munge can start with $R (an unprefixed $ is always $$/$P/$H/$V/$U), so the
+;; prefix keeps munge-name injective. A $ -> $$ still leaves the jv$/jolt-
+;; prefix tests true, and those runtime names never reach munge-name.
 (defn- munge-name [s]
-  ;; A Clojure symbol may carry chars that break a Scheme identifier or that
-  ;; collide once substituted: ' is the quote reader macro (a bare f' reads as f
-  ;; then 'rest), # is the auto-gensym suffix the reader puts on #() params
-  ;; (p__1#) and starts a Scheme datum, and $ is the escape marker used below.
-  ;; Map all three to safe tokens INJECTIVELY so two distinct Clojure locals can
-  ;; never munge to the same Scheme identifier: reserve $ as the escape char and
-  ;; escape it FIRST ($$ = a literal $), then ' -> $P and # -> $H. Decoding is an
-  ;; unambiguous left-to-right inverse ($$ -> $, $P -> ', $H -> #): every $ in
-  ;; the output is either doubled (came from a literal $) or single+P/+H (came
-  ;; from ' / #), so no two inputs share an output. The same mapping applies at
-  ;; the binding and at every reference, so resolution stays consistent. Only the
-  ;; char-substitution step changes; the reserved/emitted-name _-prefix below is
-  ;; untouched (it runs on the substituted string; a $ -> $$ still leaves the
-  ;; jv$/jolt- prefix tests true, and those runtime names never reach munge-name).
-  (let [s (-> s
-              (str/replace "$" "$$")
-              (str/replace "'" "$P")
-              (str/replace "#" "$H"))]
-    (if (or (contains? scheme-reserved s)
+  (let [s (munge-chars s)]
+    (if (or (zero? (count s))
+            (contains? scheme-reserved s)
             (contains? bare-native-names s)
             (contains? rt-emitted-names s)
             (.startsWith ^String s "jolt-")
-            (.startsWith ^String s "jv$"))
-      (str "_" s) s)))
+            (.startsWith ^String s "jv$")
+            (number-lookalike? s))
+      (str "$R" s) s)))
 
 (declare emit)
 (declare emit*)
@@ -1012,23 +1138,42 @@
 ;; the same reason: a (.concat s nil) in tail position raises from inside the
 ;; host, and without the site the fn it sat in is the one frame the report
 ;; cannot recover.
-(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw :host-call})
-;; A try with neither a catch nor a finally is tail-transparent too, because
-;; emit-try emits it as its body and nothing else: there is no guard and no
-;; dynamic-wind between the caller and that body, so a tail call inside one is a
-;; real tail call and needs its site stored like any other. Treating it as opaque
-;; stored nothing, TCO erased the frames anyway, and the trace lost every frame
-;; from the try outwards — (defn wrapped [x] (try (boom x))) reported `boom` and
-;; then stopped, where the same fn without the try named itself and its caller.
-;; A try that HAS a catch or a finally is genuinely not tail-transparent and stays
-;; opaque; this reads the same two keys emit-try branches on.
+(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw :host-call :try})
+;; A try is tail-transparent too. With neither a catch nor a finally, emit-try
+;; emits it as its body and nothing else, so a tail call inside one is a real tail
+;; call. With a catch or a finally the body runs inside a guard or dynamic-wind,
+;; so its last call is not a Chez tail call — but the guard itself is, and it
+;; erases the enclosing fn's frame all the same. The body's last call is then the
+;; fn's exit: storing its site and registering it as a tail edge is what lets a
+;; trace, or Thread.getStackTrace, name the fn the try sat in. Treating the try
+;; as opaque lost every frame from the try outwards —
+;; (defn wrapped [x] (try (boom x))) reported `boom` and then stopped. The
+;; finally body is not the fn's exit; emit-try emits it non-tail.
 (defn- tail-transparent? [node]
-  (or (contains? tail-transparent-ops (:op node))
-      (and (= :try (:op node)) (nil? (:catch-sym node)) (nil? (:finally node)))))
+  (contains? tail-transparent-ops (:op node)))
+;; ^:once captures released at their last use (see once-last-uses, near emit-fn).
+;; While a once fn's body emits, *once-clears* maps each capture's name to the
+;; Scheme store that empties its slot in the closure's box; a node marked
+;; :clear-caps gets those stores after it is evaluated.
+(def ^:dynamic *once-clears* nil)
+(defn- once-clear-stmts [names]
+  (when *once-clears*
+    (let [ss (keep (fn [n] (get *once-clears* n)) names)]
+      (when (seq ss) (str/join " " ss)))))
+;; S (a node's emitted text) followed by the stores its :clear-caps call for.
+(defn- with-once-clears [node s]
+  (let [st (when-let [cc (:clear-caps node)] (once-clear-stmts cc))]
+    (cond
+      (nil? st) s
+      (= :local (:op node)) (str "(begin " st " " s ")")
+      :else (let [v (fresh-label "_cv$")]
+              (str "(let ((" v " " s ")) " st " " v ")")))))
+
 (defn emit [node]
   (let [s (if (and *tail?* (not (tail-transparent? node)))
             (binding [*tail?* false] (emit* node))
-            (emit* node))]
+            (emit* node))
+        s (with-once-clears node s)]
     ;; a :long operand of a :double-specialized op is tagged :fl-coerce by
     ;; jolt.passes.numeric so it widens to a flonum here (JVM long->double
     ;; widening). The obvious emit is a bare (fixnum->flonum s), and that is what
@@ -1350,10 +1495,18 @@
 ;; ^{:inline (fn ...)} was never registered, so a macro splicing that value out of
 ;; (meta #'f) had no source to rebuild it from -- "Cannot compile this value into
 ;; code".
+;;
+;; The expression gets the init's cache-cell scope. Its values are mostly fns —
+;; every deftest body is the :test fn in its def's metadata — and without the scope
+;; each var they reference resolved by name per call: a loop calling an aliased
+;; var ran 66 ns/iter in a deftest body against 8 ns in a defn. Gated on
+;; var-cache? like emit-top-cells, so the seed mint's output does not move.
 (defn- emit-def-meta [node]
   (if (:meta-expr node)
     (binding [*fnsrc-def-init?* false]
-      (emit (:meta-expr node)))
+      (if (var-cache?)
+        (emit-with-cells #(emit (:meta-expr node)))
+        (emit (:meta-expr node))))
     (emit-quoted (:meta node))))
 
 (defn- emit-binding [b]
@@ -2064,18 +2217,37 @@
                      :else lett)]))
 
 ;; The globally unique letrec name for the next anon literal:
-;; jfn$<munged-ns>$<munged-def>$<counter> (counter per top-level def);
-;; literals outside any def use jfn$<munged-ns>$$<counter>, with the counter
-;; per NAMESPACE for the life of the process. Per top-level form, every
-;; deftype method body and every defmethod in a namespace started at $$0 and
-;; their registrations (keyed by name) overwrote each other, so an image
-;; restore of one such closure came back with the LAST form's source.
-;; Deterministic still: one mint or build emits a namespace's forms in source
-;; order, so the same source emits the same names.
+;; jfn$<ns>/<def>$<counter> (counter per top-level def); literals outside any
+;; def use jfn$<ns>/$<counter>, with the counter per NAMESPACE for the life of
+;; the process. Per top-level form, every deftype method body and every
+;; defmethod in a namespace started at $0 and their registrations (keyed by
+;; name) overwrote each other, so an image restore of one such closure came
+;; back with the LAST form's source. Deterministic still: one mint or build
+;; emits a namespace's forms in source order, so the same source emits the
+;; same names.
+;;
+;; The parts are munge-chars, not munge-name: the jfn$ prefix already keeps
+;; the whole name off every reserved word. The separator is `/` because no
+;; escape can forge it: munge-chars never emits one and the reader never lets
+;; one into a namespace or def name. With `$` as the separator, ns "a$" + def
+;; "c" and ns "a" + def "$c" both spelled jfn$a$$$c$0, and the second
+;; registration silently replaced the first.
 (def ^:private fnsrc-ns-counters (atom {}))
+
+(defn seed-fnsrc-ns-counter!
+  "Start namespace ns's anon-literal counter at n. The build does this as it
+  emits each namespace: the counter otherwise carries whatever the in-process
+  load of that namespace used — a source load consumes names, a cached one does
+  not — and a namespace's emitted text must not depend on which it was, since
+  the build caches one compiled unit per namespace on its text (#1059). The
+  build seeds far above zero so a built binary's own runtime evaluation, whose
+  counters start at 0, cannot reuse a baked name."
+  [ns n]
+  (swap! fnsrc-ns-counters assoc (str ns) n))
 (defn- fnsrc-name []
-  (str "jfn$" (munge-name *fnsrc-ns*)
-       (if *fnsrc-def* (str "$" (munge-name *fnsrc-def*) "$") "$$")
+  (str "jfn$" (munge-chars *fnsrc-ns*) "/"
+       (if *fnsrc-def* (munge-chars *fnsrc-def*) "")
+       "$"
        (if *fnsrc-def*
          (let [n @*fnsrc-counter*] (swap! *fnsrc-counter* inc) n)
          (let [k (str *fnsrc-ns*)
@@ -2084,7 +2256,7 @@
            n))))
 
 ;; A top-level form's collected anon-fn registrations as Scheme siblings:
-;;   (image-register-fn-form! "jfn$..." (image-fn-form-src "<source text>") "ns" <quoted free names>)
+;;   (image-register-fn-form! "jfn$ns/def$0" (image-fn-form-src "<source text>") "ns" <quoted free names>)
 ;; "" when the namespace is system or nothing was collected, so any fn-free def
 ;; emits byte-identically.
 ;;
@@ -2248,6 +2420,137 @@
              (str/join " " (map (fn [b] (str "(" (nth b 0) " " (nth b 1) ")")) binds))
              ") " (str/join " " calls) ")")))))
 
+;; ---------------------------------------------------------------------------
+;; ^:once captures, released at their last use.
+;;
+;; The reference's compiler nulls a ^:once fn's closed-over field at the point of
+;; its LAST USE on the path the body takes, so a body that walks a source does not
+;; pin it, and a body that throws and is forced again finds every capture it had
+;; not yet finished with (LazySeq reruns fn after a failure). Clearing them all on
+;; entry released as much and diverged on the rerun (jolt-4s12.3).
+;;
+;; once-last-uses marks, in a once fn's body, the nodes after whose evaluation a
+;; capture is dead: a :local read of it that nothing on the path reads again, or
+;; a nested :fn that captures it last. The mark is :clear-caps, a vector of names,
+;; which emit turns into the stores that let the captures go. The body reads each
+;; capture into a local on entry, so the store changes no value the body sees --
+;; only when the fn's own slot lets go.
+;;
+;; Backward liveness in evaluation order: `live` is the set of captures read
+;; later on the path. A capture read inside a loop is live across the whole loop
+;; (the next iteration reads it), and one read by a catch or finally is live
+;; across the try's body (a throw anywhere in it reaches them). A rebinding of a
+;; capture's name hides it for the rebinding's scope.
+
+;; The captures in CAPS a node reads, outside any rebinding of them, including
+;; through nested fns (whose own params hide names too).
+(defn- once-cap-uses [node caps]
+  (if (empty? caps)
+    #{}
+    (let [op (:op node)]
+      (cond
+        (= op :local) (if (contains? caps (:name node)) #{(:name node)} #{})
+        (= op :fn)
+        (reduce (fn [acc a]
+                  (let [hidden (cond-> (set (:params a)) (:rest a) (conj (:rest a))
+                                 (:name node) (conj (:name node)))]
+                    (into acc (once-cap-uses (:body a) (reduce disj caps hidden)))))
+                #{} (:arities node))
+        (or (= op :let) (= op :loop))
+        (let [letrec? (:letrec node)
+              names (map first (:bindings node))
+              all-caps (reduce disj caps names)]
+          (loop [bs (:bindings node) cs (if letrec? all-caps caps) acc #{}]
+            (if (empty? bs)
+              (into acc (once-cap-uses (:body node) all-caps))
+              (let [[nm init] (first bs)]
+                (recur (rest bs) (if letrec? cs (disj cs nm))
+                       (into acc (once-cap-uses init cs)))))))
+        :else (ir/reduce-ir-children (fn [acc c] (into acc (once-cap-uses c caps))) #{} node)))))
+
+;; Does the body loop back to the fn's own head (a recur outside any loop or
+;; nested fn)? Then the whole body is a loop.
+(defn- once-self-recur? [node]
+  (let [op (:op node)]
+    (cond
+      (= op :recur) true
+      (or (= op :loop) (= op :fn)) false
+      :else (ir/reduce-ir-children (fn [acc c] (or acc (once-self-recur? c))) false node))))
+
+(defn- mark-clear [node dead]
+  (if (empty? dead) node (assoc node :clear-caps (vec (sort dead)))))
+
+;; [node' live-before]
+(declare once-mark)
+(defn- once-mark-seq [nodes caps live]
+  ;; nodes in evaluation order; walk them backward
+  (loop [i (dec (count nodes)) live live acc ()]
+    (if (neg? i)
+      [(vec acc) live]
+      (let [[n l] (once-mark (nth nodes i) caps live)]
+        (recur (dec i) l (cons n acc))))))
+
+(defn- once-mark [node caps live]
+  (if (empty? caps)
+    [node live]
+    (let [op (:op node)]
+      (cond
+        (= op :local)
+        (let [nm (:name node)]
+          (if (contains? caps nm)
+            [(if (contains? live nm) node (mark-clear node #{nm})) (conj live nm)]
+            [node live]))
+        (= op :fn)
+        (let [used (once-cap-uses node caps)]
+          [(mark-clear node (remove live used)) (into live used)])
+        (= op :if)
+        (let [[t lt] (once-mark (:then node) caps live)
+              [e le] (once-mark (:else node) caps live)
+              [c lc] (once-mark (:test node) caps (into lt le))]
+          [(assoc node :test c :then t :else e) lc])
+        (or (= op :let) (= op :loop))
+        (let [letrec? (:letrec node)
+              bs (:bindings node)
+              names (map first bs)
+              body-caps (reduce disj caps names)
+              ;; a loop's body runs again: what it reads is live all through it
+              body-live (if (= op :loop) (into live (once-cap-uses (:body node) body-caps)) live)
+              [body lb] (once-mark (:body node) body-caps body-live)
+              ;; the scope each init sees: the names bound before it are hidden
+              ;; (all of them, for a letrec)
+              scopes (if letrec?
+                       (vec (repeat (count bs) body-caps))
+                       (loop [bs bs cs caps acc []]
+                         (if (empty? bs) acc
+                             (recur (rest bs) (disj cs (first (first bs))) (conj acc cs)))))
+              [inits l] (loop [i (dec (count bs)) live lb acc ()]
+                          (if (neg? i)
+                            [(vec acc) live]
+                            (let [[n l] (once-mark (second (nth bs i)) (nth scopes i) live)]
+                              (recur (dec i) l (cons n acc)))))]
+          [(assoc node :bindings (mapv (fn [b init] [(first b) init]) bs inits) :body body) l])
+        (= op :try)
+        (let [[f lf] (if (:finally node) (once-mark (:finally node) caps live) [nil live])
+              [c lc] (if (:catch-body node) (once-mark (:catch-body node) caps lf) [nil lf])
+              [b lb] (once-mark (:body node) caps (into lf lc))
+              n (assoc node :body b)
+              n (if f (assoc n :finally f) n)
+              n (if c (assoc n :catch-body c) n)]
+          [n lb])
+        :else
+        (let [kids (ir/reduce-ir-children conj [] node)
+              [kids' l] (once-mark-seq kids caps live)
+              i (atom -1)]
+          [(ir/map-ir-children (fn [_] (nth kids' (swap! i inc))) node) l])))))
+
+(defn- once-last-uses [body cap-names]
+  (let [caps (set cap-names)]
+    (if (once-self-recur? body)
+      ;; the whole body loops: nothing is read for the last time inside it, and
+      ;; the box goes when the closure does
+      body
+      (first (once-mark body caps #{})))))
+
 (defn- emit-fn [node]
   (let [;; a def's DIRECT anonymous init is named by its define, so it keeps the
         ;; bare lambda; *fnsrc-def-init?* is set only around that init's emission
@@ -2257,14 +2560,20 @@
         ;; a named fn binds its own name as a known-procedure local across ALL
         ;; arities, so self-calls emit directly rather than via jolt-invoke.
         self (when-let [nm (:name node)] (munge-name nm))
-        ;; When *qualifying-ns* is set (the :def runtime-eval path), bind the
-        ;; letrec under a qualified name (ns/name) so Chez reports a unique
-        ;; per-var frame name. Nested/anonymous fns ignore it (self is nil).
-        qname (when (and self *qualifying-ns*)
+        ;; When *qualifying-ns* is set (the :def runtime-eval path), a def's
+        ;; DIRECT named init binds its letrec under a qualified name (ns/name) so
+        ;; Chez reports a unique per-var frame name — the source registry's key
+        ;; for the def. A nested named literal is not the var's root: it binds
+        ;; under its registry label below, on this path as on every other. Bound
+        ;; under ns/name too, it was never registered (the qualified branch
+        ;; skipped registration), so a closure over a letfn-bound fn dumped from
+        ;; a build and refused from a `jolt run` session; and two defs' inner
+        ;; `mapi`s shared one frame name that read as a var named mapi.
+        qname (when (and self *qualifying-ns* def-init?)
                 (str (munge-name *qualifying-ns*) "/" self))
         ;; the unique name is allocated BEFORE the arity bodies emit, so an
         ;; enclosing literal numbers ahead of the literals nested inside it
-        ;; (document order — jfn$ns$def$0 is the outermost)
+        ;; (document order — jfn$ns/def$0 is the outermost)
         ;; The namespace the literal's SOURCE was written in: this one, or the
         ;; callee's when the inline pass copied it here. Both are checked against
         ;; the system split, so a core literal spliced into user code stays
@@ -2274,10 +2583,14 @@
         ;; A literal registers whether or not it has a NAME. It used to have to be
         ;; anonymous, because the registry is keyed on the name Chez reports and a
         ;; named fn is bound under its own munged name, which is not unique -- two
-        ;; `mapi`s in two fns would collide. So a named one is bound under
-        ;; <name>$jf<n> instead and its short name aliases that: unique for the
-        ;; registry, still readable in a backtrace (source-registry strips the
-        ;; suffix, as it already does for the splicer's __ilN).
+        ;; `mapi`s in two fns would collide. So a named one is bound under the
+        ;; anon label plus its name, jfn$<ns>/<def>$<n>/<name>, and its short
+        ;; name aliases that: unique for the registry, and a backtrace shows it
+        ;; as <ns>/<def>/<name> (source-registry srcreg-display-name), the way
+        ;; clojure.stacktrace demunges user$f$mapi__12. It was <name>$jf<n> with
+        ;; the counter per def, so `mapi` in two defs — or in two namespaces —
+        ;; was mapi$jf0 in both, and an image restore of the first closure came
+        ;; back with the second's source.
         ;;
         ;; This is what map-indexed, distinct, dedupe, partition-by and tree-seq
         ;; needed: each closes a lazy-seq thunk over a letfn-bound fn, and that
@@ -2288,9 +2601,11 @@
                             (not (fnsrc-system-ns? fnsrc-src-ns))
                             (:src-form node))
                    (if (:name node)
-                     (str (munge-name (:name node)) "$jf" (let [n @*fnsrc-counter*]
-                                                            (swap! *fnsrc-counter* inc) n))
+                     (str (fnsrc-name) "/" (munge-chars (:name node)))
                      (fnsrc-name)))
+        ;; the name a NAMED fn's frame carries, which is what its tail sites
+        ;; record; nil for an anonymous literal, whose tail sites skip
+        site (when self (or qname fnsrc-nm self))
         ;; --- fn identity -------------------------------------------------
         ;; Chez shares ONE closure object across every evaluation of a lambda
         ;; with no free variables, where Clojure allocates a fresh fn each time.
@@ -2310,9 +2625,29 @@
         ;; allocated.
         force-id? (and (not def-init?) (empty? (:free-names node)))
         id-nm (when force-id? (fresh-label "_fnid$"))
-        clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
-                          *trace-site* (or qname self)
-                          *trace-self* (cond-> #{} self (conj self) qname (conj qname))
+        ;; --- ^:once captures (the box is described at `clauses` below) --------
+        once-env (when (and (:once node) (seq (:free-names node)) (nil? (:live-names node)))
+                   (fresh-label "_once$"))
+        once-ps (when once-env (map munge-name (:free-names node)))
+        ;; A single-arity body releases each capture at its last use
+        ;; (once-last-uses), as the reference's compiler nulls a once fn's field.
+        ;; On Chez the emptied slot holds the literal #!bwp, an immediate, so the
+        ;; store needs no write barrier (1.4 ns against 2.6 for jolt-nil); the box
+        ;; is read back through jolt-once-ref, which answers nil for it -- what a
+        ;; rerun after a failure sees, as the reference's cleared fields are null.
+        once-marked (when (and once-env (= 1 (count arities)))
+                      (let [a (first arities)
+                            hidden (cond-> (set (:params a)) (:rest a) (conj (:rest a)))]
+                        [(assoc a :body (once-last-uses (:body a) (remove hidden (:free-names node))))]))
+        once-cleared (if (= :chez (target)) "#!bwp" "jolt-nil")
+        once-clears (when once-marked
+                      (into {} (map-indexed
+                                 (fn [i nm] [nm (str "(vector-set! " once-env " " (inc i) " " once-cleared ")")])
+                                 (:free-names node))))
+        clauses (binding [*known-procs* (if self (assoc *known-procs* self site) *known-procs*)
+                          *once-clears* once-clears
+                          *trace-site* site
+                          *trace-self* (cond-> #{} self (conj self) site (conj site))
                           ;; An enclosing letrec's bindings are initialised by the
                           ;; time anything in THIS body runs, so a literal nested
                           ;; here may name one — map-indexed's lazy-seq thunk
@@ -2321,7 +2656,7 @@
                           ;; DURING the initialisation, which is this fn itself.
                           *letrec-binders* #{}
                           *fnsrc-def-init?* false]
-                  (mapv emit-arity-clause arities))
+                  (mapv emit-arity-clause (or once-marked arities)))
         ;; The capture must stay LIVE. Chez removes a dead one and the sharing
         ;; comes back — measured for a dead reference, a captured value used
         ;; through begin, an assigned variable and a captured fresh pair, all of
@@ -2386,6 +2721,35 @@
                                               ") " fbody ")"))]
                              (str "(lambda " vformals
                                   " (if (null? " (munge-name (:rest variadic)) ") " fbody " " vbody "))")))))
+        ;; A ^:once fn (the reference's lazy-seq thunk) lets go of what it captured
+        ;; as it runs: the reference's compiler nulls a once-fn's closed-over
+        ;; fields at their last use. Here the captures ride in one box the closure
+        ;; holds; the body copies them into locals and empties the box first
+        ;; thing, and Chez frames keep only live values, so each is released at
+        ;; its last use (the box empties to nil, which is what a rerun after a failure
+        ;; then sees, as the reference's cleared locals are). A plain rebinding would not do -- the optimizer
+        ;; propagates (let ((x x)) ...) straight back to the closure's slot.
+        ;; Without it a thunk that walks a source -- for's :when loop, which keeps
+        ;; the closure alive for its step fn -- pinned the head of the source for
+        ;; the whole walk (3M skipped elements out of a 256MB heap the JVM does
+        ;; in 96MB). A literal the inline pass copied (:live-names) keeps the
+        ;; plain closure: its captures are renamed and the box would name them
+        ;; wrong. The tag lets the image read a boxed closure's captures in
+        ;; order (state-image.ss image-flat-free-values).
+        clauses (if once-env
+                  (let [ref (if (and once-marked (= :chez (target))) "jolt-once-ref" "vector-ref")
+                        binds (apply str (map-indexed (fn [i p] (str "(" p " (" ref " " once-env " " (inc i) "))")) once-ps))
+                        ;; a few slots cleared inline; a bigger box by the runtime loop
+                        ;; a marked body releases each at its last use; an
+                        ;; unmarked (multi-arity) one all on entry
+                        clear (cond
+                                once-marked ""
+                                (<= (count once-ps) 4)
+                                (apply str (map (fn [i] (str "(vector-set! " once-env " " (inc i) " jolt-nil) ")) (range (count once-ps))))
+                                :else (str "(jolt-once-clear! " once-env ") "))]
+                    (mapv (fn [c] [(nth c 0) (str "(let (" binds ") " clear (nth c 1) ")")])
+                          clauses))
+                  clauses)
         lambda (cond
                  (= 1 (count clauses))
                  (let [c (first clauses)] (str "(lambda " (nth c 0) " " (nth c 1) ")"))
@@ -2399,6 +2763,9 @@
         ;; and native backtrace frames depend on. Verified before relying on it.
         lambda (if force-id?
                  (str "(let ((" id-nm " jolt-fn-identity-seed)) " lambda ")")
+                 lambda)
+        lambda (if once-env
+                 (str "(let ((" once-env " (vector jolt-once-tag " (str/join " " once-ps) "))) " lambda ")")
                  lambda)
         ;; A fn with a variadic arity records that arity's FIXED param count, so
         ;; jolt-apply can hand it a lazy rest instead of realizing the tail. The
@@ -2415,7 +2782,7 @@
         ;;   (letrec ((m (lambda …))) (jolt-register-variadic! N m))   name = m
         ;;   (letrec ((m (jolt-register-variadic! N (lambda …)))) m)   name = #f
         ;; An ANONYMOUS fn has no binding of its own — it is emitted bare so the
-        ;; enclosing (define jv$ns$name …) names it — so its def registers the
+        ;; enclosing (define jv$ns/name …) names it — so its def registers the
         ;; sibling call instead (emit-def-cached), and *variadic-reg-suppressed?*
         ;; tells this fn to leave it alone.
         variadic-fixed (some (fn [a] (when (:rest a) (count (:params a)))) arities)
@@ -2546,11 +2913,16 @@
       :else op)))
 
 ;; IFn dispatch for a LITERAL callee (Clojure's "value as fn"): a keyword looks
-;; itself up in its arg; a map/set/vector literal looks up its arg.
-(defn- ifn-kind [fnode]
+;; itself up in its arg; a map/set/vector literal looks up its arg. Only at an
+;; arity the callee's invoke has — Keyword and APersistentMap take one or two
+;; args, APersistentSet and APersistentVector one. Any other count is nil, so
+;; the call goes through jolt-invoke and throws the callee's ArityException
+;; rather than a lookup quietly dropping the extra args (#1162).
+(defn- ifn-kind [fnode nargs]
   (case (:op fnode)
-    :const (when (keyword? (:val fnode)) :keyword)
-    (:map :set :vector) :coll
+    :const (when (and (keyword? (:val fnode)) (<= 1 nargs 2)) :keyword)
+    :map (when (<= 1 nargs 2) :coll)
+    (:set :vector) (when (= 1 nargs) :coll)
     nil))
 
 ;; Polymorphic inline-cache width. MUST match jolt-pic-n in host/chez/records.ss:
@@ -2735,9 +3107,12 @@
         ;; R2: record this site's static callee for the callsite table. Runs after
         ;; the args are emitted, so when a line carries both a call and its
         ;; operand's call the OUTER (later-emitted) callee wins — the tail call's.
-        _ (when tl (register-callsite! tl (static-callee fnode) tail?))
+        ;; A dynamic TAIL callee registers as "?": the reporter needs to know the
+        ;; site's call went somewhere even when it cannot say where (rt.ss
+        ;; jolt-dynamic-tail-lines). A dynamic non-tail site still registers nothing.
+        _ (when tl (register-callsite! tl (or (static-callee fnode) (when tail? "?")) tail?))
         nop (native-op fnode (count args))
-        kind (ifn-kind fnode)
+        kind (ifn-kind fnode (count args))
         ;; order args left-to-right (build receives the spliced operand strings)
         order-args (fn [build] (ordered-call arg-nodes args build))
         defstr (fn [as] (if (> (count as) 1) (str " " (nth as 1)) ""))
@@ -2753,6 +3128,20 @@
                    (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
                                  (fn [operands] (emit-call tail? callee operands tl ich)))))]
     (cond
+      ;; (instance? T x) asks the same question at nearly every call — T is a literal
+      ;; or a type's ctor value — so the site gets an inline cache (records-interop.ss
+      ;; jolt-instance-site): the last T by identity and the last receiver kind,
+      ;; answered by two eq?s and an epoch compare. Without it every call interned the type name as a symbol and went
+      ;; through instance-check's type-argument normalization and two memo tables,
+      ;; 37-54 ns against the JVM's inlined instanceof. The site object is a per-site
+      ;; constant, so this needs a pool; it also needs var-cache? so the seed mint
+      ;; stays byte-identical, and a callee that IS clojure.core's — an ns that
+      ;; defined its own instance-check resolves elsewhere and is called as written.
+      (and *const-pool* (var-cache?)
+           (= :var (:op fnode)) (= "clojure.core" (:ns fnode)) (= "instance-check" (:name fnode))
+           (= 2 (count arg-nodes)))
+      (let [site (hoist-const-per-site "(jolt-instance-site-make)")]
+        (order-args (fn [as] (str "(jolt-instance-site " site " " (first as) " " (second as) ")"))))
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
       ;; through the protocol var -> jolt-invoke -> protocol-resolve (which recomputes
@@ -2974,18 +3363,28 @@
       (= kind :coll)
       (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
                     (fn [[c & as]]
-                      (str (if (and (= :vector (:op fnode)) (= 1 (count as)))
+                      (str (if (= :vector (:op fnode))
                              "(jolt-nth "
                              "(jolt-get ")
                            c " " (str/join " " as) ")")))
       (and (stdlib-var? fnode) (not (prelude-mode?)))
       (throw (ex-info (str "emit: unsupported stdlib fn `" (:ns fnode) "/" (:name fnode)
                            "` (no core on Chez yet)") {}))
-      ;; static method call (Class/method arg*) -> (host-static-call ...).
+      ;; static method call (Class/method arg*). With a const pool the site gets a
+      ;; cache (host-static.ss host-static-proc-site): it answers the procedure the
+      ;; call applies, so a warm call is one epoch compare and a plain application
+      ;; instead of three string-keyed lookups and a rest list. Gated like the
+      ;; instance? site, so the seed mint stays byte-identical.
       (= :host-static (:op fnode))
-      (order-args (fn [as]
-                    (str "(host-static-call " (chez-str-lit (:class fnode)) " " (chez-str-lit (:member fnode))
-                         (if (empty? as) "" (str " " (str/join " " as))) ")")))
+      (if (and *const-pool* (var-cache?))
+        (let [site (hoist-const-per-site "(host-static-site-make)")]
+          (order-args (fn [as]
+                        (str "((host-static-proc-site " site " " (chez-str-lit (:class fnode)) " "
+                             (chez-str-lit (:member fnode)) " " (count as) ")"
+                             (if (empty? as) "" (str " " (str/join " " as))) ")"))))
+        (order-args (fn [as]
+                      (str "(host-static-call " (chez-str-lit (:class fnode)) " " (chez-str-lit (:member fnode))
+                           (if (empty? as) "" (str " " (str/join " " as))) ")"))))
       (= :host (:op fnode))
       (throw (ex-info (str "emit: unsupported host call `" (:name fnode) "`") {}))
       ;; a :local callee: a known procedure (the letrec-bound self-name of a named
@@ -2994,7 +3393,11 @@
       ;; holds an arbitrary IFn -> dynamic dispatch.
       (= :local (:op fnode))
       (if (*known-procs* (munge-name (:name fnode)))
-        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as tl ich)))
+        ;; a ^:once body's last use of a captured callee: released before the
+        ;; call (the local already holds it), which keeps the call in tail position
+        (let [call (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as tl ich)))
+              st (when-let [cc (:clear-caps fnode)] (once-clear-stmts cc))]
+          (if st (str "(begin " st " " call ")") call))
         (invoke))
       ;; closed-world direct call: the callee var is an app fn def already emitted
       ;; with a Scheme binding — apply it directly, no var lookup, no jolt-invoke.
@@ -3163,7 +3566,7 @@
                (emit (:body node)))]
     (if-let [fin (:finally node)]
       (str "(dynamic-wind jolt-finally-in (lambda () " core ")"
-           " (lambda () " (emit fin) "))")
+           " (lambda () " (binding [*tail?* false] (emit fin)) "))")
       core)))
 
 ;; Does this IR node emit to an expression that yields a Scheme boolean? Used to
@@ -3348,8 +3751,12 @@
                    ") (mark-macro! " (chez-str-lit (:ns node)) " "
                    (chez-str-lit (:name node)) ") jolt-nil)")
     :host (throw (ex-info (str "emit: unsupported host ref `" (:name node) "`") {}))
-    :host-static (str "(host-static-ref " (chez-str-lit (:class node)) " "
-                      (chez-str-lit (:member node)) ")")
+    ;; a static field read (Long/MIN_VALUE); cached per site like the call above
+    :host-static (if (and *const-pool* (var-cache?))
+                   (str "(host-static-ref-site " (hoist-const-per-site "(host-static-site-make)") " "
+                        (chez-str-lit (:class node)) " " (chez-str-lit (:member node)) ")")
+                   (str "(host-static-ref " (chez-str-lit (:class node)) " "
+                        (chez-str-lit (:member node)) ")"))
     :host-new (str "(host-new " (chez-str-lit (:class node))
                    (let [args (map emit (:args node))]
                      (if (empty? args) "" (str " " (str/join " " args)))) ")")
@@ -3597,7 +4004,7 @@
         ;; frame to ns/name (file:line). Chez names the frame by whatever emit-fn
         ;; binds the lambda to: a NAMED fn (defn, or (fn foo …)) gets a letrec
         ;; self-binding = munge-name of the fn's own name; an ANONYMOUS fn def has
-        ;; no letrec, so the lambda sits directly under (define jv$ns$name …) and
+        ;; no letrec, so the lambda sits directly under (define jv$ns/name …) and
         ;; takes that name. Register under whichever Chez will report.
         pos (:pos node)
         frame-name (when fn? (if-let [fnm (:name (:init node))] (munge-name fnm) b))
@@ -3690,7 +4097,7 @@
 ;; name itself. A macro's expander reaches the image emitter as a BARE fn form —
 ;; ce-defmacro->fn has already split the name off — so the caller supplies it
 ;; here; otherwise every macro in a namespace registers its anon fns under
-;; jfn$<ns>$$<n> with the counter restarting per form, and siblings collide.
+;; jfn$<ns>/$<n> with the counter restarting per form, and siblings collide.
 (defn emit-top-form
   ([node] (emit-top-form node nil))
   ([node fnsrc-def]
@@ -3702,9 +4109,9 @@
   ;; instance holding one refused to dump.
   (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node) *fnsrc-ns*)
             ;; :defmacro too, not just :def. Without it every defmacro in a
-            ;; namespace emits its expander under jfn$<ns>$$<n> with the counter
+            ;; namespace emits its expander under jfn$<ns>/$<n> with the counter
             ;; restarting per top-level form, so sibling macros all claim
-            ;; jfn$<ns>$$0 — last registration wins, and an image dump of a
+            ;; jfn$<ns>/$0 — last registration wins, and an image dump of a
             ;; closure over an earlier macro's expander restores a different
             ;; macro's source. A defmacro node carries :name exactly as :def
             ;; does, so naming it is all that is needed.

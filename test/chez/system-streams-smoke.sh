@@ -43,6 +43,12 @@ check() {
 check a "$(run '(println (instance? java.io.InputStream System/in))')" "true"
 check a2 "$(run '(println (class System/in))')" "java.io.InputStream"
 
+# stdin is decoded by the same decoder as every other Reader (natives-str.ss
+# utf8-bytes->string), not by Chez's codec: a leading BOM is U+FEFF and an
+# overlong costs one replacement per byte, both as the JVM answers them.
+check b0 "$(run '(println (pr-str [(mapv int (read-line)) (mapv int (read-line))]))' "$(printf '\357\273\277ab\n\300\257c\n')")" \
+  "[[65279 97 98] [65533 65533 99]]"
+
 # --- (b) slurp / read / line-seq over piped stdin -----------------------------
 check b "$(run '(println (slurp System/in))' 'hello stdin')" "hello stdin"
 check c "$(run '(println (pr-str (vec (line-seq (clojure.java.io/reader System/in)))))' 'a
@@ -240,6 +246,185 @@ check s2 "$(run '(let [p (java.io.PushbackInputStream. (java.io.ByteArrayInputSt
 # available over a pipe: the pushed-back byte counts, on top of whatever the
 # kernel reports (r9 above shows why that part is not a fixed number here)
 check s3 "$(run '(let [p (java.io.PushbackInputStream. System/in)] (.unread p 120) (println (pr-str [(>= (.available p) 1) (.read p) (.read p)])))' 'ab')" "[true 120 97]"
+
+# --- (io/reader path) streams the file, it does not slurp it (jolt-0nk) -------
+# io/reader over a path used to answer a StringReader built from the whole file,
+# so the content had to be read before the reader existed and nothing could be
+# consumed from a source still arriving: .readLine and line-seq over a FIFO, a
+# tailed log or a device blocked until EOF. The JVM hands back a BufferedReader
+# over a FileReader; io-streams.ss now builds a char-reader over the file's port.
+#
+# The witness is a FIFO whose writer holds it open, writes one line, sleeps, then
+# writes another. A streaming reader returns the first line immediately; a
+# slurping one cannot return until the writer closes. The test cannot hang: if
+# the reader blocks, the writer finishes on its own and the assertion fails on
+# the elapsed time instead.
+#
+# The writer's open blocks until a reader opens, so the clock is anchored to the
+# reader and does not depend on how long jolt takes to start.
+if command -v mkfifo >/dev/null 2>&1; then
+  fifo_dir="$(mktemp -d)"
+  fifo="$fifo_dir/pipe"
+  # elapsed_first_line <expr-building-the-reader>: ms until the first line lands.
+  elapsed_first_line() {
+    rm -f "$fifo"; mkfifo "$fifo"
+    ( exec 3> "$fifo"; printf 'line1\n' >&3; sleep 3; printf 'line2\n' >&3; exec 3>&- ) &
+    writer=$!
+    sleep 0.2
+    JOLT_QUIET=1 "$jolt" -e "(let [t0 (System/currentTimeMillis)
+                                   r  $1
+                                   l  (.readLine r)]
+                               (println (str l \" \" (- (System/currentTimeMillis) t0))))" \
+      </dev/null 2>/dev/null | tail -1
+    wait "$writer" 2>/dev/null || true
+  }
+  # "line1 <ms>" -- the line must be right AND must not have waited for the close.
+  got="$(elapsed_first_line "(clojure.java.io/reader \"$fifo\")")"
+  line="${got% *}"; ms="${got##* }"
+  check "io/reader path is incremental (line)" "$line" "line1"
+  if [ -n "$ms" ] && [ "$ms" -lt 1000 ] 2>/dev/null; then
+    check "io/reader path is incremental (no wait)" "ok" "ok"
+  else
+    check "io/reader path is incremental (no wait)" "waited ${ms}ms for a writer holding the pipe open 3s" "ok"
+  fi
+  # The same through io/file, which is the other door into the same arm.
+  got="$(elapsed_first_line "(clojure.java.io/reader (clojure.java.io/file \"$fifo\"))")"
+  line="${got% *}"; ms="${got##* }"
+  check "io/reader io/file is incremental (line)" "$line" "line1"
+  if [ -n "$ms" ] && [ "$ms" -lt 1000 ] 2>/dev/null; then
+    check "io/reader io/file is incremental (no wait)" "ok" "ok"
+  else
+    check "io/reader io/file is incremental (no wait)" "waited ${ms}ms" "ok"
+  fi
+  rm -rf "$fifo_dir"
+fi
+
+# The port-backed reader must decode and split exactly as the slurping one did.
+rd_dir="$(mktemp -d)"
+printf 'alpha\nbeta\ngamma\n'                > "$rd_dir/plain.txt"
+printf 'a\r\nb\r\nc'                         > "$rd_dir/crlf.txt"
+printf 'caf\303\251 \346\227\245 \360\237\216\211\n' > "$rd_dir/utf8.txt"
+: > "$rd_dir/empty.txt"
+check "reader lines" \
+  "$(run "(println (pr-str (vec (line-seq (clojure.java.io/reader \"$rd_dir/plain.txt\")))))")" \
+  '["alpha" "beta" "gamma"]'
+# CRLF: BufferedReader strips the \r with the \n, and a last line with no
+# terminator is still a line.
+check "reader CRLF lines" \
+  "$(run "(println (pr-str (vec (line-seq (clojure.java.io/reader \"$rd_dir/crlf.txt\")))))")" \
+  '["a" "b" "c"]'
+check "reader utf8 round trip" \
+  "$(run "(println (pr-str (slurp (clojure.java.io/reader \"$rd_dir/utf8.txt\"))))")" \
+  '"café 日 🎉\n"'
+check "reader empty file" \
+  "$(run "(println (pr-str (slurp (clojure.java.io/reader \"$rd_dir/empty.txt\"))))")" \
+  '""'
+# A missing path still fails at io/reader time, with the message it always had.
+check "reader missing path" \
+  "$(run "(println (try (clojure.java.io/reader \"$rd_dir/nope.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir/nope.txt (No such file or directory)"
+check "reader on a directory" \
+  "$(run "(println (try (clojure.java.io/reader \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+
+# slurp of a PATH reached the file without the classification every constructor
+# above goes through, so these three came back as a bare java.io.IOException
+# carrying Chez's own wording -- uncatchable as the class the JVM raises and the
+# class a library branches on (jolt-3ah).
+printf 'content\n' > "$rd_dir/read.txt"
+check "slurp missing path" \
+  "$(run "(println (try (slurp \"$rd_dir/nope.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir/nope.txt (No such file or directory)"
+# io/input-stream funnels its file arms through one opener, and that one was
+# never guarded either -- a missing path answered with Chez's wording inside the
+# right class, which no caller can read.
+check "input-stream missing path" \
+  "$(run "(println (try (clojure.java.io/input-stream \"$rd_dir/nope.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir/nope.txt (No such file or directory)"
+check "input-stream on a directory" \
+  "$(run "(println (try (clojure.java.io/input-stream \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+check "slurp on a directory" \
+  "$(run "(println (try (slurp \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+# Running as root defeats the mode bits, so only assert this where they hold.
+chmod 000 "$rd_dir/read.txt"
+if [ -r "$rd_dir/read.txt" ]; then
+  echo "SKIP: (slurp unreadable file) mode bits do not apply to this user"
+else
+  check "slurp unreadable file" \
+    "$(run "(println (try (slurp \"$rd_dir/read.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+    "$rd_dir/read.txt (Permission denied)"
+fi
+chmod 644 "$rd_dir/read.txt"
+
+# A target under a directory the process cannot write is the case a probe after
+# the fact gets WRONG: the open says EACCES, and re-looking at the filesystem
+# cannot even stat the target, so it would report it missing. The reason is read
+# off the condition instead, so all three doors say what the JVM says.
+mkdir -p "$rd_dir/ro"
+chmod 555 "$rd_dir/ro"
+if [ -w "$rd_dir/ro" ]; then
+  echo "SKIP: (write into an unwritable directory) mode bits do not apply to this user"
+else
+  for form in "(spit \"$rd_dir/ro/x.txt\" \"y\")" \
+              "(clojure.java.io/output-stream \"$rd_dir/ro/x.txt\")" \
+              "(clojure.java.io/writer \"$rd_dir/ro/x.txt\")"; do
+    check "write into an unwritable directory: $form" \
+      "$(run "(println (try $form :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+      "$rd_dir/ro/x.txt (Permission denied)"
+  done
+fi
+chmod 755 "$rd_dir/ro"
+
+# The WRITE side had the same gap, and io/writer had no check at all: it handed
+# back a Writer over a directory and the failure surfaced at close, or never
+# (jolt-g81).
+check "spit to a directory" \
+  "$(run "(println (try (spit \"$rd_dir\" \"x\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+check "output-stream on a directory" \
+  "$(run "(println (try (clojure.java.io/output-stream \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+check "writer on a directory" \
+  "$(run "(println (try (clojure.java.io/writer \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+check "output-stream into a missing directory" \
+  "$(run "(println (try (clojure.java.io/output-stream \"$rd_dir/no/x.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir/no/x.txt (No such file or directory)"
+
+# A BOM is content, not a signature: Chez's codec ate it and the JVM hands it
+# back, so a Reader and a path read both used to lose the first character
+# (jolt-qvt). The same file loaded as SOURCE now fails the way it does on the
+# JVM and on babashka, which is the point.
+printf '\357\273\277ab\n' > "$rd_dir/bom.txt"
+check "reader keeps a leading BOM" \
+  "$(run "(println (mapv int (slurp (clojure.java.io/reader \"$rd_dir/bom.txt\"))))")" \
+  "[65279 97 98 10]"
+check "slurp of a path keeps a leading BOM" \
+  "$(run "(println (mapv int (slurp \"$rd_dir/bom.txt\")))")" \
+  "[65279 97 98 10]"
+
+# Descriptor exhaustion. Nothing is wrong with the path -- the PROCESS is out of
+# descriptors -- so re-probing the filesystem cannot tell, and the classification
+# has to come from the condition the open raised or the message blames the file's
+# mode bits for the program's own leak. The witness holds readers open (io/reader
+# keeps a descriptor as of jolt-0nk) until the next open has to fail.
+emfile_expr="(let [p \"$rd_dir/read.txt\"
+                   held (doall (for [_ (range 2000)] (try (clojure.java.io/reader p) (catch Throwable _ nil))))
+                   n (count (remove nil? held))
+                   r (try (slurp p) :no-throw (catch java.io.FileNotFoundException e (.getMessage e)))]
+               (println (if (< n 8) :too-few-descriptors r)))"
+emfile_out="$( ulimit -n 256 2>/dev/null && run "$emfile_expr" )"
+case "$emfile_out" in
+  ":too-few-descriptors"|"")
+    echo "SKIP: (slurp under descriptor exhaustion) could not establish the limit" ;;
+  *)
+    check "slurp under descriptor exhaustion" \
+      "$emfile_out" \
+      "$rd_dir/read.txt (Too many open files)" ;;
+esac
+rm -rf "$rd_dir"
 
 echo ""
 echo "system-streams smoke: $pass passed, $fails failed"

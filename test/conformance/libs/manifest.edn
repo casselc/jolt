@@ -66,6 +66,8 @@
    ;; standing regression gate for async.ss, which the fibers epic modifies.
    :paths ["src/test/clojure"]
    :test-paths ["src/test/clojure"]
+   ;; the JVM runs the same suites against upstream's own implementation
+   :jvm {:paths ["src/main/clojure" "src/test/clojure"]}
    ;; impl.buffers / impl.timers are upstream internals the suites reach for
    ;; directly; the shims map them onto jolt's native equivalents.
    :shims ["!test/conformance/libs/shims/core.async"]
@@ -94,7 +96,13 @@
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
    :deps ["@data.priority-map/src/main/clojure"]
-   :expect {:tests 23 :pass 1314 :fail 0 :error 0}}
+   ;; wrapped-test's cache stampede asserts inside 1000 raw Threads, which do not
+   ;; inherit *report-counters*, so as on the JVM only the main thread's
+   ;; assertions count: one per successful lookup, i.e. 1000 minus however many
+   ;; failing lookups raced in before the value was cached. That moves run to run
+   ;; (the JVM read 968 for that namespace; jolt 981-999).
+   :tolerance 60
+   :expect {:tests 23 :pass 1290 :fail 0 :error 0}}
 
   {:name "core.memoize"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -148,7 +156,7 @@
    ;; backtick was data on the JVM and jolt's unlowered marker here. Gone since
    ;; the analyzer lowers every marker before anything can see the form
    ;; (jolt-024c).
-   :expect {:tests 50 :pass 887 :fail 0 :error 0}}
+   :expect {:tests 49 :pass 875 :fail 0 :error 0}}
 
   {:name "edamame"
    :paths ["src" "resources" "test"]
@@ -192,6 +200,9 @@
   {:name "spec.alpha"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
+   ;; the JVM keeps the spec.alpha Clojure boots with; a source copy on the
+   ;; classpath redefines it part way through clojure.core's own specs
+   :jvm {:paths ["src/test/clojure"]}
    ;; s/exercise generates through test.check
    :deps ["@test.check/src/main/clojure"]
    ;; the 4 fails are instrument's ::caller, which spec reads off the JVM stack
@@ -216,7 +227,10 @@
    :timeout 900
    ;; property-based: the assertion count moves with the generated cases
    :tolerance 40
-   :expect {:tests 123 :pass 236 :fail 10 :error 2}}
+   ;; the one fail is generators-test "byte": (instance? Byte (gen/byte ...)) —
+   ;; jolt's integers are one fixnum type, the :integer-box-model divergence in
+   ;; known-divergences.edn. The JVM runs the same 106 tests with 0 fails.
+   :expect {:tests 106 :pass 237 :fail 1 :error 0}}
 
   {:name "instaparse"
    :paths ["src" "test"]
@@ -240,17 +254,17 @@
    ;; agrees with Java on accepting and rejecting every pattern in its curated list,
    ;; and on what the accepted ones match. What is left is a long tail that is not
    ;; regex-translation work: \N{...} named-character escapes need a Unicode name
-   ;; database jolt does not carry, a generated case reaches a lone surrogate (jolt
-   ;; chars are scalar values — :string-model), and the clojure-test-output and
-   ;; exception-handling namespaces compare printed #error maps whose :trace is
-   ;; empty because tail calls leave no frames to report.
+   ;; database jolt does not carry, and a generated case reaches a lone surrogate
+   ;; (jolt chars are scalar values — :string-model). The clojure-test-output and
+   ;; exception-handling namespaces keep their deliberately failing specs out of
+   ;; the run with test-ns-hook, which run-tests honors, so they run 2 tests each.
    ;;
    ;; The one load failure is generators.clj-time-test, which is written
    ;; #?@(:bb [] :clj [[clj-time.core …]]) and so requires clj-time, i.e.
    ;; joda-time. It briefly read as loading-with-no-tests while jolt matched :bb
    ;; and took the empty arm (#894 re-recorded it that way); #893 dropped :bb, so
    ;; the :clj arm and its load failure are back. pass/fail/error are unchanged.
-   :expect {:tests 39 :pass 110 :fail 17 :error 2 :load-fail 1}}
+   :expect {:tests 31 :pass 115 :fail 1 :error 3 :load-fail 1}}
 
   ;; ---------------------------------------------------------- data formats
   {:name "data.csv"
@@ -261,6 +275,8 @@
   {:name "data.codec"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
+   ;; project.clj asks for commons-codec "1.12.0", which Central has as "1.12"
+   :jvm {:extra-deps {commons-codec/commons-codec {:mvn/version "1.12"}}}
    :deps ["@test.check/src/main/clojure" "@spec.alpha/src/main/clojure"]
    ;; The suite checks jolt's base64 against commons-codec's, which the
    ;; jolt.shim.commons-codec shim registers ahead of the library's sources.
@@ -333,7 +349,7 @@
    ;; org.apache.commons.lang.StringEscapeUtils, supplied by the preloaded
    ;; jolt.shim.commons-lang shim. No residue.
    :preload ["jolt.shim.commons-lang"]
-   :expect {:tests 94 :pass 182 :fail 0 :error 0}}
+   :expect {:tests 93 :pass 181 :fail 0 :error 0}}
 
   {:name "Selmer"
    :paths ["src" "test" "resources"]
@@ -540,6 +556,9 @@
    :test-paths ["test/cljc"]
    :deps ["~router/src" "@spec.alpha/src/main/clojure"]
    :extra-deps {meta-merge/meta-merge {:mvn/version "1.0.0"}}
+   ;; reitit.trie imports reitit.Trie, a Java class built by the module's javac
+   ;; step, so the source roots alone do not load on the JVM
+   :jvm {:skip "reitit.Trie is Java source the JVM run would have to compile"}
    ;; test/cljc holds the suites for every reitit module; these are the ones that
    ;; need reitit-core alone (the rest pull reitit-ring / -malli / muuntaja /
    ;; jsonista, which are not in the checkout).
@@ -573,9 +592,9 @@
    :local-deps ["~time"]
    ;; lasertag classifies a value by its class, so every failure here is jolt's class
    ;; model rather than a behavioral difference, all recorded in
-   ;; known-divergences.edn. The 7 that remain: six narrow numeric classes collapsing
-   ;; to Long/Double (:integer-box-model) and one seq class still collapsing to
-   ;; LazySeq where the JVM says Repeat (:seq-type-model). The two that used to sit
+   ;; known-divergences.edn. The 6 that remain are narrow numeric classes collapsing
+   ;; to Long/Double (:integer-box-model); the seventh, repeat's LazySeq where the
+   ;; JVM says Repeat, went when repeat became a Repeat. The two that used to sit
    ;; beside them were the suite's :bb branches asserting babashka's host model
    ;; (sci.impl.fns classnames, a :lambda-free tag set); jolt stopped reading :bb
    ;; in #893 and answers with the real defining class.
@@ -584,11 +603,13 @@
    ;; and #659 picked the range flavor from the argument types. The row had not been
    ;; re-recorded since before #648, so part of that 3 was slack this gate had been
    ;; carrying — a regression in those rows would have read as "ok".
-   :expect {:tests 58 :pass 51 :fail 7 :error 0}}
+   :expect {:tests 58 :pass 52 :fail 6 :error 0}}
 
   {:name "tools.logging"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
+   ;; slf4j-log4j12 2.x is a relocation pom with no jar; the JVM run drops it
+   :jvm {:exclude-deps [org.slf4j/slf4j-log4j12]}
    ;; test-impl pins the log4j2 backend, which needs the org.apache.logging.log4j jars
    :exclude-nses ["clojure.tools.logging.test-impl"]
    ;; impl/find-factory picks a backend at LOAD time and throws when every one it

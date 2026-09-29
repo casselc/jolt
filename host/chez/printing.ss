@@ -52,21 +52,28 @@
 ;; resolved once — see pr-readably-cell (rt.ss) for why the cached cell is safe
 (define ns-maps-cell #f)
 (define (pr-ns-maps-shared-ns pairs)
+  ;; clojure.core/lift-ns: every key a qualified ident — keyword OR symbol — of
+  ;; one namespace
+  (define (ident-ns k)
+    (let ((n (cond ((keyword? k) (keyword-t-ns k))
+                   ((symbol-t? k) (symbol-t-ns k))
+                   (else #f))))
+      (and (string? n) (not (string=? n "")) n)))
   (and (pair? pairs)
        (begin
          (unless ns-maps-cell
            (set! ns-maps-cell (jolt-var "clojure.core" "*print-namespace-maps*")))
          (jolt-truthy? (jolt-var-get ns-maps-cell)))
-       (keyword? (caar pairs))
-       (let ((ns (keyword-t-ns (caar pairs))))
-         (and ns (not (string=? ns ""))
+       (let ((ns (ident-ns (caar pairs))))
+         (and ns
               (let all-ns? ((rest (cdr pairs)))
                 (if (null? rest)
                     ns   ;; all keys checked → return the shared namespace
-                    (and (keyword? (caar rest))
-                         (let ((n (keyword-t-ns (caar rest))))
-                           (and n (string=? n ns)
-                                (all-ns? (cdr rest)))))))))))
+                    (let ((n (ident-ns (caar rest))))
+                      (and n (string=? n ns) (all-ns? (cdr rest))))))))))
+;; lift-ns's strip-ns: the key without its namespace, keeping its kind
+(define (pr-strip-ns k)
+  (if (keyword? k) (keyword #f (keyword-t-name k)) (jolt-symbol #f (symbol-t-name k))))
 
 (define (jolt-pr-readable-base x)
   (cond
@@ -111,7 +118,7 @@
                                 (jolt-str-join-comma
                                  (jolt-limited-list-strs
                                   (map (lambda (pr)
-                                         (string-append (jolt-pr-readable (keyword #f (keyword-t-name (car pr))))
+                                         (string-append (jolt-pr-readable (pr-strip-ns (car pr)))
                                                         " " (jolt-pr-readable (cdr pr))))
                                        pairs)))
                                 "}")
@@ -212,6 +219,34 @@
                 w))
          => (lambda (w) (record-method-dispatch w "write" (jolt-list s)) jolt-nil))
         (else (display s) jolt-nil)))
+;; (.append *out* x) — what the reference's print family uses for the space
+;; between arguments, the newline, and a printed character, so a Writer under
+;; *out* sees those as appends, separately from each value's write. X is a char or
+;; a string. Routed exactly like jolt-write; a writer with no append method of
+;; its own gets write, which is what java.io.Writer.append's default does.
+(define (jolt-append x)
+  (let ((s (if (char? x) (string x) x)))
+    (cond ((and (not (jolt-nil? jolt-pprint-write-hook))
+                (not (jolt-pprint-hook-suppressed))
+                (jolt-truthy? (jolt-invoke jolt-pprint-write-hook s)))
+           jolt-nil)
+          ((let ((w (begin
+                      (unless out-cell
+                        (set! out-cell (jolt-var "clojure.core" "*out*")))
+                      (var-cell-deref out-cell))))
+             (and (or (iface-method w "write" #f)
+                      (and (jhost? w)
+                           (not (and (string=? (jhost-tag w) "port-writer")
+                                     (eq? (vector-ref (jhost-state w) 0) 'out)))))
+                  w))
+           => (lambda (w)
+                (if (if (jhost? w)
+                        (host-method-ref (jhost-tag w) "append")
+                        (iface-method w "append" #f))
+                    (record-method-dispatch w "append" (jolt-list x))
+                    (record-method-dispatch w "write" (jolt-list s)))
+                jolt-nil))
+          (else (display s) jolt-nil))))
 (def-var! "clojure.core" "__set-pprint-write-hook!"
   (lambda (f) (set! jolt-pprint-write-hook f) jolt-nil))
 ;; clojure.pprint wraps its writing in this so core print routes into the active
@@ -264,6 +299,7 @@
 
 (def-var! "clojure.core" "__pr-str1" jolt-pr-str1)
 (def-var! "clojure.core" "__write" jolt-write)
+(def-var! "clojure.core" "__append" jolt-append)
 (def-var! "clojure.core" "__with-out-str" jolt-with-out-str)
 (def-var! "clojure.core" "__eprint" jolt-eprint)
 (def-var! "clojure.core" "__eprintf" jolt-eprintf)

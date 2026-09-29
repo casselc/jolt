@@ -1,8 +1,8 @@
 ;; source-registry.ss — map emitted procedures back to Clojure source for native
 ;; stack traces, and render an uncaught throwable.
 ;;
-;; A direct-linked def compiles to (define jv$ns$name <fn>); the back end also
-;; emits (jolt-register-source! "jv$ns$name" ns name file line) once per such def
+;; A direct-linked def compiles to (define jv$ns/name <fn>); the back end also
+;; emits (jolt-register-source! "jv$ns/name" ns name file line) once per such def
 ;; — at definition time, so there is zero per-call cost. On an uncaught error we
 ;; walk Chez's native continuation frames, read each frame's procedure name, and
 ;; look it up here to print a Clojure backtrace.
@@ -16,7 +16,7 @@
 
 ;; Keyed by the procedure name Chez actually reports for a frame — the SHORT
 ;; munged fn name (the letrec self-binding emit-fn uses), e.g. "deepest", not the
-;; jv$ns$name global. Two vars in different namespaces can share a short name; an
+;; jv$ns/name global. Two vars in different namespaces can share a short name; an
 ;; 'ambiguous marker then keeps the frame name in the trace but drops the
 ;; (now-uncertain) ns/file:line, so a trace is never misattributed.
 (define source-registry (make-hashtable string-hash string=?))
@@ -70,6 +70,24 @@
        => (lambda (c) (and (continuation-condition? c) (condition-continuation c))))
       (else #f))))
 
+;; An anonymous fn inside a def is emitted as jfn$<ns>/<def>$<n>: (ns def n) when
+;; nm is one and the def is registered, else #f. The JVM names the same fn
+;; ns$def$fn__n, which is what a StackTraceElement reports for it.
+(define (srcreg-jfn-parts nm)
+  (and (fx>? (string-length nm) 4)
+       (string=? (substring nm 0 4) "jfn$")
+       (let* ((body (substring nm 4 (string-length nm)))
+              (n (string-length body))
+              (dollar (let loop ((i (fx- n 1)))
+                        (cond ((fx<? i 0) #f)
+                              ((char=? (string-ref body i) #\$) i)
+                              (else (loop (fx- i 1))))))
+              (fqn (if dollar (substring body 0 dollar) body))
+              (rec (srcreg-record-for-fqn fqn)))
+         (and (vector? rec)
+              (list (vector-ref rec 0) (vector-ref rec 1)
+                    (if dollar (substring body (fx+ dollar 1) n) "0"))))))
+
 ;; A frame inspector's procedure name as a string, or #f for a non-frame / unnamed.
 (define (srcreg-frame-name io)
   (and (guard (e (#t #f)) (eq? (io 'type) 'continuation))
@@ -97,13 +115,6 @@
                 ;; no Clojure meaning in a trace
                 "record-method-dispatch" "protocol-resolve" "devirt-resolve"
                 "list->cseq" "host-static-call" "host-call"
-                ;; the reader's own recursive descent. A read error used to print
-                ;; ten of these — rdr-read-form, rdr-read-seq, rdr-read-form … —
-                ;; above the one line that said what was wrong. They name the
-                ;; parser's shape, never anything in the program being read.
-                "rdr-read-form" "rdr-read-seq" "rdr-read-top" "rdr-make-map"
-                "rdr-make-set" "rdr-read-string" "rdr-read-keyword"
-                "rdr-read-token" "rdr-read-dispatch" "rdr-read-anon-fn"
                 ;; the CLI's own entry frames: every trace ended with these, and
                 ;; they say only that jolt was started, which the reader knows.
                 ;; run-script! is the one that loads a FILE (a script, a `run
@@ -124,10 +135,18 @@
 ;; So this is load-bearing beyond tidiness: narrowing the prefix rule, or letting
 ;; a scheduler procedure be named without the prefix, puts carrier internals back
 ;; into every go-block trace.
+;;
+;; The reader's own procedures (reader.ss, every one rdr-) are plumbing by the
+;; same kind of rule. A read error used to print ten of them — rdr-read-form,
+;; rdr-read-seq, rdr-read-form … — above the one line that said what was wrong;
+;; they name the parser's shape, never anything in the program being read. A
+;; list of them went stale the first time a raise moved out of tail position in
+;; a helper nobody had listed.
 (define (srcreg-plumbing-name? nm)
   (or (hashtable-ref srcreg-plumbing-names nm #f)
       (and (fx>? (string-length nm) 0) (char=? (string-ref nm 0) #\$))
-      (and (fx>=? (string-length nm) 5) (string=? (substring nm 0 5) "jolt-"))))
+      (and (fx>=? (string-length nm) 5) (string=? (substring nm 0 5) "jolt-"))
+      (and (fx>=? (string-length nm) 4) (string=? (substring nm 0 4) "rdr-"))))
 
 ;; An inspector message that may return ZERO values (e.g. 'source-path when a
 ;; frame carries no source) — read it as one value or #f. `guard` alone cannot
@@ -174,14 +193,31 @@
 ;; eval registry (jolt-eval-source-line). #f when the frame carries no source or
 ;; no marker precedes its offset — the renderer then falls back to the defn line.
 ;; Exception-proof: the reporter runs while an error is being reported.
-(define (srcreg-frame-entry-from-source-pair io)
+(define (srcreg-frame-entry-from-source-pair io ns)
   (guard (e (#t #f))
     (let ((pair (srcreg-frame-source-pair io)))
       (and pair
            (let ((name (car pair)) (offset (cdr pair)))
-             (if (jolt-eval-source-name? name)
-                 (jolt-eval-source-entry name offset)
-                 (jolt-marker-entry-in-file name offset)))))))
+             (cond
+               ((jolt-eval-source-name? name) (jolt-eval-source-entry name offset))
+               ((jolt-baked-marker-table ns) => (lambda (t) (jolt-marker-line-from-table t offset)))
+               (else (jolt-marker-entry-in-file name offset))))))))
+
+;; --- marker tables a built binary carries ------------------------------------
+;; A built binary's app code was compiled from unit files in its build directory,
+;; one per namespace, and a frame's line comes from the markers in that file. Read
+;; off the disk, the answer depended on the directory still being there: a binary
+;; copied elsewhere, or one whose .build dir was cleaned, reported its frames at
+;; their defn lines and lost every spliced frame, and so did one assembled from
+;; build-cache units, which name the directory of the build that first compiled
+;; them. So each unit carries its own table and registers it here as it loads,
+;; under the namespaces it holds (build.ss bld-append-marker-table!); a frame's
+;; namespace is its fn's, which the walk already has.
+(define jolt-baked-marker-tables (make-hashtable string-hash string=?))   ; ns -> table
+(define (jolt-register-marker-table! nses table)
+  (for-each (lambda (ns) (hashtable-set! jolt-baked-marker-tables ns table)) nses))
+(define (jolt-baked-marker-table ns)
+  (and (string? ns) (hashtable-ref jolt-baked-marker-tables ns #f)))
 
 
 ;; The logical frames a marker/site entry stands for, innermost first, as
@@ -235,7 +271,12 @@
                  (keep? (and nm (or src (not (srcreg-plumbing-name? nm)))))
                  ;; the marker entry at the offset this frame is stopped at (only
                  ;; a mapped frame prints a line, so only it pays the lookup)
-                 (entry (and src (srcreg-frame-entry-from-source-pair io)))
+                 (parts (and nm (not src) (srcreg-jfn-parts nm)))
+                 (entry (and nm (or src parts)
+                             (srcreg-frame-entry-from-source-pair
+                               io (cond ((vector? src) (vector-ref src 0))
+                                        ((pair? parts) (car parts))
+                                        (else #f)))))
                  (line (jolt-marker-entry-line entry)))
             (when (and debug? nm)
               (display (string-append "  [frame] " nm (if src " *MAPPED*"
@@ -555,7 +596,16 @@
 ;;
 ;; Only a trailing __il<digits> over a non-empty base is stripped, so a fn the user
 ;; actually named foo__il is left alone.
-(define (srcreg-display-name nm)
+;;
+;; A NAMED inner literal is bound under its image-registry label,
+;; jfn$<ns>/<def>$<n>/<name> (backend fnsrc-name), so the registry has a key
+;; that cannot collide. Shown as <ns>/<def>/<name>, the way clojure.stacktrace
+;; demunges user$f$mapi__12: the counter is a compiler artifact. An anonymous
+;; literal's label has one `/` and is shown as is. munge-chars never emits a
+;; `/`, so the two slashes are the label's own.
+;; The alpha-rename is stripped from the name part as well: a named literal
+;; inside a spliced callee reaches here as jfn$…/step-boom__il22.
+(define (srcreg-strip-il nm)
   (let ((n (string-length nm)))
     (let scan ((i n))
       (cond
@@ -565,13 +615,31 @@
         ((and (fx<? i n) (fx>? i 4)
               (string=? (substring nm (fx- i 4) i) "__il"))
          (substring nm 0 (fx- i 4)))
-        ;; ...or by "$jf", the unique alias a NAMED inner literal is bound under
-        ;; so the image registry has a key that cannot collide. Same deal as
-        ;; __ilN: a compiler artifact, not something to show a user.
-        ((and (fx<? i n) (fx>? i 3)
-              (string=? (substring nm (fx- i 3) i) "$jf"))
-         (substring nm 0 (fx- i 3)))
         (else nm)))))
+(define (srcreg-literal-display nm)
+  (let ((n (string-length nm)))
+    (and (fx>? n 4) (string=? (substring nm 0 4) "jfn$")
+         (let* ((i1 (let find ((i 4)) (cond ((fx=? i n) #f)
+                                             ((char=? (string-ref nm i) #\/) i)
+                                             (else (find (fx+ i 1))))))
+                (i2 (and i1 (let find ((i (fx- n 1))) (cond ((fx<=? i i1) #f)
+                                                              ((char=? (string-ref nm i) #\/) i)
+                                                              (else (find (fx- i 1))))))))
+           (and i2
+                (let* ((ns (substring nm 4 i1))
+                       (mid (substring nm (fx+ i1 1) i2))
+                       ;; <def>$<n>: drop the counter
+                       (def (let scan ((i (string-length mid)))
+                              (cond ((and (fx>? i 0) (char<=? #\0 (string-ref mid (fx- i 1)) #\9))
+                                     (scan (fx- i 1)))
+                                    ((and (fx>? i 0) (char=? (string-ref mid (fx- i 1)) #\$))
+                                     (substring mid 0 (fx- i 1)))
+                                    (else mid))))
+                       (name (srcreg-strip-il (substring nm (fx+ i2 1) n))))
+                  (string-append ns "/" (if (fx=? (string-length def) 0) "" (string-append def "/")) name)))))))
+(define (srcreg-display-name nm)
+  (or (srcreg-literal-display nm)
+      (srcreg-strip-il nm)))
 
 (define (srcreg-frame name record line) (vector name record line))
 (define (srcreg-frame-nm f) (vector-ref f 0))
@@ -693,6 +761,36 @@
                ((or line-callees fn-callees) #f)
                (else #t))))))
 
+;; The positive half of jolt-site-valid?: the walk connected to a live frame, or
+;; the innermost live frame's registered callees (at its line, else anywhere in
+;; it) name a walked fn. No evidence is not enough here.
+(define (jolt-site-evidenced? path connected? cont)
+  (or connected?
+      (and (pair? cont)
+           (let* ((ctx (car cont))
+                  (fnm (srcreg-frame-nm ctx))
+                  (hit? (lambda (expected)
+                          (and expected
+                               (exists (lambda (p) (and (member (car p) expected) #t)) path)))))
+             (or (hit? (jolt-callsite-callees fnm (srcreg-frame-line ctx)))
+                 (hit? (jolt-callsite-fn-callees fnm)))))))
+
+;; A live read's pair stands for an erased frame only while its tail call is still
+;; running, and spliced innermost it claims that call reached the stack read with
+;; no traced frame in between. When the pair's own site registers a static tail
+;; callee, the call went there instead: had that callee still been running it would
+;; be a live frame, or it would have stored a pair of its own on its way out. Either
+;; way the pair is a returned call's residue, whatever the live frames' callee lists
+;; say — they only show the pair's chain is CALLED somewhere, not that it still is.
+;; A dynamic tail call (a fn value) is registered by line alone and counts the same.
+;; A tail call through a host method (the stack read itself) registers nothing.
+(define (jolt-site-exited? site)
+  (let ((line (jolt-marker-entry-line (cdr site)))
+        (exits (jolt-callsite-tail-exits (car site)))
+        (dyn (jolt-callsite-dynamic-tail-lines (car site))))
+    (or (and (pair? exits) (exists (lambda (e) (eqv? (car e) line)) exits))
+        (and (pair? dyn) (memv line dyn) #t))))
+
 ;; Forward path from callee `start` through single tail exits until an exit
 ;; reaches `target`; returns the erased (fn . exit-line) entries DEEPEST
 ;; first, '() when start IS the target (nothing erased), #f when no
@@ -716,24 +814,38 @@
 ;; a frame pair is inserted only when exactly ONE registered callee of the
 ;; outer frame's site yields a path to the inner frame's fn — ambiguity means
 ;; no insert, never a guess.
-(define (jolt-fill-gaps cont)
+;;
+;; A live stack (Thread.getStackTrace) can also bridge a gap with the most recent
+;; tail-site pair, `site`: when no static path reaches the inner frame — the
+;; erased fn's tail call went through apply or a fn value — but exactly one path
+;; reaches the pair's fn, that fn is the erased caller of the inner frame. The
+;; pair is used at most once. Returns (values frames site-used?).
+(define (jolt-fill-gaps cont site)
   (if (or (null? cont) (null? (cdr cont)))
-      cont
-      (let loop ((inner (car cont)) (rest (cdr cont)) (acc (list (car cont))))
+      (values cont #f)
+      (let loop ((inner (car cont)) (rest (cdr cont)) (acc (list (car cont))) (site site) (used? #f))
         (if (null? rest)
-            (reverse acc)
+            (values (reverse acc) used?)
             (let* ((outer (car rest))
                    (onm (srcreg-frame-nm outer)) (oln (srcreg-frame-line outer))
                    (inm (srcreg-frame-nm inner))
                    (cands (and (fixnum? oln) (fx>? oln 0)
                                (jolt-callsite-callees onm oln)))
-                   (paths (if cands
-                              (filter (lambda (x) x)
-                                      (map (lambda (c) (jolt-forward-path c inm)) cands))
-                              '()))
-                   (gap (if (and (pair? paths) (null? (cdr paths))) (car paths) '())))
+                   (paths-to (lambda (target)
+                               (if cands
+                                   (filter (lambda (x) x)
+                                           (map (lambda (c) (jolt-forward-path c target)) cands))
+                                   '())))
+                   (paths (paths-to inm))
+                   (site-paths (if (and site (null? paths)) (paths-to (car site)) '()))
+                   (bridge? (and (pair? site-paths) (null? (cdr site-paths))))
+                   (gap (cond ((and (pair? paths) (null? (cdr paths))) (car paths))
+                              (bridge? (cons site (car site-paths)))
+                              (else '()))))
               (loop outer (cdr rest)
-                    (cons outer (append (srcreg-site-frames (reverse gap)) acc))))))))
+                    (cons outer (append (srcreg-site-frames (reverse gap)) acc))
+                    (if bridge? #f site)
+                    (or used? bridge?)))))))
 
 ;; The no-continuation / REPL fallback: the pair plus its backward walk is all
 ;; there is (a REPL's own continuation is just its machinery). #f when tracing
@@ -747,31 +859,151 @@
                (let ((recs (srcreg-site-frames path)))
                  (and (pair? recs) (jolt-render-recs recs)))))))))
 
-;; Multi-line backtrace for an uncaught value: the live continuation is the
-;; spine; the throw-time pair (validated) plus its backward walk recovers the
-;; innermost erased chain, and forward gap-fills recover erased frames between
-;; live ones. All reconstruction is from compile-time tables — the runtime
-;; recorded exactly one pair.
+;; The frames a continuation stands for, innermost first: the live continuation
+;; is the spine; the most recent tail-site pair (validated) plus its backward walk
+;; recovers the innermost erased chain, and forward gap-fills recover erased
+;; frames between live ones. All reconstruction is from compile-time tables — the
+;; runtime records exactly one pair.
+;; live? is a stack read in place rather than at a throw: the pair may then
+;; belong to a caller outside the live frames, so it may bridge a gap first.
+(define (jolt-continuation-recs k live?)
+  (jolt-continuation-recs/site k live?
+    ;; a throw reads the raise-time snapshot; a live read takes the slot as
+    ;; it stands, the most recent tail call made on this thread
+    (if live?
+        (let ((s (virtual-register jolt-vreg-site))) (and (pair? s) s))
+        (jolt-throw-site))))
+;; ...with the site pair given: a caught throwable's own (jolt-throwable-recs).
+(define (jolt-continuation-recs/site k live? site0)
+  (let* ((cont (jolt-frame-records k))
+         (cont-names (let ((h (make-hashtable string-hash string=?)))
+                       (for-each (lambda (f)
+                                   (hashtable-set! h (srcreg-frame-nm f) #t))
+                                 cont)
+                       h))
+         (site (and (pair? site0) (not (hashtable-ref cont-names (car site0) #f)) site0)))
+    (call-with-values (lambda () (jolt-fill-gaps cont (and live? site)))
+      (lambda (body used?)
+        ;; At a throw the pair is the innermost call, so it splices in innermost
+        ;; unless registered evidence contradicts it. A live read's pair can be
+        ;; residue from anywhere along the stack, so there it splices in only on
+        ;; positive evidence: the walk reaches a live frame, or the innermost
+        ;; live frame's registered callees name a walked fn, and the pair's own
+        ;; tail call has not visibly gone somewhere else (jolt-site-exited?).
+        (if (and site (not used?))
+            (call-with-values (lambda () (jolt-backwalk site cont-names))
+              (lambda (path connected?)
+                (if (if live?
+                        (and (not (jolt-site-exited? site))
+                             (jolt-site-evidenced? path connected? cont))
+                        (jolt-site-valid? site path connected? cont cont-names))
+                    (append (srcreg-site-frames path) body)
+                    body)))
+            body)))))
+
+;; Multi-line backtrace for an uncaught value.
 (define (jolt-backtrace-string v)
   (let ((k (jolt-error-continuation v)))
     (if (not k)
         (jolt-history-backtrace)
-        (let* ((cont (jolt-frame-records k))
-               (cont-names (let ((h (make-hashtable string-hash string=?)))
-                             (for-each (lambda (f)
-                                         (hashtable-set! h (srcreg-frame-nm f) #t))
-                                       cont)
-                             h))
-               (site (jolt-throw-site))
-               (body (jolt-fill-gaps cont))
-               (recs (if (pair? site)
-                         (call-with-values (lambda () (jolt-backwalk site cont-names))
-                           (lambda (path connected?)
-                             (if (jolt-site-valid? site path connected? cont cont-names)
-                                 (append (srcreg-site-frames path) body)
-                                 body)))
-                         body)))
+        (let ((recs (jolt-continuation-recs k #f)))
           (and (pair? recs) (jolt-render-recs recs))))))
+
+;; --- java.lang.StackTraceElement ------------------------------------------------
+;; A frame as the JVM names it: class ns$fn (munged like Compiler/munge), method
+;; invoke, the source file's base name, and the line reached in the frame. Only
+;; frames that map to registered Clojure source become elements; an unmapped or
+;; ambiguous frame would have to be invented, so it is left out.
+(define (ste-make cls method file line)
+  (make-jhost "stack-trace-element" (vector cls method file line)))
+(define (ste? x) (and (jhost? x) (string=? (jhost-tag x) "stack-trace-element")))
+(define (ste-field x i) (vector-ref (jhost-state x) i))
+
+(define (ste-base-name path)
+  (let loop ((i (fx- (string-length path) 1)))
+    (cond ((fx<? i 0) path)
+          ((memv (string-ref path i) '(#\/ #\\)) (substring path (fx+ i 1) (string-length path)))
+          (else (loop (fx- i 1))))))
+
+(define (ste-of-frame f)
+  (let ((r (srcreg-frame-rec f))
+        (file-of (lambda (file) (if (string? file) (ste-base-name file) jolt-nil)))
+        (cls (lambda (ns nm) (string-append (class-munge-name ns) "$" (class-munge-name nm)))))
+    (cond
+      ((vector? r)
+       (let ((line (or (srcreg-frame-line f) (vector-ref r 3))))
+         (ste-make (cls (vector-ref r 0) (vector-ref r 1)) "invoke"
+                   (file-of (vector-ref r 2)) (if (fixnum? line) line -1))))
+      ((srcreg-jfn-parts (srcreg-frame-nm f))
+       => (lambda (p)
+            (let ((rec (srcreg-record-for-fqn (string-append (car p) "/" (cadr p))))
+                  (line (srcreg-frame-line f)))
+              (ste-make (string-append (cls (car p) (cadr p)) "$fn__" (caddr p)) "invoke"
+                        (file-of (vector-ref rec 2)) (if (fixnum? line) line -1)))))
+      (else #f))))
+
+;; A throwable's own frames as a StackTraceElement array, or an empty one for a
+;; throwable that was never thrown (the JVM fills one in at construction; jolt
+;; has no frames until the throw captures them).
+;;
+;; From its OWN capture (rt.ss jolt-thrown-cont: the continuation and the site pair
+;; of its throw), rendered as a throw is: the live spine, and the frames a tail
+;; call erased recovered from that site. Not from jolt-error-continuation and the
+;; thread's site snapshot, which belong to whatever threw last on this thread.
+(define (jolt-throwable-recs v)
+  (let ((cap (jolt-thrown-cont (jolt-unwrap-throw v))))
+    (and cap (guard (e (#t #f)) (jolt-continuation-recs/site (car cap) #f (cdr cap))))))
+(define (jolt-throwable-stack-trace v)
+  (let ((recs (jolt-throwable-recs v)))
+    (if recs (apply jolt-vector (jolt-recs->stack-trace recs)) (jolt-vector))))
+;; printStackTrace's frame lines: the same capture, rendered like a report.
+(define (jolt-throwable-backtrace-string v)
+  (let ((recs (jolt-throwable-recs v)))
+    (if (pair? recs) (jolt-render-recs recs) (jolt-backtrace-string v))))
+
+(define (jolt-stack-trace-list k)
+  (guard (e (#t '()))
+    (jolt-recs->stack-trace (jolt-continuation-recs k #t))))
+(define (jolt-recs->stack-trace recs)
+  (let loop ((fs recs) (acc '()))
+    (cond ((null? fs) (reverse acc))
+          ((ste-of-frame (car fs)) => (lambda (e) (loop (cdr fs) (cons e acc))))
+          (else (loop (cdr fs) acc)))))
+
+;; Thread.getStackTrace on the calling thread: its own frame first, as on the JVM,
+;; then the caller's frames.
+(define (jolt-current-stack-trace)
+  (call/cc
+   (lambda (k)
+     (apply jolt-vector
+            (ste-make "java.lang.Thread" "getStackTrace" "Thread.java" -1)
+            (jolt-stack-trace-list k)))))
+
+(define (ste-string x)
+  (let ((file (ste-field x 2)) (line (ste-field x 3)))
+    (string-append (ste-field x 0) "." (ste-field x 1) "("
+                   (cond ((not (string? file)) "Unknown Source")
+                         ((fx>=? line 0) (string-append file ":" (number->string line)))
+                         (else file))
+                   ")")))
+
+(register-host-methods! "stack-trace-element"
+  (list (cons "getClassName"  (lambda (self) (ste-field self 0)))
+        (cons "getMethodName" (lambda (self) (ste-field self 1)))
+        (cons "getFileName"   (lambda (self) (ste-field self 2)))
+        (cons "getLineNumber" (lambda (self) (ste-field self 3)))
+        (cons "isNativeMethod" (lambda (self) #f))
+        (cons "toString"      (lambda (self) (ste-string self)))
+        (cons "hashCode"      (lambda (self) (equal-hash (jhost-state self))))
+        (cons "equals"        (lambda (self o) (and (ste? o) (equal? (jhost-state self) (jhost-state o)))))))
+(register-str-render! ste? ste-string)
+(register-eq-arm! (lambda (a b) (and (ste? a) (ste? b)))
+                  (lambda (a b) (equal? (jhost-state a) (jhost-state b))))
+(register-hash-arm! ste? (lambda (x) (equal-hash (jhost-state x))))
+(register-class-arm! ste? (lambda (x) "java.lang.StackTraceElement"))
+(for-each (lambda (nm)
+            (register-class-ctor! nm (lambda (cls method file line) (ste-make cls method file line))))
+          '("StackTraceElement" "java.lang.StackTraceElement"))
 
 
 ;; Exposed for the REPL / nREPL error paths, which catch errors themselves instead
@@ -909,14 +1141,21 @@
                      "\n :trace []"
                      "}"))))
 
-;; toString (str/print) for ex-info records: "ClassName: message data"
+;; toString (str/print) for throwable records: Throwable's "ClassName: message",
+;; the ": message" dropped when there is none. Only ExceptionInfo's own toString
+;; appends its data. A throwable of another class can carry data here too — a
+;; read error keeps its diagnostic position on its RuntimeException — and
+;; printing that into its toString broke the text a caller builds from it, the
+;; ReaderException's message first among them.
 (register-str-render! jolt-ex-info-record?
   (lambda (x)
     (let* ((class-name (jolt-ex-info-record-class-name x))
            (msg (jolt-ex-info-record-message x))
            (data (jolt-ex-info-record-data x)))
-      (string-append class-name ": " (jolt-str-render-one msg)
-                     (if (jolt-nil? data) ""
+      (string-append class-name
+                     (if (jolt-nil? msg) "" (string-append ": " (jolt-str-render-one msg)))
+                     (if (or (jolt-nil? data) (not (equal? class-name "clojure.lang.ExceptionInfo")))
+                         ""
                          (string-append " " (jolt-pr-str data)))))))
 
 ;; count on ex-info / host throwable records throws UnsupportedOperationException

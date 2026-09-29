@@ -7,7 +7,7 @@
 ;; contagion clone registry.
 ;;
 ;; Loaded after records-coll.ss; uses the jrec layout + rec-tbl-mu from
-;; records.ss. reified-methods / record-method-dispatch are free references into
+;; records.ss. reify-method-ref / record-method-dispatch are free references into
 ;; records-dispatch.ss, resolved at call time.
 
 ;; ---- protocol identity ------------------------------------------------------
@@ -129,7 +129,11 @@
     (hashtable-delete! type-registry type-tag)
     (hashtable-delete! type-method-index type-tag)
     (hashtable-delete! type-class-memo type-tag)
-    (hashtable-delete! clone-registry type-tag)))
+    (hashtable-delete! clone-registry type-tag))
+  ;; find-method-any-protocol reads type-method-index, and
+  ;; chez-type-owns-lookup? (records.ss) consults it while the inference
+  ;; shapes map is built: dropping a type's valAt changes that map.
+  (chez-infer-registry-bump!))
 
 (define (prune-type-registry! keep?)
   ;; a registry change like any other to the caches keyed on the epoch (the
@@ -140,6 +144,7 @@
   ;; keep? retains its three traversal phases and runs OUTSIDE the lock. It may
   ;; dispatch or register methods itself. A cache filled during that callback
   ;; must be invalidated by the ensuing deletion, not only by the initial bump.
+  (chez-infer-registry-bump!)
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
@@ -173,7 +178,28 @@
 ;; so two pairs that print alike but split differently never collide. Minted once
 ;; per pair; reused by the descriptor ptable (eq?-ref).
 (define proto-method-keys (make-hashtable string-hash string=?))
+;; ...and in front of it, the same answer keyed eq? on the two name OBJECTS. A
+;; protocol call on a record resolves through here every time (the per-site PIC
+;; exists only under --opt), and the names it passes are the literals the
+;; defprotocol shim was compiled with, so a repeat is two eq?-refs where the
+;; string table cost a string-append and a hash of the joined name per call.
+;; A name spelled by another string object fills its own entry; the key it gets
+;; is still the one identity the string table hands out.
+(define pm-key-eq-cache (make-weak-eq-hashtable))
+(define pm-key-eq-mu (make-mutex))
 (define (intern-pm-key proto method)
+  (let* ((inner (hashtable-ref pm-key-eq-cache proto #f))
+         (k (and inner (hashtable-ref inner method #f))))
+    (or k
+        (let ((k (intern-pm-key-by-name proto method)))
+          (jolt-with-mutex pm-key-eq-mu
+            (let ((t (or (hashtable-ref pm-key-eq-cache proto #f)
+                         (let ((t (make-weak-eq-hashtable)))
+                           (hashtable-set! pm-key-eq-cache proto t)
+                           t))))
+              (hashtable-set! t method k)))
+          k))))
+(define (intern-pm-key-by-name proto method)
   (let* ((s (string-append proto (string (integer->char 0)) method))
          (k (hashtable-ref proto-method-keys s #f)))
     ;; double-checked: the whole point of this table is that one (proto . method)
@@ -227,6 +253,10 @@
   ;; the clone captured the prior body. Keyed exactly (type/proto/method) so a
   ;; sibling type's clone survives; devirt-resolve-fl then falls back to devirt-resolve.
   (remove-clone! type-tag proto method)
+  ;; an impl can flip a type's owns-lookup reading (records.ss
+  ;; chez-type-owns-lookup?), which decides whether the shapes map carries the
+  ;; type at all — so the inference-registry cache has to rebuild.
+  (chez-infer-registry-bump!)
   (if #f #f))
 (define (find-protocol-method type-tag proto method)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
@@ -337,7 +367,7 @@
 (def-var! "jolt.host" "jrec-method?"
   (lambda (v name)
     (cond ((jrec? v) (if (find-method-any-protocol (jrec-tag v) name) #t #f))
-          ((reified-methods v) => (lambda (m) (if (hashtable-ref m name #f) #t #f)))
+          ((jreify? v) (if (reify-method-ref v name) #t #f))
           (else #f))))
 
 ;; (str x) is x.toString() on the JVM, so a deftype/record that DECLARES toString
@@ -372,8 +402,24 @@
 ;; java.lang.Iterable, …) reaches a reify declaring it, exactly as instanceof
 ;; answers on the JVM. The reify's own method table is consulted before these
 ;; (protocol-resolve), so an inline impl still wins.
+;;
+;; A function of the protocol list and the class graph only, so it is memoized
+;; per list (interned by make-reified-delegating, so one per reify site) and
+;; stamped with jch-graph-epoch, which is what changes an interface's ancestry.
+(define jreify-tags-memo (make-weak-eq-hashtable))
 (define (jreify-host-tags obj)
-  (let loop ((ps (jreify-protos obj)) (acc '()))
+  (let* ((ps (jreify-protos obj))
+         (e (hashtable-ref jreify-tags-memo ps #f)))
+    (if (and e (fx= (car e) jch-graph-epoch))
+        (cdr e)
+        (let* ((epoch jch-graph-epoch)
+               (tags (jreify-protos-tags ps)))
+          (jolt-with-mutex jch-cache-mutex
+            (when (fx= epoch jch-graph-epoch)
+              (hashtable-set! jreify-tags-memo ps (cons epoch tags))))
+          tags))))
+(define (jreify-protos-tags protos)
+  (let loop ((ps protos) (acc '()))
     (if (null? ps)
         (reverse (cons "Object" acc))
         (let inner ((ts (jch-tags (proto-iface-name (car ps)))) (acc acc))
@@ -729,6 +775,7 @@
                     (hashtable-set! chez-protocol-methods-tbl
                                     (string-append ns "/" m) (cons proto-name m)))))
               (seq->list method-names)))
+  (chez-infer-registry-bump!)
   jolt-nil)
 
 ;; register-method: extend-type/extend register an impl. Host type names keep a
@@ -947,9 +994,9 @@
           (let* ((desc (jrec-desc obj))
                  (f (find-protocol-method-desc desc proto-name method-name)))
             (or f (find-protocol-method (jrdesc-tag desc) proto-name method-name)))))
-    ((reified-methods obj)
-     => (lambda (rm)
-          (or (hashtable-ref rm method-name #f)
+    ((jreify? obj)
+     => (lambda (_)
+          (or (reify-method-ref obj method-name)
               ;; not implemented on the reify — fall back to the protocol's
               ;; extended impls over the reify's host tags (e.g. an Object/default
               ;; extension). malli reifies some protocols and leans on the default.
@@ -985,7 +1032,7 @@
   (let ((proto (string-copy proto-name)) (method (string-copy method-name))
         (cache #f))
     (lambda (obj)
-      (if (or (jrec? obj) (reified-methods obj))
+      (if (or (jrec? obj) (jreify? obj))
           (protocol-resolve proto method obj)
           (let* ((ge jch-graph-epoch)
                  (tags (value-host-tags obj))

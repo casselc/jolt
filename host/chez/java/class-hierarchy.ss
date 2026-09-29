@@ -630,6 +630,10 @@
 (jch-register-supers! "java.lang.Exception" '("java.lang.Throwable"))
 (jch-register-supers! "java.lang.RuntimeException" '("java.lang.Exception"))
 (jch-register-supers! "clojure.lang.ExceptionInfo" '("java.lang.RuntimeException" "clojure.lang.IExceptionInfo"))
+;; what a read from a LineNumberingPushbackReader raises (reader.ss
+;; rdr-reader-exception); only the LispReader one carries ex-data
+(jch-register-supers! "clojure.lang.LispReader$ReaderException" '("java.lang.RuntimeException" "clojure.lang.IExceptionInfo"))
+(jch-register-supers! "clojure.lang.EdnReader$ReaderException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.lang.IllegalArgumentException" '("java.lang.RuntimeException"))
 (jch-register-supers! "clojure.lang.ArityException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.lang.NumberFormatException" '("java.lang.IllegalArgumentException"))
@@ -862,6 +866,7 @@
 (jch-register-supers! "java.net.URLEncoder" '())
 (jch-register-supers! "java.net.URLDecoder" '())
 (jch-register-supers! "java.util.ArrayList" '("java.util.List" "java.util.RandomAccess"))
+(jch-register-supers! "java.util.Arrays$ArrayList" '("java.util.List" "java.util.RandomAccess"))
 (jch-register-supers! "java.util.Queue" '("java.util.Collection"))
 ;; the two blocking queues concurrency.ss models: without a row here they were
 ;; no BlockingQueue, Queue or Collection to instance?, so a (satisfies-ish) check
@@ -959,6 +964,10 @@
 (jch-register-supers! "java.lang.Enum" '("java.lang.Comparable"))
 (jch-register-supers! "java.lang.Package" '())
 (jch-register-supers! "java.lang.Process" '())
+;; the handle shim's class had the same gap the redirect's did below — a tag row
+;; and no graph row — so it was not a known class, and the statics process.ss
+;; now registers had nothing to hang an (instance? ProcessHandle …) off
+(jch-register-supers! "java.lang.ProcessHandle" '())
 (jch-register-supers! "java.lang.ProcessBuilder" '())
 ;; the redirect shim's class had a tag row but no graph row, so it was not a
 ;; known class: no token, no nested-static modifier bit
@@ -1111,6 +1120,7 @@
 (jch-register-supers! "java.util.Random"
                       '("java.util.random.RandomGenerator" "java.io.Serializable"))
 (jch-register-supers! "java.security.SecureRandom" '("java.util.Random"))
+(jch-register-supers! "java.util.SplittableRandom" '("java.util.random.RandomGenerator"))
 (jch-register-supers! "java.util.Enumeration" '())
 (jch-mark-interface! "java.util.Enumeration")
 (jch-register-supers! "java.util.StringTokenizer" '("java.util.Enumeration"))
@@ -1201,6 +1211,7 @@
     ("coder-result" . "java.nio.charset.CoderResult")
     ("coding-error-action" . "java.nio.charset.CodingErrorAction")
     ("arraylist" . "java.util.ArrayList")
+    ("arrays-aslist" . "java.util.Arrays$ArrayList")
     ("linkedlist" . "java.util.LinkedList")
     ("arraydeque" . "java.util.ArrayDeque")
     ("hashmap" . "java.util.HashMap")
@@ -1228,6 +1239,8 @@
     ;; the delegating wrapper over a Reader jolt did not build (io-streams.ss)
     ("reader-adapter" . "java.io.BufferedReader")
     ("time-unit" . "java.util.concurrent.TimeUnit")
+    ;; Files/getLastModifiedTime and fs/last-modified-time (nio-file.ss)
+    ("file-time" . "java.nio.file.attribute.FileTime")
     ("normalizer-form" . "java.text.Normalizer$Form")
     ;; subprocess shims (process.ss), backing vendored babashka.process
     ("process-builder" . "java.lang.ProcessBuilder")
@@ -1272,6 +1285,7 @@
     ("reentrant-lock" . "java.util.concurrent.locks.ReentrantLock")
     ("count-down-latch" . "java.util.concurrent.CountDownLatch")
     ("random" . "java.util.Random")
+    ("splittable-random" . "java.util.SplittableRandom")
     ("securerandom" . "java.security.SecureRandom")
     ("optional" . "java.util.Optional")
     ("string-tokenizer" . "java.util.StringTokenizer")

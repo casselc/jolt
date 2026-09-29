@@ -144,6 +144,15 @@ jobs:
           - os: windows-latest
             target: x86_64-windows
             shell: msys2 {0}
+          # Android (bionic, #943): built in termux/termux-docker on the arm64
+          # runner by ci/termux-build.sh, which also runs the smokes and the
+          # dependency allowlist there -- the host cannot execute a bionic binary,
+          # so the host-side checks below skip this row. The binary links Termux's
+          # ncurses, libuuid and libiconv.
+          - os: ubuntu-24.04-arm
+            target: aarch64-android
+            shell: bash
+            termux: termux/termux-docker:aarch64
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -159,21 +168,21 @@ jobs:
       # image. The container writes target/release/jolt into the mounted
       # workspace; every later step (smokes, package) runs on the host. ---
       - name: Clone Chez Scheme source (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.termux
         run: |
           git clone --depth 1 --branch v10.4.1 --recurse-submodules \
             https://github.com/cisco/ChezScheme.git "$HOME/chez-src"
 
       - name: Cache Chez Scheme (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.termux
         id: cache-chez
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/chez-opt
-          key: chez-manylinux2014-v10.4.1-static-v1
+          key: chez-manylinux2014-v10.4.1-static-pic-v2
 
       - name: Build jolt in ${{ matrix.container-build }} (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.termux
         env:
           JOLT_VERSION: ${{ needs.meta.outputs.version }}
         run: |
@@ -186,6 +195,23 @@ jobs:
             -e JOLT_VERSION="$JOLT_VERSION" \
             -e STATIC_DEPS=1 \
             '${{ matrix.container-build }}' sh ci/glibc-floor-build.sh
+
+      # --- Android: Chez and jolt both build inside the Termux image (the
+      # Makefile's bionic path provisions the pinned Chez); the script copies
+      # the binary back into the workspace, which the container's unprivileged
+      # user can only write where the host has opened it up. ---
+      - name: Build jolt in Termux (Android)
+        if: matrix.termux
+        env:
+          JOLT_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          mkdir -p target/release
+          chmod 777 target target/release
+          # env inside the command: the image's entrypoint clears the environment
+          docker run --rm \
+            -v "$PWD":/src \
+            '${{ matrix.termux }}' env JOLT_VERSION="$JOLT_VERSION" sh /src/ci/termux-build.sh
+          cat target/release/bionic-report.txt
 
       # --- macOS: Homebrew chezscheme ships `chez` plus the csv kernel dev files
       # (libkernel.a, scheme.h, *.boot), which is all build-jolt needs — and,
@@ -220,7 +246,7 @@ jobs:
       - name: Cache Chez Scheme (Windows)
         if: runner.os == 'Windows'
         id: cache-chez-win
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: chez-install
           key: chez-${{ matrix.os }}-v10.4.1-mingw64
@@ -267,7 +293,7 @@ jobs:
       - name: Cache Chez cross (ta6osx)
         if: matrix.cross
         id: cache-chez-cross
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/chez-cross
           key: chez-cross-v10.4.1-tarm64osx-${{ matrix.cross }}-v1
@@ -324,7 +350,7 @@ jobs:
       # `jolt --version` check died with a dyld error for everyone else, and
       # nothing in this workflow noticed. Now it would.
       - name: Assert the binary needs no library the target machine may not have
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !matrix.termux
         run: |
           bin=target/release/jolt
           if [ "${{ runner.os }}" = "macOS" ]; then
@@ -342,11 +368,13 @@ jobs:
             bad="$(printf '%s\n%s' "$bad" "$zbad" | sed '/^$/d')"
           else
             readelf -d "$bin" | grep NEEDED || true
-            # ncurses/tinfo/uuid are the Linux build's own story (STATIC_DEPS,
-            # and libuuid on top of glibc); the compression libraries are the
-            # ones jolt bakes in itself, on every platform, so assert those.
+            # STATIC_DEPS bakes in lz4, zlib, ncurses and tinfo, so the binary
+            # needs glibc and libuuid (which has no static package on
+            # manylinux2014) and nothing else. An allowlist, because a build.ss
+            # link-flag change that quietly turns ncurses dynamic produces a
+            # binary that will not start on a machine without libncurses.so.5.
             bad="$(readelf -d "$bin" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' \
-                   | grep -Ei 'lz4|libz\.' || true)"
+                   | grep -Ev '^(libc|libdl|libm|libpthread|librt|libuuid)\.so\.[0-9]+$|^ld-linux' || true)"
           fi
           if [ -n "$bad" ]; then
             echo "::error::$bin needs libraries that are not on a stock machine:"
@@ -359,6 +387,7 @@ jobs:
       # The gzip round trip goes through the zlib the binary links and registers
       # as jolt_z_* (java.util.zip, #916).
       - name: Smoke the binary
+        if: ${{ !matrix.termux }}
         run: |
           out="$($JOLT_RUN_PREFIX ./target/release/jolt -e '(reduce + (range 10))')"
           test "$out" = "45" || { echo "jolt -e gave '$out', want 45"; exit 1; }
@@ -370,6 +399,7 @@ jobs:
       # so a build that reaches for host/chez/*.ss on the filesystem fails here,
       # not on a user's machine.
       - name: Smoke a self-contained build
+        if: ${{ !matrix.termux }}
         run: |
           jolt="$(pwd)/target/release/jolt"
           work="$(mktemp -d)"
@@ -389,11 +419,54 @@ jobs:
           want="$(printf 'built: 45\ngzip: 3000 true')"
           test "$out" = "$want" || { echo "self-contained build ran '$out', want '$want'"; exit 1; }
 
+      # The one link the packaged binary still performs. A :static native sends
+      # the build down bld-relink-stub, which cc-links the bundled Chez kernel
+      # on the USER's machine — and the kernel was compiled in the manylinux
+      # container, whose gcc has no PIE default, while this runner's gcc does.
+      # 0.8.9 and 0.8.10 shipped a binary whose every :static build died there
+      # with "libkernel.a(foreign.o): relocation R_X86_64_32 ... can not be used
+      # when making a PIE object" (issue #1060), because nothing in this
+      # workflow linked a :static native with the packaged binary — the smoke
+      # above takes the appended-stub path, which performs no link at all.
+      # Linux only: it is the platform whose kernel is not PIC, and the macOS
+      # cross row runs an x86_64 binary under Rosetta, where a `cc` that
+      # defaults to arm64 cannot link the spilled x86_64 kernel at all.
+      - name: Smoke a self-contained build with a static native (the relink path)
+        if: runner.os == 'Linux' && !matrix.termux
+        run: |
+          jolt="$(pwd)/target/release/jolt"
+          work="$(mktemp -d)"
+          mkdir -p "$work/app/src/app"
+          printf 'int jolt_relink_answer(void) { return 42; }\n' > "$work/native.c"
+          cc -c "$work/native.c" -o "$work/native.o"
+          ar rcs "$work/libnative.a" "$work/native.o"
+          cat > "$work/app/deps.edn" <<EOF
+          {:paths ["src"]
+           :jolt/native [{:name "native" :static {:archive "$work/libnative.a"}}]}
+          EOF
+          cat > "$work/app/src/app/core.clj" <<'EOF'
+          (ns app.core (:require [jolt.ffi :as ffi]))
+          (ffi/defcfn answer "jolt_relink_answer" [] :int)
+          (defn -main [& _] (println "relinked:" (answer)))
+          EOF
+          # Not `| tee`: the pipeline's status is tee's, so a failed build would
+          # pass the step.
+          ( cd "$work/app" && $JOLT_RUN_PREFIX "$jolt" build -m app.core -o app ) \
+            > "$work/build.log" 2>&1 || { cat "$work/build.log"; exit 1; }
+          cat "$work/build.log"
+          grep -q 'relinking launcher stub' "$work/build.log" || {
+            echo "the :static build did not take the relink path"; exit 1; }
+          # The archive is linked in, so the binary answers with it deleted.
+          rm -f "$work/libnative.a"
+          out="$($JOLT_RUN_PREFIX "$work/app/app")"
+          test "$out" = "relinked: 42" || { echo "relinked build ran '$out', want 'relinked: 42'"; exit 1; }
+
       # A built binary must also run the DYNAMIC require path: a namespace not
       # in the static ns graph compiles from the source roots at runtime, so the
       # boot's top-level defines must be visible to the runtime compiler's eval
       # (issue #290: this died with "variable var-deref is not bound").
       - name: Smoke a runtime require in a built binary
+        if: ${{ !matrix.termux }}
         run: |
           jolt="$(pwd)/target/release/jolt"
           work="$(mktemp -d)"
@@ -432,7 +505,7 @@ jobs:
       # (a tag, or a describe string) is theirs to ignore.
       - name: Upload the linux binary for the fleet gates
         if: matrix.target == 'x86_64-linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: jolt-x86_64-linux
           path: dist/**/*.tar.gz
@@ -447,7 +520,7 @@ jobs:
       # platform by platform, an hour before the gates have run.
       - name: Hand the assets to publish-nightly
         if: needs.meta.outputs.kind == 'nightly'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: nightly-${{ matrix.target }}
           path: |
@@ -465,7 +538,7 @@ jobs:
       # i.e. the release aborts. Each matrix row creates-or-updates the same draft.
       - name: Upload to the GitHub Release (draft)
         if: needs.meta.outputs.kind == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: |
@@ -546,7 +619,7 @@ jobs:
           # transit-jolt keeps the transit-format exemplars as a submodule and its
           # suite refuses to run without them; harmless for the repos with none.
           submodules: recursive
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: jolt-x86_64-linux
       - name: Unpack the jolt under test
@@ -608,7 +681,7 @@ jobs:
         with:
           repository: jolt-lang/db
           path: lib
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: jolt-x86_64-linux
       - name: Unpack the jolt under test
@@ -677,7 +750,7 @@ jobs:
         with:
           repository: jolt-lang/glimmer-datastar
           path: datastar
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: jolt-x86_64-linux
       - name: Unpack the jolt under test
@@ -724,7 +797,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: jolt
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: jolt-x86_64-linux
       - name: Install build deps
@@ -824,7 +897,7 @@ jobs:
     concurrency:
       group: publish-nightly
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: nightly-*
           merge-multiple: true
@@ -919,7 +992,7 @@ jobs:
 
       - name: Checkout tap
         if: steps.tok.outputs.ok == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: jolt-lang/homebrew-jolt
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

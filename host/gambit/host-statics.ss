@@ -36,6 +36,11 @@
                (let ((h (make-hashtable string-hash string=?)))
                  (hashtable-set! host-methods-tbl tag h) h))))
     (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
+;; The member NAME resolves to on TAG, or #f. There is no parent chain here:
+;; every jhost tag this target builds registers its own members.
+(define (host-method-ref tag name)
+  (let ((h (hashtable-ref host-methods-tbl tag #f)))
+    (and h (hashtable-ref h name #f))))
 ;; A class token may arrive fully qualified (java.io.StringReader) or short
 ;; (StringReader): exact first, then by last dotted segment.
 (define (lookup-class h-tbl name)
@@ -105,6 +110,13 @@
           ((null? args) v)
           (else (throw-jvm (quote IllegalArgumentException)
                   (string-append class "/" member " is a static field; it takes no arguments"))))))
+;; The per-site entry points the shared emitter uses when it has a const pool
+;; (Chez caches in them: host/chez/java/host-static.ss). Here they answer through
+;; the uncached lookups, which is the same answer.
+(define (host-static-site-make) (vector #f))
+(define (host-static-ref-site site class member) (host-static-ref class member))
+(define (host-static-proc-site site class member n)
+  (lambda args (apply host-static-call class member args)))
 (def-var! "clojure.core" "host-static-call" host-static-call)
 (def-var! "clojure.core" "host-static-ref" host-static-ref)
 ;; (Class/member) with no arguments is a field read when a field is registered

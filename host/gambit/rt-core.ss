@@ -195,6 +195,11 @@
 ;; no compiler can fold the capture away, exactly as on Chez.
 (define jolt-fn-identity-seed 0)
 (define jolt-fn-identity-probe #f)
+;; A ^:once fn's box of captures (backend emit-fn), as rt.ss.
+(define jolt-once-tag (list 'jolt-once))
+(define (jolt-once-clear! env)
+  (let loop ((i (fx- (vector-length env) 1)))
+    (when (fx>? i 0) (vector-set! env i jolt-nil) (loop (fx- i 1)))))
 (set! jolt-fn-identity-seed 1)
 (set! jolt-fn-identity-probe #f)
 
@@ -313,13 +318,26 @@
     (unless (hashtable-ref seen k #f)
       (hashtable-set! seen k #t)
       (hashtable-set! tbl key (cons entry (hashtable-ref tbl key '()))))))
+;; A TAIL call whose callee is dynamic (a fn value, a keyword, a collection) has
+;; no callee to name, so the emitter registers it as "?" and it lands only here:
+;; fqn -> (line …). Nothing walks through it. It answers one question, whether a
+;; live stack read's site pair is a call that went somewhere and returned
+;; (source-registry jolt-site-exited?), which a dynamic tail call answers the
+;; same way a static one does.
+(define jolt-dynamic-tail-lines (make-hashtable string-hash string=?))
 (define (jolt-register-callsite! fqn line callee tail?)
-  (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
-  (jolt-table-add! jolt-fn-callees-table fqn callee)
-  (when tail?
-    (jolt-table-add! jolt-tail-exits fqn (cons line callee))
-    (jolt-table-add! jolt-tail-entries callee (cons fqn line)))
+  (if (string=? callee "?")
+      (jolt-table-add! jolt-dynamic-tail-lines fqn line)
+      (begin
+        (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
+        (jolt-table-add! jolt-fn-callees-table fqn callee)
+        (when tail?
+          (jolt-table-add! jolt-tail-exits fqn (cons line callee))
+          (jolt-table-add! jolt-tail-entries callee (cons fqn line)))))
   jolt-nil)
+;; The lines of a fn's dynamic tail calls, or '().
+(define (jolt-callsite-dynamic-tail-lines fqn)
+  (and (string? fqn) (hashtable-ref jolt-dynamic-tail-lines fqn '())))
 ;; The registered static callees at (fqn, line) as a non-empty list, or #f
 ;; (unknown / dynamic site — nothing was registered).
 (define (jolt-callsite-callees fqn line)
@@ -395,18 +413,24 @@
 ;; jolt-host-throwable / throw-jvm, which is what the JVM raises wherever
 ;; ex-data is nil.
 (define (jolt-ex-info msg data . more)
-  (make-jolt-ex-info-record "clojure.lang.ExceptionInfo" msg
-                             (if (null? more) jolt-nil (car more))
-                             (if (jolt-nil? data) empty-pmap data) 0))
+  (jolt-capture-throwable!
+    (make-jolt-ex-info-record "clojure.lang.ExceptionInfo" msg
+                              (if (null? more) jolt-nil (car more))
+                              (if (jolt-nil? data) empty-pmap data) 0)))
 ;; A host-constructed throwable (RuntimeException. etc.): a jolt-ex-info-record
 ;; carrying its canonical JVM class-name, so (class …) / instance? / .getMessage /
 ;; ex-message all reflect the real type.
 ;; java.text.ParseException carries an int error offset (getErrorOffset). Stored
 ;; in the record's error-offset field.
 (define (jolt-host-throwable class-name msg . more)
-  (make-jolt-ex-info-record class-name msg
-                             (if (null? more) jolt-nil (car more))
-                             jolt-nil 0))
+  (jolt-capture-throwable!
+    (make-jolt-ex-info-record class-name msg
+                              (if (null? more) jolt-nil (car more))
+                              jolt-nil 0)))
+;; Chez records where a throwable was constructed, for its stack trace (rt.ss).
+;; This target keeps no frames (a throwable's trace is empty here), so there is
+;; nothing to capture and the throwable is returned as made.
+(define (jolt-capture-throwable! v) v)
 
 ;; throw-jvm: raise a typed JVM throwable by simple class name.
 ;; (throw-jvm 'NoSuchElementException msg) -> (jolt-throw (jolt-host-throwable

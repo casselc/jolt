@@ -46,7 +46,10 @@
 (check-eq "in string" (:out (sh ["cat"] {:in "line1\nline2\n"})) "line1\nline2\n")
 
 ;; :dir and :env / :extra-env
-(check-eq "dir" (:out (sh ["pwd"] {:dir "/tmp"})) "/tmp\n")
+;; the canonical path, so the child's `pwd` (getcwd) answers it back on hosts
+;; whose temp dir sits behind a symlink (macOS /var -> /private/var).
+(let [d (.getCanonicalPath (java.io.File. (System/getProperty "java.io.tmpdir")))]
+  (check-eq "dir" (:out (sh ["pwd"] {:dir d})) (str d "\n")))
 (check-eq "env replace" (:out (sh ["sh" "-c" "echo $JP_VAR"] {:env {"JP_VAR" "set"}})) "set\n")
 (check-eq "extra-env keeps PATH" (:out (sh ["sh" "-c" "echo $JP_X"] {:extra-env {"JP_X" "y"}})) "y\n")
 
@@ -361,6 +364,48 @@
       (when (pid-alive? gpid) (sh ["sh" "-c" (str "kill -9 " gpid)])))
     (fs/delete-if-exists pidf)))
 
+;; --- java.lang.ProcessHandle, the class (jolt-lang/jolt#1087) ----------------
+;; The handle shim answered .pid / .descendants / .destroy and Process.toHandle
+;; built one, but the CLASS was not registered, so every reference to it died at
+;; the first touch: (ProcessHandle/current) reported RFC 0014's "No dependency
+;; provides java.lang.ProcessHandle" — advice nothing can act on for a class the
+;; runtime already models. Asking for your own pid, to stamp into a log or temp
+;; filename, is the portable spelling that needs it (kmet's
+;; terminal/capture-log-path died at namespace load on it).
+(let [self (ProcessHandle/current)]
+  (check-eq "ProcessHandle/current has a live pid" (pos? (.pid self)) true)
+  (check-eq "...and it is this process's, the one a child's $PPID reports"
+            (str (.pid self)) (str/trim (:out (sh ["sh" "-c" "echo $PPID"]))))
+  (check-eq "...and it is an instance of the class"
+            (instance? java.lang.ProcessHandle self) true)
+  (check-eq "current is alive" (.isAlive self) true)
+  ;; of(pid) answers an Optional, as the JVM's does — present for a running pid
+  (check-eq "of(own pid) is present" (.isPresent (ProcessHandle/of (.pid self))) true)
+  (check-eq "of(own pid) round-trips" (.pid (.get (ProcessHandle/of (.pid self)))) (.pid self))
+  ;; ...and empty for one nothing is running under. 2^22 is over every default
+  ;; pid_max, so no race can hand this one a live process.
+  (check-eq "of(unused pid) is empty" (.isPresent (ProcessHandle/of 4194304)) false)
+  ;; ...and so is a non-positive one, which kill(2) would read as a process GROUP
+  (check-eq "of(0) is empty" (.isPresent (ProcessHandle/of 0)) false)
+  (check-eq "of(negative) is empty" (.isPresent (ProcessHandle/of -1)) false)
+  ;; pid 1 always exists and is usually root's, so kill(pid, 0) answers EPERM
+  ;; rather than 0 — "exists, you may not signal it". Reading any failure as
+  ;; dead reported every process but our own as gone.
+  (check-eq "of(pid 1) is present" (.isPresent (ProcessHandle/of 1)) true)
+  (check-eq "toString is the pid" (.toString self) (str (.pid self)))
+  (check-eq "two handles on one pid are equal" (.equals self (ProcessHandle/current)) true))
+
+;; Process.toHandle now answers something that reports the class, which is what
+;; babashka.process's destroy-tree rides on
+(let [p (process ["sh" "-c" "sleep 5"])
+      h (.toHandle (:proc p))]
+  (check-eq "toHandle is a ProcessHandle" (instance? java.lang.ProcessHandle h) true)
+  (check-eq "toHandle carries the child's pid" (.pid h) (.pid (:proc p)))
+  (check-eq "the child is alive" (.isAlive h) true)
+  (.destroy h)
+  (loop [n 0] (when (and (< n 60) (p/alive? p)) (Thread/sleep 50) (recur (inc n))))
+  (check-eq "handle destroy kills it" (p/alive? p) false))
+
 ;; --- descendants / destroy-tree over a real grandchild (jolt-hpdu) -----------
 ;; ProcessHandle.descendants was hardcoded empty, so destroy-tree WAS destroy:
 ;; killing a wrapper left whatever the wrapper spawned running (a `lake env repl`
@@ -458,6 +503,57 @@
   (check-eq "and its shutdown hooks run there too (SIGINT)" (slurp hookf) "RAN")
   (fs/delete-if-exists readyf)
   (fs/delete-if-exists hookf))
+
+;; …and no signal may be swallowed by a thread that was already running, nor
+;; depend on WHICH thread registered the hook. The kernel delivers to a thread
+;; that does not block the signal, so before the watcher was armed up front it
+;; skipped the masked arming thread and delivered to one that was forked earlier —
+;; a dependency's accept loop or pool, started at namespace-load time long before
+;; -main could register anything. ^C landed there, where Chez's keyboard-interrupt
+;; handler is a no-op, and did nothing at all: no exit, no hooks. SIGTERM landed
+;; there at SIG_DFL and killed the process with its hooks unrun. Minimal programs
+;; have no load-time threads, which is why every case above passed while a real
+;; app's ^C did nothing (#1098).
+;;
+;; The JVM answers all of this uniformly — its signal dispatcher thread owns the
+;; three from VM startup — and these rows are its answers, measured on OpenJDK 20
+;; with Clojure 1.12.6 rather than assumed: hooks run and the status is 128+signal
+;; for a hook registered on the main thread, for one registered on a worker, and
+;; the status alone for a program with no hooks at all.
+(doseq [[label prog sig code hook?]
+        (let [hookform (fn [f] (str "(.addShutdownHook (Runtime/getRuntime)"
+                                    " (Thread. (fn [] (spit \"" f "\" \"RAN\"))))"))
+              ;; a thread started before the hook, as a dependency's would be
+              prefork (fn [f] (str "(.start (Thread. (fn [] (Thread/sleep 30000))))" (hookform f)))
+              ;; …and the hook itself registered from a worker, not from -main
+              offmain (fn [f] (str "(let [t (Thread. (fn [] " (hookform f) "))]"
+                                   " (.start t) (.join t))"))
+              none    (fn [_] "nil")]
+          [["a thread forked before the hook" prefork "INT"  130 true]
+           ["a thread forked before the hook" prefork "TERM" 143 true]
+           ["a hook registered off the main thread" offmain "INT"  130 true]
+           ["a hook registered off the main thread" offmain "TERM" 143 true]
+           ["a hook registered off the main thread" offmain "HUP"  129 true]
+           ["no shutdown hook at all" none "INT"  130 false]
+           ["no shutdown hook at all" none "TERM" 143 false]])]
+  (let [readyf (str (fs/create-temp-file {:prefix "jp-presig-" :suffix ".txt"}))
+        hookf  (str (fs/create-temp-file {:prefix "jp-presig-hook-" :suffix ".txt"}))
+        nested (str (prog hookf)
+                    " (spit \"" readyf "\" \"ready\") (Thread/sleep 30000)")
+        proc (process [jolt-bin "-e" nested] {:out :string :err :string})]
+    (loop [n 0]
+      (when (and (< n 200) (str/blank? (slurp readyf)))
+        (Thread/sleep 50)
+        (recur (inc n))))
+    (sh ["sh" "-c" (str "kill -" sig " " (.pid (:proc proc)))])
+    (loop [n 0] (when (and (< n 60) (p/alive? proc)) (Thread/sleep 50) (recur (inc n))))
+    (check-eq (str "SIG" sig " is not swallowed: " label) (p/alive? proc) false)
+    (when (p/alive? proc) (.destroyForcibly (:proc proc)) (Thread/sleep 200))
+    (when hook?
+      (check-eq (str "SIG" sig " runs the hooks: " label) (slurp hookf) "RAN"))
+    (check-eq (str "SIG" sig " exits " code ": " label) (:exit @proc) code)
+    (fs/delete-if-exists readyf)
+    (fs/delete-if-exists hookf)))
 
 ;; Same root cause from the other side: while the main thread waits on stdin the
 ;; rest of the program has to keep running. A future stopped ticking the moment a
@@ -613,6 +709,74 @@
             (deref got 5000 :TIMED-OUT) true)
   (slurp (.getInputStream main))
   (.waitFor main))
+
+;; A timed waitFor keeps its bound. It counted 10 ms steps instead of reading a
+;; clock, and every step's overrun accumulated: 1000 ms came back at ~1170,
+;; 5000 at ~5840. The broken loop reads ~2340 here even on a fast machine, so the
+;; upper bound leaves 250 ms for a loaded CI box and still sits below it.
+(check-eq "a timed waitFor returns at the deadline it was given"
+          (let [p (.start (java.lang.ProcessBuilder. ["sleep" "30"]))
+                t0 (System/currentTimeMillis)
+                r (.waitFor p 2000 java.util.concurrent.TimeUnit/MILLISECONDS)
+                waited (- (System/currentTimeMillis) t0)]
+            (.destroyForcibly p)
+            [r (<= 2000 waited 2250)])
+          [false true])
+
+;; Reading a child's output as text closes its pipe. slurp of an InputStream,
+;; and closing an io/reader or InputStreamReader over one, reach the stream
+;; underneath, as on the JVM; a closed text reader that left the pipe open leaked
+;; two descriptors per :string run and three per sh, and nothing reclaims a pipe.
+;; 20 runs each, judged against a slack of a few descriptors for whatever the
+;; runtime opens on its own in between.
+(defn- open-fds [] (count (.list (java.io.File. "/dev/fd"))))
+(defn- fd-growth [f]
+  (f)                                   ; the first run opens anything lazy
+  (let [before (open-fds)]
+    (dotimes [_ 20] (f))
+    (- (open-fds) before)))
+(check-eq "process :out/:err :string closes both pipes"
+          (<= (fd-growth #(deref (process {:in "" :out :string :err :string} "true"))) 4)
+          true)
+(check-eq "sh closes its pipes"
+          (<= (fd-growth #(sh "true")) 4)
+          true)
+(check-eq "slurp of a Process stream closes it"
+          (<= (fd-growth #(let [pr (.start (java.lang.ProcessBuilder. ["true"]))]
+                            (slurp (.getInputStream pr)) (slurp (.getErrorStream pr))
+                            (.close (.getOutputStream pr)) (.waitFor pr)))
+              4)
+          true)
+;; A child's pipes are let go of at its exit when nothing is waiting in them, as
+;; the JDK does, so output nobody reads does not hold descriptors until a
+;; collection; output written before the exit is still there to read after it,
+;; and stdin is closed, so a write to it then raises.
+;; Pipes dropped unread are released through a guardian that every spawn drains,
+;; so spawning threads drain it together. Unserialized, that corrupted it: every
+;; run of this on bionic either raised an invalid memory reference or killed the
+;; process. Four threads spawning at once, then one more on this thread, round
+;; after round, so collections keep handing dropped ports to concurrent drains.
+(check-eq "spawning threads drain dropped pipes without corrupting them"
+          (let [errs (atom [])
+                safe #(try (let [pr (.start (java.lang.ProcessBuilder. ["sh" "-c" "echo $$"]))]
+                             (slurp (.getInputStream pr)) (.waitFor pr))
+                           (catch Throwable e (swap! errs conj (ex-message e))))]
+            (dotimes [_ 40]
+              (let [ts (mapv (fn [_] (Thread. #(dotimes [_ 16] (safe)))) (range 4))]
+                (doseq [t ts] (.start t))
+                (doseq [t ts] (.join t))
+                (safe)))
+            (take 3 @errs))
+          [])
+(check-eq "unread pipes are released at exit"
+          (<= (fd-growth #(deref (process "true"))) 4)
+          true)
+(check-eq "output survives the exit, stdin does not"
+          (let [pr (.start (java.lang.ProcessBuilder. ["sh" "-c" "echo x; exit 3"]))]
+            [(.waitFor pr) (slurp (.getInputStream pr))
+             (try (doto (.getOutputStream pr) (.write (.getBytes "zz")) (.flush)) :wrote
+                  (catch Exception _ :threw))])
+          [3 "x\n" :threw])
 
 (if (empty? @failures)
   (println "PROCESS-TEST OK")

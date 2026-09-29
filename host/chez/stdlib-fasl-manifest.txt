@@ -13,6 +13,9 @@
 #
 # build-jolt fails on drift between this manifest and the discovered set, so the
 # two can never silently diverge. clojure.test MUST be in the embedded set.
+babashka.cli
+babashka.cli.exec
+babashka.cli.internal
 babashka.fs
 babashka.process
 babashka.process.pprint
@@ -52,6 +55,7 @@ grenadine.repo
 grenadine.runtime
 grenadine.source
 grenadine.tree
+jolt.cli
 jolt.completions
 jolt.continuations
 jolt.fibers
@@ -90,5 +94,5 @@ jolt.time.util
 jolt.time.year
 jolt.util
 skip glojure.deps — requires glojure/deps/host.{jolt,clj,cljc} which is absent from the install roots at build time
-skip grenadine.host.glojure — top level references an unqualified `strings` symbol that does not resolve in the build image
+skip grenadine.host.glojure — glojure's Go-interop host: it references the `go` namespace (go/string) and Go package aliases, none of which exist here. Only grenadine.cli requires it, and jolt binds its own host through clojurestar.deps, so it is never loaded. (Grenadine v0.1.15 fixed the unqualified `strings` reference this reason used to name; the namespace is still unloadable, for the reason above.)
 skip grenadine.cli — requires grenadine/build_info.{jolt,clj,cljc} (generated at release packaging), absent in a dev build

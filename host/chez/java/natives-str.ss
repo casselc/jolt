@@ -385,65 +385,272 @@
 ;; UnsupportedEncodingException, which is what the JVM throws for a charset it
 ;; does not have. Silently returning UTF-8 bytes, as this used to, left the caller
 ;; no way to tell it had asked for something the host could not do.
+;; Names differ by provider: glibc exports iconv_open/iconv/iconv_close, and
+;; Termux's GNU libiconv exports libiconv_open/libiconv/libiconv_close. BOTH
+;; pairs can exist at once on bionic: Android's libc carries a PARTIAL iconv
+;; (UTF-8/16 and ASCII only) beside Termux's complete GNU library, so a symbol
+;; that resolves is not a provider that can name the charset — the libc pair
+;; answers (iconv_t)-1 for windows-1252/Shift_JIS. Trying one name and taking
+;; its presence for capability is what left every non-Unicode charset raising
+;; on bionic. So collect the pairs and let each request fall through to the
+;; next provider. Both names are literal because foreign-procedure names a
+;; symbol at compile time.
 (define c-iconv-open  (jolt-foreign-proc-safe "iconv_open" '(string string) 'void*))
 (define c-iconv-conv  (jolt-foreign-proc-safe "iconv" '(void* void* void* void* void*) 'size_t))
 (define c-iconv-close (jolt-foreign-proc-safe "iconv_close" '(void*) 'int))
+(define c-libiconv-open  (jolt-foreign-proc-safe "libiconv_open" '(string string) 'void*))
+(define c-libiconv-conv  (jolt-foreign-proc-safe "libiconv" '(void* void* void* void* void*) 'size_t))
+(define c-libiconv-close (jolt-foreign-proc-safe "libiconv_close" '(void*) 'int))
 (define iconv-size-max (- (expt 2 (* 8 (sa-foreign-sizeof 'size_t))) 1))
 
-;; iconv_open, or #f when the host has no such charset. The descriptor must be
-;; closed by the caller.
+;; (open conv close) for every iconv this host has, unprefixed first: where
+;; both work the libc's is the process's own.
+(define iconv-providers
+  (filter (lambda (p) (and (vector-ref p 0) (vector-ref p 1) (vector-ref p 2)))
+          (list (vector c-iconv-open c-iconv-conv c-iconv-close)
+                (vector c-libiconv-open c-libiconv-conv c-libiconv-close))))
+
+;; The first provider that can name FROM->TO, as (provider . descriptor), or #f
+;; when none can. A provider whose open raises is skipped too, not fatal. The
+;; descriptor is the caller's to close, with that provider's close.
 (define (iconv-open-cd from to)
-  (and c-iconv-open
-       (guard (e (#t #f))
-         (let ((cd (c-iconv-open to from)))
-           (and (not (= cd iconv-size-max)) (not (= cd 0)) cd)))))
+  (let loop ((ps iconv-providers))
+    (and (pair? ps)
+         (let ((p (car ps)))
+           (guard (e (#t (loop (cdr ps))))
+             (let ((cd ((vector-ref p 0) to from)))
+               (if (or (= cd iconv-size-max) (= cd 0))
+                   (loop (cdr ps))
+                   (cons p cd))))))))
 
 (define (iconv-known? name)
-  (let ((cd (iconv-open-cd "UTF-8" name)))
-    (and cd (begin (c-iconv-close cd) #t))))
+  (let ((pcd (iconv-open-cd "UTF-8" name)))
+    (and pcd (begin ((vector-ref (car pcd) 2) (cdr pcd)) #t))))
 
 ;; Convert bytes between two charsets, or #f if the host cannot. The four
 ;; iconv arguments are pointers to a cursor pair, so they live in one 32-byte
 ;; block at offsets 0/8/16/24: in pointer, in remaining, out pointer, out
 ;; remaining. Worst case a byte grows to four (UTF-32), plus room for a BOM.
 (define (iconv-bytes bv from to)
-  (and c-iconv-conv c-iconv-close
-       (let ((cd (iconv-open-cd from to)))
-         (and cd
-              (let* ((inlen (bytevector-length bv))
-                     (outcap (+ 32 (* 4 (max inlen 1))))
-                     (inbuf (sa-foreign-alloc (max inlen 1)))
-                     (outbuf (sa-foreign-alloc outcap))
-                     (cells (sa-foreign-alloc 32))
-                     (result
-                      (guard (e (#t #f))
-                        (do ((i 0 (+ i 1))) ((= i inlen))
-                          (sa-foreign-set! 'unsigned-8 inbuf i (bytevector-u8-ref bv i)))
-                        (sa-foreign-set! 'void* cells 0 inbuf)
-                        (sa-foreign-set! 'unsigned-64 cells 8 inlen)
-                        (sa-foreign-set! 'void* cells 16 outbuf)
-                        (sa-foreign-set! 'unsigned-64 cells 24 outcap)
-                        (and (not (= iconv-size-max
-                                     (c-iconv-conv cd cells (+ cells 8) (+ cells 16) (+ cells 24))))
-                             ;; Then reset the descriptor to its initial state, which
-                             ;; POSIX spells as an iconv with a NULL input. A stateful
-                             ;; charset holds a mode, and its closing shift back to
-                             ;; ASCII is only emitted here — without it
-                             ;; (.getBytes "い" "ISO-2022-JP") stops after the
-                             ;; character and drops the trailing ESC ( B the JVM
-                             ;; writes. Stateless charsets write nothing.
-                             (begin (c-iconv-conv cd 0 0 (+ cells 16) (+ cells 24))
-                                    #t)
-                             (let* ((n (- outcap (sa-foreign-ref 'unsigned-64 cells 24)))
-                                    (out (make-bytevector n)))
-                               (do ((i 0 (+ i 1))) ((= i n) out)
-                                 (bytevector-u8-set! out i (sa-foreign-ref 'unsigned-8 outbuf i))))))))
-                (sa-foreign-free inbuf) (sa-foreign-free outbuf) (sa-foreign-free cells)
-                (c-iconv-close cd)
-                result)))))
+  (let ((pcd (iconv-open-cd from to)))
+    (and pcd
+         (let* ((provider (car pcd))
+                (cd (cdr pcd))
+                (conv (vector-ref provider 1))
+                (close (vector-ref provider 2))
+                (inlen (bytevector-length bv))
+                (outcap (+ 32 (* 4 (max inlen 1))))
+                (inbuf (sa-foreign-alloc (max inlen 1)))
+                (outbuf (sa-foreign-alloc outcap))
+                (cells (sa-foreign-alloc 32))
+                (result
+                 (guard (e (#t #f))
+                   (do ((i 0 (+ i 1))) ((= i inlen))
+                     (sa-foreign-set! 'unsigned-8 inbuf i (bytevector-u8-ref bv i)))
+                   (sa-foreign-set! 'void* cells 0 inbuf)
+                   (sa-foreign-set! 'unsigned-64 cells 8 inlen)
+                   (sa-foreign-set! 'void* cells 16 outbuf)
+                   (sa-foreign-set! 'unsigned-64 cells 24 outcap)
+                   (and (not (= iconv-size-max
+                                (conv cd cells (+ cells 8) (+ cells 16) (+ cells 24))))
+                        ;; Then reset the descriptor to its initial state, which
+                        ;; POSIX spells as an iconv with a NULL input. A stateful
+                        ;; charset holds a mode, and its closing shift back to
+                        ;; ASCII is only emitted here — without it
+                        ;; (.getBytes "い" "ISO-2022-JP") stops after the
+                        ;; character and drops the trailing ESC ( B the JVM
+                        ;; writes. Stateless charsets write nothing.
+                        (begin (conv cd 0 0 (+ cells 16) (+ cells 24))
+                               #t)
+                        (let* ((n (- outcap (sa-foreign-ref 'unsigned-64 cells 24)))
+                               (out (make-bytevector n)))
+                          (do ((i 0 (+ i 1))) ((= i n) out)
+                            (bytevector-u8-set! out i (sa-foreign-ref 'unsigned-8 outbuf i))))))))
+           (sa-foreign-free inbuf) (sa-foreign-free outbuf) (sa-foreign-free cells)
+           (close cd)
+           result))))
 
 (define (unsupported-encoding-throw name)
   (jolt-throw (jolt-host-throwable "java.io.UnsupportedEncodingException" name)))
+
+;; --- UTF-8 -> string, the way java.nio's decoder does it ---------------------
+;;
+;; Chez's utf8->string and Java's CharsetDecoder agree on every well-formed
+;; input and disagree on malformed ones, because they disagree about how many
+;; BYTES a bad sequence costs. Java replaces per malformed RUN, and the run
+;; length is decided by sun.nio.cs.UTF_8's malformedN: an overlong lead is
+;; rejected on its own, and the continuation bytes behind it are then each a
+;; stray of their own. Chez folds the whole sequence into one replacement.
+;;
+;;   bytes           Java            Chez
+;;   C0 AF           FFFD FFFD       FFFD
+;;   E0 80 AF        FFFD FFFD FFFD  FFFD
+;;   F0 80 80 AF     FFFD x4         FFFD
+;;   F4 90 80 80     FFFD x4         FFFD
+;;   EF BB BF        FEFF            (stripped)
+;;
+;; The last row is not about malformed input at all: Chez treats a leading BOM
+;; as a signature and drops it, and Java hands it back as U+FEFF.
+;;
+;; So (String. bytes) cannot be utf8->string. It also cannot be a transcoded
+;; port, which is what slurp-of-a-path uses -- that agrees with Java only on
+;; the two-byte row above and is wrong on the other four, and it is twice the
+;; cost besides (8.1MB x20: utf8->string 889ms, bytevector->string 1733ms).
+;;
+;; utf8-bytes->string is therefore Chez's decoder behind a GUARD. Well-formed
+;; input with no leading BOM is exactly the case where the two cannot disagree,
+;; so it goes to utf8->string; anything else is re-decoded by the hand-written
+;; Java model below. Measured on the same 8.1MB x20, over utf8->string's 889ms:
+;; the guard adds 185ms, and decoding by hand instead would add 968ms -- ~20%
+;; to keep the C decoder against ~110% to replace it.
+(define (%utf8-cont? b) (fx=? (fxand b #xC0) #x80))
+
+;; #t when Chez's decoder and Java's cannot differ on bv: strictly well-formed
+;; UTF-8, and no BOM for Chez to swallow.
+(define (%utf8-java-plain? bv)
+  (let* ((n (bytevector-length bv))
+         (n4 (fx- n 4)))
+    (and (not (and (fx>=? n 3)
+                   (fx=? (bytevector-u8-ref bv 0) #xEF)
+                   (fx=? (bytevector-u8-ref bv 1) #xBB)
+                   (fx=? (bytevector-u8-ref bv 2) #xBF)))
+         (let loop ((i 0))
+           ;; ASCII runs dominate real payloads, so clear four bytes per step
+           ;; while the index stays word-aligned: no high bit anywhere in the
+           ;; word means four plain characters. Byte at a time this scan cost
+           ;; 371ms per 8.1MB x20 against the 185ms it costs here.
+           (let skip ((i i))
+             (cond
+               ((and (fx<=? i n4) (fx=? (fxand i 3) 0)
+                     (fx=? (fxand (bytevector-u32-native-ref bv i) #x80808080) 0))
+                (skip (fx+ i 4)))
+               ((fx>=? i n) #t)
+               (else
+                (let ((b1 (bytevector-u8-ref bv i)))
+                  (cond
+                    ((fx<? b1 #x80) (loop (fx+ i 1)))
+                    ;; C0/C1 are overlong two-byte leads and never well-formed
+                    ((and (fx>=? b1 #xC2) (fx<=? b1 #xDF))
+                     (and (fx<? (fx+ i 1) n)
+                          (%utf8-cont? (bytevector-u8-ref bv (fx+ i 1)))
+                          (loop (fx+ i 2))))
+                    ((and (fx>=? b1 #xE0) (fx<=? b1 #xEF))
+                     (and (fx<? (fx+ i 2) n)
+                          (let ((b2 (bytevector-u8-ref bv (fx+ i 1))))
+                            (and (%utf8-cont? b2)
+                                 (not (and (fx=? b1 #xE0) (fx<? b2 #xA0)))   ; overlong
+                                 (not (and (fx=? b1 #xED) (fx>? b2 #x9F)))   ; surrogate
+                                 (%utf8-cont? (bytevector-u8-ref bv (fx+ i 2)))
+                                 (loop (fx+ i 3))))))
+                    ((and (fx>=? b1 #xF0) (fx<=? b1 #xF4))
+                     (and (fx<? (fx+ i 3) n)
+                          (let ((b2 (bytevector-u8-ref bv (fx+ i 1))))
+                            (and (%utf8-cont? b2)
+                                 (not (and (fx=? b1 #xF0) (fx<? b2 #x90)))   ; overlong
+                                 (not (and (fx=? b1 #xF4) (fx>? b2 #x8F)))   ; > U+10FFFF
+                                 (%utf8-cont? (bytevector-u8-ref bv (fx+ i 2)))
+                                 (%utf8-cont? (bytevector-u8-ref bv (fx+ i 3)))
+                                 (loop (fx+ i 4))))))
+                    (else #f))))))))))
+
+;; sun.nio.cs.UTF_8's decode loop, one sequence at a time.
+;;
+;; Decodes the sequence at I and answers two values: its code point (#xFFFD for
+;; a malformed one) and the index just past what Java would have CONSUMED for
+;; it. N bounds the bytes available, and MORE? says whether bytes beyond N may
+;; still arrive -- a streaming reader passes #t and gets (values #f i) when the
+;; sequence is cut off at the buffer edge, meaning "refill and ask again". With
+;; MORE? #f, N is end of input: an incomplete but VALID prefix there is one
+;; replacement for the whole remainder, because Java's decoder underflows and
+;; the flush replaces once.
+;;
+;; Both the whole-buffer decoder below and the streaming port that java/
+;; io-streams.ss hands every Reader run on this, so the two cannot drift.
+(define %utf8-replacement #xFFFD)
+(define (%utf8-java-step bv i n more?)
+  (let ((b1 (bytevector-u8-ref bv i)))
+    (cond
+      ((fx<? b1 #x80) (values b1 (fx+ i 1)))
+      ;; C0/C1 are overlong leads; they fall to the stray arm at the bottom
+      ((and (fx>=? b1 #xC2) (fx<=? b1 #xDF))
+       (if (fx>=? (fx+ i 1) n)
+           (if more? (values #f i) (values %utf8-replacement n))
+           (let ((b2 (bytevector-u8-ref bv (fx+ i 1))))
+             (if (%utf8-cont? b2)
+                 (values (fxior (fxsll (fxand b1 #x1F) 6) (fxand b2 #x3F)) (fx+ i 2))
+                 (values %utf8-replacement (fx+ i 1))))))
+      ((and (fx>=? b1 #xE0) (fx<=? b1 #xEF))
+       (if (fx>=? (fx+ i 1) n)
+           (if more? (values #f i) (values %utf8-replacement n))
+           (let* ((b2 (bytevector-u8-ref bv (fx+ i 1)))
+                  ;; isMalformed3_2: the lead is already wrong on its own, so
+                  ;; Java consumes ONE byte and the rest become strays
+                  (lead-bad? (or (and (fx=? b1 #xE0) (fx=? (fxand b2 #xE0) #x80))
+                                 (not (%utf8-cont? b2)))))
+             (cond
+               (lead-bad? (values %utf8-replacement (fx+ i 1)))
+               ((fx>=? (fx+ i 2) n)
+                (if more? (values #f i) (values %utf8-replacement n)))
+               (else
+                (let ((b3 (bytevector-u8-ref bv (fx+ i 2))))
+                  (if (not (%utf8-cont? b3))
+                      (values %utf8-replacement (fx+ i 2))
+                      (let ((c (fxior (fxsll (fxand b1 #x0F) 12)
+                                      (fxsll (fxand b2 #x3F) 6)
+                                      (fxand b3 #x3F))))
+                        ;; a surrogate is malformedForLength(3) -- one
+                        ;; replacement for all three bytes, unlike the overlong
+                        ;; above, which costs one per byte
+                        (if (and (fx>=? c #xD800) (fx<=? c #xDFFF))
+                            (values %utf8-replacement (fx+ i 3))
+                            (values c (fx+ i 3)))))))))))
+      ;; Java's four-byte arm is F0..F7; F5..F7 always fail the lead test
+      ((and (fx>=? b1 #xF0) (fx<=? b1 #xF7))
+       (if (fx>=? (fx+ i 1) n)
+           (if more? (values #f i) (values %utf8-replacement n))
+           (let* ((b2 (bytevector-u8-ref bv (fx+ i 1)))
+                  (lead-bad? (or (fx>? b1 #xF4)
+                                 (and (fx=? b1 #xF0) (or (fx<? b2 #x90) (fx>? b2 #xBF)))
+                                 (and (fx=? b1 #xF4) (not (fx=? (fxand b2 #xF0) #x80)))
+                                 (not (%utf8-cont? b2)))))
+             (cond
+               (lead-bad? (values %utf8-replacement (fx+ i 1)))
+               ((fx>=? (fx+ i 2) n)
+                (if more? (values #f i) (values %utf8-replacement n)))
+               ((not (%utf8-cont? (bytevector-u8-ref bv (fx+ i 2))))
+                (values %utf8-replacement (fx+ i 2)))
+               ((fx>=? (fx+ i 3) n)
+                (if more? (values #f i) (values %utf8-replacement n)))
+               ((not (%utf8-cont? (bytevector-u8-ref bv (fx+ i 3))))
+                (values %utf8-replacement (fx+ i 3)))
+               (else
+                (values (fxior (fxsll (fxand b1 #x07) 18)
+                               (fxsll (fxand b2 #x3F) 12)
+                               (fxsll (fxand (bytevector-u8-ref bv (fx+ i 2)) #x3F) 6)
+                               (fxand (bytevector-u8-ref bv (fx+ i 3)) #x3F))
+                        (fx+ i 4)))))))
+      ;; 80..BF (a stray continuation), C0/C1, F8..FF
+      (else (values %utf8-replacement (fx+ i 1))))))
+
+;; The whole-buffer decoder: only reached for input %utf8-java-plain? turned
+;; down, so it is never on a hot path.
+(define (utf8->string/java bv)
+  (let* ((n (bytevector-length bv))
+         (out (make-string n)))          ; one char per byte is the upper bound
+    (let loop ((i 0) (o 0))
+      (if (fx>=? i n)
+          (if (fx=? o n) out (substring out 0 o))
+          (let-values (((c next) (%utf8-java-step bv i n #f)))
+            (string-set! out o (integer->char c))
+            (loop next (fx+ o 1)))))))
+
+;; Decode UTF-8 bytes the way the JVM does. Shared by decode-bytevector
+;; (String., slurp of a byte source, the CharsetDecoder) -- anything that turns
+;; a whole byte buffer into text.
+(define (utf8-bytes->string bv)
+  (if (%utf8-java-plain? bv)
+      (utf8->string bv)
+      (utf8->string/java bv)))
 
 ;; Encode a string to bytes (a bytevector) under a named charset. UTF-8 default;
 ;; ISO-8859-1/US-ASCII are one byte per char; UTF-16/UTF-32 via Chez's codecs
@@ -594,8 +801,8 @@
                       (hex! (fx+ at 6) (fx+ #xdc00 (fxmodulo rest #x400)))
                       (loop (fx+ i 1) (fx+ at 12))))))))))))))
 (define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
-(define (jolt-str-replace-all s pat repl) (irregex-replace/all (str-irx pat) s repl))
-(define (jolt-str-replace-first s pat repl) (irregex-replace (str-irx pat) s repl))
+(define (jolt-str-replace-all s pat repl) (re-replace (str-irx pat) s repl #t))
+(define (jolt-str-replace-first s pat repl) (re-replace (str-irx pat) s repl #f))
 ;; re-split, not irregex-split: irregex-split collapses an empty field, so
 ;; ("a::b" ":") came back ("a" "b") where the JVM gives ("a" "" "b").
 ;; `limit` arrives raw from the direct-emit path (the JVM's 2-arg overload) and

@@ -19,6 +19,7 @@
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
+            [jolt.winsock :as winsock]
             [jolt.analyzer :as ana]))
 
 ;; --- sockets (loopback server) ---------------------------------------------
@@ -58,9 +59,7 @@
   (do
     (ffi/defcfn c-recv  "recv"        [:int :pointer :int :int] :int :blocking)
     (ffi/defcfn c-send  "send"        [:int :pointer :int :int] :int :blocking)
-    (ffi/defcfn c-close "closesocket" [:int] :int)
-    ;; Winsock must be initialized once per process before any socket call.
-    (ffi/defcfn c-wsastartup "WSAStartup" [:int :pointer] :int))
+    (ffi/defcfn c-close "closesocket" [:int] :int))
   (do
     (ffi/defcfn c-recv  "recv"  [:int :pointer :size_t :int] :ssize_t :blocking)
     (ffi/defcfn c-send  "send"  [:int :pointer :size_t :int] :ssize_t :blocking)
@@ -78,17 +77,6 @@
 ;; SOL_SOCKET / SO_REUSEADDR: 0xffff / 4 on macOS and Windows, 1 / 2 on Linux.
 (def ^:private sol-socket (if (or macos? windows?) 0xffff 1))
 (def ^:private so-reuse   (if (or macos? windows?) 4 2))
-
-;; Initialize Winsock (a no-op off Windows). WSAStartup is refcounted and must
-;; precede any socket call; WSADATA is ~408 bytes on x64, so 512 is ample.
-(defn- ensure-winsock! []
-  (when windows?
-    (let [wsadata (ffi/alloc 512)]
-      (try
-        (let [r (c-wsastartup 0x0202 wsadata)]
-          (when-not (zero? r)
-            (throw (ex-info (str "WSAStartup failed: " r) {}))))
-        (finally (ffi/free wsadata))))))
 
 (defn- make-sockaddr [port]
   ;; ffi/alloc zeroes the block, so the padding and the bytes below are already 0.
@@ -120,13 +108,19 @@
   fd)
 
 (defn- listen-socket [port]
-  (ensure-winsock!)                                          ; no-op off Windows
+  ;; Winsock, once per process, before the first socket call — shared with
+  ;; jolt.socket and jolt.mvn-http rather than carried here, which is what this
+  ;; used to be (jolt-lang/jolt#1107). A no-op off Windows.
+  (winsock/ensure!)
   ;; SOCK_CLOEXEC where the platform has it, so the fd is never briefly
   ;; inheritable between socket() and fcntl(). Linux only; macOS relies on the
   ;; fcntl below, and Windows on neither.
   (let [fd (c-socket AF-INET (bit-or SOCK-STREAM sock-cloexec) 0)]
     (when (neg? fd) (throw (ex-info "socket() failed" {})))
-    (let [opt (ffi/alloc 4)] (ffi/write opt :int 1) (c-setsockopt fd sol-socket so-reuse opt 4) (ffi/free opt))
+    ;; not on Windows: there SO_REUSEADDR lets a second listener take a busy port
+    ;; (jolt.socket's new-fd! says more)
+    (when-not windows?
+      (let [opt (ffi/alloc 4)] (ffi/write opt :int 1) (c-setsockopt fd sol-socket so-reuse opt 4) (ffi/free opt)))
     (let [sa (make-sockaddr port)]
       (when (neg? (c-bind fd sa 16)) (c-close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
       (ffi/free sa))
@@ -232,41 +226,82 @@
   message to show."
   [] @last-backtrace)
 
+(defn- chunk-writer
+  "A java.io.Writer that hands what was written to `send` in chunks: on flush (a
+  println flushes, as *flush-on-newline* has it), and on close. Nothing is sent
+  for a flush with nothing new. A send that fails (the client went away) drops
+  the chunk rather than failing the println that flushed it: the eval runs on."
+  [send]
+  (let [sb (StringBuilder.)
+        lock (Object.)
+        emit! (fn [] (let [s (locking lock (let [s (str sb)] (.setLength sb 0) s))]
+                       (when (pos? (count s))
+                         (try (send s) (catch :default _ nil)))))]
+    (proxy [java.io.Writer] []
+      (write
+        ([x] (locking lock
+               (.append sb (cond (string? x) x
+                                 (integer? x) (str (char x))
+                                 :else (String. ^chars x)))))
+        ([x off len] (locking lock
+                       (.append sb (if (string? x)
+                                     (subs x off (+ off len))
+                                     (String. ^chars x (int off) (int len)))))))
+      (flush [] (emit!))
+      (close [] (emit!)))))
+
 (defn evaluate
-  "Evaluate `code` (optionally in loaded ns `ns-str`), capturing *out*. Returns
+  "Evaluate `code` (optionally in loaded ns `ns-str`). Returns
   {:value .. :out .. :ns .. :err ..}. in-ns — not (binding [*ns* ..]) — sets the
-  ns load-string resolves against on jolt. Reusable by eval middleware."
-  [code ns-str]
-  (let [result (atom nil) err (atom nil) exc (atom nil)
-        out (with-out-str
-              (binding [*capturing-thread* (Thread/currentThread)]
-                (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
-                       (in-ns (symbol ns-str)))
-                     (reset! result (binding [*allow-unresolved-vars* true]
-                                      (load-string code)))
-                     (catch :default e
-                       ;; the backtrace is read here, while it still describes
-                       ;; THIS failure
-                       (reset! exc e)
-                       (let [bt (jolt.host/backtrace-string)]
-                         (reset! last-backtrace bt)
-                         (reset! err (str (err-msg e) (when bt (str "\n" bt)))))))))]
-    ;; the REPL history vars, like clojure.main's REPL and every other nREPL
-    ;; server: an editor session can reach for *1 or (ex-data *e) after an error,
-    ;; and tooling (a stacktrace op) reads *e to find the last exception. These
-    ;; are process-wide roots — an nREPL server has no outer REPL loop whose
-    ;; thread bindings would shadow them.
-    ;; *e (and the backtrace beside it) survives a later successful eval, like
-    ;; every REPL's does
-    (if @exc
-      (alter-var-root #'*e (constantly @exc))
-      (do (alter-var-root #'*3 (constantly *2))
-          (alter-var-root #'*2 (constantly *1))
-          (alter-var-root #'*1 (constantly @result))))
-    {:value (when (nil? @err) (pr-str @result))
-     :out out
-     :ns (str (ns-name *ns*))
-     :err @err}))
+  ns load-string resolves against on jolt. Reusable by eval middleware.
+
+  With two arguments, *out* is captured and returned whole as :out when the eval
+  finishes. With a third, a map {:out f :err f}, output streams instead, as
+  upstream nREPL's session writers do: *out* (and *err*, when :err is given) is a
+  writer that calls f with each chunk as it is flushed — println flushes — while
+  the eval is still running, so an editor's console shows a long job's progress.
+  Whatever is left unflushed is sent before this returns, and :out is then empty.
+  A future the eval starts inherits the writers, so its output streams too."
+  ([code ns-str] (evaluate code ns-str nil))
+  ([code ns-str {on-out :out on-err :err}]
+   (let [result (atom nil) err (atom nil) exc (atom nil)
+         run (fn []
+               (binding [*capturing-thread* (Thread/currentThread)]
+                 (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
+                        (in-ns (symbol ns-str)))
+                      (reset! result (binding [*allow-unresolved-vars* true]
+                                       (load-string code)))
+                      (catch :default e
+                        ;; the backtrace is read here, while it still describes
+                        ;; THIS failure
+                        (reset! exc e)
+                        (let [bt (jolt.host/backtrace-string)]
+                          (reset! last-backtrace bt)
+                          (reset! err (str (err-msg e) (when bt (str "\n" bt)))))))))
+         out (if on-out
+               (let [ow (chunk-writer on-out)
+                     ew (when on-err (chunk-writer on-err))]
+                 (try (binding [*out* ow]
+                        (if ew (binding [*err* ew] (run)) (run)))
+                      (finally (.flush ow) (when ew (.flush ew))))
+                 "")
+               (with-out-str (run)))]
+     ;; the REPL history vars, like clojure.main's REPL and every other nREPL
+     ;; server: an editor session can reach for *1 or (ex-data *e) after an error,
+     ;; and tooling (a stacktrace op) reads *e to find the last exception. These
+     ;; are process-wide roots — an nREPL server has no outer REPL loop whose
+     ;; thread bindings would shadow them.
+     ;; *e (and the backtrace beside it) survives a later successful eval, like
+     ;; every REPL's does
+     (if @exc
+       (alter-var-root #'*e (constantly @exc))
+       (do (alter-var-root #'*3 (constantly *2))
+           (alter-var-root #'*2 (constantly *1))
+           (alter-var-root #'*1 (constantly @result))))
+     {:value (when (nil? @err) (pr-str @result))
+      :out out
+      :ns (str (ns-name *ns*))
+      :err @err})))
 
 ;; ops middleware advertise via describe (built-ins + any a library registers).
 (def ^:private extra-ops (atom #{}))
@@ -345,8 +380,11 @@
                         "status" ["done"]})
       (or (= op "eval") (= op "load-file"))
       (let [code (wire-> (if (= op "load-file") (get request "file") (get request "code")))
-            {:keys [value out ns err]} (evaluate code (get request "ns"))]
-        (when (seq out) (respond request {"out" out}))
+            ;; output goes out as it is printed, each flush its own `out` (or
+            ;; `err`) message, ahead of the value
+            {:keys [value ns err]} (evaluate code (get request "ns")
+                                             {:out #(respond request {"out" %})
+                                              :err #(respond request {"err" %})})]
         (if err
           (do (respond request {"err" (str err "\n")})
               (respond request {"ex" (str err) "status" ["eval-error" "done"]}))

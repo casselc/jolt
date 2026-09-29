@@ -1,9 +1,16 @@
 #!/bin/sh
+
 # build smoke: `jolt build` compiles a multi-namespace app (macro + cross-ns +
 # clojure.string) into a standalone binary, which then runs with no jolt source
 # or Chez install on the path — args reach -main, output matches.
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
+
+# The app's emitted Scheme is several files since the build compiles (and
+# caches) one unit per namespace: flat.ss is the prologue, app-N.ss each
+# namespace, app-post.ss the launcher. A check about what the app emitted reads
+# all of them — one over flat.ss alone passes an absence check vacuously.
+appsrc() { cat "$1/flat.ss" "$1"/app-[0-9]*.ss "$1/app-post.ss" 2>/dev/null; }
 
 # JOLT_BIN overrides the jolt under test. The gate targets point it at the
 # freshly built target/release/jolt: a `jolt build` costs ~2.5s through the
@@ -100,18 +107,18 @@ done
 # The cross-ns app.core -> app.util/shout reference is direct-linked in the plain
 # release build, not var-routed.
 #
-# Asserted on the BINDING, not on a (jv$app.util$shout ...) call form. Release
+# Asserted on the BINDING, not on a (jv$app.util/shout ...) call form. Release
 # inlines now (jolt-mbcm.6), and shout is small enough to be spliced into its
 # caller, so there is no call left to find -- the old assertion failed on a build
 # that had done MORE than it asked for. The binding is emitted for every
 # direct-linked def whether or not any particular call to it survives, and it is
 # absent entirely under --no-direct-link, so it still discriminates.
-if ! grep -q 'define jv\$app.util\$shout' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'define jv\$app.util/shout'; then
   echo "  FAIL: release build did not direct-link the app->app call"; exit 1
 fi
 # ...and nothing reads it through its var, which is the thing direct-linking is
 # for. This holds whether the call was spliced or left as a jv$ application.
-if grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")'; then
   echo "  FAIL: release build still var-routed the app->app call"; exit 1
 fi
 
@@ -122,8 +129,8 @@ fi
 if ! JOLT_PWD="$app" JOLT_NO_WP_INFER=1 "$jolt" build -m app.core -o "$out.noop" >/dev/null 2>&1; then
   echo "  FAIL: JOLT_NO_WP_INFER build exited non-zero"; exit 1
 fi
-default_fl=$(grep -c '#3%fl' "$out.build/flat.ss" || true)
-noop_fl=$(grep -c '#3%fl' "$out.noop.build/flat.ss" || true)
+default_fl=$(appsrc "$out.build" | grep -c '#3%fl' || true)
+noop_fl=$(appsrc "$out.noop.build" | grep -c '#3%fl' || true)
 if [ "$default_fl" -le "$noop_fl" ]; then
   echo "  FAIL: wp-infer added no fl-ops to the release build (default=$default_fl noop=$noop_fl)"; exit 1
 fi
@@ -133,13 +140,13 @@ fi
 # no fixpoint needed), so flat.ss carries the inline native and NO
 # record-method-dispatch "startsWith" anywhere. Runtime shape is asserted below
 # via --strd; this is the emit-level proof.
-if ! grep -q 'str-starts-with?' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'str-starts-with?'; then
   echo "  FAIL: str-target .startsWith did not lower to the string native"; exit 1
 fi
-if grep -q 'record-method-dispatch.*startsWith' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -q 'record-method-dispatch.*startsWith'; then
   echo "  FAIL: str-target .startsWith still routes through record-method-dispatch"; exit 1
 fi
-if ! grep -q 'str-starts-with?' "$out.noop.build/flat.ss"; then
+if ! appsrc "$out.noop.build" | grep -q 'str-starts-with?'; then
   echo "  FAIL: str-target lowering depended on the wp fixpoint (str-ret table is per-form)"; exit 1
 fi
 
@@ -151,10 +158,10 @@ fi
 # sym elsewhere) don't false-positive; the positive one matches kwsym's exact
 # emission (the bare (jolt-symbol (keyword-t-ns …)) shape also appears in the
 # runtime section, so it alone would not prove the stamp fired).
-if ! grep -qF '(jolt-symbol (keyword-t-ns k) (keyword-t-name k))' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -qF '(jolt-symbol (keyword-t-ns k) (keyword-t-name k))'; then
   echo "  FAIL: kw-target .sym did not lower to the inline keyword arm"; exit 1
 fi
-if grep -qE 'record-method-dispatch [^ ()]+"sym"' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -qE 'record-method-dispatch [^ ()]+"sym"'; then
   echo "  FAIL: kw-target .sym still routes through record-method-dispatch"; exit 1
 fi
 
@@ -164,13 +171,13 @@ fi
 # that local and route no "append"/"toString" on it through the jhost method table.
 # The negative grep anchors the method name right after the target so unrelated
 # record-method-dispatch lines elsewhere in the closure cannot false-positive.
-if ! grep -qF '(sb-append! sb (sb-piece' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -qF '(sb-append! sb (sb-piece'; then
   echo "  FAIL: sb-target .append did not lower to the inline sb-append!"; exit 1
 fi
-if ! grep -qF '(sb-str sb)' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -qF '(sb-str sb)'; then
   echo "  FAIL: sb-target .toString did not lower to the inline sb-str"; exit 1
 fi
-if grep -qE 'record-method-dispatch [^ ()]+"append"' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -qE 'record-method-dispatch [^ ()]+"append"'; then
   echo "  FAIL: sb-target .append still routes through record-method-dispatch"; exit 1
 fi
 
@@ -182,10 +189,10 @@ fi
 # classes are referenced nowhere, so that provider must stay out. The greps
 # target ns EMISSION (set-chez-ns!), not bare strings — the runtime section of
 # flat.ss always mentions both providers in its autoload tables.
-if ! grep -q 'set-chez-ns! "jolt\.time"' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'set-chez-ns! "jolt\.time"'; then
   echo "  FAIL: a jolt.time class ref did not pull the provider ns into flat.ss"; exit 1
 fi
-if grep -q 'set-chez-ns! "jolt\.crypto"' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -q 'set-chez-ns! "jolt\.crypto"'; then
   echo "  FAIL: unreferenced lib provider jolt.crypto leaked into flat.ss"; exit 1
 fi
 
@@ -218,13 +225,13 @@ check_fnid() {  # check_fnid <binary> <label>
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then
   echo "  FAIL: jolt build --no-direct-link exited non-zero"; exit 1
 fi
-if grep -q 'define jv\$app.util\$shout' "$out.nodl.build/flat.ss"; then
+if appsrc "$out.nodl.build" | grep -q 'define jv\$app.util/shout'; then
   echo "  FAIL: --no-direct-link still direct-linked the app->app call"; exit 1
 fi
 check_fnid "$out.nodl" "the --no-direct-link build"
 # and it IS var-routed there -- without this the check above would pass on a
 # build that emitted no reference to shout at all.
-if ! grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.nodl.build/flat.ss"; then
+if ! appsrc "$out.nodl.build" | grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")'; then
   echo "  FAIL: --no-direct-link did not var-route the app->app call"; exit 1
 fi
 # An OPEN-WORLD build maps its frames too. emit-def-cached only emits a source
@@ -336,6 +343,20 @@ if [ "$n_inner" != "1" ]; then
   echo "  FAIL: inner-fn trace names app.util/inner-boom $n_inner times, want 1"
   echo "--- got ----"; echo "$got_if"; exit 1
 fi
+# ...and the same trace with the build directory gone. A frame's line comes from
+# the markers in the unit file it was compiled from; read off the disk, a binary
+# whose .build dir was cleaned (or that was copied elsewhere) fell back to defn
+# lines and lost every spliced frame, and so did one built from cached units,
+# which name the directory of the build that first compiled them. The build bakes
+# each unit's table into the unit (build.ss bld-append-marker-table!).
+mv "$out.build" "$out.build-away"
+got_if_nodir="$(cd / && "$out" --innerfn 2>&1)"
+mv "$out.build-away" "$out.build"
+if [ "$got_if_nodir" != "$got_if" ]; then
+  echo "  FAIL: the trace changed once the build directory was gone"
+  echo "--- with it ----"; echo "$got_if"
+  echo "--- without ----"; echo "$got_if_nodir"; exit 1
+fi
 
 # --tree-shake must not cost the trace its inlined frames. A callee whose every
 # call site was spliced has no reference left in the graph, so the shake dropped
@@ -399,21 +420,46 @@ for line in 'fwd-get:   41' 'fwd-first: 7' 'fwd-late:  [{K 5, :url K, :method :g
   fi
 done
 
+# A runtime require of a namespace the image already loaded must be a no-op.
+# App namespaces are pre-registered (intern-ns!) at boot but were never
+# ldr-mark-loaded!'d, so the loader's dedup missed and re-read the embedded
+# source, re-evaluating the namespace in place — the #451 reload window again,
+# from the runtime side, outside the emit walk that fix gated. A re-evaluated
+# fwd-get links the now-visible ns-local `get`, so the binary threw
+# String→Associative where `jolt run` was fine (reported against kmet: its
+# extension loader requires host namespaces at startup). --rerequire pins both
+# the stamp identity and that call against the in-order run.
+got_rr="$(cd / && "$out" --rerequire 2>&1)"
+want_rr="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --rerequire 2>&1)"
+if [ "$got_rr" != "$want_rr" ]; then
+  echo "  FAIL: a runtime require of an image namespace re-evaluates it"
+  echo "--- binary ----"; echo "$got_rr"
+  echo "--- jolt run --"; echo "$want_rr"; exit 1
+fi
+if ! printf '%s' "$got_rr" | grep -qF 're-require same-stamp: true'; then
+  echo "  FAIL: --rerequire re-evaluated app.embedded in the built binary"
+  echo "--- got ----"; echo "$got_rr"; exit 1
+fi
+
 # ...and the same with a WARM AOT cache, which is how a user meets this: the
 # cache is on by default in a built jolt, and the report that opened this said
 # "jolt run works fine once aot kicks in". A cached namespace loads from its
 # compiled artifact, and those defs run outside the reader walk that stamps the
 # def ordinals — so pass 1 would hand the emit walk an unstamped program, every
 # var would read as visible from form 0, and the binary would resolve the
-# ns-local redefinition again. Pass 1 loading from SOURCE is what keeps the
-# stamps (ldr-source-only? gates the cache branch, loader.ss); nothing else in
-# this gate builds an app whose cache a run has already warmed, so without this
-# case that gate could be removed and every check above would still pass.
+# ns-local redefinition again. The build's pass 1 DOES load from the cache (a
+# rebuild used to recompile every namespace from source just to load it, #1059),
+# so what keeps the stamps is the artifact replaying the ones its source load made
+# (loader.ss aot-replay-def-ordinals!); nothing else in this gate builds an app
+# whose cache a run has already warmed, so without this case that replay could
+# be removed and every check above would still pass.
 # Its own cache dir (under the temp dir the trap removes) so the gate neither
 # reads nor writes the user's ~/.jolt cache.
 fwd_cache="$(dirname "$out")/aot-cache"
 warm_out="$(dirname "$out")/app-warm"
-(cd "$app" && JOLT_PWD="$app" JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$fwd_cache" \
+# JOLT_AOT_ASYNC=0: the check below reads the artifact as soon as the run exits,
+# and a built jolt otherwise hands the compile to a worker that may still be at it.
+(cd "$app" && JOLT_PWD="$app" JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$fwd_cache" \
    "$joltabs" run -m app.core --fwdref >/dev/null 2>&1)
 # ...and the run has to have actually cached something, or this case proves
 # nothing while still passing — the failure mode a warm-cache gate is most
@@ -473,24 +519,37 @@ cat > "$mfn_app/src/mf/core.clj" <<'MFN_EOF'
   (println "mfn-after: " (u/after-load {:req "K"})))
 MFN_EOF
 mfn_out="$(dirname "$out")/mfn-bin"
-if ! JOLT_PWD="$mfn_app" "$jolt" build -m mf.core -o "$mfn_out" >/dev/null 2>&1; then
-  echo "  FAIL: multi-file-namespace app build exited non-zero"; exit 1
-fi
-# the binary runs the (load) itself, so the app source outlives this run
-got_mfn="$(cd / && "$mfn_out" 2>&1)"
-want_mfn="$(cd "$mfn_app" && JOLT_PWD="$mfn_app" "$joltabs" run -m mf.core 2>&1)"
-rm -rf "$(dirname "$mfn_app")"
-if [ "$got_mfn" != "$want_mfn" ]; then
-  echo "  FAIL: a (load)ed redefinition resolves differently in the binary and under jolt run"
-  echo "--- binary ----"; echo "$got_mfn"
-  echo "--- jolt run --"; echo "$want_mfn"; exit 1
-fi
-for line in 'mfn-second: 8' 'mfn-after:  [{:req K, :seen-second true} 40]'; do
-  if ! printf '%s' "$got_mfn" | grep -qF "$line"; then
-    echo "  FAIL: (load)ed redefinition — want '$line'"
-    echo "--- got ----"; echo "$got_mfn"; exit 1
+# twice over one private AOT cache: the second build's pass 1 loads mf.util from
+# the artifact the first one cached, so its outer-frame stamps (the loaded file's
+# defs, stamped against mf.util at the (load) form) come from the replay
+mfn_cache="$(dirname "$out")/mfn-aot-cache"
+for mfn_i in 1 2; do
+  if ! JOLT_PWD="$mfn_app" JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$mfn_cache" \
+       "$jolt" build -m mf.core -o "$mfn_out.$mfn_i" >/dev/null 2>&1; then
+    echo "  FAIL: multi-file-namespace app build $mfn_i exited non-zero"; exit 1
   fi
 done
+if ! ls "$mfn_cache"/*/*/mf.util-*.so >/dev/null 2>&1; then
+  echo "  FAIL: the warm (load) case is vacuous — no AOT artifact for mf.util under $mfn_cache"
+  exit 1
+fi
+# the binary runs the (load) itself, so the app source outlives this run
+want_mfn="$(cd "$mfn_app" && JOLT_PWD="$mfn_app" "$joltabs" run -m mf.core 2>&1)"
+for mfn_i in 1 2; do
+  got_mfn="$(cd / && "$mfn_out.$mfn_i" 2>&1)"
+  if [ "$got_mfn" != "$want_mfn" ]; then
+    echo "  FAIL: a (load)ed redefinition resolves differently in binary $mfn_i and under jolt run"
+    echo "--- binary ----"; echo "$got_mfn"
+    echo "--- jolt run --"; echo "$want_mfn"; exit 1
+  fi
+  for line in 'mfn-second: 8' 'mfn-after:  [{:req K, :seen-second true} 40]'; do
+    if ! printf '%s' "$got_mfn" | grep -qF "$line"; then
+      echo "  FAIL: (load)ed redefinition (build $mfn_i) — want '$line'"
+      echo "--- got ----"; echo "$got_mfn"; exit 1
+    fi
+  done
+done
+rm -rf "$(dirname "$mfn_app")"
 
 # A closure returned by a SPLICED callee must still travel in a state image, and
 # the built binary must agree with `jolt run` about it. Only a built binary
@@ -585,6 +644,26 @@ if ! printf '%s' "$got_rl" | grep -q '^resloader: true true 1 true true$'; then
   echo "--- got ----"; echo "$got_rl"; exit 1
 fi
 
+# A loader root over the binary's EMBEDDED resources: a root spelled
+# "embed:<prefix>" resolves namespaces and resources straight out of the heap,
+# with nothing on disk — what a shipped app uses to run a plugin or extension
+# bundle it carries. Its own app: nothing in the project's closure requires the
+# fixture namespaces, so a jolt.loader context is the only way they exist in the
+# binary, and the run is from / so a filesystem answer cannot pass it by
+# accident. Only a built binary has an embedded store to resolve against, which
+# is why the check lives here.
+echo "build smoke: embedded loader root (namespace + resource from the heap)"
+elapp="$root/test/chez/embedloader-app"
+elout="$(dirname "$out")/embedloader-bin"
+if ! JOLT_PWD="$elapp" "$jolt" build -m app.core -o "$elout" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build of the embedded-root app exited non-zero"; exit 1
+fi
+got_el="$(cd / && "$elout" --embedloader 2>&1)"
+if ! printf '%s' "$got_el" | grep -q '^embedloader: true true true true true true true true true$'; then
+  echo "  FAIL: embedded loader root — want 'embedloader: true true true true true true true true true'"
+  echo "--- got ----"; echo "$got_el"; exit 1
+fi
+
 # With no -o and JOLT_PWD unset -- the built jolt started in the project -- the
 # binary is named after the project DIRECTORY, not the entry namespace: "." is
 # resolved to the directory it stands for.
@@ -667,12 +746,12 @@ if [ "$got_dl" != "$want" ]; then
   echo "--- got ----"; echo "$got_dl"
   exit 1
 fi
-if ! grep -q 'define jv\$app.util\$shout' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'define jv\$app.util/shout'; then
   echo "  FAIL: --direct-link did not emit a direct app->app call"; exit 1
 fi
 # A direct-link build registers fn sources, so an uncaught throw prints a Clojure
 # stack trace mapping each native frame back to ns/name (file:line).
-if ! grep -q 'jolt-register-source!' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'jolt-register-source!'; then
   echo "  FAIL: --direct-link did not emit source registrations"; exit 1
 fi
 boom_err="$(cd / && "$out" --boom 2>&1 >/dev/null)"
@@ -751,7 +830,7 @@ reduce_acc_want="$(printf '1\n[1 2 3]\n8\n14.0\n2\n1\n1\n1')"
 if [ "$reduce_acc_got" != "$reduce_acc_want" ]; then
   echo "  FAIL: reduce accumulator typed from its init alone — got \`$reduce_acc_got\`, want \`$reduce_acc_want\`"; exit 1
 fi
-if ! grep -q '#3%fl+' "$reduce_acc_out.build/flat.ss"; then
+if ! appsrc "$reduce_acc_out.build" | grep -q '#3%fl+'; then
   echo "  FAIL: a 0.0-seeded reduce closure returning a flonum lost its fl+"; exit 1
 fi
 
@@ -868,7 +947,7 @@ if [ "$got_do" != "$(printf '1\nalive')" ]; then
   echo "  FAIL: --tree-shake defonce binary output mismatch"
   echo "--- got ----"; echo "$got_do"; exit 1
 fi
-if grep -q '"app.core" "dead"' "$doout.build/flat.ss"; then
+if appsrc "$doout.build" | grep -q '"app.core" "dead"'; then
   echo "  FAIL: --tree-shake did not drop the unreferenced def app.core/dead"; exit 1
 fi
 [ -f "$doout.build/runtime.ss" ] || { echo "  FAIL: --tree-shake did not emit the shaken core as its own runtime unit"; exit 1; }
@@ -909,7 +988,7 @@ got_img="$(JOLT_PWD="$ckapp" "$jolt" -e "(require 'jolt.image) (println (:answer
 if [ "$got_img" != "42" ]; then
   echo "  FAIL: the image the shaken binary wrote does not read back — got: $got_img"; exit 1
 fi
-if grep -q '"ck.main" "dead"' "$ckout.build/flat.ss"; then
+if appsrc "$ckout.build" | grep -q '"ck.main" "dead"'; then
   echo "  FAIL: the compiler-keeping shake did not prune the app half (ck.main/dead)"; exit 1
 fi
 if ! grep -Eq 'def-var[a-z!-]*! "clojure.core" "group-by"' "$ckout.build/runtime.ss"; then
@@ -1039,6 +1118,25 @@ fi
 got_um_bin="$(cd / && "$umout" 2>&1 | tail -1)"
 if [ "$got_um_bin" != "$umwant" ]; then
   echo "  FAIL: top-level (set! *unchecked-math* …) in a built binary — want \`$umwant\`, got \`$got_um_bin\`"; exit 1
+fi
+
+# -main is user code after the load, so both the CLI's `run -m` and a built
+# binary's launcher run it under clojure.main's compiler-flag frame: a set! in
+# -main is legal and reads back. Before the fix both threw "Can't
+# change/establish root binding".
+efapp="$root/test/chez/entry-flags-app"
+efwant="ENTRY-FLAGS true false"
+got_ef_src="$(cd "$efapp" && JOLT_PWD="$efapp" "$joltabs" run -m eflags.main 2>&1 | tail -1)"
+if [ "$got_ef_src" != "$efwant" ]; then
+  echo "  FAIL: (set! *warn-on-reflection* …) in -main from source — want \`$efwant\`, got \`$got_ef_src\`"; exit 1
+fi
+efout="$(dirname "$out")/entry-flags-bin"
+if ! JOLT_PWD="$efapp" "$jolt" build -m eflags.main -o "$efout" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build of an entry-flags app exited non-zero"; exit 1
+fi
+got_ef_bin="$(cd / && "$efout" 2>&1 | tail -1)"
+if [ "$got_ef_bin" != "$efwant" ]; then
+  echo "  FAIL: (set! *warn-on-reflection* …) in -main in a built binary — want \`$efwant\`, got \`$got_ef_bin\`"; exit 1
 fi
 
 # A built binary must have the vendored babashka.fs (via jolt.fs) available and
@@ -1420,7 +1518,7 @@ aaout="$(dirname "$out")/as-alias-bin"
 if ! JOLT_PWD="$root/test/chez/as-alias-app" "$joltabs" build -m app.core -o "$aaout" >/dev/null 2>&1; then
   echo "  FAIL: as-alias-app build exited non-zero"; exit 1
 fi
-if grep -q 'set-chez-ns! "app.other"' "$aaout.build/flat.ss"; then
+if appsrc "$aaout.build" | grep -q 'set-chez-ns! "app.other"'; then
   echo "  FAIL: :as-alias pulled app.other into the binary"; exit 1
 fi
 got_aa="$(cd / && "$aaout" 2>&1)"
@@ -1445,7 +1543,7 @@ fi
 [ -f "$splitout.build/runtime.ss" ] || { echo "  FAIL: no runtime.ss — the split did not happen"; exit 1; }
 # clojure.core lives in the runtime half only; finding it in flat.ss means the app
 # half still carries the runtime and nothing was actually separated.
-if grep -Eq 'def-var[a-z!-]*! "clojure.core" "group-by"' "$splitout.build/flat.ss"; then
+if appsrc "$splitout.build" | grep -Eq 'def-var[a-z!-]*! "clojure.core" "group-by"'; then
   echo "  FAIL: runtime defs still in flat.ss after the split"; exit 1
 fi
 if [ "$(ls "$cachedir"/*.so 2>/dev/null | wc -l | tr -d ' ')" != "1" ]; then
@@ -1480,6 +1578,42 @@ if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nospli
   echo "--- unsplit ---";     echo "$got_nosplit"
   exit 1
 fi
+
+# --- app unit cache (#1059) -----------------------------------------------------
+# The app half compiles as one unit per namespace, cached on the unit's text. A
+# rebuild of unchanged source compiles nothing; an edit to one namespace
+# recompiles that namespace's unit and no other — which only holds if a unit's
+# text depends on its own namespace and not on how many names the namespaces
+# before it (or the build's own load phase) used. Each binary must still behave
+# exactly like the reference.
+echo "build smoke: app unit cache (rebuild compiles only what changed)"
+ucapp="$(dirname "$out")/unitcache-app"
+ucache="$(dirname "$out")/unitcache"
+rm -rf "$ucapp" "$ucache"
+cp -R "$app" "$ucapp"
+ucbuild() { # $1 = output; answers the profile's "compile app units (m/n compiled)" line
+  JOLT_PWD="$ucapp" JOLT_BUILD_CACHE_DIR="$ucache" JOLT_BUILD_PROFILE=1 "$joltabs" build -m app.core -o "$1" 2>"$1.prof" >/dev/null \
+    || { echo "  FAIL: unit-cache build $1 exited non-zero"; sed -n '1,20p' "$1.prof"; exit 1; }
+  sed -n 's/.*compile app units (\([0-9]*\)\/\([0-9]*\) compiled).*/\1 \2/p' "$1.prof"
+}
+uc1="$(ucbuild "$(dirname "$out")/uc-bin1")"
+uc2="$(ucbuild "$(dirname "$out")/uc-bin2")"
+[ -n "$uc1" ] || { echo "  FAIL: no 'compile app units' profile line"; exit 1; }
+if [ "${uc2%% *}" != "0" ]; then
+  echo "  FAIL: an unchanged rebuild compiled units ($uc2 — want 0 compiled)"; exit 1
+fi
+printf '\n(defn added-later [x] (str "later " x))\n' >> "$ucapp/src/app/util.clj"
+uc3="$(ucbuild "$(dirname "$out")/uc-bin3")"
+if [ "${uc3%% *}" != "1" ]; then
+  echo "  FAIL: editing one namespace recompiled ${uc3%% *} units (want 1; units: ${uc1#* })"; exit 1
+fi
+for b in uc-bin1 uc-bin2 uc-bin3; do
+  got_uc="$(cd / && "$(dirname "$out")/$b" alpha bb ccc 2>&1)"
+  if [ "$got_uc" != "$want" ]; then
+    echo "  FAIL: $b disagrees with the reference output"
+    echo "--- want ---"; echo "$want"; echo "--- got ---"; echo "$got_uc"; exit 1
+  fi
+done
 
 # --boot picks how the boot image is encoded (jolt-lang/jolt#886): `fast` (the
 # default) is vfasl+LZ4, `small` is vfasl+gzip, `plain` skips vfasl entirely.
@@ -1643,4 +1777,95 @@ gz_case() {
 gz_case plain || exit 1
 gz_case shake --tree-shake || exit 1
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict + gzip-round-trip)"
+# --signable (#1064): force the cc-linked path for an ordinary same-machine
+# executable, so the result is a structurally complete image `codesign --verify
+# --strict` accepts rather than a boot appended past the end of a stub copy.
+#
+# The flag reaches build.ss through a POSITIONAL optional-arg slot (bld-opt-bool
+# opt 4, behind target/target-pack/boot-mode/allow-dynamic), so an opt inserted
+# ahead of it — or a reordering of jolt.host/build-binary's trailing args —
+# turns --signable into a silent no-op that still builds a perfectly good,
+# perfectly unsignable binary. Nothing else here would notice.
+#
+# The two paths name themselves: build-self-contained's verdict says
+# ", self-contained)" and build-with-cc's does not. A dev jolt carries no
+# embedded stub and takes the cc path either way, so the assertion against THIS
+# jolt is that --signable builds and runs; it becomes the real differential the
+# moment JOLT_BIN points at a packaged jolt, which is where the bug lives.
+echo "build smoke: --signable takes the cc-linked path"
+sgout="$(dirname "$out")/signable"
+if ! JOLT_PWD="$gzapp" "$jolt" build -m gz.main -o "$sgout" --signable >"$sgout.log" 2>&1; then
+  echo "  FAIL: --signable did not build"; tail -20 "$sgout.log"; exit 1
+fi
+if grep -q 'self-contained' "$sgout.log"; then
+  echo "  FAIL: --signable took the self-contained path (the appended boot is what codesign --strict refuses)"
+  tail -5 "$sgout.log"; exit 1
+fi
+sggot="$(cd / && "$sgout" 2>&1 | tail -1)"
+if [ "$sggot" != "GZIP 3000 true" ]; then
+  echo "  FAIL: the --signable binary — want 'GZIP 3000 true', got \`$sggot\`"; exit 1
+fi
+# Say which of the two things was actually proved, so a green run from a dev
+# jolt is not mistaken for coverage of the stub-carrying case.
+if grep -q 'self-contained' "$(dirname "$out")/gzip-plain.log"; then
+  echo "  (this jolt carries the embedded stub: --signable diverted it off that path)"
+else
+  echo "  (this jolt carries no embedded stub: both paths are cc-linked here)"
+fi
+
+# --include NS / :jolt/build {:include […]} bakes a namespace the require scan
+# cannot see. The motivating shape is an app that reaches a namespace only by a
+# runtime lookup (requiring-resolve): a built binary has no source roots, so
+# without the include the lookup dies at the call and nothing else in the build
+# notices. Both spellings are exercised, plus the two edges — the same app with
+# NO include must miss, and an include nothing can emit must fail the build —
+# so neither assertion can pass for the wrong reason.
+echo "build smoke: --include bakes a dynamically looked-up namespace"
+inc_app="$(mktemp -d)/inc-app"
+mkdir -p "$inc_app/src/inc"
+printf '(ns inc.plugin)\n(defn hello [] "plugin-load")\n' > "$inc_app/src/inc/plugin.clj"
+cat > "$inc_app/src/inc/core.clj" <<'INC_CORE_EOF'
+(ns inc.core)
+(defn -main [& _]
+  (println "include:" (if-let [f (requiring-resolve 'inc.plugin/hello)] (f) :missing)))
+INC_CORE_EOF
+printf '{:paths ["src"]}\n' > "$inc_app/deps.edn"
+incbin="$(dirname "$out")/inc-bin"
+if ! JOLT_PWD="$inc_app" "$jolt" build -m inc.core -o "$incbin" --include inc.plugin >/dev/null 2>&1; then
+  echo "  FAIL: --include build exited non-zero"; exit 1
+fi
+got_inc="$(cd / && "$incbin" 2>&1)"
+if [ "$got_inc" != "include: plugin-load" ]; then
+  echo "  FAIL: --include binary — want 'include: plugin-load', got \`$got_inc\`"; exit 1
+fi
+# the deps.edn spelling of the same thing (symbols, not strings)
+printf '{:paths ["src"] :jolt/build {:include [inc.plugin]}}\n' > "$inc_app/deps.edn"
+incdeps="$(dirname "$out")/inc-deps-bin"
+if ! JOLT_PWD="$inc_app" "$jolt" build -m inc.core -o "$incdeps" >/dev/null 2>&1; then
+  echo "  FAIL: :jolt/build {:include […]} build exited non-zero"; exit 1
+fi
+got_incdeps="$(cd / && "$incdeps" 2>&1)"
+if [ "$got_incdeps" != "include: plugin-load" ]; then
+  echo "  FAIL: deps.edn :include binary — want 'include: plugin-load', got \`$got_incdeps\`"; exit 1
+fi
+# ...and with neither spelling the lookup MISSES — the passes above are only
+# meaningful against a baseline that fails.
+printf '{:paths ["src"]}\n' > "$inc_app/deps.edn"
+incnone="$(dirname "$out")/inc-none-bin"
+if ! JOLT_PWD="$inc_app" "$jolt" build -m inc.core -o "$incnone" >/dev/null 2>&1; then
+  echo "  FAIL: plain include-less build exited non-zero"; exit 1
+fi
+got_incnone="$(cd / && "$incnone" 2>&1 || true)"
+if ! printf '%s' "$got_incnone" | grep -q 'Could not locate inc/plugin'; then
+  echo "  FAIL: without an include the lookup must miss — got \`$got_incnone\`"; exit 1
+fi
+# a name nothing can emit fails the build instead of silently baking nothing
+if JOLT_PWD="$inc_app" "$jolt" build -m inc.core -o "$(dirname "$out")/inc-bad-bin" --include no.such.ns >"$(dirname "$out")/inc-bad.log" 2>&1; then
+  echo "  FAIL: an unemittable --include name was accepted"; exit 1
+fi
+if ! grep -q 'cannot include no.such.ns' "$(dirname "$out")/inc-bad.log"; then
+  echo "  FAIL: the include failure did not name the namespace"; tail -5 "$(dirname "$out")/inc-bad.log"; exit 1
+fi
+rm -rf "$(dirname "$inc_app")"
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include)"

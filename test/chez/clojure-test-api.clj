@@ -5,10 +5,6 @@
 ;; Kept separate from clojure-test.clj (which gates the assertion/report/fixture
 ;; machinery) so a missing var reads as a missing var. Prints the
 ;; `CLOJURE-TEST-API OK` / `FAIL` sentinel smoke.sh greps.
-;;
-;; Where jolt's model differs from the reference, the difference is asserted here
-;; rather than glossed: test-ns reports a delta off one cumulative counter atom
-;; instead of binding *report-counters* to a per-namespace ref.
 (ns clojure-test-api
   (:require [clojure.test :as t :refer [deftest is]]
             [clojure.string :as str]))
@@ -153,12 +149,11 @@
 (ok= (:private (meta #'api-private-test)) true "deftest- marks the var private")
 
 ;; --- test-ns / test-all-vars / run-test-var --------------------------------------
-;; test-ns returns this call's summary. jolt's is a delta off the cumulative
-;; counter atom rather than a per-namespace ref's contents; the summary shape is
-;; the same, which is what callers use.
+;; test-ns returns the counters of a ref bound for that namespace, like the
+;; reference: {:test :pass :fail :error}, with no :type.
 (let [s (binding [t/*test-out* (java.io.StringWriter.)]
           (t/test-ns 'clojure-test-api))]
-  (ok= (:type s) :summary "test-ns returns a :summary map")
+  (ok= (contains? s :type) false "test-ns returns the namespace's counters, no :type")
   (ok= (and (pos? (:test s)) (pos? (:fail s))) true
        "test-ns counts this namespace's tests, including the deliberately failing one"))
 
@@ -197,6 +192,254 @@
        (- (t/n-pass) before))
      2
      "run-test takes the var by name")
+
+;; --- the registry replaces on redefine -------------------------------------
+;; deftest used to append unconditionally, so reloading a test namespace in a
+;; live image ran its tests once more per reload and reported the extra runs as
+;; extra tests (jolt#1096). Re-evaluating a deftest form is the same code path a
+;; reload takes, so that is what these drive. Reference clojure.test cannot grow
+;; here at all: it finds tests through var metadata, so redefining the var
+;; replaces the test — checked against `clojure -M` on the same input.
+
+(def ^:private redef-runs (atom []))
+
+(deftest api-redefined (swap! redef-runs conj :first))
+(deftest api-redefined (swap! redef-runs conj :second))
+
+(let [entries (filter (fn [e] (= (quote api-redefined) (:name e))) @t/registry)]
+  (ok= (count entries) 1
+       "a redefined deftest replaces its registry entry rather than adding one")
+  ;; and the entry must carry the NEW body — replacing with the stale thunk
+  ;; would be just as wrong as appending, and invisible to a count.
+  (reset! redef-runs [])
+  ((:fn (first entries)))
+  (ok= @redef-runs [:second]
+       "the replacement registers the new body, not the original"))
+
+;; a replaced entry keeps its position, so a reload does not reorder a
+;; namespace's tests against each other
+(deftest api-order-first (is true))
+(deftest api-order-second (is true))
+(deftest api-order-first (is true))
+(ok= (->> @t/registry
+          (filter (fn [e] (contains? #{(quote api-order-first) (quote api-order-second)}
+                                     (:name e))))
+          (mapv :name))
+     [(quote api-order-first) (quote api-order-second)]
+     "replacing an entry keeps its position in the registry")
+
+;; the entry is keyed by namespace AND name, so the same test name in two
+;; namespaces stays two tests. Driven through register-test! directly rather
+;; than with in-ns gymnastics; the registry is saved and restored around it.
+(let [saved @t/registry]
+  (t/register-test! (quote reg-probe-a) (quote shared) (fn [] nil))
+  (t/register-test! (quote reg-probe-b) (quote shared) (fn [] nil))
+  (ok= (count (filter (fn [e] (= (quote shared) (:name e))) @t/registry)) 2
+       "the same test name in two namespaces is two entries")
+  (t/register-test! (quote reg-probe-a) (quote shared) (fn [] nil))
+  (ok= (count (filter (fn [e] (= (quote shared) (:name e))) @t/registry)) 2
+       "re-registering one of them replaces only that namespace's entry")
+  (reset! t/registry saved))
+
+;; --- (is (thrown? ...)) answers the thing thrown ----------------------------
+;; `is`'s own docstring states it: "checks that an instance of c is thrown from
+;; body, fails if not; then returns the thing thrown". It used to answer
+;; do-report's value instead -- the counters map on a pass -- so binding the
+;; result and asserting on it silently stopped asserting (jolt#1091). Every
+;; expectation here was read off JVM Clojure 1.12.
+;;
+;; quiet? runs an assertion with the report swallowed, so these do not print
+;; into the gate's output; the pass/fail counters still move and are checked.
+(defn- quiet? [f] (binding [t/*test-out* (java.io.StringWriter.)] (f)))
+
+(ok= (quiet? (fn [] (instance? clojure.lang.ExceptionInfo
+                               (is (thrown? clojure.lang.ExceptionInfo
+                                            (throw (ex-info "boom" {:a 1})))))))
+     true
+     "thrown? answers the exception, not the counters")
+
+;; the shape the issue is about, and the reason it matters: on a counters map
+;; ex-message is nil, so the inner assertion compared nil to a string and tested
+;; nothing at all.
+(ok= (quiet? (fn [] (let [ex (is (thrown? clojure.lang.ExceptionInfo
+                                          (throw (ex-info "boom" {:a 1}))))]
+                      [(ex-message ex) (ex-data ex)])))
+     ["boom" {:a 1}]
+     "the bound exception carries its message and data")
+
+(ok= (quiet? (fn [] (instance? clojure.lang.ExceptionInfo
+                               (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
+                                                     (throw (ex-info "boom" {})))))))
+     true
+     "thrown-with-msg? answers the exception too")
+
+;; a subclass matches and still answers the exception
+(ok= (quiet? (fn [] (instance? clojure.lang.ExceptionInfo
+                               (is (thrown? RuntimeException (throw (ex-info "sub" {})))))))
+     true
+     "a subclass match answers the exception")
+
+;; nil when nothing matching the CLASS was thrown, which is the JVM's answer.
+;; Worth pinning: answering the exception here would be a fresh divergence
+;; rather than a fix, since the JVM's catch names the expected class and a
+;; mismatch never reaches it.
+(ok= (quiet? (fn [] (is (thrown? clojure.lang.ExceptionInfo :nothing-thrown))))
+     nil
+     "nothing thrown answers nil")
+(ok= (quiet? (fn [] (is (thrown? java.io.IOException (throw (ex-info "wrong class" {}))))))
+     nil
+     "a non-matching class answers nil")
+(ok= (quiet? (fn [] (is (thrown-with-msg? java.io.IOException #"boom"
+                                          (throw (ex-info "boom" {}))))))
+     nil
+     "thrown-with-msg? of a non-matching class answers nil")
+;; ...but a matching class with a non-matching message answers the exception:
+;; the JVM's e# follows the message test inside the class's own catch.
+(ok= (quiet? (fn [] (instance? clojure.lang.ExceptionInfo
+                               (is (thrown-with-msg? clojure.lang.ExceptionInfo #"nope"
+                                                     (throw (ex-info "boom" {})))))))
+     true
+     "a non-matching message still answers the exception")
+
+;; the value changed; the reporting must not have
+(ok= (let [p (t/n-pass) f (t/n-fail)]
+       (quiet? (fn []
+                 (is (thrown? clojure.lang.ExceptionInfo (throw (ex-info "x" {}))))
+                 (is (thrown-with-msg? clojure.lang.ExceptionInfo #"x" (throw (ex-info "x" {}))))
+                 (is (thrown? clojure.lang.ExceptionInfo :nothing-thrown))))
+       [(- (t/n-pass) p) (- (t/n-fail) f)])
+     [2 1]
+     "two passes and one fail still counted as before")
+
+;; --- a captured run keeps its own tally ----------------------------------------
+;; test.check's clojure-test suite runs one test var with *report-counters* bound
+;; to a fresh ref and report rebound to a recorder, then asserts on both. The
+;; results belong to that ref alone: they must not reach the enclosing run's
+;; summary or jolt's process-wide tally. Expectations read off JVM Clojure 1.12.
+(deftest ^:private api-throws (throw (ex-info "terrible" {})))
+
+(defn- capture [v]
+  (let [reports (atom [])
+        r0 t/report
+        before [(t/n-pass) (t/n-fail) (t/n-error)]]
+    (binding [t/*report-counters* (ref t/*initial-report-counters*)
+              t/*test-out* (java.io.StringWriter.)
+              t/report (fn [m] (swap! reports conj (:type m)) (r0 m))]
+      (t/test-var v)
+      {:counters @t/*report-counters*
+       :types @reports
+       :global (mapv - [(t/n-pass) (t/n-fail) (t/n-error)] before)})))
+
+(ok= (capture #'api-failing-test)
+     {:counters {:test 1 :pass 0 :fail 1 :error 0}
+      :types [:begin-test-var :fail :end-test-var]
+      :global [0 0 0]}
+     "a failure lands in the bound ref, not the process-wide tally")
+(ok= (capture #'api-throws)
+     {:counters {:test 1 :pass 0 :fail 0 :error 1}
+      :types [:begin-test-var :error :end-test-var]
+      :global [0 0 0]}
+     "an uncaught throw is reported through report and counted as an error")
+
+(deftest ^:private api-captures-inside
+  (is (= 1 (:fail (:counters (capture #'api-failing-test))))))
+(ok= (binding [t/*test-out* (java.io.StringWriter.)
+               t/*report-counters* (ref t/*initial-report-counters*)]
+       (t/test-vars [#'api-captures-inside])
+       @t/*report-counters*)
+     {:test 1 :pass 1 :fail 0 :error 0}
+     "a capture nested in a run does not leak into the run's tally")
+
+;; --- test-ns-hook ----------------------------------------------------------------
+;; When a namespace defines test-ns-hook, run-tests and test-ns call it INSTEAD of
+;; running every test in the namespace (test.check's own suite uses it to keep
+;; its deliberately failing defspecs out of the run).
+(let [hns (create-ns 'api-hook-ns)
+      ran (atom [])
+      saved @t/registry]
+  (intern hns (with-meta 'skipped {:test (fn [] (swap! ran conj :skipped))}) nil)
+  (intern hns (with-meta 'kept {:test (fn [] (swap! ran conj :kept) (is true))}) nil)
+  (intern hns 'test-ns-hook (fn [] (t/test-vars [(ns-resolve hns 'kept)])))
+  ;; a deftest-registered test in the namespace is skipped by the hook too
+  (t/register-test! 'api-hook-ns 'registered (fn [] (swap! ran conj :registered)))
+  (let [s (quiet? (fn [] (t/run-tests 'api-hook-ns)))]
+    (ok= [@ran s] [[:kept] {:type :summary :test 1 :pass 1 :fail 0 :error 0}]
+         "run-tests calls test-ns-hook instead of running every test"))
+  (reset! ran [])
+  (let [s (quiet? (fn [] (t/test-ns 'api-hook-ns)))]
+    (ok= [@ran s] [[:kept] {:test 1 :pass 1 :fail 0 :error 0}]
+         "test-ns calls test-ns-hook and returns that namespace's counters"))
+  (reset! t/registry saved))
+
+;; --- deftest's shape: calling the test fn runs it AS a test ---------------------
+;; clojure.test's deftest defines the var as (fn [] (test-var (var name))) and puts
+;; the body in :test, so the canonical hook (defn test-ns-hook [] (a) (b)) counts
+;; each test, brackets it in begin/end-test-var, and turns an uncaught throw into
+;; an :error so the tests after it still run. Expectations read off JVM Clojure
+;; 1.12 on the same namespace.
+(defn- report-trace [f]
+  (let [rs (atom []) r0 t/report]
+    (binding [t/report (fn [m]
+                         (swap! rs conj (if (#{:begin-test-var :end-test-var} (:type m))
+                                          [(:type m) (symbol (name (:name (meta (:var m)))))]
+                                          (:type m)))
+                         (binding [t/*test-out* (java.io.StringWriter.)] (r0 m)))]
+      [(f) @rs])))
+
+(ns api-hook-direct (:require [clojure.test :refer [deftest is]]))
+(deftest ta (is true))
+(deftest tb (throw (ex-info "boom" {})))
+(deftest tc (is true) (is true))
+(defn test-ns-hook [] (ta) (tb) (tc))
+
+(ns api-fixture-ns (:require [clojure.test :as t :refer [deftest is]]))
+(def each-calls (atom 0))
+(t/use-fixtures :each (fn [f] (swap! each-calls inc) (f)))
+(deftest one (is true))
+(defn plain [] 1)
+
+(ns clojure-test-api)
+
+(def ^:private hook-trace
+  [{:test 3 :pass 3 :fail 0 :error 1 :type :summary}
+   [:begin-test-ns
+    [:begin-test-var 'ta] :pass [:end-test-var 'ta]
+    [:begin-test-var 'tb] :error [:end-test-var 'tb]
+    [:begin-test-var 'tc] :pass :pass [:end-test-var 'tc]
+    :end-test-ns :summary]])
+
+(ok= (report-trace (fn [] (t/run-tests 'api-hook-direct)))
+     hook-trace
+     "a hook calling deftest fns runs each through test-var")
+
+;; no-arg run-tests is (run-tests *ns*): it honors that namespace's hook too
+(ok= (report-trace (fn [] (binding [*ns* (the-ns 'api-hook-direct)] (t/run-tests))))
+     hook-trace
+     "(run-tests) runs *ns* through the same path, hook included")
+
+(ok= [(fn? api-hook-direct/ta)
+      (fn? (:test (meta #'api-hook-direct/ta)))
+      (= api-hook-direct/ta (:test (meta #'api-hook-direct/ta)))]
+     [true true false]
+     "deftest's var value is a test-var thunk, its body lives in :test")
+
+(ok= (report-trace (fn [] (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                            (api-hook-direct/ta)
+                            @t/*report-counters*)))
+     [{:test 1 :pass 1 :fail 0 :error 0}
+      [[:begin-test-var 'ta] :pass [:end-test-var 'ta]]]
+     "calling a deftest directly reports it as a test")
+
+(ok= (let [v (t/deftest- api-private-t (is true))] [(:private (meta v)) (fn? @v)])
+     [true true]
+     "deftest- is private and keeps the thunk")
+
+;; :each fixtures wrap test vars only, like clojure.test's (when (:test (meta v)) …)
+(ok= (binding [t/*test-out* (java.io.StringWriter.)]
+       (t/test-vars [#'api-fixture-ns/one #'api-fixture-ns/plain])
+       @api-fixture-ns/each-calls)
+     1
+     "test-vars runs :each fixtures only around test vars")
 
 (let [n @passes f @fails]
   (doseq [m f] (println "clojure-test-api FAIL " m))

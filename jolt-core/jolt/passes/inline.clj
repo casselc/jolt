@@ -104,6 +104,50 @@
     100000
     (reduce-ir-children (fn [acc c] (+ acc (body-size c))) 1 node)))
 
+;; Growth budget per top-level form. The per-site check above bounds one splice;
+;; nothing bounded how many a form takes, so a mid-size callee at many sites grew
+;; the form by its size at every one of them — clojure.test's `is` spliced
+;; do-report twice per assertion, a 41-line deftest emitted 69KB of Scheme, and on
+;; a test-heavy app inlining was half the build (#1059). run-passes opens a budget
+;; for each form; a splice is charged its NET growth (the body minus the call it
+;; replaces), so a callee no bigger than its call is free at any number of sites,
+;; and once a form has grown by the budget its remaining calls stay calls. The
+;; budget is a flat node count, not a multiple of the form: a big form is the one
+;; least likely to be hot and the one where a multiple buys the most bytes (the
+;; deftest above is ~1500 nodes before inlining and ~20 bytes of Scheme per node).
+;; JOLT_INLINE_GROWTH=<nodes> at build time overrides it.
+;;
+;; An atom rather than a binding: inlining only runs in a closed-world build,
+;; which compiles one form at a time on one thread. nil = no budget open (a
+;; caller outside run-passes), which splices as before.
+(defn- digits->long [s]
+  (when (and (string? s) (pos? (count s)))
+    (loop [i 0 n 0]
+      (if (< i (count s))
+        (let [d (- (int (nth s i)) 48)]
+          (when (and (>= d 0) (<= d 9)) (recur (inc i) (+ (* n 10) d))))
+        n))))
+(def ^:private growth-default 400)
+(def ^:private growth-left (atom nil))
+
+(defn begin-growth-budget!
+  "Open the code-growth budget for one top-level form."
+  [_node]
+  (reset! growth-left (or (digits->long (jolt.host/getenv "JOLT_INLINE_GROWTH"))
+                          growth-default)))
+
+(defn end-growth-budget! [] (reset! growth-left nil))
+
+(defn- growth-of [body args]
+  ;; a call is the invoke node, its fn node and one node per arg
+  (max 0 (- (body-size body) (+ 2 (count args)))))
+
+(defn- growth-fits? [g]
+  (let [left @growth-left] (or (nil? left) (<= g left))))
+
+(defn- charge-growth! [g]
+  (when @growth-left (swap! growth-left - g)))
+
 (defn- spliced-captures
   "What a fn literal's captures become in a SPLICED copy, one entry per name in
   its registered :free-names and in that order — a vector the back end emits
@@ -430,6 +474,7 @@
                 args (get node :args)]
             (if (and (= (count params) (count args))
                      (<= (body-size body) inline-budget)
+                     (growth-fits? (growth-of body args))
                      (body-closed? body (reduce conj #{} params))
                      ;; a recur targeting the callee's own arity has no target
                      ;; once the body leaves it
@@ -486,6 +531,7 @@
                     ;; preserve the fn's ^double/^long return coercion.
                     rbody (if ret (coerce-node ret rbody0) rbody0)]
                 (mark!)
+                (charge-growth! (growth-of body args))
                 ;; Tell the host this callee's body was actually copied somewhere.
                 ;; The tree-shake graph roots the set: with every call site spliced
                 ;; there is no reference left to the callee's def, so the shake
@@ -549,6 +595,21 @@
 ;; the ArithmeticException. Add nothing here that can throw on a legal input.
 (def ^:private pure-fns op-registry/pure-ops)
 
+;; A call at an arity its callee lacks throws ArityException, so it is neither
+;; pure nor total however pure the callee: dropping (:k m x y) would swallow the
+;; throw (#1162). A keyword invokes at one or two args; a registry op at what its
+;; :arity admits (stricter than Clojure for some, e.g. (= x) — which only costs a
+;; fold). A callee with no recorded arity keeps the old answer.
+(defn- invoke-arity-ok? [node]
+  (let [f (get node :fn)
+        n (count (get node :args))]
+    (cond
+      (kw-callee? f) (<= 1 n 2)
+      (contains? #{:var :host} (get f :op))
+      (let [ok (op-registry/op-arity (get f :name))]
+        (or (nil? ok) (boolean (ok n))))
+      :else true)))
+
 (defn- pure-fn? [f]
   (let [op (get f :op)]
     (cond
@@ -573,6 +634,7 @@
       ;; :invoke is pure only for a known-pure fn / record ctor, and only its ARGS
       ;; are folded (not the :fn position) — so it can't go through the uniform fold.
       (= op :invoke) (and (or (pure-fn? (get node :fn)) (ctor-shape node))
+                          (invoke-arity-ok? node)
                           (every? pure? (get node :args)))
       ;; leaves (:const/:local/:var/:host/:the-var/:quote) fold to true; :if/:do/
       ;; :let/:vector/:set/:map AND their children's purity. :throw is safe-op? (an
@@ -610,6 +672,7 @@
       ;; :throw always throws — discarding it swallows the exception.
       (= op :throw) false
       (= op :invoke) (and (or (total-fn? (get node :fn)) (ctor-shape node))
+                          (invoke-arity-ok? node)
                           (every? total? (get node :args)))
       (safe-op? op) (reduce-ir-children (fn [ok c] (and ok (total? c))) true node)
       :else false)))

@@ -108,6 +108,8 @@
       (lambda (x) (set! trace (cons 'pred trace)) (if (eq? obj x) 'yes jolt-nil))
       (case-lambda ((x) (set! trace (cons 'class trace)) "bridge.Class") ((x y) #f))
       (lambda args (set! trace (cons 'tags trace)) (jolt-vector "bridge.Class" "java.lang.Object")))
+    ;; Registration now probes the upstream runtime-owned class fast paths.
+    (set! trace '())
     (let ((r (observe-invoke (lambda ()
       (let* ((matches? ((caar jolt-class-arms) obj))
              (class ((cdar jolt-class-arms) obj)) (tags (value-host-tags obj)))
@@ -122,7 +124,7 @@
     (let ((bad (lambda () #t)))
       (ok "wrong-arity class registration stays lazy"
         (not (thrown (lambda () (register-class
-          (if (= which 0) bad (lambda (x) #t))
+          (if (= which 0) bad (lambda (x) (eq? x 'x)))
           (if (= which 1) bad (lambda (x) "bridge.Class"))
           (if (= which 2) bad (lambda (x) (jolt-vector "bridge.Class"))))))))
       (ok "wrong-arity class callback throws at call"
@@ -135,7 +137,7 @@
 (for-each (lambda (which)
   (isolated (lambda ()
     (let* ((sentinel (vector 'class-exception)) (bad (lambda (x) (raise sentinel))))
-      (register-class (if (= which 0) bad (lambda (x) #t))
+      (register-class (if (= which 0) bad (lambda (x) (eq? x 'x)))
         (if (= which 1) bad (lambda (x) "bridge.Class"))
         (if (= which 2) bad (lambda (x) (jolt-vector "bridge.Class"))))
       (ok "class callback exception identity retained"
@@ -146,9 +148,9 @@
             ((2) ((cdar jt-user-value-tags-arms) 'x)))))))))))
   '(0 1 2))
 (isolated (lambda ()
-  (register-class (lambda (x) #t) (lambda (x) "bridge.Old")
+  (register-class (lambda (x) (eq? x 'x)) (lambda (x) "bridge.Old")
                   (lambda (x) (jolt-vector "bridge.Old")))
-  (register-class (lambda (x) #t) (lambda (x) "bridge.New")
+  (register-class (lambda (x) (eq? x 'x)) (lambda (x) "bridge.New")
                   (lambda (x) (jolt-vector "bridge.New")))
   (ok "class arms remain newest-first" (string=? "bridge.New" ((cdar jolt-class-arms) 'x)))
   (ok "tag arms remain oldest-first" (equal? '("bridge.Old") (value-host-tags 'x)))))
@@ -171,7 +173,7 @@
         (t (keyword "bridge" "tags")))
     (register-invoke-prefix-arm! (lambda (f) (or (eq? f p) (eq? f c) (eq? f t)))
       (lambda (f args)
-        (cond ((eq? f p) #t) ((eq? f c) "bridge.Prefix")
+        (cond ((eq? f p) (eq? (car args) 'x)) ((eq? f c) "bridge.Prefix")
               (else (jolt-vector "bridge.Prefix")))))
     (register-class p c t)
     (let ((r (observe-invoke (lambda ()

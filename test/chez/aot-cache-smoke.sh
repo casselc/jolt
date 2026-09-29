@@ -688,6 +688,345 @@ else
 fi
 rm -rf "$cache_e" "$elib"
 
+# --- Phase 6: compile-time-relevance narrowing (JOLT_AOT_NARROW) --------------
+# With direct-linking and whole-program inference off (plain `jolt run`), a
+# dependency that defines no macros/records/protocols/forwarded vars cannot
+# change a consumer's emitted code, so its edit must NOT recompile the consumer
+# — while the consumer still reads the new value through the dep's var. A dep
+# that GAINS a macro is the case the assumption has to catch: the consumer's
+# cached artifact was compiled against an inert dep, so the hit is discarded and
+# recompiled after the dep loads (loader.ss aot-assumptions-hold?).
+xlib="$(mktemp -d)"; mkdir -p "$xlib/src/xlib" "$xlib/src/xapp"
+printf '{:paths ["src"]}\n' > "$xlib/deps.edn"
+printf '(ns xlib.core)\n(defn v [] 1)\n' > "$xlib/src/xlib/core.clj"
+printf '(ns xapp.core (:require [xlib.core]))\n(defn run [] (xlib.core/v))\n' > "$xlib/src/xapp/core.clj"
+cache_x="$(mktemp -d)"
+xrun() {
+  JOLT_AOT_NARROW=1 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_x" JOLT_QUIET=1 JOLT_DEBUG=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'xapp/xapp {:local/root \"$xlib\"}}})
+    (require 'xapp.core) (println (xapp.core/run))" 2>&1
+}
+x_cold="$(xrun || true)"
+x_warm="$(xrun || true)"
+printf '(ns xlib.core)\n(defn v [] 2)\n' > "$xlib/src/xlib/core.clj"
+x_edit="$(xrun || true)"
+if echo "$x_cold" | grep -q '^1$' && echo "$x_warm" | grep -q '^1$' \
+   && echo "$x_edit" | grep -q '^2$' \
+   && echo "$x_edit" | grep -q 'hit xapp.core' \
+   && echo "$x_edit" | grep -q 'miss xlib.core'; then
+  echo "PASS: (x) inert dep edit recompiles only the dep, consumer hits and sees v2"; pass=$((pass+1))
+else
+  echo "FAIL: (x) cold=$(echo "$x_cold" | tail -1) warm=$(echo "$x_warm" | tail -1) edit=$(echo "$x_edit" | tail -1) hit-consumer=$(echo "$x_edit" | grep -c 'hit xapp.core') miss-dep=$(echo "$x_edit" | grep -c 'miss xlib.core')"
+  fails=$((fails+1))
+fi
+# the dep gains a macro: the consumer's stored assumption (inert) no longer
+# holds, and the hit must be turned into a recompile rather than served
+printf '(ns xlib.core)\n(defn v [] 2)\n(defmacro m [] :x)\n' > "$xlib/src/xlib/core.clj"
+x_gain="$(xrun || true)"
+if echo "$x_gain" | grep -q '^2$' \
+   && echo "$x_gain" | grep -q 'stale-assumption cache for xapp.core, recompiling'; then
+  echo "PASS: (y) a dep that gained a macro invalidated the assumed-inert consumer"; pass=$((pass+1))
+else
+  echo "FAIL: (y) after-gain=$(echo "$x_gain" | tail -1) stale=$(echo "$x_gain" | grep -c 'stale-assumption cache for xapp.core')"
+  fails=$((fails+1))
+fi
+rm -rf "$cache_x" "$xlib"
+
+# An inert dep still decides WHICH vars a consumer's compile can see: a var it
+# drops makes a qualified reference a compile error, and under :refer :all a
+# var it gains shadows a bare clojure.core symbol. Both must reach the consumer
+# — its cached artifact is compiled against the old var set — so an inert dep
+# is folded by its var names rather than as a constant.
+slib="$(mktemp -d)"; mkdir -p "$slib/src/slib" "$slib/src/sapp"
+printf '{:paths ["src"]}\n' > "$slib/deps.edn"
+printf '(ns slib.core)\n(defn v [] 1)\n(defn w [] 2)\n' > "$slib/src/slib/core.clj"
+printf '(ns sapp.core (:require [slib.core :refer :all]))\n(defn run [] [(inc 1) (slib.core/w)])\n' > "$slib/src/sapp/core.clj"
+cache_s="$(mktemp -d)"
+srun() {
+  JOLT_AOT_NARROW=1 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_s" JOLT_QUIET=1 JOLT_DEBUG=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'sapp/sapp {:local/root \"$slib\"}}})
+    (println (try (require 'sapp.core) (pr-str ((resolve 'sapp.core/run)))
+                  (catch Throwable t (str \"threw \" (ex-message t)))))" 2>&1
+}
+s_cold="$(srun || true)"; s_warm="$(srun || true)"
+printf '(ns slib.core)\n(defn v [] 1)\n(defn w [] 2)\n(defn inc [x] :shadowed)\n' > "$slib/src/slib/core.clj"
+s_gain="$(srun || true)"
+printf '(ns slib.core)\n(defn v [] 1)\n(defn inc [x] :shadowed)\n' > "$slib/src/slib/core.clj"
+s_drop="$(srun || true)"
+if echo "$s_warm" | grep -q '^\[2 2\]$' \
+   && echo "$s_gain" | grep -q '^\[:shadowed 2\]$' \
+   && echo "$s_drop" | grep -q '^threw .*slib.core/w'; then
+  echo "PASS: (x2) a var an inert dep gains or drops reaches its consumer"; pass=$((pass+1))
+else
+  echo "FAIL: (x2) warm=$(echo "$s_warm" | tail -1) gain=$(echo "$s_gain" | tail -1) drop=$(echo "$s_drop" | tail -1)"
+  fails=$((fails+1))
+fi
+rm -rf "$cache_s" "$slib"
+
+# --- Phase 7: async fasl compilation ------------------------------------------
+# A miss's fasl compiles in a background worker of the running binary; the run
+# itself must not wait. On by default, and JOLT_AOT_ASYNC=0 must put the compile
+# back in the run (the fasl is there when it exits). Needs a built jolt — source
+# mode's bin/jolt would spawn a plain Chez — so it skips without
+# target/release/jolt, like (k).
+async_bin="target/release/jolt"
+if [ ! -x "$async_bin" ]; then
+  echo "SKIP: (z) async worker needs $async_bin (make testbin)"
+else
+  alib="$(mktemp -d)"; mkdir -p "$alib/src/alib"; printf '{:paths ["src"]}\n' > "$alib/deps.edn"
+  printf '(ns alib.core)\n(defn val [] 7)\n' > "$alib/src/alib/core.clj"
+  zprog="(require 'jolt.deps) (jolt.deps/add-deps {:deps {'alib/alib {:local/root \"$alib\"}}}) (require 'alib.core) (println (alib.core/val))"
+  zrun() {  # $1: cache dir; worker on (the default)
+    env -u JOLT_AOT_ASYNC JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$1" JOLT_QUIET=1 JOLT_DEBUG=1 \
+      "$async_bin" -e "$zprog" 2>&1
+  }
+  zrun_off() {  # $1: cache dir; in-process compile
+    env -u JOLT_AOT_ASYNC JOLT_AOT_ASYNC=0 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$1" JOLT_QUIET=1 JOLT_DEBUG=1 \
+      "$async_bin" -e "$zprog" 2>&1
+  }
+  cache_z="$(mktemp -d)"
+  z_cold="$(zrun "$cache_z" || true)"
+  # the worker is a separate process: wait for its artifact, then prove it is
+  # served. A crashed or mis-dispatched worker never writes one.
+  i=0
+  while [ "$i" -lt 40 ]; do
+    [ "$(find "$cache_z" -name '*.so' | wc -l | tr -d ' ')" -ge 1 ] && break
+    sleep 0.25; i=$((i+1))
+  done
+  z_so="$(find "$cache_z" -name '*.so' | wc -l | tr -d ' ')"
+  z_warm="$(zrun "$cache_z" || true)"
+  if echo "$z_cold" | grep -q '^7$' \
+     && echo "$z_cold" | grep -q 'queued alib.core' \
+     && [ "$z_so" -ge 1 ] \
+     && echo "$z_warm" | grep -q '^7$' \
+     && echo "$z_warm" | grep -q 'hit alib.core'; then
+    echo "PASS: (z) a default-run miss queued to a worker, later runs hit its fasl"; pass=$((pass+1))
+  else
+    echo "FAIL: (z) cold=$(echo "$z_cold" | tail -1) queued=$(echo "$z_cold" | grep -c 'queued alib.core') so=$z_so warm=$(echo "$z_warm" | tail -1) hit=$(echo "$z_warm" | grep -c 'hit alib.core')"
+    fails=$((fails+1))
+  fi
+  cache_z2="$(mktemp -d)"
+  z_off="$(zrun_off "$cache_z2" || true)"
+  z_off_so="$(find "$cache_z2" -name '*.so' | wc -l | tr -d ' ')"
+  if echo "$z_off" | grep -q '^7$' \
+     && ! echo "$z_off" | grep -q 'queued' \
+     && [ "$z_off_so" -ge 1 ]; then
+    echo "PASS: (z2) JOLT_AOT_ASYNC=0 compiles in-process and leaves the fasl"; pass=$((pass+1))
+  else
+    echo "FAIL: (z2) out=$(echo "$z_off" | tail -1) queued=$(echo "$z_off" | grep -c 'queued') so=$z_off_so"
+    fails=$((fails+1))
+  fi
+  # A long-running program that misses again after the worker has gone idle:
+  # the worker must still be there to take the job (it does not idle out while
+  # its parent lives), and it removes its manifest once the parent is gone.
+  printf '(ns alib.late)\n(defn val [] 8)\n' > "$alib/src/alib/late.clj"
+  cache_z3="$(mktemp -d)"
+  env -u JOLT_AOT_ASYNC JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_z3" JOLT_QUIET=1 "$async_bin" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'alib/alib {:local/root \"$alib\"}}})
+    (require 'alib.core) (Thread/sleep 12000) (require 'alib.late)" >/dev/null 2>&1 || true
+  i=0
+  while [ "$i" -lt 60 ]; do
+    [ "$(find "$cache_z3" -name 'alib.late-*.so' | wc -l | tr -d ' ')" -ge 1 ] \
+      && [ "$(find "$cache_z3" -name 'aot-jobs-*.edn' | wc -l | tr -d ' ')" -eq 0 ] && break
+    sleep 0.25; i=$((i+1))
+  done
+  z3_so="$(find "$cache_z3" -name 'alib.late-*.so' | wc -l | tr -d ' ')"
+  z3_mf="$(find "$cache_z3" -name 'aot-jobs-*.edn' | wc -l | tr -d ' ')"
+  if [ "$z3_so" -ge 1 ] && [ "$z3_mf" -eq 0 ]; then
+    echo "PASS: (z3) a miss after the worker idled still compiles; the manifest is removed"; pass=$((pass+1))
+  else
+    echo "FAIL: (z3) late fasl=$z3_so manifests-left=$z3_mf log=$(cat "$cache_z3"/*/*/aot-jobs-*.log 2>/dev/null | head -3)"
+    fails=$((fails+1))
+  fi
+  rm -rf "$cache_z" "$cache_z2" "$cache_z3" "$alib"
+fi
+
+# --- (aa) a warm run reads and hashes each source once (#1161) ---------------
+# A dependency's own key is computed while its consumer folds the dep digest, and
+# again when the dependency itself loads. The second has to come from the first:
+# for a jar root every read is an inflate + CRC + hash of the whole entry. The
+# "hash" aot-info line fires once per source actually read for a key.
+aa="$tmp/aa"; mkdir -p "$aa/src/exp"
+printf '(ns exp.dep)\n(defn v [] 5)\n' > "$aa/src/exp/dep.clj"
+printf '(ns exp.top (:require [exp.dep :as d]))\n(defn answer [] (d/v))\n' > "$aa/src/exp/top.clj"
+JOLT_PWD="$aa" JOLT_QUIET=1 "$jolt" run "$root/tools/mkjar.clj" "$aa/exp.jar" \
+  "exp/dep.clj=$aa/src/exp/dep.clj" "exp/top.clj=$aa/src/exp/top.clj" >/dev/null 2>&1 || true
+cache_aa="$(mktemp -d)"
+aarun() {
+  JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_aa" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/exp {:local/root \"$1\"}}})
+    (require 'exp.top) (println (exp.top/answer))" 2>&1
+}
+for aaroot in "$aa" "$aa/exp.jar"; do
+  rm -rf "$cache_aa"; mkdir -p "$cache_aa"
+  aarun "$aaroot" >/dev/null
+  aa_warm="$(aarun "$aaroot")"
+  aa_dep="$(echo "$aa_warm" | grep -c 'hash exp.dep$' || true)"
+  aa_top="$(echo "$aa_warm" | grep -c 'hash exp.top$' || true)"
+  if echo "$aa_warm" | grep -q '^5$' && echo "$aa_warm" | grep -q 'hit exp.dep' \
+     && [ "$aa_dep" -eq 1 ] && [ "$aa_top" -eq 1 ]; then
+    echo "PASS: (aa) warm run from $(basename "$aaroot") hashes each source once"; pass=$((pass+1))
+  else
+    echo "FAIL: (aa) warm run from $(basename "$aaroot"): out=$(echo "$aa_warm" | tail -1) dep hashed $aa_dep, top hashed $aa_top (want 1 each)"
+    fails=$((fails+1))
+  fi
+done
+# ...and a require reads a jar's entries through one open reader, not one per
+# entry: the outermost load opens it on first read and closes it on the way out.
+rm -rf "$cache_aa"; mkdir -p "$cache_aa"
+aarun "$aa/exp.jar" >/dev/null
+aa_opens="$(JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_aa" JOLT_QUIET=1 "$jolt" -e "
+  (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/exp {:local/root \"$aa/exp.jar\"}}})
+  (let [before (jolt.host/scheme-eval-string \"zipdir-reader-opens\")]
+    (require 'exp.top)
+    (println (- (jolt.host/scheme-eval-string \"zipdir-reader-opens\") before)
+             (jolt.host/scheme-eval-string \"(zipdir-scope-readers)\")))" 2>&1 | tail -1)"
+if [ "$aa_opens" = "1 false" ]; then
+  echo "PASS: (aa2) a warm require from a jar opens it once and closes it"; pass=$((pass+1))
+else
+  echo "FAIL: (aa2) jar reader opens / scope after the require: '$aa_opens' (want '1 false')"; fails=$((fails+1))
+fi
+# ...and the scope is the loading thread's alone. A Chez thread starts with its
+# creator's thread-parameter values, so a thread forked by a namespace's top level
+# used to hold the require's reader table: it read through it unlocked from a
+# second thread, and after the require closed it, reopened readers nothing closed.
+printf '(ns exp.fork)\n(def seen (promise))\n(doto (Thread. (fn [] (deliver seen (boolean (jolt.host/scheme-eval-string "(zipdir-scope-readers)")))))\n  (.start) (.join))\n' > "$aa/fork.clj"
+JOLT_PWD="$aa" JOLT_QUIET=1 "$jolt" run "$root/tools/mkjar.clj" "$aa/fork.jar" "exp/fork.clj=$aa/fork.clj" >/dev/null 2>&1 || true
+aa_fork="$(JOLT_QUIET=1 "$jolt" -e "
+  (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/fork {:local/root \"$aa/fork.jar\"}}})
+  (require 'exp.fork) (println @exp.fork/seen)" 2>&1 | tail -1)"
+if [ "$aa_fork" = "false" ]; then
+  echo "PASS: (aa3) a thread forked inside a jar require has no reader scope of its own"; pass=$((pass+1))
+else
+  echo "FAIL: (aa3) forked thread's reader scope inside a jar require: '$aa_fork' (want 'false')"; fails=$((fails+1))
+fi
+rm -rf "$cache_aa"
+
+# --- (ad) a Maven release jar is keyed by stat, not by reading it ------------
+# A release artifact in the local Maven repository never changes in place, so
+# its entries' keys are kept per (jar, mtime) and a warm run reads no source at
+# all. A SNAPSHOT is republished under the same path and keeps full hashing, and
+# a jar rewritten in place (a repaired download) has a new mtime and is re-read.
+ad_m2="$tmp/ad-m2"
+for v in 1.0.0 1.1.0-SNAPSHOT; do
+  mkdir -p "$ad_m2/exp/exp/$v"
+  cp "$aa/exp.jar" "$ad_m2/exp/exp/$v/exp-$v.jar"
+  printf '<project><modelVersion>4.0.0</modelVersion><groupId>exp</groupId><artifactId>exp</artifactId><version>%s</version></project>\n' "$v" \
+    > "$ad_m2/exp/exp/$v/exp-$v.pom"
+done
+cache_ad="$(mktemp -d)"
+adrun() {
+  JOLT_MAVEN_REPOSITORY="$ad_m2" JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ad" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/exp {:mvn/version \"$1\"}}})
+    (require 'exp.top) (println (exp.top/answer))" 2>&1
+}
+adrun 1.0.0 >/dev/null
+ad_rel="$(adrun 1.0.0)"
+adrun 1.1.0-SNAPSHOT >/dev/null
+ad_snap="$(adrun 1.1.0-SNAPSHOT)"
+if echo "$ad_rel" | grep -q '^5$' && echo "$ad_rel" | grep -q 'hit exp.dep' \
+   && [ "$(echo "$ad_rel" | grep -c 'hash exp' || true)" -eq 0 ] \
+   && echo "$ad_snap" | grep -q '^5$' \
+   && [ "$(echo "$ad_snap" | grep -c 'hash exp' || true)" -eq 2 ]; then
+  echo "PASS: (ad) a release jar warm-starts on stat alone; a SNAPSHOT still hashes"; pass=$((pass+1))
+else
+  echo "FAIL: (ad) release: out=$(echo "$ad_rel" | tail -1) hashed=$(echo "$ad_rel" | grep -c 'hash exp' || true) (want 0); snapshot: out=$(echo "$ad_snap" | tail -1) hashed=$(echo "$ad_snap" | grep -c 'hash exp' || true) (want 2)"
+  fails=$((fails+1))
+fi
+# the release jar rewritten in place with new content: a new mtime, a new read
+sleep 1
+printf '(ns exp.dep)\n(defn v [] 6)\n' > "$aa/dep6.clj"
+JOLT_PWD="$aa" JOLT_QUIET=1 "$jolt" run "$root/tools/mkjar.clj" "$ad_m2/exp/exp/1.0.0/exp-1.0.0.jar" \
+  "exp/dep.clj=$aa/dep6.clj" "exp/top.clj=$aa/src/exp/top.clj" >/dev/null 2>&1 || true
+ad_new="$(adrun 1.0.0)"
+if echo "$ad_new" | grep -q '^6$'; then
+  echo "PASS: (ad2) a release jar rewritten in place is read again"; pass=$((pass+1))
+else
+  echo "FAIL: (ad2) after rewriting the release jar: out=$(echo "$ad_new" | tail -1) (want 6)"; fails=$((fails+1))
+fi
+rm -rf "$cache_ad" "$ad_m2"
+
+# --- (ab) a reload in the same process still sees an edit --------------------
+# The key a load reuses from the dep walk is only good for the source it was read
+# from: dropping the namespace from *loaded-libs* and requiring it again after an
+# equal-length edit has to read the new source, not serve the old artifact.
+ab="$tmp/ab"; mkdir -p "$ab/src/rl"
+printf '(ns rl.core)\n(defn v [] 11)\n' > "$ab/src/rl/core.clj"
+cache_ab="$(mktemp -d)"
+ab_out="$(JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ab" JOLT_QUIET=1 "$jolt" -e "
+  (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rl/rl {:local/root \"$ab\"}}})
+  (require 'rl.core) (println (rl.core/v))
+  (spit \"$ab/src/rl/core.clj\" \"(ns rl.core)\\n(defn v [] 22)\\n\")
+  (dosync (alter @#'clojure.core/*loaded-libs* disj 'rl.core))
+  (require 'rl.core) (println (rl.core/v))" 2>&1 | tail -2 | tr '\n' ' ')"
+if [ "$ab_out" = "11 22 " ]; then
+  echo "PASS: (ab) an in-process reload after an edit loads the edit"; pass=$((pass+1))
+else
+  echo "FAIL: (ab) got '$ab_out' (want '11 22 ')"; fails=$((fails+1))
+fi
+rm -rf "$cache_ab"
+
+# --- (ac) a library with data readers is cached in one run -------------------
+# Every key folds the digest of each data reader's namespace. Computed before
+# that namespace had compiled and written its sidecars, it keyed every artifact
+# of the first run on a value no later run reproduces, so the whole project
+# missed a second time (and the reader namespace a third). Only a reader
+# namespace with requires of its own moves: a leaf's digest has no sidecar.
+ac="$tmp/ac"; mkdir -p "$ac/src/rd"
+printf '{rd/tag rd.readers/read-tag}\n' > "$ac/src/data_readers.clj"
+printf '(ns rd.util)\n(defn label [x] (str "tagged:" x))\n' > "$ac/src/rd/util.clj"
+printf '(ns rd.readers (:require [rd.util :as u]))\n(defn read-tag [x] (u/label x))\n' > "$ac/src/rd/readers.clj"
+printf '(ns rd.plain)\n(defn v [] 7)\n' > "$ac/src/rd/plain.clj"
+cache_ac="$(mktemp -d)"
+acrun() {
+  JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ac" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rd/rd {:local/root \"$ac\"}}})
+    (require 'rd.plain) (println (rd.plain/v))" 2>&1
+}
+# That includes a namespace the reader namespace itself requires: it compiles
+# while the reader namespace's own compile is open above it, before that
+# namespace's sidecars exist, so its artifact is keyed once they do.
+acrun >/dev/null
+ac_warm="$(acrun)"
+if echo "$ac_warm" | grep -q '^7$' && echo "$ac_warm" | grep -q 'hit rd.plain' \
+   && echo "$ac_warm" | grep -q 'hit rd.readers' && echo "$ac_warm" | grep -q 'hit rd.util' \
+   && ! echo "$ac_warm" | grep -q 'miss '; then
+  echo "PASS: (ac) a project with data readers hits on its second run"; pass=$((pass+1))
+else
+  echo "FAIL: (ac) second run: $(echo "$ac_warm" | grep -E 'hit |miss ' | tr '\n' ' ')"
+  fails=$((fails+1))
+fi
+rm -rf "$cache_ac"
+# ...and two reader namespaces, one requiring the other. The data_readers scan
+# loads one before the other exists in the cache, so what it compiled folded a
+# digest the next run could not reproduce and missed again. Both name orders,
+# since the scan's order follows the table.
+for ac2_order in a z; do
+  if [ "$ac2_order" = a ]; then ac2_o=ra; ac2_i=rz; else ac2_o=rz; ac2_i=ra; fi
+  ac2="$tmp/ac2-$ac2_order"; mkdir -p "$ac2/src/rn"
+  printf '{rn/o rn.%s/read-o rn/i rn.%s/read-i}\n' "$ac2_o" "$ac2_i" > "$ac2/src/data_readers.clj"
+  printf '(ns rn.leaf)\n(defn label [x] (str "tagged:" x))\n' > "$ac2/src/rn/leaf.clj"
+  printf '(ns rn.%s (:require [rn.leaf :as l]))\n(defn read-i [x] (l/label x))\n' "$ac2_i" > "$ac2/src/rn/$ac2_i.clj"
+  printf '(ns rn.%s (:require [rn.%s :as i]))\n(defn read-o [x] (i/read-i x))\n' "$ac2_o" "$ac2_i" > "$ac2/src/rn/$ac2_o.clj"
+  printf '(ns rn.plain)\n(defn v [] 7)\n' > "$ac2/src/rn/plain.clj"
+  cache_ac2="$(mktemp -d)"
+  ac2run() {
+    JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ac2" JOLT_QUIET=1 "$jolt" -e "
+      (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rn/rn {:local/root \"$ac2\"}}})
+      (require 'rn.plain) (println (rn.plain/v))" 2>&1
+  }
+  ac2run >/dev/null
+  ac2_warm="$(ac2run)"
+  if echo "$ac2_warm" | grep -q '^7$' && [ "$(echo "$ac2_warm" | grep -c 'hit rn\.' || true)" -eq 4 ] \
+     && ! echo "$ac2_warm" | grep -q 'miss '; then
+    echo "PASS: (ac2) nested reader namespaces ($ac2_order) hit on the second run"; pass=$((pass+1))
+  else
+    echo "FAIL: (ac2) nested reader namespaces ($ac2_order), second run: $(echo "$ac2_warm" | grep -E 'hit |miss ' | tr '\n' ' ')"
+    fails=$((fails+1))
+  fi
+  rm -rf "$cache_ac2"
+done
+
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.
 

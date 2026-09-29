@@ -35,8 +35,8 @@
 ;; random across PROCESSES — Chez seeds its generator the same way every start,
 ;; so every run of this file picked the identical name and two concurrent runs
 ;; deleted each other's image ("image: no such file", from whichever lost).
-(define tmp (string-append "/tmp/jolt-image-test-" (number->string (get-process-id)) ".jimg"))
-(define refstub-tmp (string-append "/tmp/jolt-image-refstub-" (number->string (get-process-id)) ".txt"))
+(define tmp (string-append (host-temp-dir) "/jolt-image-test-" (number->string (get-process-id)) ".jimg"))
+(define refstub-tmp (string-append (host-temp-dir) "/jolt-image-refstub-" (number->string (get-process-id)) ".txt"))
 (define (cleanup!) (when (file-exists? tmp) (delete-file tmp)))
 
 ;; --- Chez substrate the format depends on ------------------------------------
@@ -173,8 +173,14 @@
      "[(re-find $rt \"y\\nx\") (.flags $rt)]"               "[\"x\" 8]")
 (rtu "class token" "String"     "[(str $rt) (instance? $rt \"x\")]"
      "[\"class java.lang.String\" true]")
-(rtu "File"        "(java.io.File. \"/tmp\")"
-     "[(.getPath $rt) (.isDirectory $rt)]"                   "[\"/tmp\" true]")
+;; a File drops a trailing separator, and macOS's TMPDIR ends in one
+(define tmp-root
+  (let ((d (host-temp-dir)))
+    (if (and (> (string-length d) 1) (char=? (string-ref d (- (string-length d) 1)) #\/))
+        (substring d 0 (- (string-length d) 1))
+        d)))
+(rtu "File"        (string-append "(java.io.File. \"" tmp-root "\")")
+     "[(.getPath $rt) (.isDirectory $rt)]"                   (string-append "[\"" tmp-root "\" true]"))
 
 ;; arrays and StringBuilder are mutable host objects: contents, and still writable
 (rtu "byte-array"   "(byte-array [1 2 3])"      "(vec $rt)"  "[1 2 3]")
@@ -1113,7 +1119,7 @@
 (let* ((fn-form (list->cseq (list (jolt-symbol #f "fn*")
                                   (apply jolt-vector (list (jolt-symbol #f "x")))
                                   (list->cseq (list (jolt-symbol #f "x"))))))
-       (bad (make-image-fnsrc "jfn$r3$bad$0" fn-form "user"
+       (bad (make-image-fnsrc "jfn$r3/bad$0" fn-form "user"
                               (apply jolt-vector (list (jolt-symbol #f "x")))
                               (vector 1 2))))
   (ok "malformed fnsrc record refuses with a named error"
@@ -1138,14 +1144,14 @@
       (put-string p "(load \"host/chez/scheme-adapter-runtime.ss\")\n")
       (put-string p "(load \"host/chez/rt.ss\")\n")
       (put-string p "(guard (e (#t (display (condition->message-string e)) (newline)))\n")
-      (put-string p "  (image-eval-fnsrc (make-image-fnsrc \"jfn$r3$nce$0\" '() \"user\" '() (vector)) '()))\n"))
+      (put-string p "  (image-eval-fnsrc (make-image-fnsrc \"jfn$r3/nce$0\" '() \"user\" '() (vector)) '()))\n"))
     'replace)
   (let* ((rc (system (string-append chez-bin " --script " probe " > " out " 2>&1")))
          (msg (read-file-string out)))
     (ok "compiler-dropped build refuses fnsrc restore, naming the fn"
         (and (fx=? rc 0)
              (str-contains? msg "no compiler")
-             (str-contains? msg "jfn$r3$nce$0")))
+             (str-contains? msg "jfn$r3/nce$0")))
     (delete-file probe)
     (delete-file out)))
 
@@ -1402,12 +1408,12 @@
                    (and (fx=? (bytevector-u8-ref bv (fx+ i j)) (bytevector-u8-ref sb j))
                         (cmp (fx+ j 1))))) #t)
             (else (scan (fx+ i 1)))))))
-(ok "ref-carrying image is format 8 with no raw jolt-ref rtd"
+(ok "ref-carrying image is the current format with no raw jolt-ref rtd"
     (let ((port (open-file-input-port tmp)))
       (let* ((h (fasl-read port))
              (rest (get-bytevector-all port)))
         (close-port port)
-        (and (fx=? 8 (vector-ref h 1))
+        (and (fx=? jolt-image-format-version (vector-ref h 1))
              (bv-contains? rest "image-ref")
              (not (bv-contains? rest "jolt-ref-v2"))))))
 ;; an unknown format version refuses with a clean error naming both versions
@@ -1418,6 +1424,10 @@
     (call/cc (lambda (k)
       (with-exception-handler (lambda (e) (k #t))
         (lambda () (jolt-image-read tmp) #f)))))
+(is "the refusal names the versions this build reads"
+    (string-append "(try (jolt.host/image-read \"" tmp "\") :no-throw"
+                   " (catch Exception e (re-find #\"reads versions [0-9]+ to [0-9]+\" (ex-message e))))")
+    (string-append "reads versions 2 to " (number->string jolt-image-format-version)))
 
 (cleanup!)
 (when (file-exists? (string-append tmp ".txt")) (delete-file (string-append tmp ".txt")))
@@ -1456,6 +1466,67 @@
            (jolt-hash-map (jolt-keyword "kind") ":object"))
          (not (image-stub-resolver-match ":port"
                 (jolt-hash-map (jolt-keyword "kind") ":object")))))
+
+;; --- throwables: their construction capture does not travel -----------------
+;; A throwable records where it was constructed (rt.ss capture field: a
+;; continuation and site pair). A continuation cannot be written and another
+;; process's frames would name nothing, so an image writes a throwable without
+;; it (format 9). A thrown and caught ex-info inside a value must dump and read
+;; back with its class, message, data and cause.
+(cleanup!)
+(ev "(def thrown-held {:err (try (throw (ex-info \"t\" {:k 1} (IllegalStateException. \"root\"))) (catch Exception e e))})")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/thrown-held)"))
+(let ((g (jolt-image-read tmp)))
+  (ok "a caught ex-info (with its capture) dumps and reads back"
+      (let ((e (jolt-get g (keyword #f "err") jolt-nil)))
+        (and (jolt-ex-info-record? e)
+             (equal? "t" (jolt-ex-info-record-message e))
+             (equal? "java.lang.IllegalStateException"
+                     (jolt-ex-info-record-class-name (jolt-ex-info-record-cause e)))
+             (not (jolt-ex-info-record-capture e))))))
+(cleanup!)
+
+;; The layout before the capture field (format <= 8): a throwable rides raw as the
+;; v1 record, which restores through the legacy arm into a live throwable.
+;; Fixture made by the 0.8.12-era build (format 8); permanent, like those above.
+(ok "v0.8.12 ex-info fixture present" (file-exists? "test/chez/fixtures/image-v0.8.12-ex-info.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.8.12-ex-info.image")
+(is "v0.8.12 fixture: imgexi9/plain" "imgexi9/plain" "7")
+(is "v0.8.12 fixture: an ex-info's message, data and cause arrive"
+    "[(ex-message imgexi9/boom) (ex-data imgexi9/boom) (ex-message (ex-cause imgexi9/boom)) (ex-data (ex-cause imgexi9/boom))]"
+    "[boom {:k 1} inner {:j 2}]")
+(is "v0.8.12 fixture: a caught one and a host throwable arrive typed"
+    "[(ex-message imgexi9/caught) (.getMessage imgexi9/host) (instance? IllegalStateException imgexi9/host) (instance? clojure.lang.ExceptionInfo (:err imgexi9/held))]"
+    "[caught ise true true]")
+(is "v0.8.12 fixture: the restored throwable is live, not an inert record"
+    "(try (throw imgexi9/boom) (catch clojure.lang.ExceptionInfo e (ex-data e)))"
+    "{:k 1}")
+
+;; A concat part-way through a collection travels as its pending lazy source,
+;; whose arguments are image surface: the format 8 walk held (coll-seq outer-cell),
+;; and the concat that holds only the remaining colls must not read that outer
+;; cell as the rest (it would walk the current collection twice). Fixture made by
+;; the 0.8.12-era build (format 8); permanent, like those above.
+(ok "v0.8.12 concat fixture present" (file-exists? "test/chez/fixtures/image-v0.8.12-concat.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.8.12-concat.image")
+(is "v0.8.12 fixture: imgcat8/plain" "imgcat8/plain" "7")
+(is "v0.8.12 fixture: a half-walked mapcat and apply concat finish once"
+    "[(vec imgcat8/walked) (vec imgcat8/outer-walked)]"
+    "[[1 2 3 4 5 6] [1 2 3 4 5 6]]")
+
+;; A channel travels raw, its mutex and condition as image-sync placeholders.
+;; async-chan-v4 counts the threads waiting on it; the 0.8.12 layout (v3) has no
+;; count and restores through the legacy arm, values, closed state and all.
+;; Fixture made by v0.8.12 (format 8); permanent, like those above.
+(ok "v0.8.12 channel fixture present" (file-exists? "test/chez/fixtures/image-v0.8.12-chan.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.8.12-chan.image")
+(is "v0.8.12 fixture: imgchan8/plain" "imgchan8/plain" "7")
+(is "v0.8.12 fixture: a buffered channel keeps its values, a closed one its last value"
+    "(do (require 'clojure.core.async) [(clojure.core.async/<!! imgchan8/buffered) (clojure.core.async/<!! imgchan8/buffered) (clojure.core.async/<!! imgchan8/buffered) (clojure.core.async/<!! imgchan8/closed) (clojure.core.async/<!! imgchan8/closed)])"
+    "[1 2 3 :last nil]")
+(is "v0.8.12 fixture: the restored channel is live: a take waiting on it is woken by a put"
+    "(let [f (future (clojure.core.async/<!! imgchan8/buffered))] (Thread/sleep 50) (clojure.core.async/>!! imgchan8/buffered 9) (deref f 2000 :timeout))"
+    "9")
 
 (printf "~a/~a state-image assertions passed\n" (- total fails) total)
 (when (> fails 0) (exit 1))

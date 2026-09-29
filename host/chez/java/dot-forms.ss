@@ -156,7 +156,7 @@
          (let ((kw (keyword #f mname)))
            (cond
              ((jrec? obj)
-              (cond ((jrec-field-index obj kw) (jrec-lookup obj kw jolt-nil))
+              (cond ((jrec-member-field obj kw) => (lambda (k) (jrec-lookup obj k jolt-nil)))
                     ((jrec-class-field obj mname) => car)
                     (else 'pass)))
              ((and (jolt-map? obj) (jolt-truthy? (jolt-contains? obj kw)))
@@ -207,7 +207,7 @@
         ;; declares both seq[this] (Seqable) and seq[this ascending] (Sorted), and
         ;; (.seq pm false) must reach the 2-arg one, not dot-coll's plain seq.
         ((and (jrec? obj)
-              (find-method-any-protocol-arity (jrec-tag obj) mname (+ 1 (length rest))))
+              (jrec-method-arity obj mname (+ 1 (length rest))))
          => (lambda (f) (apply jolt-invoke f obj rest)))
         ;; collection interop first (entry count / seq / nth / get / containsKey).
         ((and (dot-coll? obj) (dot-coll-method obj mname rest))

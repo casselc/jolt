@@ -177,8 +177,15 @@
 ;; A NAMED fn whose body ends in a native-op tail call: exactly one jolt-site!
 ;; store, carrying the static ('fn . line) pair (sited-tail-call), and the def
 ;; wrapper registers the site's static callee for the reporter's staleness
-;; validator (jolt-register-callsite!). A dynamic-callee site (mdemo's f above)
-;; registers nothing.
+;; validator (jolt-register-callsite!). A dynamic-callee NON-tail site registers
+;; nothing; a dynamic TAIL site registers "?" so a live stack read can tell its
+;; pair went somewhere and returned (source-registry jolt-site-exited?).
+(define dyn-src "(def ddemo (fn ddemo [f x]\n  (let [a (f x)]\n    (f a))))")
+(let ((e (emit-num dyn-src)))
+  (gate-check "(10b) dynamic tail site registers ?"
+              (gate-sub? e "(jolt-register-callsite! \"ddemo\" 3 \"?\" #t)") #t)
+  (gate-check "(10b) dynamic non-tail site registers nothing"
+              (gate-sub? e "(jolt-register-callsite! \"ddemo\" 2 ") #f))
 (define sited-src "(def sdemo (fn sdemo [x]\n  (+ x 1)))")
 (let ((e (emit-num sited-src)))
   (gate-check "(10b) native tail site stores the pair" (gate-sub? e "(jolt-site! '(") #t)
@@ -256,7 +263,7 @@
   (gate-check "(12) offset at the line-3 call" (jolt-marker-line-at-offset e (+ i3 8)) 3)
   (gate-check "(12) offset past the last call" (jolt-marker-line-at-offset e (+ i3 30)) 3)
   ;; the file wrapper reads the same generated text from disk
-  (let ((p (format "/tmp/jolt-marker-r1-~a.scm" (random 1000000))))
+  (let ((p (format "~a/jolt-marker-r1-~a.scm" (host-temp-dir) (random 1000000))))
     (call-with-output-file p (lambda (out) (display e out)))
     (gate-check "(12) file wrapper resolves the same line"
                 (jolt-marker-line-in-file p (+ i3 3)) 3)

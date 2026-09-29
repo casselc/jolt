@@ -39,7 +39,8 @@
 ;; bakes first-wins to match). Grenadine ships host adapters alongside its portable
 ;; core, one of them named jolt.deps, so jolt-core has to precede it.
 (define ldr-install-roots
-  '("jolt-core" "stdlib" "vendor/fs/src" "vendor/process/src" "vendor/grenadine/src"
+  '("jolt-core" "stdlib" "vendor/fs/src" "vendor/process/src" "vendor/cli/src"
+    "vendor/grenadine/src"
     ;; the four namespaces grenadine generates instead of committing — see
     ;; vendor/grenadine-generated/README.md
     "vendor/grenadine-generated"))
@@ -131,6 +132,10 @@
 ;; *data-readers* are rewritten. data-readers-active gates the per-form walk so
 ;; projects without data readers (the common case) pay nothing.
 (define data-readers-active #f)
+;; The AOT key folds the digest of every registered reader fn's namespace (see
+;; aot-readers-digest). A merge adds to the registry, so it invalidates the
+;; memo — declared here, before the first merge can run.
+(define aot-readers-digest-memo 'unset)
 (define (data-readers-table) (var-deref "clojure.core" "*data-readers*"))
 ;; tag keyword (:#time/date) -> its registered reader symbol, or #f.
 (define (data-reader-symbol tag)
@@ -257,6 +262,7 @@
           (apply jolt-assoc (if (pmap? cur) cur empty-pmap)
                  (pmap-fold m (lambda (k v a) (cons k (cons v a))) '()))))
       (set! data-readers-active #t)
+      (set! aot-readers-digest-memo 'unset)
       ;; eagerly load each reader fn's namespace so the rewritten call resolves.
       ;; Tolerant — a data_readers entry must not kill the project load — but a
       ;; failure is reported in full (ldr-warn-reader-ns-failed!), or the miss
@@ -293,14 +299,17 @@
     (unless (null? tags)
       (display (string-append "  tags " (jolt-str-join tags) " will not read\n") port))))
 (define (load-data-readers!)
-  (for-each
+  ;; one settle point for the whole scan: see aot-call-with-readers-batch
+  (aot-call-with-readers-batch
+   (lambda ()
+    (for-each
     (lambda (root)
       ;; data_readers.{jolt,clj,cljc}, in the same precedence as a namespace's
       ;; source (ldr-source-exts below) — first one found on this root wins,
       ;; inside a jar root as on disk.
       (let ((f (ldr-root-source root "data_readers")))
         (when f (merge-data-readers-file f))))
-    source-roots))
+    source-roots))))
 
 ;; --- namespace -> file path -------------------------------------------------
 ;; "app.commonmark-test" -> "app/commonmark_test": split on '.', munge '-'->'_'
@@ -334,6 +343,25 @@
            (or (and (>= n m) (string=? (substring p (- n m) n) suf))
                (loop (cdr es)))))))
 
+;; --- embedded roots ---------------------------------------------------------
+;; A root spelled "embed:<prefix>" is not a directory on disk but a prefix
+;; into the runtime's embedded-resource table — the store `jolt build`'s
+;; deps.edn :jolt/build {:embed [dirs]} registers (io.ss
+;; register-embedded-resource!), and the one a self-contained jolt binary
+;; carries jolt-core + stdlib under. A loader context over such a root serves
+;; namespaces and resources with no files anywhere, which is how a shipped
+;; binary runs a library it baked in.
+;;
+;; The spelling cannot collide with a real path: ":" is illegal in a Windows
+;; path, and a POSIX directory literally named "embed:" is not a thing. Keys
+;; are "<prefix>/<name>", so the prefix never carries a trailing slash.
+(define (ldr-embedded-root? root)
+  (and (string? root)
+       (>= (string-length root) 6)
+       (string=? (substring root 0 6) "embed:")))
+(define (ldr-embedded-root-prefix root)
+  (substring root 6 (string-length root)))
+
 ;; --- jar roots -------------------------------------------------------------
 ;; A root that names a jar (a .jar or .zip file, either case) is read through
 ;; its central directory (java/zip-file.ss root-jar-index): a namespace or a
@@ -342,14 +370,21 @@
 ;; (jolt issue #1005), and the jar's own path is what the roots hold, as a jar
 ;; on the JVM's classpath is.
 ;;
-;; The file NAME on ROOT — a disk path under a directory root, a jar path into
-;; a jar root — or #f when it is not there.
+;; The location NAME resolves to on ROOT — a disk path under a directory root,
+;; a jar path into a jar root, an embedded KEY under an embedded root — or #f
+;; when it is not there.
 (define (ldr-root-file root name)
-  (let ((d (root-jar-index root)))
-    (if d
-        (and (zipdir-has? d name) (make-jar-path (root-path-abs root) name))
-        (let ((f (string-append root "/" name)))
-          (and (file-exists? f) f)))))
+  (if (ldr-embedded-root? root)
+      ;; The answer is the key itself, not a path: ldr-read-source reads such a
+      ;; key (embedded-resource-ref), and io.ss's reader/opener accept it the
+      ;; way they accept any other source location.
+      (let ((k (string-append (ldr-embedded-root-prefix root) "/" name)))
+        (and (embedded-resource-has? k) k))
+      (let ((d (root-jar-index root)))
+        (if d
+            (and (zipdir-has? d name) (make-jar-path (root-path-abs root) name))
+            (let ((f (string-append root "/" name)))
+              (and (file-exists? f) f))))))
 ;; The source of REL on ROOT: the first extension present, in ldr-source-exts
 ;; order, or #f.
 (define (ldr-root-source root rel)
@@ -395,6 +430,21 @@
     (cond ((string? emb) emb)
           ((bytevector? emb) (utf8->string emb))
           (else (read-file-string path)))))
+
+;; The same source as BYTES, for the AOT key, and those bytes as the text
+;; ldr-read-source would have answered. The cache keys a namespace on its bytes so
+;; a warm hit never decodes: the text is only needed when the source compiles.
+(define (ldr-read-source-bytes path)
+  (let ((emb (embedded-resource-ref path)))
+    (cond ((string? emb) (string->utf8 emb))
+          ((bytevector? emb) emb)
+          ((jar-path? path) (or (jar-path-bytes path) (jar-path-missing path)))
+          (else (read-file-bytes-on-disk path)))))
+(define (ldr-source-bytes->string path bv)
+  (let ((emb (embedded-resource-ref path)))
+    (cond ((string? emb) emb)
+          ((bytevector? emb) (utf8->string emb))
+          (else (utf8-bytes->string bv)))))
 
 (define (find-ns-file name) (resolve-on-roots (ns-name->rel name)))
 
@@ -512,10 +562,16 @@
 ;; A file load binds *file* to the path and *source-path* to the bare file
 ;; name around its forms (the reference binds both in Compiler.load), so loaded
 ;; code can read its own location. It also rebinds the compiler-flag vars
-;; *warn-on-reflection*, *assert* and *unchecked-math* to their current roots, so
-;; a file's top-level (set! *unchecked-math* …) is legal and its effect ends with
-;; the file rather than leaking into the root. Cells resolve lazily — the vars'
-;; defaults load after this file.
+;; *warn-on-reflection*, *assert* and *unchecked-math* to the values they
+;; currently hold, so a file's top-level (set! *unchecked-math* …) is legal and
+;; its effect ends with the file rather than leaking into the root.
+;;
+;; CURRENT, not root: Compiler.load pushes WARN_ON_REFLECTION.deref(), so a file
+;; loaded from inside another file INHERITS the outer one's flags and only stops
+;; inheriting where the outer frame ends. Binding the root reset every nested
+;; load to the defaults instead — measured against the reference, an outer
+;; (set! *unchecked-math* true) was invisible to load-string, load-file and
+;; require alike. Cells resolve lazily — the vars' defaults load after this file.
 (define ldr-file-cell #f)
 (define ldr-spath-cell #f)
 (define ldr-warn-cell #f)
@@ -540,9 +596,9 @@
         (dyn-with-frame
           (list (cons ldr-file-cell path)
                 (cons ldr-spath-cell name)
-                (cons ldr-warn-cell (var-cell-root ldr-warn-cell))
-                (cons ldr-assert-cell (var-cell-root ldr-assert-cell))
-                (cons ldr-unchecked-cell (var-cell-root ldr-unchecked-cell)))
+                (cons ldr-warn-cell (var-cell-deref ldr-warn-cell))
+                (cons ldr-assert-cell (var-cell-deref ldr-assert-cell))
+                (cons ldr-unchecked-cell (var-cell-deref ldr-unchecked-cell)))
           thunk))))
 
 ;; The loader's two compile-from-source entrances -- load-jolt-file* below and
@@ -682,12 +738,15 @@
 ;; script exports JOLT_AOT_CACHE=0, so source-mode dev (a volatile compiler whose
 ;; "dev" version tag would NOT invalidate the cache across edits, and whose
 ;; startup is already covered by the devboot cache) stays OFF by default.
+;; An explicitly-off env switch (the shared 0/false/no/off spelling). Unset,
+;; empty, or any other value is "not off": each switch chooses its own default.
+(define (aot-env-off? name)
+  (let ((e (getenv name)))
+    (and (string? e) (fx>? (string-length e) 0)
+         (or (string=? e "0") (string-ci=? e "false")
+             (string-ci=? e "no") (string-ci=? e "off")))))
 (define (aot-cache-enabled?)
-  (let ((e (getenv "JOLT_AOT_CACHE")))
-    (if (and (string? e) (fx>? (string-length e) 0))
-        (not (or (string=? e "0") (string-ci=? e "false")
-                 (string-ci=? e "no") (string-ci=? e "off")))
-        #t)))   ; unset/empty → default ON
+  (not (aot-env-off? "JOLT_AOT_CACHE")))   ; unset/empty → default ON
 ;; A cached fasl is only valid for the runtime that emitted it, and the version
 ;; string alone does not pin one: `git describe` reports the same "…-dirty" for
 ;; every edit in a working tree, so successive builds out of one checkout all
@@ -844,7 +903,8 @@
                      (char=? c #\-) (char=? c #\.) (char=? c #\_))
                  c #\_)))
          (string->list s))))
-;; length (hex) + full-content FNV-1a 32-bit hash (hex). FNV-1a is process-STABLE
+;; byte length (hex) + full-content FNV-1a 32-bit hash (hex) of the source's
+;; bytes — the bytes, not the decoded text, so a hit never decodes the source. FNV-1a is process-STABLE
 ;; (no randomized seed), so the key is reproducible across runs and machines —
 ;; required for the cache to hit at all. The length prefix stays as a cheap second
 ;; factor: a false share needs a genuine 32-bit collision BETWEEN SOURCES OF EQUAL
@@ -857,12 +917,341 @@
 ;; inc→dec, a rename to an equal-length name — kept the key and silently served
 ;; the previous fasl. Do not "optimize" this back to a sampling hash: the whole
 ;; cost is one linear pass over source jolt is about to compile anyway.
-(define (aot-cache-key src)
-  (string-append (number->string (string-length src) 16) "-"
-                 (number->string (aot-content-hash src) 16)))
+(define (aot-cache-key bv)
+  (aot-cache-key-of (bytevector-length bv) (aot-bytes-hash bv)))
+(define (aot-cache-key-of len hash)
+  (string-append (number->string len 16) "-" (number->string hash 16)))
 (define (aot-info msg)
   (when (getenv "JOLT_DEBUG")
     (display (string-append "[jolt.aot] " msg "\n") (current-error-port))))
+
+;; --- compile-time relevance (AOT key narrowing) -------------------------------
+;; A namespace's fasl bakes in what its DEPENDENCIES contributed at COMPILE
+;; time: macro expansions, record/protocol registrations, and the files a macro
+;; read at expansion time. Everything else a dependency defines is reached
+;; through its var cell at RUNTIME — with direct-linking and whole-program
+;; inference both off (the plain `jolt run` posture), the emitter never binds or
+;; splices a dependency's procedure — so a dependency defining none of those
+;; compile-time things changes a consumer's emitted code only through WHICH
+;; vars it has: a qualified reference to a var that is gone is a compile error,
+;; and under `:refer :all`/`:use` a var the dependency gains can shadow a bare
+;; symbol that resolved to clojure.core before. Such a dependency contributes
+;; the digest of its var names (its "surface"), not of its source, so a body
+;; edit leaves its consumers' keys alone and adding or removing a var does not.
+;;
+;; The conservative closure stays for every posture where a dependency's
+;; compiled body CAN be baked into a consumer: `jolt build` (direct-link and/or
+;; inference on) and the build's pass-1 load (ldr-build-aot-cache?). JOLT_AOT_NARROW=0
+;; turns the narrowing off everywhere.
+;;
+;; Which namespaces define a compile-time thing is recorded when they COMPILE,
+;; in a sidecar named by the namespace's own source hash (`<base-for-own>.ct`):
+;; the captured Scheme carries `(mark-macro! …)` for every defmacro/definline the
+;; namespace defines, and the record-shape / protocol-method registries carry the
+;; namespace that registered each entry. A `:refer` of a project/library var
+;; makes the namespace forward that var's home (a consumer can reach it through
+;; the qualified `N/x`), so it counts too.
+;;
+;; The ordering problem: a consumer's key is computed BEFORE its deps load, so an
+;; edited dependency has no `.ct` for its new source hash yet — the moment the
+;; narrowing would help most, the flag is unknown. The consumer's own sidecar
+;; (`<base-for-own>.cti`) records which of its direct deps were folded by surface
+;; when it was compiled, and the surface each had. A dep with a missing flag that
+;; appears there is assumed to have that surface still (the key stays stable
+;; across the edit), and a HIT is then verified after the artifact's own
+;; requires have loaded the deps: every assumed dep must now be inert with the
+;; recorded surface, or the artifact was compiled against a dependency whose
+;; compile-time surface has since moved (gained/lost a var, macro, record, …)
+;; and is discarded and recompiled from source. So an edit to an inert namespace
+;; recompiles that namespace alone; an edit that changes a compile-time surface
+;; invalidates its consumers exactly as before.
+;;
+;; The one compile-time state a namespace can change that is NOT local to it is a
+;; data reader: the fn runs while READING a source, so its code is baked into the
+;; forms the read produced. Every key folds the digest of each registered reader
+;; fn's namespace (see aot-readers-digest), which is blunt but sound — readers
+;; are few and change rarely. A reader registered as a raw fn value (not a
+;; symbol/var) has no namespace to name and stays outside this, as it is outside
+;; the closure key too unless its namespace is required.
+(define (aot-narrow?)
+  (and (not (aot-env-off? "JOLT_AOT_NARROW"))
+       (not hc-direct-link?)
+       (not hc-optimize?)
+       (not (ldr-build-aot-cache?))))
+(define (aot-ct-sidecar base) (string-append base ".ct"))
+;; The var names a namespace interns, with the private flag (a consumer's
+;; reference to a private var does not compile), as one hex digest. Asked after
+;; the capture load, so it is what the namespace's top levels defined.
+(define (aot-ns-surface name)
+  (let ((names (sort string<?
+                     (fold-left (lambda (acc c)
+                                  (if (var-cell-defined? c)
+                                      (cons (string-append (var-cell-name c)
+                                                           (if (var-private? c) " p" ""))
+                                            acc)
+                                      acc))
+                                '() (ns-cells-list name)))))
+    (number->string
+      (fold-left (lambda (h n) (aot-hash-mix h (aot-content-hash n))) 19 names)
+      16)))
+(define (aot-write-ct! base relevant? surface)
+  (guard (e (else #f))
+    (let ((out (open-output-file (aot-ct-sidecar base) 'replace)))
+      (put-string out (if relevant? "1\n" (string-append "0 " surface "\n")))
+      (close-port out))))
+;; The compile-time state of a namespace, keyed by its CURRENT source hash:
+;;   a string — inert: its artifact says it defines nothing a consumer's compile
+;;              bakes in beyond its var names; the string is their digest
+;;   relevant — it defines (or may define) macros/records/protocols/forwarded vars
+;;   unknown  — no artifact for this exact source (just edited, never compiled)
+(define aot-ct-state-memo (make-hashtable string-hash string=?))
+(define (aot-ct-state name)
+  (let ((cached (hashtable-ref aot-ct-state-memo name 'miss)))
+    (if (not (eq? cached 'miss))
+        cached
+        (let* ((own (aot-own-key name))
+               (v (if (not own)
+                      'unknown
+                      (let ((p (aot-ct-sidecar (aot-base-for-own name own))))
+                        (if (not (file-exists? p))
+                            'unknown
+                            (let ((s (read-file-string p)))
+                              (cond
+                                ((and (fx>? (string-length s) 0)
+                                      (char=? #\1 (string-ref s 0)))
+                                 'relevant)
+                                ((aot-ct-inert-surface s))
+                                (else 'unknown))))))))
+          (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-ct-state-memo name v))
+          v))))
+;; "0 <surface>" → the surface string; anything else (an older "0" with no
+;; digest included) → #f.
+(define (aot-ct-inert-surface s)
+  (let ((n (string-length s)))
+    (and (fx>? n 2) (char=? #\0 (string-ref s 0)) (char=? #\space (string-ref s 1))
+         (let loop ((e 2))
+           (if (or (fx=? e n) (char=? #\newline (string-ref s e)))
+               (and (fx>? e 2) (substring s 2 e))
+               (loop (fx+ e 1)))))))
+;; The direct deps a compiled namespace folded by surface, each with the surface
+;; it folded ("<dep> <surface>" lines), recorded for the next run (when their
+;; flag may be missing again). Named by the namespace's own hash, like the other
+;; sidecars.
+(define (aot-cti-sidecar base) (string-append base ".cti"))
+(define (aot-write-cti! base pairs)
+  (guard (e (else #f))
+    (let ((out (open-output-file (aot-cti-sidecar base) 'replace)))
+      (for-each (lambda (pr)
+                  (put-string out (car pr)) (put-string out " ")
+                  (put-string out (cdr pr)) (put-string out "\n"))
+                (sort (lambda (a b) (string<? (car a) (car b))) pairs))
+      (close-port out))))
+;; The recorded .cti as an alist dep → surface.
+(define aot-assumed-memo (make-hashtable string-hash string=?))
+(define (aot-assumed-inert name own)
+  (or (hashtable-ref aot-assumed-memo name #f)
+      (let ((v (fold-right
+                 (lambda (line acc)
+                   (let ((sp (let loop ((i 0))
+                               (cond ((fx=? i (string-length line)) #f)
+                                     ((char=? #\space (string-ref line i)) i)
+                                     (else (loop (fx+ i 1)))))))
+                     (if (and sp (fx>? sp 0) (fx<? (fx+ sp 1) (string-length line)))
+                         (cons (cons (substring line 0 sp)
+                                     (substring line (fx+ sp 1) (string-length line)))
+                               acc)
+                         acc)))
+                 '()
+                 (aot-read-dep-list (aot-cti-sidecar (aot-base-for-own name own))))))
+        (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-assumed-memo name v))
+        v)))
+;; The surface DEP contributes to a key computed with ASSUMED (the recorded
+;; alist of the namespace being keyed) in force, or #f when it contributes its
+;; whole digest.
+(define (aot-dep-surface dep assumed)
+  (and (aot-narrow?)
+       (let ((st (aot-ct-state dep)))
+         (cond ((string? st) st)
+               ((eq? st 'relevant) #f)
+               (else (let ((a (assoc dep assumed))) (and a (cdr a))))))))
+;; The digest a consumer folds for one dependency. An inert dependency
+;; contributes its surface; everything else keeps its whole compiled contribution.
+(define (aot-dep-contribution dep assumed)
+  (let ((sf (aot-dep-surface dep assumed)))
+    (if sf
+        (aot-hash-mix 17 (aot-content-hash sf))
+        (aot-ns-digest dep))))
+;; After a HIT, the artifact's own requires have loaded its deps: every dep the
+;; key ASSUMED (dep . surface) must now read inert with that same surface, or the
+;; artifact predates a change to that dep's compile-time surface. 'unknown still
+;; means the dep never loaded — equally untrustworthy.
+(define (aot-assumptions-hold? assumed-now)
+  (let loop ((ds assumed-now))
+    (cond ((null? ds) #t)
+          ((equal? (aot-ct-state (caar ds)) (cdar ds)) (loop (cdr ds)))
+          (else #f))))
+
+;; --- compiling the fasl off the startup path ----------------------------------
+;; On a miss the namespace has ALREADY been analyzed, emitted and evaluated in
+;; this process; the .scm → .so compile exists only for FUTURE runs. Compiling it
+;; inline blocks the run that missed — 10.3s of a 24s edit run on kmet's 65-file
+;; cascade. Each miss is instead handed to one background worker — a detached
+;; child of this executable reading job lines from a manifest as the parent
+;; appends them — started on the first miss of the process and exited once the
+;; parent is gone and its jobs are done. JOLT_AOT_ASYNC=0 opts back
+;; into the in-process compile. Any failure — no executable to name, a non-jolt
+;; executable (source mode's bin/jolt runs a plain Chez), an unwritable manifest,
+;; a host with no POSIX spawn — falls back to compiling here, so a run
+;; never depends on the worker's machinery.
+;;
+;; Nothing waits on the worker: a program that exits first leaves it compiling
+;; the cache it will read next time. A job a worker could not compile (or a
+;; worker killed mid-job) only misses again next run; the parent never tracks
+;; completion, so there is no protocol to get wrong.
+(define (aot-cstring bv)
+  (let loop ((i 0))
+    (if (or (fx=? i (bytevector-length bv)) (fx=? 0 (bytevector-u8-ref bv i)))
+        (utf8->string (let ((out (make-bytevector i))) (bytevector-copy! bv 0 out 0 i) out))
+        (loop (fx+ i 1)))))
+;; The executable this process is running, or #f — asked of the OS rather than
+;; read off argv[0], which is whatever the caller passed (build.ss bld-self-exe).
+(define aot-self-exe-memo 'unset)
+(define (aot-self-exe)
+  (when (eq? aot-self-exe-memo 'unset)
+    (set! aot-self-exe-memo
+      (guard (e (else #f))
+        (case (sa-os-family)
+          ((macos)
+           (let ((f (jolt-foreign-proc-safe "_NSGetExecutablePath" '(u8* u8*) 'int)))
+             (and f
+                  (let ((buf (make-bytevector 4096 0)) (sz (make-bytevector 4 0)))
+                    (bytevector-u32-native-set! sz 0 4096)
+                    (and (fx=? 0 (f buf sz)) (aot-cstring buf))))))
+          ((linux)
+           (let ((f (jolt-foreign-proc-safe "readlink" '(string u8* size_t) 'long)))
+             (and f
+                  (let* ((buf (make-bytevector 4096 0)) (n (f "/proc/self/exe" buf 4095)))
+                    (and (fx>? n 0) (aot-cstring buf))))))
+          (else #f)))))
+  (and (string? aot-self-exe-memo) (file-exists? aot-self-exe-memo) aot-self-exe-memo))
+;; #t only in a built jolt/app binary. Its launcher (build-jolt.ss
+;; jb-emit-launcher) sets jolt-standalone-binary before dispatching; source mode —
+;; bin/jolt runs a plain Chez — leaves it #f, so there is no jolt to spawn and
+;; the compile happens in-process. No probe is needed to tell them apart, and a
+;; launcher that cannot spawn itself (exec denied, binary moved) still falls
+;; back: aot-worker-start! reports #f and the caller compiles here.
+(define jolt-standalone-binary #f)
+(define (aot-worker-capable? exe)
+  (and jolt-standalone-binary (string? exe) #t))
+(define (aot-async?)
+  (and (not (aot-env-off? "JOLT_AOT_ASYNC"))
+       (not (ldr-build-aot-cache?))
+       (case (sa-os-family) ((linux macos) #t) (else #f))))
+(define aot-worker-state (vector #f #f))   ; #(manifest out-port) once started
+(define (aot-worker-start!)
+  (let ((exe (aot-self-exe)))
+    (and exe (aot-worker-capable? exe)
+         (let* ((mf (string-append (aot-cache-subdir) "/aot-jobs-"
+                                   (number->string (get-process-id)) ".edn"))
+                (out (guard (e (else #f)) (open-output-file mf 'replace))))
+           (and out
+                (zero? (jolt-sh (string-append "( " (sh-quote exe) " --aot-worker "
+                                               (sh-quote mf)
+                                               " </dev/null >> " (sh-quote (string-append mf ".log"))
+                                               " 2>&1 & )")))
+                (vector-set! aot-worker-state 0 mf)
+                (vector-set! aot-worker-state 1 out)
+                #t)))))
+;; #t when a worker owns the job, #f when the caller must compile it here.
+(define (aot-enqueue-compile! scm so)
+  (and (aot-async?)
+       (or (vector-ref aot-worker-state 1) (aot-worker-start!))
+       (let ((out (vector-ref aot-worker-state 1)))
+         (and out
+              (guard (e (else #f))
+                (write (list scm so) out)
+                (newline out)
+                (flush-output-port out)
+                #t)))))
+(define (aot-run-job! job)
+  (let* ((scm (car job))
+         (so (cadr job))
+         (tmp (string-append so ".part" (number->string (get-process-id)))))
+    (guard (e (else (display (string-append "jolt: aot worker: compile failed for " scm "\n")
+                              (current-error-port))
+                    (guard (e2 (#t #f)) (delete-file tmp #f))))
+      (parameterize ((current-output-port (open-output-string)))
+        (sa-compile-file scm tmp #f))
+      (rename-replace! tmp so))))
+(define (aot-manifest-jobs manifest)
+  (if (not (file-exists? manifest))
+      '()
+      (let loop ((lines (bld-string-lines-like (read-file-string manifest))) (acc '()))
+        (if (null? lines)
+            (reverse acc)
+            (let ((job (guard (e (#t #f))
+                         (let ((x (read (open-input-string (car lines)))))
+                           (and (pair? x) (string? (car x)) (pair? (cdr x))
+                                (string? (cadr x)) x)))))
+              (loop (cdr lines) (if job (cons job acc) acc)))))))
+;; Entry for `jolt --aot-worker MANIFEST`: compile every job as it appears and
+;; exit once the parent is gone and every job it wrote is done. The worker does
+;; NOT exit on idleness while the parent lives: the parent keeps one open port to
+;; its manifest for its whole life and never starts a second worker, so a job
+;; appended after an idle exit would be lost, and with it the cache for every
+;; namespace a long-running program requires late. An idle worker polls from
+;; 50ms backing off to ~1s, so it costs one small read a second.
+;;
+;; The parent's pid is in the manifest's name (aot-jobs-<pid>.edn) — it wrote
+;; that file, and it is the one that keeps appending to it. kill(pid, 0) is the
+;; aliveness probe: 0 for a process of this uid. A host where the probe itself
+;; fails reads as dead, which costs only the jobs in flight (their namespaces
+;; miss again next run).
+(define (aot-manifest-owner manifest)
+  (guard (e (else #f))
+    (let* ((base (path-last manifest))
+           (pre "aot-jobs-") (suf ".edn")
+           (n (string-length base)) (pn (string-length pre)) (sn (string-length suf)))
+      (and (fx>? n (fx+ pn sn))
+           (string=? pre (substring base 0 pn))
+           (string=? suf (substring base (fx- n sn) n))
+           (string->number (substring base pn (fx- n sn)))))))
+(define (aot-proc-alive? pid)
+  (guard (e (else #f))
+    (let ((f (jolt-foreign-proc-safe "kill" '(int int) 'int)))
+      (and f (fx=? 0 (f pid 0))))))
+;; The manifest and an empty log go with the worker: each run that missed has
+;; its own pair, and nothing else reads them once the parent is gone.
+(define (aot-worker-cleanup! manifest)
+  (guard (e (else #f)) (delete-file manifest #f))
+  (let ((log (string-append manifest ".log")))
+    (guard (e (else #f))
+      (when (and (file-exists? log) (fx=? 0 (string-length (read-file-string log))))
+        (delete-file log #f)))))
+(define (aot-compile-worker manifest)
+  (let ((owner (aot-manifest-owner manifest)))
+    (let loop ((done 0) (idle 0))
+      (let ((jobs (aot-manifest-jobs manifest)))
+        (cond
+          ((> (length jobs) done)
+           (aot-run-job! (list-ref jobs done))
+           (loop (fx+ done 1) 0))
+          ;; the parent is gone: no job can arrive after it, and the read above
+          ;; came after its last flush
+          ((and owner (not (aot-proc-alive? owner)))
+           (aot-worker-cleanup! manifest))
+          ;; no owner to watch (a manifest not named by a pid): the old idle
+          ;; window, ~10s at the capped poll
+          ((and (not owner) (fx>=? idle 20)) #t)
+          ;; make-time is (type NANOSECONDS seconds). The reversed reading slept
+          ;; for a year and a half — and with it the whole async cache, since a
+          ;; worker that never wakes never sees the jobs appended after its first
+          ;; look at the manifest.
+          ;; The nanosecond field must stay below 1e9, so the 1s cap is 950ms.
+          (else (sleep (make-time 'time-duration (fxmin 950000000 (fx* 50000000 (fx+ idle 1))) 0))
+                (loop done (fx+ idle 1))))))))
+(def-var! "jolt.host" "aot-compile-worker"
+  (lambda (manifest) (aot-compile-worker (jolt-str-render-one manifest)) jolt-nil))
 
 ;; --- dependency closure ------------------------------------------------------
 ;; A namespace's fasl bakes in what its dependencies contributed at compile time —
@@ -928,9 +1317,105 @@
 (define (aot-file-digest path)
   (guard (e (else 0))
     (if (if (jar-path? path) (jar-path-exists? path) (file-exists? path))
-        (let ((bv (read-file-bytes path)))
-          (aot-hash-mix (bytevector-length bv) (aot-bytes-hash bv)))
+        (let ((lh (aot-content-of path)))
+          (aot-hash-mix (car lh) (cdr lh)))
         0)))
+;; PATH's (length . FNV-1a hash), from the release-jar store when PATH is an
+;; entry of one (below), else from reading it.
+(define (aot-content-of path)
+  (let* ((stamp (aot-source-stamp path))
+         (known (aot-release-entry-lookup path stamp)))
+    (or known
+        (let* ((bv (read-file-bytes path))
+               (lh (cons (bytevector-length bv) (aot-bytes-hash bv))))
+          (aot-release-entry-record! path stamp lh)
+          lh))))
+
+;; --- release jars, keyed by stat ----------------------------------------------
+;; A Maven release artifact is never republished under the same path, so what
+;; its entries hash to is fixed once read. jolt.deps names those roots
+;; (add-immutable-roots!), and for an entry of one the (length . hash) is kept on
+;; disk per jar and modification time — a warm start then stats the jar and
+;; reads none of it, where it otherwise inflated and hashed every source of the
+;; closure only to learn that nothing changed. A jar rewritten in place (a
+;; repaired download) has a new mtime and a new store. Everything else — a
+;; SNAPSHOT, a :local/root jar, a directory — keeps full content hashing.
+(define ldr-immutable-roots (make-hashtable string-hash string=?))
+(def-var! "jolt.host" "add-immutable-roots!"
+  (lambda (roots)
+    (jolt-with-mutex ldr-tbl-mu
+      (for-each (lambda (r) (when (string? r) (hashtable-set! ldr-immutable-roots r #t)))
+                (seq->list roots)))
+    jolt-nil))
+;; FILE's jar and entry when FILE is an entry of a release jar, else #f.
+(define (aot-release-entry file)
+  (let ((parts (jar-path-split file)))
+    (and parts
+         (let ((jar (file-url->path (car parts))))
+           (and (hashtable-ref ldr-immutable-roots jar #f)
+                (cons jar (uri-decode-lenient (cdr parts))))))))
+;; jar -> #(stamp table), the table entry -> (length . hash)
+(define aot-release-stores (make-hashtable string-hash string=?))
+(define (aot-release-store-path jar stamp)
+  (string-append (aot-cache-subdir) "/jars/" (aot-cache-sanitize jar)
+                 "-" (number->string stamp 16) ".keys"))
+;; One line per entry: length and hash in hex, then the entry name, which is last
+;; because it may hold spaces. A line that doesn't parse is skipped; its entry is
+;; just read again.
+(define (aot-release-store-read path)
+  (let ((tbl (make-hashtable string-hash string=?)))
+    (for-each
+      (lambda (line)
+        (let* ((sp1 (aot-index-of line #\space 0))
+               (sp2 (and sp1 (aot-index-of line #\space (fx+ sp1 1))))
+               (len (and sp2 (string->number (substring line 0 sp1) 16)))
+               (hash (and sp2 (string->number (substring line (fx+ sp1 1) sp2) 16))))
+          (when (and len hash)
+            (hashtable-set! tbl (substring line (fx+ sp2 1) (string-length line))
+                            (cons len hash)))))
+      (aot-read-dep-list path))
+    tbl))
+(define (aot-index-of s c from)
+  (let loop ((i from))
+    (cond ((fx>=? i (string-length s)) #f)
+          ((char=? (string-ref s i) c) i)
+          (else (loop (fx+ i 1))))))
+(define (aot-release-store jar stamp)
+  (let ((st (hashtable-ref aot-release-stores jar #f)))
+    (if (and st (eqv? (vector-ref st 0) stamp))
+        (vector-ref st 1)
+        (let ((tbl (aot-release-store-read (aot-release-store-path jar stamp))))
+          (jolt-with-mutex ldr-tbl-mu
+            (hashtable-set! aot-release-stores jar (vector stamp tbl)))
+          tbl))))
+(define (aot-release-entry-lookup file stamp)
+  (and (fixnum? stamp)
+       (let ((je (aot-release-entry file)))
+         (and je (hashtable-ref (aot-release-store (car je) stamp) (cdr je) #f)))))
+;; Remember an entry read from a release jar, and rewrite the jar's store (temp +
+;; rename, so a concurrent reader sees the old store or the new one). Best
+;; effort: a store that can't be written only means reading the entry again.
+(define (aot-release-entry-record! file stamp lh)
+  (when (fixnum? stamp)
+    (let ((je (aot-release-entry file)))
+      (when je
+        (let ((tbl (aot-release-store (car je) stamp))
+              (path (aot-release-store-path (car je) stamp)))
+          (jolt-with-mutex ldr-tbl-mu
+            (hashtable-set! tbl (cdr je) lh)
+            (guard (e (else #f))
+              (aot-mkdir-p (path-parent path))
+              (let* ((tmp (string-append path ".tmp" (number->string (get-process-id))))
+                     (out (open-output-file tmp 'replace)))
+                (let-values (((ks vs) (hashtable-entries tbl)))
+                  (vector-for-each
+                    (lambda (k v)
+                      (put-string out (number->string (car v) 16)) (put-string out " ")
+                      (put-string out (number->string (cdr v) 16)) (put-string out " ")
+                      (put-string out k) (put-string out "\n"))
+                    ks vs))
+                (close-port out)
+                (rename-replace! tmp path)))))))))
 ;; The PATH is folded alongside its content, so gaining or losing an entry moves
 ;; the digest even when the contents happen to coincide. Sorted, like the deps, so
 ;; the result doesn't depend on the order the reads happened to be recorded in.
@@ -964,13 +1449,92 @@
 (define (aot-cacheable-file name)
   (let ((f (find-ns-file name)))
     (and f (not (ldr-install-file? f)) f)))
+;; A namespace's own key, read once per process and shared by every consult: the
+;; dep walk of each consumer folds it, and the namespace's own load needs it
+;; again. Each entry is #(key file stamp) — the stamp (aot-source-stamp) says
+;; which state of the file the key was read from, so the load can tell whether
+;; the walk's key still describes the source it is about to load.
 (define aot-own-key-memo (make-hashtable string-hash string=?))
+;; What a key read from FILE is good for: the backing file's modification time
+;; (the archive's, for a jar entry — zipdir-for re-reads an index on the same
+;; stamp), 'embedded for a baked source that cannot change, or #f when the file
+;; can't be stat'ed and nothing is trusted. A stat, never an open: the point is
+;; not to touch the file.
+(define (aot-source-stamp file)
+  (if (embedded-resource-ref file)
+      'embedded
+      (let ((parts (jar-path-split file)))
+        (guard (e (#t #f))
+          (sa-file-mtime-ms (if parts (file-url->path (car parts)) file))))))
+;; Read FILE and key it: (values key bytes stamp). The stamp is taken before the
+;; read, so a write racing the read leaves a stamp that no longer matches.
+;; An entry of a release jar whose key is already stored answers without a read,
+;; and #f in place of the bytes.
+(define (aot-read-own-key name file)
+  (let* ((stamp (aot-source-stamp file))
+         (known (aot-release-entry-lookup file stamp)))
+    (if known
+        (values (aot-cache-key-of (car known) (cdr known)) #f stamp)
+        (begin
+          (aot-info (string-append "hash " name))
+          (let* ((bv (ldr-read-source-bytes file))
+                 (lh (cons (bytevector-length bv) (aot-bytes-hash bv))))
+            (aot-release-entry-record! file stamp lh)
+            (values (aot-cache-key-of (car lh) (cdr lh)) bv stamp))))))
+;; Record NAME's key. A key that MOVED within this process (the source was edited
+;; and reloaded) leaves every digest folded from the old one stale, so those memos
+;; go with it and the next consult recomputes them.
+(define (aot-remember-own-key! name key file stamp)
+  (jolt-with-mutex ldr-tbl-mu
+    (let ((prev (hashtable-ref aot-own-key-memo name #f)))
+      (hashtable-set! aot-own-key-memo name (vector key file stamp))
+      (when (and prev (not (string=? (vector-ref prev 0) key)))
+        (aot-drop-derived-memos!)))))
+(define (aot-forget-own-key! name)
+  (when (hashtable-ref aot-own-key-memo name #f)
+    (jolt-with-mutex ldr-tbl-mu
+      (hashtable-delete! aot-own-key-memo name)
+      (aot-drop-derived-memos!))))
+;; caller holds ldr-tbl-mu
+(define (aot-drop-derived-memos!)
+  (hashtable-clear! aot-dep-digest-memo)
+  (hashtable-clear! aot-res-digest-memo)
+  (hashtable-clear! aot-ct-state-memo)
+  (hashtable-clear! aot-assumed-memo)
+  (unless (eq? aot-readers-digest-memo 'computing)
+    (set! aot-readers-digest-memo 'unset)))
 (define (aot-own-key name)
-  (or (hashtable-ref aot-own-key-memo name #f)
-      (let ((f (aot-cacheable-file name)))
-        (and f (let ((k (aot-cache-key (ldr-read-source f))))
-                 (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-own-key-memo name k))
-                 k)))))
+  (let ((m (hashtable-ref aot-own-key-memo name #f)))
+    (if m
+        (vector-ref m 0)
+        (let ((f (aot-cacheable-file name)))
+          (and f (let-values (((k bv stamp) (aot-read-own-key name f)))
+                   (aot-remember-own-key! name k f stamp)
+                   k))))))
+;; Namespaces whose first load has taken its key from the memo. Only a first load
+;; may: the walk read the source moments earlier, in the same require. A later
+;; load of the same namespace is a reload — its source may have been edited since
+;; within the stamp's resolution — so it reads again.
+(define aot-own-loaded (make-hashtable string-hash string=?))
+;; The key NAME loads under, and a promise of (key . text) from one read of FILE
+;; for when the source has to compile. A first load whose memo was read from this
+;; same, unchanged file reuses that key and reads nothing unless it misses; the
+;; promise then reads afresh, so a miss is always keyed on the bytes it compiles.
+(define (aot-load-key name file)
+  (let ((m (hashtable-ref aot-own-key-memo name #f))
+        (first? (not (hashtable-ref aot-own-loaded name #f))))
+    (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-own-loaded name #t))
+    (if (and m first?
+             (equal? (vector-ref m 1) file)
+             (vector-ref m 2)
+             (equal? (vector-ref m 2) (aot-source-stamp file)))
+        (values (vector-ref m 0)
+                (delay (let-values (((k bv stamp) (aot-read-own-key name file)))
+                         (aot-remember-own-key! name k file stamp)
+                         (cons k (ldr-source-bytes->string file (or bv (ldr-read-source-bytes file)))))))
+        (let-values (((k bv stamp) (aot-read-own-key name file)))
+          (aot-remember-own-key! name k file stamp)
+          (values k (delay (cons k (ldr-source-bytes->string file (or bv (ldr-read-source-bytes file))))))))))
 (define (aot-base-for-own name own) (string-append (aot-cache-subdir) "/"
                                                    (aot-cache-sanitize name) "-" own))
 ;; Fold the dep keys into one integer. Sorted, so the digest doesn't depend on the
@@ -989,14 +1553,34 @@
 (define aot-dep-inflight (make-hashtable string-hash string=?))
 (define (aot-inflight-key name)
   (string-append (number->string (get-thread-id)) "\x0;" name))
+;; The digest of every namespace a registered data reader lives in, folded into
+;; every key: a reader runs while READING a source, so its code is baked into the
+;; forms the read produced, not just into a macro expansion. The registry is
+;; small and changes rarely, so noticing WHICH tags a source used is not worth a
+;; read-time hook; folding all of them over-invalidates on a reader edit, never
+;; under-invalidates. Memoized per process (a merge resets it), with 'computing
+;; cutting a recursive walk — a reader namespace that requires the namespace
+;; being keyed — at the same constant an empty registry folds to.
+(define (aot-readers-digest)
+  (cond
+    ((eq? aot-readers-digest-memo 'unset)
+     (set! aot-readers-digest-memo 'computing)
+     (let* ((names (sort string<? (aot-reader-namespaces)))
+            (d (fold-left (lambda (h ns) (aot-hash-mix h (aot-ns-digest ns))) 17 names)))
+       (set! aot-readers-digest-memo d)
+       d))
+    ((eq? aot-readers-digest-memo 'computing) 17)
+    (else aot-readers-digest-memo)))
 (define (aot-ns-digest name)
   ;; a namespace's whole contribution: its own hash, the files its compile read,
-  ;; and its deps'. All three so a change anywhere below reaches every consumer.
+  ;; its deps', and the project's data readers. All four so a change anywhere
+  ;; below reaches every consumer.
   (let ((own (aot-own-key name)))
     (if (not own)
         0
-        (aot-hash-mix (aot-hash-mix (equal-hash own) (aot-res-digest name own))
-                      (aot-dep-digest name own)))))
+        (aot-hash-mix (aot-hash-mix (aot-hash-mix (equal-hash own) (aot-res-digest name own))
+                                    (aot-dep-digest name own))
+                      (aot-readers-digest)))))
 (define (aot-dep-digest name own)
   (or (hashtable-ref aot-dep-digest-memo name #f)
       (let ((ik (aot-inflight-key name)))
@@ -1006,25 +1590,29 @@
             (equal-hash own)
             (begin
               (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-dep-inflight ik #t))
-              (let* ((deps (sort string<? (aot-read-dep-list
+              (let* ((assumed (aot-assumed-inert name own))
+                     (deps (sort string<? (aot-read-dep-list
                                             (aot-dep-sidecar (aot-base-for-own name own)))))
-                     (d (fold-left (lambda (h dep) (aot-hash-mix h (aot-ns-digest dep))) 17 deps)))
+                     (d (fold-left (lambda (h dep) (aot-hash-mix h (aot-dep-contribution dep assumed))) 17 deps)))
                 (jolt-with-mutex ldr-tbl-mu
                   (hashtable-delete! aot-dep-inflight ik)
                   (hashtable-set! aot-dep-digest-memo name d))
                 d))))))
 ;; The full cache base: own hash, then the dep digest folded with the digest of
-;; the files this compile read. A namespace with no recorded deps or reads (or
-;; none cacheable) folds to the digest of the empty list, so the suffix is
-;; constant for the whole leaf case rather than absent.
+;; the files this compile read, then the data readers. A namespace with no
+;; recorded deps or reads (or none cacheable) folds to the digest of the empty
+;; list, so the suffix is constant for the whole leaf case rather than absent.
 (define (aot-base-full name own deps res)
-  (string-append (aot-base-for-own name own) "-"
-                 (number->string
-                   (aot-hash-mix
-                     (fold-left (lambda (h dep) (aot-hash-mix h (aot-ns-digest dep))) 17
-                                (sort string<? deps))
-                     (aot-res-fold res))
-                   16)))
+  (let ((assumed (aot-assumed-inert name own)))
+    (string-append (aot-base-for-own name own) "-"
+                   (number->string
+                     (aot-hash-mix
+                       (aot-hash-mix
+                         (fold-left (lambda (h dep) (aot-hash-mix h (aot-dep-contribution dep assumed))) 17
+                                    (sort string<? deps))
+                         (aot-res-fold res))
+                       (aot-readers-digest))
+                     16))))
 ;; Tee the per-form emitted Scheme (compile-eval.ss jolt-aot-capture) while running
 ;; the normal load loop, so a cache miss reproduces the EXACT interleaved analyze
 ;; →eval semantics (forward macro refs and same-file requires expand correctly).
@@ -1091,50 +1679,217 @@
 (define (aot-complete? name)
   (jolt-with-mutex ldr-tbl-mu (hashtable-ref aot-complete-tbl name #f)))
 
+;; --- what makes a namespace compile-time relevant -----------------------------
+;; All questions are asked AFTER the capture load (the namespace's top levels
+;; have run), so the registries and var cells already carry what it defined.
+
+;; Any macro var the namespace owns — defmacro/definline flag it directly, and so
+;; does a re-export that copies a macro's meta onto a fresh var (ns.ss
+;; var-meta-sync-macro!), which no emitted-text scan would catch. ns-cells-list is
+;; the namespace's own bucket in rt.ss's ns-cells-index: O(vars in ns), where the
+;; var-table prefix scan this replaced was O(every var in the image) per compile.
+(define (aot-ns-has-macro-var? ns)
+  (let loop ((cs (ns-cells-list ns)))
+    (cond ((null? cs) #f)
+          ((macro-var? (car cs)) #t)
+          (else (loop (cdr cs))))))
+
+;; The namespace part of a "<ns>/<name>" table key: ns names hold no '/', so the
+;; FIRST slash separates.
+(define (aot-key-ns k)
+  (let loop ((i 0))
+    (cond ((fx>=? i (string-length k)) #f)
+          ((char=? (string-ref k i) #\/) (substring k 0 i))
+          (else (loop (fx+ i 1))))))
+(define (aot-tbl-has-ns? tbl name)
+  (let ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys tbl))))
+    (let loop ((i 0))
+      (cond ((fx>=? i (vector-length ks)) #f)
+            ((string=? name (aot-key-ns (vector-ref ks i))) #t)
+            (else (loop (fx+ i 1)))))))
+
+;; A `:refer`/:refer :all of a project/library var makes this namespace forward
+;; the var's home: a consumer can call `N/x` (qualified lookup goes through N's
+;; ns map) and reach a macro/record that N's own source never defines. clojure.core
+;; and the install roots are skipped — they are part of the runtime fingerprint.
+(define (aot-ns-forwards-ref? ns)
+  (or (jolt-with-mutex ns-map-mu
+        (let ((ks (hashtable-keys ns-refer-table)))
+          (let loop ((i 0))
+            (cond ((fx>=? i (vector-length ks)) #f)
+                  (else
+                   (let ((k (vector-ref ks i)))
+                     (if (and (pair? k) (string=? ns (car k)))
+                         (let ((ref (hashtable-ref ns-refer-table k #f)))
+                           (if (and (pair? ref) (aot-cacheable-file (car ref)))
+                               #t (loop (fx+ i 1))))
+                         (loop (fx+ i 1)))))))))
+      (let ((alls (jolt-with-mutex ns-map-mu (hashtable-ref ns-refer-all-table ns #f))))
+        (and (pair? alls)
+             (let loop ((xs alls))
+               (cond ((null? xs) #f)
+                     ((aot-cacheable-file (car xs)) #t)
+                     (else (loop (cdr xs)))))))))
+
+(define (aot-ct-relevant? name)
+  (or (aot-ns-has-macro-var? name)
+      (aot-tbl-has-ns? chez-record-shapes-tbl name)
+      (aot-tbl-has-ns? chez-protocol-methods-tbl name)
+      (aot-ns-forwards-ref? name)))
+
+;; Compiles whose sidecars are not written yet: name -> the publishes waiting on
+;; it (below), each (name . publish!). A data reader's namespace in here makes
+;; the readers digest — which every key folds — provisional, since that
+;; namespace's digest reads sidecars it has yet to write.
+(define aot-open-compiles (make-hashtable string-hash string=?))
+;; ...and the eager load of the data_readers namespaces (load-data-readers!), under
+;; a key no namespace can have. Until the batch is done, a reader namespace it has
+;; yet to reach has no sidecars, so a key folded then is provisional too: with two
+;; reader namespaces where one requires the other, the one loaded first and its
+;; requires were keyed before the second had compiled, and missed on the next run.
+(define aot-readers-batch-key "#data_readers")
+(define (aot-call-with-readers-batch thunk)
+  (if (jolt-with-mutex ldr-tbl-mu (hashtable-contains? aot-open-compiles aot-readers-batch-key))
+      (thunk)
+      (dynamic-wind
+        (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-open-compiles aot-readers-batch-key '())))
+        (lambda () (thunk) (aot-settle! aot-readers-batch-key))
+        (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles aot-readers-batch-key))))))
+;; KEY's compile (or the batch) has settled: close it and publish what waited on
+;; it. Each goes back through aot-publish-when-readers-settle!, since another
+;; settle point may still be open above this one.
+(define (aot-settle! key)
+  (let ((waiting (jolt-with-mutex ldr-tbl-mu
+                   (let ((q (hashtable-ref aot-open-compiles key '())))
+                     (hashtable-delete! aot-open-compiles key)
+                     q))))
+    (for-each (lambda (w) (aot-publish-when-readers-settle! (car w) (cdr w)))
+              (reverse waiting))))
+;; The namespaces the registered data readers live in.
+(define (aot-reader-namespaces)
+  (let ((tbl (guard (e (#t #f)) (data-readers-table))))
+    (if (not (pmap? tbl))
+        '()
+        (pmap-fold tbl
+                   (lambda (k v acc)
+                     (let ((ns (cond ((and (symbol-t? v) (string? (symbol-t-ns v)))
+                                      (symbol-t-ns v))
+                                     ((var-cell? v) (var-cell-ns v))
+                                     (else #f))))
+                       (if (and ns (not (member ns acc))) (cons ns acc) acc)))
+                   '()))))
+;; Publish now, or queue it on the reader batch or the open compile of a reader
+;; namespace other than NAME. A namespace a data reader's namespace requires
+;; compiles inside that namespace's compile, so a base computed then folds a
+;; readers digest the next run can't reproduce, and the artifact would miss once
+;; more for nothing.
+(define (aot-publish-when-readers-settle! name publish!)
+  (let ((open (jolt-with-mutex ldr-tbl-mu
+                (let loop ((rs (cons aot-readers-batch-key (aot-reader-namespaces))))
+                  (cond ((null? rs) #f)
+                        ((and (not (string=? (car rs) name))
+                              (hashtable-contains? aot-open-compiles (car rs)))
+                         (hashtable-set! aot-open-compiles (car rs)
+                                         (cons (cons name publish!)
+                                               (hashtable-ref aot-open-compiles (car rs) '())))
+                         (car rs))
+                        (else (loop (cdr rs))))))))
+    (if open
+        (aot-info (string-append "deferred " name " until " open " settles"))
+        (publish!))))
 (define (aot-compile-and-cache name file src own)
   (let ((sink (aot-new-dep-sink))
         ;; the files this compile reads, collected the same way and for the same
         ;; reason (io.ss io-file-read-sink). A nested require binds its own, so a
         ;; dependency's reads are recorded against the dependency.
-        (res-sink (vector '())))
-    (let ((captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink))
-                      (aot-capture-load file src))))
-      (unless (and (string? captured) (fx>? (string-length captured) 0))
-        (aot-info (string-append "nothing captured for " name ", not caching")))
-      (when (and (string? captured) (fx>? (string-length captured) 0))
-        (let* ((deps (filter aot-cacheable-file (vector-ref sink 0)))
-               (res (vector-ref res-sink 0))
-               (base (aot-base-full name own deps res))
-               (scm (string-append base ".scm"))
-               (so  (string-append base ".so"))
-               (pid (number->string (get-process-id)))
-               (tmp-scm (string-append base ".tmp" pid ".scm"))
-               (tmp-so  (string-append base ".tmp" pid ".so")))
-          (aot-mkdir-p (path-parent base))
-          ;; the sidecars are named by the own hash alone, so the next run can read
-          ;; them back before it is able to compute the full key.
-          (aot-write-dep-list! (aot-dep-sidecar (aot-base-for-own name own)) deps)
-          (aot-write-res-list! (aot-res-sidecar (aot-base-for-own name own)) res)
-          ;; this run already computed digests for `name` from the OLD sidecars;
-          ;; drop them so a later require in the same process sees the new ones.
-          (jolt-with-mutex ldr-tbl-mu
-            (hashtable-delete! aot-dep-digest-memo name)
-            (hashtable-delete! aot-res-digest-memo name))
-          (guard (e (else (aot-info (string-append "compile failed for " name))
-                          (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
-            (let ((out (open-output-file tmp-scm 'replace)))
-              (put-string out captured)
-              (put-string out (format "\n(aot-mark-complete! ~s)\n" name))
-              (close-output-port out))
-            (rename-file tmp-scm scm)
-            ;; compile-file prints "compiling X with output to Y" per file to
-            ;; current-output-port by default — swallow it so a cache miss can't
-            ;; corrupt the running program's stdout.
+        (res-sink (vector '()))
+        (stamps (vector file '())))
+    ;; open until the sidecars are written; an unwind drops whatever was queued
+    ;; on it, which then only misses next run
+    (dynamic-wind
+      (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-open-compiles name '())))
+      (lambda ()
+        (let ((captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink)
+                                       (jolt-def-ordinal-sink stamps))
+                          (aot-capture-load file src))))
+          (if (and (string? captured) (fx>? (string-length captured) 0))
+              (let* ((deps (filter aot-cacheable-file (vector-ref sink 0)))
+                     (res (vector-ref res-sink 0))
+                     (obase (aot-base-for-own name own)))
+                (aot-write-sidecars! name own obase deps res)
+                (aot-publish-when-readers-settle!
+                  name (lambda () (aot-publish-artifact! name own deps res captured stamps))))
+              (aot-info (string-append "nothing captured for " name ", not caching")))
+          ;; with or without sidecars this namespace's digest is final now, so
+          ;; what waited on it goes ahead either way
+          (aot-settle! name)))
+      (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles name))))))
+;; Everything a later run reads back BEFORE it can compute the full key: the
+;; sidecars are named by the own hash alone.
+(define (aot-write-sidecars! name own obase deps res)
+  ;; the dep list this namespace assumed inert when its key was computed (or when
+  ;; its previous artifact was written), which the .cti below records
+  (let ((assumed (aot-assumed-inert name own)))
+    (aot-mkdir-p (path-parent obase))
+    (aot-write-dep-list! (aot-dep-sidecar obase) deps)
+    (aot-write-res-list! (aot-res-sidecar obase) res)
+    ;; ...and the compile-time-relevance flag that lets a later run skip an
+    ;; inert dependency (aot-narrow?). Only computed/kept when narrowing is
+    ;; in force; a missing sidecar reads as "unknown" and stays conservative.
+    ;; The .cti records the direct deps whose key contribution was the inert
+    ;; constant, so a later run whose dep flags are missing again can make the
+    ;; same assumption and then VERIFY it after a hit (aot-assumptions-hold?).
+    (when (aot-narrow?)
+      (aot-write-ct! obase (aot-ct-relevant? name) (aot-ns-surface name))
+      (aot-write-cti! obase
+                      (fold-right (lambda (d acc)
+                                    (let ((sf (aot-dep-surface d assumed)))
+                                      (if sf (cons (cons d sf) acc) acc)))
+                                  '() deps)))
+    ;; this run already computed digests for `name` from the OLD sidecars; drop
+    ;; them so the base, and a later require in the same process, see the new
+    ;; ones. The readers digest folds namespace digests too — `name` may be a
+    ;; data reader's namespace, or below one — and every key folds it. Memoized
+    ;; from before these sidecars existed, it keyed every artifact this run wrote
+    ;; on a value the next run can't reproduce.
+    (jolt-with-mutex ldr-tbl-mu
+      (hashtable-delete! aot-dep-digest-memo name)
+      (hashtable-delete! aot-res-digest-memo name)
+      (hashtable-delete! aot-ct-state-memo name)
+      (hashtable-delete! aot-assumed-memo name)
+      (unless (eq? aot-readers-digest-memo 'computing)
+        (set! aot-readers-digest-memo 'unset)))))
+;; The artifact under its full key: the captured Scheme, then its fasl.
+(define (aot-publish-artifact! name own deps res captured stamps)
+  (let* ((base (aot-base-full name own deps res))
+         (scm (string-append base ".scm"))
+         (so  (string-append base ".so"))
+         (pid (number->string (get-process-id)))
+         (tmp-scm (string-append base ".tmp" pid ".scm"))
+         (tmp-so  (string-append base ".tmp" pid ".so")))
+    (guard (e (else (aot-info (string-append "compile failed for " name))
+                    (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
+      (let ((out (open-output-file tmp-scm 'replace)))
+        (put-string out captured)
+        ;; the first-def stamps this load made, replayed against whatever
+        ;; file the artifact is loaded for (aot-replay-def-ordinals!)
+        (put-string out (format "\n(aot-replay-def-ordinals! '~s)" (reverse (vector-ref stamps 1))))
+        (put-string out (format "\n(aot-mark-complete! ~s)\n" name))
+        (close-output-port out))
+      (rename-replace! tmp-scm scm)
+      ;; The fasl is for FUTURE runs; with a worker (JOLT_AOT_ASYNC=1) it
+      ;; compiles there and this run starts without waiting. Otherwise the
+      ;; in-process compile: compile-file prints "compiling X with output to
+      ;; Y" per file to current-output-port by default — swallow it so a
+      ;; cache miss can't corrupt the running program's stdout.
+      (if (aot-enqueue-compile! scm so)
+          (aot-info (string-append "queued " name))
+          (begin
             (parameterize ((current-output-port (open-output-string)))
               (sa-compile-file scm tmp-so #f))
-            (rename-file tmp-so so))
-          (unless (file-exists? so)
-            (aot-info (string-append "no .so produced for " name))))))))
+            (rename-replace! tmp-so so)
+            (unless (file-exists? so)
+              (aot-info (string-append "no .so produced for " name))))))))
 ;; Evaluate a namespace's top-level forms from COMPILED code — an embedded fasl,
 ;; an AOT-cached .so, a classpath artifact. RT.load brackets a compiled class's
 ;; init with the compiler-flag vars exactly as Compiler.load brackets a source
@@ -1170,19 +1925,41 @@
 ;; require dedups) and the fresh full load re-runs them; install-owned
 ;; namespaces, whose defs DO get set!-overridden after load, never take this
 ;; path at all. Non-fatal — a repeated failure just misses every run.
-(define (aot-safe-load-or-recompile name file src own base)
+;; The file a cached artifact is being loaded for, while it loads.
+(define aot-loading-file (make-parameter #f))
+;; Replay the first-def stamps a source load of the artifact's file made (rt.ss
+;; var-def-ordinals): a cached load runs compiled defs outside the reader walk
+;; that stamps them, and a build's pass 1 loading from the cache would otherwise
+;; hand the emit walk an unstamped program — the #451 forward-reference
+;; divergence. First writer wins, as for a source load.
+(define (aot-replay-def-ordinals! stamps)
+  (let ((file (aot-loading-file)))
+    (when file
+      (for-each (lambda (s) (var-def-ordinal-stamp1! file (car s) (cadr s) (caddr s)))
+                stamps))))
+
+(define (aot-safe-load-or-recompile name file source base assumed-now)
   (let ((so (string-append base ".so")))
     (define (recover! why)
       (aot-info (string-append why " cache for " name ", recompiling"))
       (delete-file so #f)           ; best-effort; ignore if already gone
       (delete-file (string-append base ".scm") #f)
-      (aot-compile-and-cache name file src own))
+      (let ((ks (force source)))
+        (aot-compile-and-cache name file (cdr ks) (car ks))))
     (let ((state (guard (e (else 'corrupt))
                    (aot-complete-reset! name)
-                   (ldr-with-compiled-ns-vars (lambda () (load so)))
+                   (parameterize ((aot-loading-file file))
+                     (ldr-with-compiled-ns-vars (lambda () (load so))))
                    (if (aot-complete? name) 'ok 'incomplete))))
       (case state
-        ((ok) (aot-complete-reset! name))     ; done with the entry
+        ;; loaded — but if the key was computed with an inert ASSUMPTION for a dep
+        ;; whose flag was missing then, the artifact's own requires have now loaded
+        ;; (and recompiled) those deps: each must have turned out inert. Otherwise
+        ;; this artifact was compiled against a dependency whose compile-time
+        ;; surface has since moved, and it must be recompiled from source.
+        ((ok) (if (aot-assumptions-hold? assumed-now)
+                  (aot-complete-reset! name)     ; done with the entry
+                  (recover! "stale-assumption")))
         ((incomplete) (recover! "incomplete"))
         (else (recover! "corrupt"))))))
 ;; Load an embedded compiled fasl for `name` if one was baked into this binary.
@@ -1241,7 +2018,7 @@
          ;; embedded fasl registered but failed to load: fall back to source.
          (load-jolt-file file))))
     ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
-          (not (ldr-source-only?))
+          (or (not (ldr-source-only?)) (ldr-build-aot-cache?))
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so
           ;; there is no key that would be safe to reuse.
@@ -1251,20 +2028,32 @@
      ;; to the enclosing one. A hit binds #f on both: the fasl it loads re-runs
      ;; the requires and re-does the reads, and those are already described by
      ;; this namespace's own sidecars.
-     (let* ((src (ldr-read-source file))
-            (own (aot-cache-key src))
-            (obase (aot-base-for-own name own))
-            (base (aot-base-full name own
-                                 (aot-read-dep-list (aot-dep-sidecar obase))
-                                 (aot-read-dep-list (aot-res-sidecar obase))))
-            (so (string-append base ".so")))
+     (let*-values (((own source) (aot-load-key name file)))
+      (let* ((obase (aot-base-for-own name own))
+            (deps (aot-read-dep-list (aot-dep-sidecar obase)))
+            (assumed (aot-assumed-inert name own))
+            (base (aot-base-full name own deps (aot-read-dep-list (aot-res-sidecar obase))))
+            (so (string-append base ".so"))
+            ;; deps the key is folding as a constant only because their current flag
+            ;; is missing and the recorded assumption says inert — the ones a HIT
+            ;; has to verify after the artifact's requires have loaded them.
+            (assumed-now (fold-right
+                           (lambda (d acc)
+                             (let ((a (and (eq? (aot-ct-state d) 'unknown) (assoc d assumed))))
+                               (if a (cons a acc) acc)))
+                           '() deps)))
        (if (file-exists? so)
            (begin (aot-info (string-append "hit " name))
                   (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
-                    (aot-safe-load-or-recompile name file src own base)))
+                    (aot-safe-load-or-recompile name file source base assumed-now)))
            (begin (aot-info (string-append "miss " name))
-                  (aot-compile-and-cache name file src own)))))
-    (else (parameterize ((aot-dep-sink #f) (io-file-read-sink #f)) (load-jolt-file file)))))
+                  (let ((ks (force source)))
+                    (aot-compile-and-cache name file (cdr ks) (car ks))))))))
+    (else
+     ;; a reload bypasses the cache, and whatever key this process read for the
+     ;; namespace before may no longer describe its source
+     (when force? (aot-forget-own-key! name))
+     (parameterize ((aot-dep-sink #f) (io-file-read-sink #f)) (load-jolt-file file)))))
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
 ;; Namespaces defined by the CLI's OWN AOT closure (bld-emit-cli-aot bakes
@@ -1344,7 +2133,7 @@
 ;; covered by the runtime fingerprint.
 (define (cpath-source-key name)
   (let ((f (aot-cacheable-file name)))
-    (if f (aot-cache-key (ldr-read-source f)) "")))
+    (if f (aot-cache-key (ldr-read-source-bytes f)) "")))
 
 ;; Does `name` still hash to what the artifact recorded for it? An empty key now
 ;; means there is no source to be stale against — the artifact-only deploy, where
@@ -1405,6 +2194,13 @@
 ;; would hand it a path with no source behind it. Compiled output is a load
 ;; shortcut; a build wants the real thing.
 (define ldr-source-only? (make-thread-parameter #f))
+;; ...except the AOT cache, when the build's pass 1 asks for it: a cached
+;; namespace loads the same program its source would (the cache's contract for
+;; `jolt run`), replays its def-ordinal stamps (aot-replay-def-ordinals!), and
+;; the emit walk reads the source file the ns-loaded hook names either way. The
+;; build otherwise recompiled every namespace from source on every build just
+;; to load it — 16s of a 46s rebuild of a 231-namespace app (#1059).
+(define ldr-build-aot-cache? (make-thread-parameter #f))
 
 ;; The base path of the first usable artifact for `name` on the source roots, or
 ;; #f. This is the load side: the JVM finds compiled output through the classpath,
@@ -1465,14 +2261,14 @@
     (guard (e (else (delete-file tmp-scm #f) (delete-file tmp-so #f) (raise e)))
       (let ((out (open-output-file tmp-scm 'replace)))
         (put-string out captured) (close-output-port out))
-      (rename-file tmp-scm (cpath-scm-file base))
+      (rename-replace! tmp-scm (cpath-scm-file base))
       ;; compile-file narrates to current-output-port by default — swallow it so a
       ;; compile can't corrupt the running program's stdout.
       (parameterize ((current-output-port (open-output-string)))
         (sa-compile-file (cpath-scm-file base) tmp-so #f))
       (delete-file (cpath-so-file base) #f)
       (cpath-write-meta! (cpath-meta-file base) (cpath-meta-lines name deps))
-      (rename-file tmp-so (cpath-so-file base)))
+      (rename-replace! tmp-so (cpath-so-file base)))
     base))
 
 ;; The compiling load: evaluate the namespace while capturing its emitted Scheme,
@@ -1965,10 +2761,15 @@
       ;; that DECLARES it, whichever way the load was reached — the class-miss
       ;; autoload, or a plain require from another provider's install namespace
       ;; (host-static.ss lib-with-install-ns-mark, jolt#926).
+      ;;
+      ;; The load's jar reads share one reader per archive (zip-file.ss
+      ;; call-with-zipdir-read-scope); a nested load joins the outer one's scope.
       (dynamic-wind
         (lambda () (ldr-assert-claim! name))
         (lambda ()
-          (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))
+          (call-with-zipdir-read-scope
+            (lambda ()
+              (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))))
           (set! finished? #t))
         (lambda ()
           (unless (jolt-park-unwinding?)
@@ -2038,9 +2839,19 @@
                                               " was compiled by a different jolt build, or"
                                               " a namespace it requires has changed — recompile it"))))))))))
 
-;; load-file: load an explicit path (a `run FILE`), in the current ns.
+;; load-file / load run a file's forms starting in the current ns, and put
+;; *ns* back afterwards however the load exits: Compiler.load binds *ns* for the
+;; duration, so an `ns` form in the loaded file never leaks into the caller.
+(define (load-jolt-file/restoring-ns path)
+  (let ((saved (chez-current-ns)))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda () (load-jolt-file path))
+      (lambda () (set-chez-ns! saved)))))
+
+;; load-file: load an explicit path, in the current ns.
 (define (jolt-load-file path)
-  (load-jolt-file path)
+  (load-jolt-file/restoring-ns path)
   jolt-nil)
 
 ;; expand-spec: the shared prefix-list expansion (expand-libspec, ns.ss) —
@@ -2098,7 +2909,7 @@
                     (else (let ((dir (ns-rel-dir (chez-current-ns))))
                             (if (string=? dir "") p (string-append dir "/" p))))))
              (f (resolve-on-roots rel)))
-        (if f (load-jolt-file f)
+        (if f (load-jolt-file/restoring-ns f)
             (throw-jvm (quote java.io.FileNotFoundException) (string-append "Could not locate resource on source roots: " p)))))
     paths)
   jolt-nil)
@@ -2108,13 +2919,20 @@
 ;; `sh` runs `sh -c CMD`, inheriting stdout/stderr (so git progress shows), and
 ;; returns the exit code. `sh-out` captures stdout to a string (exit ignored) for
 ;; commands whose output we parse (git rev-parse). Used by jolt.deps for git.
-(define (jolt-sh cmd) (system cmd))
+;;
+;; Both spawn with an EMPTY signal mask, as ProcessBuilder does (process.ss): the
+;; CLI blocks SIGTERM/SIGHUP/SIGINT on the primordial thread at entry for the
+;; shutdown watcher (java/concurrency.ss), a blocked mask survives fork and exec,
+;; and bash — /bin/sh on macOS and several Linuxes — does not clear it. The
+;; child and everything it starts would then ignore ^C and a plain `kill`.
+(define (jolt-sh cmd) (jolt-with-empty-sigmask (lambda () (system cmd))))
 (def-var! "jolt.host" "sh" jolt-sh)
 
 (define (jolt-sh-out cmd)
   (call-with-values
-    (lambda () (sa-run-process (string-append "exec sh -c " (sh-quote cmd))
-                               (native-transcoder)))
+    (lambda () (jolt-with-empty-sigmask
+                 (lambda () (sa-run-process (string-append "exec sh -c " (sh-quote cmd))
+                                            (native-transcoder)))))
     (lambda (stdin stdout stderr pid)
       (close-port stdin)
       (let ((out (get-string-all stdout)))
@@ -2191,10 +3009,12 @@
       (aot-delete-tree p)
       (if (file-exists? p) #f #t))))
 ;; `mv` within one filesystem: rename(2), which is the atomicity the publish
-;; steps (a staged cache entry, a staged git checkout) depend on.
+;; steps (a staged cache entry, a staged git checkout) depend on — INCLUDING
+;; rename(2)'s replacement of an existing destination, which Windows refuses
+;; (java/io.ss rename-replace!, jolt-lang/jolt#1074).
 (def-var! "jolt.host" "rename-file!"
   (lambda (from to)
-    (guard (e (#t #f)) (rename-file (host-fs-path from) (host-fs-path to)) #t)))
+    (guard (e (#t #f)) (rename-replace! (host-fs-path from) (host-fs-path to)) #t)))
 ;; last-modified in epoch milliseconds, 0 when absent — what `test -nt` compared.
 (def-var! "jolt.host" "file-mtime"
   (lambda (p)
@@ -2239,12 +3059,21 @@
     (let ((bv (jar-path-bytes p)))
       (if bv (utf8->string bv) jolt-nil))))
 
-;; The path NAME resolves to on ROOT — a file under a directory root, a jar
-;; path into a jar root — or nil. jolt.loader's roots backend locates through
-;; this so a context's roots may hold jars as the global roots may.
+;; The location NAME resolves to on ROOT — a file under a directory root, a
+;; jar path into a jar root, an embedded key under an "embed:<prefix>" root —
+;; or nil. jolt.loader's roots backend locates through this so a context's
+;; roots may hold jars (and embedded roots) as the global roots may.
 (def-var! "jolt.host" "root-file"
   (lambda (root name)
     (or (ldr-root-file (host-fs-path root) name) jolt-nil)))
+
+;; True when NAME is a key in the runtime's embedded-resource table — what
+;; deps.edn :jolt/build {:embed [dirs]} bakes into a binary, and what a
+;; jolt.loader embedded root ("embed:<prefix>", ldr-embedded-root? above)
+;; resolves against. The Clojure side reads such a source through the host
+;; resolver instead of opening the key as a filesystem path.
+(def-var! "jolt.host" "embedded-resource?"
+  (lambda (name) (if (embedded-resource-has? name) #t #f)))
 
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked
 ;; release tag in a binary, $JOLT_VERSION under bin/jolt, else "dev".

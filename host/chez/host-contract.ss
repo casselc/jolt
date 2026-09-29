@@ -31,6 +31,7 @@
 (define hc-kw-ns    (keyword #f "ns"))
 (define hc-kw-name  (keyword #f "name"))
 (define hc-kw-var   (keyword #f "var"))
+(define hc-kw-private (keyword #f "private"))
 (define hc-kw-unresolved (keyword #f "unresolved"))
 (define hc-kw-class (keyword #f "class"))
 (define hc-kw-num-ret (keyword #f "num-ret"))
@@ -273,7 +274,13 @@
             ;; a :refer'd name resolves to its source ns
             (let ((ref (chez-resolve-refer (chez-actx-cns ctx) nm)))
               (and ref (var-cell-lookup (car ref) (cdr ref))))
-            (var-cell-lookup "clojure.core" nm)))))
+            ;; clojure.core last — unless (:refer-clojure :exclude [nm]) or
+            ;; ns-unmap took the name out of this ns. The JVM has no core
+            ;; mapping to fall back on then, so a use ABOVE the ns's own
+            ;; (defn nm …) is "Unable to resolve symbol", not clojure.core/nm
+            ;; (jolt#1095). The same guard jsq-resolve-symbol applies.
+            ;; Public vars only, as the JVM's refer maps them.
+            (chez-core-refer-cell (chez-actx-cns ctx) nm)))))
 
 ;; Runtime macros: a defmacro is emitted into the prelude as a
 ;; def-var! of its cross-compiled expander fn plus (mark-macro! ns name), so the
@@ -355,10 +362,21 @@
                (if changed (hc-keep-identity form (apply jolt-hash-map kvs)) form)))))
       (else form))))
 
+;; A symbol's metadata map is walked too: a def evaluates its name's metadata, so
+;; (def ^{:test (fn [] '`foo)} x …) — the shape clojure.test's deftest expands to
+;; — must not keep a marker the same code in the init would have had lowered.
+(define (hc-walk-sym-meta visit form)
+  (let ((m (symbol-t-meta form)))
+    (if (pmap? m)
+        (let ((nm (hc-walk-map visit m)))
+          (if (eq? nm m) form (jolt-with-meta form nm)))
+        form)))
+
 (define (hc-walk-form visit form)
   (cond
     ((visit form))
-    ((or (symbol-t? form) (hc-literal? form) (empty-list-t? form)) form)
+    ((symbol-t? form) (hc-walk-sym-meta visit form))
+    ((or (hc-literal? form) (empty-list-t? form)) form)
     ((cseq? form)
      (let-values (((items changed) (hc-walk-items visit (seq->list form))))
        (if (not changed)
@@ -532,11 +550,18 @@
   (let* ((nm (symbol-t-name sym))
          (cell (hc-resolve-cell ctx sym)))
     (if (and cell (var-cell-defined? cell))
-        (let ((base (jolt-hash-map hc-kw-kind hc-kw-var
-                                   hc-kw-ns (var-cell-ns cell)
-                                   hc-kw-name (var-cell-name cell)))
-              (nr (hc-cell-num-ret cell)))
-          (if nr (jolt-assoc base hc-kw-num-ret nr) base))
+        (let* ((base (jolt-hash-map hc-kw-kind hc-kw-var
+                                    hc-kw-ns (var-cell-ns cell)
+                                    hc-kw-name (var-cell-name cell)))
+               (nr (hc-cell-num-ret cell))
+               (base (if nr (jolt-assoc base hc-kw-num-ret nr) base)))
+          ;; :private — a ^:private var of ANOTHER namespace, which the analyzer
+          ;; refuses to reference ("var: a/hidden is not public"), as the JVM's
+          ;; Compiler.resolveIn / isMacro do. (var a/hidden) still takes it.
+          (if (and (not (string=? (var-cell-ns cell) (chez-actx-cns ctx)))
+                   (var-private? cell))
+              (jolt-assoc base hc-kw-private #t)
+              base))
         (cond
           ;; java.util.Map / clojure.lang.Named — a dotted class name.
           ((hc-fq-class-name? nm) (jolt-hash-map hc-kw-kind hc-kw-class hc-kw-name nm))
@@ -935,6 +960,8 @@
     ;; (records.ss jrec-field). Declared here like the rest so the list matches
     ;; native-ops, which manifest-check.sh enforces.
     "__deftype-field"
+    ;; the `lazy-seq` macro's two halves (lazy-bridge.ss): internal names too
+    "make-lazy-seq" "coll->cells" "chunked-seq?"
     "aget" "aset" "alength"
     "bit-and" "bit-or" "bit-xor" "bit-not"
     "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"

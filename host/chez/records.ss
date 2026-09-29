@@ -328,13 +328,42 @@
 ;; handed a class and has to answer what that class declares.
 (define chez-record-fields-tbl (make-hashtable string-hash string=?))
 
+;; --- inference-registry materialization cache ---------------------------------
+;; chez-record-shapes-map / chez-protocol-methods-map walk the registries above
+;; and rebuild a whole jolt map on every call. jolt.passes/run-passes calls BOTH
+;; once per emitted top-level form — 441us + 173us measured against kmet's 153
+;; records / 124 methods, ~615us a form, ~4.8s of a build whose 7750 forms are
+;; emitted. The registries only change when a type or protocol is DEFINED, so a
+;; cached map is served until the next registration.
+;;
+;; Every writer clears the cache under chez-infer-map-mu, and the reader
+;; re-checks the generation after building, so a registration racing a read can
+;; never publish a map that predates it. The reader never holds
+;; chez-infer-map-mu while scanning the tables, so a writer holding rec-tbl-mu
+;; can take chez-infer-map-mu without a lock-order cycle. A miss on the race just
+;; rebuilds next call — the same work the uncached version did every call.
+;; register-record-type! and register-protocol-method bump too, though they
+;; mutate other tables: chez-type-owns-lookup? (consulted per record while
+;; building the shapes map) reads the defrecord-type and protocol-method
+;; registries, so a change there changes the materialized map.
+(define chez-infer-map-mu (make-mutex))
+(define chez-infer-registry-gen 0)
+(define chez-record-shapes-memo #f)      ; (generation . map) or #f
+(define chez-protocol-methods-memo #f)
+(define (chez-infer-registry-bump!)
+  (jolt-with-mutex chez-infer-map-mu
+    (set! chez-infer-registry-gen (fx+ chez-infer-registry-gen 1))
+    (set! chez-record-shapes-memo #f)
+    (set! chez-protocol-methods-memo #f)))
+
 (define (register-record-shape! ctor-key field-kws field-tags type-tag)
   (jolt-with-mutex rec-tbl-mu
     (hashtable-set! chez-record-shapes-tbl ctor-key
                     (vector field-kws field-tags type-tag))
     (hashtable-set! chez-record-fields-tbl type-tag field-kws)
     (hashtable-set! chez-record-dbl-tbl type-tag
-                    (list->vector (map chez-double-tag? field-tags)))))
+                    (list->vector (map chez-double-tag? field-tags))))
+  (chez-infer-registry-bump!))
 
 ;; Coerce ^double fields to flonums in-place on a freshly-built field vector.
 ;; simple name of a dotted/slashed string: the segment after the last . or /.
@@ -383,8 +412,9 @@
           (else (loop (+ i 1))))))
 
 ;; materialize chez-record-shapes-tbl into "ns/->Name" -> {:fields :tags :type},
-;; the shape record-type-from-entry consumes.
-(define (chez-record-shapes-map)
+;; the shape record-type-from-entry consumes. Built fresh; chez-record-shapes-map
+;; below serves it from the generation cache.
+(define (chez-record-shapes-map-build)
   (let ((by-name (make-hashtable string-hash string=?))
         (kw-fields (keyword #f "fields")) (kw-tags (keyword #f "tags")) (kw-type (keyword #f "type"))
         (out (jolt-hash-map)))
@@ -435,7 +465,8 @@
                 (else (loop (cdr ks))))))))
 
 ;; materialize chez-protocol-methods-tbl into "ns/method" -> [proto method].
-(define (chez-protocol-methods-map)
+;; Built fresh; chez-protocol-methods-map below serves it from the generation cache.
+(define (chez-protocol-methods-map-build)
   (let ((out (jolt-hash-map)))
     (let-values (((ks vs) (jolt-with-mutex rec-tbl-mu
                             (let-values (((a b) (hashtable-entries chez-protocol-methods-tbl)))
@@ -444,6 +475,34 @@
         (lambda (k v) (set! out (jolt-assoc out k (jolt-vector (car v) (cdr v)))))
         ks vs))
     out))
+
+;; Serve the shapes map from the generation cache, rebuilding only after a
+;; registration moved the generation. The generation is re-read after the build:
+;; a writer that bumped while the build was in flight leaves the generation
+;; different, and the fresh map is used for this call but not published, so the
+;; next call rebuilds against the newer registries instead of installing a
+;; pre-registration snapshot. See the cache block above.
+(define (chez-record-shapes-map)
+  (let ((gen chez-infer-registry-gen))
+    (let ((memo chez-record-shapes-memo))
+      (if (and memo (fx=? (car memo) gen))
+          (cdr memo)
+          (let ((m (chez-record-shapes-map-build)))
+            (jolt-with-mutex chez-infer-map-mu
+              (when (fx=? chez-infer-registry-gen gen)
+                (set! chez-record-shapes-memo (cons gen m))))
+            m)))))
+
+(define (chez-protocol-methods-map)
+  (let ((gen chez-infer-registry-gen))
+    (let ((memo chez-protocol-methods-memo))
+      (if (and memo (fx=? (car memo) gen))
+          (cdr memo)
+          (let ((m (chez-protocol-methods-map-build)))
+            (jolt-with-mutex chez-infer-map-mu
+              (when (fx=? chez-infer-registry-gen gen)
+                (set! chez-protocol-methods-memo (cons gen m))))
+            m)))))
 
 ;; A type that declares its own clojure.lang.ILookup has its fields MASKED from
 ;; the get path: on the JVM a bare deftype has no key lookup but the one it
@@ -459,6 +518,25 @@
 (define (jrec-field-index r k)
   (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
     (and i (if (fx<? i 0) (fx- -1 i) i))))
+;; The declared slot an interop member name K (a keyword) reads or sets, as its
+;; keyword, or #f. The JVM compiler munges a member name before the reflector
+;; looks, and a slot's Java field is its own munged name, so two spellings that
+;; munge alike name one slot: (.-processed_count r) reads [processed-count],
+;; (.-my-field r) reads [my_field], (.-ready_QMARK_ r) reads [ready?]. The
+;; spelling as written is tried first, so a read that matches never munges.
+;; Only the interop field paths go through this; a keyword read stays exact, as
+;; on the JVM ((:processed_count r) is nil). class-munge-name
+;; (java/host-class.ss) loads after this file and is resolved at call time.
+(define (jrec-member-field r k)
+  (if (jrec-field-index r k)
+      k
+      (let ((m (class-munge-name (keyword-t-name k)))
+            (fkeys (jrdesc-fkeys (jrec-desc r))))
+        (let loop ((i 0))
+          (cond ((fx=? i (vector-length fkeys)) #f)
+                ((string=? (class-munge-name (keyword-t-name (vector-ref fkeys i))) m)
+                 (vector-ref fkeys i))
+                (else (loop (fx+ i 1))))))))
 ;; the slot the GET path may read — #f for a masked type, so get falls through to
 ;; the valAt that type declares.
 (define (jrec-get-index r k)
@@ -593,7 +671,8 @@
 ;; this; returns v, as set! does.
 (define (jolt-set-field! inst k v)
   (if (jrec? inst)
-      (let ((i (jrec-field-index inst k)))
+      (let ((i (let ((k2 (and (keyword-t? k) (jrec-member-field inst k))))
+                 (and k2 (jrec-field-index inst k2)))))
         (if i (let* ((flags (hashtable-ref chez-record-dbl-tbl (jrec-tag inst) #f))
                      ;; a ^double field stays a flonum across set!, like the ctor —
                      ;; keeps a later field read sound to unbox.
@@ -614,7 +693,7 @@
         ((or (jolt-nil? ea) (jolt-nil? eb)) #f)
         (else (jolt=2 ea eb))))
 (define (jrec=? a b)
-  (and (string=? (jrec-tag a) (jrec-tag b))
+  (and (or (eq? (jrec-desc a) (jrec-desc b)) (string=? (jrec-tag a) (jrec-tag b)))
        (let ((n (jrec-nfields a)))
          (and (= n (jrec-nfields b))
               (let loop ((i 0))
@@ -695,6 +774,14 @@
     ((jrec-coll-print-shape r) => (lambda (shape) (jrec-coll-pr r shape)))
     (else (jrec-field-pr r))))
 (define (jrec-field-pr r)
+  ;; the JVM spelling of the tag (my_app.core.Foo for a type in my-app.core):
+  ;; what the JVM's reader resolves a record literal by, and what its own
+  ;; printer writes. jolt's reader takes either spelling (reader.ss).
+  ;; The map part obeys *print-level* / *print-length* like any map — the JVM
+  ;; writes #tag then print-map, so a level past the limit is #tag#.
+  (string-append "#" (jch-munge-segments (jrec-tag r))
+                 (if (jolt-print-hash?) "#" (with-deeper-print (jrec-field-body r)))))
+(define (jrec-field-body r)
   ;; one "k v" string per entry, joined once: the extension map is unbounded
   ;; (any non-field key assoc'd on lands there), and appending each entry to a
   ;; growing accumulator is quadratic in the entry count.
@@ -715,7 +802,4 @@
                       (cons (string-append (jolt-pr-readable (vector-ref fkeys i)) " "
                                            (jolt-pr-readable (jrec-field-ref r i)))
                             acc))))))
-    ;; the JVM spelling of the tag (my_app.core.Foo for a type in my-app.core):
-    ;; what the JVM's reader resolves a record literal by, and what its own
-    ;; printer writes. jolt's reader takes either spelling (reader.ss).
-    (string-append "#" (jch-munge-segments (jrec-tag r)) "{" (jolt-str-join-comma entry-strs) "}")))
+    (string-append "{" (jolt-str-join-comma (jolt-limited-list-strs entry-strs)) "}")))

@@ -80,7 +80,10 @@
 (bld-system (string-append "mkdir -p '" (path-parent jb-out) "' '" jb-build "'"))
 
 ;; --- 0. compile the launcher stub -------------------------------------------
-(define jb-stub (string-append jb-build "/launcher"))
+;; A Windows linker names its output "<name>.exe" whatever -o says, so the stub
+;; is named that way for a Windows target: a native MSYS2 build only found
+;; "launcher" through MSYS's own .exe lookup, and a cross build has none.
+(define jb-stub (string-append jb-build (if (bld-tgt-nt?) "/launcher.exe" "/launcher")))
 (display "build-jolt: compiling launcher stub\n")
 (bld-system (string-append
   (bld-cc) " " (bld-arch-flag) " -O2 -I'" (bld-csv-dir) "' 'host/chez/stub/launcher.c' '"
@@ -229,20 +232,19 @@
         (\"host/chez/stub/jolt_zlib.h\" \"jolt_zlib_h\" \"jolt_zlib_h_len\")))))
 
 (suppress-greeting #t)
-;; GC tuning: larger nursery for allocation-heavy workloads. Default 16 MB;
-;; override via JOLT_GC_TRIP_BYTES env (integer bytes).
-(sa-gc-trip-bytes!
-  (let ((trip (getenv \"JOLT_GC_TRIP_BYTES\"))
-        (default (* 16 1024 1024)))
-    (if trip (or (string->number trip) default) default)))
-;; A heap ceiling, matching the JVM's MaxRAMPercentage default. Installed HERE
-;; and not at heap-build: it reads syscalls and the environment, both of which
+;; The collector policy: a nursery sized by the time collection takes (16MB
+;; floor, JOLT_GC_TRIP_BYTES pins it) and a heap ceiling matching the JVM's
+;; MaxRAMPercentage default (rt.ss jolt-install-gc-policy!). Installed HERE and
+;; not at heap-build: it reads syscalls and the environment, both of which
 ;; belong to the running process rather than the build.
-(jolt-install-heap-ceiling!)
+(jolt-install-gc-policy!)
 
 (scheme-start
   (lambda args
     (jolt-startup-profile-mark! \"heap built (scheme-start entered)\")
+    ;; this process can spawn copies of itself: the async AOT worker's gate
+    ;; (loader.ss aot-worker-capable?)
+    (set! jolt-standalone-binary #t)
     (set-source-roots! " (ldr-install-roots-str) ")
     (jolt-startup-profile-mark! \"source roots + data readers\")
     ;; JOLT_TRACE at RUNTIME (the env is unset at heap-build), before any app ns

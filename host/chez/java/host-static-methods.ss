@@ -13,7 +13,11 @@
 ;; complex plane for out-of-domain real inputs) becomes +nan.0, matching Java;
 ;; real results stay flonums, NaN/Inf pass through. real? is #f on a Chez complex.
 (define (real-or-nan x) (if (and (number? x) (real? x)) (exact->inexact x) +nan.0))
-(define math-pi (acos -1.0))
+;; java.lang.Math's PI/E are compile-time double literals in the JDK, not the
+;; host libm's atan(1)/exp(1) — pin the same doubles so a platform whose libm
+;; rounds exp(1) one ulp high (bionic's) still answers the JVM's value.
+(define math-pi 3.141592653589793)
+(define math-e 2.718281828459045)
 ;; Every Math method takes numbers (PI/E are values, not methods), and each one
 ;; hands its argument to a Chez numeric primitive. Check at the boundary: the
 ;; condition Chez raises for a wrong-typed operand carries no class, so it would
@@ -23,7 +27,8 @@
 (define (math-checked entry)
   (let ((f (cdr entry)))
     (if (procedure? f)
-        (cons (car entry) (lambda args (apply f (map jolt-need-num args))))
+        (cons (car entry)
+              (host-arity-like f (lambda args (apply f (map jolt-need-num args)))))
         entry)))
 (register-class-statics! "Math"
   (map math-checked
@@ -82,7 +87,7 @@
         (cons "scalb" (lambda (x n) (->dbl (* (exact->inexact x) (expt 2.0 (jnum->exact n))))))
         (cons "max" (lambda (a b) (if (> a b) a b))) (cons "min" (lambda (a b) (if (< a b) a b)))
         (cons "signum" (lambda (x) (cond ((< x 0) -1.0) ((> x 0) 1.0) (else 0.0))))
-        (cons "PI" (->dbl (* 4 (atan 1)))) (cons "E" (->dbl (exp 1)))
+        (cons "PI" math-pi) (cons "E" math-e)
         (cons "random" (lambda args (jolt-random 1.0))))))
 
 ;; Thread: real OS threads back futures/promises.
@@ -387,7 +392,7 @@
                      ;; System.gc is a HINT on the JVM and never throws; Chez's
                      ;; collect refuses when multiple threads are active, so a
                      ;; guarded no-op is the faithful behavior under live threads.
-                     (guard (e (#t #f)) (sa-gc-collect))
+                     (guard (e (#t #f)) (jolt-collect-full!))
                      jolt-nil))
         ;; No finalizers on this host, so running them is genuinely a no-op — which
         ;; is also all the JVM promises (a hint, deprecated for removal since 18).
@@ -682,7 +687,55 @@
         ;; Character.codePointOf(name) is deliberately absent: it is a lookup in the
         ;; Unicode character-name database, which this host does not carry, and a
         ;; partial ASCII-only table would answer wrongly rather than not at all.
+        ;; So are getNumericValue (the numeric value of a Roman numeral or a vulgar
+        ;; fraction is a table Chez does not expose) and reverseBytes (it can answer
+        ;; a surrogate, which is no char here).
+        ;;
+        ;; The case maps are the simple (one-to-one) Unicode mappings, which is
+        ;; what char-upcase and its kin answer and what the JVM's char overloads
+        ;; are defined by: \ß upper-cases to itself, not to "SS". The int
+        ;; overload answers an int, and a value that is no scalar is unchanged.
+        (cons "toUpperCase" (lambda (c) (char-case-map c char-upcase)))
+        (cons "toLowerCase" (lambda (c) (char-case-map c char-downcase)))
+        (cons "toTitleCase" (lambda (c) (char-case-map c char-titlecase)))
+        (cons "isTitleCase" (lambda (c) (char-category-in? c '(Lt))))
+        (cons "isDefined" (lambda (c) (let ((ch (scalar-char c))) (and ch (not (eq? (char-general-category ch) 'Cn))))))
+        (cons "isAlphabetic" (lambda (c) (let ((ch (scalar-char c))) (and ch (char-alphabetic? ch)))))
+        (cons "isSpaceChar" (lambda (c) (char-category-in? c '(Zs Zl Zp))))
+        (cons "isISOControl" (lambda (c) (let ((cp (char->cp c)))
+                                           (or (and (>= cp 0) (<= cp #x1F)) (and (>= cp #x7F) (<= cp #x9F))))))
+        ;; the identifier rules the JVM's javadoc states: a start is a letter, a
+        ;; letter number, a currency symbol or a connector; a part adds digits, the
+        ;; two combining marks and the ignorable controls and formats
+        (cons "isJavaIdentifierStart" (lambda (c) (char-category-in? c '(Lu Ll Lt Lm Lo Nl Sc Pc))))
+        (cons "isJavaIdentifierPart"
+              (lambda (c) (or (char-category-in? c '(Lu Ll Lt Lm Lo Nl Sc Pc Nd Mn Mc Cf))
+                              (let ((cp (char->cp c)))
+                                (or (and (>= cp 0) (<= cp 8)) (and (>= cp #xE) (<= cp #x1B))
+                                    (and (>= cp #x7F) (<= cp #x9F)))))))
+        (cons "isSurrogate" (lambda (c) (jolt-need-char c) #f))   ; no char here is one
+        (cons "compare" (lambda (a b) (->num (- (char->integer (jolt-need-char a)) (char->integer (jolt-need-char b))))))
+        (cons "hashCode" (lambda (c) (->num (char->integer (jolt-need-char c)))))
+        (cons "toString"
+              (lambda (c)
+                (if (char? c)
+                    (string c)
+                    (let ((ch (scalar-char c)))
+                      (if ch
+                          (string ch)
+                          (throw-jvm 'IllegalArgumentException
+                            (string-append "Not a valid Unicode code point: 0x"
+                                           (string-upcase (number->string (jnum->exact c) 16)))))))))
         ))
+
+;; A char argument of an overload that takes only a char.
+(define (jolt-need-char x) (if (char? x) x (jolt-cast-throw x "java.lang.Character")))
+;; A Character case map over a char or an int codepoint (see toUpperCase above).
+(define (char-case-map x f)
+  (if (char? x)
+      (f x)
+      (let ((ch (scalar-char x)))
+        (->num (if ch (char->integer (f ch)) (jnum->exact x))))))
 
 ;; String/valueOf(Object): "null" for nil, else jolt's str semantics.
 ;; String/format(fmt args…) / (locale fmt args…) -> the clojure.core format engine.
@@ -746,35 +799,34 @@
                                         parts)))
                          (str-join-strs (map jolt-str-render-one items)
                                         (jolt-str-render-one delim)))))
-        ;; String.format(fmt, Object...) is called both ways in the wild: with the
-        ;; args spread, and with a single Object[] holding them (which is what the
-        ;; JVM's varargs actually compiles to, and what Selmer writes). Splat a lone
-        ;; array argument so both reach the same format engine. A leading Locale is
-        ;; accepted and ignored — formatting here is locale-independent.
-        ;; The leading argument is a Locale when it is not the format string —
-        ;; String.format(Locale, String, Object...) vs String.format(String,
-        ;; Object...). Testing for the core "locale" jhost tag alone missed the
-        ;; Locale jolt-lang/time installs (a tagged table), so (String/format
-        ;; (Locale/getDefault) "%.3f" args) took the table as the format string.
-        ;; Formatting here is locale-independent, so the locale is dropped either way.
-        (cons "format" (lambda (a . rest)
-                         (let* ((locale? (and (pair? rest) (not (string? a))))
-                                (fmt (if locale? (car rest) a))
-                                (args (if locale? (cdr rest) rest))
-                                ;; jolt-array? / ja->list live in natives-array.ss,
-                                ;; loaded after this file — resolved at call time.
-                                (args (if (and (pair? args) (null? (cdr args))
-                                               (jolt-array? (car args)))
-                                          (ja->list (car args))
-                                          args)))
-                           ;; The locale drives the decimal separator: the JVM
-                           ;; renders %.3f of 123.04455 as "123,045" under de.
-                           (if locale?
-                               (parameterize ((format-decimal-sep
-                                               (number-symbol (jolt-str-render-one a)
-                                                              "decimal-sep" ".")))
-                                 (apply jolt-format fmt args))
-                               (apply jolt-format fmt args)))))))
+        ;; String.format([Locale] fmt, Object...): jvm-format-string below
+        (cons "format" (lambda (a . rest) (jvm-format-string a rest)))))
+
+;; The text of a JVM format(…) call — String.format, and PrintStream's and
+;; PrintWriter's printf/format, which all take ([Locale] String Object...). A
+;; lone array argument is the varargs array itself, which is what the JVM's
+;; varargs compiles to and what Selmer writes, so it is splatted. The leading
+;; argument is a Locale when it is not the format string; testing for the core
+;; "locale" jhost tag alone missed the Locale jolt-lang/time installs (a tagged
+;; table). The locale only picks the decimal separator: the JVM renders %.3f of
+;; 123.04455 as "123,045" under de.
+(define (jvm-format-string a rest) (jvm-format-pieces a rest #f))
+;; The same, handing SINK each piece java.util.Formatter would append separately
+;; (natives-format.ss jolt-format*) — PrintWriter/PrintStream .printf.
+(define (jvm-format-pieces a rest sink)
+  (let* ((locale? (and (pair? rest) (not (string? a))))
+         (fmt (if locale? (car rest) a))
+         (args (if locale? (cdr rest) rest))
+         ;; jolt-array? / ja->list live in natives-array.ss, loaded after this
+         ;; file — resolved at call time.
+         (args (if (and (pair? args) (null? (cdr args)) (jolt-array? (car args)))
+                   (ja->list (car args))
+                   args)))
+    (if locale?
+        (parameterize ((format-decimal-sep
+                        (number-symbol (jolt-str-render-one a) "decimal-sep" ".")))
+          (jolt-format* sink fmt args))
+        (jolt-format* sink fmt args))))
 
 ;; ---- java.text.NumberFormat -------------------------------------------------
 ;; A grouping decimal formatter (selmer number-format / cuerdas). state:
@@ -884,8 +936,10 @@
 ;; ---- java.text.Normalizer ----------------------------------------------------
 ;; Unicode normalization: identifier comparison, path equality on filesystems
 ;; that store decomposed accents, and search/fuzzy matching all go through it.
-;; Chez implements all four Unicode normalization forms natively, so this is a
-;; direct dispatch on the Form constant rather than a table of its own.
+;; Chez implements all four Unicode normalization forms natively, so the Form
+;; constant only has to pick one of them; java/text-normalize.ss is what stands
+;; between that and the call, so text that needs no normalizing does not get
+;; rebuilt character by character to prove it.
 ;;
 ;; Form is an enum, and jolt models an enum constant the way TimeUnit does: a
 ;; jhost carrying its name, so (str Normalizer$Form/NFC) is "NFC" as on the JVM
@@ -906,21 +960,26 @@
 ;; has no other failure mode. A form that is not one of the four constants can
 ;; only come from jolt code that built one by hand, so it names itself in the
 ;; message rather than reading as a missing method.
-(define (normalizer-normalize s form)
-  (let ((str (jolt-str-render-one s))
-        (nm (if (normalizer-form? form) (normalizer-form-name form) (jolt-str-render-one form))))
-    (cond ((string=? nm "NFC")  (string-normalize-nfc str))
-          ((string=? nm "NFD")  (string-normalize-nfd str))
-          ((string=? nm "NFKC") (string-normalize-nfkc str))
-          ((string=? nm "NFKD") (string-normalize-nfkd str))
+(define (normalizer-form-index form)
+  (let ((nm (if (normalizer-form? form) (normalizer-form-name form) (jolt-str-render-one form))))
+    (cond ((string=? nm "NFC")  0)
+          ((string=? nm "NFD")  1)
+          ((string=? nm "NFKC") 2)
+          ((string=? nm "NFKD") 3)
           (else (throw-jvm (quote IllegalArgumentException)
                            (string-append "Normalizer/normalize: not a Normalizer.Form: " nm))))))
+;; Both entry points run over java/text-normalize.ss's per-character
+;; classification rather than straight at Chez: text that is already normalized
+;; is recognized by a scan and returned as it came in, and isNormalized answers
+;; at the first character that disagrees instead of normalizing the whole string
+;; to compare it (gh-1066).
+(define (normalizer-normalize s form)
+  (jtn-normalize (jolt-str-render-one s) (normalizer-form-index form)))
 (register-class-statics! "java.text.Normalizer"
   (list (cons "normalize" normalizer-normalize)
         (cons "isNormalized"
               (lambda (s form)
-                (let ((str (jolt-str-render-one s)))
-                  (string=? str (normalizer-normalize str form)))))))
+                (jtn-normalized? (jolt-str-render-one s) (normalizer-form-index form))))))
 (register-class-statics! "java.text.Normalizer$Form" normalizer-form-constants)
 
 ;; Class.forName: an array descriptor ("[C") is its own class token; a class Jolt
@@ -1087,6 +1146,53 @@
   (jolt-with-mutex sys-prop-mu
     (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
       (hashtable-delete! sys-prop-table k) prev)))
+;; The PATH-LIST separator is not the file separator, and Windows is the reason
+;; they must be told apart: ":" is the drive suffix there, so ";" separates list
+;; entries. Answering ":" everywhere cut every Windows entry in half —
+;; (babashka.fs/split-paths "C:/a;C:/b") came back as ["C" "/a;C" "/b"], so
+;; fs/exec-paths was garbage, fs/which never found anything, and
+;; babashka.process's Windows resolver threw before a spawn was attempted
+;; (jolt-lang/jolt#1074).
+;;
+;; The FILE separator is "\\" on Windows, and File and Path render with it
+;; (java/io.ss path-native), so the property, File/separator and every rendered
+;; path agree (jolt-lang/jolt#1110).
+;;
+;; Parameterized by platform, and defined in this file rather than beside the
+;; other path helpers in java/io.ss, because this file loads first (rt.ss) and
+;; System/getProperty is the caller closest to the load point.
+(define (path-list-separator-for windows?) (if windows? ";" ":"))
+(define (path-list-separator) (path-list-separator-for (eq? (sa-os-family) 'windows)))
+(define (file-separator-for windows?) (if windows? "\\" "/"))
+(define (file-separator) (file-separator-for (eq? (sa-os-family) 'windows)))
+
+;; java.io.tmpdir. TMPDIR is the POSIX spelling and the only one this chain
+;; knew, so on Windows — which sets TEMP and TMP and not TMPDIR — it answered
+;; "/tmp": a directory on whichever drive the process happened to be on, which
+;; is where every File/createTempFile, every jolt.host temp write and every
+;; resolver download went (jolt-lang/jolt#1074). TMPDIR still wins everywhere,
+;; because a caller that sets it means it and the https-fetch smoke sets it on
+;; Windows too.
+;;
+;; GETENV* is a parameter so the rows a Linux runner cannot reach are still
+;; pinned (test/chez/win-platform-test.ss), and one definition serves all three
+;; callers — System/getProperty, File/createTempFile (java/io.ss) and
+;; Files/createTempFile (java/nio-file.ss) — because two hand-kept copies is how
+;; java.io and java.nio.file start disagreeing about a path.
+(define (host-temp-dir-for windows? getenv*)
+  (define (named k) (let ((v (getenv* k))) (and v (> (string-length v) 0) v)))
+  (or (named "TMPDIR")
+      (and (not windows?) "/tmp")
+      (named "TEMP")
+      (named "TMP")
+      ;; Nothing named one. SystemRoot is the variable Windows always sets (the
+      ;; OS probe in scheme-adapter-runtime.ss keys off it), and <SystemRoot>\Temp
+      ;; exists on every install; "C:/Windows/Temp" is the last resort for a
+      ;; process started with no environment at all.
+      (let ((sr (named "SystemRoot"))) (and sr (string-append sr "/Temp")))
+      "C:/Windows/Temp"))
+(define (host-temp-dir) (host-temp-dir-for (eq? (sa-os-family) 'windows) getenv))
+
 ;; java.class.path — jolt's equivalent of the JVM classpath is the resolved
 ;; source roots (project :paths + every dependency's roots), which a project
 ;; command installs with set-source-roots! before it runs anything. Editor
@@ -1100,10 +1206,11 @@
 (define sys-class-path-provider (lambda () '()))
 (define (set-class-path-provider! f) (set! sys-class-path-provider f))
 (define (sys-class-path)
-  (let loop ((roots (sys-class-path-provider)) (acc ""))
-    (cond ((null? roots) acc)
-          ((string=? acc "") (loop (cdr roots) (car roots)))
-          (else (loop (cdr roots) (string-append acc ":" (car roots)))))))
+  (let ((sep (path-list-separator)))
+    (let loop ((roots (sys-class-path-provider)) (acc ""))
+      (cond ((null? roots) acc)
+            ((string=? acc "") (loop (cdr roots) (car roots)))
+            (else (loop (cdr roots) (string-append acc sep (car roots))))))))
 
 (define (sys-get-property k . dflt)
   (let* ((k (jolt-need-string k))
@@ -1115,15 +1222,15 @@
           ((string=? k "user.name") (sys-user-name))
           ((string=? k "jolt.version") (jolt-version-string))
           ((string=? k "line.separator") "\n")
-          ((string=? k "file.separator") "/")
-          ((string=? k "path.separator") ":")
+          ((string=? k "file.separator") (file-separator))
+          ((string=? k "path.separator") (path-list-separator))
           ((string=? k "java.class.path") (sys-class-path))
           ;; user.dir is the user's cwd (JVM: the process cwd). jolt-user-dir (io.ss)
           ;; owns that chain — JOLT_PWD, then the process's own working directory —
           ;; so the property and every relative path resolve against the same place.
           ((string=? k "user.dir") (jolt-user-dir))
           ((string=? k "user.home") (or (getenv "HOME") ""))
-          ((string=? k "java.io.tmpdir") (or (getenv "TMPDIR") "/tmp"))
+          ((string=? k "java.io.tmpdir") (host-temp-dir))
           ((pair? dflt) (car dflt))
           (else jolt-nil))))
 ;; System/getProperties: a java.util.Properties holding the same values
@@ -1133,11 +1240,12 @@
   (make-system-properties (sys-properties-pmap) sys-prop-table))
 (define (sys-properties-pmap)
   (let ((base (jolt-hash-map "os.name" sys-os-name "os.arch" sys-os-arch
-                             "line.separator" "\n" "file.separator" "/"
-                             "path.separator" ":" "java.class.path" (sys-class-path)
+                             "line.separator" "\n" "file.separator" (file-separator)
+                             "path.separator" (path-list-separator)
+                             "java.class.path" (sys-class-path)
                              "jolt.version" (jolt-version-string)
                              "user.dir" (jolt-user-dir) "user.home" (or (getenv "HOME") "")
-                             "java.io.tmpdir" (or (getenv "TMPDIR") "/tmp"))))
+                             "java.io.tmpdir" (host-temp-dir))))
     ;; keys whose value can be absent join only when they answer — a JVM
     ;; Properties never holds a nil value
     (let ((v (sys-os-version)))

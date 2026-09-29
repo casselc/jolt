@@ -15,6 +15,11 @@ jolt="${JOLT_BIN:-bin/jolt}"
 # cases that the make gate never saw, because the gate always sets JOLT_BIN.
 jolt_bin="${JOLT_BIN:-bin/jolt}"
 
+# Temp root for the cases that write real files. TMPDIR is the POSIX spelling and
+# the only one set on Termux, where /tmp does not exist; /tmp is the fallback
+# when it is unset.
+tmp="${TMPDIR:-/tmp}"
+
 # Every case here is a sub-second jolt invocation, so a case that does not finish
 # has hung — and a hung case is invisible: `make -Oline` shows nothing for a target
 # until it completes, so a CI gate sits silent until the 6-hour job limit with no
@@ -579,6 +584,21 @@ else
   echo "  FAIL: --help should print the same usage as help"
   fails=$((fails + 1))
 fi
+# CMD -h / --help prints that command's usage and runs nothing: each command
+# parsed its own args and none knew the flag, so nrepl-server --help started a
+# server on the default port and repl --help a REPL (#1152).
+help_dir="$(mktemp -d)"
+help_jolt="$jolt_timeout $(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+for c in run repl nrepl-server path tasks completions build; do
+  out="$(cd "$help_dir" && JOLT_PWD="$help_dir" JOLT_NREPL_PORT=45991 $help_jolt $c --help </dev/null 2>&1)"; rc=$?
+  if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q "^  $c " && [ ! -e "$help_dir/.nrepl-port" ]; then
+    pass=$((pass + 1))
+  else
+    echo "  FAIL: $c --help should print its usage and run nothing (exit $rc): $(printf '%s' "$out" | head -2)"
+    fails=$((fails + 1))
+  fi
+done
+rm -rf "$help_dir"
 # version / --version are synonyms and name the version.
 if $jolt version 2>/dev/null | grep -q '^jolt ' \
    && [ "$($jolt version 2>/dev/null)" = "$($jolt --version 2>/dev/null)" ]; then
@@ -953,6 +973,19 @@ else
   fails=$((fails + 1))
 fi
 
+# Thread.getStackTrace / StackTraceElement: frames reconstructed the way an
+# uncaught error's backtrace is, named like the JVM's (ns$fn). test.check's
+# clojure-test reporter walks this stack for an assertion's file:line.
+st_out="$($jolt run test/chez/stack-trace-test.clj 2>/dev/null)"
+if printf '%s' "$st_out" | grep -q 'STACK-TRACE OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: Thread.getStackTrace"
+  echo "    $(printf '%s' "$st_out" | grep STACK-TRACE-RESULT | tail -1)"
+  printf '%s' "$st_out" | grep 'stack-trace FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # clojure.zip + clojure.data: the surface data.zip and cider-nrepl drive, including
 # the SHAPE of a diff result (its map arm is a seq, its vector/set arms are
 # vectors). Both load on require, so they cannot be corpus rows.
@@ -1091,17 +1124,17 @@ fi
 
 # A throwing go/thread body reports to stderr (the JVM's uncaught-exception
 # handler behavior) while the channel still just closes: <!! stays nil.
-thr_out="$($jolt -e "(do (require '[clojure.core.async :as a]) (pr (a/<!! (a/thread (/ 1 0)))))" 2>/tmp/jolt-smoke-thr-err)"
-if [ "$thr_out" = "nil" ] && grep -q "Exception in go/thread body" /tmp/jolt-smoke-thr-err; then
+thr_out="$($jolt -e "(do (require '[clojure.core.async :as a]) (pr (a/<!! (a/thread (/ 1 0)))))" 2>"$tmp/jolt-smoke-thr-err")"
+if [ "$thr_out" = "nil" ] && grep -q "Exception in go/thread body" "$tmp/jolt-smoke-thr-err"; then
   pass=$((pass + 1))
 else
   echo "  FAIL: throwing (thread ...) should print an uncaught report and <!! nil"
-  echo "    stdout \`$thr_out\`; stderr: $(head -1 /tmp/jolt-smoke-thr-err)"
+  echo "    stdout \`$thr_out\`; stderr: $(head -1 "$tmp/jolt-smoke-thr-err")"
   fails=$((fails + 1))
 fi
 # Same for a raw Thread body.
-$jolt -e '(do (.start (Thread. (fn [] (throw (ex-info "boom" {}))))) (Thread/sleep 200))' 2>/tmp/jolt-smoke-thr2-err >/dev/null
-if grep -q "Exception in Thread body" /tmp/jolt-smoke-thr2-err; then
+$jolt -e '(do (.start (Thread. (fn [] (throw (ex-info "boom" {}))))) (Thread/sleep 200))' 2>"$tmp/jolt-smoke-thr2-err" >/dev/null
+if grep -q "Exception in Thread body" "$tmp/jolt-smoke-thr2-err"; then
   pass=$((pass + 1))
 else
   echo "  FAIL: a throwing Thread body should print an uncaught report"
@@ -1712,6 +1745,18 @@ else
   fails=$((fails + 1))
 fi
 
+# Static member sites (Class/member) cache their resolution; a member added or
+# replaced later, a mutable static set later, and the uncached path's errors must
+# all still come through a warm site.
+static_site_out="$($jolt run test/chez/static-site-test.clj 2>/dev/null)"
+if printf '%s' "$static_site_out" | grep -q 'STATIC SITES OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: static member site caching"
+  printf '%s\n' "$static_site_out" | grep FAIL | head -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # Unit-checks the REPL read-until-complete predicate over balanced/unbalanced,
 # string, comment and regex-literal inputs. A multi-form `jolt run` so jolt.main
 # is loaded and its private var resolves; the file self-checks and prints a sentinel.
@@ -1930,7 +1975,15 @@ check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a 
 # actually relies on. POSIX only — Windows has no FD_CLOEXEC (it controls
 # inheritance with HANDLE_FLAG_INHERIT), so there this asserts nothing rather
 # than asserting the wrong thing.
-check '(do (require (quote jolt.nrepl)) (if jolt.nrepl/windows? :close-on-exec (let [fd (jolt.nrepl/listen-socket 0) flags (jolt.nrepl/c-fcntl fd 1 0)] (jolt.nrepl/c-close fd) (if (pos? (bit-and flags 1)) :close-on-exec :inheritable))))' ':close-on-exec'
+# nREPL eval streams *out* as it is flushed (#1153): the eval itself sees the
+# chunk its first println sent before it returns, and the built-in op sends
+# each flush as its own `out` ahead of the value. A trailing print that never
+# flushed still goes out before `done`. The two-argument evaluate still
+# captures and returns :out whole, for middleware written against it.
+check '(do (require (quote jolt.nrepl)) (def seen (atom [])) (let [r (jolt.nrepl/evaluate "(println :a) (let [n (count @user/seen)] (println :b) n)" "user" {:out #(swap! seen conj %)})] [(:value r) (:out r) @seen]))' '["1" "" [":a\n" ":b\n"]]'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(print \"a\") (println \"b\") (print \"c\") :v" :reply #(swap! sent conj %)}) (mapv #(or (get % "out") (get % "value")) @sent)))' '["ab\n" "c" ":v"]'
+check '(do (require (quote jolt.nrepl)) (:out (jolt.nrepl/evaluate "(println 1) 2" "user")))' '"1\n"'
+check '(do (require (quote jolt.nrepl)) (if @(var jolt.nrepl/windows?) :close-on-exec (let [fd ((var jolt.nrepl/listen-socket) 0) flags (jolt.nrepl/c-fcntl fd 1 0)] (jolt.nrepl/c-close fd) (if (pos? (bit-and flags 1)) :close-on-exec :inheritable))))' ':close-on-exec'
 
 # jolt.ffi/load-library's per-OS map form — documented since the FFI docs
 # existed, implemented only in 0.7.10 (it rendered the map to a string and
@@ -1955,6 +2008,67 @@ check '(do (set! *assert* false) *assert*)' 'false'
 check '(do (load-string "(set! *unchecked-math* true) :x") *unchecked-math*)' 'false'
 check '(do (load-string "(set! *warn-on-reflection* true) :x") *warn-on-reflection*)' 'false'
 check '(do (load-string "(set! *assert* false) :x") *assert*)' 'true'
+
+# ...and the other direction, which is the one that was wrong: a nested load
+# INHERITS the enclosing frame's flags. Compiler.load pushes
+# WARN_ON_REFLECTION.deref(), not the var's root, so a file loaded from inside
+# another file sees the outer file's set! and stops seeing it only where that
+# outer frame ends. jolt bound the ROOT, which reset every nested load to the
+# defaults: an outer (set! *unchecked-math* true) was invisible to load-string,
+# load-file and require alike, so arithmetic under a require compiled
+# differently from the arithmetic above it (jolt-8sf).
+check '(do (set! *unchecked-math* true) (load-string "*unchecked-math*"))' 'true'
+check '(do (set! *warn-on-reflection* true) (load-string "*warn-on-reflection*"))' 'true'
+check '(do (set! *assert* false) (load-string "*assert*"))' 'false'
+# Both directions in one form: the inner set! is visible to the rest of the
+# inner load and gone once it returns, and the value it started from was the
+# enclosing frame's rather than the root.
+check '(do (set! *unchecked-math* true) [(load-string "(set! *unchecked-math* false) *unchecked-math*") *unchecked-math*])' '[false true]'
+# A real file, which is the other frame: load-string scopes through
+# compile-eval.ss, load-file and require through loader.ss ldr-with-file-vars,
+# and both read the value the same way now. The file PRINTS what it saw rather
+# than yielding it, because jolt's load-file answers nil where the reference
+# answers the last form's value (jolt-5gx) -- reading the value back through
+# the return would be testing that instead of this.
+inh_dir="$(mktemp -d)"
+printf '(println [*unchecked-math* *warn-on-reflection* *assert*])\n' > "$inh_dir/finner.clj"
+check "(do (set! *unchecked-math* true) (set! *warn-on-reflection* true) (set! *assert* false) (load-file \"$inh_dir/finner.clj\"))" '[true true false]'
+check "(load-file \"$inh_dir/finner.clj\")" '[false false true]'
+rm -rf "$inh_dir"
+
+# ...and -m/run -m carry the same frame: -main is code running AFTER the
+# require's load frame popped, so a -main that set! a flag used to throw where
+# the same form at the file's top level worked. The entry frame also reaches
+# what -main evaluates at runtime — a jolt.loader source dep opens with the
+# same idiom — and the loader brackets it per file, so the dep's set! does not
+# escape into the entry's frame (checked here as *assert* staying at its root).
+ef_dir="$(mktemp -d)"
+mkdir -p "$ef_dir/src"
+printf '(ns eflags) (defn -main [& _] (set! *warn-on-reflection* true) (println "ENTRY-FLAGS" *warn-on-reflection*))\n' \
+  > "$ef_dir/src/eflags.clj"
+printf '(ns fdep) (set! *assert* false) (def v :from-dep)\n' > "$ef_dir/src/fdep.clj"
+printf '(ns xeflags) (defn go [_] (set! *assert* false) (println "XF-FLAGS" *assert*))\n' \
+  > "$ef_dir/src/xeflags.clj"
+printf '{:paths ["src"] :tasks {flg {:task (do (set! *warn-on-reflection* true) (println "TASK-FLAGS" *warn-on-reflection*))}}}\n' \
+  > "$ef_dir/deps.edn"
+printf '(ns lflags (:require [jolt.loader :as jl]))\n(defn -main [& _]\n  (set! *unchecked-math* true)\n  (let [r (jl/load (jl/classpath ["%s/src"]) {:kind :ns :name "fdep"})]\n    (println "LOADER-FLAGS" *unchecked-math* *assert* (:handle r))))\n' "$ef_dir" \
+  > "$ef_dir/src/lflags.clj"
+ef_check() { # label expected actual
+  if [ "$2" = "$3" ]; then pass=$((pass + 1))
+  else echo "  FAIL: $1"; echo "    want \`$2\` got \`$3\`"; fails=$((fails + 1)); fi
+}
+ef_check "-m: a set! in -main has a frame" "ENTRY-FLAGS true" \
+  "$(JOLT_PWD="$ef_dir" $jolt -m eflags 2>&1 | tail -1)"
+ef_check "run -m: the same" "ENTRY-FLAGS true" \
+  "$(JOLT_PWD="$ef_dir" $jolt run -m eflags 2>&1 | tail -1)"
+ef_check "-m + jolt.loader: the entry's set! holds and the loaded file's stays scoped" \
+  "LOADER-FLAGS true true fdep" \
+  "$(JOLT_PWD="$ef_dir" $jolt -m lflags 2>&1 | tail -1)"
+ef_check "a task body: an entry like any other" "TASK-FLAGS true" \
+  "$(JOLT_PWD="$ef_dir" $jolt flg 2>&1 | tail -1)"
+ef_check "-X exec fn: the same" "XF-FLAGS false" \
+  "$(JOLT_PWD="$ef_dir" $jolt -X xeflags/go 2>&1 | tail -1)"
+rm -rf "$ef_dir"
 
 # The runtime's own boot must not read as registry drift. A class registered
 # under BOTH its qualified and its simple name shares one member table, so a

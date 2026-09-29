@@ -1,10 +1,17 @@
 #!/bin/sh
+
 # static-native smoke: a project's :jolt/native lib with a :static archive is
 # LINKED INTO the built binary (the default), so the binary calls the C function
 # with no shared object on disk at runtime. --dynamic keeps the old behavior —
 # load a shared object at runtime.
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
+
+# The app's emitted Scheme is several files since the build compiles (and
+# caches) one unit per namespace: flat.ss is the prologue, app-N.ss each
+# namespace, app-post.ss the launcher. A check about what the app emitted reads
+# all of them — one over flat.ss alone passes an absence check vacuously.
+appsrc() { cat "$1/flat.ss" "$1"/app-[0-9]*.ss "$1/app-post.ss" 2>/dev/null; }
 
 # JOLT_BIN overrides the jolt under test. The gate targets point it at the
 # freshly built target/release/jolt: a `jolt build` costs ~2.5s through the
@@ -77,10 +84,10 @@ fi
 [ -x "$out" ] || { echo "  FAIL: no executable produced"; exit 1; }
 # A static lib emits a process-symbol load (its archive is in-process), not a
 # dlopen of the shared object.
-if ! grep -q "jolt-build-load-native '() #f #t" "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q "jolt-build-load-native '() #f #t"; then
   echo "  FAIL: static native did not emit a process-symbol load"; exit 1
 fi
-if grep -q "libgreet.$soext" "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -q "libgreet.$soext"; then
   echo "  FAIL: static native baked a runtime shared-object load"; exit 1
 fi
 # Remove BOTH libs: a static-linked symbol lives in the binary, nothing to load.
@@ -89,6 +96,72 @@ got="$(cd / && "$out" 2>&1)"
 if [ "$got" != "answer: 42" ]; then
   echo "  FAIL: static-linked binary output mismatch"
   echo "--- want ---"; echo "answer: 42"; echo "--- got ----"; echo "$got"; exit 1
+fi
+
+# --- a static archive that is not position-independent (jolt#1060) ----------
+# gcc on most Linux distributions links PIE by default, and an archive compiled
+# without -fPIC cannot go into a position-independent executable:
+#
+#   relocation R_X86_64_32 against `.rodata' can not be used when making a PIE
+#   object; recompile with -fPIE
+#
+# Two archives in this link can be in that state and neither is the app's doing:
+# the Chez kernel the self-contained jolt carries (built on an image whose gcc
+# had no PIE default) and a :static native compiled the same way. The link falls
+# back to -no-pie (build.ss bld-link-executable), so the build must succeed.
+# Linux only: -fno-pie means nothing where there is no PIE default to undo, and
+# arm64 macOS has no non-PIC form at all.
+if [ "$(uname -s)" = Linux ] && cc -no-pie -E -x c /dev/null -o /dev/null 2>/dev/null; then
+  # A leaf function is position-independent by accident — take the address of
+  # static data, which is what gets the absolute relocation. The data is a
+  # NON-static (preemptible) global on purpose: on aarch64 a reference to a
+  # local symbol still lowers to adrp/add, which links into a shared object
+  # fine, so only a global the loader could interpose forces the non-PIC
+  # relocation this case is about (R_X86_64_32 on x86_64, and
+  # R_AARCH64_ADR_PREL_PG_HI21 / R_AARCH64_ABS64 on aarch64).
+  cat > "$work/nopic.c" <<'EOF'
+const char greeting[] = "static";
+const char *jolt_static_greeting(void) { return greeting; }
+int jolt_static_answer(void) { return 42; }
+EOF
+  cc -fno-pie -fno-PIC -c "$work/nopic.c" -o "$work/nopic.o"
+  ar rcs "$work/libnopic.a" "$work/nopic.o"
+  cat > "$app/deps.edn" <<EOF
+{:paths ["src"]
+ :jolt/native [{:name "nopic" :static {:archive "$work/libnopic.a"}}]}
+EOF
+  rm -rf "$app/.jolt"
+  echo "static-native smoke: building (non-PIC static archive)"
+  if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" >"$work/build.log" 2>&1; then
+    echo "  FAIL: jolt build with a non-PIC static archive exited non-zero (jolt#1060)"
+    cat "$work/build.log"; exit 1
+  fi
+  # The archive cannot be preloaded as a shared object either (no flag makes an
+  # absolute relocation work in a library the loader maps anywhere), so the build
+  # says what it gave up rather than failing.
+  if ! grep -q "symbols cannot be resolved while the build runs" "$work/build.log"; then
+    echo "  FAIL: the build did not report the archive it could not preload"
+    cat "$work/build.log"; exit 1
+  fi
+  # Where the compiler links PIE by default (__PIE__), the first link must have
+  # failed and the -no-pie retry must be what produced the binary. NOT on
+  # bionic: build.ss bld-no-pie-supported? refuses -no-pie there by design —
+  # Android's loader requires a PIE executable, so the first link has to
+  # succeed, and on aarch64 it does (the adrp/add pair in the archive resolves
+  # against the definition in the executable).
+  if echo | cc -E -dM -x c - 2>/dev/null | grep -q '__PIE__' \
+     && ! cc -dumpmachine 2>/dev/null | grep -q android; then
+    if ! grep -q 'relinking with -no-pie' "$work/build.log"; then
+      echo "  FAIL: a PIE-by-default toolchain linked a non-PIC archive without the -no-pie retry"
+      cat "$work/build.log"; exit 1
+    fi
+  fi
+  got="$(cd / && "$out" 2>&1)"
+  if [ "$got" != "answer: 42" ]; then
+    echo "  FAIL: non-PIC static archive binary output mismatch"
+    echo "--- got ----"; echo "$got"; exit 1
+  fi
+  rm -rf "$app/.jolt"
 fi
 
 # --- --dynamic: runtime load ------------------------------------------------
@@ -106,7 +179,7 @@ if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" --dynamic >"$work/build
   echo "  FAIL: jolt build --dynamic exited non-zero"; cat "$work/build.log"; exit 1
 fi
 # --dynamic loads the shared object at runtime.
-if ! grep -q "libgreet.$soext" "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q "libgreet.$soext"; then
   echo "  FAIL: --dynamic did not emit a runtime shared-object load"; exit 1
 fi
 got="$(cd / && "$out" 2>&1)"
@@ -250,4 +323,4 @@ if grep -qn 'bld-link-libs.*native-link' host/chez/build.ss; then
   exit 1
 fi
 
-echo "static-native smoke: passed (static default + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"
+echo "static-native smoke: passed (static default + non-PIC archive + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"

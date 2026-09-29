@@ -96,6 +96,32 @@
   (check-eq "write-bytes still takes the str coercion for a non-nil value"
             (ffi/write-bytes buf 42) 2)
 
+  ;; …but a byte-array is DATA, not a value to render. It used to reach the same
+  ;; `str` coercion, which writes the characters of "#object[[B]" — 11 octets of
+  ;; the array's own print form in place of its bytes, with nothing raised at any
+  ;; layer. A caller reaching for write-bytes to move bytes got silent
+  ;; corruption. It now takes the block move write-array makes.
+  (let [bs (byte-array [104 105 0 -1 122])]
+    (ffi/write-array buf (byte-array 512))   ; clear, so a short write is visible
+    (check-eq "write-bytes answers a byte-array's own length, not its str form's"
+              (ffi/write-bytes buf bs) 5)
+    (check-eq "write-bytes copies a byte-array's octets exactly"
+              (seq (ffi/read-array buf 5)) (seq bs))
+    (check-eq "write-bytes writes nothing past the array"
+              (seq (ffi/read-array (+ buf 5) 4)) (repeat 4 0))
+    (check-eq "write-bytes of an empty byte-array is 0" (ffi/write-bytes buf (byte-array 0)) 0))
+
+  ;; every byte value through write-bytes, so the signed/unsigned fold on this
+  ;; path is held to the same bar as write-array's
+  (check-eq "write-bytes round-trips all 256 byte values"
+            (do (ffi/write-bytes buf all-bytes) (seq (ffi/read-array buf 256)))
+            (seq all-bytes))
+
+  ;; an array of some other width is not a byte-array and must not be
+  ;; reinterpreted as one — it keeps the str coercion
+  (check-eq "write-bytes does not treat an int-array as bytes"
+            (> (ffi/write-bytes buf (int-array [1 2 3])) 5) true)
+
   ;; bytes that are not valid UTF-8 come back through read-array unharmed
   ;; (read-bytes would have to substitute; read-array must not)
   (let [invalid (byte-array [-128 -61 40 0 -1])]
@@ -104,6 +130,38 @@
               (seq (ffi/read-array buf 5)) (seq invalid)))
 
   (ffi/free buf))
+
+;; --- string->ptr of a byte-array ---------------------------------------------
+;; string->ptr is the allocate-and-copy half of write-bytes, so it answers a
+;; byte-array the same way: its octets, exactly, then the NUL. It used to render
+;; the array with `str` and allocate "#object[[B]" + NUL, the arena's size
+;; bookkeeping agreeing with the wrong copy, and with-c-string and
+;; with-c-string-array inherited it.
+(let [bs (byte-array [104 105 0 -1 122])]
+  (ffi/with-arena [a]
+    (let [p (ffi/string->ptr a bs)]
+      (check-eq "string->ptr copies a byte-array's octets and a NUL"
+                (vec (ffi/read-array p 6)) [104 105 0 -1 122 0])
+      (check-eq "the arena records the octets plus the NUL" (ffi/size p) 6)))
+  (let [p (ffi/string->ptr bs)]
+    (check-eq "caller-owned string->ptr copies the same octets"
+              (vec (ffi/read-array p 6)) [104 105 0 -1 122 0])
+    (ffi/free p))
+  (check-eq "with-c-string of a byte-array binds its octets"
+            (ffi/with-c-string [p (byte-array [104 105])] (ffi/ptr->string p)) "hi")
+  (check-eq "with-c-string-array of a byte-array member binds its octets"
+            (ffi/with-c-string-array [arr 1] [(byte-array [104 105])]
+              (ffi/ptr->string (ffi/read arr :pointer 0)))
+            "hi")
+  (ffi/with-arena [a]
+    (let [p (ffi/string->ptr a (byte-array 0))]
+      (check-eq "an empty byte-array is one NUL, not NULL"
+                [(ffi/null? p) (ffi/size p) (ffi/ptr->string p)] [false 1 ""])))
+  (ffi/with-arena [a]
+    (let [p (ffi/string->ptr a all-bytes)]
+      (check-eq "string->ptr round-trips all 256 byte values"
+                (seq (ffi/read-array p 256)) (seq all-bytes))
+      (check-eq "and terminates after them" (ffi/read p :int8 256) 0))))
 
 ;; --- a java.nio.ByteBuffer over foreign memory -------------------------------
 ;; ffi/byte-buffer is a DIRECT buffer: it shares the bytes with the pointer

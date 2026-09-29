@@ -208,7 +208,8 @@
 (define (al-family? x)
   (and (jhost? x) (or (string=? (jhost-tag x) "arraylist")
                        (string=? (jhost-tag x) "linkedlist")
-                       (string=? (jhost-tag x) "arraydeque"))))
+                       (string=? (jhost-tag x) "arraydeque")
+                       (string=? (jhost-tag x) "arrays-aslist"))))
 (register-seq-arm! al-family? (lambda (x) (list->cseq (al->list x))))
 
 ;; ---- StringWriter -----------------------------------------------------------
@@ -248,7 +249,7 @@
 ;; descriptor under it takes the bytes themselves — see pw-write-bytes! below.
 (define (writer-piece-range x rest)
   (cond
-    ((byte-array-arg? x) (utf8->string (byte-array-range x rest)))
+    ((byte-array-arg? x) (utf8-bytes->string (byte-array-range x rest)))
     ((and (pair? rest) (pair? (cdr rest)))
      (let* ((s (writer-piece x))
             (off (max 0 (jnum->exact (car rest))))
@@ -400,28 +401,62 @@
   (list (cons "setOut" (lambda (v) (sys-set-stream! "out" v)))
         (cons "setErr" (lambda (v) (sys-set-stream! "err" v)))))
 
-;; PrintWriter — a thin wrapper over a target writer. write/append/print forward
-;; the rendered text to the target. clojure.data.json's pretty printer builds
-;; (PrintWriter. *out*) where *out* is bound to clojure.pprint's pretty-writer (a
-;; jolt record), so forwarding routes column-aware through clojure.pprint/-write;
-;; for a host writer target it falls back to that writer's own write.
-(define (pw-forward target s)
+;; PrintWriter — a thin wrapper over a target writer. clojure.data.json's pretty
+;; printer builds (PrintWriter. *out*) where *out* is bound to clojure.pprint's
+;; pretty-writer (a jolt record), so text for one of those routes column-aware
+;; through clojure.pprint/-write.
+;;
+;; A target that is a Writer in its own right — a host writer (file-backed,
+;; OutputStreamWriter, BufferedWriter, a nested PrintWriter) or a proxy/reify
+;; java.io.Writer — is called the way the JDK's PrintWriter calls its `out`:
+;; text (write(String), print, append, a char[]) as write(s, 0, len), a single
+;; char (write(int), append(char)) as write(c), the line separator
+;; as write("\n"), and flush/close as its own flush/close. Which overload a
+;; proxy receives is observable: a java.io.Writer proxy need only define the
+;; abstract write(cbuf, off, len), and one that does must work.
+(define (pw-target self) (vector-ref (jhost-state self) 0))
+(define (pw-writer-target? t)
+  (or (and (jhost? t)
+           (not (string=? (jhost-tag t) "port-writer"))
+           (not (string=? (jhost-tag t) "writer"))
+           (not (sb-jhost? t)))
+      (and (not (jhost? t)) (iface-method t "write" #f) #t)))
+;; Text into a target that is not a Writer of its own: stdout/stderr, a
+;; StringWriter/StringBuilder, or clojure.pprint's pretty-writer.
+(define (pw-emit-text t s)
   (cond
     ;; through port-writer-port, not the raw slot: a port-writer holds the SYMBOL
     ;; 'out / 'err and resolves it per call, so a (PrintWriter. *out*) built inside
     ;; a with-out-str writes to the capture rather than past it.
-    ((and (jhost? target) (string=? (jhost-tag target) "port-writer"))
-     (display s (port-writer-port target)))
-    ((and (jhost? target) (memv #t (list (string=? (jhost-tag target) "writer")
-                                         (sb-jhost? target))))
-     (sb-append! target s))
-    ;; every other host writer knows how to write itself — a file-backed writer, an
-    ;; OutputStreamWriter, a nested PrintWriter. Naming them one by one left
-    ;; (PrintWriter. (io/writer f)) falling through to the pprint protocol below,
-    ;; which a file writer does not implement.
-    ((jhost? target) (record-method-dispatch target "write" (jolt-list s)))
-    (else
-     (jolt-invoke (var-deref "clojure.pprint" "-write") target s))))
+    ((and (jhost? t) (string=? (jhost-tag t) "port-writer"))
+     (display s (port-writer-port t)))
+    ((jhost? t) (sb-append! t s))
+    (else (jolt-invoke (var-deref "clojure.pprint" "-write") t s))))
+(define (pw-text! self s)
+  (let ((t (pw-target self)))
+    (if (pw-writer-target? t)
+        (record-method-dispatch t "write" (jolt-list s (->num 0) (->num (string-length s))))
+        (pw-emit-text t s))))
+(define (pw-char! self c)                 ; c: the char's code
+  (let ((t (pw-target self)))
+    (if (pw-writer-target? t)
+        (record-method-dispatch t "write" (jolt-list (->num c)))
+        (pw-emit-text t (string (integer->char c))))))
+(define (pw-newline! self)
+  (let ((t (pw-target self)))
+    (if (pw-writer-target? t)
+        (record-method-dispatch t "write" (jolt-list "\n"))
+        (pw-emit-text t "\n"))))
+(define (pw-print! self x)              ; print(char) too is text: write(s, 0, 1)
+  (if (char-array-arg? x)
+      (pw-text! self (char-array->string x))
+      (pw-text! self (render-piece x))))
+(define (pw-pass! self name)              ; flush / close, when the target has one
+  (let ((t (pw-target self)))
+    (when (or (and (jhost? t) (host-method-ref (jhost-tag t) name))
+              (and (not (jhost? t)) (iface-method t name #f)))
+      (record-method-dispatch t name jolt-nil))
+    jolt-nil))
 (register-class-ctor! "PrintWriter"
   (lambda args (make-jhost "print-writer" (vector (if (pair? args) (car args) jolt-nil)))))
 (register-class-ctor! "java.io.PrintWriter"
@@ -431,11 +466,28 @@
   ;; (csq start end) and renders everything as text. Sharing append-text between
   ;; them read the 3-arg write's LENGTH as an end index and printed (.write w 65)
   ;; as "65" rather than "A".
-  (list (cons "write" (lambda (self x . rest) (pw-forward (vector-ref (jhost-state self) 0) (writer-piece-range x rest)) jolt-nil))
-        (cons "print" (lambda (self x) (pw-forward (vector-ref (jhost-state self) 0) (render-piece x)) jolt-nil))
-        (cons "append" (lambda (self x . rest) (pw-forward (vector-ref (jhost-state self) 0) (append-text x rest)) self))
-        (cons "flush" (lambda (self) jolt-nil))
-        (cons "close" (lambda (self) jolt-nil))
+  (list (cons "write" (lambda (self x . rest)
+                        (if (and (null? rest) (number? x))
+                            (pw-char! self (jnum->exact x))
+                            (pw-text! self (writer-piece-range x rest)))
+                        jolt-nil))
+        (cons "print" (lambda (self x) (pw-print! self x) jolt-nil))
+        (cons "println" (lambda (self . xs)
+                          (unless (null? xs) (pw-print! self (car xs)))
+                          (pw-newline! self)
+                          jolt-nil))
+        (cons "append" (lambda (self x . rest)
+                         (if (and (null? rest) (char? x))
+                             (pw-char! self (char->integer x))
+                             (pw-text! self (append-text x rest)))
+                         self))
+        (cons "printf" (lambda (self a . rest)
+                         (jvm-format-pieces a rest (lambda (piece) (pw-text! self piece)))
+                         self))
+        (cons "format" (lambda (self a . rest) (jvm-format-pieces a rest (lambda (piece) (pw-text! self piece))) self))
+        (cons "flush" (lambda (self) (pw-pass! self "flush")))
+        (cons "close" (lambda (self) (pw-pass! self "close")))
+        (cons "checkError" (lambda (self) (pw-pass! self "flush") #f))
         (cons "toString" (lambda (self) ""))))
 
 ;; PrintWriter-on — a writer that accumulates writes and, on flush, hands the
@@ -999,7 +1051,11 @@
         (values cbuf (jnum->exact (cadr rest)) (jnum->exact (caddr rest)))
         (values cbuf 0 (ja-len cbuf)))))
 
-(define (sr-s self) (vector-ref (jhost-state self) 0))
+;; close drops the string; every read reaches it through sr-s, which then
+;; raises what a closed java.io.StringReader does.
+(define (sr-s self)
+  (or (vector-ref (jhost-state self) 0)
+      (throw-jvm 'java.io.IOException "Stream closed")))
 (define (sr-pos self) (vector-ref (jhost-state self) 1))
 (define (sr-pos! self p) (vector-set! (jhost-state self) 1 p))
 (register-host-methods! "string-reader"
@@ -1018,8 +1074,8 @@
                                     (let ((n (min len (- slen p))))
                                       (let loop ((i 0)) (when (< i n) (ja-set! cbuf (+ off i) (string-ref s (+ p i))) (loop (+ i 1))))
                                       (sr-pos! self (+ p n)) (->num n))))))))))
-        (cons "mark" (lambda (self . _) (vector-set! (jhost-state self) 2 (sr-pos self)) jolt-nil))
-        (cons "reset" (lambda (self) (sr-pos! self (vector-ref (jhost-state self) 2)) jolt-nil))
+        (cons "mark" (lambda (self . _) (sr-s self) (vector-set! (jhost-state self) 2 (sr-pos self)) jolt-nil))
+        (cons "reset" (lambda (self) (sr-s self) (sr-pos! self (vector-ref (jhost-state self) 2)) jolt-nil))
         (cons "skip" (lambda (self n) (let ((n (jnum->exact n)))
                                         (sr-pos! self (min (string-length (sr-s self)) (+ (sr-pos self) n))) (->num n))))
         ;; readLine: the next line without its terminator, nil at EOF — what
@@ -1050,17 +1106,32 @@
                         (let loop ((acc '()))
                           (let ((l (record-method-dispatch self "readLine" jolt-nil)))
                             (if (jolt-nil? l) (list->cseq (reverse acc)) (loop (cons l acc)))))))
-        (cons "ready" (lambda (self) #t))
-        (cons "close" (lambda (self) jolt-nil))))
+        (cons "ready" (lambda (self) (sr-s self) #t))
+        (cons "close" (lambda (self) (vector-set! (jhost-state self) 0 #f) jolt-nil))))
 
 ;; ---- PushbackReader ---------------------------------------------------------
 ;; state: a vector #(wrapped-reader pushed-list line-numbering? line column skip-lf?
-;;                   at-line-start? prev-at-line-start?)
-;; The last two are LineNumberingPushbackReader's atLineStart: true before
-;; anything is read, then whether the last unit read was a newline (or EOF); an
-;; unread restores the value from before that read, as the JVM's does.
+;;                   at-line-start? prev-at-line-start? owned-reader line-pending?)
+;; The counters split the way clojure.lang.LineNumberingPushbackReader's do. LINE
+;; (0-based, as java.io.LineNumberReader keeps it) is counted BELOW the pushback,
+;; so a character read twice through an unread counts once; skip-lf? marks the
+;; \n of a \r\n, already counted; line-pending? is JDK 21's end-of-input rule —
+;; the stream ending after anything but a line terminator ends one more line,
+;; once. COLUMN (1-based) and at-line-start? are the pushback reader's own, moved
+;; by every read including one out of the pushback: a newline or the end of input
+;; puts the column back to 1, anything else moves it on, and an unread steps it
+;; back. prev-at-line-start? is what an unread restores at-line-start? to.
+;;
+;; wrapped-reader is what reads come from, and a form read replaces it: the
+;; drain-parse-refill path of host-reader-read-form (io.ss) drains it and puts a
+;; StringReader over the unconsumed tail in its place. owned-reader is the
+;; reader the constructor was handed, which that swap never touches, and it is
+;; what close closes (jolt-lang/jolt#1117) -- closing slot 0 after a read closed
+;; the in-memory tail and left the file open until a GC.
+(define (make-pbr-state rdr line-numbering?)
+  (vector rdr '() line-numbering? 0 1 #f #t #t rdr #f))
 (register-class-ctor! "PushbackReader"
-  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '() #f 0 0 #f #t #t))))
+  (lambda (rdr . _) (make-jhost "pushback-reader" (make-pbr-state rdr #f))))
 ;; Fully-qualified aliases so (java.io.PushbackReader. …) / (java.io.StringReader. …)
 ;; resolve to these built-ins even when a library defines a deftype of the same
 ;; simple name (tools.reader), which would otherwise take the bare-name slot.
@@ -1076,14 +1147,15 @@
 ;; (extend LineNumberingPushbackReader IndexingReader …) to dispatch. The methods
 ;; are shared with the plain reader below, so the two cannot drift.
 (define (make-lnpbr rdr . _)
-  (make-jhost "line-numbering-pushback-reader" (vector rdr '() #t 0 0 #f #t #t)))
+  (make-jhost "line-numbering-pushback-reader" (make-pbr-state rdr #t)))
 (register-class-ctor! "LineNumberingPushbackReader" make-lnpbr)
 (register-class-ctor! "clojure.lang.LineNumberingPushbackReader" make-lnpbr)
 (define (read-unit r)        ; read one code unit (flonum) from any reader, -1 at EOF
   (record-method-dispatch r "read" jolt-nil))
-;; One character from the wrapped reader, terminators folded to \n. Pushback sits
-;; ABOVE this (as it does on the JVM), so an unread \n is handed straight back and
-;; does not count a second line.
+;; One character from the wrapped reader, terminators folded to \n: the
+;; LineNumberReader half, which owns the line count. Pushback sits ABOVE this (as
+;; it does on the JVM), so an unread \n is handed straight back and does not
+;; count a second line.
 (define (pbr-read-translated self)
   (let* ((st (jhost-state self))
          (c (read-unit (vector-ref st 0)))
@@ -1097,9 +1169,25 @@
        (cond
          ((or (eqv? n 13) (eqv? n 10))
           (vector-set! st 3 (+ 1 (vector-ref st 3)))
-          (vector-set! st 4 0)
+          (vector-set! st 9 #f)
           (->num 10))
-         (else (vector-set! st 4 (+ 1 (vector-ref st 4))) c))))))
+         ((or (jolt-nil? c) (and n (< n 0)))
+          (when (vector-ref st 9)
+            (vector-set! st 3 (+ 1 (vector-ref st 3)))
+            (vector-set! st 9 #f))
+          c)
+         (else (vector-set! st 9 #t) c))))))
+;; Every java.io.Reader has close(), so the JVM's PushbackReader.close can call
+;; in.close() unconditionally. jolt can be handed something a JVM PushbackReader
+;; could not: clojure.core's *in* is a reify over IReader (jolt-core/clojure/
+;; core/50-io.clj) with no close method at all, and dispatching one at it would
+;; throw where the JVM has nothing to throw about. So a record or reify is asked
+;; whether it HAS the method; a host reader (io/reader, StringReader, the port
+;; readers) always does and is dispatched straight.
+(define (pbr-closeable? rdr)
+  (if (or (jrec? rdr) (jreify? rdr))
+      (and (iface-method rdr "close" #f) #t)
+      #t))
 (register-host-methods! "pushback-reader"
   (list (cons "read"
           (lambda (self . rest)
@@ -1111,7 +1199,12 @@
                           (else (read-unit (vector-ref st 0)))))
                      (n (and (number? c) (jnum->exact c))))
                 (vector-set! st 7 (vector-ref st 6))
-                (vector-set! st 6 (or (eqv? n 10) (eqv? n -1) (jolt-nil? c)))
+                (cond ((or (eqv? n 10) (eqv? n -1) (jolt-nil? c))
+                       (vector-set! st 6 #t)
+                       (vector-set! st 4 1))
+                      (else
+                       (vector-set! st 6 #f)
+                       (vector-set! st 4 (+ 1 (vector-ref st 4)))))
                 c))
             (if (null? rest)
                 (read1)
@@ -1127,9 +1220,13 @@
           (lambda (self ch . rest)
             (vector-set! (jhost-state self) 6 (vector-ref (jhost-state self) 7))
             (if (null? rest)
-                ;; unread(int|char) — push one code unit back
-                (vector-set! (jhost-state self) 1
-                  (cons (if (char? ch) (->num (char->integer ch)) ch) (vector-ref (jhost-state self) 1)))
+                ;; unread(int|char) — push one code unit back, and step the column
+                ;; back over it (only this arity is LineNumberingPushbackReader's
+                ;; own; the char[] one below is PushbackReader's and leaves it)
+                (begin
+                  (vector-set! (jhost-state self) 4 (- (vector-ref (jhost-state self) 4) 1))
+                  (vector-set! (jhost-state self) 1
+                    (cons (if (char? ch) (->num (char->integer ch)) ch) (vector-ref (jhost-state self) 1))))
                 ;; unread(char[] cbuf, off, len) — push cbuf[off,off+len) so cbuf[off]
                 ;; reads back first (the list head).
                 (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
@@ -1138,7 +1235,24 @@
                         (vector-set! (jhost-state self) 1 acc)
                         (loop (- i 1) (cons (->num (char->integer (ja-ref ch i))) acc))))))
             jolt-nil))
-        (cons "close" (lambda (self) jolt-nil))
+        ;; java.io.PushbackReader.close() is `in.close()` — it closes the reader it
+        ;; WRAPS, and a no-op here leaked every one of them (jolt-lang/jolt#1109).
+        ;; with-open over a PushbackReader is the normal spelling, so nothing else
+        ;; ever closed the wrapped reader: jolt.loader brackets each source file
+        ;; that way (stdlib/jolt/loader.clj), so every file it loaded stayed open
+        ;; for the life of the process. Invisible on POSIX, where an open
+        ;; descriptor does not stop an unlink; on Windows it makes the directory
+        ;; undeletable, which is how it was found.
+        ;;
+        ;; Only the PUSHBACK readers delegate. The other no-op closes in this file
+        ;; ("writer", "string-reader", ...) are over in-memory buffers, where a
+        ;; no-op is exactly what the JDK does.
+        (cons "close"
+          (lambda (self)
+            (let ((rdr (vector-ref (jhost-state self) 8)))
+              (when (and (not (jolt-nil? rdr)) (pbr-closeable? rdr))
+                (record-method-dispatch rdr "close" jolt-nil)))
+            jolt-nil))
         ;; 1-based, like clojure.lang.LineNumberingPushbackReader's own +1 over the
         ;; underlying LineNumberReader. A plain PushbackReader counts nothing.
         (cons "getLineNumber" (lambda (self) (->num (+ 1 (vector-ref (jhost-state self) 3)))))
@@ -1224,7 +1338,14 @@
   (let* ((name (string-charset-name rest))
          (cs (charset-canonical-down name)))
     (cond
-      ((string=? cs "utf-8") (utf8->string bv))
+      ;; utf8-bytes->string, not utf8->string: Java's decoder replaces malformed
+      ;; input per RUN and Chez's per SEQUENCE, so the two differ on overlongs
+      ;; and on a leading BOM (natives-str.ss has the table). Every byte->text
+      ;; seam below this -- (String. bytes), slurp of a byte array or a byte
+      ;; stream, .readAllBytes, the CharsetDecoder, a zip entry name -- inherits
+      ;; whichever one is named here, which is how (slurp (io/input-stream f))
+      ;; came to disagree with (slurp f) on the same bytes (jolt-dta.13).
+      ((string=? cs "utf-8") (utf8-bytes->string bv))
       ((or (string=? cs "iso-8859-1") (string=? cs "us-ascii"))
        (list->string (map integer->char (bytevector->u8-list bv))))
       ((or (string=? cs "utf-16") (string=? cs "utf-16be"))
@@ -1239,7 +1360,7 @@
       (else (let ((u8 (iconv-bytes bv name "UTF-8")))
               (if u8
                   (guard (e (#t (list->string (map integer->char (bytevector->u8-list u8)))))
-                    (utf8->string u8))
+                    (utf8-bytes->string u8))
                   (unsupported-encoding-throw name)))))))
 ;; (String. bytes offset length [charset]) — decode a SLICE. Returns (bv . rest')
 ;; where rest' is the charset args; a plain (String. bytes [charset]) is unsliced.
@@ -1715,6 +1836,13 @@
                     (not (jolt-nil? (jolt-re-find obj)))))
                ((string=? method-name "group") (apply jolt-matcher-group obj rest))
                ((string=? method-name "groupCount") (jolt-matcher-group-count obj))
+               ;; .replaceAll/.replaceFirst reset the matcher, substitute every
+               ;; match in the region (or the first), expand $N in the replacement,
+               ;; and leave the matcher with no match.
+               ((string=? method-name "replaceAll")
+                (jolt-matcher-replace obj (car rest) #t))
+               ((string=? method-name "replaceFirst")
+                (jolt-matcher-replace obj (car rest) #f))
                ((string=? method-name "region")
                 (jolt-matcher-region obj (jnum->exact (car rest)) (jnum->exact (cadr rest))))
                ((string=? method-name "regionStart") (matcher-t-rstart obj))
@@ -1916,8 +2044,8 @@
 
 ;; Pluggable instance? — a library registers (fn [class-name-string val] -> true
 ;; | false | nil); nil means "not my class, fall through". First non-nil wins.
-(define user-instance-checks '())
-(register-instance-check-arm!
+;; user-instance-checks lives in records-interop.ss.
+(register-instance-check-user-arm!
   (lambda (type-sym val)
     (let ((tname (symbol-t-name type-sym)))
       (let loop ((fs user-instance-checks))
@@ -1925,8 +2053,13 @@
             'pass
             (let ((r ((car fs) tname val)))
               (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f))))))))
+;; the bump retires every instance? answer cached while no library arm existed
+;; (records-interop.ss jolt-instance-site) — the arm may claim any of them now
 (def-var! "clojure.core" "__register-instance-check!"
-  (lambda (f) (set! user-instance-checks (append user-instance-checks (list f))) jolt-nil))
+  (lambda (f)
+    (set! user-instance-checks (append user-instance-checks (list f)))
+    (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
+    jolt-nil))
 
 ;; ---- value-semantics seams -------------------------------------------------
 ;; A library that models its own host values (java.time via jolt-lang/time) needs
@@ -2021,7 +2154,7 @@
          (class-fn (hsc-callback1 class-fn))
          (tags-fn (hsc-callback1 tags-fn))
          (p (lambda (x) (jolt-truthy? (pred x)))))
-    (register-class-arm! p (lambda (x) (class-fn x)))
+    (register-class-arm-checked! p (lambda (x) (class-fn x)))
     (set! jt-user-value-tags-arms
           (append jt-user-value-tags-arms
                   (list (cons p (lambda (x) (jt-jolt-strs->list (tags-fn x))))))))
@@ -2282,6 +2415,35 @@
 ;; (jolt.host/table? x) — is x a host tagged-table?
 (def-var! "jolt.host" "table?" (lambda (x) (if (htable? x) #t #f)))
 
+;; --- Arrays.asList ----------------------------------------------------------
+;; A fixed-size List VIEW of the array: .set writes the array and aset shows
+;; through the list, and add/remove raise UnsupportedOperationException, as
+;; java.util.Arrays$ArrayList does. The view shares the array's backing vector
+;; in ArrayList's state layout — #(backing count head) — so the ArrayList
+;; accessors read it unchanged. A reference array's backing is a plain vector
+;; and is never replaced (only fxvector and string backings promote), so the
+;; view cannot detach from its array.
+;;
+;; asList is varargs: an Object[] is the list's array, and loose elements get a
+;; fresh one, the looseness String/format already has.
+(define (arrays-as-list . args)
+  (let ((arr (if (and (= 1 (length args)) (jolt-array? (car args))
+                      (eq? (jolt-array-kind (car args)) 'object))
+                 (car args)
+                 (make-jolt-array (list->vector args) 'object))))
+    (make-jhost "arrays-aslist" (vector (jolt-array-vec arr) (ja-len arr) 0))))
+(define (aslist-unsupported . _) (throw-jvm 'UnsupportedOperationException jolt-nil))
+(define arrays-aslist-methods
+  (let ((read-only (lambda (name) (cdr (assoc name arraylist-methods)))))
+    (append
+      (map (lambda (n) (cons n (read-only n)))
+           '("get" "set" "size" "isEmpty" "contains" "toArray" "iterator" "toString"))
+      (list (cons "getFirst" al-first) (cons "getLast" al-last))
+      (map (lambda (e) (cons (car e) (host-arity-of (cdr e) #t aslist-unsupported)))
+           '(("add" 1 2) ("addAll" 1 2) ("remove" 1) ("clear" 0)
+             ("addFirst" 1) ("addLast" 1) ("removeFirst" 0) ("removeLast" 0))))))
+(register-host-methods! "arrays-aslist" arrays-aslist-methods)
+
 ;; --- java.util.Arrays -------------------------------------------------------
 ;; Arrays/sort sorts IN PLACE and returns void, so it writes back through the
 ;; array's own backing (whichever of the four natives-array.ss picks for the
@@ -2342,9 +2504,89 @@
                                     "[" (if (null? parts) ""
                                             (fold-left (lambda (acc s) (string-append acc ", " s))
                                                        (car parts) (cdr parts)))
-                                    "]"))))))))
+                                    "]")))))
+         (cons "asList" arrays-as-list))))
   (register-class-statics! "Arrays" arrays-statics)
   (register-class-statics! "java.util.Arrays" arrays-statics))
+
+;; --- java.util.Objects ------------------------------------------------------
+;; The null-safe forms of equals/hashCode/toString, over the same seams a value's
+;; own .equals and .hashCode take (record-method-dispatch, jolt-java-hashcode), so
+;; Objects/equals on two jolt values answers what (.equals a b) does: an array is
+;; equal only to itself, a vector equals a list with the same elements.
+(define (objects-equals? a b)
+  (or (eq? a b)
+      (and (not (jolt-nil? a))
+           (jolt-truthy? (record-method-dispatch a "equals" (jolt-list b))))))
+(define (objects-deep-equals? a b)
+  (cond ((eq? a b) #t)
+        ((or (jolt-nil? a) (jolt-nil? b)) #f)
+        ((and (jolt-array? a) (jolt-array? b))
+         (and (eq? (jolt-array-kind a) (jolt-array-kind b))
+              (= (ja-len a) (ja-len b))
+              (let loop ((i 0))
+                (or (fx=? i (ja-len a))
+                    (and (objects-deep-equals? (ja-ref a i) (ja-ref b i)) (loop (fx+ i 1)))))))
+        (else (objects-equals? a b))))
+;; Arrays.hashCode(Object[]), which Objects.hash is: 31*h + hash(e) from 1, in
+;; 32-bit int arithmetic, nil hashing to 0.
+(define (objects-hash-of xs)
+  (fold-left (lambda (h x) (i32 (+ (* 31 h) (jolt-java-hashcode x)))) 1 xs))
+;; A Supplier argument: a reified Supplier's get, or a plain fn (as withInitial
+;; takes above).
+(define (objects-supply f)
+  (if (iface-method f "get" 1) (record-method-dispatch f "get" jolt-nil) (jolt-invoke f)))
+(define (objects-npe msg) (throw-jvm 'NullPointerException msg))
+(let ((objects-statics
+       (list
+         (cons "equals" (lambda (a b) (objects-equals? a b)))
+         (cons "deepEquals" (lambda (a b) (objects-deep-equals? a b)))
+         (cons "hashCode" (lambda (o) (->num (jolt-java-hashcode o))))
+         ;; varargs: an Object[] is the values, loose values are too
+         (cons "hash" (lambda xs
+                        (->num (objects-hash-of
+                                 (if (and (= 1 (length xs)) (jolt-array? (car xs))
+                                          (eq? (jolt-array-kind (car xs)) 'object))
+                                     (ja->list (car xs))
+                                     xs)))))
+         (cons "toString"
+               (case-lambda
+                 ((o) (if (jolt-nil? o) "null" (jolt-str-render-one o)))
+                 ((o d) (if (jolt-nil? o) d (jolt-str-render-one o)))))
+         (cons "isNull" (lambda (o) (jolt-nil? o)))
+         (cons "nonNull" (lambda (o) (not (jolt-nil? o))))
+         ;; the message is a String, or a Supplier of one asked only on failure
+         (cons "requireNonNull"
+               (case-lambda
+                 ((o) (if (jolt-nil? o) (objects-npe jolt-nil) o))
+                 ((o m) (if (jolt-nil? o)
+                            (objects-npe (cond ((string? m) m)
+                                               ((jolt-nil? m) jolt-nil)
+                                               (else (objects-supply m))))
+                            o))))
+         (cons "requireNonNullElse"
+               (lambda (o d)
+                 (cond ((not (jolt-nil? o)) o)
+                       ((not (jolt-nil? d)) d)
+                       (else (objects-npe "defaultObj")))))
+         (cons "requireNonNullElseGet"
+               (lambda (o s)
+                 (cond ((not (jolt-nil? o)) o)
+                       ((jolt-nil? s) (objects-npe "supplier"))
+                       (else (let ((v (objects-supply s)))
+                               (if (jolt-nil? v) (objects-npe "supplier.get()") v))))))
+         (cons "compare"
+               (lambda (a b c) (if (eq? a b) 0 ((jolt-comparator-fn c) a b))))
+         (cons "checkIndex"
+               (lambda (i n)
+                 (let ((i (jnum->exact i)) (n (jnum->exact n)))
+                   (if (and (>= i 0) (< i n))
+                       (->num i)
+                       (throw-jvm 'IndexOutOfBoundsException
+                         (string-append "Index " (number->string i)
+                                        " out of bounds for length " (number->string n))))))))))
+  (register-class-statics! "Objects" objects-statics)
+  (register-class-statics! "java.util.Objects" objects-statics))
 
 ;; --- java.util.Random -------------------------------------------------------
 ;; Java-compatible LCG: java.util.Random's exact algorithm.
@@ -2439,6 +2681,169 @@
                         (let ((st (jhost-state self)))
                           (/ (random-next 24 st) (exact->inexact (expt 2 24))))))
     (cons "nextBoolean" (lambda (self) (fx=? 1 (random-next 1 (jhost-state self)))))))
+
+;; --- java.util.SplittableRandom ------------------------------------------------
+;; SplitMix64, the JDK's algorithm step for step: a 64-bit seed advanced by an
+;; odd gamma, each output a mix of the new seed. State is #(seed gamma) held as
+;; unsigned 64-bit values; results come back as the JVM's signed long/int.
+;; test.check's JavaUtilSplittableRandom is a port of this class, and its suite
+;; checks the port against the real one draw for draw.
+(define sr-mask64 #xFFFFFFFFFFFFFFFF)
+(define sr-golden #x9e3779b97f4a7c15)
+(define (sr-u64 x) (bitwise-and x sr-mask64))
+(define (sr-s64 x) (let ((u (sr-u64 x))) (if (>= u #x8000000000000000) (- u #x10000000000000000) u)))
+(define (sr-s32 x) (let ((u (bitwise-and x #xFFFFFFFF))) (if (>= u #x80000000) (- u #x100000000) u)))
+(define (sr-xorshift z n) (bitwise-xor z (bitwise-arithmetic-shift-right z n)))
+(define (sr-mix64 z)
+  (let* ((z (sr-u64 (* (sr-xorshift z 30) #xbf58476d1ce4e5b9)))
+         (z (sr-u64 (* (sr-xorshift z 27) #x94d049bb133111eb))))
+    (sr-xorshift z 31)))
+(define (sr-mix32 z)
+  (let ((z (sr-u64 (* (sr-xorshift z 33) #x62a9d9ed799705f5))))
+    (sr-s32 (bitwise-arithmetic-shift-right (sr-u64 (* (sr-xorshift z 28) #xcb24d0a5c88c35b3)) 32))))
+(define (sr-mix-gamma z)
+  (let* ((z (sr-u64 (* (sr-xorshift z 33) #xff51afd7ed558ccd)))
+         (z (sr-u64 (* (sr-xorshift z 33) #xc4ceb9fe1a85ec53)))
+         (z (bitwise-ior (sr-xorshift z 33) 1)))
+    (if (< (bitwise-bit-count (sr-xorshift z 1)) 24)
+        (bitwise-xor z #xaaaaaaaaaaaaaaaa)
+        z)))
+(define (make-splittable-random seed gamma)
+  (make-jhost "splittable-random" (vector (sr-u64 seed) gamma)))
+(define (sr-next-seed! st)
+  (let ((s (sr-u64 (+ (vector-ref st 0) (vector-ref st 1)))))
+    (vector-set! st 0 s)
+    s))
+(define (sr-next-long st) (sr-s64 (sr-mix64 (sr-next-seed! st))))
+(define (sr-next-int st) (sr-mix32 (sr-next-seed! st)))
+(define (sr-next-double st)
+  (* (bitwise-arithmetic-shift-right (sr-mix64 (sr-next-seed! st)) 11) (expt 2.0 -53)))
+;; An argument to a long or int parameter narrows the way reflective dispatch
+;; narrows it on the JVM, through Number.longValue/intValue: an integer wraps to
+;; the parameter's width and a double saturates (NaN is 0). So (.nextInt r
+;; 3000000000) reaches the JDK as a negative bound and throws its "bound must be
+;; positive", instead of drawing from a range no int can reach.
+(define (sr-narrow x lo hi wrap)
+  (if (flonum? x)
+      (cond ((not (= x x)) 0)
+            ((<= x (inexact lo)) lo)
+            ((>= x (inexact hi)) hi)
+            (else (exact (truncate x))))
+      (wrap (exact (truncate x)))))
+(define (sr-long-arg x)
+  (sr-narrow x #x-8000000000000000 #x7FFFFFFFFFFFFFFF sr-s64))
+(define (sr-int-arg x)
+  (sr-narrow x #x-80000000 #x7FFFFFFF sr-s32))
+;; Math.nextDown: the largest double below d, for a bounded nextDouble that
+;; rounded up to its bound. Both zeros step to -Double/MIN_VALUE.
+(define (sr-next-down d)
+  (if (= d 0.0)
+      -4.9406564584124654e-324
+      (let ((bv (make-bytevector 8)))
+        (bytevector-ieee-double-set! bv 0 d (endianness little))
+        (let ((bits (bytevector-s64-ref bv 0 (endianness little))))
+          (bytevector-s64-set! bv 0 (if (> d 0.0) (- bits 1) (+ bits 1)) (endianness little))
+          (bytevector-ieee-double-ref bv 0 (endianness little))))))
+;; RandomSupport.boundedNextLong / boundedNextInt: rejection sampling written with
+;; the JVM's wrapping arithmetic, so the draws consumed match the JDK's.
+(define (sr-bounded-long st origin bound)
+  (let ((r (sr-next-long st)))
+    (let* ((n (sr-s64 (- bound origin))) (m (sr-s64 (- n 1))))
+      (cond
+        ((= 0 (bitwise-and n m)) (sr-s64 (+ (bitwise-and r m) origin)))
+        ((> n 0)
+         (let loop ((u (bitwise-arithmetic-shift-right (sr-u64 r) 1)))
+           (let ((r (remainder u n)))
+             (if (< (sr-s64 (- (+ u m) r)) 0)
+                 (loop (bitwise-arithmetic-shift-right (sr-u64 (sr-next-long st)) 1))
+                 (sr-s64 (+ r origin))))))
+        (else
+         (let loop ((r r))
+           (if (or (< r origin) (>= r bound)) (loop (sr-next-long st)) r)))))))
+(define (sr-bounded-int st origin bound)
+  (let ((r (sr-next-int st)))
+    (let* ((n (sr-s32 (- bound origin))) (m (sr-s32 (- n 1))))
+      (cond
+        ((= 0 (bitwise-and n m)) (sr-s32 (+ (bitwise-and r m) origin)))
+        ((> n 0)
+         (let loop ((u (bitwise-arithmetic-shift-right (bitwise-and r #xFFFFFFFF) 1)))
+           (let ((r (remainder u n)))
+             (if (< (sr-s32 (- (+ u m) r)) 0)
+                 (loop (bitwise-arithmetic-shift-right (bitwise-and (sr-next-int st) #xFFFFFFFF) 1))
+                 (sr-s32 (+ r origin))))))
+        (else
+         (let loop ((r r))
+           (if (or (< r origin) (>= r bound)) (loop (sr-next-int st)) r)))))))
+(define (sr-check-bound bound)
+  (unless (> bound 0) (throw-jvm 'IllegalArgumentException "bound must be positive")))
+(define (sr-check-range origin bound)
+  (unless (< origin bound) (throw-jvm 'IllegalArgumentException "bound must be greater than origin")))
+
+(for-each
+  (lambda (nm)
+    (register-class-ctor! nm
+      (lambda args
+        (if (pair? args)
+            (make-splittable-random (sr-long-arg (car args)) sr-golden)
+            ;; the JDK seeds a no-arg instance from a shared generator; jolt-random
+            ;; is seeded per process and per thread, which serves the same purpose
+            (let ((s (jolt-random #x10000000000000000)))
+              (make-splittable-random (sr-mix64 s) (sr-mix-gamma (sr-u64 (+ s sr-golden)))))))))
+  '("SplittableRandom" "java.util.SplittableRandom"))
+(register-host-methods! "splittable-random"
+  (list
+    (cons "split" (lambda (self)
+                    (let* ((st (jhost-state self))
+                           (seed (sr-next-long st)))
+                      (make-splittable-random seed (sr-mix-gamma (sr-next-seed! st))))))
+    (cons "nextLong" (lambda (self . a)
+                       (let ((st (jhost-state self)))
+                         (cond
+                           ((null? a) (sr-next-long st))
+                           ((null? (cdr a))
+                            (let ((b (sr-long-arg (car a))))
+                              (sr-check-bound b)
+                              (sr-bounded-long st 0 b)))
+                           (else
+                            (let ((o (sr-long-arg (car a))) (b (sr-long-arg (cadr a))))
+                              (sr-check-range o b)
+                              (sr-bounded-long st o b)))))))
+    (cons "nextInt" (lambda (self . a)
+                      (let ((st (jhost-state self)))
+                        (cond
+                          ((null? a) (sr-next-int st))
+                          ((null? (cdr a))
+                           (let ((b (sr-int-arg (car a))))
+                             (sr-check-bound b)
+                             (sr-bounded-int st 0 b)))
+                          (else
+                           (let ((o (sr-int-arg (car a))) (b (sr-int-arg (cadr a))))
+                             (sr-check-range o b)
+                             (sr-bounded-int st o b)))))))
+    (cons "nextDouble" (lambda (self . a)
+                         (let ((st (jhost-state self)))
+                           (cond
+                             ((null? a) (sr-next-double st))
+                             ((null? (cdr a))
+                              (let ((b (inexact (car a))))
+                                (unless (and (> b 0.0) (< b +inf.0))
+                                  (throw-jvm 'IllegalArgumentException "bound must be finite and positive"))
+                                (let ((r (* (sr-next-double st) b)))
+                                  (if (>= r b) (sr-next-down b) r))))
+                             (else
+                              ;; RandomSupport.checkRange + boundedNextDouble: both
+                              ;; ends finite, and a span that overflows to Infinity
+                              ;; is drawn at half scale and doubled back
+                              (let ((o (inexact (car a))) (b (inexact (cadr a))))
+                                (unless (and (finite? o) (finite? b) (< o b))
+                                  (throw-jvm 'IllegalArgumentException "bound must be greater than origin"))
+                                (let* ((d (sr-next-double st))
+                                       (r (if (< (- b o) +inf.0)
+                                              (+ (* d (- b o)) o)
+                                              (let ((ho (* 0.5 o)))
+                                                (* (+ (* d (- (* 0.5 b) ho)) ho) 2.0)))))
+                                  (if (>= r b) (sr-next-down b) r))))))))
+    (cons "nextBoolean" (lambda (self) (< (sr-next-int (jhost-state self)) 0)))))
 
 ;; --- java.security.SecureRandom ----------------------------------------------
 ;; Every draw comes straight from the OS CSPRNG (jolt-random-bytes), so there is

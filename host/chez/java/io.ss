@@ -25,35 +25,113 @@
 ;;
 ;; The two-argument constructor normalizes each ARGUMENT and then resolves them.
 ;; That result is normal too, on every JDK from 21. See jolt-file-join.
-(define (path-has-double-sep? p n)
-  (let loop ((i 1))
+;; Scanning starts after the ROOT, whose separators are structural rather than
+;; redundant: "//srv/sh" is a UNC root and collapsing its leading pair to
+;; "/srv/sh" names a directory on the current drive instead. POSIX has no root
+;; to protect (FROM is 0 there), so "//a/b" still folds to "/a/b" as the JVM
+;; does — the row win-path-test.ss already pins.
+(define (path-has-double-sep? p n from)
+  (let loop ((i (fxmax 1 from)))
     (and (fx<? i n)
          (or (and (char=? (string-ref p i) #\/) (char=? (string-ref p (fx- i 1)) #\/))
              (loop (fx+ i 1))))))
 
-(define (jolt-path-normalize p)
-  (let ((n (string-length p)))
+;; May the trailing separator at index N-1 be dropped? Not when it IS the root:
+;; "/" is a path rather than an empty one, and on Windows so is the drive root
+;; "C:/" — trimming that to "C:" names the drive's current directory instead,
+;; which is a different file. File/listRoots is what found this: it builds its
+;; roots through here, so every root it answered came back drive-RELATIVE
+;; (jolt-lang/jolt#1074).
+;;
+;; POSIX is decided by the length test alone — the only POSIX path whose
+;; trailing separator is its root is "/" itself — so the root scan runs on
+;; Windows only, and this stays allocation-free on the hot path (a jfile is
+;; built per entry on every directory listing).
+(define (trailing-sep-droppable-for? windows? p n)
+  (and (fx>? n 1)
+       (char=? (string-ref p (fx- n 1)) #\/)
+       (or (not windows?)
+           (fx>=? (fx- n 1) (path-root-end #t p)))))
+
+;; Windows spells a separator either way, and a File or Path holds ONE spelling:
+;; "/", the one every scan in this file and nio-file.ss reads. What the caller
+;; SEES is the native "\" — path-native below renders it at the display boundary
+;; (str, toString, getPath, getAbsolutePath, getCanonicalPath, getParent, and the
+;; path in an exception message), as WinNTFileSystem and WindowsPathParser do by
+;; normalizing to "\" at construction. Keeping the held spelling "/" is what lets
+;; the ~60 separator scans between here and the Path shim stay as they are; the
+;; alternative, holding "\", would have to teach every one of them both.
+(define (path-backslashes->slashes p)
+  (if (let loop ((i 0)) (and (fx<? i (string-length p))
+                             (or (char=? (string-ref p i) #\\) (loop (fx+ i 1)))))
+      (list->string (map (lambda (c) (if (char=? c #\\) #\/ c)) (string->list p)))
+      p))
+;; The spelling a caller sees: "\" for "/" on Windows, the held path on POSIX.
+;; A File or Path renders through this and nothing else, so File/separator, the
+;; file.separator property and every rendered path agree — the one thing the JDK
+;; guarantees about them, and why File/separator could not be flipped alone
+;; (jolt-lang/jolt#1110).
+(define (path-native-for windows? p)
+  (if (and windows?
+           (let loop ((i 0)) (and (fx<? i (string-length p))
+                                  (or (char=? (string-ref p i) #\/) (loop (fx+ i 1))))))
+      (list->string (map (lambda (c) (if (char=? c #\/) #\\ c)) (string->list p)))
+      p))
+(define (path-native p) (path-native-for (eq? (sa-os-family) 'windows) p))
+;; A java.nio.file FileSystemException's message: "file", "file -> other", and
+;; ": reason" after either, as FileSystemException.getMessage builds it. Only the
+;; paths are rendered natively; the reason is strerror's text, and flipping the
+;; whole string would turn "Input/output error" into "Input\output error".
+(define (fs-exception-message-for windows? file other reason)
+  (string-append (path-native-for windows? file)
+                 (if other (string-append " -> " (path-native-for windows? other)) "")
+                 (if reason (string-append ": " reason) "")))
+(define (fs-exception-message file other reason)
+  (fs-exception-message-for (eq? (sa-os-family) 'windows) file other reason))
+
+(define (jolt-path-normalize-for windows? p0)
+  (define (trailing-sep-droppable? p n) (trailing-sep-droppable-for? windows? p n))
+  (let* ((p (if windows? (path-backslashes->slashes p0) p0))
+         (n (string-length p))
+         ;; POSIX classifies nothing as a root here, so its answers are exactly
+         ;; what they were; only Windows has a prefix to hold back.
+         (root-end (if windows? (path-root-end #t p) 0)))
     (cond
       ;; an already-normal path is the overwhelmingly common case, and a jfile is
       ;; built per entry on every directory listing: look before copying, so the
       ;; answer is p itself and nothing is allocated
-      ((not (path-has-double-sep? p n))
-       ;; a trailing separator goes, but "/" is a path, not an empty one
-       (if (and (fx>? n 1) (char=? (string-ref p (fx- n 1)) #\/))
+      ((not (path-has-double-sep? p n root-end))
+       (if (trailing-sep-droppable? p n)
            (substring p 0 (fx- n 1))
            p))
       (else
        (let ((out (make-string n)))
-         (let loop ((i 0) (j 0) (prev-slash? #f))
+         ;; the root is copied verbatim, and the collapse picks up after it with
+         ;; prev-slash? seeded from the root's last character, so a root that
+         ;; ends in a separator does not then swallow the first child separator
+         (let copy ((k 0))
+           (when (fx<? k root-end)
+             (string-set! out k (string-ref p k))
+             (copy (fx+ k 1))))
+         (let loop ((i root-end)
+                    (j root-end)
+                    (prev-slash? (and (fx>? root-end 0)
+                                      (char=? (string-ref p (fx- root-end 1)) #\/))))
            (if (fx=? i n)
-               (let ((j (if (and (fx>? j 1) (char=? (string-ref out (fx- j 1)) #\/))
-                            (fx- j 1)
-                            j)))
-                 (substring out 0 j))
+               ;; cut to the written prefix BEFORE asking about the trailing
+               ;; separator: out is n wide and only j of it is valid, and
+               ;; path-root-end measures the whole string it is handed
+               (let* ((collapsed (substring out 0 j))
+                      (m (string-length collapsed)))
+                 (if (trailing-sep-droppable? collapsed m)
+                     (substring collapsed 0 (fx- m 1))
+                     collapsed))
                (let ((c (string-ref p i)))
                  (cond ((and (char=? c #\/) prev-slash?) (loop (fx+ i 1) j #t))
                        (else (string-set! out j c)
                              (loop (fx+ i 1) (fx+ j 1) (char=? c #\/))))))))))))
+(define (jolt-path-normalize p)
+  (jolt-path-normalize-for (eq? (sa-os-family) 'windows) p))
 
 (define-record-type jfile (fields path) (nongenerative jolt-jfile-v1)
   (protocol (lambda (new) (lambda (p) (new (jolt-path-normalize p))))))
@@ -93,8 +171,13 @@
       ((string=? name "isDirectory") (list #f))
       ((string=? name "isFile")      (list #t))
       ((string=? name "openStream")
+       ;; A byte stream, not a reader: a URL's openStream is byte-level on the
+       ;; JVM, and a baked resource can be binary (the same StringReader ->
+       ;; InputStream fix url-open-stream records for file: URLs). io/reader
+       ;; still decodes whatever it is handed.
        (let ((c (embedded-res-content obj)))
-         (list (host-new "StringReader" (if (bytevector? c) (utf8->string c) c)))))
+         (list (make-in-stream (open-bytevector-input-port
+                                (if (bytevector? c) c (string->utf8 c)))))))
       (else #f))))
 
 ;; --- self-contained build artifacts (jolt-eaj) ------------------------------
@@ -258,17 +341,19 @@
                   (cons (substring p pn i) (substring p (+ i 2) (string-length p))))
                  (else (loop (+ i 1))))))))
 (define (jar-path? p) (and (jar-path-split p) #t))
-(define (make-jar-path jar entry) (string-append jar-path-prefix jar "!/" entry))
+(define (make-jar-path jar entry) (string-append jar-path-prefix (file-uri-path jar) "!/" entry))
 ;; The archive index and the entry a jar path names, or (values #f #f) when the
 ;; archive is not readable or has no such entry.
 (define (jar-path-entry p)
   (let ((parts (jar-path-split p)))
     (if (not parts)
         (values #f #f)
-        (let ((d (zipdir-for (car parts))))
+        ;; the archive is a file: URL's path, the entry a URL path segment:
+        ;; both may be escaped, and the jar may be spelled "/C:/…" (#1118)
+        (let ((d (zipdir-for (file-url->path (car parts)))))
           (if (not d)
               (values #f #f)
-              (let ((ent (hashtable-ref (zipdir-table d) (cdr parts) #f)))
+              (let ((ent (hashtable-ref (zipdir-table d) (uri-decode-lenient (cdr parts)) #f)))
                 (if ent (values d ent) (values #f #f))))))))
 (define (jar-path-exists? p)
   (let-values (((d ent) (jar-path-entry p))) (and ent #t)))
@@ -380,12 +465,14 @@
        (ascii-drive-letter? (string-ref p 0))
        (char=? (string-ref p 1) #\:)))
 
-(define (windows-root-relative? p)
-  (and (eq? (sa-os-family) 'windows)
+(define (windows-root-relative-for? windows? p)
+  (and windows?
        (> (string-length p) 0)
        (path-separator-char? (string-ref p 0))
        (or (= (string-length p) 1)
            (not (path-separator-char? (string-ref p 1))))))
+(define (windows-root-relative? p)
+  (windows-root-relative-for? (eq? (sa-os-family) 'windows) p))
 
 (define (trim-trailing-path-separator p)
   (let ((n (string-length p)))
@@ -401,9 +488,14 @@
 ;; relative case is resolved separately by project-relative below. `C:child`
 ;; still depends on Windows' process-local current directory for that drive and
 ;; remains an older File-shim compatibility gap.
-(define (jfile-path-absolute? p)
+;;
+;; Split on the platform the way jfile-fold-dots-for is, so the rows a Linux
+;; runner can never reach are still pinned (test/chez/win-platform-test.ss), and
+;; so ProcessBuilder's program resolver can ask the same question this does
+;; instead of keeping a second, POSIX-only answer of its own (#1074).
+(define (jfile-path-absolute-for? windows? p)
   (let ((n (string-length p)))
-    (if (eq? (sa-os-family) 'windows)
+    (if windows?
         (or (and (>= n 3)
                  (windows-drive-prefix? p)
                  (path-separator-char? (string-ref p 2)))
@@ -411,6 +503,8 @@
                  (path-separator-char? (string-ref p 0))
                  (path-separator-char? (string-ref p 1))))
         (and (> n 0) (char=? (string-ref p 0) #\/)))))
+(define (jfile-path-absolute? p)
+  (jfile-path-absolute-for? (eq? (sa-os-family) 'windows) p))
 
 (define (project-relative p)
   (cond
@@ -510,10 +604,91 @@
              (not (char=? (string-ref abs (- (string-length abs) 1)) #\/)))
         (string-append abs "/")
         abs)))
+;; The two edges between a filesystem path and the path of a file: URL, per
+;; platform (jolt-lang/jolt#1118). Everything between them is written once over
+;; the URL spelling; the platform is a parameter so the Windows rows are pinned
+;; from any host (test/chez/win-platform-test.ss).
+;;
+;; OUT, java.io.File.slashify over an absolute path: on Windows the separators
+;; become "/" and the path gains the "/" a drive does not start with, so
+;; "C:\a\b" is "/C:/a/b" and the URL "file:/C:/a/b" — the JDK's spelling, and
+;; the one every consumer of a file URL expects. A UNC path keeps its host as the
+;; JDK does: "//srv/sh" becomes "////srv/sh". POSIX paths are already in URL
+;; form. Characters are NOT encoded here; File.toURI encodes, File.toURL and
+;; jolt's own file:/jar:file: spellings do not.
+(define (file-uri-path-for windows? abs)
+  (if windows?
+      (let* ((p (list->string (map (lambda (c) (if (char=? c #\\) #\/ c)) (string->list abs))))
+             (p (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/))
+                    p
+                    (string-append "/" p))))
+        (if (and (>= (string-length p) 2) (string=? (substring p 0 2) "//"))
+            (string-append "//" p)
+            p))
+      abs))
+(define (file-uri-path abs) (file-uri-path-for (win32?) abs))
+
+;; IN, the filesystem path a file: URL names — what the JDK's file: handler
+;; opens. An empty or "localhost" authority is dropped ("file:///a" is "/a"),
+;; any other is a UNC host ("file://srv/sh/x" is "//srv/sh/x"); %hh escapes are
+;; decoded, since File.toURI writes them; and on Windows the "/" in front of a
+;; drive is dropped, since "/C:/a" is a path on the current drive's root that
+;; names nothing. The JVM rejects a malformed escape; a "%" that does not start
+;; one is left as a literal here, because jolt's own file: spellings carry the
+;; path unencoded and a "%" in a file name must still open.
+(define (file-url->path-for windows? spec)
+  (let* ((rest (if (and (>= (string-length spec) 5) (string-ci=? (substring spec 0 5) "file:"))
+                   (substring spec 5 (string-length spec))
+                   spec))
+         (rest (if (and (>= (string-length rest) 2) (string=? (substring rest 0 2) "//"))
+                   (let* ((n (string-length rest))
+                          (slash (let loop ((j 2)) (cond ((>= j n) n)
+                                                         ((char=? (string-ref rest j) #\/) j)
+                                                         (else (loop (+ j 1))))))
+                          (host (substring rest 2 slash))
+                          (path (substring rest slash n)))
+                     (if (or (string=? host "") (string-ci=? host "localhost"))
+                         path
+                         (string-append "//" host path)))
+                   rest))
+         (p (uri-decode-lenient rest)))
+    (if (and windows?
+             (>= (string-length p) 3)
+             (char=? (string-ref p 0) #\/)
+             (windows-drive-prefix? (substring p 1 (string-length p)))
+             (or (= (string-length p) 3) (path-separator-char? (string-ref p 3))))
+        (substring p 1 (string-length p))
+        p)))
+(define (file-url->path spec) (file-url->path-for (win32?) spec))
+
+;; The path a STRING names as a clojure.java.io source or sink. Its Coercions
+;; try (URL. s) before (File. s), so "file:/a/b" is the file /a/b rather than a
+;; relative path whose first segment is "file:"; any other string is a path.
+(define (file-url-string? s)
+  (and (>= (string-length s) 5) (string-ci=? (substring s 0 5) "file:")))
+(define (io-source-path s)
+  (project-relative (if (file-url-string? s) (file-url->path s) s)))
+
+;; %hh decoding when every "%" starts a well-formed escape, else the text as it
+;; is (see file-url->path-for).
+(define (uri-decode-lenient s)
+  (let ((n (string-length s)))
+    (let loop ((i 0))
+      (cond ((>= i n) (uri-decode s))
+            ((char=? (string-ref s i) #\%)
+             (if (and (<= (+ i 3) n) (uri-hex? (string-ref s (+ i 1))) (uri-hex? (string-ref s (+ i 2))))
+                 (loop (+ i 3))
+                 s))
+            (else (loop (+ i 1)))))))
+
 ;; File.toURI / Path.toUri: a java.net.URI over the file: form of the path, its
 ;; characters percent-encoded and an existing directory's ending in a slash.
-(define (jfile->uri p)
-  (uri-parse (string-append "file:" (uri-quote-path (jfile-uri-path p)))))
+(define (jfile->uri-spec p)
+  (string-append "file:" (uri-quote-path (file-uri-path (jfile-uri-path p)))))
+(define (jfile->uri p) (uri-parse (jfile->uri-spec p)))
+;; File.toURL: the same URL unencoded, as the JDK's (deprecated) toURL spells it.
+(define (jfile->url-spec p)
+  (string-append "file:" (file-uri-path (jfile-uri-path p))))
 
 ;; --- canonical paths --------------------------------------------------------
 ;; getCanonicalPath is realpath(3), not "make it absolute": it resolves
@@ -541,10 +716,74 @@
 ;; #f when the path does not exist (realpath fails ENOENT) or the host has no
 ;; realpath at all -- a Windows build, where the callers below fall back to
 ;; lexical folding, which is what this file could do before.
+;; --- why realpath failed ------------------------------------------------------
+;; The walk below answers a best-effort path when realpath fails, which is right
+;; for a path that merely does not exist yet: the JVM does the same. It is wrong
+;; for a failure meaning the path can NEVER name a file, where the JVM raises.
+;; Answering a string there lets a path that cannot be opened travel on as though
+;; it could.
+;;
+;; The JVM's split, measured against Clojure 1.12 rather than assumed:
+;;
+;;   ENOENT / ENOTDIR / EACCES    best-effort path, no error
+;;   ELOOP / ENAMETOOLONG         java.io.IOException, in strerror's own wording
+;;
+;; Errno comes from the location accessor rather than Chez's native-error
+;; convention, which needs a literal foreign-procedure whose load-time relocation
+;; aborts the boot where the symbol is absent -- exactly the Windows build
+;; realpath is already missing from. Same three spellings process.ss uses:
+;; Darwin/BSD, glibc/musl, then bionic.
+(define io-errno-loc
+  (or (jolt-foreign-proc-safe "__error" '() 'void*)
+      (jolt-foreign-proc-safe "__errno_location" '() 'void*)
+      (jolt-foreign-proc-safe "__errno" '() 'void*)))
+(define (io-errno)
+  (if io-errno-loc (guard (e (#t 0)) (sa-foreign-ref 'int (io-errno-loc) 0)) 0))
+
+;; macOS values from <sys/errno.h>; Linux from asm-generic/errno.h. The same
+;; os-family split process.ss uses for EAGAIN and io_poller.clj for EINPROGRESS.
+;; A wrong value here degrades to today's behavior (no raise) rather than
+;; misfiring, and the gate exercises both platforms.
+(define io-ELOOP        (if (eq? (sa-os-family) 'macos) 62 40))
+(define io-ENAMETOOLONG (if (eq? (sa-os-family) 'macos) 63 36))
+
+(define (jfile-realpath* p)                 ; -> (values path-or-#f errno)
+  (if (not c-realpath)
+      (values #f 0)
+      (let ((buf (make-bytevector 4096 0)))
+        (if (= 0 (c-realpath p buf))
+            (values #f (io-errno))
+            (values (jfile-cstr buf) 0)))))
+
 (define (jfile-realpath p)
-  (and c-realpath
-       (let ((buf (make-bytevector 4096 0)))     ; >= PATH_MAX
-         (and (not (= 0 (c-realpath p buf))) (jfile-cstr buf)))))
+  (let-values (((rp e) (jfile-realpath* p))) rp))
+
+;; realpath for an ANCESTOR of the path being canonicalized -- a component that
+;; has to be resolved to descend through. A failure that can never name a file
+;; raises HERE, where the same failure on the FINAL component does not: the JVM
+;; leaves a trailing symlink loop or over-long name unresolved and answers,
+;; and raises only when it had to walk through one. Both directions measured.
+(define (jfile-realpath-ancestor p)
+  (let-values (((rp e) (jfile-realpath* p)))
+    (cond (rp rp)
+          ((= e io-ELOOP)
+           (throw-jvm (quote java.io.IOException)
+                      "Too many levels of symbolic links"))
+          ((= e io-ENAMETOOLONG)
+           (throw-jvm (quote java.io.IOException) "File name too long"))
+          (else #f))))
+
+;; A Java String can hold a NUL and a C path cannot, so a path carrying one can
+;; never name a file. The JVM refuses it in the CANONICALIZING route
+;; specifically: File.exists answers false rather than raising, and
+;; getAbsolutePath hands the NUL straight back. So this belongs here and not in
+;; jfile-abs, which those two go through.
+(define (jfile-nul-free! p)
+  (when (let loop ((i 0))
+          (cond ((>= i (string-length p)) #f)
+                ((char=? (string-ref p i) #\nul) #t)
+                (else (loop (+ i 1)))))
+    (throw-jvm (quote java.io.IOException) "Invalid file path")))
 
 ;; "/a/b" -> "/a", "/a" -> "/", "/" -> #f. The directory half of an output
 ;; path, POSIX-only on purpose: its callers are the AOT cache and the build
@@ -576,6 +815,220 @@
 ;; jfile-fold-dots as a single unsplittable segment.
 (define (path-sep-for? windows? c)
   (or (char=? c #\/) (and windows? (char=? c #\\))))
+
+;; Is P already spelled in the native Windows style — backslashes and no forward
+;; slash? A join onto such a path uses ITS separator rather than handing back a
+;; mixed spelling: Windows accepts either, but a %TEMP%- or PATH-derived
+;; directory is native, and the joined path is what the caller then sees in an
+;; error message or hands to a child process. Callers: the java.nio.file Path
+;; resolve/join (nio-file.ss) and ProcessBuilder's program resolver
+;; (process.ss). Always false on POSIX, where a backslash is an ordinary
+;; character in a filename and nothing about it says "separator".
+(define (path-backslash-style? windows? p)
+  (and windows?
+       (let loop ((i 0) (bs #f))
+         (cond ((= i (string-length p)) bs)
+               ((char=? (string-ref p i) #\/) #f)
+               ((char=? (string-ref p i) #\\) (loop (+ i 1) #t))
+               (else (loop (+ i 1) bs))))))
+
+;; The separator a join adds after P: the one P already uses, else "/".
+(define (path-join-sep windows? p) (if (path-backslash-style? windows? p) "\\" "/"))
+
+;; --- the Win32 native surface ------------------------------------------------
+;; The handful of kernel32 entry points the shims need where POSIX has no answer:
+;; the DOS file attributes behind java.nio.file.Files/isHidden (nio-file.ss), and
+;; the UTF-16 marshalling every W entry point takes, which the ProcessBuilder
+;; spawn path (process.ss) shares. Lives here because io.ss is the file both of
+;; those already load — and already the home of the other platform-parameterized
+;; path helpers above.
+;;
+;; Everything is resolved LAZILY and only on Windows: on POSIX nothing here ever
+;; loads a library or looks up an entry, so a jolt that never calls one pays
+;; nothing and a host without the entry degrades rather than failing to boot.
+;;
+;; kernel32 is loaded explicitly, as sa-windows-env-entries does for
+;; GetEnvironmentStringsW and jolt.nrepl does for ws2_32: -lkernel32 being linked
+;; does not put its symbols in jolt.exe's own export table, so the process handle
+;; alone does not resolve them. load-shared-object PREPENDS to Chez's lookup list
+;; and every later foreign-entry walks it, so each library is loaded at most once.
+(define win32? (lambda () (eq? (sa-os-family) 'windows)))
+
+(define win32-loaded-libs '())
+(define (win32-load-lib! name)
+  (unless (member name win32-loaded-libs)
+    (set! win32-loaded-libs (cons name win32-loaded-libs))
+    (guard (e (#t #f)) (sa-load-shared-object name))))
+
+;; A Win32 entry point, or #f: #f off Windows, #f when the library or the symbol
+;; is missing. Resolved through sa-foreign-procedure-runtime for the reason
+;; jolt-foreign-proc-safe takes that branch on Windows — a compiled foreign
+;; reference is a load-time fasl relocation there, and a missing symbol aborts
+;; the boot before any guard can run.
+(define (win32-proc lib name args res)
+  (and (win32?)
+       (begin
+         (win32-load-lib! lib)
+         (and (sa-foreign-entry? name)
+              (guard (e (#t #f)) (sa-foreign-procedure-runtime name args res #f))))))
+
+;; Resolve ONCE, on first use, and remember the answer (including #f).
+(define-syntax define-win32-proc
+  (syntax-rules ()
+    ((_ id lib name args res)
+     (define id
+       (let ((memo #f) (done? #f))
+         (lambda ()
+           (unless done?
+             (set! done? #t)
+             (set! memo (win32-proc lib name (quote args) (quote res))))
+           memo))))))
+
+;; A NUL-terminated UTF-16LE copy of S in foreign memory — what every W entry
+;; point takes. The caller owns it and must sa-foreign-free it. Surrogate pairs
+;; are string->utf16's to get right, which is the reason not to hand-roll it.
+(define (win32-wstr s)
+  (let* ((bv (string->utf16 s (endianness little)))
+         (n (bytevector-length bv))
+         (p (sa-foreign-alloc (+ n 2))))
+    (sa-foreign-bytes-set! p bv n)
+    (sa-foreign-set! 'unsigned-8 p n 0)
+    (sa-foreign-set! 'unsigned-8 p (+ n 1) 0)
+    p))
+
+;; Run BODY with the wide copy of S, freeing it however BODY leaves.
+(define (win32-with-wstr s proc)
+  (let ((w (win32-wstr s)))
+    (dynamic-wind (lambda () #f) (lambda () (proc w)) (lambda () (sa-foreign-free w)))))
+
+(define win32-INVALID-FILE-ATTRIBUTES #xFFFFFFFF)
+(define win32-FILE-ATTRIBUTE-HIDDEN   #x2)
+(define win32-FILE-ATTRIBUTE-DIRECTORY #x10)
+
+(define-win32-proc win32-get-file-attributes-w
+  "kernel32.dll" "GetFileAttributesW" (void*) unsigned-32)
+
+;; The DOS attribute word for PATH, or #f when it cannot be read (the path does
+;; not exist, or this is not Windows). Win32 takes "/" as a separator as happily
+;; as "\\", so the "/"-rendered paths the Path shim hands out need no rewriting.
+(define (win32-file-attributes path)
+  (let ((f (win32-get-file-attributes-w)))
+    (and f
+         (let ((a (win32-with-wstr path
+                    (lambda (w) (guard (e (#t win32-INVALID-FILE-ATTRIBUTES)) (f w))))))
+           (and (not (= a win32-INVALID-FILE-ATTRIBUTES)) a)))))
+
+;; A FILETIME: 100-nanosecond intervals since 1601-01-01 UTC, which is
+;; 11644473600 seconds before the Unix epoch. Pure, so the conversion is pinned
+;; from any host (test/chez/win-platform-test.ss).
+;; Converted at the FILETIME's own resolution, which is what a FileTime carries:
+;; a nanosecond count loses only its last two digits on the way out.
+(define win32-epoch-offset-ticks 116444736000000000)
+(define (unix-ns->filetime ns) (+ (div ns 100) win32-epoch-offset-ticks))
+(define (filetime->unix-ns ft) (* (- ft win32-epoch-offset-ticks) 100))
+
+(define win32-FILE-READ-ATTRIBUTES       #x80)
+(define win32-FILE-WRITE-ATTRIBUTES      #x100)
+(define win32-FILE-SHARE-ALL             #x7)          ; read | write | delete
+(define win32-OPEN-EXISTING              3)
+(define win32-FILE-FLAG-BACKUP-SEMANTICS #x02000000)   ; what opens a directory
+(define win32-FILE-FLAG-OPEN-REPARSE-POINT #x00200000) ; the link itself, not its target
+(define win32-FILE-ATTRIBUTE-REPARSE-POINT #x400)
+(define win32-INVALID-HANDLE-VALUE       -1)
+
+;; CreateFileW follows a symbolic link unless told not to, so the handle a time
+;; is read or set through names the link's TARGET by default. NOFOLLOW_LINKS asks
+;; for the link itself: FILE_FLAG_OPEN_REPARSE_POINT, as the JDK's
+;; WindowsPath.openFor*AttributeAccess(followLinks=false) passes.
+(define (win32-attr-open-flags follow?)
+  (if follow?
+      win32-FILE-FLAG-BACKUP-SEMANTICS
+      (bitwise-ior win32-FILE-FLAG-BACKUP-SEMANTICS win32-FILE-FLAG-OPEN-REPARSE-POINT)))
+;; GetFileAttributesExW never follows a reparse point: on a link it answers the
+;; link's own times. That is the NOFOLLOW answer, and for any path that is not a
+;; reparse point the only answer; a FOLLOW read of a link has to open it.
+(define (win32-times-need-handle? attrs follow?)
+  (and follow? (not (= 0 (bitwise-and attrs win32-FILE-ATTRIBUTE-REPARSE-POINT)))))
+
+(define-win32-proc win32-create-file-w
+  "kernel32.dll" "CreateFileW" (void* unsigned-32 unsigned-32 void* unsigned-32 unsigned-32 void*) iptr)
+(define-win32-proc win32-set-file-time
+  "kernel32.dll" "SetFileTime" (iptr u8* u8* u8*) int)
+(define-win32-proc win32-close-handle
+  "kernel32.dll" "CloseHandle" (iptr) int)
+(define-win32-proc win32-get-file-time
+  "kernel32.dll" "GetFileTime" (iptr u8* u8* u8*) int)
+
+;; Open PATH for ACCESS with the link-following flags, run PROC on the handle and
+;; close it. #f when the open fails or this is not Windows.
+(define (win32-with-attr-handle path access follow? proc)
+  (let ((create (win32-create-file-w)) (close (win32-close-handle)))
+    (and create close
+         (let ((h (win32-with-wstr path
+                    (lambda (w)
+                      (create w access win32-FILE-SHARE-ALL 0
+                              win32-OPEN-EXISTING (win32-attr-open-flags follow?) 0)))))
+           (and (not (= h win32-INVALID-HANDLE-VALUE))
+                (dynamic-wind (lambda () #f) (lambda () (proc h)) (lambda () (close h))))))))
+
+;; Files.setLastModifiedTime / setAttribute on Windows, as WindowsFileAttributeViews
+;; does it: open the path for FILE_WRITE_ATTRIBUTES — with
+;; FILE_FLAG_BACKUP_SEMANTICS, the flag that lets CreateFile open a directory at
+;; all, and FILE_FLAG_OPEN_REPARSE_POINT when not following a link — and set just
+;; the times given. Each of CREATION, ACCESS and WRITE is epoch NANOSECONDS or #f,
+;; and a #f slot passes NULL, which SetFileTime leaves alone. Answers whether they
+;; were set; #f off Windows.
+(define (win32-set-file-times! path creation access write follow?)
+  (let ((set-time (win32-set-file-time)))
+    (define (ft ns)
+      (and ns (let ((b (make-bytevector 8 0)))
+                (bytevector-u64-set! b 0 (unix-ns->filetime ns) (endianness little))
+                b)))
+    (and set-time
+         (win32-with-attr-handle path win32-FILE-WRITE-ATTRIBUTES follow?
+           (lambda (h) (not (= 0 (set-time h (ft creation) (ft access) (ft write)))))))))
+
+;; Files.createLink on Windows: CreateHardLinkW(new, existing, NULL). Answers
+;; whether the link was made; #f off Windows.
+(define-win32-proc win32-create-hard-link-w
+  "kernel32.dll" "CreateHardLinkW" (void* void* void*) int)
+(define (win32-create-hard-link! link existing)
+  (let ((f (win32-create-hard-link-w)))
+    (and f
+         (win32-with-wstr link
+           (lambda (l) (win32-with-wstr existing
+                         (lambda (e) (not (= 0 (f l e 0))))))))))
+
+;; The three times of PATH as a vector #(creation access write) of epoch
+;; NANOSECONDS (100ns resolution), or #f. WIN32_FILE_ATTRIBUTE_DATA is the
+;; attribute word and then three FILETIMEs, each two DWORDs — at 4, 12 and 20, so
+;; not 8-aligned, and read as two halves. FOLLOW? on a reparse point reads the
+;; target's through a handle (GetFileTime), since the attribute data describes
+;; the link itself.
+(define-win32-proc win32-get-file-attributes-ex-w
+  "kernel32.dll" "GetFileAttributesExW" (void* int u8*) int)
+(define (win32-filetime-at buf off)
+  (filetime->unix-ns
+   (+ (bytevector-u32-ref buf off (endianness little))
+      (* (bytevector-u32-ref buf (+ off 4) (endianness little)) #x100000000))))
+(define (win32-file-times path follow?)
+  (let ((f (win32-get-file-attributes-ex-w)))
+    (and f
+         (let ((buf (make-bytevector 36 0)))
+           (and (win32-with-wstr path
+                  (lambda (w) (guard (e (#t #f)) (not (= 0 (f w 0 buf))))))  ; GetFileExInfoStandard
+                (if (win32-times-need-handle? (bytevector-u32-ref buf 0 (endianness little)) follow?)
+                    (let ((get-time (win32-get-file-time)))
+                      (and get-time
+                           (win32-with-attr-handle path win32-FILE-READ-ATTRIBUTES #t
+                             (lambda (h)
+                               (let ((c (make-bytevector 8 0)) (a (make-bytevector 8 0))
+                                     (m (make-bytevector 8 0)))
+                                 (and (not (= 0 (get-time h c a m)))
+                                      (vector (win32-filetime-at c 0) (win32-filetime-at a 0)
+                                              (win32-filetime-at m 0))))))))
+                    (vector (win32-filetime-at buf 4) (win32-filetime-at buf 12)
+                            (win32-filetime-at buf 20))))))))
 
 ;; The ROOT of P — the prefix that is not a segment and must be reproduced
 ;; verbatim — and the index the segments start at. Rendered with "/" separators,
@@ -614,9 +1067,8 @@
 ;; The root as a string, separators normalized to "/" and one trailing "/" kept
 ;; when the root is a directory prefix ("C:/", "//srv/sh/", "/") rather than a
 ;; drive-relative "C:".
-(define (path-root windows? p)
-  (let* ((end (path-root-end windows? p))
-         (raw (substring p 0 end)))
+(define (path-root-from windows? p end)
+  (let ((raw (substring p 0 end)))
     (cond
       ((= end 0) "")
       ((and windows? (= end 2) (windows-drive-prefix? p)) raw)  ; "C:" — drive-relative
@@ -630,30 +1082,79 @@
                       out
                       (string-append out "/"))))
            s))))))
+(define (path-root windows? p)
+  (path-root-from windows? p (path-root-end windows? p)))
 
 ;; The non-empty segments under the root. Empty ones (a doubled separator) are
 ;; dropped here, which is what the JVM's normalize does to them anyway.
-(define (path-segments windows? p)
+(define (path-segments-from windows? p from)
   (let ((n (string-length p)))
-    (let loop ((i (path-root-end windows? p)) (start (path-root-end windows? p)) (acc '()))
+    (let loop ((i from) (start from) (acc '()))
       (cond
         ((= i n) (reverse (if (> i start) (cons (substring p start i) acc) acc)))
         ((path-sep-for? windows? (string-ref p i))
          (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring p start i) acc) acc)))
         (else (loop (+ i 1) start acc))))))
+(define (path-segments windows? p)
+  (path-segments-from windows? p (path-root-end windows? p)))
+
+;; A path PARSED once: its root, its segments, and the platform they were read
+;; for. Every helper below used to take the string and re-derive both, and
+;; path-root / path-segments each begin with their own path-root-end scan — so a
+;; single Path method could scan the same string up to seven times (endsWith
+;; against a rooted other normalizes both sides, and each normalize is a root
+;; plus a segment split). The scan runs once here and the parts are read as
+;; fields instead (jolt-2sp).
+;;
+;; This deliberately does NOT reach jolt-path-normalize, which every jfile runs
+;; through and which a directory listing runs per entry: that one is a character
+;; walk that allocates nothing for an already-normal path, it never asks for
+;; segments, and turning it into a parse-and-render would allocate a record and
+;; a segment list per file. It keeps its own shape for that reason.
+;;
+;; The platform is NOT a field. It reads like it should be one -- the parse is
+;; platform-specific, so the result "belongs to" a platform -- but nothing would
+;; ever read it back: every helper below already takes `windows?` as a parameter,
+;; which is what lets a Linux runner pin the Windows rows
+;; (test/chez/win-platform-test.ss). A field no caller reads is weight on every
+;; parse and one more thing to keep true, so the parser takes the platform and
+;; the value keeps only what the platform decided.
+(define-record-type ppath
+  (fields root segs)
+  (nongenerative jolt-ppath-v1))
+
+(define (path-parse windows? p)
+  (let ((end (path-root-end windows? p)))
+    (make-ppath (path-root-from windows? p end)
+                (path-segments-from windows? p end))))
+
+(define (ppath-rooted? pp) (not (string=? (ppath-root pp) "")))
+
+;; Re-render, optionally over a different segment list — the shape every
+;; consumer wants: parse, transform the segments, render.
+(define (ppath-render pp segs) (path-rebuild (ppath-root pp) segs))
 
 (define (path-rebuild root segs)
   (cond
     ((null? segs) (if (string=? root "") "." root))
     (else
-     (let loop ((out root) (ss segs) (first? #t))
-       (if (null? ss)
-           out
-           (loop (string-append out
-                                (if (or first? (string=? out "")) "" "/")
-                                (car ss))
-                 (cdr ss)
-                 #f))))))
+     ;; ONE allocation for the whole path. This appended per segment, and each
+     ;; append copies the answer built so far -- quadratic in the number of
+     ;; segments, on the function every getter below ends in. A path is short
+     ;; enough that the constant hid it, but rebuilding was measurably the most
+     ;; expensive thing in the Path algebra, more than the scanning above it.
+     ;;
+     ;; No separator before the FIRST segment: a root either ends in one ("/",
+     ;; "C:/", "//srv/sh/") or must not gain one ("C:" is drive-relative, and
+     ;; "C:a" names a different file from "C:/a"). The old spelling also tested
+     ;; (string=? out "") for that, which could only ever be true on the first
+     ;; segment and so said the same thing twice.
+     (apply string-append root
+            (cons (car segs)
+                  (let loop ((ss (cdr segs)) (acc '()))
+                    (if (null? ss)
+                        (reverse acc)
+                        (loop (cdr ss) (cons (car ss) (cons "/" acc))))))))))
 
 ;; Fold "." and ".." lexically. Only ever applied to a part of a path that does
 ;; NOT exist: where a component is real, realpath resolves it instead, because
@@ -668,8 +1169,8 @@
       (else (loop (cdr ss) (cons (car ss) out))))))
 
 (define (jfile-fold-dots-for windows? p)
-  (path-rebuild (path-root windows? p)
-                (fold-dot-segments (path-segments windows? p))))
+  (let ((pp (path-parse windows? p)))
+    (ppath-render pp (fold-dot-segments (ppath-segs pp)))))
 
 ;; The JVM canonicalizes a path whose tail does not exist -- on a host where
 ;; /tmp is a link, new File("/tmp/nope").getCanonicalPath is
@@ -679,25 +1180,37 @@
 ;; be driven from a test without a filesystem, and so the Windows rows -- where
 ;; the host has no realpath at all and this is the entire implementation -- are
 ;; reachable from a POSIX host.
-(define (jfile-canonical-for windows? realpath p)
-  (or (realpath p)
-      (let* ((root (path-root windows? p))
-             (segs (path-segments windows? p)))
-        (let loop ((n (- (length segs) 1)))
-          (cond
-            ((< n 0) (jfile-fold-dots-for windows? p))
-            (else
-             (let ((rp (realpath (path-rebuild root (list-head segs n)))))
-               (if rp
-                   (jfile-fold-dots-for
-                    windows?
-                    (path-rebuild (path-root windows? rp)
-                                  (append (path-segments windows? rp)
-                                          (list-tail segs n))))
-                   (loop (- n 1))))))))))
+;; ANCESTOR-REALPATH resolves the components the walk descends through, and is
+;; where a can-never-name-a-file failure raises; REALPATH answers for the whole
+;; path, where such a failure is not an error on the JVM. The 3-argument form
+;; uses one procedure for both, which is what a driver with no errno to read
+;; wants (win-path-test.ss) and what the Windows fallback is.
+(define jfile-canonical-for
+  (case-lambda
+    ((windows? realpath p)
+     (jfile-canonical-for windows? realpath realpath p))
+    ((windows? realpath ancestor-realpath p)
+     (or (realpath p)
+         (let* ((pp (path-parse windows? p))
+                (root (ppath-root pp))
+                (segs (ppath-segs pp)))
+           (let loop ((n (- (length segs) 1)))
+             (cond
+               ((< n 0) (jfile-fold-dots-for windows? p))
+               (else
+                (let ((rp (ancestor-realpath (path-rebuild root (list-head segs n)))))
+                  (if rp
+                      (let ((rpp (path-parse windows? rp)))
+                        (jfile-fold-dots-for
+                         windows?
+                         (ppath-render rpp (append (ppath-segs rpp) (list-tail segs n)))))
+                      (loop (- n 1))))))))))))
 
 (define (jfile-canonical p)
-  (jfile-canonical-for (eq? (sa-os-family) 'windows) jfile-realpath (jfile-abs p)))
+  (let ((abs (jfile-abs p)))
+    (jfile-nul-free! abs)
+    (jfile-canonical-for (eq? (sa-os-family) 'windows)
+                         jfile-realpath jfile-realpath-ancestor abs)))
 
 ;; --- file metadata over Chez filesystem ops ---------------------------------
 ;; byte size of a regular file (0 for a directory or a missing file).
@@ -732,33 +1245,56 @@
       (= (c-access p mode) 0)
       ;; no access(2) to ask (or X_OK on Windows): the old answer, existence.
       (if (file-exists? p) #t #f)))
-;; set atime+mtime from epoch milliseconds via utimes(2). struct timeval is
-;; sec + usec, 16 bytes each on the 64-bit platforms Chez targets; usec fits
-;; its field (< 1e6) so a signed 64-bit native-endian write covers the layout.
-;; Resolved via jolt-foreign-proc-safe — a literal foreign-procedure here is a
+;; utimes(2) is the fallback for a host without utimensat: struct timeval is
+;; sec + usec, 16 bytes each on the 64-bit platforms Chez targets. Resolved via jolt-foreign-proc-safe — a literal foreign-procedure here is a
 ;; fasl relocation that aborts the boot on platforms lacking the symbol.
-;; Windows has no utimes; its CRT _utime64 takes {actime, modtime} as two
-;; signed 64-bit seconds (16 bytes, second resolution).
+;; Windows has no utimes, and its CRT's _utime64 is no substitute: it opens the
+;; path without FILE_FLAG_BACKUP_SEMANTICS, so it cannot open a DIRECTORY and a
+;; directory's mtime was never set (jolt-lang/jolt#1119) — and it has second
+;; resolution. win32-set-file-times! (SetFileTime) is what the JDK's Windows
+;; provider does. Answers whether the time was set.
 (define c-utimes (jolt-foreign-proc-safe "utimes" '(string u8*) 'int))
-(define c-utime64 (and (not c-utimes)
-                       (jolt-foreign-proc-safe "_utime64" '(string u8*) 'int)))
+;; utimensat(2) sets either time alone (UTIME_OMIT in the other slot) at
+;; nanosecond resolution, and can leave a symbolic link's target alone
+;; (AT_SYMLINK_NOFOLLOW). Setting the mtime through utimes moved the access time
+;; to it as well, where the JDK keeps the access time as it was, for
+;; File.setLastModified and Files.setLastModifiedTime both. The constants are
+;; per-OS, measured with cc/gcc: #(AT_FDCWD UTIME_OMIT AT_SYMLINK_NOFOLLOW).
+(define c-utimensat (jolt-foreign-proc-safe "utimensat" '(int string u8* int) 'int))
+(define utimensat-consts
+  (case (sa-os-family)
+    ((linux) '#(-100 1073741822 #x100))
+    ((macos) '#(-2 -2 #x20))
+    (else #f)))
+;; A struct timespec of epoch NS at OFF: seconds floored, so a time before the
+;; epoch keeps its nanoseconds field in [0, 1e9).
+(define (timespec-bytes! bv off ns)
+  (bytevector-s64-set! bv off (div ns 1000000000) (native-endianness))
+  (bytevector-s64-set! bv (+ off 8) (mod ns 1000000000) (native-endianness)))
+;; Set P's access and/or modification time, each epoch NS or #f to leave it as
+;; it is. FOLLOW? #f sets a symbolic link's own. Answers whether it was set.
+(define (set-file-times-ns! p atime mtime follow?)
+  (cond
+    ((eq? (sa-os-family) 'windows) (win32-set-file-times! p #f atime mtime follow?))
+    ((and c-utimensat utimensat-consts)
+     (let ((ts (make-bytevector 32 0)) (k utimensat-consts))
+       (if atime (timespec-bytes! ts 0 atime)
+           (bytevector-s64-set! ts 8 (vector-ref k 1) (native-endianness)))
+       (if mtime (timespec-bytes! ts 16 mtime)
+           (bytevector-s64-set! ts 24 (vector-ref k 1) (native-endianness)))
+       (= 0 (c-utimensat (vector-ref k 0) p ts (if follow? 0 (vector-ref k 2))))))
+    ;; no utimensat: utimes, which can only set both, so both get the one given
+    ((and c-utimes follow? (or mtime atime))
+     (let ((tv (make-bytevector 32 0)) (t (or mtime atime)))
+       (define (tv! off ns)
+         (bytevector-s64-set! tv off (div ns 1000000000) (native-endianness))
+         (bytevector-s64-set! tv (+ off 8) (div (mod ns 1000000000) 1000) (native-endianness)))
+       (tv! 0 (or atime t))
+       (tv! 16 (or mtime t))
+       (= (c-utimes p tv) 0)))
+    (else #f)))
 (define (set-file-mtime-millis! p ms)
-  (let ((sec (div ms 1000)))
-    (cond
-      (c-utimes
-       (let ((tv (make-bytevector 32 0))
-             (usec (* (mod ms 1000) 1000)))
-         (bytevector-s64-set! tv 0 sec (native-endianness))
-         (bytevector-s64-set! tv 8 usec (native-endianness))
-         (bytevector-s64-set! tv 16 sec (native-endianness))
-         (bytevector-s64-set! tv 24 usec (native-endianness))
-         (= (c-utimes p tv) 0)))
-      (c-utime64
-       (let ((tb (make-bytevector 16 0)))
-         (bytevector-s64-set! tb 0 sec (native-endianness))
-         (bytevector-s64-set! tb 8 sec (native-endianness))
-         (= (c-utime64 p tb) 0)))
-      (else #f))))
+  (set-file-times-ns! p #f (* (exact (floor ms)) 1000000) #t))
 ;; mkdir -p: create p and any missing parents. Returns #t if p ends up a dir.
 (define (mkdirs! p)
   (unless (or (= 0 (string-length p)) (file-exists? p))
@@ -776,6 +1312,24 @@
           ((file-directory? p) (delete-directory p))
           (else (delete-file p) #t))))
 
+;; rename(2) REPLACES an existing destination. Chez's rename-file is MoveFile on
+;; Windows, which refuses one — "cannot rename A to B: file exists" — so every
+;; publish-by-rename here failed the moment its target already existed: the
+;; SECOND spit to a path, the first spit to a File/createTempFile target, and
+;; every AOT or classpath artifact written a second time (jolt-lang/jolt#1074).
+;; Those callers all mean the POSIX semantic, so drop the destination first
+;; there. That opens a window where the target is gone and the new content is
+;; not in place yet; it is Windows-only, and still far narrower than the
+;; truncate-in-place write the staged rename replaced.
+;;
+;; java.io.File.renameTo keeps the bare rename-file: the JVM documents it as
+;; platform-dependent and it fails over an existing destination on Windows too,
+;; so matching it IS the shim's job.
+(define (rename-replace! from to)
+  (when (and (eq? (sa-os-family) 'windows) (file-exists? to))
+    (delete-file to #f))
+  (rename-file from to))
+
 ;; --- java.net.URL (a jhost "url", state #(spec handler)) --------------------
 ;; A File.toURL value: .toString / .toExternalForm give the spec, .getPath /
 ;; .getFile strip the "file:" scheme.
@@ -792,9 +1346,6 @@
     (and (> (vector-length st) 1)
          (let ((h (vector-ref st 1))) (and (not (jolt-nil? h)) h)))))
 (define (url-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "url")))
-(define (url-strip-scheme spec)
-  (if (and (>= (string-length spec) 5) (string=? (substring spec 0 5) "file:"))
-      (substring spec 5 (string-length spec)) spec))
 ;; The path component: the spec without its scheme, and without an authority when
 ;; one is present. "https://example.com/a.html" -> "/a.html", "file:/a/b" -> "/a/b"
 ;; (a file: URL keeps giving the filesystem path callers read it for).
@@ -818,7 +1369,7 @@
 (define (url-write-path u)
   (let ((spec (url-spec u)))
     (if (string=? (url-protocol spec) "file")
-        (url-strip-scheme spec)
+        (file-url->path spec)
         (throw-jvm (quote IllegalArgumentException)
                    (string-append "Can not write to non-file URL <" spec ">")))))
 
@@ -945,7 +1496,7 @@
       ;; FileInputStream resolves a relative path against user.dir and raises
       ;; java.io.FileNotFoundException for a missing one, both like the JVM.
       ((string=? (url-protocol spec) "file")
-       (host-new "FileInputStream" (url-strip-scheme spec)))
+       (host-new "FileInputStream" (file-url->path spec)))
       ;; an entry of a jar on the roots streams out of the archive
       ((jar-path? spec) (jar-path-stream spec))
       (else (throw-jvm (quote java.io.IOException)
@@ -1002,19 +1553,41 @@
       (guard (e (#t jolt-nil)) (produce))
       jolt-nil))
 
+;; File.setReadable/setWritable/setExecutable(enable [, ownerOnly]) and
+;; setReadOnly, as the JDK's UnixFileSystem.setPermission does them: BIT is the
+;; permission's "other" bit, widened to the owner's alone (ownerOnly, the
+;; default) or to all three classes, then or'd in or masked out with chmod.
+;; Answers whether the mode was changed; false for a missing file. On Windows
+;; only the write bit means anything (the read-only attribute, which Chez's
+;; chmod sets through _wchmod), and the JDK answers a read or execute change
+;; with ENABLE itself. None of these existed, so every call raised.
+(define (jfile-set-permission! fp bit args)
+  (let ((enable? (and (pair? args) (jolt-truthy? (car args))))
+        (owner-only? (or (not (pair? args)) (null? (cdr args)) (jolt-truthy? (cadr args)))))
+    (guard (e (#t #f))
+      (cond
+        ((and (eq? (sa-os-family) 'windows) (not (= bit 2))) enable?)
+        (else
+         (let* ((m (bitwise-and (get-mode fp) #o7777))
+                (a (if (and owner-only? (not (eq? (sa-os-family) 'windows)))
+                       (* bit #o100)
+                       (* bit #o111))))
+           (chmod fp (if enable? (bitwise-ior m a) (bitwise-and m (bitwise-not a))))
+           #t))))))
+
 ;; --- File method surface (record-method-dispatch arm) -----------------------
 (define (jfile-method f name args)        ; -> boxed result, or #f to fall through
   (let ((p (jfile-path f))               ; the path as given (display methods)
         (fp (jfile-fs f)))               ; JOLT_PWD-resolved on-disk path (FS methods)
     (cond
-      ((string=? name "getPath")        (list p))
+      ((string=? name "getPath")        (list (path-native p)))
       ((string=? name "getName")        (list (path-last-segment p)))
-      ((string=? name "toString")       (list p))
-      ((string=? name "getAbsolutePath")(list (jfile-abs fp)))
-      ((string=? name "getCanonicalPath")(list (jfile-canonical fp)))
+      ((string=? name "toString")       (list (path-native p)))
+      ((string=? name "getAbsolutePath")(list (path-native (jolt-path-normalize (jfile-abs fp)))))
+      ((string=? name "getCanonicalPath")(list (path-native (jfile-canonical fp))))
       ;; File.toURI returns a java.net.URI (JVM), not a String.
       ((string=? name "toURI")          (list (jfile->uri fp)))
-      ((string=? name "toURL")          (list (make-url (string-append "file:" (jfile-uri-path fp)))))
+      ((string=? name "toURL")          (list (make-url (jfile->url-spec fp))))
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
@@ -1037,6 +1610,10 @@
       ((string=? name "mkdirs")         (list (if (mkdirs! fp) #t #f)))
       ((string=? name "delete")         (list (if (delete-path! fp) #t #f)))
       ((string=? name "deleteOnExit")   (list jolt-nil))
+      ((string=? name "setReadable")    (list (jfile-set-permission! fp 4 args)))
+      ((string=? name "setWritable")    (list (jfile-set-permission! fp 2 args)))
+      ((string=? name "setExecutable")  (list (jfile-set-permission! fp 1 args)))
+      ((string=? name "setReadOnly")    (list (jfile-set-permission! fp 2 (list #f #f))))
       ((string=? name "setLastModified")
        (list (guard (e (#t #f))
                (set-file-mtime-millis! fp (exact (floor (car args)))))))
@@ -1056,7 +1633,7 @@
       ((string=? name "equals")         (list (and (jfile? (car args)) (string=? p (jfile-path (car args))))))
       ((string=? name "hashCode")       (list (->num (string-hash p))))
       ((string=? name "getParent")
-       (list (or (jfile-parent-path p) jolt-nil)))
+       (list (let ((parent (jfile-parent-path p))) (if parent (path-native parent) jolt-nil))))
       (else #f))))
 
 (register-method-arm! arm-priority-file
@@ -1124,62 +1701,147 @@
 ;; NOT announced: the loader reads namespace SOURCE through this too, and those
 ;; are described by the cache key already. slurp-path / io/resource / io/reader —
 ;; the entry points user code reaches — announce for themselves.
-;; 64 KB, the same block the reader drain uses: a single get-string-n! the size
-;; of the whole file measures no better than chunks (the decoder has no bulk win
-;; to give), and chunking keeps one bad length from asking for an absurd string.
-(define slurp-block-size 65536)
-
-;; The text of a file, decoded through the port's own transcoder.
+;; The BYTES of a file, read into a buffer allocated once.
 ;;
-;; get-string-all was the whole cost of slurp: it grows its result as it goes,
-;; so an 8.1 MB file cost 1745 ms against 1249 ms for the same decode into a
-;; buffer allocated ONCE — slurp is among the most-called IO functions in
-;; ordinary Clojure, and it was paying ~40% overhead on every call.
-;;
-;; The file's BYTE length is an exact upper bound on its character count (UTF-8
-;; never decodes more characters than it has bytes), so the result buffer can be
-;; allocated once up front. An ASCII file then needs no copy at all — the count
-;; comes back equal to the length and the buffer IS the answer; a file with
-;; multibyte characters decodes to fewer and takes one substring at the end.
-;;
-;; The DECODER IS UNCHANGED, deliberately. Reading the bytes and calling
-;; utf8->string is faster still (665 ms), but it is a different decoder: on an
-;; overlong sequence (C0 AF) the port's transcoder emits two replacement
-;; characters, as Java's CharsetDecoder does, and utf8->string emits one. Slurp
-;; is not the place to trade Java's behavior on malformed input for speed.
-(define (read-file-string-sized p n)
-  (let ((out (make-string n)))
+;; get-bytevector-all was the whole cost of slurp: it grows its result as it
+;; goes, so an 8.1 MB file cost 1745 ms against 1249 ms for the same read into a
+;; buffer allocated ONCE -- slurp is among the most-called IO functions in
+;; ordinary Clojure, and it was paying ~40% overhead on every call. file-length
+;; gives the exact size, so ask for it once.
+(define (read-file-bytes-sized p n)
+  (let ((out (make-bytevector n)))
     (let loop ((at 0))
       (cond
         ((fx<? at n)
-         (let ((k (get-string-n! p out at (fxmin slurp-block-size (fx- n at)))))
+         (let ((k (get-bytevector-n! p out at (fx- n at))))
            (if (or (eof-object? k) (fx=? k 0))
-               ;; fewer characters than bytes — the file had multibyte content
-               (substring out 0 at)
+               ;; shorter than file-length promised: truncated under the read
+               (let ((short (make-bytevector at)))
+                 (bytevector-copy! out 0 short 0 at)
+                 short)
                (loop (fx+ at k)))))
         ;; The bound was reached, which normally means done. A file being
-        ;; APPENDED to while it is read has more, and get-string-all would have
-        ;; taken it, so ask once rather than silently truncating.
+        ;; APPENDED to while it is read has more, and get-bytevector-all would
+        ;; have taken it, so ask once rather than silently truncating.
         (else
-         (let ((more (get-string-all p)))
-           (if (or (eof-object? more) (fx=? (string-length more) 0))
+         (let ((more (get-bytevector-all p)))
+           (if (or (eof-object? more) (fx=? (bytevector-length more) 0))
                out
-               (string-append out more))))))))
+               (let* ((m (bytevector-length more))
+                      (both (make-bytevector (fx+ n m))))
+                 (bytevector-copy! out 0 both 0 n)
+                 (bytevector-copy! more 0 both n m)
+                 both))))))))
 
-(define (read-file-string path)
-  (if (jar-path? path)
-      (utf8->string (or (jar-path-bytes path) (jar-path-missing path)))
-      (read-file-string-on-disk path)))
-(define (read-file-string-on-disk path)
-  (with-port (open-input-file path)
+;; --- why an open failure is classified, and where ----------------------------
+;; The JVM raises java.io.FileNotFoundException when a path cannot be opened, and
+;; libraries branch on that class: instaparse decides whether its argument is a
+;; grammar or a file by slurping and catching FNF. A raw Chez i/o condition is
+;; not catchable as that class -- nor as any Java class -- so the caller's
+;; fallback never runs. The message is the JVM's shape: the path AS GIVEN, then
+;; the reason in parens. The JVM uses this one class for all the reasons, so only
+;; the parenthetical distinguishes them.
+;;
+;; This lives in io.ss rather than next to the stream constructors because slurp
+;; reaches a file through read-file-bytes-on-disk below, not through
+;; io-streams.ss -- and while that was the only opener NOT classifying, slurp of
+;; a directory, of an unreadable file and of anything at all under descriptor
+;; exhaustion all came back as a bare java.io.IOException carrying Chez's own
+;; wording (jolt-3ah).
+;;
+;; --- the reason comes from the condition, not from a second look at the disk ---
+;; What the JVM puts in the parentheses is strerror(errno), and Chez's i/o
+;; conditions carry that very string among their IRRITANTS, as
+;; ("/the/path" "No such file or directory") -- and equally "Permission denied",
+;; "Is a directory", "Too many open files". Both sides are printing the same libc
+;; string, so the condition is what is asked.
+;;
+;; A probe of the filesystem cannot stand in for it. EMFILE is the case that
+;; shows why: the open failed because the PROCESS is out of descriptors and
+;; nothing is wrong with the path at all, so a probe finds a readable file and
+;; blames the program's own leak on the file's mode bits. A parent directory
+;; without +x is the same story inverted -- the open says "Permission denied" and
+;; the probe cannot so much as stat the target, so it would say "No such file or
+;; directory". And whatever the reason, the filesystem can change between the
+;; failure and the probe.
+;;
+;; The IRRITANTS, not condition/report-string: Chez's EMFILE condition carries no
+;; i/o-file-name, so report-string raises trying to format it -- and it raises
+;; whether or not descriptors are still exhausted, so there is no waiting it out.
+;; The reason is the LAST irritant; the first is the path Chez was handed, which
+;; is not always the path being reported (spit opens a temp file and names its
+;; target), so position picks it out rather than identity.
+(define (io-open-reason exc)
+  (and (pair? exc) (condition? (car exc))
+       (let ((irr (guard (e2 (#t (quote ()))) (condition-irritants (car exc)))))
+         (and (pair? irr) (pair? (cdr irr))
+              (let last ((l irr))
+                (cond ((pair? (cdr l)) (last (cdr l)))
+                      ((and (string? (car l)) (fx>? (string-length (car l)) 0)) (car l))
+                      (else #f)))))))
+
+;; EXC is the condition the open raised, when there was one. The probes are the
+;; fallback for the one caller with no condition to offer: open-path-guarded's
+;; directory check, which refuses before it opens.
+;; GIVEN is named the way a java.io.File built from it would name it: the JDK
+;; opens a File, so (slurp "a//b") reports "a/b", and path-native alone left the
+;; doubled separator in.
+(define (file-open-error given resolved . exc)
+  (throw-jvm (quote java.io.FileNotFoundException)
+             (string-append (path-native (jolt-path-normalize given)) " ("
+                            (or (io-open-reason exc)
+                                (cond ((not (file-exists? resolved)) "No such file or directory")
+                                      ((file-directory? resolved)    "Is a directory")
+                                      (else                          "Permission denied")))
+                            ")")))
+
+;; Opening is guarded rather than pre-checked -- existence and permission can
+;; change between a check and the open, and only the open itself is
+;; authoritative. A DIRECTORY is the one case that needs the check: the JVM
+;; refuses it at construction, while a Chez port over a directory opens fine and
+;; raises on the first READ, far from the call that was wrong.
+;;
+;; That check is the only syscall this adds, and on the slurp path it replaces
+;; one: slurp-path used to stat for existence up front and now lets the open
+;; report it.
+(define (open-path-guarded given resolved thunk)
+  (when (file-directory? resolved) (file-open-error given resolved))
+  (guard (e ((i/o-error? e) (file-open-error given resolved e)))
+    (thunk resolved)))
+
+;; The text of a file: read the bytes, then decode them with the one decoder
+;; every other byte->text seam uses (natives-str.ss utf8-bytes->string).
+;;
+;; This used to read through the PORT's transcoder instead, which is Chez's
+;; UTF-8 codec and not java.nio's -- so the same bytes came back differently
+;; from (slurp f) and from (String. (.readAllBytes ...)), and a file with a BOM
+;; quietly lost its first character. Reading bytes is also the faster of the two
+;; (8.1MB x20: 1150ms against the transcoder's 1234ms); the well-formedness
+;; guard inside utf8-bytes->string spends that margin and about as much again,
+;; for a net ~8%.
+;;
+;; THE LOADER READS SOURCE THROUGH HERE, so a .clj beginning with a UTF-8 BOM
+;; now fails to read, exactly as it does on the JVM and on babashka
+;; ("Unable to resolve symbol: <U+FEFF>"). Chez's codec used to swallow the BOM
+;; and hide that, at the price of swallowing it out of DATA files too.
+;; GIVEN, when passed, is the path as the caller spelled it, for the message: a
+;; missing file is reported under that name, as the JVM's FileInputStream does,
+;; rather than under the user.dir-resolved PATH this opens.
+(define (read-file-string path . given)
+  (utf8-bytes->string
+   (if (jar-path? path)
+       (or (jar-path-bytes path) (jar-path-missing path))
+       (apply read-file-bytes-on-disk path given))))
+(define (read-file-bytes-on-disk path . given)
+  (with-port (open-path-guarded (if (pair? given) (car given) path) path (lambda (p) (open-file-input-port p)))
     (lambda (p)
       ;; A port with no meaningful length — a fifo, a character device — reports
       ;; 0 or raises; both fall back to the growing read, which is correct for
       ;; anything whose size cannot be known in advance.
       (let ((n (guard (e (#t #f)) (file-length p))))
         (if (and (fixnum? n) (fx>? n 0))
-            (read-file-string-sized p n)
-            (let ((s (get-string-all p))) (if (eof-object? s) "" s)))))))
+            (read-file-bytes-sized p n)
+            (let ((bv (get-bytevector-all p))) (if (eof-object? bv) (bytevector) bv)))))))
 
 ;; Drain a jhost reader (StringReader / PushbackReader): read code units from the
 ;; current position to EOF (-1) and assemble the string. Used by slurp; advances
@@ -1204,22 +1866,58 @@
         (loop (cdr ps) (cons (integer->char (jnum->exact (car ps))) acc)))))
 
 ;; A line-numbering reader folds \r\n and a lone \r to one \n and counts a line
-;; for each, one character at a time (pbr-read-translated). A bulk drain has to
-;; leave exactly the state that loop would have: same text, same line/column, and
-;; the same "a \n right after this \r is already counted" flag.
+;; for each, one character at a time (pbr-read-translated, then the pushback
+;; reader's own column in its read). A bulk drain has to leave exactly the state
+;; that loop would have: same text, same line and column, the same "a \n right
+;; after this \r is already counted" and end-of-input flags, and the same
+;; atLineStart pair. Reaching the end of S is not reading the end of input —
+;; pbr-fold-eof! is that.
 (define (pbr-fold-and-count! st s)
   (let ((n (string-length s)))
     (let loop ((i 0) (acc '()) (line (vector-ref st 3)) (col (vector-ref st 4))
-               (skip-lf (vector-ref st 5)))
+               (skip-lf (vector-ref st 5)) (pending (vector-ref st 9))
+               (als (vector-ref st 6)) (prev (vector-ref st 7)))
       (if (fx>=? i n)
           (begin (vector-set! st 3 line) (vector-set! st 4 col) (vector-set! st 5 skip-lf)
+                 (vector-set! st 9 pending) (vector-set! st 6 als) (vector-set! st 7 prev)
                  (list->string (reverse acc)))
           (let ((c (string-ref s i)))
             (cond
-              ((and skip-lf (char=? c #\newline)) (loop (fx+ i 1) acc line col #f))
+              ((and skip-lf (char=? c #\newline)) (loop (fx+ i 1) acc line col #f pending als prev))
               ((or (char=? c #\return) (char=? c #\newline))
-               (loop (fx+ i 1) (cons #\newline acc) (fx+ line 1) 0 (char=? c #\return)))
-              (else (loop (fx+ i 1) (cons c acc) line (fx+ col 1) #f))))))))
+               (loop (fx+ i 1) (cons #\newline acc) (fx+ line 1) 1 (char=? c #\return) #f #t als))
+              (else (loop (fx+ i 1) (cons c acc) line (fx+ col 1) #f #t #f als))))))))
+
+;; pbr-fold-and-count!'s counting over s[a, b) with no folded copy built: what
+;; a read that parses the string in place needs, per form.
+(define (pbr-count! st s a b)
+  (let loop ((i a) (line (vector-ref st 3)) (col (vector-ref st 4))
+             (skip-lf (vector-ref st 5)) (pending (vector-ref st 9))
+             (als (vector-ref st 6)) (prev (vector-ref st 7)))
+    (if (fx>=? i b)
+        (begin (vector-set! st 3 line) (vector-set! st 4 col) (vector-set! st 5 skip-lf)
+               (vector-set! st 9 pending) (vector-set! st 6 als) (vector-set! st 7 prev))
+        (let ((c (string-ref s i)))
+          (cond
+            ((and skip-lf (char=? c #\newline)) (loop (fx+ i 1) line col #f pending als prev))
+            ((or (char=? c #\return) (char=? c #\newline))
+             (loop (fx+ i 1) (fx+ line 1) 1 (char=? c #\return) #f #t als))
+            (else (loop (fx+ i 1) line (fx+ col 1) #f #t #f als)))))))
+
+;; Reading the end of input: the pending line ends, and the column and
+;; atLineStart go back to the start of a line, as a read of -1 leaves them.
+(define (pbr-fold-eof! st)
+  (when (vector-ref st 9)
+    (vector-set! st 3 (+ 1 (vector-ref st 3)))
+    (vector-set! st 9 #f))
+  (vector-set! st 7 (vector-ref st 6))
+  (vector-set! st 6 #t)
+  (vector-set! st 4 1))
+
+;; The numbering origin a read at index I of S starts from (reader.ss
+;; rdr-read-one): the line the reader reports, its column, and the two flags.
+(define (pbr-numbering-origin st s i)
+  (vector s i (+ 1 (vector-ref st 3)) (vector-ref st 4) (vector-ref st 5) (vector-ref st 9) #f))
 
 (define (drain-reader-by-dispatch r)
   (let loop ((acc '()))
@@ -1275,43 +1973,233 @@
     (else (values #f #f))))
 
 ;; Read ONE form from a host reader (StringReader/PushbackReader), advancing it
-;; past exactly that form. -> (values form found?). (read r) over a java.io reader
-;; — cuerdas' interpolation reads this way, and so does anything reading a source
-;; file form by form.
+;; past exactly that form. -> (values form found? text), TEXT (when CAPTURE is
+;; passed, else "") the source the read
+;; consumed. (read r) over a java.io reader — cuerdas' interpolation reads this
+;; way, and so does anything reading a source file form by form — and
+;; read+string and clojure.edn/read over one.
+;;
+;; EDN? and CB pick clojure.edn's grammar (reader.ss rdr-read-one); EOF-ERROR?
+;; raises "EOF while reading" at end of input instead of answering found? #f.
+;; Over a LineNumberingPushbackReader the read is numbered from the reader's own
+;; counters, so an error escapes as the reference's ReaderException, and the
+;; counters then move over exactly what the read consumed. An EOF error consumes
+;; the rest of the input, as the reference's reader has by then.
 ;;
 ;; A string-backed reader parses AT its current index and moves the index; the
 ;; drain-parse-refill fallback below re-materializes the whole remaining input per
 ;; form, which is quadratic over a file. The fallback still covers a char-reader
 ;; over a Chez port, a library's own reader shim, and a reader with pushback.
-(define (host-reader-read-form r)
+(define (host-reader-read r edn? cb eof-error? . capture)
   (let-values (((sr lnst) (host-reader-string-cursor r)))
     (if sr
-        (let* ((s (sr-s sr)) (i (sr-pos sr)) (pr (rdr-parse-at s i)))
-          (if (not pr)
-              (begin (sr-pos! sr (string-length s)) (values jolt-nil #f))
-              (let ((j (cdr pr)))
-                ;; the line-numbering reader counts what a char-by-char read would
-                ;; have counted over the span this form consumed
-                (when lnst (pbr-fold-and-count! lnst (substring s i j)))
-                (sr-pos! sr j)
-                (values (car pr) #t))))
-        (let* ((s (drain-reader r)) (pr (jolt-parse-next s)))
-          (if (jolt-nil? pr)
-              (begin (reader-refill! r "") (values jolt-nil #f))
-              (begin (reader-refill! r (jolt-nth pr 1)) (values (jolt-nth pr 0) #t)))))))
+        (let* ((s (sr-s sr)) (i (sr-pos sr)) (end (string-length s)))
+          (define (consume-all!)
+            (when lnst
+              (pbr-count! lnst s i end)
+              (pbr-fold-eof! lnst))
+            (sr-pos! sr end))
+          ;; an error consumes through what it names (rdr-error-resume-index)
+          (define (consume-through! k)
+            (when lnst (pbr-count! lnst s i k))
+            (sr-pos! sr k))
+          (let ((pr (rdr-on-read-error
+                     (lambda (e)
+                       (if (rdr-eof-error? e)
+                           (consume-all!)
+                           (consume-through! (rdr-error-resume-index s i e))))
+                     (lambda ()
+                       (rdr-read-one s i (and lnst (pbr-numbering-origin lnst s i))
+                                     edn? cb eof-error?)))))
+            (if (not pr)
+                (begin (consume-all!) (values jolt-nil #f ""))
+                (let ((j (cdr pr)))
+                  (when lnst (pbr-count! lnst s i j))
+                  (sr-pos! sr j)
+                  (values (car pr) #t (if (pair? capture) (substring s i j) ""))))))
+        (if (pushback-over-user-reader? r)
+            (host-reader-read-incremental r edn? cb eof-error?)
+            (host-reader-read-drained r edn? cb eof-error?)))))
 
-;; clojure.edn/read over a reader: drain the jhost reader to a string and read the
-;; first EDN form. Re-asserted over the prelude in post-prelude.ss.
+;; The fallback: drain, read from the front, and put back what the read did not
+;; consume. Draining a line-numbering reader counts everything it drains, so the
+;; counters are put back first and then moved over only the consumed text. The
+;; drained text is already folded (no \r left in it), which is also why skip-lf
+;; starts over; characters that came out of the pushback buffer were counted when
+;; they were first read, so they move the column only.
+(define (host-reader-read-drained r edn? cb eof-error?)
+  (let* ((st (and (jhost? r) (pushback-reader-tag? (jhost-tag r)) (jhost-state r)))
+         (lnst (and st (vector-ref st 2) st))
+         (snap (and lnst (vector-copy lnst)))
+         (npushed (if st (length (vector-ref st 1)) 0))
+         (s (drain-reader r))
+         (end (string-length s)))
+    (define (count-through! j)
+      (when lnst
+        (let ((p (fxmin npushed j)))
+          (let ((line (vector-ref lnst 3)) (pending (vector-ref lnst 9)))
+            (pbr-fold-and-count! lnst (substring s 0 p))
+            (vector-set! lnst 3 line)
+            (vector-set! lnst 9 pending))
+          (pbr-fold-and-count! lnst (substring s p j)))))
+    (define (consume-all!)
+      (count-through! end)
+      (when lnst (pbr-fold-eof! lnst))
+      (reader-refill! r ""))
+    (when snap
+      (for-each (lambda (k) (vector-set! lnst k (vector-ref snap k))) '(3 4 6 7 9))
+      (vector-set! lnst 5 #f))
+    (let ((pr (rdr-on-read-error
+               (lambda (e)
+                 (if (rdr-eof-error? e)
+                     (consume-all!)
+                     (let ((k (rdr-error-resume-index s 0 e)))
+                       (count-through! k)
+                       (reader-refill! r (substring s k end)))))
+               (lambda ()
+                 (rdr-read-one s 0 (and lnst (pbr-numbering-origin lnst s 0))
+                               edn? cb eof-error?)))))
+      (if (not pr)
+          (begin (consume-all!) (values jolt-nil #f ""))
+          (let ((j (cdr pr)))
+            (count-through! j)
+            (reader-refill! r (substring s j end))
+            (values (car pr) #t (substring s 0 j)))))))
+
+;; A pushback reader whose wrapped reader is the program's own -- a proxy/reify
+;; java.io.Reader, or the adapter io/reader puts around one. Such a reader can
+;; be an interactive source (a REPL's or an IDE's stdin) whose read blocks until
+;; more input arrives, so draining it to EOF to parse one form waits for input
+;; the form never needed, as the JVM's LispReader does not (jolt-lang/jolt#1137).
+;; The string and char-reader cases stay on their drains: those end, and the
+;; char-reader drain is the fast path loading a file depends on.
+(define (pushback-over-user-reader? r)
+  (and (jhost? r) (pushback-reader-tag? (jhost-tag r))
+       (let ((w (vector-ref (jhost-state r) 0)))
+         (or (not (jhost? w)) (string=? (jhost-tag w) "reader-adapter")))))
+
+;; Read ONE form from a pushback reader through its own read/unread, taking
+;; only as much input as the form needs. Characters go into a buffer while a
+;; small scanner tracks bracket depth and whether it is inside a string, regex,
+;; char literal or comment. The real parser runs only at a top-level boundary:
+;; the bracket that closes depth back to 0, the quote that closes a top-level
+;; string, whitespace or a comment after a top-level token, or a terminating
+;; macro character right after one (where the reference's token read stops). An
+;; EOF read error there means the form continues (a quote or #_ with nothing
+;; after it yet), so reading goes on. What the parser did not consume is
+;; unread, so the next read starts right after the form; a read error unreads
+;; what lies past the token it names, as the string path consumes through it.
+;; At end of input the buffer is parsed as it stands, so its errors are the
+;; string path's errors.
 ;;
-;; Through clojure.edn/read-string, NOT the core one: this is the edn seam, and
-;; the core reader is the SOURCE reader — it resolves ::kw, takes #(…) and #=,
-;; and ends a token at an @ where edn refuses it (#905). An empty opts map is
-;; what makes end of input an error here, as it is on the JVM; the core
-;; read-string answered nil.
-(define (chez-edn-read reader)
-  (jolt-invoke (var-deref "clojure.edn" "read-string")
-               empty-pmap
-               (if (reader-jhost? reader) (drain-reader reader) (jolt-str-render-one reader))))
+;; The pushback reader's own read counts lines, so a line-numbering reader's
+;; counters need no bookkeeping here; the numbering origin for a ReaderException
+;; is the counters as they stood before the first character was read.
+(define (host-reader-read-incremental r edn? cb eof-error?)
+  (let* ((st (jhost-state r))
+         (snap (and (vector-ref st 2) (vector-copy st)))
+         (buf (open-output-string)))
+    (define (read-char!)
+      (let ((u (record-method-dispatch r "read" jolt-nil)))
+        (if (or (jolt-nil? u) (and (number? u) (< u 0)))
+            #f
+            (integer->char (exact (truncate u))))))
+    (define (unread-tail! s j)
+      (let loop ((k (fx- (string-length s) 1)))
+        (when (fx>=? k j)
+          (record-method-dispatch r "unread" (jolt-list (string-ref s k)))
+          (loop (fx- k 1)))))
+    ;; the read at the buffer's front; a non-EOF error unreads past its token
+    ;; and propagates
+    (define (read-buffer s eof-err?)
+      (rdr-on-read-error
+       (lambda (e)
+         (unless (rdr-eof-error? e)
+           (unread-tail! s (rdr-error-resume-index s 0 e))))
+       (lambda ()
+         (rdr-read-one s 0 (and snap (pbr-numbering-origin snap s 0)) edn? cb eof-err?))))
+    (define (buffer-text)
+      ;; get-output-string resets the port, so put the text back
+      (let ((s (get-output-string buf))) (put-string buf s) s))
+    ;; -> (form . text) when a form is complete, #f when more input is needed
+    (define (attempt)
+      (let* ((s (buffer-text))
+             (pr (guard (e ((rdr-eof-error? e) #f)) (read-buffer s #t))))
+        (and pr
+             (begin (unread-tail! s (cdr pr))
+                    (cons (car pr) (substring s 0 (cdr pr)))))))
+    (define (finish)
+      (let* ((s (buffer-text)) (pr (read-buffer s eof-error?)))
+        (if pr
+            (begin (unread-tail! s (cdr pr)) (values (car pr) #t (substring s 0 (cdr pr))))
+            (values jolt-nil #f ""))))
+    (define (done-or got otherwise)
+      (if got (values (car got) #t (cdr got)) (otherwise)))
+    (define (step depth mode content?)
+      (let ((c (read-char!)))
+        (if (not c)
+            (finish)
+            (begin
+              (write-char c buf)
+              (case mode
+                ((code)
+                 (if (and content? (fx<=? depth 0)
+                          (memv c '(#\( #\[ #\{ #\" #\; #\\ #\@ #\^ #\` #\~)))
+                     ;; a terminating macro character ends a pending token
+                     (done-or (attempt) (lambda () (code-char depth c content?)))
+                     (code-char depth c content?)))
+                ((char-escape) (step depth 'code #t))
+                ((string)
+                 (cond
+                   ((char=? c #\\) (step depth 'string-escape #t))
+                   ((char=? c #\")
+                    (if (fx<=? depth 0)
+                        (done-or (attempt) (lambda () (step depth 'code #t)))
+                        (step depth 'code #t)))
+                   (else (step depth 'string #t))))
+                ((string-escape) (step depth 'string #t))
+                ((comment)
+                 (if (memv c '(#\newline #\return))
+                     (if (and content? (fx<=? depth 0))
+                         (done-or (attempt) (lambda () (step depth 'code content?)))
+                         (step depth 'code content?))
+                     (step depth 'comment content?))))))))
+    (define (code-char depth c content?)
+      (cond
+        ((char=? c #\;) (step depth 'comment content?))
+        ((char=? c #\\) (step depth 'char-escape #t))
+        ((char=? c #\") (step depth 'string #t))
+        ((memv c '(#\( #\[ #\{)) (step (fx+ depth 1) 'code #t))
+        ((memv c '(#\) #\] #\}))
+         (let ((d (fx- depth 1)))
+           (if (fx<=? d 0)
+               (done-or (attempt) (lambda () (step d 'code #t)))
+               (step d 'code #t))))
+        ((or (char-whitespace? c) (char=? c #\,))
+         (if (and content? (fx<=? depth 0))
+             (done-or (attempt) (lambda () (step depth 'code content?)))
+             (step depth 'code content?)))
+        (else (step depth 'code #t))))
+    (step 0 'code #f)))
+
+(define (host-reader-read-form r)
+  (let-values (((form found? text) (host-reader-read r #f #f #f)))
+    (values form found?)))
+
+;; java.lang.String.trim: every char at or below U+0020 off both ends.
+;; clojure.edn/read over a reader: one EDN form off the reader, leaving the rest
+;; of it for the next read, through clojure.edn's own tag pass. Absent :eof in
+;; opts makes end of input an error, as on the JVM.
+(define (chez-edn-read opts reader)
+  (let ((edn->value (var-deref "clojure.edn" "edn->value"))
+        (kw-eof (keyword #f "eof")))
+    (let-values (((form found? text)
+                  (host-reader-read reader #t
+                                    (lambda (f) (jolt-invoke edn->value opts f) jolt-nil)
+                                    (not (jolt-truthy? (jolt-contains? opts kw-eof))))))
+      (if found?
+          (jolt-invoke edn->value opts form)
+          (jolt-get opts kw-eof)))))
 
 ;; line-seq: an io/reader is a jhost StringReader. Drain it (or take a string)
 ;; and split on a line terminator; a trailing terminator does NOT yield a final
@@ -1377,12 +2265,17 @@
 ;; libraries branch on it: instaparse decides whether its argument is a grammar or
 ;; a file by slurping and catching FNF. A raw Chez open-input-file condition is not
 ;; catchable as that class, so the caller's fallback never runs.
-(define (slurp-path path)
+(define (slurp-path path . given)
   (io-note-file-read! path)
-  (unless (if (jar-path? path) (jar-path-exists? path) (file-exists? path))
+  ;; An entry inside a jar has no open to fail, so its absence is still checked
+  ;; here. A path ON DISK is not pre-checked: read-file-bytes-on-disk opens
+  ;; through open-path-guarded, which reports a missing file the same way and
+  ;; also reports the three this used to miss -- a directory, an unreadable
+  ;; file, and an open refused because the process is out of descriptors.
+  (when (and (jar-path? path) (not (jar-path-exists? path)))
     (throw-jvm (quote java.io.FileNotFoundException)
                (string-append path " (No such file or directory)")))
-  (read-file-string path))
+  (apply read-file-string path given))
 ;; The content a URL names, as text: a file: URL reads its target from disk (a
 ;; missing file is a FileNotFoundException, as on the JVM); any other protocol has
 ;; no local backing, so raise rather than hand back empty content. slurp /
@@ -1398,7 +2291,7 @@
       ;; JVM, where a bare path here would resolve against the process cwd -- the
       ;; jolt repo root under the launcher, not the project the user is in.
       ((string=? (url-protocol spec) "file")
-       (slurp-path (project-relative (url-strip-scheme spec))))
+       (slurp-path (project-relative (file-url->path spec))))
       ((jar-path? spec) (slurp-path spec))
       (else (throw-jvm (quote java.io.IOException)
                        (string-append "protocol doesn't support input: " spec))))))
@@ -1410,8 +2303,8 @@
         ;; whose readAllBytes is the class's
         ((or (and (jhost? s) (string=? (jhost-tag s) "in-stream"))
              (user-in-stream? s))
-         (utf8->string (na-bytearray->bv
-                        (record-method-dispatch s "readAllBytes" jolt-nil))))
+         (utf8-bytes->string (na-bytearray->bv
+                              (record-method-dispatch s "readAllBytes" jolt-nil))))
         (else (jolt-str-render-one s))))
 ;; slurp over a clojure.core/IReader (what *in* and with-in-str hand out). The
 ;; protocol is line-based — -read-line, -read-form, -read+string, no char read —
@@ -1430,13 +2323,12 @@
               (loop #f)))))))
 (define (jolt-slurp src . opts)
   (cond
-    ((jfile? src) (slurp-path (jfile-fs src)))
+    ((jfile? src) (slurp-path (jfile-fs src) (jfile-path src)))
     ((embedded-res? src)
      (let ((c (embedded-res-content src)))
        (if (bytevector? c) (utf8->string c) c)))
     ((reader-jhost? src) (drain-reader src))
-    ((and (reified-methods src)
-          (hashtable-ref (reified-methods src) "-read-line" #f))
+    ((reify-method-ref src "-read-line")
      (drain-ireader src))
     ;; a file: URL reads its target (jar:/http:/… raise in url-content).
     ((and (jhost? src) (string=? (jhost-tag src) "url")) (url-content src))
@@ -1448,7 +2340,10 @@
     ;; a byte input-stream shim (e.g. clj-http-lite's :as :stream body): drain it.
     ((and (htable? src) (jolt-truthy? (jolt-ref-get src (keyword "jolt" "input-stream"))))
      (decode-bytevector (drain-byte-stream src) (slurp-encoding opts)))
-    ((string? src) (slurp-path (project-relative src)))
+    ((string? src) (let ((fp (io-source-path src)))
+                     (if (jar-path? fp)
+                         (slurp-path fp)
+                         (slurp-path fp (if (file-url-string? src) (file-url->path src) src)))))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str src) "> as a Reader.")))))
 
 (define (spit-append? opts)
@@ -1471,20 +2366,30 @@
   (unless (or (string? path) (jfile? path) (jhost? path))
     (throw-jvm (quote IllegalArgumentException)
                (string-append "Cannot open <" (jolt-pr-str path) "> as a Writer.")))
-  (let* ((p (project-relative (if (url-jhost? path) (url-write-path path) (file-path-of path))))
+  (let* ((given (if (url-jhost? path) (url-write-path path) (file-path-of path)))
+         (p (project-relative given))
          (text (jolt-str-render-one content)))
+    ;; The JVM opens the TARGET, so a target it cannot open fails here and names
+    ;; itself. This wrote its temp file first and only discovered the target at
+    ;; the rename, which came back as Chez's "cannot rename ..." inside a plain
+    ;; java.io.IOException -- naming a temp path the caller never asked for
+    ;; (jolt-g81).
+    (when (file-directory? p) (file-open-error given p))
     (if (spit-append? opts)
-        (with-port (open-output-file p 'append)
+        (with-port (open-path-guarded given p (lambda (rp) (open-output-file rp 'append)))
           (lambda (port) (put-string port text)))
         (let ((tmp (string-append p ".spit-tmp-"
                                    (number->string (sa-real-time-ms)) "-"
                                    (number->string (jolt-with-mutex io-counter-mutex
                                                      (begin (set! spit-tmp-counter (+ spit-tmp-counter 1))
                                                             spit-tmp-counter))))))
-          (with-port (open-output-file tmp 'replace)
+          ;; the temp file is this function's business, but a failure to open it
+          ;; is the caller's target failing, so report the target
+          (with-port (guard (e ((i/o-error? e) (file-open-error given p e)))
+                       (open-output-file tmp 'replace))
             (lambda (port) (put-string port text)))
           (guard (e (#t (guard (_ (#t #f)) (delete-file tmp)) (raise e)))
-            (rename-file tmp p))))
+            (rename-replace! tmp p))))
     jolt-nil))
 
 ;; (flush) is (.flush *out*) on the JVM. When *out* holds a real writer — a
@@ -1508,7 +2413,7 @@
 
 ;; --- str / type / instance? integration ------------------------------------
 ;; str of a jfile is its path (Clojure's File.toString).
-(register-str-render! jfile? jfile-path)
+(register-str-render! jfile? (lambda (f) (path-native (jfile-path f))))
 
 ;; The stdin line seam (__stdin-read-line, the *in* reader's source) lives in
 ;; io-streams.ss, next to the System/in stream it reads.
@@ -1582,14 +2487,14 @@
   (cond
     ((reader-jhost? x) x)
     ((jfile? x) (io-note-file-read! (jfile-fs x))
-                (host-new "StringReader" (read-file-string (jfile-fs x))))
+                (host-new "StringReader" (read-file-string (jfile-fs x) (jfile-path x))))
     ((embedded-res? x)
      (let ((c (embedded-res-content x)))
        (host-new "StringReader" (if (bytevector? c) (utf8->string c) c))))
     ((url-jhost? x) (host-new "StringReader" (url-content x)))
     ((string? x) (let ((p (project-relative x)))
                    (io-note-file-read! p)
-                   (host-new "StringReader" (read-file-string p))))
+                   (host-new "StringReader" (if (jar-path? p) (read-file-string p) (read-file-string p x)))))
     ((or (cseq? x) (empty-list-t? x) (pvec? x))
      (host-new "StringReader" (seq-source->string x)))
     ;; anything else is not a source, and quietly rendering it would read as empty
@@ -1601,13 +2506,32 @@
 ;; --- clojure.java.io/writer: an existing writer passes through; a File / path
 ;; gets a file-backed writer (host-static.ss "file-writer") that persists on
 ;; flush/close. Mirrors io.clj's writer over the host's StringWriter/file ports.
+;; The JVM opens the file when the Writer is CONSTRUCTED, so a target it cannot
+;; open raises there. jolt's file-writer is a StringWriter over a path that
+;; spits at flush/close (host-static-classes.ss), so there was no open at all
+;; here and (io/writer <a directory>) handed back a Writer -- the failure then
+;; surfaced at close, or never (jolt-g81).
+;;
+;; The target is OPENED rather than reasoned about, for the reason
+;; open-path-guarded gives: only the open knows. Opening for append rather than
+;; truncate keeps any existing content -- the write itself still goes through
+;; jolt-spit later -- while still creating a missing file, which is what the
+;; JVM's FileWriter does too.
+(define (io-writer-target! given)
+  (let ((p (project-relative given)))
+    (close-port (open-path-guarded given p
+                  (lambda (rp)
+                    (open-file-output-port rp (file-options no-fail no-truncate append)
+                                           (buffer-mode none)))))
+    given))
+
 (define (jolt-io-writer x)
   (cond
     ((and (jhost? x) (string=? (jhost-tag x) "writer")) x)
     ((and (jhost? x) (string=? (jhost-tag x) "file-writer")) x)
-    ((jfile? x) (make-jhost "file-writer" (vector (jfile-path x) "")))
-    ((url-jhost? x) (make-jhost "file-writer" (vector (url-write-path x) "")))
-    ((string? x) (make-jhost "file-writer" (vector x "")))
+    ((jfile? x) (make-jhost "file-writer" (vector (io-writer-target! (jfile-path x)) "")))
+    ((url-jhost? x) (make-jhost "file-writer" (vector (io-writer-target! (url-write-path x)) "")))
+    ((string? x) (make-jhost "file-writer" (vector (io-writer-target! x) "")))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as a Writer.")))))
 
 ;; --- clojure.java.io ns -----------------------------------------------------
@@ -1634,7 +2558,12 @@
     (throw-jvm (quote NullPointerException)
                "Cannot invoke \"java.io.File.isAbsolute()\" because \"f\" is null"))
   (let ((p (jfile-path (make-jfile (file-path-of x)))))
-    (when (and (fx>? (string-length p) 0) (char=? (string-ref p 0) #\/))
+    ;; .isAbsolute, not "starts with a separator" — the two agree on POSIX and
+    ;; differ on Windows both ways round: "C:/x" IS absolute and was silently
+    ;; accepted here, and "/x" is NOT (it is rooted on the current drive) yet was
+    ;; rejected. The comment above already says this mirrors .isAbsolute; now it
+    ;; asks it (jolt-lang/jolt#1074).
+    (when (jfile-path-absolute? p)
       (throw-jvm (quote IllegalArgumentException)
                  (string-append p " is not a relative path")))
     p))
@@ -1650,7 +2579,7 @@
 ;; IllegalArgumentException, as the JVM's File(URI) throws.
 (define (url-file-coercion u)
   (if (string=? (url-protocol (url-spec u)) "file")
-      (make-jfile (url-strip-scheme (url-spec u)))
+      (make-jfile (file-url->path (url-spec u)))
       (throw-jvm 'IllegalArgumentException (string-append "Not a file: " (url-spec u)))))
 (def-var! "clojure.java.io" "as-file"
   ;; Clojure extends Coercions to nil, so (io/as-file nil) is nil -- NOT a File
@@ -1680,7 +2609,7 @@
 ;; base every other filesystem touch uses, dropping a leading "./" so the path
 ;; reads like the JVM's instead of carrying a "/./" segment.
 (define (resource-file-url root nm)
-  (make-url (string-append "file:" (root-path-abs (string-append root "/" nm)))))
+  (make-url (string-append "file:" (file-uri-path (root-path-abs (string-append root "/" nm))))))
 ;; A path under a source root made absolute for a URL: the roots are spelled as
 ;; deps.edn spells them ("./src", "./lib.jar"), and the JVM's URL for a resource
 ;; carries no "./" segment, so a leading one is dropped before the cwd is put in
@@ -1808,13 +2737,14 @@
 (def-var! "clojure.java.io" "resource" jolt-io-resource)
 ;; as-url honors a library-registered URL class (e.g. jolt-lang/http-client's full
 ;; java.net.URL shim) so io/as-url and (URL. spec) agree; else the file-only jhost.
-;; as-url of a File is File.toURL — a file: URL (JVM), so the spec carries the
-;; scheme; a bare string keeps its spec as given.
+;; as-url of a File is clojure.java.io's (.toURL (.toURI f)) — the encoded
+;; file: URL File.toURI spells, "file:/C:/…" on Windows (#1118); a bare string
+;; keeps its spec as given.
 (def-var! "clojure.java.io" "as-url"
   (lambda (x)
     (cond ((and (jhost? x) (string=? (jhost-tag x) "url")) x)
           ((htable? x) x)
-          (else (let ((spec (if (jfile? x) (string-append "file:" (jfile-fs x)) (jolt-str-render-one x)))
+          (else (let ((spec (if (jfile? x) (jfile->uri-spec (jfile-fs x)) (jolt-str-render-one x)))
                       (ctor (lookup-class class-ctors-tbl "URL")))
                   (if ctor (ctor spec) (make-url spec)))))))
 
@@ -1974,11 +2904,13 @@
                           (jolt-thread-name-set! (thread-handle-id self) (jolt-final-str nm))
                           jolt-nil))
         (cons "getId" (lambda (self) (thread-handle-id self)))
-        ;; no reified call stack (jolt does TCO, so caller frames are erased) — an
-        ;; empty StackTraceElement[]. clojure.spec.test.alpha's instrument reads it
-        ;; to name the caller var; it degrades to no ::caller, the conform error
-        ;; (the ExceptionInfo) is still thrown.
-        (cons "getStackTrace" (lambda (self) (jolt-vector)))
+        ;; the calling thread's frames, reconstructed the way an uncaught error's
+        ;; backtrace is (source-registry.ss); another thread's stack is not
+        ;; reachable, so it answers an empty array.
+        (cons "getStackTrace" (lambda (self)
+                                (if (eqv? (thread-handle-id self) (get-thread-id))
+                                    (jolt-current-stack-trace)
+                                    (jolt-vector))))
         ;; The flag first, then the poke: a waiter woken by the poke reads the
         ;; flag, so a wake that arrives before it is set says nothing. Waking is
         ;; what turns .interrupt from "the target will notice next time it looks"
@@ -2071,18 +3003,46 @@
 ;; throws, message and all -- new File("/a", null) raises NPE rather than
 ;; answering "/a". jolt read it as "" and quietly answered the parent, the same
 ;; silently-wrong-file shape as the nil coercions above.
+
+;; The rules above, spelled for both platforms. Three things in them are really
+;; questions about the platform rather than about "/":
+;; whether a character is a separator, whether the parent already ends in one,
+;; and which one a join should add. The old spelling asked (string=? p "/"),
+;; which is "is the parent the root" written for the one platform that has
+;; exactly one root — Windows has "C:/", "//srv/sh/" and "/". Since a normalized
+;; path ends in a separator only when it IS a root, asking that directly covers
+;; every root on both platforms and needs no root table.
+;;
+;; The default parent stays "/" for both: WinNTFileSystem.getDefaultParent() is
+;; "\\", which is the same path in the "/" spelling this shim renders with.
+(define (path-ends-with-sep? windows? p)
+  (let ((n (string-length p)))
+    (and (fx>? n 0) (path-sep-for? windows? (string-ref p (fx- n 1))))))
+
+(define (jolt-file-join-for windows? p c)
+  (let ((p (if (string=? p "") "/" p)))
+    (cond
+      ;; an empty child, or one that is nothing but a separator, adds nothing
+      ((or (string=? c "")
+           (and (fx=? (string-length c) 1) (path-sep-for? windows? (string-ref c 0))))
+       p)
+      ;; a child that starts with a separator supplies the join itself, so the
+      ;; parent must not add a second one
+      ((path-sep-for? windows? (string-ref c 0))
+       (if (path-ends-with-sep? windows? p)
+           (string-append p (substring c 1 (string-length c)))
+           (string-append p c)))
+      ((path-ends-with-sep? windows? p) (string-append p c))
+      (else (string-append p (path-join-sep windows? p) c)))))
+
 (define (jolt-file-join parent child)
   (when (jolt-nil? child) (throw-jvm (quote NullPointerException) jolt-nil))
   (let ((c (jolt-path-normalize (file-path-of child))))
     (if (jolt-nil? parent)
         c
-        (let* ((p (jolt-path-normalize (file-path-of parent)))
-               (p (if (string=? p "") "/" p)))
-          (cond ((or (string=? c "") (string=? c "/")) p)
-                ((char=? (string-ref c 0) #\/)
-                 (if (string=? p "/") c (string-append p c)))
-                ((string=? p "/") (string-append p c))
-                (else (string-append p "/" c)))))))
+        (jolt-file-join-for (eq? (sa-os-family) 'windows)
+                            (jolt-path-normalize (file-path-of parent))
+                            c))))
 ;; new File((String)null) throws too, with a null message of its own. Only the
 ;; two-arg form takes a null parent, and there it means "the child alone".
 (define (jolt-file-ctor a . rest)
@@ -2100,8 +3060,7 @@
                (string-append "Prefix string \"" (jolt-str-render-one prefix)
                               "\" too short: length must be at least 3")))
   (let* ((d (cond ((pair? dir) (file-path-of (car dir)))
-                  ((getenv "TMPDIR") => (lambda (t) t))
-                  (else "/tmp")))
+                  (else (host-temp-dir))))
          (sfx (if (or (null? (list suffix)) (jolt-nil? suffix)) ".tmp" (jolt-str-render-one suffix))))
     (let ((n (jolt-with-mutex io-counter-mutex
               (set! temp-file-counter (+ temp-file-counter 1))
@@ -2111,12 +3070,41 @@
                               (number->string (now-millis)) "-" (number->string n) sfx)))
         (if (file-exists? p) (loop (+ n 1))
             (begin (close-port (open-output-file p 'truncate)) (make-jfile p))))))))
-(let ((statics (list (cons "separator" "/")
-                     (cons "separatorChar" #\/)
-                     (cons "pathSeparator" ":")
-                     (cons "pathSeparatorChar" #\:)
+;; File.listRoots: the filesystem roots. POSIX has exactly one; Windows has one
+;; per mounted drive, and answering "/" there named a directory on whichever
+;; drive the process happened to be on rather than enumerating anything
+;; (jolt-lang/jolt#1074). No volume-enumerating entry point is bound here, so
+;; probe the 26 letters — enumeration IS what the method is for, it is called
+;; rarely, and 26 stats are cheap next to a wrong answer. EXISTS? is a parameter
+;; so the Windows row is reachable from a Linux runner
+;; (test/chez/win-platform-test.ss). A Windows host that somehow shows no drive
+;; at all still answers "C:/" rather than an empty array, because the JVM never
+;; answers an empty one.
+(define (file-list-roots-for windows? exists?)
+  (if (not windows?)
+      (list "/")
+      (let loop ((i 25) (acc '()))
+        (if (< i 0)
+            (if (null? acc) (list "C:/") acc)
+            (let ((r (string-append (string (integer->char (+ (char->integer #\A) i))) ":/")))
+              (loop (- i 1) (if (exists? r) (cons r acc) acc)))))))
+
+;; separator is "\\" on Windows, and File and Path render with it (path-native),
+;; so the two agree as they do on the JDK (jolt-lang/jolt#1110). pathSeparator is
+;; the PATH-LIST separator and must be ";" there, or babashka.fs/split-paths and
+;; fs/which cut every drive-lettered entry in half (host-static-methods.ss
+;; path-list-separator).
+(let ((statics (list (cons "separator" (file-separator))
+                     (cons "separatorChar" (string-ref (file-separator) 0))
+                     (cons "pathSeparator" (path-list-separator))
+                     (cons "pathSeparatorChar" (string-ref (path-list-separator) 0))
                      (cons "createTempFile" file-create-temp)
-                     (cons "listRoots" (lambda () (jolt-vector (make-jfile "/")))))))
+                     (cons "listRoots"
+                           (lambda ()
+                             (apply jolt-vector
+                                    (map make-jfile
+                                         (file-list-roots-for (eq? (sa-os-family) 'windows)
+                                                              file-exists?))))))))
   (register-class-statics! "File" statics)
   (register-class-statics! "java.io.File" statics))
 (register-class-ctor! "java.io.File" jolt-file-ctor)
@@ -2340,10 +3328,11 @@
 ;;     two characters — so the run is collected and decoded together;
 ;;   - a byte sequence that is not valid UTF-8 becomes U+FFFD rather than
 ;;     raising, since the string already parsed as a URI and the accessor has no
-;;     way to report an error. Chez's utf8->string replaces malformed input
-;;     exactly as the JVM's UTF-8 decoder does (one U+FFFD for "%FF", one for the
-;;     truncated "%E2%82", one for a surrogate's "%ED%A0%80"), so the
-;;     substitution is the host's, not a rule reimplemented here;
+;;     way to report an error. The JVM decodes these through a CharsetDecoder, so
+;;     the run decodes through utf8-bytes->string (natives-str.ss), which is that
+;;     decoder: "%FF" is one U+FFFD and "%C0%AF" is two, where Chez's own
+;;     utf8->string would answer one for both, and "%EF%BB%BF" is U+FEFF rather
+;;     than a signature to swallow;
 ;;   - inside a BRACKETED IPv6 literal a "%" is the scope-id separator, not an
 ;;     escape, so "[fe80::1%25eth0]" must not decode to "[fe80::1%eth0]" — a
 ;;     scope id is written with the "%" escaped and stays that way. The JVM has
@@ -2373,7 +3362,7 @@
                    (run (+ j 3) (cons (+ (* 16 (hexv (string-ref x (+ j 1))))
                                          (hexv (string-ref x (+ j 2))))
                                       bytes))
-                   (begin (set! out (cons (utf8->string (u8-list->bytevector (reverse bytes))) out))
+                   (begin (set! out (cons (utf8-bytes->string (u8-list->bytevector (reverse bytes))) out))
                           (loop j in?)))))
             ;; everything up to the next escape passes through unchanged — but
             ;; the bracket state has to be tracked across it to know what an

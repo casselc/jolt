@@ -255,7 +255,10 @@
     ;; find's call sites lower to jolt-find2 (host-table.ss), which answers for a
     ;; native map itself and resolves find-other by name for every other type — so
     ;; an app that only ever calls find has no IR edge to it
-    "clojure.core/find-other"))
+    "clojure.core/find-other"
+    ;; FileTime.from(Instant) (nio-file.ss) reads the Instant's epoch millis
+    ;; through inst-ms, so fs/set-last-modified-time with an Instant needs it
+    "clojure.core/inst-ms"))
 
 ;; --- reading a minted blob (prelude.ss) into records ------------------------
 ;; The prelude is a flat list of (guard CLAUSE (def-var! "ns" "name" V)) forms (+ the
@@ -344,9 +347,9 @@
 ;; under one of their names is unsound.
 ;; A direct-linked seed def (bootstrap.ss) is minted as
 ;;   (begin [(image-register-fn-form! ...)... | (let* <quote pool> (image-register-fn-form! ...)...)]
-;;          (define jv$ns$name <init>)
-;;          (def-var-linked! "ns" "name" 'jv$ns$name jv$ns$name (lambda (v) (set! jv$ns$name v)) meta)
-;;          [(jolt-register-variadic! n jv$ns$name)])
+;;          (define jv$ns/name <init>)
+;;          (def-var-linked! "ns" "name" 'jv$ns/name jv$ns/name (lambda (v) (set! jv$ns/name v)) meta)
+;;          [(jolt-register-variadic! n jv$ns/name)])
 ;; — the same single-fqn def, so it prunes under that name too. The walk below
 ;; admits exactly these siblings, in this order; any other begin stays a keep form.
 (define (dce-def-var-form b)

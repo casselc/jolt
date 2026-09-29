@@ -70,6 +70,17 @@
 (defn- gen-name [prefix]
   (str "_r$" prefix (dec (swap! gensym-counter inc))))
 
+(defn set-name-counter!
+  "Reseed the counter behind generated names. The build driver does this at each
+  namespace so a namespace's emitted text does not depend on how many names the
+  namespaces before it — or the in-process load before the build — used, which is
+  what lets the build cache one compiled unit per namespace (#1059). Safe because
+  every name this makes is either lexical (a catch, loop or duplicate-param local)
+  or qualified by its compile namespace (a fn's rname), and the driver seeds each
+  build phase above anything the load phase reached."
+  [n]
+  (reset! gensym-counter n))
+
 ;; The innermost list form currently being analyzed that carries reader position
 ;; metadata — what a diagnostic raised anywhere below it should name. Without it
 ;; the only position available to the reporter is the one the LOADER records per
@@ -233,7 +244,14 @@
 
 (defn- empty-env [] {:locals #{} :hints {}})
 (defn- local? [env nm] (contains? (:locals env) nm))
-(defn- add-locals [env names] (update env :locals #(reduce conj % names)))
+;; A new binding of a name forgets what was known about the one it shadows: its
+;; type hint and its JVM primitive type. An outer ^String s used to lend its hint
+;; to an inner, unhinted s, since add-hint only ever adds.
+(defn- add-locals [env names]
+  (-> env
+      (update :locals #(reduce conj % names))
+      (update :hints #(reduce dissoc % names))
+      (update :jprims #(reduce dissoc % names))))
 ;; &env value handed to a macro: a map of each in-scope local SYMBOL to nil
 ;; (Clojure's &env maps locals to compiler binding objects; consumers like
 ;; core.logic's matche only read its keys to tell locals from fresh pattern vars).
@@ -256,8 +274,84 @@
 ;; Establishing a target also lifts any `try` boundary crossed to get here: the
 ;; boundary is about reaching an OUTER target, and a fn or loop written inside a
 ;; try recurs to itself normally, exactly as it does on the JVM.
-(defn- with-recur [env name arity]
-  (-> env (assoc :recur name :recur-arity arity) (dissoc :recur-blocked)))
+(defn- with-recur
+  ([env name arity] (with-recur env name arity nil))
+  ([env name arity prims]
+   (-> env (assoc :recur name :recur-arity arity :recur-prims prims) (dissoc :recur-blocked))))
+
+;; --- the JVM's primitive boolean loop locals --------------------------------
+;; The reference compiler gives a loop local the JVM type of its init, and a local
+;; whose init is a primitive boolean -- (nil? x), (= a b), (< a b), (zero? n),
+;; (instance? C x), (boolean x) all inline to one -- rejects a recur argument that
+;; is not also a primitive boolean: "recur arg for primitive local: x is not
+;; matching primitive, had: java.lang.Boolean, needed: boolean" for a literal
+;; false. (A long or double local is re-analyzed boxed instead; only these fail.)
+;; jolt has no primitive locals and ran such a loop. It now refuses exactly where
+;; the JVM certainly does: the local's init is one of those inlines, and the
+;; argument is certainly not a primitive boolean -- a literal, or a call to a var
+;; that does not inline to one, which the JVM always types as an Object. Anything
+;; it cannot type the same way (a host call, a branch) is let through, so this
+;; never refuses a loop the JVM compiles.
+(def ^:private jvm-boolean-inlines
+  {"nil?" 1 "zero?" 1 "pos?" 1 "neg?" 1 "boolean" 1
+   "identical?" 2 "=" 2 "==" 2 "<" 2 "<=" 2 ">" 2 ">=" 2})
+(defn- jvm-boolean-prim? [node env]
+  (case (:op node)
+    :local (= :boolean (get (:jprims env) (:name node)))
+    :invoke (let [f (:fn node)]
+              (and (= :var (:op f)) (= "clojure.core" (str (:ns f)))
+                   (let [nm (str (:name f)) n (count (:args node))]
+                     (or (= n (get jvm-boolean-inlines nm))
+                         ;; (instance? C x) with a class as written: an InstanceOfExpr
+                         (and (= "instance-check" nm) (= 2 n)
+                              (= :var (:op (first (:args node)))))))))
+    false))
+;; The JVM class of an expression as the reference compiler types it -- "boolean"
+;; for a primitive boolean, :null for a nil literal (typed, but with no class) --
+;; or nil when jolt cannot type it the same way (a host call, a local it has no
+;; JVM type for). Only what decides a recur into a primitive boolean local.
+(defn- jvm-class [node env]
+  (if (jvm-boolean-prim? node env)
+    "boolean"
+    (case (:op node)
+      :const (let [v (:val node)]
+               (cond (nil? v) :null
+                     (boolean? v) "java.lang.Boolean"
+                     (int? v) "long"
+                     (double? v) "double"
+                     (string? v) "java.lang.String"
+                     (keyword? v) "clojure.lang.Keyword"
+                     (char? v) "java.lang.Character"
+                     :else nil))
+      ;; a call to a var that does not inline to a primitive: an Object, or the
+      ;; var's :tag
+      :invoke (let [f (:fn node)]
+                (when (= :var (:op f))
+                  (let [tag (some-> (find-var (symbol (str (:ns f)) (str (:name f)))) meta :tag)]
+                    (cond (nil? tag) "Object"
+                          ;; the reference evaluates a tag written in a metadata
+                          ;; map, so core's are classes: (defn not {:tag Boolean})
+                          (class? tag) (.getName tag)
+                          (and (symbol? tag) (nil? (namespace tag))
+                               (contains? #{"Boolean" "String" "Long" "Object" "Number" "Integer"} (name tag)))
+                          (str "java.lang." (name tag))
+                          :else (str tag)))))
+      ;; IfExpr: typed when both branches are and agree, or one is nil and the
+      ;; other not primitive; reported as the then branch's class, else the else's
+      :if (let [t (jvm-class (:then node) env) e (jvm-class (:else node) env)]
+            (when (and t e)
+              (cond (= t e) t
+                    (and (= t :null) (not (contains? #{"boolean" "long" "double"} e))) e
+                    (and (= e :null) (not (contains? #{"boolean" "long" "double"} t))) t
+                    ;; branches that disagree leave the if untyped: an Object
+                    :else "Object")))
+      nil)))
+;; The class the reference reports for an argument that is certainly NOT a
+;; primitive boolean, or nil when it is one or cannot be typed as the JVM would.
+;; A nil literal is left alone: the reference's own message has no class for it.
+(defn- jvm-non-boolean-class [node env]
+  (let [c (jvm-class node env)]
+    (when (and (string? c) (not= c "boolean")) c)))
 
 ;; Type hints. The reader keeps ^hint metadata on the binding symbol.
 ;; Two hints resolve to the :struct fast path (a constant-keyword lookup skips
@@ -492,8 +586,11 @@
               init (if ak (assoc init0 :akind ak) init0)]
           ;; an explicit hint wins; init-proves-hint only fills in where the
           ;; programmer wrote nothing.
-          (recur (+ i 2) (add-hint (add-locals env [nm]) nm
-                                   (or (hint-of ctx bsym) (init-proves-hint init)))
+          (recur (+ i 2) (let [e (add-hint (add-locals env [nm]) nm
+                                           (or (hint-of ctx bsym) (init-proves-hint init)))]
+                           (if (jvm-boolean-prim? init env)
+                             (assoc-in e [:jprims nm] :boolean)
+                             e))
                  (conj pairs [nm init]))))
       [pairs env])))
 
@@ -823,7 +920,12 @@
         ;; equality costs the subtree the sharing was meant to save.
         node (assoc node
                     :src-form (if (fn-head-canonical? items) form (cons 'fn* (rest items)))
-                    :free-names (fn-free-names (:arities node) fn-name))]
+                    :free-names (fn-free-names (:arities node) fn-name))
+        ;; ^{:once true} on the fn* symbol, as the reference's lazy-seq writes it:
+        ;; the fn runs at most once, so its captures may be let go as it runs
+        ;; (backend_scheme.clj emit-fn)
+        hm (form-sym-meta (first items))
+        node (if (and (map? hm) (get hm :once)) (assoc node :once true) node)]
     node))
 
 ;; class names that catch everything (the JVM root types); a (catch Throwable e …)
@@ -899,15 +1001,18 @@
                         (let [cform (nth cl 1)
                               bindsym (nth cl 2)
                               bodyf (drop 3 cl)
-                              letform (cons 'let (cons (vector bindsym evar) bodyf))
+                              ;; clojure.core-qualified: a ns that excludes (or
+                              ;; :only-omits) let/or/instance? and defines its
+                              ;; own must still get core's here (jolt#1095).
+                              letform (cons 'clojure.core/let (cons (vector bindsym evar) bodyf))
                               fullname (when (form-sym? cform) (form-sym-name cform))
                               catch-all? (or (not (form-sym? cform))
                                              (contains? catch-all-names fullname))]
                           (if catch-all?
                             letform
-                            (list 'if (list 'or
-                                            (list 'instance? cform evar)
-                                            (list '__catch-broad? fullname evar))
+                            (list 'if (list 'clojure.core/or
+                                            (list 'clojure.core/instance? cform evar)
+                                            (list 'clojure.core/__catch-broad? fullname evar))
                                   letform else))))
                       (list 'throw evar)
                       (reverse @catches))]
@@ -1142,7 +1247,9 @@
     "loop*" (let [bvec (vec (form-vec-items (nth items 1)))
                   rname (gen-name "loop")
                   r (analyze-bindings ctx bvec env)
-                  env** (with-recur (second r) rname (quot (count bvec) 2))
+                  env** (assoc (with-recur (second r) rname (quot (count bvec) 2)
+                                           (mapv (fn [[nm _]] (get (:jprims (second r)) nm)) (first r)))
+                               :recur-locals (mapv first (first r)))
                   ;; The other recur-target root (see analyze-arity): a recur
                   ;; against THIS loop may only sit in tail position of its body.
                   body-node (analyze-seq ctx (drop 2 items) env**)
@@ -1174,6 +1281,15 @@
               ;; reader metadata, which falls back to the enclosing form.
               (let [node {:op :recur
                           :args (mapv #(analyze ctx % env) (rest items))}
+                    _ (when-let [prims (:recur-prims env)]
+                        (dotimes [i (count prims)]
+                          (when (= :boolean (nth prims i))
+                            (when-let [had (jvm-non-boolean-class (nth (:args node) i) env)]
+                              (analysis-error :analyze/invalid-recur
+                                              (str " recur arg for primitive local: "
+                                                   (nth (:recur-locals env) i)
+                                                   " is not matching primitive, had: " had
+                                                   ", needed: boolean"))))))
                     p (form-position form)]
                 (if p (assoc node :pos p) node)))
     "try" (analyze-try ctx items env)
@@ -1665,6 +1781,22 @@
     (analysis-error :analyze/invalid-macro-value
            (str "Can't take value of a macro: #'" (:ns r) "/" (:name r)))))
 
+;; A ^:private var of another namespace cannot be referenced at all, as on the
+;; JVM (jolt#1095): resolve-global tags one :private, and this throws the
+;; reference's IllegalStateException wording. A call head or macro gets
+;; Compiler.isInline / isMacro's "var: #'a/hidden is not public"; a value gets
+;; resolveIn's, which prints the symbol as written. (var a/hidden) is exempt —
+;; analyze-special's "var" arm never calls this — so @#'a/hidden still works.
+(defn- deny-private [form r head?]
+  (when (:private r)
+    (analysis-error :analyze/private-var
+                    (str "var: "
+                         (if head?
+                           (str "#'" (:ns r) "/" (:name r))
+                           (str (if-let [ns (form-sym-ns form)] (str ns "/") "") (form-sym-name form)))
+                         " is not public")
+                    {:jolt.error/symbol (str (:ns r) "/" (:name r))})))
+
 ;; instance? is a macro on jolt (so it can quote a bare class name — the class
 ;; model has no evaluable Class for every name), but the JVM has it as a plain fn,
 ;; so a value-position reference — (partial instance? SomeClass), (map (partial
@@ -1767,7 +1899,8 @@
       ns (let [r (resolve-global ctx form)]
            (if (= :var (:kind r))
              (or (macro-value-fn ctx form r)
-                 (do (deny-macro-value ctx form r)
+                 (do (deny-private form r false)
+                     (deny-macro-value ctx form r)
                      (cond-> (var-ref (:ns r) (:name r)) (:num-ret r) (assoc :num-ret (:num-ret r)))))
              ;; A non-var qualified ref `Class/member` is a host class static
              ;; (Math/sqrt, Long/MAX_VALUE, System/getenv). The Chez back end
@@ -1816,7 +1949,8 @@
                 ;; :num-ret (a ^double/^long declared return) rides on the var node so
                 ;; jolt.passes.numeric types a call to it (an accumulator over the result).
                 :var (or (macro-value-fn ctx form r)
-                         (do (deny-macro-value ctx form r)
+                         (do (deny-private form r false)
+                             (deny-macro-value ctx form r)
                              (cond-> (var-ref (:ns r) (:name r)) (:num-ret r) (assoc :num-ret (:num-ret r)))))
                 :host (host-ref (:name r))
                 ;; a class-name symbol (java.util.Map) self-evaluates to an interned
@@ -1973,7 +2107,8 @@
             ;; The RUN of the expander is marked separately (macro-run box): a
             ;; throw out of it is filed under the reference's macro phases and
             ;; names the macro, which is a different thing from the note above.
-            (let* [mbox *macro-run-box*
+            (let* [_ (deny-private head (resolve-global ctx head) true)
+                   mbox *macro-run-box*
                    mprev (when mbox @mbox)
                    _ (when mbox (reset! mbox [(macro-symbol ctx head) head form]))
                    expanded (form-expand-1 ctx form (amp-env-map env))
@@ -2005,7 +2140,7 @@
           ;; spec §3 and the reference. No (not shadowed) guard here.
           (and sf-name (contains? handled sf-name))
             ;; stamp the form's source offset onto a top-level def so the back end
-            ;; can register it (jv$ns$name -> source) for native stack traces.
+            ;; can register it (jv$ns/name -> source) for native stack traces.
             (let [node (analyze-special ctx sf-name form items env)
                   p (form-position form)]
               (if (and p (= :def (:op node))) (stamp-def-pos ctx env node p) node))
@@ -2072,7 +2207,11 @@
               ;; stamp the list form's source offset onto the :invoke
               ;; so the success checker can report file:line:col. nil when the
               ;; reader did not record it (synthetic/macro-built forms).
-              (let [n (invoke (analyze ctx head env)
+              ;; qualified heads only: an unqualified one resolves again in
+              ;; analyze-symbol, which applies the same check.
+              (let [_ (when (and (form-sym? head) (form-sym-ns head))
+                        (deny-private head (resolve-global ctx head) true))
+                    n (invoke (analyze ctx head env)
                               (mapv #(analyze ctx % env) (rest items)))
                     p (form-position form)]
                 (if p (assoc n :pos p) n))))))))

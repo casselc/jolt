@@ -46,11 +46,10 @@ Machine-readable index for coding agents: [`llms.txt`](llms.txt).
 
 ## Install
 
-Prebuilt binaries are self-contained — runtime, compiler, and stdlib in one
-executable — and need only the base system libraries: **Linux x86_64** wants
-glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+), **macOS arm64** wants
-macOS 14+. Anything else (Intel Mac, musl/Alpine, older glibc) is not supported
-by the prebuilt binaries — [build from source](CONTRIBUTING.md#build-from-source).
+Prebuilt binaries are self-contained (runtime, compiler, stdlib) for **Linux
+x86_64** (glibc 2.17+), **macOS arm64** (14+), **Windows x86_64** and **Android
+arm64** under Termux (`pkg install ncurses libuuid libiconv`). Anything else
+(Intel Mac, musl/Alpine) — [build from source](CONTRIBUTING.md#build-from-source).
 
 With Homebrew:
 
@@ -318,6 +317,20 @@ task, `name<TAB>doc`, which is the machine-readable form of what `jolt tasks`
 prints for a person. Anything scripting over a project's tasks should read that
 rather than parse the listing.
 
+A task that parses its own arguments — one with an `:exec-fn` or a `:cmd` tree,
+see below — carries a third field, `cli`, and completes past its own name:
+
+```
+$ jolt serve --<TAB>
+--port    port to listen on
+--host    interface to bind
+```
+
+Those options cannot be cached as a flat list, since what a task accepts depends
+on where the cursor is, so that one case does call jolt back — through
+`jolt org.babashka.cli/completions`, babashka.cli's own callback contract. Every
+other task still completes from the cache without starting jolt at all.
+
 A `:private` task and one whose name starts with `-` are left out, the same two
 `jolt tasks` hides. One case differs on purpose: a task sharing a built-in
 command's name is offered only when it wins that name with `:override-builtin`,
@@ -325,6 +338,43 @@ because a completion's description says what the word will do, and for a task
 that loses to a command the answer is the command. `jolt tasks` lists it either
 way, being a list of what the project defines rather than of what typing the
 word gets you.
+
+## Tasks that parse their arguments
+
+A `bb.edn` (or `deps.edn`) `:tasks` entry normally holds a body to run. An entry
+that names an `:exec-fn` instead — or a `:cmd` tree of them — has its arguments
+parsed by [babashka.cli](https://github.com/babashka/cli) first, which is
+babashka's own CLI-task feature and works here the same way:
+
+```clojure
+{:tasks
+ {:requires ([app.api :as api])
+
+  serve {:doc     "serve the app"
+         :exec-fn api/serve
+         :cli     {:spec {:port {:coerce :long :default 8080 :desc "port to listen on"}}}}
+
+  db    {:doc "database commands"
+         :cmd {"migrate" {:exec-fn api/migrate :spec {:steps {:coerce :long}}}
+               "seed"    {:exec-fn api/seed}}}}}
+```
+
+`jolt serve --port 9000` calls `api/serve` with `{:port 9000}`, coerced and
+validated; `jolt serve --help` prints the options and runs nothing; `jolt db
+migrate --steps 3` dispatches through the tree. A spec may live on the handler
+var as `:org.babashka/cli` metadata instead of in the task map, which is where
+`bb -x` reads it from too, and `:cli` may name a `def` for options edn cannot
+express, such as an `:error-fn`.
+
+`--help` short-circuits before the `:depends` walk: asking what a task accepts
+never runs its dependencies. A CLI task named in `:depends` does not parse on its
+own — its handler is called in its place in the graph with the options the
+target's parse produced, narrowed by its own `:restrict`, and its spec merges
+into the target's so those options parse and show up in `--help` there.
+
+The parser is vendored at `vendor/cli` and re-exported as `jolt.cli`, so a
+program can use it directly: `(require '[jolt.cli :as cli])` gives `parse-opts`,
+`parse-args`, `dispatch` and `format-opts`.
 
 ## Runtime dependencies
 
@@ -381,6 +431,17 @@ in that effective root.
   default (zero cost); a checker error never breaks a compile.
 - **`JOLT_DEBUG`** — verbose dependency resolution (the fetching / using-cache /
   skipping lines that are otherwise quiet) and the host static-shim drift warning.
+- **`JOLT_AOT_NARROW=0`** — restore the conservative AOT cache key. By default a
+  plain `jolt run` keys a namespace on the compile-time surface its dependencies
+  contribute (macros, records/protocols, forwarded vars, data readers), so an
+  edit to an ordinary function recompiles that namespace alone; a dependent that
+  assumed an inert dependency is re-verified when its cached fasl loads. `jolt
+  build` (direct-linked/inferred) always keeps the conservative whole-closure key.
+- **`JOLT_AOT_ASYNC=0`** — compile AOT cache misses in-process instead of in a
+  background worker. On by default for a built jolt: the run that missed does not
+  wait, and the fasl is ready for the next one (the worker finishes its jobs and
+  exits once its parent is gone). Source mode (`bin/jolt`) has no
+  spawnable jolt and always compiles in process.
 
 ## REPL and editor integration
 
@@ -410,6 +471,31 @@ sessions and interruptible eval, plus the cider-nrepl ops an editor expects
 ```
 
 See [REPL-Driven Development](https://jolt-lang.github.io/docs/repl-driven-development.html).
+
+### Linting with clj-kondo
+
+`jolt.ffi`'s macros (`defcfn` and the scoped-allocation helpers) expand to
+special forms only the compiler understands, so without help
+[clj-kondo](https://github.com/clj-kondo/clj-kondo) reports every C symbol
+`defcfn` binds as an unresolved var, with no way to catch a wrong-arity call
+either. This repo exports a config and hook for that, at
+`clj-kondo.exports/jolt-lang/jolt/`:
+
+```bash
+mkdir -p .clj-kondo
+clj-kondo --lint /path/to/jolt/checkout --dependencies --copy-configs
+```
+
+`/path/to/jolt/checkout` is wherever jolt's own source lives locally. The
+export ships in the repo, not in the installed binary, so a checkout (a full
+clone, or one already on disk for another reason) is what `--copy-configs`
+needs to read. The command copies `config.edn` and its hook into
+`.clj-kondo/imports/jolt-lang/jolt/`; clj-kondo loads every config under
+`.clj-kondo/imports/` on its own, so nothing further has to name it in the
+project's own `.clj-kondo/config.edn`. Re-run the command whenever the
+export changes upstream. `test/clj-kondo/` in this repo has a fixture
+covering every `defcfn` shape and the other macros the config touches, with
+its own README for re-running that check.
 
 ## Compile a binary
 
@@ -478,6 +564,22 @@ of a computed name that runs and names a namespace the build did not bake
 fails at the call, by name: the binary has that namespace's source to compile
 and no compiler, and the loader says so, pointing at the vouch. Name a site
 only when you can say why it is dead.
+
+A namespace the app reaches only by a runtime lookup — a plugin loader's
+`(requiring-resolve 'myapp.plugin/run)` — is invisible to the require scan, and
+a built binary has no source roots to load it from. Bake it in explicitly; the
+flag repeats, and the `deps.edn` key takes symbols or strings:
+
+```bash
+jolt build -m myapp.core --include myapp.plugin
+```
+
+```clojure
+:jolt/build {:include [myapp.plugin]}
+```
+
+An include with no source file on the roots fails the build, rather than baking
+nothing and leaving the failure to the binary's first lookup.
 
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the

@@ -87,6 +87,7 @@
 ;; value, a waiting putter, or a closed channel complete immediately (no
 ;; capture); an empty open channel registers an alt-taker and parks.
 (define (jolt-fiber-<! ch)
+  (jolt-fiber-may-park! 'clojure.core.async/<!)   ; before registering as a taker
   (jolt-chan-lock! ch)
   (let ((r (ac-poll!/locked ch)))
     (if (eq? r ac-poll-empty)
@@ -108,6 +109,7 @@
 ;; taker completes immediately (no capture); a full channel registers an
 ;; alt-putter and parks.
 (define (jolt-fiber->! ch v)
+  (jolt-fiber-may-park! 'clojure.core.async/>!)   ; before registering as a putter
   (async-check-put! v)                   ; throws — keep it outside the mutex
   (jolt-chan-lock! ch)
   (let ((r (jolt-chan-locked-give! ch v)))
@@ -192,24 +194,44 @@
   (let ((f (jolt-current-fiber)))
     (unless f
       (error 'jolt-fiber-waiter-wait! "channel wait outside a fiber"))
+    ;; the take/put ops checked before registering; alts! registers its shared
+    ;; handler in async.ss and arrives here first
+    (jolt-fiber-may-park! 'jolt-fiber-waiter-wait!)
     ;; Commit and park are ONE region with interrupts disabled — see
     ;; jolt-sm-commit!. The park records the depth (swish's pcb-sic) and the
     ;; resume is restored to it, so the resumed path must NOT enable again; only
     ;; the no-park path does.
     (disable-interrupts)
-    (let ((park?
-           (jolt-with-mutex (alt-handler-wmu h)
-             (if (vector-ref (alt-handler-mailbox h) 0)
-                 #f
-                 (begin (jolt-fiber-state-set! f 'parked) #t)))))
-      (when park?
-        (jolt-fiber-bump-chan-parks! f)
-        (jolt-fiber-to-scheduler! f))
-      ;; Balances the disable above on BOTH paths: the park returns here when the
-      ;; fiber is resumed (restored to the depth it parked at), so it owes the
-      ;; same enable the no-park path does.
-      (enable-interrupts)
-      (alt-handler-mailbox h))))
+    (let wait ()
+      (let ((park?
+             (jolt-with-mutex (alt-handler-wmu h)
+               (if (vector-ref (alt-handler-mailbox h) 0)
+                   #f
+                   ;; #f too when an interrupt is pending (fibers.ss): then the
+                   ;; wait is abandoned, and claimed below so no value lands in it
+                   (jolt-fiber-commit-park! f h)))))
+        (when park?
+          (jolt-fiber-bump-chan-parks! f)
+          (jolt-fiber-to-scheduler! f))
+        ;; Resumed with nothing delivered and no interrupt to raise: a wake from a
+        ;; registration an interrupt left behind (the waiter list of a deref or a
+        ;; monitor the fiber was raised out of). Park again; the resume restored
+        ;; the depth the park was taken at, so the region is still open.
+        (when (and park?
+                   (not (vector-ref (alt-handler-mailbox h) 0))
+                   (not (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))))
+          (wait))))
+    ;; Balances the disable above on BOTH paths: the park returns here when the
+    ;; fiber is resumed (restored to the depth it parked at), so it owes the
+    ;; same enable the no-park path does.
+    (enable-interrupts)
+    (jolt-fiber-parked-on-set! f #f)
+    (when (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
+      ;; the wait is over either way: a value already in the mailbox was taken
+      ;; by a fiber that is dying, and an empty one must never be filled
+      (alt-claim! h)
+      (jolt-fiber-check-interrupt! f))
+    (alt-handler-mailbox h)))
 
 ;; The fiber alts! await: park on the already-registered shared handler and
 ;; return [val port]. Registered by async.ss's __do-alts with wake = the
@@ -293,21 +315,38 @@
 ;; that commits must switch (wait-fiber does; nothing else calls them).
 (def-var! "jolt.host" "fiber-park-commit!"
   (lambda ()
+    (jolt-fiber-may-park! 'jolt.host/fiber-park-commit!)
     (disable-interrupts)
-    (jolt-fiber-state-set! (jolt-current-fiber) 'parked)))
+    ;; An interrupt pending: commit as a yield instead, so the switch the caller
+    ;; owes comes straight back and the seam below raises.
+    (let ((f (jolt-current-fiber)))
+      (unless (jolt-fiber-commit-park! f #f)
+        (jolt-fiber-state-set! f 'ready)
+        (jolt-fiber-enqueue! (jolt-fiber-carrier f) f)))))
 ;; jolt-fiber-to-scheduler! takes the fiber (it clears the current-fiber vreg
 ;; before capturing, so the record has to be passed in, not read afterwards).
 (def-var! "jolt.host" "fiber-to-scheduler!"
   (lambda ()
-    (jolt-fiber-to-scheduler! (jolt-current-fiber))
-    ;; balances fiber-park-commit!'s disable, on resume — see jolt-fiber-park!.
-    (enable-interrupts)))
+    ;; the commit seam above checked already, and a caller takes no counted lock
+    ;; between the two; this is the gate's rule for a switching definition
+    (jolt-fiber-may-park! 'jolt.host/fiber-to-scheduler!)
+    (let ((f (jolt-current-fiber)))
+      (jolt-fiber-to-scheduler! f)
+      ;; balances fiber-park-commit!'s disable, on resume — see jolt-fiber-park!.
+      (enable-interrupts)
+      (jolt-fiber-check-interrupt! f))))
 (def-var! "jolt.host" "fiber-resume" sa-fiber-resume)
+;; The interrupt's throwable is a jolt value, raised as a throw would raise it,
+;; so the fiber's own try/catch sees exactly what the caller passed.
+(def-var! "jolt.host" "fiber-interrupt!"
+  (lambda (fib throwable) (if (jolt-fiber-interrupt! fib throwable) #t #f)))
+(def-var! "jolt.host" "fiber-masked" (lambda (f) (jolt-fiber-masked (lambda () (jolt-invoke f)))))
+(def-var! "jolt.host" "fiber-unmasked" (lambda (f) (jolt-fiber-unmasked (lambda () (jolt-invoke f)))))
 ;; Unguarded full collect for the R8 gate: System/gc swallows Chez's
 ;; "cannot collect when multiple threads are active" refusal (the JVM-faithful
 ;; guarded no-op), but the gate must SEE that refusal when the poller's blocking
 ;; wait is not collect-safe — a collect that fails proves it.
-(def-var! "jolt.host" "gc-full!" (lambda () (sa-gc-collect)))
+(def-var! "jolt.host" "gc-full!" (lambda () (jolt-collect-full!)))
 
 ;; --- jolt.fibers: the public lower-level API (epic jolt-of08.1) ---------------
 ;; stdlib/jolt/fibers.clj is a thin veneer over these seams. spawn mirrors

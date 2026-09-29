@@ -5,7 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [Unreleased]
+
+- Evaluate upstream Jolt 0.8.14 on the isolated cumulative performance line,
+  preserving the 0.8.10 StringWriter, owned-byte, callback-domain, protocol-site,
+  native WAL and bounded zero-fill work. Adapt protocol sites to the new reify
+  layout and preserve upstream rejection of class callbacks claiming built-in
+  types. This is not yet a canonical aspects migration or throughput claim.
 
 - Zero-initialize Chez FFI allocations from a private bounded read-only block,
   avoiding a full-sized managed zero buffer per native allocation. Preserve
@@ -74,6 +80,843 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiler fast path is guarded by a proven String receiver; consumers select
   it only after exact parity with the portable encoder, and unproven receivers
   retain ordinary method dispatch.
+## [0.8.14] - 2026-09-28
+
+Android arm64 ships again as a prebuilt Termux binary, with bionic fixes for
+charsets, locales, process spawning and `Math/E`. The run-path AOT cache
+recompiles less after an edit, reads each source once, and compiles misses in a
+background worker. Fibers can be interrupted, pprint's code-dispatch lays out
+code like the reference, and closing a reader or finishing a child process no
+longer leaks descriptors.
+
+### Added
+
+- A prebuilt **Android arm64** binary (`jolt-<ver>-aarch64-android.tar.gz`) for
+  Termux, built and checked in `termux/termux-docker` on each release (#943,
+  #1148). It needs Termux's `ncurses`, `libuuid` and `libiconv`; the install
+  script picks it on Android and says which packages to add if one is missing.
+  The bionic CI job now runs the full CI gate, so the build is no longer held
+  out of releases.
+- **`jolt.fibers/interrupt!`, `masked` and `unmasked`.** `interrupt!` makes
+  another fiber raise a throwable wherever it is (spinning, parked on a
+  channel, in a deref, in a CPS'd go body), the way an Erlang process dies of
+  an exit signal. The fiber raises it itself at a point where it could already
+  be switched out, and an abandoned channel wait is claimed so it can't swallow
+  a value. `masked` defers interrupts over a region and `unmasked` reopens one
+  inside it, like Haskell's `mask`, so cleanup after an interruptible body
+  can't be torn.
+- **AOT cache misses compile in a background worker.** On a miss the namespace
+  has already been loaded; the fasl only serves later runs, so a detached child
+  of the built jolt compiles it while the program starts (atomic temp + rename;
+  a job the worker could not finish simply misses again). On by default for
+  built jolts on Linux/macOS — the worker finishes its jobs and exits after its
+  parent does — and `JOLT_AOT_ASYNC=0` restores the in-process compile. Source
+  mode's `bin/jolt` has no spawnable jolt and always compiles in process.
+
+### Fixed
+
+- **Closing a text reader over a stream closes the stream (#1175).** An
+  `InputStreamReader`, or an `io/reader` over an `InputStream`, stopped at its
+  own port on close and left the stream open, and `slurp` closed nothing it was
+  handed. Every `jolt.process` run with `:out :string` leaked the child's
+  stdout and stderr pipes for good (`sh` leaked three descriptors), and file
+  streams stayed open until a collection. `slurp` now closes the stream or
+  reader it reads, as the JVM's `with-open` does, and a closed `StringReader`
+  raises `IOException: Stream closed` instead of reading on.
+- **A child process's pipes are released like the JDK's.** `jolt.process`
+  copies a child's output with `io/copy`, which closes nothing, and `sh` never
+  closes stdin, so fixing the reader alone left every run leaking. A pipe now
+  lets go of its descriptor once a read reaches its end, stdin is closed when
+  the child's exit is recorded, and at exit an idle, empty stdout or stderr is
+  closed too; a pipe that is dropped unread is released once collected. The
+  descriptor is freed only after the last read or write on it returns, so a
+  close from another thread no longer races an operation in flight.
+- **`clojure.pprint/code-dispatch` lays out code like the reference (#1177).**
+  It printed every list as a plain list, so `defn`, `let`, `if`, `cond`,
+  `condp`, `ns` and the rest broke after their head, and `#(...)` came out as
+  `(fn* [p__1#] ...)`. The reference's code table is ported, so those forms
+  keep their name, params, bindings or test on the first line, pair clauses
+  and bindings, and `#(...)` prints with `%` params. Along the way,
+  `(cl-format true ...)` called from a dispatch fn now writes into the active
+  pretty writer as on the JVM; it buffered separately, so a pretty directive
+  in it crashed.
+- **An `instance?` miss while the Gambit seed prelude loads no longer kills
+  the def.** The memo asked a host fn Gambit defines only after the prelude,
+  so the def threw and the seed's load guard dropped it silently. It is now
+  defined beside the memo on both hosts.
+- **`seq` on a `PersistentQueue` is O(1) (#1172).** It built the whole element
+  list before returning the first cell, so `first`, `rest` and `next` on a
+  queue cost its size. The seq now walks the front and then the reversed rear
+  lazily, one cell at a time.
+- **A warm AOT-cache start reads each namespace's source once (#1161).** A
+  dependency's key was computed while its consumer folded the dep digest and
+  then again, from a second read, when the dependency loaded, so every
+  dependency was read and hashed twice; from a jar that meant inflating and
+  CRC-checking the entry twice. The load now reuses the walk's key when the
+  file's mtime is unchanged, and only on a namespace's first load in the
+  process. Keys also hash the source's bytes, so a hit no longer decodes the
+  source at all.
+- **A project using a library with data readers is cached after one run.**
+  Every key folds the digests of the reader namespaces, and that digest was
+  memoized before those namespaces had written their dependency sidecars, so
+  the first run stored every artifact under a key the next run never
+  computed. Each namespace compiled once more on the second run, and the reader
+  namespace itself on the third. A namespace the reader namespace requires now
+  publishes its artifact once the reader namespace's sidecars exist, and
+  anything compiled during the data_readers scan waits for the scan to finish,
+  so a reader namespace that requires another reader namespace hits on the
+  second run as well.
+- **A warm start no longer reads Maven release jars at all.** A released
+  version is never republished under the same path, so each entry's key is
+  kept per jar and modification time, and an unchanged closure from Maven
+  release jars costs a stat per jar instead of inflating and hashing every
+  source. SNAPSHOTs, `:local/root` jars and directories keep full content
+  hashing. A require's jar reads also share one open reader per archive
+  instead of opening the file per entry; nothing holds a jar open between
+  requires.
+- **A large top-level form compiles in near-linear time again.** Since a bare
+  top-level fn got a constant pool, its pool was one `let*`, which Chez
+  compiles quadratically in the number of bindings: a `(fn [] …)` holding 400
+  `(is …)` forms took 1.7s to compile, up from 1.2s. The pool is now emitted as
+  flat `let` layers by dependency depth, and the same form takes about 1.05s.
+  compilescaling had been failing CI intermittently on this.
+- **A heap near its `JOLT_MAX_HEAP` ceiling no longer overshoots it during the
+  ceiling's own full collection (jolt-exoj).** The collection marks the old
+  generations in place, but Chez still copies sparse segments, and one
+  collection of every generation held all those copies beside their sources: a
+  program with ~140MB spread over the younger old generations peaked at 322MB
+  under a 256MB ceiling, and gcpolicy's ceiling check failed intermittently
+  under CPU contention. When the younger generations hold more than the free
+  room, the collection now goes a generation at a time, so the peak is the heap
+  plus the largest step. Below the soft limit the collection also fires after
+  a quarter of the remaining room rather than half, leaving it room to copy
+  into. Both workloads now peak at 269-274MB, and `JOLT_GC_LOG` lines show the
+  running peak.
+- **A built image marks its app namespaces loaded, so a runtime `require` of
+  one is a no-op.** The app emit pre-registered every linked namespace
+  (`intern-ns!`) but never marked it loaded, so a `require` after startup — a
+  library's lazy load, an extension host's requires, kmet's extension-load
+  `host-requires!` — missed the loader's dedup, read the source from the
+  embedded roots again and re-evaluated the namespace IN PLACE. Top-level side
+  effects re-ran, and a bare symbol compiled before a same-namespace
+  redefinition of a `clojure.core` name (the #451 shape: `(get env
+  "HTTPS_PROXY")` above a same-ns `(defn get …)`) was re-resolved against the
+  now-populated var table: the built program threw `class java.lang.String
+  cannot be cast to class clojure.lang.Associative` where `jolt run` was fine
+  (reported against kmet, whose `src` is embedded and whose extension loader
+  requires host namespaces at startup; only the app build was exposed — the
+  CLI AOT emit already marks `jolt.main`/`jolt.deps`).
+- **A keyword, set or vector called with the wrong number of arguments throws
+  `ArityException` (#1162).** A literal callee was lowered straight to `get`/`nth`
+  whatever the argument count, so `(:a 1 2 3)` answered 2, `(#{1} 1 2)` 1 and
+  `([1 2] 0 1)` 1, and `(:a)`/`({:a 1})` reported the arity of an anonymous
+  `get`. Those calls now go through the ordinary invoke and throw the callee's
+  own message (`Wrong number of args (0) passed to: :a`), and the inliner no
+  longer counts an over-arity lookup as pure, so a discarded one still throws.
+- **A `jolt.loader` root lookup racing a private load no longer answers the
+  context's half-built namespace (jolt-fmvc).** The root checked whether a
+  context owned the name before looking the namespace up, so a context that
+  claimed and created the name between the two reads had its namespace handed
+  out as the host's. A second context loading the same name could link it
+  mid-evaluation, with vars missing. It showed up once as loaderconf case 13
+  throwing under memory pressure.
+- **Non-Unicode charsets work on bionic (#1148).** `getBytes`, `String`'s
+  decoding constructor, `URLEncoder`/`URLDecoder` and the stateful ISO-2022-JP
+  cases went through Android's partial libc iconv: `iconv_open` resolves there
+  but cannot name Shift_JIS, EUC-JP, ISO-2022-JP or windows-1252, and Termux's
+  GNU library exports only `libiconv_*`. The charset layer now collects every
+  provider and uses the first that can name the charset, so those encodings
+  work and one no provider has still raises `UnsupportedEncodingException`.
+- **`jolt.host/locale-name` returns nil for a locale bionic did not actually
+  switch to (#1148).** bionic's `setlocale` accepts an unavailable locale and
+  silently keeps C.UTF-8, where glibc returns NULL, so jolt's boot probe
+  believed an `en_US.UTF-8` locale was installed and every localized format
+  answered English. The probe and `locale-name` now read the category back and
+  compare locale roots; a request the OS did not honor answers nil, and
+  jolt.time's bundled tables take over.
+- **`ProcessBuilder.start` returns after the child has exec'd on bionic
+  (#1148).** Android's `posix_spawn` returns as soon as it forks, before the
+  child has closed the descriptors it should not inherit, so a listener the
+  parent closed right after `start` could still be bound in the child. Every
+  spawn now waits on a close-on-exec pipe, as glibc, musl and Darwin already
+  do internally.
+- **`Process.waitFor(n, unit)` returns on time.** It subtracted a 10 ms step
+  per poll instead of reading a clock, so every pause's overrun accumulated: a
+  1000 ms wait came back after ~1170 ms and 5000 ms after ~5840. It now waits
+  against a deadline and returns within a couple of milliseconds of it.
+- **`Math/PI`/`Math/E` and `clojure.math`'s are the JDK's literal constants,
+  not the host libm's `atan(1)`/`exp(1)` (#1148).** bionic's `exp(1)` is one ulp
+  high, so `Math/E` — and everything built on it, `jolt.infix`'s `e` among
+  them — answered a different double than the JVM's.
+
+### Changed
+
+- **The bionic CI job runs the full CI gate (#1148).** `make bionic-ci` no
+  longer skips the ten gates that used to fail on Android/Termux: the charset
+  layer finds libiconv, the provisioned Chez kernel is built with
+  `CFLAGS+=-fPIC` (so `jolt build --library` links there), CTS matches its
+  baseline, and the fixtures that assumed off-Android behavior or a glibc
+  provisioning path branch on the platform. `ci/termux-build.sh` installs the
+  libsqlite package the smoke fixture's per-OS map names.
+- **The run-path AOT cache narrows its key to a dependency's compile-time
+  surface.** With direct-linking and whole-program inference off (plain `jolt
+  run`), a dependency that defines no macros, records/types/protocols,
+  forwarded `:refer`s, or data readers cannot change a consumer's emitted code,
+  so the consumer no longer folds that dependency's source. Editing an ordinary
+  function recompiles that namespace alone; its consumers hit their cached
+  fasls and read the new value through the dependency's var. A consumer whose
+  cached fasl assumed an inert dependency is re-verified once the fasl's own
+  requires have loaded, so a dependency that gained a macro invalidates it.
+  `jolt build` (direct-linked/inferred) keeps the conservative key; set
+  `JOLT_AOT_NARROW=0` to keep it everywhere.
+
+## [0.8.13] - 2026-09-26
+
+Mostly memory and lazy seqs. The heap ceiling now bounds the whole heap as `-Xmx`
+does, the nursery sizes itself by the time spent collecting, and the JVM's GC tuning
+flags have `JOLT_*` equivalents, including the GC overhead limit. Lazy seqs stop
+holding what they have walked past (writ's prover went from 3.8GB live to 134MB) and
+cost a third of what they did per element, and collections no longer promote the
+cells a walk left behind. `jolt build` caches and compiles namespaces in parallel,
+and a run of reader, printer and interop fixes brings more of the JVM's behavior
+over.
+
+### Added
+
+- **A clj-kondo config and hook for `jolt.ffi`, exported at
+  `clj-kondo.exports/jolt-lang/jolt/`.** Without it, clj-kondo cannot see
+  through `defcfn`'s `__cfn` expansion, so every C symbol it binds reads as
+  an unresolved var and a wrong-arity call at the binding's call site goes
+  uncaught. The hook rewrites every `defcfn` shape (plain, docstring,
+  attribute map, `:blocking`/options-map trailing, the raw-binding wrapper
+  in both its single- and multi-arity forms, and both spellings of the
+  variadic marker) into a `def`/`defn` clj-kondo can check for real, with
+  the same arity as the C binding; `with-arena`'s single-symbol binding
+  gets a small hook of its own, and `with-alloc`/`with-out`/`with-layout`/
+  `with-c-string`/`with-c-string-array` are covered by `:lint-as
+  clojure.core/let` since each binds one `[symbol expr]` pair already. See
+  the README's "Linting with clj-kondo" section for the import command and
+  `test/clj-kondo/` for the fixture that exercises it.
+
+### Changed
+
+- **`jolt build` caches and parallelizes its back end (#1059).** The app half of a
+  binary is now one compile unit per namespace, cached in `~/.jolt/build-cache` on its
+  emitted text, with misses compiled in parallel child processes; the vfasl image is
+  converted per unit, with the runtime part converted once and cached; and the build's
+  load step uses the AOT namespace cache again. Inlining is bounded per top-level form
+  (400 IR nodes; `JOLT_INLINE_GROWTH`), which stops test-heavy namespaces from
+  expanding into megabytes of Scheme. On kmet a release build went from 128.5s and
+  5.6GB of memory to 55s from cold, 35s for an unchanged rebuild and 38s after editing
+  one namespace, under 1GB. `JOLT_BUILD_CACHE=0`, `JOLT_BUILD_CACHE_DIR`,
+  `JOLT_BUILD_CACHE_MB` and `JOLT_BUILD_JOBS` control the unit cache.
+- **The compiler does less work per build** (#1155): each app source is parsed once,
+  the inference registries' maps are reused across forms, the whole-program
+  parameter-type fixpoint skips nodes whose inputs did not move, and a pass that
+  changes one call site leaves the rest of the tree shared instead of copying it.
+  The output is byte-identical; with the build cache off, the fps-demo example
+  builds in 3.4s where it took 3.8s, and reactive-dashboard in 9.8s to 13.4s where
+  it took 11s to 15.7s.
+- **The heap ceiling bounds the heap's total size, as `-Xmx` does.** `JOLT_MAX_HEAP`
+  (and the 25%-of-RAM default) used to bound only the live data, so a program near a
+  4GB ceiling held 6.5GB. It now covers the live data, the nursery and the free memory
+  the collector keeps, within the working room a collection needs: about 10%, since
+  Chez's collector cannot compact in place (under 256MB with 100MB held, 0.8.12 went
+  23% over). Near the ceiling the nursery
+  shrinks to a quarter of the remaining room, the collector keeps less free memory,
+  and collections mark older objects in place instead of copying them. The
+  out-of-memory error is unchanged: it is raised only when the live data cannot fit.
+- **The JVM's GC overhead limit.** Five collections in a row that find more than 98% of
+  the time spent collecting with under 2% of the ceiling free raise `OutOfMemoryError`
+  ("GC overhead limit exceeded") instead of running on at a crawl.
+  `JOLT_GC_OVERHEAD_LIMIT=off`, `JOLT_GC_TIME_LIMIT` and `JOLT_GC_HEAP_FREE_LIMIT`
+  mirror `-XX:-UseGCOverheadLimit`, `GCTimeLimit` and `GCHeapFreeLimit`.
+- **The nursery size follows the time spent collecting, bounded by the live data.**
+  It starts at 16MB and doubles while collection takes more than a tenth of the run,
+  up to the size of the data the program keeps; past that only while collection keeps
+  taking more than a fifth. The share counts each collection by its time, and nothing
+  is resized before five collections are in, as the JVM's
+  `AdaptiveSizePolicyReadyThreshold` has it, so a short run keeps the floor. A
+  program that allocates little keeps 16MB. writ's prover
+  spent 40% of its time collecting at the fixed 16MB and 25% now (65.4s to 58.8s, peak
+  RSS 2.14GB to 2.28GB); a loop holding 40MB went from 3.25s to 2.1s at 256MB to 327MB peak.
+  The knobs mirror the JVM's: `JOLT_MAX_RAM_PERCENTAGE`, `JOLT_GC_TIME_RATIO`,
+  `JOLT_MAX_HEAP_FREE_RATIO`, `JOLT_NEW_SIZE`, `JOLT_MAX_NEW_SIZE`; `JOLT_GC_TRIP_BYTES`
+  still pins the size, and a value jolt cannot read is refused at startup. The older
+  generations are also collected once the heap passes twice what was live after the
+  last full collection, so garbage there no longer waits for a schedule counted in
+  nurseries; that allowance grows toward 8x when the full collections take more than
+  the target share of the time (writ's pong: 263 full collections down to 86). Growth
+  of the nursery past the live data is checked: eight collections after it, a share of
+  time that rose by more than a tenth sends it back and holds it (a bigger window cost
+  writ's prover 10x per collection), after one jump to 8x for programs where only a
+  big window lets most of it die.
+- **Walking a lazy seq no longer promotes what it walked past.** Every young
+  collection promoted the cell a walk was on; the walk then realized that cell's
+  tail into it, and the dead cell, in a generation the next collection skipped,
+  kept every cell realized after it alive until the older generations were
+  collected: about 70% of each nursery survived a `reduce` over `iterate` or an
+  `into` over `mapcat`, in 0.8.12 as well. Each collection now takes generation 1
+  with it, so a dead cell there roots nothing. `bench/seqs` went from 245ms to
+  165ms and `lazy-threads` from 201ms to 107ms against 0.8.12.
+- **`for` is the reference's expansion.** The innermost binding conses each value (and
+  over a chunked seq fills a chunk at a time, as the reference does) where jolt's
+  expansion built `(concat (list x) (step (rest s)))` per value; an innermost binding
+  with no modifiers runs on the native `map`. `for` with `:when` over a vector went from
+  178ns to 38ns per element, and how much of its source a first element realizes now
+  matches the JVM (a chunk over a chunked seq). An unknown keyword in a `for` or `doseq`
+  binding is refused by name, where it read the rest of the vector wrong ("index out of
+  bounds").
+- **`seq` on a lazy seq takes the fast path.** It went through the registered arms
+  after seven type tests: a quarter of a `tree-seq` walk. `tree-seq` is 293ns per node
+  where it was 370.
+- **Lazy seq nodes are 48 bytes, not 64**, without the two mirror fields they wrote for
+  images on every force (images derive them; older images restore through the legacy
+  arm), and a realized node lets go of its rerun thunk, as the reference nulls `fn`.
+- The per-site static member and instance-check caches publish each entry behind a
+  release fence; on ARM64 another thread could see a new entry before its slots.
+- **Seq cells are 48 bytes, not 80.** A cell carries its head, tail, kind and
+  metadata; the chunk fields moved to a vector-backed subtype, a claim swaps the tail
+  word itself instead of a lock field, and the image mirror of the forced flag is
+  gone. writ's pong allocates 345GB where it allocated 449GB; a realized `map` costs
+  77 bytes per element where it cost 92.
+- Near the heap ceiling, a full collection that cannot get under its soft limit no
+  longer repeats after every young collection; the next waits until half the remaining
+  room is used. A program whose live data sat above the soft limit (writ's prover on a
+  16GB CI runner) used to stall there for hours. `JOLT_GC_LOG=1` prints a line per
+  collection, as `-verbose:gc` does.
+- **Hand-written lazy seqs cost less per element.** A `lazy-seq` node's own thunk stays
+  on it while it runs, as the reference keeps `fn`, which drops three stores and a
+  marker from every force; the macro's two halves and `chunked-seq?` compile to direct
+  calls instead of a var lookup and a generic invoke. With the other lazy-seq changes
+  in this release, a `lazy-seq` walker over a list costs 42ns per element where 0.8.12
+  took 123ns, `keep` 53ns (was 150), and `for` with `:when` 33ns (was 203).
+- **Hashing a long is 3x faster, and hash sets and maps with it.** The 32-bit
+  sign-extension the murmur hash applies at every step branched on the hash's sign bit,
+  a coin flip the CPU mispredicted about half the time; it is branch-free now, and the
+  long hash keeps its steps unsigned until one final conversion (85ns to 30ns for
+  `(hash n)`). A persistent map or set copies a changed node in one block move instead
+  of a zero fill and a copy loop with a write barrier per slot, the per-level
+  helpers inline, and `contains?` takes the lookup path `get` already had: `conj` onto
+  a 100k-element set went from 610ns to 300ns, `contains?` from 148ns to 95ns, and
+  `distinct` from 943ns to 397ns per element.
+- **A core.async take or put that no thread is waiting on skips the wakeup.**
+  Every take and put broadcast the channel's condition, which on Android is a
+  futex syscall even with no waiters (bionic's `pthread_cond_broadcast` does not
+  check first, glibc's and macOS's do). A channel now counts the threads blocked
+  on it and broadcasts only when there are some: a take from a buffered channel
+  went from 96ns to 53ns on macOS and from about 340ns to 135ns under Termux.
+  Images from 0.8.12 holding a channel still restore.
+
+### Fixed
+
+- nREPL `eval` and `load-file` send output as it is printed, each flush (every
+  `println`) its own `out` or `err` message, instead of all of it in one message
+  just before the value (#1153). `jolt.nrepl/evaluate` takes an optional map
+  `{:out f :err f}` of callbacks that do the same for eval middleware; with two
+  arguments it still captures `*out*` and returns it whole.
+- `jolt CMD --help` (or `-h`) prints that command's usage for every built-in
+  command. None of them knew the flag: `nrepl-server --help` dropped it and started
+  a server on the default port, `repl --help` started a REPL, and `run`, `build`
+  and `completions` failed on it as an argument (#1152).
+- `mapcat` and `(apply concat ...)` return their last collection as it is instead of
+  copying it, as the JVM's `concat` does. `tree-seq` nests one `mapcat` per level, so
+  the copy cost every element its depth: a 4000-deep chain took 1.6s to walk (JVM
+  1ms), and writ's proof summaries spent minutes in `tree-seq`.
+- **A lazy seq whose body throws runs its body again on the next force**, as the
+  reference's `LazySeq` does (it keeps `fn` until `invoke` returns); jolt cached the
+  failure and re-raised it. The rerun sees the locals the body had not finished with:
+  a `lazy-seq` thunk is `^:once` (below), and as the reference's compiler does, each
+  capture is emptied at its last use on the path the body takes, with loops, branches
+  and nested fns accounted for, so `(let [v [1 2]] (lazy-seq (when (first-run?)
+  (throw …)) v))` answers `(1 2)` on the second force, as on the JVM. Not recording
+  failures also took an exception handler off every force.
+- **Lazy seqs no longer keep what they have walked past.** Three retention bugs,
+  each fixed the way the reference does it:
+  - A lazy seq whose body answers another lazy seq (a `keep` or `dedupe` skip, a
+    `lazy-seq` returning a `lazy-seq`) was forced inside the body, so a run of skips
+    was a recursion as deep as the run, each frame pinning its place in the source.
+    The chain is now walked in a loop, as `LazySeq.realize`/`unwrap` does, with the
+    forced node holding nothing but its answer.
+  - A `lazy-seq` thunk kept what it closed over until it returned. It is now
+    `^:once`, as in the reference: its captures are released as it runs, so a thunk
+    looping over a run (`distinct`, `for` with `:when`) does not pin its source.
+    `^{:once true} fn*` works in user code too.
+  - `concat` over a seq of colls (`mapcat`, `apply concat`, `tree-seq`, `flatten`)
+    held the outer cell of the coll it was walking, whose first is that coll, so the
+    whole walk stayed live. It holds only the remaining colls now, as the reference's
+    `(cat (first zs) (next zs))` does, and realizes the same amount of its source.
+  writ's prover went from 3.8GB live to 134MB (the JVM holds 256MB) and from 507s to
+  277s; `drop-while`, `distinct`, `mapcat`, `for`, `remove`, `flatten`, `interleave`
+  and `dedupe` over a 3M-element run now fit in a 256MB heap, as on the JVM.
+  `(apply concat xs)` realizes as much of `xs` as the JVM does (4 colls, from
+  `RestFn.applyTo`), where it realized 1.
+- clojure.core vars carry the reference's `:tag` metadata (`(:tag (meta #'not))` is
+  `Boolean`, `(:tag (meta #'str))` is `String`), where they carried none.
+- A `loop` local bound to a primitive boolean (`(nil? x)`, `(= a b)`, `(< a b)`,
+  `(instance? C x)` …) refuses a `recur` of anything that is not one, with the JVM's
+  "recur arg for primitive local" error; jolt used to run such a loop.
+- A built binary's stack traces no longer depend on its build directory. Each frame's
+  line was read from the generated unit files under `<out>.build`, so a binary copied
+  elsewhere, or whose build directory was cleaned, showed frames at their `defn` lines
+  and dropped inlined ones, and so did a binary assembled from build-cache units that
+  an earlier build compiled. The line tables are baked into the binary now.
+- On a fiber, code inside a lazy seq can wait: a `locking` that is contended, a
+  promise deref, a channel take or any other park inside `(doall (map f xs))`, a
+  `for` body or a two-collection `mapv` used to raise "a fiber cannot leave the CPU
+  while its carrier holds a counted lock" (#1142). Forcing a lazy seq no longer counts
+  as holding a lock; a lazy cell is claimed by the fiber forcing it, and another fiber
+  waiting on it gives up the carrier instead of blocking it.
+- A fiber that catches the error for parking while it holds a lock is left as it was.
+  The yield, park or channel take used to mark it queued, parked or registered first,
+  so it was later run a second time ("fiber in unexpected state") or its carrier
+  stopped running fibers.
+- A caught exception keeps its stack trace. `.getStackTrace`, `.printStackTrace` and
+  `Throwable->map`'s `:trace` (and each `:via` entry's `:at`) answer the frames of where
+  the exception was constructed, as on the JVM, including one that was never thrown;
+  they were empty unless nothing else had thrown since. `StackTraceElement->vec`
+  names the class and method as symbols, as on the JVM.
+- A static member reference like `Long/MIN_VALUE` or a call like
+  `(Long/numberOfLeadingZeros x)` looks its member up once per call site instead of
+  hashing the class and member names on every evaluation (136 to 32 ns for a
+  `Long/MIN_VALUE` compare). The site notices a member a library adds or replaces
+  later, and a mutable static set later. test.check's generators spent a fifth of
+  their time on those lookups.
+- A function in a def's metadata looks up the vars it calls once, as the def's value
+  does, instead of by name on every call. Every `deftest` body is such a function, so
+  test code ran its var calls about 8x slower than the same code in a `defn`.
+- Reading source off a reader is linear again for nested code. A list took its
+  `:line`/`:column` after reading its children, which sent the position cursor back
+  to the start of the input on every list holding a list, so `(read r)` over
+  `clojure/core.clj` took 1s (the JVM takes 20ms) and twice that file took 4s. It
+  now takes 17ms. This also covered edamame, tools.reader and anything else
+  reading through jolt's reader.
+- `load-file` and `load` put `*ns*` back when the file finishes, including when it
+  throws, as the JVM does. A loaded file's `ns` form used to leave the caller in the
+  file's namespace, so the caller's next form resolved its aliases there.
+- An interop field read or `set!` on a record or deftype finds a declared slot under
+  any spelling that munges to the slot's name, as the JVM's compiler does:
+  `(.-processed_count r)` reads `[processed-count]`, `(.-my-field r)` reads `[my_field]`,
+  and `(.-ready_QMARK_ r)` reads `[ready?]` (#1139). Keyword reads stay exact. A no-arg
+  `(.zz r)` no longer reads a key assoc'd onto the record, which is not a field.
+- A deftype or defrecord method whose parameter is `_` can read `_` in its body. It
+  names the last `_` parameter, as in `fn`.
+- Reader errors carry the JVM's class: EOF, an unmatched delimiter, a bad escape and
+  the rest are `RuntimeException`s (they were `ExceptionInfo`), a malformed `\u`
+  escape an `IllegalArgumentException`, with the JVM's messages ("EOF while reading
+  character", "Invalid digit: z", "read-cond body must be a list", ...). A read from a
+  `LineNumberingPushbackReader`, `with-in-str` or stdin wraps any error in a
+  `LispReader$ReaderException` at the stream's line and column (`clojure.edn`: an
+  `EdnReader$ReaderException`), and an unclosed collection names the line it opened
+  on. `clojure.main/repl` catches that class as the JVM's does, and moves past the
+  bad input instead of reporting the same error forever. EOF errors have their own
+  kind, `read/eof`.
+- `#'` at end of input and a reader conditional whose matched feature has no form
+  are read errors; `(read-string {} "nil")` is nil, not an EOF error; `"\0a"` is an
+  invalid octal escape.
+- `LineNumberingPushbackReader` counts like the JVM's: the column starts at 1 and an
+  unread steps it back, end of input ends the last line, and reading forms from one
+  over a file no longer counts every line twice. A form read from one carries the
+  stream's line, so `clojure.main/renumbering-read` keeps it.
+- Successive `clojure.edn/read`s from one reader read successive forms; the first
+  drained the whole reader. `read+string` trims its text like the JVM's.
+- `(str e)` includes ex-data only for an `ExceptionInfo`, as `Throwable.toString` does.
+- A Writer bound to `*out*` sees the JVM's calls: `print`/`pr`/`println`/`prn` write
+  each argument separately with the space and newline as appends, a printed char is
+  an append, `println` makes no empty write, and `PrintWriter`/`PrintStream`
+  `.printf`/`.format` write each piece the Formatter produces.
+- `take` and `drop` count a non-integer `n` as the JVM does: `(take 1.5 xs)` is two
+  elements and `(take 1/2 xs)` one, where jolt floored a double and threw on a ratio or
+  a count past the fixnum range. `repeatedly`, `split-at` and `drop-last` follow.
+- A vfasl conversion that fails inside the build prints its note instead of silently
+  keeping the plain boot.
+- `repeat` is a `clojure.lang.Repeat` (it was a `LazySeq`), `realized?` refuses it,
+  and dropping into it skips ahead instead of walking. `drop` over an `IDrop`
+  collection (a vector or its seq, a long range, a repeat, a string's seq, an array
+  map or its seq) is eager and answers that collection's own seq, raising `IDrop`'s
+  int-cast errors for a count that does not fit, as on the JVM.
+- A `java.io.PrintWriter` over a `proxy` `java.io.Writer` writes through the proxy's
+  own `write`, where its first write threw a missing `clojure.pprint/-write` (#1132).
+- `(read)` and `(read+string)` read a host reader bound to `*in*`, such as a
+  `LineNumberingPushbackReader` or `PushbackReader`. They threw a missing `-read-form`
+  / `-read+string`, although `(read *in*)` already worked (#1133).
+- A `java.io.PrintWriter` passes `flush` and `close` to the writer it wraps, so text
+  written through one over a file writer reaches the file; it lost everything before.
+  It also calls its target the way the JDK's does (text as `write(s, 0, len)`, which is
+  all a `java.io.Writer` proxy has to define), and gains `println`, `printf`, `format`
+  and `checkError`.
+- `clojure.pprint/pprint` and `cl-format` write to any `java.io.Writer` (a
+  `StringWriter`, a file writer, a `PrintWriter`, `*out*`); they threw a missing
+  `-write` for all of them.
+- `PrintStream`'s and `PrintWriter`'s `printf`/`format` spread a lone `Object[]` as the
+  varargs, as `String/format` does, and `PrintStream.printf` answers the stream.
+- `read` and `read+string` over a `PushbackReader` wrapping a program's own `proxy`
+  or `reify` Reader return once the form is complete, as on the JVM. They drained
+  the reader to end of input first, so over an interactive source such as an IDE's
+  stdin they waited until the stream was closed (#1137). A token followed by `(`,
+  `;` or another terminating character returns at that character, and read errors
+  over such a reader are the same `ReaderException` as over a string.
+
+### Internal
+
+- CI builds jolt for Android arm64 in `termux/termux-docker` and runs the gate on
+  bionic (`make bionic-ci`) on every push (#943). There is no Android release
+  binary yet: the gates that still fail on bionic are tracked in #1148, and the
+  install script says so under Termux.
+
+## [0.8.12] - 2026-09-24
+
+Mostly Windows and host-surface parity. Files and Paths render with `\` on
+Windows, `file:` URLs round-trip with drive letters, directory mtimes and
+access/creation times are real on every platform, and a DLL that is present
+but cannot load says so instead of reading as missing. Host static members now
+check the JVM's arities, which rejects calls that used to run with their extra
+arguments dropped. `instance?`, `satisfies?` and `reify` stop resolving by name
+on every call (core.logic's finite-domain case 2445 ms → 379 ms), and
+test.check's own suite runs 106/1 against the JVM's 106/0.
+
+### Added
+
+- **`java.util.SplittableRandom`, `java.util.Objects`, fixed-size
+  `Arrays/asList`.** SplittableRandom is SplitMix64 as the JDK implements it,
+  bounded variants included, checked draw for draw against the JVM (test.check
+  defines two specs only when the class exists). `Arrays/asList` is a view that
+  writes through to its array. Character gains the case maps, `isAlphabetic`,
+  `isSpaceChar`, `isISOControl`, the Java identifier predicates, `compare`,
+  `hashCode` and `toString`.
+
+- **`jolt.loader`: a root over the embedded resource table, `"embed:<prefix>"`.**
+  A build already bakes `deps.edn :jolt/build {:embed [dirs]}` into the binary
+  and `io/resource` serves those keys with no files on disk, but a loader root
+  could only be a directory or a jar — so a shipped app could not `require` a
+  library it had baked in. An embedded root resolves namespaces and resources
+  straight out of that store: `ldr-root-file` answers the embedded key (which
+  `ldr-read-source` already reads), `jolt.loader/embedded-root?` is the public
+  predicate and the feature probe, a blank prefix is refused at construction
+  (a prefix holding nothing is still a legal root), and a resource hit from
+  such a root carries `:embedded? true`, so opening reads the hit's own
+  location instead of re-resolving the request name — on a prefixed root the
+  two are different keys. `jolt.host/embedded-resource?` is the Clojure-side
+  predicate.
+
+- **`jolt build --include NS` / `:jolt/build {:include [ns …]}`.** A namespace
+  the require scan cannot see — one the app reaches only through a runtime
+  `requiring-resolve`, a plugin loader's shape — was simply absent from the
+  built image, and a built binary has no source roots to load it from, so the
+  lookup failed at the call with "Could not locate … on the source roots". The
+  repeatable flag and the deps.edn key (symbols or strings) seed the require
+  closure with the named namespaces, so their vars are compiled in; a name with
+  no source file on the roots fails the build, instead of silently baking
+  nothing and leaving the failure to the binary's first lookup.
+
+### Fixed
+
+- **Windows file paths and URLs (#1110, #1117, #1118, #1119).** File and Path
+  render with `\` wherever the JVM shows one (`toString`, `getPath`,
+  `getParent`, `str`, exception messages, `File/separator`); a `\` typed by
+  the caller is a separator and paths normalize like the JDK. `toURI`/`toURL`,
+  `io/as-url` and `io/resource` spell `file:/C:/…` as the JDK does and accept
+  `file:///C:/…` back. Closing a PushbackReader after `read` closes the reader
+  it was built on, so the file is no longer left pending delete.
+  `FileTime/from` works, and a directory's mtime can be set on Windows. The
+  POSIX attribute view raises UnsupportedOperationException on Windows instead
+  of answering `rwxr-xr-x` and ignoring writes.
+
+- **File access and creation times are real.** `lastAccessTime` and
+  `creationTime` answered the mtime; they read `st_atime` and the birth time
+  now (statx on Linux, GetFileAttributesEx on Windows) and can be set.
+  `FileTime.toString` printed `#object[…]`, equal FileTimes were not `=`,
+  `fileKey` was nil, and a failed `createLink`/`createSymbolicLink` looked like
+  it succeeded. Exception messages name the path the caller gave, not the one
+  jolt resolved.
+
+- **`string->ptr` on a byte-array copies its bytes (#1100).** It rendered the
+  array with `str` and allocated `"#object[[B]"`; `with-c-string` and
+  `with-c-string-array` inherited it.
+
+- **clojure.test honours `test-ns-hook` and a caller's `*report-counters*`.**
+  `run-tests` ran every test in a namespace that defines a hook, and a report
+  inside a captured run bumped the global tally. `test-var` reports an uncaught
+  exception through `report` and emits begin/end-test-var.
+  `Thread.getStackTrace` answers the reconstructed stack instead of an empty
+  array, so test.check's failure location prints a file and line instead of
+  `(:)`.
+
+- **`map?`/`coll?`/`vector?` on a redefined deftype could recurse forever**
+  when a library `instance?` predicate itself called `map?`. They answer from
+  the type's declared interfaces now. `(class r)` no longer reports a record's
+  `:type` metadata, which the JVM ignores.
+
+- **A native library that is on disk but fails to load is no longer reported
+  as not found (#1127).** On Windows, `libssl-3-x64.dll` copied beside
+  `jolt.exe` warned "not found — tried [libssl-3-x64.dll …] (a task may build
+  it)" when what actually failed was a DLL it depends on (libcrypto, the VC++
+  runtime): LoadLibrary fails the file that exists, and the loader's reason was
+  dropped. `:jolt/native` loading, `jolt.ffi/load-library` and a built binary's
+  startup now name the file they found and the loader's own reason (dlerror on
+  macOS/Linux), and a task no longer offers to build a library that is already
+  there. The Windows lookup of the executable's own folder also read argv[0],
+  which is plain `jolt` when jolt.exe is run from PATH; it now asks Windows for
+  the module path.
+
+  ```
+  warning: required native library ssl did not load — C:\jolt/libssl-3-x64.dll
+  is there but did not load: (while loading libssl-3-x64.dll) The specified
+  module could not be found. (a DLL it depends on is missing or not on PATH …)
+  ```
+
+- **`io/input-stream` refused an embedded resource, and `URL.openStream` handed
+  back a reader.** `(io/input-stream (io/resource "baked.txt"))` threw in a
+  built binary while the same call on a `file:` URL worked, and
+  `(.getResourceAsStream cl "baked.txt")` answered a `java.io.Reader` where the
+  JVM answers an `InputStream`. Both are byte streams now, so a byte read and
+  `(InputStreamReader. …)`-style composition behave as they do on the JVM.
+
+### Changed
+
+- **Host static members check the JVM's arities (#1020 follow-up).** About 170
+  members accepted any argument count and dropped the extras:
+  `(Integer/parseInt "1" 10 3)` answered 1 and `(String/join "," ["a"] 1)`
+  answered `"[a],1"`. They now declare the JDK's overload arities and a miss
+  names the class. Java varargs members stay open. `(repeat nil :a)` and
+  `(mapcat identity 5)` throw at the call as on the JVM.
+
+### Performance
+
+- **`instance?`, `class`, `satisfies?`, record methods and `reify` stop
+  resolving by name on every call.** Per-site and per-type caches, retired by
+  an epoch when a library registers a new arm. `instance?` on a reify
+  3500 → 13 ns (JVM 14), `satisfies?` on a reify ~1300 → 39 ns, reify
+  construction 310 → 48 ns; the `dispatch` and `mono-dispatch` benchmarks are
+  3.1x and 3.5x faster.
+
+### Internal
+
+- **`tools/wine`**: a podman image that runs jolt's Windows build (source mode
+  and a cross-built `jolt.exe`) under Wine, and the `winparity` gate replaying
+  the Windows issue repros. A ta6nt cross build of jolt itself links again.
+- `make libconformance` finds the library checkouts from a git worktree, and
+  fails instead of skipping when they are missing.
+
+## [0.8.11] - 2026-09-22
+
+Namespace resolution, regex and Windows are the bulk of this window. A
+`^:private` var of another namespace is refused now, and `:refer-clojure
+:exclude`/`:only`/`:rename` mean what they mean on the JVM. That is the one
+breaking change here: code that calls another namespace's private function
+by its qualified name has to go through the var (`(@#'ns/f ...)`).
+`java.util.regex` got faster on `$`-anchored patterns and character classes,
+its matching agrees with the JVM on look-behinds, `\b`/`\B` and flag groups,
+and a bad pattern gets the JVM's `PatternSyntaxException` message. On
+Windows, subprocesses, sockets, `spit` over an existing file, `PATH`
+splitting and drive-rooted paths all work. `jolt build` gains `--signable`
+for macOS code signing, and a `:static` native links on a stock Linux box
+again. `bb.edn` tasks with `:exec-fn`/`:cmd` parse their arguments through
+babashka.cli.
+
+### Changed
+
+- **A `^:private` var of another namespace is refused.** Calling or reading
+  `a/hidden` from outside `a` is `var: #'a/hidden is not public` (call or
+  macro head) or `var: a/hidden is not public` (value position), as on the
+  JVM. `(var a/hidden)`, `#'a/hidden`, `@#'a/hidden` and `with-redefs` still
+  reach it. `refer :only`, `require :refer`, `use :only` and `:refer-clojure
+  :only` throw `IllegalAccessError` for a name that does not exist or is
+  private instead of ignoring it, and `refer` without `:only` refers only
+  public vars. A private `clojure.core` name is no longer visible unqualified
+  elsewhere: `(resolve 'lift-ns)` is `nil`. (#1095, #1113, #1115)
+
+  A macro that expands to its own namespace's private function breaks the
+  same way in its callers. glimmer's `reaction` did: a project using it
+  needs glimmer v0.1.3 or later. glimmer-tui v0.2.5, glimmer-gtk v0.1.1,
+  glimmer-gl v0.1.1, glimmer-appkit v0.1.2, glimmer-uikit v0.2.1 and
+  glimmer-datastar v0.1.1 pin it, as does duratom's main branch.
+- **`:refer-clojure` exclusion follows the JVM.** An excluded core name no
+  longer falls back to `clojure.core`, so using it above the namespace's own
+  def is `Unable to resolve symbol`. `:only` and `:rename` were ignored and are
+  honored now. A name stays withheld only while every `refer-clojure` the
+  namespace has seen withholds it, so `(refer-clojure :exclude '[inc])` after
+  a plain `(ns x)` leaves `inc` mapped. Reloading an ns form no longer grows
+  the exclusion list that every unqualified core lookup scans. The `try`/`catch`
+  lowering names `clojure.core/let` and friends, so a namespace that excludes
+  `let` and defines its own (promesa does) no longer gets its own `let` inside
+  every `catch`. (#1113, #1115)
+- **Regex alternation is leftmost-first when there are no groups.** A
+  non-capturing pattern always ran irregex's DFA, which is leftmost-longest:
+  `(re-find #"a|ab" "ab")` answered `"ab"`; the JVM and now jolt answer `"a"`.
+  (#1062)
+- **`clojure.test`: `(is (thrown? ...))` and `(is (thrown-with-msg? ...))`
+  return the exception** on a pass and `nil` otherwise, as `is`'s docstring
+  says. They returned the report counters map, so `(ex-message (is (thrown?
+  ...)))` was `nil` and an assertion on it tested nothing. (#1091)
+- **A redefined `deftest` replaces its registry entry.** Reloading a test
+  namespace ran each test once more per reload, and the first entry kept the
+  old body. The entry keeps its position. A suite that defines one test name
+  twice now runs it once, as on the JVM. (#1096)
+- **`(ServerSocket.)` is unbound until `.bind`.** The no-arg constructor bound
+  and listened on an ephemeral port. It now makes the socket and stops, and
+  `.bind(SocketAddress)` / `.bind(SocketAddress, backlog)` exist. `isBound`
+  stays true after close, `getLocalPort` is `-1` until bound, and `accept` on
+  an unbound socket raises `Socket is not bound yet` instead of blocking.
+  (#1093)
+- **A nested load inherits the enclosing file's compiler flags.** A file that
+  `set!`s `*unchecked-math*`, `*warn-on-reflection*` or `*assert*` and then
+  loads another file (`require`, `load-file`, `load-string`) passes its current
+  values down, as `Compiler.load` does; the nested load used to start from the
+  roots.
+- **Every entry point binds the `set!`-able compiler flags.** A `(set!
+  *warn-on-reflection* true)` inside `-main` under `-m`, `run -m`, `-M`, an
+  `-X`/`-T` exec fn, a task body or a built binary's launcher threw `Can't
+  change/establish root binding`. `jolt.loader`'s source evaluation brackets
+  the flags per file, like the host loader.
+
+### Added
+
+- **`jolt build --signable`** produces an executable that `codesign --verify
+  --strict` accepts. The default self-contained build appends the compiled
+  boot past the launcher's Mach-O image, which codesign refuses; `--signable`
+  takes the cc-linked path instead and needs a C compiler. (#1064)
+- **CLI tasks.** A `bb.edn` or `deps.edn` task naming an `:exec-fn`, or a `:cmd`
+  tree of them, has its arguments parsed by babashka.cli (vendored at
+  v0.12.91, public as `jolt.cli`) with babashka 1.13.223's semantics:
+  coercion, validation, subcommands, `--help`, inherited options and
+  `:depends` on CLI tasks. `jolt <task> --help` matches `bb <task> --help`
+  byte for byte apart from the program name. Shell completion offers a CLI
+  task's own options. (#1083)
+- **`java.lang.ProcessHandle`** is a class: `ProcessHandle/current`,
+  `ProcessHandle/of` (an `Optional`), `isAlive`, `destroyForcibly`,
+  `supportsNormalTermination`, `equals`/`hashCode`/`toString`. Referencing it
+  used to throw at the first touch. (#1087)
+- **`Files/isHidden` on Windows** reads the hidden attribute instead of the
+  leading dot, so `fs/glob` skips the same files babashka does. (#1110)
+- **java.util.regex escapes**: `\h` `\H` `\v` `\V` are real classes (they
+  matched the literal letter), `\p{...}` covers every general category, the
+  binary properties and the `java*` names, and `\p{name=value}` keys are
+  case-insensitive. `\N{NAME}`, `\X`, scripts and blocks are refused with a
+  message that says jolt has no table for them rather than matched wrongly.
+
+### Fixed
+
+- **A `:static` native builds on Linux again.** In 0.8.9 and 0.8.10 every
+  `jolt build` with a `:jolt/native` `:static` entry died on x86_64 Ubuntu with
+  `relocation R_X86_64_32 ... can not be used when making a PIE object`,
+  because the shipped Chez kernel was not position-independent. The release
+  kernel is built with `-fPIC` now, and a link that still fails on PIE (an
+  app's own non-PIC archive, or a locally built Chez) retries with `-no-pie`.
+  The relink also named `-luuid`, `-lncurses` and `-ltinfo`, which need the
+  `-dev` packages; without `uuid-dev` it failed with `cannot find -luuid`. It
+  links the versioned runtime library (`libuuid.so.1`) when the dev name is
+  missing, since jolt itself already depends on it. (#1060)
+- **Windows: subprocesses spawn.** Every `ProcessBuilder` start failed or
+  reported exit 0 with empty output. Spawning goes through `CreateProcessW`
+  with the JDK's own command-line quoting and environment block, pipes via
+  `CreatePipe`, and reaping via the process handle. (#1108)
+- **Windows: `java.net` sockets work.** Winsock is started once
+  (`jolt.winsock`) and the socket constants are Winsock's (`SOL_SOCKET`,
+  `SO_REUSEADDR`, `FIONREAD`, no `MSG_NOSIGNAL`). Sockets stay blocking on
+  Windows, and `NetworkInterface` enumerates nothing there, but
+  `InetAddress/getLocalHost` no longer dies looking for `getifaddrs`. (#1107)
+- **Windows: `spit` over an existing file**, including a `createTempFile`
+  target, no longer throws `file exists`. `path.separator` is `";"`, so
+  `fs/split-paths`, `fs/exec-paths` and `fs/which` work. `ProcessBuilder`
+  finds programs on a `;`-separated PATH, takes drive-rooted and UNC paths as
+  spelled, and tries PATHEXT. A drive path has a root, so `fs/absolute?`,
+  `getRoot`, `getParent` and `normalize` answer correctly. `java.io.tmpdir`
+  reads `TEMP`/`TMP`, and `File/listRoots` lists drives. (#1074)
+- **Windows: a glob with a separator matches.** `(fs/glob "src" "**/*.clj")`
+  found nothing while `"**.clj"` found everything. (#1086)
+- **`PushbackReader.close` closes the reader it wraps**, so `with-open` over
+  one no longer leaks the file descriptor. (#1109)
+- **Shutdown hooks run whichever thread registered them.** A thread forked
+  before the first hook was registered could receive SIGINT/SIGTERM itself:
+  ^C did nothing and SIGTERM killed the process without running hooks. With the
+  hook registered off the main thread, ^C exited 255 without hooks. Every
+  forked thread now starts with the shutdown signals blocked and the watcher is
+  armed at startup, so exit codes (130/143/129) and hooks match the JVM in
+  every case. ^C at the REPL exits 130 instead of 255. (#1098)
+- **`compare-and-set!` no longer fails spuriously on Apple silicon.** The
+  underlying CAS is a single `ldxr`/`stxr`, which can fail with the field still
+  holding the old value; it retries now while the field is unchanged.
+  ring-chez-adapter was dropping about one connection in 1400 under load on
+  M-series Macs because of it.
+- **`io/reader` on a path streams the file** instead of reading it whole
+  first, so `.readLine` and `line-seq` over a FIFO or a growing log return as
+  lines arrive. `mark`/`reset` work on it. Running out of descriptors reports
+  `(Too many open files)`, not `(Permission denied)`.
+- **File open errors report the reason the open failed.** Writing into a
+  directory the process cannot write reported `(No such file or directory)`
+  from `spit`, `io/output-stream` and `io/writer`; it reports `(Permission
+  denied)`. `slurp`, `spit`, `io/writer` and `io/output-stream` on a directory
+  are a `FileNotFoundException ... (Is a directory)` as on the JVM.
+- **Malformed UTF-8 decodes like the JVM everywhere.** `String.`, `slurp` of a
+  path, a stream or a URL, readers, `read-line` from stdin and URI accessors
+  now agree with java.nio on replacement counts for overlong and truncated
+  sequences and keep a leading BOM as U+FEFF.
+- **`getCanonicalPath` refuses a path that can never name a file.** A path
+  that has to traverse a symlink loop or an over-long component raises the
+  JVM's `IOException`, and a NUL in the path is refused instead of silently
+  canonicalizing to the working directory. (#1094)
+- **Regex matching agrees with the JVM on look-behinds and word boundaries.**
+  An anchor inside a look-behind read the end of the look-behind's window
+  instead of the input, so `(?<=a$)` matched in `"ab"` and `(?m)(?<=^)` matched
+  nowhere. `\b` reported a word end at position 0 of `" ab"`, `\B` never
+  matched at the edges, and `\b` split words at `_`.
+- **Regex flag groups and COMMENTS mode.** `(?x-i)` turned COMMENTS off,
+  `(?i-i:AB)` matched `"ab"`, and `(?x)` applied to the rest of the pattern
+  instead of its enclosing group. `\Q...\E` is read the same way by the
+  validator and the parser. Look-behinds the JVM rejects (`(?<!ab*+)`) are
+  rejected.
+- **`PatternSyntaxException` messages read like the JVM's**: description,
+  `near index N`, the pattern and the caret line. They carried the
+  translator's internal text and `near index 0`.
+- **Array constructors read their init.** `(char-array 3 \.)` ignored the
+  fill, and a seq init filled every slot with the seq itself: `(int-array 3
+  [1 2])` was `[[1 2] [1 2] [1 2]]`. A seq init fills a prefix, as on the JVM:
+  `[1 2 0]`.
+- **`jolt.ffi/write-bytes` of a byte-array writes its octets.** It wrote the
+  array's print form, `#object[[B]`. (#1092)
+- **`*print-length*` and `*print-level*`.** `clojure.pprint` had its own copies
+  of the vars, so binding core's did nothing to pprint, and maps were never
+  truncated. Records and sorted collections obey both limits in the core
+  printer. Namespaced-map printing lifts symbol keys too (`#:a{b 1}`).
+- **`jolt.loader` reads a file's forms in the file's own namespace**, one at a
+  time. A syntax quote inside a loaded file's macro resolved against the
+  caller's `*ns*`, so a dependent namespace failed with `No such var:
+  user/v` or called the wrong var.
+- **Symbols with reader-unsafe characters compile.** A name containing `|`
+  (ys.v0.std's `|||` macro), a backslash, a bracket or non-ASCII whitespace
+  produced Scheme that could not be read, or collided with another name
+  (`a\b` and `ab` were the same local). Names that read as Scheme numbers
+  (`+i`, `.5`) and names starting with `_` no longer collide with generated
+  ones. Two named `fn` literals with the same name in different defs no
+  longer share an image source-map entry.
+
+### Performance
+
+- **Regex: `$`-anchored patterns and character classes.** Anchors were
+  quadratic in the input: `(str/replace content #"(?m)\s+$" "")` over 274 KB
+  did not finish in 256 s and now takes 12.6 ms. Anchors are direct
+  predicates, a class of single characters is one char-set test instead of an
+  alternation chain, and the backtracking matcher is used where it is linear
+  (`#"[0-9]+"` 30 → 3.8 ms). Against babashka on the issue's rows jolt is now
+  0.8–2.8x. (#1062)
+- **`java.text.Normalizer`** returns an already-normalized string without
+  rebuilding it and `isNormalized` stops at the first character that needs
+  work: NFC/NFKC over 1 MB of ASCII 112 → 2.8 ms, under babashka's 5 ms. (#1066)
+- **`readLine`/`line-seq` on a file reader**: 120 → 85 ms over a 7 MB file.
+
+### Internal
+
+- Actions moved to their first Node 24 majors; nix-installer-action v22 with
+  `determinate: false` so the flake job still installs upstream Nix.
+- grenadine 0.1.13 → 0.1.15.
+- `make certify` pins its oracle to JDK 21 (`:oracle-jdk` in `profile.edn`)
+  and refuses another.
+- New gates: `winplatform` (Windows path/PATH/spawn rows pinned from Linux,
+  plus a live spawn), `utf8decode`, `normalizecheck`, `regexanchorprims`,
+  `regexsyntax`, `cas`, `clishim`; `windows-deps` CI runs `winplatform` and
+  `winpath`; the release workflow links a `:static` native with the packaged
+  binary.
 
 ## [0.8.10] - 2026-09-19
 

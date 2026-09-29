@@ -748,6 +748,159 @@
            (identical? new-cl (l/with-loader* new (fn [] (clojure.lang.RT/baseLoader)))))
       (l/unload! new))))
 
+;; --- 32. the reader follows the file's own namespace -------------------------
+;; A file is read form by form, each after the forms before it ran, so the
+;; namespace its ns form switched to — and the aliases and refers that form
+;; installed — are in force for the reader that expands its syntax quotes.
+;; Reading the whole file up front under the caller's *ns* expanded `v to the
+;; CALLER's v and `bb/v by the caller's aliases, so a macro's expansion named
+;; a var the defining file never mentioned. The host loader read form-by-form,
+;; which is why a plain require from the root never showed this. The caller
+;; here is bound to a decoy namespace holding v 999, so the failure mode is a
+;; wrong value, not just an error.
+(defcase 32 "syntax quotes resolve in the namespace the file declares"
+  (let [d (root-dir "syntaxquote")]
+    (spit (str d "/sqb.clj") "(ns sqb) (def v 42) (defmacro m [] `v)")
+    (spit (str d "/sqa.clj") "(ns sqa (:require [sqb])) (defn f [] (sqb/m))")
+    (spit (str d "/sqc.clj") "(ns sqc (:require [sqb :as bb])) (defmacro m [] `bb/v)")
+    (spit (str d "/sqd.clj") "(ns sqd (:require [sqc])) (defn f [] (sqc/m))")
+    (spit (str d "/sqe.clj") "(ns sqe (:require [sqb :refer [v]])) (defmacro m [] `v)")
+    (spit (str d "/sqf.clj") "(ns sqf (:require [sqe])) (defn f [] (sqe/m))")
+    (let [ctx (l/classpath [d])
+          decoy (create-ns 'loaderconf-decoy)
+          _ (intern decoy 'v 999)]
+      (binding [*ns* decoy]
+        (l/load ctx {:kind :ns :name "sqa"})
+        (l/load ctx {:kind :ns :name "sqd"})
+        (l/load ctx {:kind :ns :name "sqf"}))
+      (chk "a plain syntax quote resolves in the defining namespace"
+           (= 42 ((val-of (l/resolve ctx {:kind :var :name "sqa/f"})))))
+      (chk "a syntax-quoted alias resolves through the defining namespace's aliases"
+           (= 42 ((val-of (l/resolve ctx {:kind :var :name "sqd/f"})))))
+      (chk "a syntax-quoted referred symbol resolves through the defining namespace"
+           (= 42 ((val-of (l/resolve ctx {:kind :var :name "sqf/f"}))))))))
+
+;; --- 33. a load's compiler-flag set! is scoped to the load -------------------
+;; A source load brackets the set!-able compiler flags to their roots for the
+;; file's extent, as the host loader does (loader.ss ldr-with-file-vars — the
+;; JVM's Compiler.load): a top-level (set! *warn-on-reflection* true) is legal,
+;; and its effect ends with the file instead of escaping into the loading
+;; context's frame. Without the bracket, the set! wrote the caller's frame and
+;; stayed there; this caller watches its own values.
+(defcase 33 "a loaded file's compiler-flag set! does not escape into the caller"
+  (let [d (write! (root-dir "loadflags") "lf.clj"
+                  "(ns lf) (set! *warn-on-reflection* true) (set! *unchecked-math* true) (set! *assert* false) (def v 42)")
+        ctx (l/classpath [d])
+        w *warn-on-reflection*
+        u *unchecked-math*
+        a *assert*]
+    (binding [*warn-on-reflection* *warn-on-reflection*
+              *unchecked-math* *unchecked-math*
+              *assert* *assert*]
+      (l/load ctx {:kind :ns :name "lf"})
+      (chk "the file loaded and its def is live"
+           (= 42 (val-of (l/resolve ctx {:kind :var :name "lf/v"}))))
+      (chk "warn-on-reflection did not escape the load"
+           (identical? w *warn-on-reflection*))
+      (chk "unchecked-math did not escape the load"
+           (identical? u *unchecked-math*))
+      (chk "assert did not escape the load"
+           (identical? a *assert*)))))
+
+;; --- 34. embedded roots: the marker, validation, status ---------------------
+;; An embedded root is a prefix into the runtime's embedded-resource table, not
+;; a path: construction validates the PREFIX itself, so a blank one is refused
+;; eagerly while a prefix holding nothing yet is a legal root — the keys are
+;; probed per request, never up front.
+(defcase 34 "an embedded root is a marker into the embedded table, validated at construction"
+  (chk "embedded-root? recognises the marker"
+       (and (l/embedded-root? "embed:assets/bundled")
+            (l/embedded-root? "embed:")
+            (not (l/embedded-root? "src"))
+            (not (l/embedded-root? nil))))
+  (let [ctx (l/classpath ["embed:no/such/prefix"] {:id "embedded" :parent (l/isolated)})]
+    (chk "a prefix holding nothing is still a legal root"
+         (= ["embed:no/such/prefix"] (:roots (l/status ctx))))
+    (l/unload! ctx))
+  (let [err (try (l/classpath ["embed:"]) nil (catch Exception e e))]
+    (chk "a blank prefix is refused eagerly" (= :loader/bad-root (:type (ex-data err))))
+    (chk "the refusal names the root" (= "embed:" (:root (ex-data err))))))
+
+;; --- 35. an embedded root that holds nothing is a plain miss -----------------
+;; Nothing about an embedded root touches the filesystem: `find` answers [],
+;; `load` fails with the loader's own miss, and no "path" is ever opened — a
+;; prefix that matches nothing degrades exactly like a directory root that is
+;; empty.
+(defcase 35 "an embedded root over an empty prefix misses without a filesystem error"
+  (let [ctx (l/classpath ["embed:no/such/bundle"] {:parent (l/isolated)})
+        err (try (l/load ctx {:kind :ns :name "fixture.entry"}) nil (catch Exception e e))]
+    (chk "find answers no namespace hits"
+         (empty? (l/find ctx {:kind :ns :name "fixture.entry"})))
+    (chk "find answers no resource hits"
+         (empty? (l/find ctx {:kind :resource :name "fixture/data.txt"})))
+    (chk "load fails" (some? err))
+    (chk "the failure is the loader's own miss, not a filesystem error"
+         (= :loader/miss (:type (ex-data err))))
+    (chk "the failure names the namespace"
+         (= "fixture.entry" (:name (ex-data err))))
+    (l/unload! ctx)))
+
+;; --- 36. a resource hit opens through its own location -----------------------
+;; A resource hit carries the LOCATION it was found at; opening must read that,
+;; never re-resolve the request name through the host. On a prefixed root the
+;; two differ by construction — the request name is relative to the root while
+;; the location is the full embedded key — so a fallback to the name would ask
+;; for a key that does not exist. `jolt/loader.clj` names this very source, on a
+;; host source root under bin/jolt and in the embedded table of a built jolt.
+(defcase 36 "a resource hit opens through its own location, not the request name"
+  (let [ctx (l/->loader (fn [req]
+                          (when (= :resource (:kind req))
+                            {:kind :resource
+                             :url "jolt/loader.clj"
+                             :embedded? true})))
+        hit (first (l/find ctx {:kind :resource :name "loaderconf-probe.txt"}))]
+    (chk "the resolver's hit comes back" (some? hit))
+    (chk "it carries its own location" (= "jolt/loader.clj" (:url hit)))
+    (let [s (l/open-hit ctx hit)]
+      (chk "open-hit opens the hit's location" (some? s))
+      (chk "and reads that resource, not the request name"
+           (str/includes? (slurp s) "(ns jolt.loader")))))
+
+;; --- 37. the root never answers a name a context is claiming ----------------
+;; The root hides a context's namespace, and "does a context own it" and "is it
+;; installed" are two reads. A context claims the name before it creates the
+;; namespace, so reading them in the other order let a claim land in between:
+;; the root answered the context's half-built namespace as the host's, and a
+;; second context loading the same name linked it — with vars missing, since
+;; the snapshot ran mid-evaluation (case 13 threw nil-as-IFn once under memory
+;; pressure). This parks a root lookup between the two reads through the
+;; private seam, so the interleaving is pinned instead of left to the scheduler.
+(defcase 37 "a root lookup racing a private load answers nothing of it"
+  (let [d (write! (root-dir "claimrace") "libcr.clj" "(ns libcr) (defn who [] :private)")
+        orig @#'l/private-ns?]
+    (doseq [req [{:kind :ns :name "libcr"} {:kind :var :name "libcr/who"}]]
+      (let [ctx (l/classpath [d] {:parent (l/root)})
+            spy-thread (promise) parked (promise) resume (promise)]
+        (with-redefs [l/private-ns?
+                      (fn [nm]
+                        (let [r (orig nm)]
+                          (when (and (= nm "libcr")
+                                     (identical? (Thread/currentThread) @spy-thread)
+                                     (not (realized? parked)))
+                            (deliver parked true)
+                            (deref resume 5000 nil))
+                          r))]
+          (let [spy (future
+                      (deliver spy-thread (Thread/currentThread))
+                      (l/find (l/root) req))]
+            ;; with a correct ordering the lookup may finish without parking
+            (deref parked 2000 nil)
+            (l/load ctx {:kind :ns :name "libcr"})
+            (deliver resume true)
+            (chk (str "the root answers no " (name (:kind req)) " a context owns")
+                 (empty? @spy))))
+        (l/unload! ctx)))))
+
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]
   (reset! failures [])

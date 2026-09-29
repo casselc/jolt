@@ -37,6 +37,11 @@
   `identical?` holds. A resource hit names a location; `open-hit` turns it into
   an open handle on demand, so nothing holds a file handle between calls.
 
+  A hit on an embedded root (`embedded-root?`) names an embedded key instead of
+  a path: a namespace hit carries it in `:file`, a resource hit in `:url` with
+  `:embedded? true`, and reading goes through that location rather than
+  re-resolving the request name.
+
   Two tiers decide which loader answers. Linkage follows the DEFINING loader:
   code compiled for a context resolves through that context for its whole life,
   whoever calls it and on whatever thread. Dynamic loading — `require` reached
@@ -69,6 +74,11 @@
     * loading a namespace pre-loads its `(ns … (:require …))` dependencies
       through the loader first, so the compiler resolves the context's own
       version of every dependency.
+    * a namespace's source is read and evaluated form by form, the way the
+      host loader reads one: the file's `ns` form has run by the time the rest
+      of it is read, so the aliases and refers that form installs are in force
+      for the reader, and syntax quotes resolve in the namespace the file
+      declares, never in the caller's.
     * a call through `require` / `use` / `refer` / `resolve` / `ns-resolve` /
       `find-var` in evaluated source compiles to its context-carrying form
       (`__require-in` and friends): the compiler's var-call hook
@@ -99,9 +109,11 @@
   own cells. That claim covers the evict/evaluate window, not a reader's view
   of a name another context reloads while unrelated code compiles; a name one
   context reloaded is the name the global registry holds. `:class` requests
-  have no backend on this host yet. A root may be a directory or a jar; a jar
-  is read in place through its central directory, as the global roots read
-  one, and never extracted.
+  have no backend on this host yet. A root may be a directory, a jar, or an
+  embedded root — "embed:<prefix>", a prefix into the runtime's
+  embedded-resource table (what deps.edn `:jolt/build {:embed [dirs]}` bakes
+  into a binary; see `embedded-root?`); a jar is read in place through its
+  central directory, as the global roots read one, and never extracted.
 
   One registry also means one slot per name. A private load EVICTS whatever
   the process has under the name — including a host namespace the context is
@@ -349,14 +361,16 @@
 
 (defn- default-open
   "Open a resource hit. A file: location opens the file, a jar:file: location
-   streams the entry out of its archive; anything else — the jar:-classed
-   embedded resource a built binary hands out — is re-resolved by name through
-   the host's resolver, which is what produced the location."
+   streams the entry out of its archive, an embedded hit reads its key through
+   the host resolver; anything else — the jar:-classed embedded resource a
+   built binary hands out — is re-resolved by name through the host's resolver,
+   which is what produced the location."
   [hit]
   (when-let [url (:url hit)]
     (cond
       (str/starts-with? url "file:") (io/input-stream (file-url-path url))
       (str/starts-with? url "jar:file:") (io/input-stream url)
+      (:embedded? hit) (io/input-stream (host-resource url))
       :else (io/input-stream (host-resource (:name hit))))))
 
 (defn- hit-url
@@ -369,6 +383,7 @@
     (cond
       (str/starts-with? url "file:") (io/as-url (java.io.File. (file-url-path url)))
       (str/starts-with? url "jar:file:") (java.net.URL. url)
+      (:embedded? hit) (host-resource url)
       :else (host-resource (:name hit)))))
 
 (defn- open*
@@ -739,6 +754,20 @@
               (str u)))
           source-exts)))
 
+(defn- host-ns
+  "The namespace the host has installed under NS-NAME, or nil when it has none
+   or a context owns the name. The order of the two reads is the point: a
+   context claims a name BEFORE its evaluation creates the namespace
+   (mark-private!), so a namespace seen here was either claimed already — and
+   the ownership read after it sees the claim — or is the host's. Asking
+   private-ns? first leaves a window in which a context claims and creates the
+   name between the two reads, and the root answers a context's half-built
+   namespace as its own (jolt-fmvc)."
+  [ns-name]
+  (when-let [n (find-ns (symbol ns-name))]
+    (when-not (private-ns? ns-name)
+      n)))
+
 (defn- host-locate
   [req]
   (case (:kind req)
@@ -747,40 +776,61 @@
     ;; loaded yet but CAN load locates as a source location, so the load goes
     ;; through the host's own loader (AOT cache included) instead of leaking
     ;; to whatever `require` the evaluated form calls.
-    :ns (when-not (private-ns? (:name req))
-          (if-let [n (find-ns (symbol (:name req)))]
-            [{:kind :ns :handle n}]
+    :ns (if-let [n (host-ns (:name req))]
+          [{:kind :ns :handle n}]
+          (when-not (or (private-ns? (:name req)) (find-ns (symbol (:name req))))
             (when-let [u (host-ns-location (:name req))]
               [{:kind :ns :file u}])))
     :var (let [[ns-name var-name] (str/split (:name req) #"/" 2)]
-           (when (and ns-name var-name (not (private-ns? ns-name)))
-             (let [ns-sym (symbol ns-name)]
-               ;; ns-resolve also answers a CLASS for a capitalized name
-               ;; (clojure.core/String); a :var hit carries a cell, so only a
-               ;; var is one
-               (when (find-ns ns-sym)
-                 (let [v (ns-resolve ns-sym (symbol var-name))]
-                   (when (var? v)
-                     [{:kind :var :cell v}]))))))
+           (when (and ns-name var-name)
+             ;; ns-resolve also answers a CLASS for a capitalized name
+             ;; (clojure.core/String); a :var hit carries a cell, so only a
+             ;; var is one
+             (when-let [ns-obj (host-ns ns-name)]
+               (let [v (ns-resolve ns-obj (symbol var-name))]
+                 ;; the cell was read after the ownership check; re-check so a
+                 ;; claim that landed in between is not answered either
+                 (when (and (var? v) (identical? ns-obj (host-ns ns-name)))
+                   [{:kind :var :cell v}])))))
     :resource (when-let [u (host-resource (:name req))]
                 [{:kind :resource :url (str u)}])
     nil))
 
+(defn- host-ns-changed!
+  [ns-name]
+  (throw (ex-info (str "namespace " ns-name " was taken over by a context while the"
+                       " root was loading it")
+                  {:type :loader/unreadable :kind :ns :name ns-name})))
+
 (defn- host-ns-vars
+  "ns-interns reads the registry by NAME, so the snapshot is the handle's only
+   while the handle is still the installed, host-owned namespace — checked
+   after the read, or a context that claimed the name meanwhile would have its
+   cells linked as the root's."
   [home ns-obj]
-  (when ns-obj (ns-interns ns-obj)))
+  (when ns-obj
+    (let [vars (ns-interns ns-obj)
+          nm (str (ns-name ns-obj))]
+      (when-not (identical? ns-obj (host-ns nm))
+        (host-ns-changed! nm))
+      vars)))
 
 (defn- host-load-ns
   "The root's reader: a namespace the host does not have loaded yet loads
    through the host's own loader (global source roots, AOT cache and all)."
   [home hit req]
-  (or (find-ns (symbol (:name hit)))
-      (do
-        (jolt.host/load-namespace (:name hit))
-        (or (find-ns (symbol (:name hit)))
-            (throw (ex-info (str "the host has no namespace " (:name hit))
-                            {:type :loader/unreadable
-                             :kind :ns :name (:name hit)}))))))
+  (let [nm (:name hit)]
+    (or (host-ns nm)
+        (do
+          (when (private-ns? nm)
+            (host-ns-changed! nm))
+          (jolt.host/load-namespace nm)
+          (or (host-ns nm)
+              (if (private-ns? nm)
+                (host-ns-changed! nm)
+                (throw (ex-info (str "the host has no namespace " nm)
+                                {:type :loader/unreadable
+                                 :kind :ns :name nm}))))))))
 
 (defonce ^:private root-loader
   (delay (make-loader {:id "root"
@@ -956,6 +1006,25 @@
 
 ;; ─── The source-roots code backend ─────────────────────────────────────────
 
+(def ^:private embedded-root-marker "embed:")
+
+(defn embedded-root?
+  "Is ROOT an embedded root — the spelling \"embed:<prefix>\", naming a prefix
+   into the runtime's embedded-resource table (what deps.edn
+   `:jolt/build {:embed [dirs]}` bakes into a binary) rather than a directory
+   or a jar on disk? A context over such a root serves namespaces and
+   resources with no files anywhere, which is how a shipped binary runs a
+   library it carries. The var is also the feature probe: a jolt that has it
+   supports embedded roots."
+  [root]
+  (and (some? root) (str/starts-with? (str root) embedded-root-marker)))
+
+(defn- embedded-root-prefix
+  "The prefix of an embedded root — the marker's rest, with no trailing
+   slash. Keys are \"<prefix>/<name>\"."
+  [root]
+  (subs (str root) (count embedded-root-marker)))
+
 (defn- jar-root?
   "Is ROOT a jar — a .jar or .zip that is a file? The host reads such a root
    in place (jolt.host/root-file); every other root is a directory."
@@ -967,36 +1036,49 @@
 (defn- validate-root!
   "Construction is the eager-validation point: a root that is missing, not a
    directory or a whole jar, or not readable fails here, not at the first
-   load."
+   load. An embedded root's only requirement is a non-blank prefix — its keys
+   are probed per request, so a prefix holding nothing is still a legal root,
+   and a wrong one degrades to an ordinary miss."
   [root]
-  (let [f (fs/file (str root))]
-    (when-not (fs/exists? f)
-      (throw (ex-info (str "loader root does not exist: " root)
+  (if (embedded-root? root)
+    (when (str/blank? (embedded-root-prefix root))
+      (throw (ex-info (str "loader root is an embedded root with a blank prefix: " root)
                       {:type :loader/bad-root :root (str root)})))
-    (when-not (fs/readable? f)
-      (throw (ex-info (str "loader root is not readable: " root)
-                      {:type :loader/bad-root :root (str root)})))
-    (cond
-      (fs/directory? f) nil
-      (jar-root? root)
-      (when-not (jolt.host/zip-archive? (str root))
-        (throw (ex-info (str "loader root is not a whole zip archive: " root)
+    (let [f (fs/file (str root))]
+      (when-not (fs/exists? f)
+        (throw (ex-info (str "loader root does not exist: " root)
                         {:type :loader/bad-root :root (str root)})))
-      :else
-      (throw (ex-info (str "loader root is neither a directory nor a jar: " root)
-                      {:type :loader/bad-root :root (str root)})))))
+      (when-not (fs/readable? f)
+        (throw (ex-info (str "loader root is not readable: " root)
+                        {:type :loader/bad-root :root (str root)})))
+      (cond
+        (fs/directory? f) nil
+        (jar-root? root)
+        (when-not (jolt.host/zip-archive? (str root))
+          (throw (ex-info (str "loader root is not a whole zip archive: " root)
+                          {:type :loader/bad-root :root (str root)})))
+        :else
+        (throw (ex-info (str "loader root is neither a directory nor a jar: " root)
+                        {:type :loader/bad-root :root (str root)}))))))
 
 (defn- root-file
   "The location NAME resolves to on ROOT, or nil: an absolute file path under
-   a directory root, a jar: path into a jar root (jolt.host/root-file)."
+   a directory root, a jar: path into a jar root, an embedded key under an
+   embedded root (jolt.host/root-file). An embedded key is already its own
+   location — absolutizing it would turn the key into a path that cannot
+   exist."
   [root name]
   (when-let [p (jolt.host/root-file (str root) name)]
-    (if (str/starts-with? p "jar:file:") p (str (fs/absolutize (fs/file p))))))
+    (cond
+      (embedded-root? root) p
+      (str/starts-with? p "jar:file:") p
+      :else (str (fs/absolutize (fs/file p))))))
 
 (defn- roots-locate
   "Locate ns sources and resources under ROOTS, in order, without reading
-   them — ns hits carry a file path (a jar: path for a jar root), resource
-   hits a URL."
+   them — ns hits carry a file path (a jar: path for a jar root, an embedded
+   key for an embedded root), resource hits a URL and, on an embedded root,
+   the `:embedded?` marker that says the URL is a key."
   [roots]
   (fn [req]
     (case (:kind req)
@@ -1010,23 +1092,18 @@
                       (for [root roots
                             :let [f (root-file root (:name req))]
                             :when f]
-                        {:kind :resource
-                         :url (if (str/starts-with? f "jar:file:") f (str "file:" f))}))
+                        (cond-> {:kind :resource
+                                 ;; an embedded key is its own location; a URL
+                                 ;; path is "/"-separated, and the file path
+                                 ;; renders with "\\" on Windows
+                                 :url (cond
+                                        (or (embedded-root? root)
+                                            (str/starts-with? f "jar:file:")) f
+                                        :else (str "file:" (if (= "\\" java.io.File/separator) (str/replace f "\\" "/") f)))}
+                          (embedded-root? root) (assoc :embedded? true))))
       nil)))
 
 ;; --- reading and evaluating a namespace source ----------------------------
-
-(defn- read-forms
-  "Every top-level form in FILE, in order. Metadata (line/column) is kept on
-   the forms the reader put it on."
-  [file]
-  (with-open [r (java.io.PushbackReader. (io/reader file))]
-    (let [eof (Object.)]
-      (loop [xs []]
-        (let [f (read r false eof)]
-          (if (identical? eof f)
-            xs
-            (recur (conj xs f))))))))
 
 (defn- ns-form?
   [f]
@@ -1236,9 +1313,11 @@
 (defn- declares-data-readers?
   "Do L's own roots ship a data_readers.clj? (Its tags cannot work: the
    runtime's reader resolves #tag against the host's *data-readers* before the
-   loader ever sees the form — see the docstring.)"
+   loader ever sees the form — see the docstring.) An embedded root has no
+   files to check."
   [l]
-  (boolean (some #(fs/exists? (fs/file % "data_readers.clj"))
+  (boolean (some #(when-not (embedded-root? %)
+                    (fs/exists? (fs/file % "data_readers.clj")))
                  (get-in l [:info :roots]))))
 
 (defn- unresolved-reader-tags
@@ -1259,79 +1338,126 @@
      forms)
     @seen))
 
+(defn- open-source-reader
+  "A reader over FILE — a source path, or an embedded-resource key (the
+   `:file` of an ns hit on an embedded root), which is read through the host
+   resolver rather than the filesystem: a key is not a path, and opening it as
+   one would look for a file named \"assets/…\" under the cwd."
+  [file]
+  (if (jolt.host/embedded-resource? file)
+    (io/reader (host-resource file))
+    (io/reader file)))
+
 (defn- eval-namespace-source
   "Read FILE, evaluate it as NS-NAME in the host namespace space, and answer
-   {:handle <namespace object> :vars {sym cell}}."
+   {:handle <namespace object> :vars {sym cell}}.
+
+   FILE is a source path, a jar: path, or an embedded key (an ns hit on an
+   embedded root) — `*file*` carries whichever of the three it is, and the
+   whole file is read through `open-source-reader`.
+
+   Like the host loader, forms are read and evaluated one at a time: a form is
+   read only after the ones before it ran, so the file's own namespace — and
+   the aliases and refers its `ns` form installed — are in force for the
+   reader. A syntax quote therefore resolves in the namespace the file
+   declares, not in whatever namespace the caller happened to be in. Only the
+   forms through the first `ns` form are read ahead, because its requires are
+   preloaded through this loader before the private-load claim is taken (a
+   claim is never held while waiting on another)."
   [l ns-name file]
-  ;; a context's data-reader vars must be loaded through IT (the host's require
-  ;; has no business finding them), then its file is bound over the host table
-  ;; while the source is read.
-  (let [forms (read-forms file)]
-    (when (empty? forms)
-      (unreadable! l ns-name (str file " is empty")))
-    (doseq [dep (required-ns-names forms)]
-      (when (not= dep ns-name)
-        (preload-dep! l dep)
-        ;; The runtime `require` inside the ns form would load from the GLOBAL
-        ;; roots whatever this loader could not serve, silently compiling the
-        ;; source against definitions the context cannot see (a hermetic
-        ;; context's clojure.string, say). Resolving only through the loader is
-        ;; what makes the policies and the delegate chain mean anything.
-        (when-not (resolve l {:kind :ns :name dep})
-          (throw (ex-info (str "namespace " ns-name " requires " dep
-                               ", which this loader cannot serve; add its root,"
-                               " delegate it, or inject it")
-                          {:type :loader/unreadable :kind :ns :name dep})))))
-    (with-private-load-claim
-      ns-name
-      (fn []
-        (if (reloading? ns-name)
-          (claim-private! l ns-name)
-          (mark-private! l ns-name))
-        (try
+  (with-open [r (java.io.PushbackReader. (open-source-reader file))]
+    (let [eof (Object.)
+          ;; Read through the first ns form, or the whole file when there is
+          ;; none. Reading stops there because the forms after it must be read
+          ;; once it has run — see the docstring — and the requires it names
+          ;; are the ones preloaded below, before evaluation.
+          prefix (loop [xs []]
+                   (let [f (read r false eof)]
+                     (cond
+                       (identical? eof f) xs
+                       (ns-form? f) (conj xs f)
+                       :else (recur (conj xs f)))))]
+      (when (empty? prefix)
+        (unreadable! l ns-name (str file " is empty")))
+      (doseq [dep (required-ns-names prefix)]
+        (when (not= dep ns-name)
+          (preload-dep! l dep)
+          ;; The runtime `require` inside the ns form would load from the GLOBAL
+          ;; roots whatever this loader could not serve, silently compiling the
+          ;; source against definitions the context cannot see (a hermetic
+          ;; context's clojure.string, say). Resolving only through the loader
+          ;; is what makes the policies and the delegate chain mean anything.
+          (when-not (resolve l {:kind :ns :name dep})
+            (throw (ex-info (str "namespace " ns-name " requires " dep
+                                 ", which this loader cannot serve; add its root,"
+                                 " delegate it, or inject it")
+                            {:type :loader/unreadable :kind :ns :name dep})))))
+      (with-private-load-claim
+        ns-name
+        (fn []
+          (if (reloading? ns-name)
+            (claim-private! l ns-name)
+            (mark-private! l ns-name))
           (try
             ;; *file* is the source being evaluated, as load binds it, so a
             ;; def that reads it (a resource path relative to its own file, a
             ;; jar entry's spelling) sees the context's file and not the
-            ;; program that opened the context
+            ;; program that opened the context. The compiler flags are
+            ;; bracketed like a host file load brackets them
+            ;; (loader.ss ldr-with-file-vars — the JVM's Compiler.load): a
+            ;; top-level (set! *warn-on-reflection* true) is legal, and its
+            ;; effect ends with the file instead of escaping into the loading
+            ;; context's frame.
             (binding [*ns* *ns*
                       *file* file
+                      *warn-on-reflection* *warn-on-reflection*
+                      *assert* *assert*
+                      *unchecked-math* *unchecked-math*
                       jolt.host/*invoke-rewrite* (context-rewriter (:id l) ns-name)]
-              (doseq [f forms]
-                (eval f)))
+              (letfn [(eval-form [f]
+                        (try
+                          (eval f)
+                          (catch :default e
+                            ;; an unresolved #tag is the one failure the runtime
+                            ;; reports as a bare "cannot compile this value" —
+                            ;; name the tag and the reason
+                            (if-let [tags (seq (unresolved-reader-tags [f]))]
+                              (throw (ex-info (str "the source of " ns-name " uses " (count tags)
+                                                   (if (= 1 (count tags)) " reader tag " " reader tags ")
+                                                   (str/join " " (map #(str "#" %) (sort tags)))
+                                                   (if (declares-data-readers? l)
+                                                     (str ": its roots ship a data_readers.clj, but"
+                                                          " per-context data readers are not supported"
+                                                          " — register the tag in the host's"
+                                                          " *data-readers* (or read such data with"
+                                                          " clojure.edn/read-string and a :readers map)")
+                                                     ": no reader is registered for it"))
+                                            {:type :loader/unreadable :kind :ns :name ns-name
+                                             :tags (vec (sort tags))}
+                                            e))
+                              (throw e)))))]
+                (doseq [f prefix]
+                  (eval-form f))
+                (loop []
+                  (let [f (read r false eof)]
+                    (when-not (identical? eof f)
+                      (eval-form f)
+                      (recur))))))
+            (let [n (find-ns (symbol ns-name))]
+              (when-not n
+                (unreadable! l ns-name (str "the source did not define it (" file ")")))
+              {:handle n :vars (ns-interns n)})
             (catch :default e
-              ;; an unresolved #tag is the one failure the runtime reports as a
-              ;; bare "cannot compile this value" — name the tag and the reason
-              (if-let [tags (seq (unresolved-reader-tags forms))]
-                (throw (ex-info (str "the source of " ns-name " uses " (count tags)
-                                     (if (= 1 (count tags)) " reader tag " " reader tags ")
-                                     (str/join " " (map #(str "#" %) (sort tags)))
-                                     (if (declares-data-readers? l)
-                                       (str ": its roots ship a data_readers.clj, but"
-                                            " per-context data readers are not supported"
-                                            " — register the tag in the host's"
-                                            " *data-readers* (or read such data with"
-                                            " clojure.edn/read-string and a :readers map)")
-                                       ": no reader is registered for it"))
-                                  {:type :loader/unreadable :kind :ns :name ns-name
-                                   :tags (vec (sort tags))}
-                                  e))
-                (throw e))))
-          (let [n (find-ns (symbol ns-name))]
-            (when-not n
-              (unreadable! l ns-name (str "the source did not define it (" file ")")))
-            {:handle n :vars (ns-interns n)})
-          (catch :default e
-            ;; A failed load leaves no partial namespace behind: the claim is
-            ;; held, so whatever is installed under the name was installed by
-            ;; this evaluation. A failed :reload is the exception — it was
-            ;; re-evaluating the INSTALLED namespace in place, and that
-            ;; namespace is what already-linked code is holding, so dropping
-            ;; the registration would be the destructive choice.
-            (when (and (not (reloading? ns-name))
-                       (find-ns (symbol ns-name)))
-              (remove-ns (symbol ns-name)))
-            (throw e)))))))
+              ;; A failed load leaves no partial namespace behind: the claim is
+              ;; held, so whatever is installed under the name was installed by
+              ;; this evaluation. A failed :reload is the exception — it was
+              ;; re-evaluating the INSTALLED namespace in place, and that
+              ;; namespace is what already-linked code is holding, so dropping
+              ;; the registration would be the destructive choice.
+              (when (and (not (reloading? ns-name))
+                         (find-ns (symbol ns-name)))
+                (remove-ns (symbol ns-name)))
+              (throw e))))))))
 
 (defn- source-roots-ns-load
   "The backend's namespace reader: a namespace already linked through the home
@@ -1542,8 +1668,8 @@
    loader IS roots plus a delegate; every combinator below builds a delegate to
    hand to :parent, except `self-first`, which reorders the two.
 
-   Validation is eager: an unreadable root or jar fails here, not at the first
-   load."
+   Validation is eager: an unreadable root or jar — or an embedded root with a
+   blank prefix — fails here, not at the first load."
   ([roots] (classpath roots nil))
   ([roots opts] (roots-loader roots opts)))
 

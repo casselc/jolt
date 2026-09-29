@@ -121,15 +121,15 @@ JOLT-TARGETS-NEEDING-DEPS := \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
-  jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa \
-  narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy lazyretain \
+  deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
+  hostarity narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci gate-run-test gate-run-ci gate-status hooks attributioncheck \
+.PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck gambitunbound gambitunbound-regen \
         gambitvars gambitvars-regen gambitstatics gambitstatics-regen gambittwins grenadinecheck \
@@ -183,16 +183,16 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
-  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
+  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash callbackbridges callbackdomains protocolsite \
-  protoret accfix pic narrow directlink directcall durablewalnative arraymap mapseqfold arraybacking unitcontext numeric oparity mathfl flarr \
+  protoret accfix pic narrow directlink directcall defmetacells staticsite durablewalnative mapseqfold arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher regexstatic winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
-  systemstreams \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher regexstatic winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
+  systemstreams utf8decode \
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -260,10 +260,20 @@ test:
 ci:
 	$(call run-gate,ci,$(CI-GATES))
 
+# The CI gate on bionic (Android/Termux, #943), which tests.yml runs inside
+# termux/termux-docker through ci/termux-build.sh. It is now the CI gate: the
+# ten gates that used to be skipped here (jolt-rcz9) all pass on bionic — the
+# charset layer finds libiconv, the provisioned kernel is PIC, CTS matches its
+# baseline, and the fixtures that asserted off-Android behavior branch on the
+# platform.
+bionic-ci:
+	$(call run-gate,bionic-ci,$(CI-GATES))
+
 # The prerequisite-only targets the wrappers drive. Not meant to be run directly:
 # they pass silently, which is the thing the wrappers exist to prevent.
 gate-run-test: $(TEST-GATES)
 gate-run-ci: $(CI-GATES)
+gate-run-bionic-ci: $(CI-GATES)
 
 # Is THIS working tree covered by a complete gate run? A subset run leaves the
 # receipt absent (the wrapper clears it) and any edit since changes the tree hash.
@@ -347,6 +357,9 @@ narrowhash:
 # bare monitor-enter/monitor-exit halves across a fiber switch. A monitor is the
 # one lock in the runtime that wraps user code, so neither half of locks.ss's
 # premise — short regions, never spanning a park — holds for it.
+# fibers-interrupt-test.ss is the interrupt gate: jolt.fibers/interrupt! raises
+# a throwable in another fiber wherever it is -- spinning, parked on a channel or
+# a deref, a CPS'd go body -- and an abandoned channel wait swallows no value.
 # async-io-thread-test.ss is the io-thread gate (jolt-579): core.async's third
 # carrier. It runs with the pool pinned to ONE carrier, which is what makes "8
 # bodies parked at the same time, all of them resuming" mean that a fiber released
@@ -363,6 +376,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-preempt-test.ss
 	@$(CHEZ) --script test/chez/fibers-lock-test.ss
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
+	@$(CHEZ) --script test/chez/fibers-interrupt-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own
@@ -430,7 +444,7 @@ documented-record:
 # buildlibsmoke` slower with the prerequisite than without it. The staleness
 # check covers the same inputs build-jolt.ss embeds: the runtime .ss files, the
 # install roots, and the launcher stub. JOLT_FORCE_TESTBIN=1 rebuilds anyway.
-TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/grenadine/src vendor/grenadine-generated vendor/irregex
+TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/cli/src vendor/grenadine/src vendor/grenadine-generated vendor/irregex
 testbin:
 	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
 	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
@@ -524,6 +538,11 @@ noexecsmoke: testbin
 ffidupsym:
 	@sh host/chez/ffi-duplicate-symbol-smoke.sh
 
+# A native that is on disk but fails to load (its own dependency is missing)
+# is reported as that, with the loader's reason — not as "not found" (#1127).
+ffiloadfail:
+	@sh host/chez/ffi-load-failure-smoke.sh
+
 # OPT-IN: jolt.mvn-http cert-verifying HTTPS fetch against Central + Clojars.
 # Not in `make test` — needs network + a working system OpenSSL.
 httpsfetch:
@@ -539,6 +558,14 @@ libconformance: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" \
 	 JOLT_NO_USER_DEPS=1 target/release/jolt run test/conformance/libs/run.clj $(LIBS)
 
+# OPT-IN: time the same library suites per test on jolt and on JVM Clojure, and
+# list the tests more than JOLT_LIBPERF_THRESHOLD (default 5) times slower on
+# jolt. Needs the checkouts and a `clojure` CLI. Report in target/libperf/.
+# `make libperf LIBS="malli honeysql"` runs a subset.
+libperf: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" \
+	 JOLT_NO_USER_DEPS=1 target/release/jolt run test/conformance/libs/timing.clj $(LIBS)
+
 # jolt.mvn-http pure-function tests (URL/redirect/header/body parsing). No
 # network, no OpenSSL — runs in the default gate.
 mvnhttp:
@@ -553,6 +580,82 @@ mvnhttp:
 readscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/read_scaling_test.clj
 
+# Lazy realization walks past what it has consumed in constant memory, as the
+# JVM does (test/lazy_retention_test.clj): each case in its own process under a
+# 256MB ceiling, so one that runs out cannot mask the next. A run of skips used
+# to become a recursion pinning the whole run (lazy-bridge.ss, and ^:once thunks
+# in backend emit-fn).
+lazyretain: testbin
+	@t=test/lazy_retention_test.clj; j=target/release/jolt; fails=0; n=0; \
+	 for c in $$(JOLT_NO_USER_DEPS=1 $$j run $$t); do \
+	   n=$$((n + 1)); \
+	   out=$$(JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=256m timeout 60 $$j run $$t $$c 2>&1 | tail -1); \
+	   case "$$out" in "$$c ok") ;; *) fails=$$((fails + 1)); echo "FAIL lazyretain: $$c: $${out:-timed out}";; esac; \
+	 done; \
+	 [ "$$fails" = 0 ] || exit 1; \
+	 echo "lazyretain: $$n cases in constant memory under a 256MB heap"
+
+# The nursery follows the collector's time share, bounded by the live set
+# (rt.ss jolt-install-gc-policy!): a churning program grows it past the 16MB floor
+# but not past its footprint bound (the fixed-cap policy grew the same loop's to
+# 512MB+), a light one leaves it at the floor, and the JVM-named knobs take
+# effect: JOLT_GC_TRIP_BYTES pins it, JOLT_MAX_NEW_SIZE caps it, JOLT_MAX_HEAP
+# bounds the total heap (not only the live data) within the collector's working
+# room -- 10%: Chez cannot compact in place, so a full collection over live data
+# near the limit either copies (room for a second copy) or marks in place
+# (fragments that cannot go back to the OS) --
+# JOLT_MAX_RAM_PERCENTAGE sets the heap ceiling, and a bad value is refused by
+# name. Each mode is its own process, since the policy is per process.
+# Recipes run under bash -e (.cache/makes/init.mk), so a capture whose process is
+# meant to fail takes `|| true` and the check after it decides; without it the
+# recipe exits there with no FAIL line (macOS's make 3.81 ignores .SHELLFLAGS,
+# which is why it only showed on Linux).
+gcpolicy: testbin
+	@floor=16777216; t=test/gc_policy_test.clj; j=target/release/jolt; \
+	 trip() { env JOLT_NO_USER_DEPS=1 "$$@" $$j run $$t churn 2>&1 | sed -n 's/^trip //p'; }; \
+	 churn=$$(trip); \
+	 light=$$(JOLT_NO_USER_DEPS=1 $$j run $$t light 2>&1 | sed -n 's/^trip //p'); \
+	 pinned=$$(trip JOLT_GC_TRIP_BYTES=33554432); \
+	 capped=$$(trip JOLT_MAX_NEW_SIZE=24m); \
+	 echo "gcpolicy: churn $$churn, light $$light, pinned $$pinned, max-new-size 24m -> $$capped"; \
+	 [ -n "$$churn" ] && [ "$$churn" -gt "$$floor" ] || { echo "FAIL gcpolicy: a churning program kept the $$floor floor"; exit 1; }; \
+	 [ "$$churn" -lt 536870912 ] || { echo "FAIL gcpolicy: a ~40MB-live loop grew its nursery to $$churn, past the live-set bound"; exit 1; }; \
+	 [ "$$light" = "$$floor" ] || { echo "FAIL gcpolicy: a light program left the floor ($$light)"; exit 1; }; \
+	 [ "$$pinned" = "33554432" ] || { echo "FAIL gcpolicy: JOLT_GC_TRIP_BYTES did not pin the nursery ($$pinned)"; exit 1; }; \
+	 [ -n "$$capped" ] && [ "$$capped" -le 25165824 ] || { echo "FAIL gcpolicy: JOLT_MAX_NEW_SIZE=24m did not cap the nursery ($$capped)"; exit 1; }; \
+	 full=$$(JOLT_NO_USER_DEPS=1 $$j -e '(print (.maxMemory (Runtime/getRuntime)))'); \
+	 tenth=$$(JOLT_NO_USER_DEPS=1 JOLT_MAX_RAM_PERCENTAGE=10 $$j -e '(print (.maxMemory (Runtime/getRuntime)))'); \
+	 [ $$((tenth * 25 / 10)) -le $$((full + 1)) ] && [ $$((tenth * 25 / 10)) -ge $$((full - 4)) ] || { echo "FAIL gcpolicy: JOLT_MAX_RAM_PERCENTAGE=10 gave $$tenth against $$full at the default 25"; exit 1; }; \
+	 out=$$(JOLT_NO_USER_DEPS=1 JOLT_GC_LOG=1 JOLT_MAX_HEAP=256m $$j run $$t ceiling 2>&1); \
+	 set -- $$(printf '%s\n' "$$out" | sed -n 's/^peak //p'); pk=$$1; mx=$$3; \
+	 after=$$(printf '%s\n' "$$out" | sed -n 's/^gc: .* total \([0-9]*\)MB .*/\1/p' | sort -n | tail -1); \
+	 echo "gcpolicy: JOLT_MAX_HEAP=256m with ~100MB held -> total after collections $${after}MB, peak $$((pk / 1048576))MB, max $$((mx / 1048576))MB"; \
+	 [ -n "$$after" ] && [ $$((after * 1048576 * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: a collection left the total heap at $${after}MB, more than 10% over JOLT_MAX_HEAP=256m: the ceiling bounds the TOTAL heap, as -Xmx does, within the collector's working room"; exit 1; }; \
+	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the total heap peaked at $$pk during collections, more than 10% over JOLT_MAX_HEAP=256m (v0.8.12 peaked 23% over)"; exit 1; }; \
+	 fdir=$$(mktemp -d); \
+	 set -- $$(cd "$$fdir" && JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=256m "$(CURDIR)/$$j" run "$(CURDIR)/test/gc_ceiling_forced_test.clj" 2>&1 | sed -n 's/^peak //p'); pk=$$1; mx=$$3; rmdir "$$fdir"; \
+	 echo "gcpolicy: a ceiling-forced full collection with ~140MB spread over the older generations -> peak $$(($${pk:-0} / 1048576))MB"; \
+	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the heap peaked at $${pk:-?} in a ceiling-forced full collection, more than 10% over JOLT_MAX_HEAP=256m: one collection of every generation holds its copies beside their sources (collect it a generation at a time; jolt-exoj)"; exit 1; }; \
+	 set -- $$(JOLT_NO_USER_DEPS=1 $$j run $$t refresh 2>&1 | sed -n 's/^growth //p'); \
+	 echo "gcpolicy: older generations' allowance with ~100MB held $$(($${1:-0} / 1048576))MB, after dropping it and System/gc $$(($${2:-0} / 1048576))MB"; \
+	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -eq 67108864 ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \
+	 st=$$(JOLT_NO_USER_DEPS=1 $$j run $$t startup 2>&1 | sed -n 's/^trip //p'); \
+	 echo "gcpolicy: a sub-millisecond first reading then cheap collections -> nursery $$st"; \
+	 [ "$$st" = "$$floor" ] || { echo "FAIL gcpolicy: one collection right after startup grew the nursery to $${st:-?} (the share must weigh collections by their time, and wait for five)"; exit 1; }; \
+	 set -- $$(JOLT_NO_USER_DEPS=1 JOLT_GC_TRIP_BYTES=16m JOLT_GC_LOG=1 $$j run $$t walk 2>&1 | sed -n 's/^gc: .* heap \([0-9]*\)MB .*/\1/p' | sort -n | sed -n '1p;$$p'); \
+	 echo "gcpolicy: a lazy-seq walk's heap after each collection ranged $${1:-?}MB..$${2:-?}MB"; \
+	 [ -n "$${2:-}" ] && [ $$(($$2 - $$1)) -le 4 ] || { echo "FAIL gcpolicy: the heap after a lazy-seq walk's collections climbed from $${1:-?}MB to $${2:-?}MB: a dead promoted cell is rooting the cells realized after it (nepotism; see sa-collect-young!)"; exit 1; }; \
+	 oh=$$(JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=1g JOLT_GC_TIME_LIMIT=0 JOLT_GC_HEAP_FREE_LIMIT=100 $$j run $$t churn 2>&1) || true; \
+	 case "$$oh" in *OutOfMemoryError*"GC overhead limit exceeded"*) ;; *) echo "FAIL gcpolicy: with every collection over the limits, the GC overhead limit did not raise: $$(printf '%s' "$$oh" | head -2)"; exit 1;; esac; \
+	 off=$$(JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=1g JOLT_GC_TIME_LIMIT=0 JOLT_GC_HEAP_FREE_LIMIT=100 JOLT_GC_OVERHEAD_LIMIT=off $$j run $$t churn 2>&1 | sed -n 's/^trip //p'); \
+	 [ -n "$$off" ] || { echo "FAIL gcpolicy: JOLT_GC_OVERHEAD_LIMIT=off did not turn the limit off"; exit 1; }; \
+	 echo "gcpolicy: the GC overhead limit raises OutOfMemoryError, and JOLT_GC_OVERHEAD_LIMIT=off turns it off"; \
+	 for bad in JOLT_GC_TIME_RATIO=0 JOLT_MAX_HEAP_FREE_RATIO=100 JOLT_MAX_RAM_PERCENTAGE=abc JOLT_NEW_SIZE=12q JOLT_GC_TIME_LIMIT=200; do \
+	   msg=$$(env JOLT_NO_USER_DEPS=1 $$bad $$j -e '(println :ran)' 2>&1) || true; \
+	   case "$$msg" in *"$${bad%%=*}"*"is not valid"*) ;; *) echo "FAIL gcpolicy: $$bad was not refused by name: $$msg"; exit 1;; esac; \
+	 done; \
+	 echo "gcpolicy: passed"
+
 # Compiling a namespace stays linear in its source, and a quoted form does not
 # cost dramatically more than the construction it is. The second half is not
 # implied by the first: a per-form cost regression is linear, just linear and
@@ -564,15 +667,20 @@ compilescaling: testbin
 # jolt-register-variadic! registration on the native + - * / min max and the
 # comparison chains (host/chez/seq.ss). Without it (apply max (range)) realizes
 # an unbounded seq until the process dies.
+# Both footprint gates below judge the collector's high-water mark against ONE
+# collection trip, so the trip is pinned (JOLT_GC_TRIP_BYTES) rather than left to
+# the collector policy (rt.ss jolt-install-gc-policy!): a nursery that grows during
+# an allocation-heavy arm raises the floor the reading is judged against, and the
+# arms that must differ read the same (what failed apply-scaling's control on CI).
 applyscaling: testbin
-	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/apply_scaling_test.clj
+	@JOLT_NO_USER_DEPS=1 JOLT_GC_TRIP_BYTES=16777216 target/release/jolt run test/apply_scaling_test.clj
 
 # Peak memory of the java.util.zip streams: 100 MB through GZIPOutputStream or
 # GZIPInputStream peaks within 2 MB of 1 MB. It reads the live heap, not the
 # collector's high-water mark applyscaling reads: that mark hides anything under
 # one collection trip, and the ceiling here is 2 MB.
 zipmemory: testbin
-	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/zip_memory_test.clj
+	@JOLT_NO_USER_DEPS=1 JOLT_GC_TRIP_BYTES=16777216 target/release/jolt run test/zip_memory_test.clj
 
 # Lazy realization costs the same whether or not a thread has ever existed: a
 # cell publishes its forced tail through one word and reads it lock-free, and the
@@ -683,6 +791,14 @@ depsnounzip: testbin
 depsunit:
 	@JOLT_NO_USER_DEPS=1 bin/jolt run test/deps_expand_test.clj
 
+# The jolt.cli surface over the vendored babashka.cli: that the re-export
+# reaches the parser, the dispatcher and the help renderer, and that *exit-fn*
+# (a dynamic var, which import-vars cannot re-export as a delegating fn) is
+# deliberately NOT among them. The task runner's own use of babashka.cli is
+# covered by taskssmoke. Offline.
+clishim:
+	@JOLT_NO_USER_DEPS=1 bin/jolt run test/cli_shim_test.clj
+
 # Vendored Grenadine core plus Jolt's effective-POM adapter. Offline.
 grenadine:
 	@JOLT_NO_USER_DEPS=1 bin/jolt run test/grenadine_test.clj
@@ -778,6 +894,13 @@ ffi:
 zlibunit:
 	@$(CHEZ) --script test/chez/zlib-test.ss
 
+# UTF-8 bytes -> text against java.nio's decoder (natives-str.ss
+# utf8-bytes->string, host-static-classes.ss decode-bytevector): the named
+# malformed rows, 2702 JVM-pinned random rows, and the soundness of the guard
+# that keeps Chez's C decoder on the well-formed path.
+utf8decode:
+	@$(CHEZ) --script test/chez/utf8-decode-test.ss
+
 # Escape continuations (jolt.continuations, issue #736): the one-shot contract
 # call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber
 # is not an ownership boundary, and the four misuses. The cross-fiber rows are
@@ -843,6 +966,15 @@ gosm:
 # the same bug class through a core.async pipeline sweep.
 threadsafety:
 	@$(CHEZ) --script test/chez/thread-safety-test.ss
+
+# compare-and-swap is strong. Chez's $record-cas! is one ldxr/stxr attempt on
+# AArch64 and answers #f with the field still holding the expected value when
+# the exclusive monitor was cleared under it; sa-record-cas! retries while it
+# does. Scenarios 2 and 3 are reproducers: on the weak primitive they count
+# spurious refusals on Apple silicon (ring-chez-adapter lost one connection in
+# ~1400 to one); on x86 they can only check the semantics.
+cas:
+	@$(CHEZ) --script test/chez/cas-test.ss
 
 # Native record field reads: a keyword lookup on a statically-known record reads
 # the field by its declared slot (jrec-field-at) instead of jolt-get; the value
@@ -954,6 +1086,14 @@ narrow:
 directcall:
 	@$(CHEZ) --script host/chez/run-directcall.ss
 
+# A var named in a def's evaluated metadata (every deftest body) is cell-cached.
+defmetacells:
+	@$(CHEZ) --script host/chez/run-defmetacells.ss
+
+# Class/member sites are emitted with a per-site cache (host-static.ss).
+staticsite:
+	@$(CHEZ) --script host/chez/run-staticsite.ss
+
 # Array-mode maps are one flat k/v slot vector (PersistentArrayMap), their
 # transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
 arraymap:
@@ -978,7 +1118,7 @@ directlink:
 	@$(CHEZ) --script test/chez/directlink-test.ss
 
 # Unique anon-fn letrec names + source-form registration (R1): a user-ns anon
-# literal registers jfn$<ns>$<def>$<n> -> {form, ns, free-names} and the live
+# literal registers jfn$<ns>/<def>$<n> -> {form, ns, free-names} and the live
 # closure's inspector name must agree; system-ns closures stay unregistered.
 fnform:
 	@$(CHEZ) --script test/chez/fnform-test.ss
@@ -1097,6 +1237,15 @@ regexdfacheck:
 regexdfacheck-regen:
 	@sh host/chez/regex-dfa-check.sh --regen
 
+# host/chez/java/regex-anchor-sre.scm is a COPY of one vendored irregex procedure
+# (sre->procedure) with one deliberate change. Same staleness gate as the DFA
+# shadow: fails when the submodule's original has moved on.
+regexanchorcheck:
+	@sh host/chez/regex-anchor-check.sh
+
+regexanchorcheck-regen:
+	@sh host/chez/regex-anchor-check.sh --regen
+
 # The DFA work budget itself (#945): the pattern that took ~5s / never finished
 # takes the backtracker, a small one still gets a DFA, and the two engines agree
 # on every match. Deterministic — which engine a pattern got — not a clock.
@@ -1113,6 +1262,13 @@ regexdfa:
 # and a gate without that rule would have deleted every varargs FFI binding.
 deadhost:
 	@sh host/chez/dead-host-check.sh
+
+# A top-level define that rebinds a name a define-record-type generated. The
+# host files share one top level, so the later define wins silently and every
+# reader of the field gets the other procedure (the fiber record's waiter field
+# read through fibers-async.ss's handler allocator).
+recordshadow:
+	@$(CHEZ) --script host/chez/record-shadow-check.ss
 
 census:
 	@sh host/chez/portability-check.sh --census
@@ -1131,6 +1287,16 @@ adaptercheck:
 hostprops:
 	@$(CHEZ) --script test/chez/host-derived-props-test.ss
 
+# java/text-normalize.ss reads every Unicode property it needs back out of the
+# running Chez, but one — whether a character composes BACKWARD — can only be
+# derived by decomposing the whole code point space, so it is pinned in the
+# file. A miss is a wrong answer, not a slow one: the fast path would split a
+# Hangul syllable or an Indic vowel sign away from its base. Unicode keeps
+# adding these, so this re-derives the set from the Chez in hand and diffs it,
+# then runs the fast path against Chez over every code point and ~20k strings.
+normalizecheck:
+	@$(CHEZ) --script test/chez/normalize-fastpath-test.ss
+
 # The host method registry's tag relations (host-static.ss alias / derive): a
 # derivation must agree with the class graph (the child's class a strict
 # descendant of the parent's, both tags naming a class), the chain cannot cycle,
@@ -1138,6 +1304,14 @@ hostprops:
 # member once. Also re-checks every derivation the runtime itself registers.
 hostregistry:
 	@$(CHEZ) --script test/chez/host-registry-test.ss
+
+# Every host member answers the JVM's arities: a member that takes any count is
+# a JVM varargs member with a `varargs` row in host-static.ss, every arity row
+# names a registered member, and a fixed row narrowed its member. An open member
+# passes the invocation layer's arity check for every call, so an extra argument
+# was silently dropped (jolt#1020).
+hostarity:
+	@$(CHEZ) --script test/chez/host-arity-test.ss
 
 # The process's own symbol handle is loaded once per process: Chez walks every
 # loaded handle with dlsym before its static "(cs)" table, so the 57 boot-time
@@ -1158,6 +1332,37 @@ regexmatcher:
 .PHONY: regexstatic
 regexstatic:
 	@$(CHEZ) --script test/chez/regex-static-repeat-test.ss
+# A one-unit look-behind must stop rescanning from the chunk start (#1062): the
+# `^`/`$`/`\A`/`\Z` anchors build on such look-behinds, so the vendored O(position)
+# compile made every anchored pattern quadratic / unusable on a whole file. The
+# witness is deterministic — the general path calls `wrap-end-chunker`, the fast
+# path never does — plus JVM-verified answers, so no clock.
+regexanchor:
+	@$(CHEZ) --script test/chez/regex-anchor-test.ss
+
+# java.util.regex's `^`/`$`/`\Z` are compiled as zero-width PRIMITIVES
+# (host/chez/java/regex-anchors.ss), not as the look-ahead/look-behind SREs they
+# are equivalent to. The SREs stay registered as those primitives' expansions, so
+# the gate is differential: the same pattern compiled both ways must report the
+# same matches over every terminator (\n, \r, \r\n, NEL, LS, PS) in every
+# position. Also pins the `or`-to-char-set fold, and what it must refuse.
+regexanchorprims:
+	@$(CHEZ) --script test/chez/regex-anchor-prims-test.ss
+
+# clojure.string/replace must emit the replacement for a ZERO-WIDTH match —
+# #"" , (?=x), (?m)^/(?m)$ — then advance one char past it, the same rule re-seq
+# and the matcher's .find use. re-replace bumped `start` and dropped the
+# replacement text, so every zero-width match replaced with nothing.
+regexreplace:
+	@$(CHEZ) --script test/chez/regex-replace-zero-width-test.ss
+
+# A malformed pattern is a PatternSyntaxException whose message reads exactly
+# like the JVM's ("<description> near index N", the pattern, the caret line):
+# host/chez/java/regex-translate.ss's java-syntax-check mirrors Pattern's own
+# scan. The vectors are JDK getMessage() output captured verbatim, plus the
+# refusals jolt makes of patterns the JVM compiles (known-divergences.edn).
+regexsyntax:
+	@$(CHEZ) --script test/chez/regex-syntax-test.ss
 
 # java.io.File/getCanonicalPath's LEXICAL half, per platform (#991). On Windows
 # realpath(3) is not bound, so the fallback IS getCanonicalPath there — and its
@@ -1167,6 +1372,30 @@ regexstatic:
 # CI runs on, so the platform (and realpath itself) is a parameter.
 winpath:
 	@$(CHEZ) --script test/chez/win-path-test.ss
+
+# The rest of the Windows answers a Linux runner cannot observe (#1074): the
+# PATH-LIST separator (";" there, because ":" is the drive suffix, so a ":"-split
+# cut every entry in half and fs/which never found anything), the ProcessBuilder
+# program resolver (";"-split PATH, drive-rooted and UNC programs, PATHEXT), the
+# java.nio.file Path root (a drive path read as relative, so fs/absolute? was
+# false and getParent walked off the drive letter), java.io.tmpdir (TMPDIR only,
+# which Windows does not set), File/listRoots, and the replace-rename that spit
+# and the AOT publish steps depend on — Windows refuses a rename onto an
+# existing destination, so the second spit to any path threw. Same arrangement
+# as winpath and hostprops: the platform is a parameter, so the rows that broke
+# are pinned from the host CI runs on. The end-to-end half, which needs a real
+# Windows filesystem, PATH and process table, is the windows-deps job in
+# .github/workflows/tests.yml.
+winplatform:
+	@$(CHEZ) --script test/chez/win-platform-test.ss
+
+# The Windows parity reports (#1108 spawn, #1109/#1117 PushbackReader close,
+# #1118 file: URLs, #1119 mtimes) as their own repros, end to end through the
+# CLI. A POSIX run checks the portable half; the rows it exists for are the
+# Windows ones, which run in the windows-deps job and, locally, under Wine
+# (tools/wine: `tools/wine/run.sh jolt-nt test/chez/win-parity-smoke.clj`).
+winparity:
+	@$(CHEZ) --script host/chez/cli.ss test/chez/win-parity-smoke.clj
 
 # The boot image's LZ4 ceiling (jolt-lang/jolt#886). Chez cannot read back a big
 # enough LZ4 fasl entry, and 0.8.5's vfasl boot is one entry per input boot file
@@ -1179,6 +1408,12 @@ winpath:
 # the runtime's own heap bound would otherwise answer first.
 vfaslceiling:
 	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/vfasl-ceiling-test.ss
+
+# The build-side shapes `jolt build`'s back-end cost depends on (#1059): small
+# init procedures, the back end's collect trip, a failed vfasl that says so, and
+# the per-unit compile/convert caches.
+buildscaling:
+	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/build-scaling-test.ss
 
 # The other half of the same rule: knowing the platform is only useful if the
 # struct stat offsets it selects are the ones this machine actually uses. The
@@ -1251,13 +1486,32 @@ hooks:
 	@for h in tools/git-hooks/*; do cp "$$h" ".git/hooks/$$(basename "$$h")"; chmod +x ".git/hooks/$$(basename "$$h")"; echo "installed .git/hooks/$$(basename "$$h")"; done
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
-# The oracle version is READ from the committed profile, which certify.clj also
-# checks the running Clojure against — so the pin has one source, and bumping the
-# oracle is a profile edit rather than two edits that can drift apart.
+# The oracle's Clojure version AND JDK are READ from the committed profile, which
+# certify.clj also checks the running oracle against — so each pin has one source,
+# and bumping the oracle is a profile edit rather than two edits that can drift
+# apart. The clojure launcher runs JAVA_CMD first, else whatever java is first on
+# PATH — on a machine with several JDKs that is rarely the pinned one, and a
+# mismatched JDK reports its own java.* changes as jolt divergences. With
+# JAVA_CMD unset, look for the pinned JDK in the usual places (Homebrew, the
+# Linux jvm directory, macOS java_home) and hand it to the launcher; certify.clj
+# still refuses whatever JDK actually runs if it is not the pinned one.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
 		v=$$(sed -n 's/^ :clojure-version "\([^"]*\)".*/\1/p' test/conformance/profile.edn); \
 		if [ -z "$$v" ]; then echo "certify: no :clojure-version in test/conformance/profile.edn"; exit 1; fi; \
+		jdk=$$(sed -n 's/^ :oracle-jdk \([0-9]*\).*/\1/p' test/conformance/profile.edn); \
+		if [ -z "$$jdk" ]; then echo "certify: no :oracle-jdk in test/conformance/profile.edn"; exit 1; fi; \
+		if [ -z "$$JAVA_CMD" ]; then \
+			for c in /opt/homebrew/opt/openjdk@$$jdk/bin/java /usr/local/opt/openjdk@$$jdk/bin/java \
+			         /usr/lib/jvm/java-$$jdk-openjdk*/bin/java /usr/lib/jvm/temurin-$$jdk-jdk*/bin/java \
+			         /usr/lib/jvm/java-$$jdk-*/bin/java; do \
+				if [ -x "$$c" ]; then JAVA_CMD="$$c"; break; fi; \
+			done; \
+			if [ -z "$$JAVA_CMD" ] && [ -x /usr/libexec/java_home ]; then \
+				h=$$(/usr/libexec/java_home -v "$$jdk" 2>/dev/null) && [ -x "$$h/bin/java" ] && JAVA_CMD="$$h/bin/java"; \
+			fi; \
+			if [ -n "$$JAVA_CMD" ]; then echo "certify: JAVA_CMD=$$JAVA_CMD (profile pins JDK $$jdk)"; export JAVA_CMD; fi; \
+		fi; \
 		deps="{:deps {org.clojure/clojure {:mvn/version \"$$v\"}}}"; \
 		clojure -Sdeps "$$deps" -M test/conformance/certify.clj --self-test && \
 		clojure -Sdeps "$$deps" -M test/conformance/certify.clj; \
