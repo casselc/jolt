@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Synchronize cold weak-table equality-domain metadata reads and registration
+  publication. Preserve weak retirement, lock-free warm snapshots and callbacks
+  outside locks; add deterministic lock witnesses and concurrent registration
+  coverage. No compiler release-epoch or consumer pin change.
+
 - Avoid full-sized managed zero-fill buffers when allocating native FFI
   memory. Allocations remain zero-initialized with unchanged ownership and
   cleanup. This is not a sustained or tail-throughput guarantee.

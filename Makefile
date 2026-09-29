@@ -278,6 +278,7 @@ callbackbridges:
 .PHONY: callbackdomains
 callbackdomains:
 	@$(CHEZ) --script test/chez/callback-domains-test.ss
+	@$(CHEZ) --script test/chez/equality-domain-concurrent-test.ss
 
 .PHONY: eqdomainsnapshot
 eqdomainsnapshot:
