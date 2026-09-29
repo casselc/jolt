@@ -55,6 +55,25 @@
     (equal? (durable-bytes "😀")
             (ascii "{\"sql\":\"\\ud83d\\ude00\"}\n")))
 
+;; Independent expected text for every ASCII code point, not a copy/read of
+;; the runtime classification table. Pin DEL and all unnamed controls too.
+(do ((cp 0 (+ cp 1))) ((= cp 128))
+  (let* ((input (string (integer->char cp)))
+         (escaped
+           (case cp
+             ((34) "\\\"") ((92) "\\\\") ((47) "\\/")
+             ((8) "\\b") ((12) "\\f") ((10) "\\n")
+             ((13) "\\r") ((9) "\\t")
+             (else
+               (if (< cp 32)
+                   (string-append "\\u00" (if (< cp 16) "0" "")
+                                  (string-downcase (number->string cp 16)))
+                   input))))
+         (expected (string-append "{\"sql\":\"" escaped "\"}\n")))
+    (ok (format "exact ASCII spelling at code point ~a" cp)
+        (equal? (jvec->list (jolt-str-durable-wal-bytes input))
+                (ascii expected)))))
+
 (for-each
   (lambda (n)
     (let* ((prefix (make-string n #\a))
