@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Avoid full-sized managed zero-fill buffers when allocating native FFI
+  memory. Allocations remain zero-initialized with unchanged ownership and
+  cleanup. This is not a sustained or tail-throughput guarantee.
+
 - Classify ASCII escapes with a private lookup table in the Chez Durable WAL
   encoder, preserving canonical bytes, bounded per-call scratch and fresh
   result storage. This is not a sustained or S3 throughput guarantee.
