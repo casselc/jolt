@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Synchronize cold weak-table equality-domain metadata reads and registration
+  publication. Preserve weak retirement, lock-free warm snapshots and callbacks
+  outside locks; add deterministic lock witnesses and concurrent registration
+  coverage. This fixes a concurrency gap in the retained performance prototype.
+
 - Evaluate upstream Jolt 0.8.14 on the isolated cumulative performance line,
   preserving the 0.8.10 StringWriter, owned-byte, callback-domain, protocol-site,
   native WAL and bounded zero-fill work. Adapt protocol sites to the new reify

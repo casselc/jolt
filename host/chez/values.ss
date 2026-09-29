@@ -501,12 +501,23 @@
 ;; base scalars. This is a registration contract, never a purity inference from
 ;; probes. Keep legacy arm pairs intact for existing registry observers.
 (define eq-value-domain-arms (make-weak-eq-hashtable))
+(define eq-domain-metadata-mu (make-mutex))
+;; Private access seams: called only under eq-domain-metadata-mu. Weak-table
+;; cells can be relinked by a writer, so cold reads need the same exclusion.
+(define (eq-domain-metadata-ref arm)
+  (hashtable-ref eq-value-domain-arms arm #f))
+(define (eq-domain-metadata-mark! arm)
+  (hashtable-set! eq-value-domain-arms arm #t))
 (define eq-scalar-arm-snapshot (cons #f '()))
 (define (eq-extension-value? x)
   (not (or (procedure? x) (base-scalar? x))))
 (define (register-eq-arm! pred handler)
   (eq-arm-reject-fast-type! 'register-eq-arm! pred)
-  (set! jolt-eq-arms (cons (cons pred handler) jolt-eq-arms)))
+  ;; Predicates/probes run above, never under the metadata/publication lock.
+  (jolt-with-mutex eq-domain-metadata-mu
+    (let ((next (cons (cons pred handler) jolt-eq-arms)))
+      (memory-order-release)
+      (set! jolt-eq-arms next))))
 (define (register-value-eq-arm! pred handler)
   ;; Trusted native callers explicitly declare their existing effective
   ;; predicate owns a non-procedure/non-base-scalar representation. Public
@@ -514,20 +525,26 @@
   ;; Keep that predicate unchanged: another guard on every full-registry walk
   ;; erased the measured benefit. This is opt-in metadata, not inferred purity.
   (eq-arm-reject-fast-type! 'register-value-eq-arm! pred)
-  (let ((arm (cons pred handler)))
-    (hashtable-set! eq-value-domain-arms arm #t)
-    (set! jolt-eq-arms (cons arm jolt-eq-arms))))
+  (jolt-with-mutex eq-domain-metadata-mu
+    (let* ((arm (cons pred handler)) (next (cons arm jolt-eq-arms)))
+      (eq-domain-metadata-mark! arm)
+      (memory-order-release)
+      (set! jolt-eq-arms next))))
 (define (eq-scalar-arms registry)
   ;; Publish key and value together. Identity includes direct registry restore
   ;; by tests/winders, not just calls through the registration API. Capture the
   ;; list at equality entry, matching the existing first-match walk semantics.
   (let ((snapshot eq-scalar-arm-snapshot))
+    (memory-order-acquire)
     (if (eq? registry (car snapshot)) (cdr snapshot)
-        (let ((arms (filter (lambda (arm)
-                              (not (hashtable-ref eq-value-domain-arms arm #f)))
-                            registry)))
-          (set! eq-scalar-arm-snapshot (cons registry arms))
-          arms))))
+        (jolt-with-mutex eq-domain-metadata-mu
+          (let* ((arms (filter (lambda (arm)
+                                (not (eq-domain-metadata-ref arm)))
+                              registry))
+                 (next (cons registry arms)))
+            (memory-order-release)
+            (set! eq-scalar-arm-snapshot next)
+            arms)))))
 (define (jolt=2-base a b)
   (cond
     ((and (jolt-nil? a) (jolt-nil? b)) #t)

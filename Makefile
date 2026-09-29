@@ -307,6 +307,7 @@ callbackbridges:
 .PHONY: callbackdomains
 callbackdomains:
 	@$(CHEZ) --script test/chez/callback-domains-test.ss
+	@$(CHEZ) --script test/chez/equality-domain-concurrent-test.ss
 
 # Host method sites retain live tags and publish only coherent bounded snapshots.
 .PHONY: protocolsite
