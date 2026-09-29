@@ -480,14 +480,21 @@
 ;; alloc returns a pointer (integer address). The caller frees it. read/write take
 ;; a type keyword and an optional byte offset.
 (define (ffi-alloc nbytes) (sa-foreign-alloc (jnum->exact nbytes)))
-;; ZEROED allocation, in one block move. An arena hands out zeroed memory (as
+;; ZEROED allocation, in bounded block moves. An arena hands out zeroed memory (as
 ;; babashka.ffi/alloc does), because a struct a caller only partly fills is the
 ;; ordinary case and malloc's leftovers in the rest of it are a C-visible bug
-;; that reproduces only under load. A fresh bytevector is already zero, so the
-;; fill is one sa-foreign-bytes-set!, not a per-byte loop.
+;; that reproduces only under load. Retain one private read-only zero template,
+;; rather than allocating an equally large managed bytevector for every native
+;; request. The adapter synchronously COPIES it; no caller receives an alias.
+;; Allocator/free ownership and the non-collect-safe copy contract are unchanged.
+(define ffi-zero-block (make-bytevector 65536 0))
 (define (ffi-calloc nbytes)
   (let* ((n (jnum->exact nbytes)) (p (sa-foreign-alloc n)))
-    (when (> n 0) (sa-foreign-bytes-set! p (make-bytevector n 0) n))
+    (let loop ((offset 0))
+      (when (< offset n)
+        (let ((chunk (min 65536 (- n offset))))
+          (sa-foreign-bytes-set! (+ p offset) ffi-zero-block chunk)
+          (loop (+ offset chunk)))))
     p))
 (define (ffi-free ptr) (sa-foreign-free (jnum->exact ptr)) jolt-nil)
 ;; --- :bool <-> a one-byte C boolean -----------------------------------------

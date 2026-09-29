@@ -1,0 +1,87 @@
+;; Real candidate primitive, sentinel bounds and deterministic mechanism checks.
+(import (chezscheme))
+(load "host/chez/gate-boot.ss")
+(load "host/chez/java/ffi.ss")
+(define total 0)
+(define fails 0)
+(define (ok name value)
+  (set! total (+ total 1))
+  (unless value (set! fails (+ fails 1)) (printf "FAIL: ~a~n" name)))
+(define source-seen #f)
+(define (check n)
+  (let* ((base (sa-foreign-alloc (+ n 2))) (p (+ base 1))
+         (allocate sa-foreign-alloc) (copy sa-foreign-bytes-set!)
+         (calls 0) (copied 0) (bounded? #t) (same-source? #t))
+    (dynamic-wind
+      (lambda ()
+        (do ((i 0 (+ i 1))) ((= i (+ n 2)))
+          (sa-foreign-set! 'unsigned-8 base i #xa5))
+        (set! sa-foreign-alloc
+          (lambda (asked) (ok "exact requested native size" (= asked n)) p))
+        (set! sa-foreign-bytes-set!
+          (lambda (at bv count)
+            (set! calls (+ calls 1))
+            (set! bounded? (and bounded? (> count 0) (<= count 65536)
+                                 (= at (+ p copied)) (= (bytevector-length bv) 65536)))
+            (when source-seen (set! same-source? (and same-source? (eq? bv source-seen))))
+            (set! source-seen bv)
+            (set! copied (+ copied count))
+            ;; Collection before the synchronous copy tests managed liveness.
+            (collect)
+            (copy at bv count))))
+      (lambda ()
+        (ok "same allocation returned" (= p (ffi-calloc n)))
+        (ok "bounded consecutive copies" bounded?)
+        (ok "exact byte coverage" (= n copied))
+        (ok "exact block count" (= calls (quotient (+ n 65535) 65536)))
+        (ok "one read-only source across calls" same-source?)
+        (ok "every output byte zero"
+          (let loop ((i 0))
+            (or (= i n) (and (= 0 (sa-foreign-ref 'unsigned-8 p i)) (loop (+ i 1))))))
+        (ok "neighbor sentinels untouched"
+          (and (= #xa5 (sa-foreign-ref 'unsigned-8 base 0))
+               (= #xa5 (sa-foreign-ref 'unsigned-8 base (+ n 1)))))
+        (when (> n 0) (sa-foreign-set! 'unsigned-8 p 0 #xff)))
+      (lambda ()
+        (set! sa-foreign-alloc allocate)
+        (set! sa-foreign-bytes-set! copy)
+        (sa-foreign-free base)))))
+(for-each check '(0 1 65535 65536 65537 131071 131072 131073 3406625))
+(ok "template remains zero after destination mutation"
+  (let loop ((i 0))
+    (or (= i (bytevector-length source-seen))
+        (and (= 0 (bytevector-u8-ref source-seen i)) (loop (+ i 1))))))
+(ok "public reserved entry points at candidate"
+  (eq? (var-deref "jolt.ffi" "__calloc") ffi-calloc))
+(let ((mu (make-mutex)) (cv (make-condition)) (ready 0) (done 0) (bad 0))
+  (do ((worker 0 (+ worker 1))) ((= worker 4))
+    (fork-thread
+      (lambda ()
+        (with-mutex mu
+          (set! ready (+ ready 1))
+          (condition-broadcast cv)
+          (let wait () (unless (= ready 4) (condition-wait cv mu) (wait))))
+        (let ((passed?
+                (guard (e (#t #f))
+                  (let loop ((iteration 0))
+                    (or (= iteration 8)
+                        (let ((p (ffi-calloc 131073)))
+                          (let ((zero?
+                                  (dynamic-wind
+                                    (lambda () #f)
+                                    (lambda ()
+                                      (let bytes ((i 0))
+                                        (or (= i 131073)
+                                            (and (= 0 (sa-foreign-ref 'unsigned-8 p i))
+                                                 (bytes (+ i 1))))))
+                                    (lambda () (ffi-free p)))))
+                            (and zero? (loop (+ iteration 1))))))))))
+          (with-mutex mu
+            (unless passed? (set! bad (+ bad 1)))
+            (set! done (+ done 1))
+            (condition-broadcast cv))))))
+  (with-mutex mu
+    (let wait () (unless (= done 4) (condition-wait cv mu) (wait))))
+  (ok "four native threads independently zero and free blocks" (= bad 0)))
+(printf "ffi-zero-block-test: ~a/~a passed~n" (- total fails) total)
+(exit (if (zero? fails) 0 1))
