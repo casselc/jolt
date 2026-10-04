@@ -850,6 +850,10 @@
 (define (aot-file-seconds path)
   (guard (e (else 0))
     (div (sa-file-mtime-ms path) 1000)))
+;; Windows refuses to delete a read-only file, and git writes its objects
+;; read-only, so a failed delete clears the attribute (Chez's chmod goes through
+;; _wchmod there) and tries once more. Without it a partial git clone could not
+;; be scrubbed, and every retry of the clone failed on the leftover directory.
 (define (aot-delete-tree path)
   (guard (e (else #f))
     (if (and (file-directory? path) (not (file-symbolic-link? path)))
@@ -857,7 +861,10 @@
           (for-each (lambda (f) (aot-delete-tree (string-append path "/" f)))
                     (directory-list path))
           (delete-directory path))
-        (delete-file path #f))))
+        (or (delete-file path #f)
+            (begin
+              (guard (e (else #f)) (chmod path #o666))
+              (delete-file path #f))))))
 ;; Drop every generation that is neither the current one nor among the few most
 ;; recently used. The grace period keeps a generation another live process may be
 ;; midway through: worst case that process misses and recompiles (mkdir -p and the
@@ -1637,7 +1644,7 @@
 ;; cache dir was never created and open-output-file failed. Native mkdir +
 ;; path-parent recursion is portable (mirrors build.ss bld-mkdir-p).
 (define (aot-mkdir-p dir)
-  (unless (or (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
+  (unless (or (not dir) (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
     (aot-mkdir-p (path-parent dir))
     ;; tolerate the benign race (created concurrently); re-raise a real failure.
     (guard (e (#t (unless (file-exists? dir) (raise e))))
@@ -1938,17 +1945,45 @@
       (for-each (lambda (s) (var-def-ordinal-stamp1! file (car s) (cadr s) (caddr s)))
                 stamps))))
 
+;; Take back the defs a cached load made (rt.ss jolt-def-capture): every var the
+;; load defined that was not defined before it goes back to undefined, as a
+;; fresh process has it — unbound root, not a macro, not dynamic — so the
+;; analyzer resolves past it (hc-resolve-cell skips an undefined cell) until the
+;; recompile reaches its def. The cell itself stays, since nothing may be holding
+;; a different one. A var defined before the load keeps its value: a fresh
+;; process has it too.
+(define (aot-undo-captured-defs! defs)
+  (let-values (((ks was) (hashtable-entries (vector-ref defs 1))))
+    (vector-for-each
+      (lambda (k was-defined?)
+        (unless was-defined?
+          (let ((c (jolt-with-mutex var-table-mu (hashtable-ref var-table k #f))))
+            (when c
+              (var-cell-defined?-set! c #f)
+              (var-cell-macro?-set! c #f)
+              (var-cell-dynamic?-set! c #f)
+              (var-root-set! c (make-jolt-var-unbound (var-cell-ns c) (var-cell-name c)))))))
+      ks was)))
 (define (aot-safe-load-or-recompile name file source base assumed-now)
-  (let ((so (string-append base ".so")))
+  (let ((so (string-append base ".so"))
+        (defs (vector name (make-hashtable string-hash string=?))))
     (define (recover! why)
       (aot-info (string-append why " cache for " name ", recompiling"))
       (delete-file so #f)           ; best-effort; ignore if already gone
       (delete-file (string-append base ".scm") #f)
+      ;; The recompile runs in the process the artifact just ran in, and it has
+      ;; to compile what a fresh process would: a var the load defined below a
+      ;; form must not be visible to that form, or (get m k) above a same-ns
+      ;; (defn get ...) binds to the ns's get instead of clojure.core's and the
+      ;; artifact published from it is wrong for every later run (#1219). Take
+      ;; back the defs the load made, keeping each cell so its later def lands
+      ;; in the same place.
+      (aot-undo-captured-defs! defs)
       (let ((ks (force source)))
         (aot-compile-and-cache name file (cdr ks) (car ks))))
     (let ((state (guard (e (else 'corrupt))
                    (aot-complete-reset! name)
-                   (parameterize ((aot-loading-file file))
+                   (parameterize ((aot-loading-file file) (jolt-def-capture defs))
                      (ldr-with-compiled-ns-vars (lambda () (load so))))
                    (if (aot-complete? name) 'ok 'incomplete))))
       (case state

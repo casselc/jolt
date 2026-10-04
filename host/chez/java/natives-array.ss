@@ -6,15 +6,32 @@
 ;; to see a jolt-array (backed by a Chez vector). Loaded after host-table.ss (ref-put!),
 ;; transients.ss, seq.ss (the dispatchers it chains).
 
-(define-record-type jolt-array (fields (mutable vec) kind) (nongenerative jolt-array-v1))
+(define-record-type (jolt-array %make-jolt-array jolt-array?)
+  (fields (mutable vec) kind) (nongenerative jolt-array-v1))
+;; Every array is built here, so this is where a large long or double backing is
+;; pinned (na-pin-large!). The size test is inline rather than a record protocol
+;; or a call: either made building a small array ~15% dearer.
+(define (make-jolt-array vec kind)
+  (let ((a (%make-jolt-array vec kind)))
+    (when (if (fxvector? vec)
+              (fx>=? (fxvector-length vec) 8192)
+              (and (flvector? vec) (fx>=? (flvector-length vec) 8192)))
+      (na-pin-large! a vec))
+    a))
 
-;; JVM array class name per element kind ((class (int-array 3)) -> "[I", like the
-;; JVM's Class.getName for arrays). Object arrays use the descriptor form.
-(define (na-array-class-name arr)
-  (case (jolt-array-kind arr)
-    ((int) "[I") ((long) "[J") ((short) "[S") ((double) "[D")
-    ((float) "[F") ((boolean) "[Z") ((byte) "[B") ((char) "[C")
-    (else "[Ljava.lang.Object;")))
+;; An array's kind is one of the eight primitive symbols, 'object for an
+;; Object[], or — for any other reference array — its COMPONENT class's JVM name
+;; as a string: "java.lang.String" for a String[], "[I" for an int[][] (whose
+;; elements are int[]s). The kind field always held a symbol, so a string there
+;; changes no layout; every reader below takes a non-primitive kind to be a
+;; reference array, which is what a typed reference array is on the JVM.
+(define na-prim-kinds '(int long short double float boolean byte char))
+(define (na-ref-kind? k) (not (memq k na-prim-kinds)))
+
+;; na-kind-class-name (the JVM array class name for a kind) is protocols.ss's,
+;; which the class tags of an array need on every host.
+(define (na-array-class-name arr) (na-kind-class-name (jolt-array-kind arr)))
+
 
 ;; …and the matching seq flavor. The JVM gives an array's seq its own class per
 ;; element type (ArraySeq$ArraySeq_int for an int[], plain ArraySeq for an
@@ -37,10 +54,31 @@
 (define na-prim-type-kinds
   '(("int" . int) ("long" . long) ("short" . short) ("double" . double)
     ("float" . float) ("boolean" . boolean) ("byte" . byte) ("char" . char)))
+;; A reference type is its component class name (see na-kind-class-name), taken
+;; through the interner so a simple name and a deftype's registered spelling land
+;; on the one JVM name its values report; Object is the plain 'object kind.
 (define (na-type-kind t)
-  (let* ((n (cond ((string? t) t) ((jclass? t) (jclass-name t)) (else #f)))
-         (hit (and n (assoc n na-prim-type-kinds))))
-    (if hit (cdr hit) 'object)))
+  (cond ((string? t) (if (assoc t na-prim-type-kinds) (na-name-kind t) (na-name-kind (jclass-name (jolt-class-for t)))))
+        ((jclass? t) (na-name-kind (jclass-name t)))
+        (else 'object)))
+;; A class NAME's array kind. The JVM spelling is jch-munge-segments of the name,
+;; a pure function of the string, so each name's answer is computed once: every
+;; into-array / make-array asks, and the munge walk cost them 2x. Reads are the
+;; bare hashtable-ref; only a first-ever name takes the lock to publish.
+(define na-name-kind-tbl (make-hashtable string-hash string=?))
+(define na-name-kind-mu (make-mutex))
+(define (na-name-kind n)
+  (or (hashtable-ref na-name-kind-tbl n #f)
+      (let* ((hit (assoc n na-prim-type-kinds))
+             (k (if hit
+                    (cdr hit)
+                    (let ((jvm (jch-munge-segments n)))
+                      (if (or (string=? jvm "java.lang.Object") (string=? jvm "Object")) 'object jvm)))))
+        (jolt-with-mutex na-name-kind-mu (hashtable-set! na-name-kind-tbl n k))
+        k)))
+;; The kind of an array whose elements are arrays of KIND — make-array's outer
+;; dimensions, and (class (make-array String 1 1)) is String[][].
+(define (na-array-of-kind k) (na-kind-class-name k))
 ;; The JVM's zero for an element kind: an int/long/short/byte array reads 0 (not
 ;; 0.0), a double/float 0.0, a boolean false, a char NUL, a reference array nil.
 (define (na-zero-of kind)
@@ -183,6 +221,8 @@
   (let* ((v (jolt-array-vec a)) (n (fxvector-length v)) (w (make-vector n 0)))
     (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! w i (fxvector-ref v i)))
     (jolt-array-vec-set! a w)
+    ;; the fxvector is garbage now; a pin would hold it for the array's life
+    (when (na-large-backing? v) (sa-unpin-for-owner! a))
     w))
 ;; The char backing's counterpart to ja-promote!, and it exists for the same
 ;; reason: a Chez string holds CHARACTERS, and jolt cannot stop a program from
@@ -278,6 +318,39 @@
 (define (char-array-chunk x off cnt who)
   (jvm-range-check who (ja-len x) off (+ off cnt))
   (char-array-region x off cnt))
+;; A fresh byte backing of N bytes, all FILL. From 64KB up it is one the collector
+;; never copies (sa-make-large-bytevector): copied, a live 8MB byte array cost a
+;; full collection ~1ms instead of ~100us, depending only on where its segments
+;; landed (#1225). Below that a copy costs microseconds, and pinning small ones
+;; would only fragment the heap.
+(define na-large-bytes 65536)
+(define (na-new-bytes n fill)
+  ;; < not fx<?: a size past the fixnum range must reach make-bytevector's own error
+  (if (< n na-large-bytes)
+      (make-bytevector n fill)
+      (let ((bv (sa-make-large-bytevector n)))
+        (unless (fx=? fill 0) (bytevector-fill! bv fill))
+        bv)))
+;; A long, int or double array's backing (an fxvector or flvector) of 64KB and up
+;; is pinned to its array for the array's life (sa-pin-for-owner!), for the reason
+;; a byte array of that size is immobile: Chez has no immobile fxvector or flvector
+;; to allocate instead, and a mobile one in a mostly free chunk is copied at every
+;; full collection -- a 64KB fxvector in a bare Chez heap is, every time (#1227). A
+;; huge one (2MB up) is pinned by Chez itself only when it took fresh segments.
+;; Pinning instead of a bytevector backing keeps the typed-array hot paths on
+;; fxvector and flvector ops.
+;; 8192 elements is na-large-bytes of 8-byte slots, written out in make-jolt-array.
+(define (na-large-backing? v)
+  (or (and (fxvector? v) (fx>=? (fxvector-length v) 8192))
+      (and (flvector? v) (fx>=? (flvector-length v) 8192))))
+(define (na-pin-large! a v) (sa-pin-for-owner! a v))
+(define (na-bytes-copy bv)
+  (let ((n (bytevector-length bv)))
+    (if (fx<? n na-large-bytes)
+        (bytevector-copy bv)
+        (let ((r (sa-make-large-bytevector n)))
+          (bytevector-copy! bv 0 r 0 n)
+          r))))
 ;; A fresh backing holding the same elements — aclone's copy, and the one
 ;; java.util.Arrays hands its copyOf results.
 (define (ja-copy a)
@@ -285,7 +358,7 @@
     (cond ((vector? v) (vector-copy v))
           ((fxvector? v) (fxvector-copy v))
           ((string? v) (string-copy v))
-          ((bytevector? v) (bytevector-copy v))
+          ((bytevector? v) (na-bytes-copy v))
           (else (let* ((n (flvector-length v)) (r (make-flvector n 0.0)))
                   (do ((i 0 (fx+ i 1))) ((fx=? i n) r) (flvector-set! r i (flvector-ref v i))))))))
 ;; --- building a backing -----------------------------------------------------
@@ -296,7 +369,7 @@
   (let ((n (exact n)))
     (cond ((na-fl-kind? kind) (make-flvector n (if (flonum? init) init (exact->inexact init))))
           ((na-fx-kind? kind) (if (fixnum? init) (make-fxvector n init) (make-vector n init)))
-          ((eq? kind 'byte) (make-bytevector n (na-byte-of init)))
+          ((eq? kind 'byte) (na-new-bytes n (na-byte-of init)))
           ;; A char array is a Chez STRING: the elements are characters and a
           ;; string is the carrier that holds them unboxed, exactly as an
           ;; fxvector holds an int array's. It also removes a conversion at
@@ -320,7 +393,7 @@
         ;; every element narrowed on the way in, so the seq of a byte array
         ;; agrees with what a raw-byte consumer reads out of it
         ((eq? kind 'byte)
-         (let* ((n (length lst)) (bv (make-bytevector n)))
+         (let* ((n (length lst)) (bv (na-new-bytes n 0)))
            (let loop ((i 0) (l lst))
              (if (null? l) bv (begin (bytevector-s8-set! bv i (na-byte-of (car l))) (loop (+ i 1) (cdr l)))))))
         (else (list->vector lst))))
@@ -368,6 +441,53 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v (fx+ off i) (na-u8->byte (bytevector-u8-ref bv (fx+ bvoff i))))))))
 
+;; --- the java.nio buffer seam ------------------------------------------------
+;; java/byte-buffer.ss is shared with Gambit, which has no arrays; these are the
+;; array operations it asks the host for (rt-core.ss answers them there).
+;;
+;; A heap ByteBuffer reads and writes the OCTETS of the byte array it wraps, so
+;; a write through either is visible to the other. A byte array restored from an
+;; image older than the bytevector backing still holds a boxed vector; it moves
+;; onto a bytevector here, once, which every ja-* accessor reads the same way.
+(define (nb-host-bytes a)
+  (and (jolt-array? a) (eq? (jolt-array-kind a) 'byte)
+       (let ((v (jolt-array-vec a)))
+         (if (bytevector? v)
+             v
+             (let ((bv (make-bytevector (vector-length v))))
+               (do ((i 0 (fx+ i 1))) ((fx=? i (vector-length v)))
+                 (bytevector-s8-set! bv i (na-byte-of (vector-ref v i))))
+               (jolt-array-vec-set! a bv)
+               bv)))))
+(define (nb-host-new-bytes n) (make-jolt-array (na-new-bytes n 0) 'byte))
+(define (nb-host-array? a kind) (and (jolt-array? a) (eq? (jolt-array-kind a) kind)))
+(define (nb-host-array-len a) (ja-len a))
+(define (nb-host-array-ref a i) (ja-ref a i))
+(define (nb-host-array-set! a i v) (ja-set! a i v))
+;; One char of a char array: a string backing (every char array that only ever
+;; held chars) is one string-ref/-set!; anything else takes ja-ref/ja-set!,
+;; which also raises the out-of-range index.
+(define (nb-host-char-ref a i)
+  (let ((v (jolt-array-vec a)))
+    (if (and (string? v) (fixnum? i) (fx>=? i 0) (fx<? i (string-length v)))
+        (string-ref v i)
+        (ja-ref a i))))
+(define (nb-host-char-set! a i c)
+  (let ((v (jolt-array-vec a)))
+    (if (and (string? v) (fixnum? i) (fx>=? i 0) (fx<? i (string-length v)))
+        (string-set! v i c)
+        (ja-set! a i c))))
+(define (nb-host-char-string a)          ; the string a char array holds, or #f
+  (let ((v (jolt-array-vec a))) (and (string? v) v)))
+(define (nb-host-chars->string a from to)   ; a char array's [from, to) as a string
+  (let ((v (jolt-array-vec a)))
+    (if (string? v)
+        (substring v from to)
+        (let ((s (make-string (fx- to from))))
+          (do ((i from (fx+ i 1))) ((fx=? i to) s) (string-set! s (fx- i from) (ja-ref a i)))))))
+(define (nb-host-new-array kind n)
+  (make-jolt-array (na-make-backing n kind (case kind ((float double) 0.0) ((char) #\nul) (else 0))) kind))
+
 ;; A byte array's elements are signed-byte-folded by na-list->backing, the same
 ;; coercion aset applies through na-elem-of — so (into-array Byte/TYPE …) stores
 ;; bytes rather than whatever magnitude it was handed.
@@ -387,7 +507,7 @@
 ;; reference behaviour to match and nothing to be wrong about — narrowing it to a
 ;; prefix fill would be jolt inventing a second rule, not adopting the JVM's.
 (define (na-scalar-init? kind v)
-  (cond ((eq? kind 'object) #t)
+  (cond ((na-ref-kind? kind) #t)
         ((eq? kind 'char) (char? v))
         ((eq? kind 'boolean) (boolean? v))
         (else (number? v))))
@@ -490,11 +610,19 @@
 ;; Files/readAllBytes, Base64, FFI — funnels through here. One block copy now
 ;; that the two carriers agree on representation; the copy stays because the
 ;; caller's bytevector is usually a buffer it goes on writing into.
-(define (na-bv->bytearray bv) (make-jolt-array (bytevector-copy bv) 'byte))
+(define (na-bv->bytearray bv) (make-jolt-array (na-bytes-copy bv) 'byte))
 ;; INTERNAL ownership transfer: BV must be fresh, exclusively owned storage.
 ;; The producer relinquishes every mutable alias; the returned byte array is
 ;; its sole owner. Never use this for borrowed buffers or public constructors.
-(define (na-owned-bv->bytearray bv) (make-jolt-array bv 'byte))
+(define (na-owned-bv->bytearray bv)
+  (let ((a (make-jolt-array bv 'byte)))
+    ;; Fresh UTF-8/WAL output already owns its mobile backing. Preserve exact
+    ;; storage adoption, but also the new large-array no-relocation guarantee.
+    ;; The same owner-lifetime pin used by numeric arrays avoids an extra copy
+    ;; into an immobile bytevector, and releases the backing after owner death.
+    (when (fx>=? (bytevector-length bv) na-large-bytes)
+      (na-pin-large! a bv))
+    a))
 ;; (byte-array n [init]) | (byte-array coll). Also coerces the host's OTHER byte
 ;; carrier — a Chez bytevector (what the charset encoders produce) — and a string's
 ;; UTF-8 bytes, so bytevector and byte-array interconvert across interop seams.
@@ -516,21 +644,61 @@
   (let* ((n (ja-len arr)) (bv (make-bytevector n)))
     (ja-bytes->bv! arr 0 bv 0 n)
     bv))
-(define (na-make-array a . rest)    ; (make-array len) | (make-array type len ...)
+;; (make-array len) | (make-array type len & more-dims). Each extra dimension is
+;; an array of the inner arrays, as Array.newInstance(type, dims...) builds: the
+;; outer kind is the inner array's class, so (make-array String 2 3) is a
+;; String[][] of two String[3]s.
+(define (na-make-array a . rest)
   (let* ((typed? (not (number? a)))
          (kind (if typed? (na-type-kind a) 'object))
-         (len (exact (na-idx (if typed? (car rest) a)))))
-    (make-jolt-array (na-make-backing len kind (na-zero-of kind)) kind)))
+         (dims (if typed? rest (list a))))
+    (let build ((kind kind) (dims dims))
+      (if (null? (cdr dims))
+          (make-jolt-array (na-make-backing (exact (na-idx (car dims))) kind (na-zero-of kind)) kind)
+          (let* ((n (exact (na-idx (car dims)))) (v (make-vector n)))
+            (do ((i 0 (fx+ i 1))) ((fx=? i n))
+              (vector-set! v i (build kind (cdr dims))))
+            (make-jolt-array v (let wrap ((k kind) (n (length (cdr dims))))
+                                 (if (fx=? n 0) k (wrap (na-array-of-kind k) (fx- n 1))))))))))
 ;; (into-array coll) | (into-array type coll). The typed form honors its element
-;; type, so (into-array Integer/TYPE …) is an int[] — it used to build an Object[]
-;; and report [Ljava.lang.Object; where the JVM says [I.
-;; NOTE the untyped form stays an Object[] while the JVM infers the element class
-;; from the first element ((into-array [1 2]) is a Long[] there); that follows from
-;; jolt modelling reference arrays as one kind, same as the typed reference case.
+;; type, so (into-array Integer/TYPE …) is an int[] and (into-array String …) a
+;; String[]. The untyped form takes the class of the first element, as
+;; RT.seqToTypedArray does ((into-array ["a"]) is a String[]; an empty or
+;; nil-headed seq is an Object[]).
+;;
+;; The elements are NOT checked against the component class, where the JVM raises
+;; "array element type mismatch" (and an aset its ArrayStoreException): jolt's
+;; class model does not know every JDK class's ancestry — a StandardCopyOption is
+;; a CopyOption there and not here — so a check would refuse arrays the JVM
+;; builds. Recorded in known-divergences.edn (:permissive).
+(define (na-ref-array-of kind x)
+  (make-jolt-array (list->vector (seq->list (jolt-seq x))) kind))
+;; The array kind the untyped into-array takes from its first element: the
+;; common heads by their Scheme type (the class arms cost more than the array),
+;; anything else through its class name.
+(define (na-head-kind head)
+  (cond ((jolt-nil? head) 'object)
+        ((fixnum? head) "java.lang.Long")
+        ((string? head) "java.lang.String")
+        ((keyword-t? head) "clojure.lang.Keyword")
+        ((flonum? head) "java.lang.Double")
+        ((symbol-t? head) "clojure.lang.Symbol")
+        ((char? head) "java.lang.Character")
+        ((boolean? head) "java.lang.Boolean")
+        (else (let ((n (jolt-class-name head)))
+                ;; a boxed head names its wrapper class, never a primitive kind
+                (let ((k (if (string? n) (na-name-kind n) 'object)))
+                  (if (na-ref-kind? k) k 'object))))))
 (define (na-into-array a . rest)
   (if (pair? rest)
-      (na-from-seq (car rest) (na-type-kind a))
-      (na-from-seq a 'object)))
+      (let ((kind (na-type-kind a)))
+        (if (na-ref-kind? kind)
+            (na-ref-array-of kind (car rest))
+            (na-from-seq (car rest) kind)))
+      (let* ((xs (seq->list (jolt-seq a)))
+             (kind (if (null? xs) 'object (na-head-kind (car xs)))))
+        ;; a reference array's backing is a plain vector (na-list->backing's else)
+        (make-jolt-array (list->vector xs) kind))))
 (define (na-to-array coll)          (na-from-seq coll 'object))
 (define (na-aclone arr)
   (if (jolt-array? arr)
@@ -765,9 +933,10 @@
   (lambda (type-sym val)
     (let ((tname (cond ((string? type-sym) type-sym)
                        ((symbol-t? type-sym) (symbol-t-name type-sym))
+                       ((jclass? type-sym) (jclass-name type-sym))
                        (else #f))))
       (if (and tname (> (string-length tname) 0) (char=? (string-ref tname 0) #\[))
-          (and (jolt-array? val) (string=? (na-array-class-name val) tname))
+          (and (jolt-array? val) (jclass-name-assignable? tname (na-array-class-name val)))
           'pass))))
 
 ;; clojure.java.io/reader over a char-array reads its chars (the JVM char[] branch).
@@ -1011,7 +1180,8 @@
                                         (static-field-names-of cls)))
                        (statics (map (lambda (p) (class-static-field-obj cls (car p)))
                                      (class-static-members cls #f))))
-                  (make-jolt-array (list->vector (append declared registered statics)) 'objects))))
+                  (make-jolt-array (list->vector (append declared registered statics))
+                                   "java.lang.reflect.Field"))))
         (cons "getDeclaredField"
               (lambda (self name)
                 (cond ((lookup-static-field (jclass-name self) name)
@@ -1125,12 +1295,12 @@
               (lambda (self)
                 (make-jolt-array
                  (make-vector (reflect-method-arity self) (jolt-class-for "java.lang.Object"))
-                 'objects)))
+                 "java.lang.Class")))
         ;; jolt's registries carry no return or throws signature; Object and empty
         ;; are the honest answers, and they are what the JVM reports for an
         ;; Object-returning method with no checked exceptions anyway.
         (cons "getReturnType" (lambda (self) (jolt-class-for "java.lang.Object")))
-        (cons "getExceptionTypes" (lambda (self) (make-jolt-array (vector) 'objects)))
+        (cons "getExceptionTypes" (lambda (self) (make-jolt-array (vector) "java.lang.Class")))
         ;; public, plus static for a class-statics entry — the bit clojure.reflect
         ;; renders as :static and every "is this a static method" filter reads.
         (cons "getModifiers" (lambda (self) (->num (if (reflect-method-static? self) 9 1))))
@@ -1142,11 +1312,7 @@
         ;; caller spelling out arguments passes them straight through.
         (cons "invoke"
               (lambda (self target . args)
-                (let ((as (if (and (= 1 (length args)) (jolt-array? (car args)))
-                              (ja->list (car args))
-                              (if (and (= 1 (length args)) (jolt-nil? (car args)))
-                                  '()
-                                  args))))
+                (let ((as (reflect-varargs args)))
                   (if (reflect-method-static? self)
                       (apply (reflect-method-fn self) as)
                       (apply (reflect-method-fn self) target as)))))
@@ -1201,7 +1367,7 @@
        (for-each (lambda (e) (add! nm (car e) (cdr e) #f)) (host-method-entries tag)))
      (jhost-tags-for-fqn fqn))
     (for-each (lambda (p) (add! nm (car p) (cdr p) #t)) (class-static-members nm #t))
-    (make-jolt-array (list->vector (reverse acc)) 'objects)))
+    (make-jolt-array (list->vector (reverse acc)) "java.lang.reflect.Method")))
 
 ;; ---- Reflector/getMethods (SCI's reflective lookup) -------------------------
 ;; SCI's interpreter (sci.impl.reflector) resolves a method call by asking

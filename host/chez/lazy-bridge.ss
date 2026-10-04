@@ -284,15 +284,73 @@
 ;; POSIX mask primitives are up; the identity below is what a host without them
 ;; (Windows, Gambit) keeps.
 (define jolt-fork-sigmask-guard (lambda (fork) (fork)))
+;; DAEMON STATUS, per thread id, for Thread.isDaemon — asked of the Thread object
+;; a (Thread. f) built, of the handle Thread/currentThread gives the thread itself,
+;; or of the handle getAllStackTraces gives someone else, and all three must agree.
+;; So it lives here, where every thread is born, and not in any one
+;; representation. Only live daemons have an entry (absent is false, as for the
+;; boot thread): the entry goes when the thread ends, since ids are never reused
+;; and a program forking daemons would otherwise grow the table without bound. A
+;; (Thread. f) object keeps its own flag, so it still answers once finished.
+;;
+;; A thread is born with its creator's status, which is the JVM's rule for a new
+;; Thread. A fork site that stands for a JVM thread whose status is FIXED — a
+;; pool's worker made by Executors.defaultThreadFactory (never a daemon), a
+;; core.async or ForkJoin thread (always one) — says so with fork-thread/daemon.
+;; The answer is recorded by the child as its first act and by the parent after
+;; the fork, under live-threads-mutex, so it is there whichever runs first; the
+;; parent records nothing for a child that has already finished.
+(define thread-daemons (make-eqv-hashtable))              ; id -> #t
+(define (jolt-thread-daemon? id)
+  (jolt-with-mutex live-threads-mutex (hashtable-ref thread-daemons id #f)))
+(define (thread-daemon-record! id d)
+  (jolt-with-mutex live-threads-mutex
+    (if d (hashtable-set! thread-daemons id #t) (hashtable-delete! thread-daemons id))))
+;; WHAT KEEPS THE PROCESS UP, as on the JVM: it ends when the program's main
+;; returns only once every live non-daemon thread has finished (clojure.main
+;; returns, and the JVM waits for them). Every jolt thread is forked below, so the
+;; count is kept here: a non-daemon fork counts itself in on the PARENT, before the
+;; child exists — a program that forks and returns at once must still wait for it
+;; — and out as the child's last act. jolt-await-user-threads! (concurrency.ss)
+;; is the wait; it also honours the two holds a JVM Clojure program has without a
+;; live thread to show for them, the agent pools' idle workers (exit-hold-*).
+;;
+;; All of it is under exit-mu and announced on exit-cv, whose only waiter is the
+;; exiting main thread, so a plain condition is enough.
+(define exit-mu (make-mutex))
+(define exit-cv (make-condition))
+(define exit-nondaemon-live 0)
+;; What a thread's end means to its java.lang.Thread object (io.ss): it is no
+;; longer alive, join returns, and the id-keyed tables let it go.
+(define jolt-thread-exit-hook (lambda (id) (void)))
+;; The pools behind clojure.core's future/send-off (a cached pool: a worker idles
+;; 60s after its last task before it exits) and send (a fixed pool: its workers
+;; never exit). jolt runs that work on threads of its own, so the pool's idle
+;; threads are represented by these two: the time until which the last task's
+;; worker would still be idling, and whether the fixed pool has any worker at all.
+;; shutdown-agents ends both.
+(define exit-linger-until #f)          ; epoch ms, or #f
+(define exit-pooled-held? #f)
+(define exit-pools-shut? #f)
+(define (exit-nondaemon-enter!)
+  (jolt-with-mutex exit-mu (set! exit-nondaemon-live (fx+ exit-nondaemon-live 1))))
+(define (exit-nondaemon-leave!)
+  (jolt-with-mutex exit-mu
+    (set! exit-nondaemon-live (fx- exit-nondaemon-live 1))
+    (condition-broadcast exit-cv)))
 (define %ls-orig-fork-thread fork-thread)
-(define (%ls-fork-thread mark-mt? thunk)
+(define (%ls-fork-thread mark-mt? daemon thunk)
   (when mark-mt? (jolt-mark-mt!))
-  (let* ((t (jolt-fork-sigmask-guard
+  (let* ((d (if (eq? daemon 'inherit) (jolt-thread-daemon? (get-thread-id)) (and daemon #t)))
+         (_ (unless d (exit-nondaemon-enter!)))
+         (t (guard (e (#t (unless d (exit-nondaemon-leave!)) (raise e)))
+             (jolt-fork-sigmask-guard
              (lambda ()
                (%ls-orig-fork-thread
                 (lambda ()
                   (*txn* #f)
                   (rdr-default-modes!)
+                  (thread-daemon-record! (get-thread-id) d)
                   (let ((id (get-thread-id)))
                     (dynamic-wind
                       (lambda () #f)
@@ -301,15 +359,25 @@
                         (jolt-with-mutex live-threads-mutex
                           (if (hashtable-contains? live-threads id)
                               (hashtable-delete! live-threads id)
-                              (hashtable-set! live-threads id 'done)))))))))))
+                              (hashtable-set! live-threads id 'done)))
+                        ;; the hook reads the daemon entry into the Thread
+                        ;; object before it goes
+                        (jolt-thread-exit-hook id)
+                        (jolt-with-mutex live-threads-mutex
+                          (hashtable-delete! thread-daemons id))
+                        (unless d (exit-nondaemon-leave!)))))))))))
          (id (sa-thread-id-of t)))
     (when id
       (jolt-with-mutex live-threads-mutex
         (if (eq? 'done (hashtable-ref live-threads id #f))
             (hashtable-delete! live-threads id)
-            (hashtable-set! live-threads id #t))))
+            (begin
+              (hashtable-set! live-threads id #t)
+              (if d (hashtable-set! thread-daemons id #t) (hashtable-delete! thread-daemons id))))))
     t))
-(define (fork-thread thunk) (%ls-fork-thread #t thunk))
+(define (fork-thread thunk) (%ls-fork-thread #t 'inherit thunk))
+;; (fork-thread/daemon d thunk): a thread whose daemon status is D whoever forks it.
+(define (fork-thread/daemon d thunk) (%ls-fork-thread #t d thunk))
 
 ;; A thread that parks in a foreign call and runs no jolt code until something
 ;; wakes it has not made the process multi-threaded, and saying that it has is not
@@ -321,7 +389,7 @@
 ;; multi-threaded before any jolt code can reach it: for the watcher that is hook
 ;; registration (concurrency.ss), which is the moment a second mutator becomes
 ;; possible at all.
-(define (fork-thread-dormant thunk) (%ls-fork-thread #f thunk))
+(define (fork-thread-dormant thunk) (%ls-fork-thread #f #t thunk))
 
 ;; coll->cells: coerce a `lazy-seq` body's result to a seq | nil -- except a lazy
 ;; seq, handed back unforced for force-lazyseq to walk in its loop (the

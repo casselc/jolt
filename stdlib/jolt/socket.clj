@@ -10,228 +10,60 @@
   stream classes with the host class registry.
 
   Deliberate divergences from the JVM (test/conformance/known-divergences.edn):
-  a recv error reads as EOF (-1) rather than throwing, .connect ignores its
-  timeout argument (always blocking), and toString formats are approximate.
-  IPv4 only.
+  a recv error reads as EOF (-1) rather than throwing, and toString formats are
+  approximate. IPv4 only.
 
-  On Windows, additionally: sockets are blocking, because the readiness poller is
-  kqueue/epoll and there is none there — so a fiber blocked on a socket holds its
-  carrier rather than parking, which is a jolt superset java.net never promised —
-  and NetworkInterface enumerates nothing, for want of a GetAdaptersAddresses
-  walk. Both are recorded entries; InetAddress and the sockets themselves work
-  (jolt-lang/jolt#1107)."
+  Sockets are non-blocking on every platform and wait on jolt.io-poller — kqueue,
+  epoll, or WSAPoll on Windows — so a fiber parks rather than holding its
+  carrier, and SO_TIMEOUT and the connect timeout are deadlines on that wait.
+  On Windows NetworkInterface enumerates nothing, for want of a
+  GetAdaptersAddresses walk; that is a recorded entry (jolt-lang/jolt#1107)."
   (:require [jolt.ffi :as ffi]
             [jolt.io-poller :as poller]
-            [jolt.winsock :as winsock]
+            [jolt.socket.native :as native]
             [clojure.string :as str]))
 
 ;; -- platform ----------------------------------------------------------------
-;; macOS carries BSD constants and a sin_len-led sockaddr; Linux has a 16-bit
-;; sin_family and needs MSG_NOSIGNAL on send — without it a write to a
-;; peer-closed socket raises SIGPIPE and kills the process (macOS suppresses
-;; the signal per-fd via the SO_NOSIGPIPE socket option instead).
-;;
-;; Windows is the third platform, and it sides with BSD on almost everything that
-;; is a number here: Winsock grew out of the BSD API, so SOL_SOCKET is 0xffff,
-;; SO_REUSEADDR is 4 and FIONREAD is the BSD _IOR encoding. It is NOT BSD about
-;; the sockaddr (no sin_len — the 16-bit sin_family is Linux's shape) and it has
-;; no MSG_NOSIGNAL at all, because it has no SIGPIPE to suppress; passing Linux's
-;; 0x4000 there is an unknown flag and send() fails with it. Every one of these
-;; was answered with the Linux value before, which is a large part of why no
-;; java.net socket worked on Windows (jolt-lang/jolt#1107).
-(def ^:private os-name
-  (str/lower-case (or (System/getProperty "os.name") "")))
-(def ^:private macos?   (str/includes? os-name "mac"))
-(def ^:private windows? (str/includes? os-name "win"))
-
-;; -- FFI --------------------------------------------------------------------
-;; The library that provides the socket symbols, loaded before the bindings
-;; below. POSIX: the running process's own libc. Windows: ws2_32, which has to be
-;; asked for by name — its symbols are not in jolt.exe's export table even though
-;; it is linked in (jolt.winsock says more).
-(ffi/load-library)
-(when windows? (ffi/load-library ["ws2_32.dll" "ws2_32"]))
-
-(def ^:private AF-INET 2)
-(def ^:private SOCK-STREAM 1)
-
-(ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
-(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int
-  {:blocking true :capture-native-error true})
-(ffi/defcfn c-bind        "bind"        [:int :pointer :int] :int)
-(ffi/defcfn c-listen      "listen"      [:int :int] :int)
-(ffi/defcfn c-accept      "accept"      [:int :pointer :pointer] :int
-  {:blocking true :capture-native-error true})
-(ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
-(ffi/defcfn c-getsockname "getsockname" [:int :pointer :pointer] :int)
-(ffi/defcfn c-inet-addr   "inet_addr"   [:pointer] :uint)
-(ffi/defcfn c-gethostbyname "gethostbyname" [:pointer] :pointer :blocking)
-(ffi/defcfn c-gethostname  "gethostname"  [:pointer :size_t] :int)
-(ffi/defcfn c-getnameinfo  "getnameinfo"
-  [:pointer :uint :pointer :uint :pointer :uint :int] :int :blocking)
-
-;; The rest differ by platform in signature, not only in value, so they live in
-;; the taken branch — a symbol that exists on one OS only (closesocket on
-;; Windows, getifaddrs on POSIX) can be bound nowhere else. jolt interns the vars
-;; from both branches at analysis time, so the references below resolve either
-;; way; this is the arrangement jolt.nrepl already uses.
-(if windows?
-  (do
-    ;; Winsock's recv/send take an int length and return int, not ssize_t; a
-    ;; socket is closed with closesocket, not close; and the ioctl is
-    ;; ioctlsocket, which is fixed-arity rather than variadic.
-    (ffi/defcfn c-recv  "recv" [:int :pointer :int :int] :int
-      {:blocking true :capture-native-error true})
-    (ffi/defcfn c-send  "send" [:int :pointer :int :int] :int
-      {:blocking true :capture-native-error true})
-    (ffi/defcfn c-close "closesocket" [:int] :int)
-    (ffi/defcfn c-ioctl "ioctlsocket" [:int :int :pointer] :int))
-  (do
-    (ffi/defcfn c-recv  "recv" [:int :pointer :size_t :int] :ssize_t
-      {:blocking true :capture-native-error true})
-    (ffi/defcfn c-send  "send" [:int :pointer :size_t :int] :ssize_t
-      {:blocking true :capture-native-error true})
-    (ffi/defcfn c-close "close" [:int] :int)
-    ;; ioctl is (int fd, unsigned long request, ...) — the :varargs marker puts the
-    ;; third argument where the callee's va_list reads it. Binding it fixed-arity
-    ;; instead is what makes Apple arm64 return SUCCESS with the out-parameter
-    ;; untouched, since variadic arguments travel on the stack there.
-    (ffi/defcfn c-ioctl "ioctl" [:int :ulong :varargs :pointer] :int)
-    ;; The interface table. Windows has no getifaddrs — see ifaddr-entries.
-    (ffi/defcfn c-getifaddrs  "getifaddrs"  [:pointer] :int)
-    (ffi/defcfn c-freeifaddrs "freeifaddrs" [:pointer] :void)))
-
-(defn sock-consts-for
-  "The four socket numbers that differ by platform, as a map. A function of the
-  platform rather than four reads of this host's, so the Windows row — which no
-  CI runner here can observe — is pinned from a POSIX one (test/chez/unit.edn).
-  Every one of them answered Linux's value on Windows before jolt-lang/jolt#1107.
-
-    :sol-socket   SOL_SOCKET. BSD (and Winsock, which grew out of it) put the
-                  socket level at 0xffff; Linux numbers it 1.
-    :so-reuse     SO_REUSEADDR at that level: 4 on BSD/Windows, 2 on Linux.
-    :msg-nosignal The send flag that suppresses SIGPIPE on a peer-closed socket.
-                  Linux needs it; macOS uses the SO_NOSIGPIPE socket option
-                  instead; Windows has no SIGPIPE to suppress and no such flag,
-                  so passing Linux's 0x4000 there is an unknown flag and send
-                  fails with it. 0 on both.
-    :fionread     The ioctl that reports how many bytes are readable. The BSD
-                  _IOR encoding on macOS and Windows; Linux has its own number."
-  [macos? windows?]
-  (let [bsd? (or macos? windows?)]
-    {:sol-socket   (if bsd? 0xffff 1)
-     :so-reuse     (if bsd? 4 2)
-     :msg-nosignal (if bsd? 0 0x4000)
-     :fionread     (if bsd? 0x4004667F 0x541B)}))
-
-(def ^:private sock-consts (sock-consts-for macos? windows?))
-(def ^:private sol-socket   (:sol-socket sock-consts))
-(def ^:private so-reuse     (:so-reuse sock-consts))
-(def ^:private so-nosigpipe 0x1022)
-(def ^:private msg-nosignal (:msg-nosignal sock-consts))
-(def ^:private fionread     (:fionread sock-consts))
-
-;; The link-layer address family getifaddrs reports a MAC under, and where the
-;; MAC sits inside that entry's sockaddr. BSD's sockaddr_dl carries a
-;; variable-length name before the address (data starts at 8, the name occupies
-;; sdl_nlen of it); Linux's sockaddr_ll has a fixed 12-byte header.
-(def ^:private af-link (if macos? 18 17))
-;; A sockaddr's family byte: BSD leads with a one-byte sa_len, Linux with a
-;; 16-bit sa_family.
-(defn- sa-family [sa] (if macos? (ffi/read sa :uint8 1) (ffi/read sa :uint16 0)))
+;; Every C call, constant and struct layout lives in jolt.socket.native, which
+;; knows macOS, Linux and Windows apart (jolt-lang/jolt#1107 is what answering
+;; Linux's numbers on Windows cost). What is left here is the java.net object
+;; model over it.
 
 ;; -- sockaddr helpers ---------------------------------------------------------
 
-(defn- resolve-host [host]
-  ;; sin_addr (network byte order) for a numeric IP or hostname (IPv4 only).
-  ;; string->ptr NUL-terminates — a bare alloc+write-array leaves the
-  ;; terminator to whatever malloc hands back.
-  (winsock/ensure!)
-  (let [hp (ffi/string->ptr (str host))]
-    (try
-      (let [addr (c-inet-addr hp)]
-        (if (= addr 4294967295) ;; INADDR_NONE: not a numeric IP, try DNS
-          (let [he (c-gethostbyname hp)]
-            (when (ffi/null? he)
-              (throw (java.io.IOException. (str "unknown host: " host))))
-            (let [h-addr-list (ffi/read he :uptr 24)
-                  h-addr (ffi/read h-addr-list :uptr 0)]
-              (ffi/read h-addr :uint 0)))
-          addr))
-      (finally (ffi/free hp)))))
+(defn- resolve-host
+  "The IPv4 address host names, as a dotted quad — a numeric literal answers
+  itself without a lookup."
+  [host]
+  (let [{:keys [addrs]} (native/resolve-addrs (str host) 0 {:family native/af-inet})]
+    (native/free-addrs! addrs)
+    (or (:ip (first addrs))
+        (throw (java.net.UnknownHostException. (str host))))))
 
-(defn- ip->str [ip]
-  ;; ip is sin_addr in network byte order read back as a native (little-endian)
-  ;; uint, so the low byte is the first octet.
-  (str (bit-and ip 0xff) "."
-       (bit-and (bit-shift-right ip 8) 0xff) "."
-       (bit-and (bit-shift-right ip 16) 0xff) "."
-       (bit-and (bit-shift-right ip 24) 0xff)))
-
-(defn- make-sockaddr [ip port]
-  ;; sockaddr_in (16 bytes): header(2) + sin_port(2, network order) +
-  ;; sin_addr(4) + padding(8). BSD's header is sin_len + one-byte sin_family;
-  ;; Linux's is a 16-bit little-endian sin_family. ffi/alloc zeroes the block,
-  ;; so every byte this does not set is already 0 — which is what the padding
-  ;; and the unset half of the header have to be.
-  (let [sa (ffi/alloc 16)]
-    (if macos?
-      (do (ffi/write sa :uint8 16)          ;; sin_len
-          (ffi/write sa :uint8 AF-INET 1))
-      (ffi/write sa :uint8 AF-INET))
-    (ffi/write sa :uint8 (bit-and (bit-shift-right port 8) 0xff) 2)
-    (ffi/write sa :uint8 (bit-and port 0xff) 3)
-    (ffi/write sa :uint ip 4)
-    sa))
-
-(defn- make-sockaddr-in [host port]
-  (make-sockaddr (resolve-host host) port))
-
-(defn- sa-port [sa]
-  (bit-or (bit-shift-left (ffi/read sa :uint8 2) 8) (ffi/read sa :uint8 3)))
-(defn- sa-addr [sa]
-  (ip->str (ffi/read sa :uint 4)))
+(defn- make-sockaddr-in
+  "[sa len] for host:port, IPv4. The caller frees sa."
+  [host port]
+  (native/make-sockaddr native/af-inet (resolve-host host) port))
 
 (defn- local-port [fd]
-  (let [sa (ffi/alloc 16) lenp (ffi/alloc 4)]
-    (try
-      (ffi/write lenp :int 16)
-      (if (neg? (c-getsockname fd sa lenp)) 0 (sa-port sa))
-      (finally (ffi/free sa) (ffi/free lenp)))))
-
-(defn- set-opt-1! [fd opt]
-  (let [p (ffi/alloc 4)]
-    (try
-      (ffi/write p :int 1)
-      (c-setsockopt fd sol-socket opt p 4)
-      (finally (ffi/free p)))))
+  (max 0 (native/local-port fd)))
 
 (defn- guard-fd! [fd]
-  ;; accepted fds don't reliably inherit socket options — set SO_NOSIGPIPE
-  ;; explicitly on every fd we hand out, and O_NONBLOCK so the R8 readiness
-  ;; interception can park a fiber instead of pinning its carrier.
-  ;;
-  ;; nonblock! is a no-op on Windows, deliberately: there is no readiness poller
-  ;; there (jolt.io-poller is kqueue/epoll), so a non-blocking socket would answer
-  ;; WSAEWOULDBLOCK with nothing able to wait for it. Blocking sockets are also
-  ;; what the JVM's own java.net.Socket is — the non-blocking fd plus the poller
-  ;; is jolt's fiber extension over it, not the java.net contract — so this is a
-  ;; missing jolt superset on Windows, not a missing java.net behaviour. Recorded
-  ;; in test/conformance/known-divergences.edn (jolt-lang/jolt#1107).
-  (when macos? (set-opt-1! fd so-nosigpipe))
+  ;; accepted fds don't reliably inherit socket options — close-on-exec and
+  ;; SO_NOSIGPIPE go on every fd we hand out (native/guard-accepted!), and
+  ;; non-blocking mode so the R8 readiness interception can park a fiber instead
+  ;; of pinning its carrier. That is O_NONBLOCK on POSIX and FIONBIO on Windows,
+  ;; where the WSAPoll backend does the waiting.
+  (native/guard-accepted! fd)
   (poller/nonblock! fd))
 
 (defn- new-fd! []
-  (winsock/ensure!)
-  (let [fd (c-socket AF-INET SOCK-STREAM 0)]
-    (when (neg? fd) (throw (java.io.IOException. "socket() failed")))
-    ;; SO_REUSEADDR is what the JDK sets on a POSIX listener, so a restarted server
-    ;; can rebind a port its predecessor left in TIME_WAIT. Winsock gives the same
-    ;; option a different meaning — bind a port another socket is LISTENING on —
-    ;; and the JDK's Windows listener binds exclusively instead, so a busy port is
-    ;; a BindException there. Leave it unset on Windows.
-    (when-not windows? (set-opt-1! fd so-reuse))
-    (guard-fd! fd)
+  (let [fd (native/new-socket native/af-inet)]
+    ;; SO_REUSEADDR on POSIX, as the JDK sets it; nothing on Windows, where the
+    ;; option means sharing a live listener and the JDK binds exclusively, so a
+    ;; busy port is a BindException there (native/set-listener-reuse!)
+    (native/set-listener-reuse! fd)
+    (poller/nonblock! fd)
     fd))
 
 ;; -- tagged-table constructors ------------------------------------------------
@@ -254,28 +86,94 @@
     (str (or (jolt.host/ref-get h :address) (jolt.host/ref-get h :host)))
     (str h)))
 
-(defn- connect-fd! [fd host port]
+;; -- fd lifetime ---------------------------------------------------------------
+;; A socket's fd is live while any operation is using it. Closing marks the
+;; socket closed, which stops new operations, and wakes the ones blocked on it
+;; (poller/cancel!); the fd itself is closed by whichever of the closer or the
+;; last operation out comes second. That is the JDK's shape, and the reason is
+;; the same: a closed fd number is handed to the next socket or pipe the process
+;; opens, so an operation that retried on it would read that socket's bytes or
+;; write to its peer (jolt#1183, jolt-hmnr). process.ss counts its pipe fds the
+;; same way. Windows included: its sockets wait on the WSAPoll backend, which
+;; cancel! wakes like the others.
+(defn- fd-release! [fd]
+  (poller/forget! fd)
+  (native/c-close fd))
+
+;; Under the owner's lock: claims the release, answering the fd to close, when the
+;; socket is closed and nothing is using it.
+(defn- claim-release! [owner]
+  (when (and (jolt.host/ref-get owner :closed?)
+             (zero? (or (jolt.host/ref-get owner :ops) 0))
+             (not (jolt.host/ref-get owner :released?)))
+    (jolt.host/ref-put! owner :released? true)
+    (jolt.host/ref-get owner :fd)))
+
+(defn- op-enter! [owner]
+  (locking owner
+    (when (jolt.host/ref-get owner :closed?)
+      (throw (java.net.SocketException. "Socket closed")))
+    (jolt.host/ref-put! owner :ops (inc (or (jolt.host/ref-get owner :ops) 0)))))
+
+(defn- op-leave! [owner]
+  (when-let [fd (locking owner
+                  (jolt.host/ref-put! owner :ops (dec (jolt.host/ref-get owner :ops)))
+                  (claim-release! owner))]
+    (fd-release! fd)))
+
+(defmacro ^:private with-op [owner & body]
+  `(let [o# ~owner]
+     (op-enter! o#)
+     (try ~@body (finally (op-leave! o#)))))
+
+(defn- close-owner! [owner]
+  (let [[first? fd] (locking owner
+                      (if (jolt.host/ref-get owner :closed?)
+                        [false nil]
+                        (do (jolt.host/ref-put! owner :closed? true)
+                            [true (claim-release! owner)])))]
+    (cond
+      fd (fd-release! fd)
+      first? (poller/cancel! (jolt.host/ref-get owner :fd))))
+  nil)
+
+;; An operation woken by close raises what the JVM's does: a read, accept or
+;; connect "Socket closed", a write cut off mid-send "Broken pipe".
+(defn- raise-if-closed! [owner msg]
+  (when (jolt.host/ref-get owner :closed?)
+    (throw (java.net.SocketException. msg))))
+
+(defn- connect-fd! [owner fd host port deadline]
   ;; resolve + connect; frees the sockaddr either way. Returns the resolved ip.
   ;; The fd is O_NONBLOCK (fibers R8), so connect answers EINPROGRESS; wait for
   ;; writability (parking on a fiber, blocking kevent on a thread — the same
   ;; dispatch every other IO path uses), then read SO_ERROR for the verdict.
+  ;; DEADLINE (epoch ms, or nil for none) bounds that wait: connect(endpoint,
+  ;; timeout). Windows answers WSAEWOULDBLOCK where POSIX says EINPROGRESS, and
+  ;; native/connect-pending? knows both.
   (let [ip (resolve-host host)
-        sa (make-sockaddr ip port)
-        r  (loop []
-             (let [[r e] (c-connect fd sa 16)]
-               (cond
-                 (zero? r) 0
-                 (poller/connect-pending? e)
-                 (do (poller/wait-ready fd :write)
-                     (let [e (poller/so-error fd)]
-                       (if (zero? e)
-                         0
-                         (if (poller/connect-pending? e) (recur) -1))))
-                 :else r)))]
-    (ffi/free sa)
-    (when (neg? r)
-      (throw (java.io.IOException. (str "connect failed: " host ":" port))))
-    ip))
+        [sa len] (native/make-sockaddr native/af-inet ip port)
+        ;; 0 when connected, else the failure's errno (-1 when there is none)
+        e  (try
+             (loop []
+               (let [[r e] (native/c-connect fd sa len)]
+                 (cond
+                   (zero? r) 0
+                   (native/connect-pending? e)
+                   (let [t (poller/wait-ready fd :write deadline)]
+                     (raise-if-closed! owner "Socket closed")
+                     (when (= t :timeout)
+                       (throw (java.net.SocketTimeoutException. "Connect timed out")))
+                     (let [e (native/pending-error fd)]
+                       (cond (zero? e) 0
+                             (native/connect-pending? e) (recur)
+                             :else e)))
+                   :else (if (pos? e) e -1))))
+             (finally (ffi/free sa)))]
+    (cond
+      (zero? e) ip
+      (= e native/econnrefused) (throw (java.net.ConnectException. "Connection refused"))
+      :else (throw (java.io.IOException. (str "connect failed: " host ":" port))))))
 
 ;; -- Socket ------------------------------------------------------------------
 
@@ -288,41 +186,99 @@
     (when (= 2 (count args))
       (let [h  (host-arg->str (first args))
             p  (int (second args))
-            ip (try (connect-fd! fd h p)
-                    (catch java.io.IOException e (c-close fd) (throw e)))]
+            ip (try (connect-fd! inst fd h p nil)
+                    (catch java.io.IOException e (fd-release! fd) (throw e)))]
         (jolt.host/ref-put! inst :connected? true)
         (jolt.host/ref-put! inst :host h)
-        (jolt.host/ref-put! inst :remote-addr (ip->str ip))
+        (jolt.host/ref-put! inst :remote-addr ip)
         (jolt.host/ref-put! inst :port p)
         (jolt.host/ref-put! inst :local-port (local-port fd))))
     inst))
 
-(defn- socket-close! [self]
-  (when-not (jolt.host/ref-get self :closed?)
-    (jolt.host/ref-put! self :closed? true)
-    (let [fd (jolt.host/ref-get self :fd)]
-      (c-close fd)
-      ;; close first, then forget: forget! wakes any reader still parked on the
-      ;; fd (no event is coming — close removed it from the kernel set), and a
-      ;; woken read must see EBADF, not EAGAIN-and-repark on a dying socket.
-      (poller/forget! fd)))
+(defn- socket-close! [self] (close-owner! self))
+
+(defn- ensure-socket-open! [self]
+  (when (jolt.host/ref-get self :closed?)
+    (throw (java.net.SocketException. "Socket is closed"))))
+
+;; getInputStream, getOutputStream and the two shutdowns refuse a socket that is
+;; not connected, in the JDK's order: closed first, then unconnected.
+(defn- ensure-socket-connected! [self]
+  (ensure-socket-open! self)
+  (when-not (jolt.host/ref-get self :connected?)
+    (throw (java.net.SocketException. "Socket is not connected"))))
+
+;; shutdownInput / shutdownOutput (jolt-lang/jolt#1208). The flag is the JDK's
+;; isInputShutdown / isOutputShutdown: set by a call that succeeds, kept after
+;; close, and asked by the streams, since what the JDK answers after a half-close
+;; is decided by the flag rather than by the kernel — a read after shutdownInput
+;; is EOF even over data that had already arrived, which Linux would still hand
+;; back. A write after shutdownOutput reaches send and fails there with EPIPE, as
+;; the JDK's does. The shutdown also wakes a read parked on the poller, which
+;; then sees the flag.
+(defn- socket-shutdown! [self how flag already]
+  (ensure-socket-connected! self)
+  (when (jolt.host/ref-get self flag)
+    (throw (java.net.SocketException. already)))
+  ;; the flag goes up before the call: the shutdown wakes a parked read, which
+  ;; must find it set rather than recv data SHUT_RD left queued
+  (jolt.host/ref-put! self flag true)
+  (with-op self
+    (let [[r e] (native/c-shutdown (jolt.host/ref-get self :fd) how)]
+      ;; ENOTCONN is not an error here, as it is not in the JDK's Net.shutdown:
+      ;; macOS answers it once both directions have seen a FIN, and the socket
+      ;; is then as shut down as the caller asked
+      (when (and (neg? r) (not= e native/enotconn))
+        (jolt.host/ref-put! self flag false)
+        (throw (java.net.SocketException.
+                 (native/error-message e))))))
   nil)
 
-(defn- socket-connect! [self endpoint]
-  (when (jolt.host/ref-get self :closed?)
-    (throw (java.io.IOException. "Socket closed")))
+(defn- socket-connect! [self endpoint timeout]
+  ;; The JDK's order: the timeout is validated before the socket's state, and
+  ;; timeout 0 is the untimed connect the 1-arity is.
+  (when (neg? timeout)
+    (throw (IllegalArgumentException. "connect: timeout can't be negative")))
+  (ensure-socket-open! self)
   (when (jolt.host/ref-get self :connected?)
-    (throw (java.io.IOException. "Already connected")))
-  (let [h  (str (jolt.host/ref-get endpoint :host))
-        p  (jolt.host/ref-get endpoint :port)
-        fd (jolt.host/ref-get self :fd)
-        ip (connect-fd! fd h p)]
-    (jolt.host/ref-put! self :connected? true)
-    (jolt.host/ref-put! self :host h)
-    (jolt.host/ref-put! self :remote-addr (ip->str ip))
-    (jolt.host/ref-put! self :port p)
-    (jolt.host/ref-put! self :local-port (local-port fd)))
+    (throw (java.net.SocketException. "Already connected")))
+  ;; A connect that fails closes the socket, as the JDK's does — a refused or
+  ;; timed-out socket is not left half-connected for the caller to reuse.
+  (try
+    (with-op self
+      (let [h  (str (jolt.host/ref-get endpoint :host))
+            p  (jolt.host/ref-get endpoint :port)
+            fd (jolt.host/ref-get self :fd)
+            ip (connect-fd! self fd h p (when (pos? timeout)
+                                          (+ (System/currentTimeMillis) timeout)))]
+        (jolt.host/ref-put! self :connected? true)
+        (jolt.host/ref-put! self :host h)
+        (jolt.host/ref-put! self :remote-addr ip)
+        (jolt.host/ref-put! self :port p)
+        (jolt.host/ref-put! self :local-port (local-port fd))))
+    (catch java.io.IOException e
+      (close-owner! self)
+      (throw e)))
   nil)
+
+;; SO_TIMEOUT: milliseconds a read (Socket) or an accept (ServerSocket) may wait
+;; before raising SocketTimeoutException; 0, the default, waits forever. It bounds
+;; each call, not the connection, and a timeout leaves the socket usable. The
+;; JDK validates it after the closed check; the two classes word the negative
+;; case differently. Accepted sockets start at 0 — they do not inherit it.
+(defn- so-timeout [self] (or (jolt.host/ref-get self :so-timeout) 0))
+
+(defn- set-so-timeout! [self ms negative-msg]
+  (when (jolt.host/ref-get self :closed?)
+    (throw (java.net.SocketException. "Socket is closed")))
+  (when (neg? ms) (throw (IllegalArgumentException. negative-msg)))
+  (jolt.host/ref-put! self :so-timeout (int ms))
+  nil)
+
+(defn- get-so-timeout [self]
+  (when (jolt.host/ref-get self :closed?)
+    (throw (java.net.SocketException. "Socket is closed")))
+  (so-timeout self))
 
 (defn- socket->str [self]
   (if (jolt.host/ref-get self :connected?)
@@ -335,29 +291,47 @@
 (def ^:private socket-methods
   {"connect"
    (fn
-     ([self endpoint] (socket-connect! self endpoint))
-     ;; Java's timeout is milliseconds-until-abort; this connect is always
-     ;; blocking (equivalent to timeout 0). Divergence, documented in the ns.
-     ([self endpoint _timeout] (socket-connect! self endpoint)))
+     ([self endpoint] (socket-connect! self endpoint 0))
+     ([self endpoint timeout] (socket-connect! self endpoint (int timeout))))
+
+   "setSoTimeout" (fn [self ms] (set-so-timeout! self ms "timeout can't be negative"))
+   "getSoTimeout" get-so-timeout
 
    "getInputStream"
    (fn [self]
+     (ensure-socket-connected! self)
+     (when (jolt.host/ref-get self :in-shutdown?)
+       (throw (java.net.SocketException. "Socket input is shutdown")))
+     ;; :jolt/in-stream: a java.io.InputStream to clojure.java.io's coercions
+     ;; (io-streams.ss user-in-stream?), so io/reader, slurp and io/copy take it
      (doto (tt :socket-input-stream "java.net.SocketInputStream")
+       (jolt.host/ref-put! :jolt/in-stream true)
        (jolt.host/ref-put! :fd (jolt.host/ref-get self :fd))
        (jolt.host/ref-put! :socket self)))
 
    "getOutputStream"
    (fn [self]
+     (ensure-socket-connected! self)
+     (when (jolt.host/ref-get self :out-shutdown?)
+       (throw (java.net.SocketException. "Socket output is shutdown")))
      (doto (tt :socket-output-stream "java.net.SocketOutputStream")
+       (jolt.host/ref-put! :jolt/out-stream true)
        (jolt.host/ref-put! :fd (jolt.host/ref-get self :fd))
        (jolt.host/ref-put! :socket self)))
 
    "close"        socket-close!
+   "shutdownInput"
+   (fn [self] (socket-shutdown! self native/shut-rd :in-shutdown? "Socket input is already shutdown"))
+   "shutdownOutput"
+   (fn [self] (socket-shutdown! self native/shut-wr :out-shutdown? "Socket output is already shutdown"))
+   "isInputShutdown"  (fn [self] (boolean (jolt.host/ref-get self :in-shutdown?)))
+   "isOutputShutdown" (fn [self] (boolean (jolt.host/ref-get self :out-shutdown?)))
    "isConnected"  (fn [self] (boolean (jolt.host/ref-get self :connected?)))
    "isClosed"     (fn [self] (boolean (jolt.host/ref-get self :closed?)))
    "isBound"      (fn [self] (boolean (jolt.host/ref-get self :connected?)))
-   "getLocalPort" (fn [self] (or (jolt.host/ref-get self :local-port)
-                                 (local-port (jolt.host/ref-get self :fd))))
+   ;; -1 until connected, as Java answers for an unbound socket. Never asked of
+   ;; the fd: once closed its number may be another socket's.
+   "getLocalPort" (fn [self] (or (jolt.host/ref-get self :local-port) -1))
    "getPort"      (fn [self] (or (jolt.host/ref-get self :port) 0))
    "toString"     socket->str
 
@@ -374,7 +348,9 @@
        (jolt.host/ref-put! :port (jolt.host/ref-get self :port))))})
 
 ;; -- SocketInputStream -------------------------------------------------------
-(defn- io-call [op fd wait-kind]
+(defn- io-call
+  ([owner op fd wait-kind] (io-call owner op fd wait-kind 0 nil))
+  ([owner op fd wait-kind timeout-ms timeout-msg]
   ;; Run one blocking-capable syscall with the fd in O_NONBLOCK mode (fibers
   ;; R8). EAGAIN waits for readiness — parking the fiber on the poller when
   ;; there is a current fiber, blocking on a private kevent/epoll_wait when
@@ -384,24 +360,47 @@
   ;; :capture-native-error) — every binding io-call drives is declared that
   ;; way. The errno is spent on that classification and not returned, so a
   ;; caller sees a terminal failure only as a negative result.
-  (loop []
-    (let [[r e] (op)]
-      (cond
-        (and (neg? r) (poller/eintr? e)) (recur)
-        (and (neg? r) (poller/eagain? e)) (do (poller/wait-ready fd wait-kind) (recur))
-        :else
-        (do
-          ;; A negative return that is neither retryable nor a wait is where a
-          ;; socket read turns into EOF (do-recv below), and the caller then sees
-          ;; a closed connection with no reason attached. It is the one place a
-          ;; syscall failure goes quiet, so say what it was when asked.
-          (when (and (neg? r) (jolt.host/getenv "JOLT_DEBUG"))
-            (binding [*out* *err*]
-              (println "jolt.socket: fd" fd wait-kind "syscall failed, errno" e
-                       "- answered as EOF")))
-          r)))))
+  ;;
+  ;; OWNER is the socket: the call counts as one of its operations, so a close
+  ;; meanwhile wakes the wait and leaves the fd open until this call has left.
+  ;; A socket found closed after a wait, or behind a failure, raises.
+  ;;
+  ;; A positive TIMEOUT-MS bounds the whole call (SO_TIMEOUT): the waits share
+  ;; one deadline, and running out raises SocketTimeoutException with
+  ;; TIMEOUT-MSG — never a -1 that a read would take for EOF. A close that lands
+  ;; first still raises as a close.
+  (with-op owner
+    (let [closed-msg (if (= wait-kind :write) "Broken pipe" "Socket closed")
+          deadline (when (pos? timeout-ms) (+ (System/currentTimeMillis) timeout-ms))]
+      (loop []
+        (let [[r e] (op)]
+          (cond
+            (and (neg? r) (native/eintr? e)) (recur)
+            (and (neg? r) (native/eagain? e))
+            (let [t (poller/wait-ready fd wait-kind deadline)]
+              (raise-if-closed! owner closed-msg)
+              (when (= t :timeout)
+                (throw (java.net.SocketTimeoutException. timeout-msg)))
+              (recur))
+            :else
+            (do
+              (when (neg? r) (raise-if-closed! owner closed-msg))
+              ;; A negative return that is neither retryable nor a wait is where a
+              ;; socket read turns into EOF (do-recv below), and the caller then
+              ;; sees a closed connection with no reason attached. It is the one
+              ;; place a syscall failure goes quiet, so say what it was when asked.
+              (when (and (neg? r) (jolt.host/getenv "JOLT_DEBUG"))
+                (binding [*out* *err*]
+                  (println "jolt.socket: fd" fd wait-kind "syscall failed, errno" e
+                           "- answered as EOF")))
+              r))))))))
 
-(defn- do-recv [fd buf len]
+;; A read of a socket whose input is shut down is EOF, whatever the kernel still
+;; holds (see socket-shutdown!).
+(defn- input-shutdown? [stream]
+  (jolt.host/ref-get (jolt.host/ref-get stream :socket) :in-shutdown?))
+
+(defn- do-recv [owner fd buf len]
   ;; n <= 0 answers EOF: recv 0 is orderly shutdown; a negative return (error)
   ;; also reads as EOF. Java throws SocketException there — documented
   ;; divergence. What is left of the error is a CHOICE, not a limitation:
@@ -410,81 +409,91 @@
   ;; already gone by this point — io-call loops on EINTR and waits out EAGAIN
   ;; — so every negative n here is terminal. Narrowing that to SocketException
   ;; on ECONNRESET means widening io-call's contract to hand the errno back.
-  (let [n (io-call #(c-recv fd buf len 0) fd :read)]
+  (let [n (if (jolt.host/ref-get owner :in-shutdown?)
+            -1
+            (io-call owner #(native/c-recv fd buf len 0) fd :read
+                     (so-timeout owner) "Read timed out"))
+        ;; a read parked when shutdownInput landed is woken by it, and may find
+        ;; data that arrived meanwhile; the JDK answers EOF there too
+        n (if (jolt.host/ref-get owner :in-shutdown?) -1 n)]
     (if (pos? n)
       {:n n :bytes (ffi/read-array buf n)}
       {:n -1 :bytes nil})))
 
+;; A stream of a closed socket must not reach its fd: close frees the number,
+;; and the next socket to open is handed it, so a read would take that socket's
+;; bytes and a write would send to its peer (jolt#1183). The socket carries the
+;; flag, so this is a KNOWN error and raises what Java raises — SocketException,
+;; a subclass of IOException, so a catch of either sees it. A zero-length read
+;; or write never reaches the fd and answers 0 / nil on a closed socket, as the
+;; JVM's does, so callers guard after that shortcut.
+(defn- ensure-open! [stream]
+  (when (jolt.host/ref-get (jolt.host/ref-get stream :socket) :closed?)
+    (throw (java.net.SocketException. "Socket closed"))))
+
 ;; InputStream.available — the same question the JVM asks, through the same
 ;; syscall: ioctl(fd, FIONREAD, &n) reports what has arrived without reading it
-;; or waiting for more. The binding is what has to be right; see c-ioctl above.
+;; or waiting for more (native/available).
 (defn- socket-available [self]
-  ;; Closed is an error on both, and here it is a KNOWN one — the socket carries
-  ;; the flag — so it raises rather than answering, where a recv error can only
-  ;; read as EOF. SocketException is the class Java raises and a subclass of
-  ;; IOException, so a catch of either sees it. Asking the kernel is also not an
-  ;; option once the fd is closed: the number is free to be reused by the next
-  ;; socket, and the count would be somebody else's.
-  (when (jolt.host/ref-get (jolt.host/ref-get self :socket) :closed?)
-    (throw (java.net.SocketException. "Socket closed")))
-  (let [fd (jolt.host/ref-get self :fd)
-        out (ffi/alloc 4)]
-    (try
-      (ffi/write out :int 0)
-      ;; a failed ioctl reads as "nothing there", the way a failed recv reads as
-      ;; EOF. c-ioctl is not on a retry path, so it is bound without
-      ;; :capture-native-error and its errno is never captured to say more
-      ;; with — unlike the recv side, where the errno exists and io-call
-      ;; spends it on classification.
-      (if (neg? (c-ioctl fd fionread out)) 0 (max 0 (ffi/read out :int 0)))
-      (finally (ffi/free out)))))
+  ;; Closed raises rather than answering 0, where a recv error can only read as
+  ;; EOF; asking the kernel would count some other socket's bytes. A shut-down
+  ;; input has nothing to read, whatever arrived.
+  (ensure-open! self)
+  (if (input-shutdown? self)
+    0
+    (with-op (jolt.host/ref-get self :socket)
+      ;; a failed ioctl reads as "nothing there", the way a failed recv reads
+      ;; as EOF
+      (max 0 (native/available (jolt.host/ref-get self :fd))))))
 
 (def ^:private socket-input-stream-methods
   {"read"
    (fn
      ([self]
+      (ensure-open! self)
       (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc 1)]
         (try
-          (let [{:keys [n]} (do-recv fd buf 1)]
+          (let [{:keys [n]} (do-recv (jolt.host/ref-get self :socket) fd buf 1)]
             (if (pos? n) (bit-and (ffi/read buf :uint8 0) 0xff) -1))
           (finally (ffi/free buf)))))
      ([self b]
       (let [fd (jolt.host/ref-get self :fd) len (alength b)]
         (if (zero? len) 0
-            (let [buf (ffi/alloc len)]
+            (let [_ (ensure-open! self) buf (ffi/alloc len)]
               (try
-                (let [{:keys [n bytes]} (do-recv fd buf len)]
+                (let [{:keys [n bytes]} (do-recv (jolt.host/ref-get self :socket) fd buf len)]
                   (if (pos? n) (do (dotimes [i n] (aset b i (nth bytes i))) n) -1))
                 (finally (ffi/free buf)))))))
      ([self b off len]
       (let [fd (jolt.host/ref-get self :fd)]
         (if (zero? len) 0
-            (let [buf (ffi/alloc len)]
+            (let [_ (ensure-open! self) buf (ffi/alloc len)]
               (try
-                (let [{:keys [n bytes]} (do-recv fd buf len)]
+                (let [{:keys [n bytes]} (do-recv (jolt.host/ref-get self :socket) fd buf len)]
                   (if (pos? n) (do (dotimes [i n] (aset b (+ off i) (nth bytes i))) n) -1))
                 (finally (ffi/free buf))))))))
    "available" (fn [self] (socket-available self))
    "close"     (fn [self] (socket-close! (jolt.host/ref-get self :socket)))})
 
 ;; -- SocketOutputStream ------------------------------------------------------
-(defn- send-fully! [fd buf len]
+(defn- send-fully! [owner fd buf len]
   ;; loop over short sends; a non-positive return is a dead peer (EPIPE /
   ;; ECONNRESET) — throw like Java rather than silently dropping the rest.
   (loop [off 0]
     (when (< off len)
-      (let [s (io-call #(c-send fd (+ buf off) (- len off) msg-nosignal) fd :write)]
+      (let [s (io-call owner #(native/c-send fd (+ buf off) (- len off) native/msg-nosignal) fd :write)]
         (when-not (pos? s)
-          (throw (java.io.IOException. "Broken pipe")))
+          (throw (java.net.SocketException. "Broken pipe")))
         (recur (+ off s))))))
 
 (defn- write-bytes! [self bytes off len]
   (when (pos? len)
+    (ensure-open! self)
     (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc len)]
       (try
         (dotimes [i len]
           (ffi/write buf :uint8 (bit-and (aget bytes (+ off i)) 0xff) i))
-        (send-fully! fd buf len)
+        (send-fully! (jolt.host/ref-get self :socket) fd buf len)
         (finally (ffi/free buf))))))
 
 (def ^:private socket-output-stream-methods
@@ -501,10 +510,12 @@
      ([self b]
       (if (bytes? b)
         (write-bytes! self b 0 (alength b))
-        (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc 1)]
+        (let [_ (ensure-open! self)
+              fd (jolt.host/ref-get self :fd)
+              buf (ffi/alloc 1)]
           (try
             (ffi/write buf :uint8 (bit-and (int b) 0xff))
-            (send-fully! fd buf 1)
+            (send-fully! (jolt.host/ref-get self :socket) fd buf 1)
             (finally (ffi/free buf))))))
      ([self bytes off len] (write-bytes! self bytes off len)))
    "flush" (fn [self] nil)
@@ -520,15 +531,16 @@
 ;; or it leaks. bind must NOT close, because Java leaves a failed bind's socket
 ;; open — the caller still holds it and is the one who closes or retries.
 (defn- bind-listen! [fd bind-host port backlog close-on-failure?]
-  (let [sa (make-sockaddr-in bind-host port)]
-    (when (neg? (c-bind fd sa 16))
-      (when close-on-failure? (c-close fd))
-      (ffi/free sa)
-      (throw (java.io.IOException. (str "bind failed on port " port))))
-    (ffi/free sa)
-    (when (neg? (c-listen fd backlog))
-      (when close-on-failure? (c-close fd))
-      (throw (java.io.IOException. "listen() failed")))))
+  ;; any failure closes fd when asked, an unknown bind host included
+  (try
+    (let [[sa len] (make-sockaddr-in bind-host port)]
+      (when (neg? (first (try (native/c-bind fd sa len) (finally (ffi/free sa)))))
+        (throw (java.io.IOException. (str "bind failed on port " port))))
+      (when (neg? (first (native/c-listen fd backlog)))
+        (throw (java.io.IOException. "listen() failed"))))
+    (catch :default e
+      (when close-on-failure? (native/c-close fd))
+      (throw e))))
 
 (defn- server-ctor [& args]
   ;; [] [port] [port backlog] [port backlog bindAddr]. The arg'd forms bind the
@@ -585,36 +597,34 @@
   {"accept"
    (fn [self]
      (when (jolt.host/ref-get self :closed?)
-       (throw (java.io.IOException. "ServerSocket closed")))
+       (throw (java.net.SocketException. "Socket is closed")))
      ;; A no-arg socket has an fd but nothing is listening on it, so accept would
      ;; block or fail obscurely. Java names the case.
      (when-not (jolt.host/ref-get self :bound?)
        (throw (java.net.SocketException. "Socket is not bound yet")))
-     (let [sa (ffi/alloc 16) lenp (ffi/alloc 4)]
+     (let [[sa lenp] (native/alloc-sockaddr)]
        (try
-         (ffi/write lenp :int 16)
-         (let [cfd (io-call #(c-accept (jolt.host/ref-get self :fd) sa lenp)
-                            (jolt.host/ref-get self :fd) :read)]
+         (let [cfd (io-call self #(native/c-accept (jolt.host/ref-get self :fd) sa lenp)
+                            (jolt.host/ref-get self :fd) :read
+                            (so-timeout self) "Accept timed out")]
            (when (neg? cfd) (throw (java.io.IOException. "accept() failed")))
            (guard-fd! cfd)
            (doto (tt :socket "java.net.Socket")
              (jolt.host/ref-put! :fd cfd)
              (jolt.host/ref-put! :closed? false)
              (jolt.host/ref-put! :connected? true)
-             (jolt.host/ref-put! :host (sa-addr sa))
-             (jolt.host/ref-put! :remote-addr (sa-addr sa))
-             (jolt.host/ref-put! :port (sa-port sa))
+             (jolt.host/ref-put! :host (native/sockaddr-ip sa))
+             (jolt.host/ref-put! :remote-addr (native/sockaddr-ip sa))
+             (jolt.host/ref-put! :port (native/sockaddr-port sa))
              (jolt.host/ref-put! :local-port (local-port cfd))))
          (finally (ffi/free sa) (ffi/free lenp)))))
 
    "close"
    (fn [self]
-     (when-not (jolt.host/ref-get self :closed?)
-       (jolt.host/ref-put! self :closed? true)
-       (let [fd (jolt.host/ref-get self :fd)]
-         (c-close fd)
-         (poller/forget! fd)))   ; see socket-close!
-     nil)
+     (close-owner! self))
+
+   "setSoTimeout" (fn [self ms] (set-so-timeout! self ms "timeout < 0"))
+   "getSoTimeout" get-so-timeout
 
    "bind"
    (fn
@@ -654,93 +664,28 @@
    "getAddress"
    (fn [self]
      (let [h (or (jolt.host/ref-get self :host) "0.0.0.0")]
-       (make-inet-address h (try (ip->str (resolve-host h))
+       (make-inet-address h (try (resolve-host h)
                                  (catch java.io.IOException _ nil)))))
    "toString"      isa->str})
 
 ;; -- host identity: local host + network interfaces ---------------------------
-;; getifaddrs(3) reports one entry PER ADDRESS, so an interface with an IPv4
-;; address and a MAC appears twice; the entries are grouped by name below into
-;; one NetworkInterface each, which is the shape java.net presents.
-;;
-;; struct ifaddrs is laid out the same on both platforms for the fields read
-;; here: ifa_next 0, ifa_name 8, ifa_flags 16, ifa_addr 24.
-
-(defn- mac-bytes
-  "The hardware address inside a link-layer sockaddr, or nil when the entry
-  carries none (a loopback or tunnel interface reports a zero-length address)."
-  [sa]
-  (let [[off len] (if macos?
-                    ;; sockaddr_dl: sdl_nlen 5, sdl_alen 6, sdl_data 8 — the
-                    ;; interface name occupies sdl_nlen bytes of data first.
-                    [(+ 8 (ffi/read sa :uint8 5)) (ffi/read sa :uint8 6)]
-                    ;; sockaddr_ll: sll_halen 11, sll_addr 12.
-                    [12 (ffi/read sa :uint8 11)])]
-    (when (pos? len)
-      (let [bs (mapv (fn [i] (ffi/read sa :uint8 (+ off i))) (range len))]
-        ;; an all-zero address is what an interface with no hardware reports.
-        (when (some pos? bs) (byte-array bs))))))
-
-(defn- ifaddr-entries* []
-  (let [pp (ffi/alloc (ffi/sizeof :pointer))]
-    (try
-      (ffi/write pp :pointer ffi/null)
-      (when (neg? (c-getifaddrs pp))
-        (throw (java.io.IOException. "getifaddrs() failed")))
-      (let [head (ffi/read pp :pointer)]
-        (try
-          (loop [cur head acc []]
-            (if (ffi/null? cur)
-              acc
-              (let [nm (ffi/ptr->string (ffi/read cur :pointer 8))
-                    sa (ffi/read cur :pointer 24)
-                    fam (when-not (ffi/null? sa) (sa-family sa))]
-                (recur (ffi/read cur :pointer 0)
-                       (conj acc (cond-> {:name nm}
-                                   (= fam AF-INET) (assoc :ip (sa-addr sa))
-                                   (= fam af-link) (assoc :mac (mac-bytes sa))))))))
-          (finally (c-freeifaddrs head))))
-      (finally (ffi/free pp)))))
 
 (defn- ifaddr-entries
-  "One map per getifaddrs entry: {:name :ip :mac}. The list is freed before
-  returning, so everything needed is read out here.
+  "One map per getifaddrs entry: {:name :ip :mac}. java.net here is IPv4 only,
+  so a v6 entry keeps only its name — an interface with no IPv4 address (utun,
+  wg, a v6-only link) still exists and getByName still finds it.
 
-  Empty on Windows, which has no getifaddrs — enumerating adapters there means
-  GetAdaptersAddresses and a walk of the IP_ADAPTER_ADDRESSES chain, which is not
-  written here. What used to happen instead was worse than an empty list: the
-  binding did not resolve and every caller died with `foreign-procedure: no entry
-  for \"getifaddrs\"`, including InetAddress/getLocalHost, which only wanted this
-  as a fallback (jolt-lang/jolt#1107). getLocalHost answers from gethostname plus
-  the resolver, which is the primary path on every platform and the one the JDK's
-  own Windows getLocalHost uses; NetworkInterface enumerates nothing there,
-  recorded in test/conformance/known-divergences.edn."
+  Empty on Windows, which has no getifaddrs (native/interface-addresses).
+  getLocalHost answers from gethostname plus the resolver, which is the primary
+  path on every platform and the one the JDK's own Windows getLocalHost uses;
+  NetworkInterface enumerates nothing there, recorded in
+  test/conformance/known-divergences.edn (jolt-lang/jolt#1107)."
   []
-  (if windows? [] (ifaddr-entries*)))
-
-(defn- local-hostname []
-  (winsock/ensure!)
-  (let [n 256 buf (ffi/alloc n)]
-    (try
-      (ffi/write buf :uint8 0)
-      (if (neg? (c-gethostname buf n)) "localhost" (ffi/ptr->string buf))
-      (finally (ffi/free buf)))))
-
-(defn- reverse-name
-  "The name DNS gives back for an address, or nil. getnameinfo with no flags
-  asks for the canonical name and falls back to the numeric form itself, so a
-  result equal to the address means the lookup found nothing."
-  [address]
-  (let [sa (make-sockaddr (resolve-host address) 0)
-        n 1025
-        buf (ffi/alloc n)]
-    (try
-      (ffi/write buf :uint8 0)
-      (when (zero? (c-getnameinfo sa 16 buf n ffi/null 0 0))
-        (let [nm (ffi/ptr->string buf)]
-          (when-not (or (str/blank? nm) (= nm address)) nm)))
-      (catch java.io.IOException _ nil)
-      (finally (ffi/free buf) (ffi/free sa)))))
+  (map (fn [{:keys [family] :as e}]
+         (if (= family native/af-inet)
+           (dissoc e :family)
+           (dissoc e :family :ip)))
+       (native/interface-addresses)))
 
 ;; -- InetAddress --------------------------------------------------------------
 (defn- inet-address-ctor [& _]
@@ -759,7 +704,7 @@
      (let [h (jolt.host/ref-get self :host)]
        (if (str/blank? h)
          (let [addr (jolt.host/ref-get self :address)
-               nm (or (and addr (reverse-name addr)) addr)]
+               nm (or (and addr (native/reverse-lookup addr)) addr)]
            (jolt.host/ref-put! self :host nm)
            nm)
          h)))
@@ -769,7 +714,7 @@
    (fn [self]
      (or (jolt.host/ref-get self :canonical)
          (let [addr (jolt.host/ref-get self :address)
-               nm (or (and addr (reverse-name addr))
+               nm (or (and addr (native/reverse-lookup addr))
                       (jolt.host/ref-get self :host)
                       addr)]
            (jolt.host/ref-put! self :canonical nm)
@@ -788,30 +733,18 @@
    "toString"       inet-address->str})
 
 (defn- all-addresses-of
-  "Every address the resolver has for `host`. gethostbyname's h_addr_list (a
-  NULL-terminated array of pointers at offset 24 of struct hostent) carries them
-  all; a numeric literal resolves to itself without a lookup."
+  "Every IPv4 address the resolver has for host; a numeric literal resolves to
+  itself without a lookup."
   [host]
-  (winsock/ensure!)
-  (let [hp (ffi/string->ptr (str host))]
-    (try
-      (let [numeric (c-inet-addr hp)]
-        (if (not= numeric 4294967295)
-          [(ip->str numeric)]
-          (let [he (c-gethostbyname hp)]
-            (when (ffi/null? he)
-              (throw (java.io.IOException. (str "unknown host: " host))))
-            (let [list-ptr (ffi/read he :uptr 24)]
-              (loop [i 0 acc []]
-                (let [entry (ffi/read list-ptr :uptr (* i (ffi/sizeof :pointer)))]
-                  (if (zero? entry)
-                    acc
-                    (recur (inc i) (conj acc (ip->str (ffi/read entry :uint 0)))))))))))
-      (finally (ffi/free hp)))))
+  (let [{:keys [addrs]} (native/resolve-addrs (str host) 0 {:family native/af-inet})]
+    (native/free-addrs! addrs)
+    (when (empty? addrs)
+      (throw (java.io.IOException. (str "unknown host: " host))))
+    (mapv :ip addrs)))
 
 (def ^:private inet-address-statics
   {"getByName"
-   (fn [h] (make-inet-address (str h) (ip->str (resolve-host h))))
+   (fn [h] (make-inet-address (str h) (resolve-host h)))
    "getAllByName"
    ;; an array, as on the JVM, so alength and aget hold on the result.
    (fn [h] (object-array (mapv (fn [ip] (make-inet-address (str h) ip))
@@ -824,10 +757,10 @@
    ;; UnknownHostException, which is what the JVM does there.
    "getLocalHost"
    (fn []
-     (let [nm (local-hostname)]
+     (let [nm (native/host-name)]
        (make-inet-address
          nm
-         (or (try (ip->str (resolve-host nm)) (catch java.io.IOException _ nil))
+         (or (try (resolve-host nm) (catch java.io.IOException _ nil))
              (first (remove (fn [ip] (= "127.0.0.1" ip))
                             (keep :ip (ifaddr-entries))))
              "127.0.0.1"))))})

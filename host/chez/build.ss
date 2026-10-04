@@ -68,8 +68,10 @@
   (display (bld-log-string log)))
 
 ;; mkdir -p without a subprocess (the self-contained build shells out to nothing).
+;; path-parent answers #f at a root or a bare name, which ends the walk
+;; (jolt-lang/jolt#1207: a Windows path used to have no parent at all).
 (define (bld-mkdir-p dir)
-  (unless (or (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
+  (unless (or (not dir) (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
     (bld-mkdir-p (path-parent dir))
     ;; tolerate only the benign race (someone else created it) — a real mkdir
     ;; failure (permissions) used to surface later as a less specific
@@ -272,13 +274,14 @@
 
 ;; The directory holding an executable named the way the shell would find it. A
 ;; BARE command name — JOLT_CHEZ=scheme, which runs perfectly well since PATH is
-;; what locates it — has no directory part to take, and path-parent answers "" for
-;; it where dirname answers ".": unhandled, the csv candidate built from it became
-;; an absolute "/../lib/csv<ver>" off the filesystem root. PATH is the only thing
-;; that knows where such a name lives, so ask it.
+;; what locates it — has no directory part to take: path-parent answers #f for it
+;; (Chez's own path-parent, which io.ss shadows, answers ""), where dirname
+;; answers ".". Unhandled, the csv candidate built from it became an absolute
+;; "/../lib/csv<ver>" off the filesystem root, and then a string=? on #f. PATH is
+;; the only thing that knows where such a name lives, so ask it.
 (define (bld-exe-dir exe)
   (let ((parent (path-parent exe)))
-    (if (string=? parent "")
+    (if (or (not parent) (string=? parent ""))
         (let ((p (bld-sh-capture
                   (string-append "dirname \"$(command -v " (bld-sh-quote exe) ")\""))))
           (if (> (string-length p) 0) p "."))
@@ -335,7 +338,7 @@
 (define (bld-xpatch) (string-append (bld-target-pack) "/xpatch"))
 
 (define (bld-have-cc?)
-  (> (string-length (bld-sh-capture "command -v cc")) 0))
+  (> (string-length (bld-sh-capture (string-append "command -v " (bld-sh-quote (bld-cc))))) 0))
 
 (define (bld-check-toolchain)
   (let ((hint (if (bld-cross?)
@@ -511,7 +514,11 @@
     (bld-nt?
           ;; -static: a single-file exe (no libwinpthread/libgcc/lz4 DLL deps) —
      ;; required for a distributable binary and for TLS init consistency.
-     "-static -llz4 -lz -lws2_32 -lrpcrt4 -lole32 -luuid -ladvapi32 -luser32 -lshell32 -lm")
+     ;; -lcrypt32: OpenSSL 3's static libcrypto.a calls the CryptoAPI certificate
+     ;; store (CertOpenStore and the rest), so an app that links it as a :static
+     ;; native could not link without it (jolt-lang/jolt#1206). An import library
+     ;; costs nothing when nothing references it.
+     "-static -llz4 -lz -lws2_32 -lcrypt32 -lrpcrt4 -lole32 -luuid -ladvapi32 -luser32 -lshell32 -lm")
     ;; Linux: the Chez kernel pulls in compression (lz4/z), the expression
     ;; editor (ncurses + terminfo), threads, dlopen, libuuid, and clock_gettime.
     ;;
@@ -1269,6 +1276,19 @@
            (put-string out (string-append "(jolt-build-load-native (list " cand-lits ") #t #f)\n"))))))
     (seq->list natives)))
 
+;; The "static" natives' link forms, each once. The same archive named by two
+;; specs would otherwise be force-loaded twice, which is a duplicate definition of
+;; every symbol in it.
+(define (bld-static-forms natives)
+  (let loop ((es (seq->list natives)) (acc '()))
+    (if (null? es)
+        (reverse acc)
+        (let ((parts (bld-strs (car es))))
+          (loop (cdr es)
+                (if (and (string=? (car parts) "static") (not (member (cdr parts) acc)))
+                    (cons (cdr parts) acc)
+                    acc))))))
+
 ;; The cc link fragment for the "static" natives: each archive must be FORCE-loaded
 ;; (the linker would otherwise drop an archive member main.c never references) and,
 ;; on Linux, the executable's symbols exported into the dynamic table so the
@@ -1277,55 +1297,81 @@
 ;; is statically linked. Entry forms: ["static" "archive" path] | ["static" "lib"
 ;; name libdir].
 (define (bld-native-link-flags natives)
-  (fold-left
-    (lambda (acc entry)
-      (let ((parts (bld-strs entry)))
-        (if (string=? (car parts) "static")
-            (string-append acc " " (bld-one-static-link (cdr parts)))
-            acc)))
-    "" (seq->list natives)))
+  (fold-left (lambda (acc form) (string-append acc " " (bld-one-static-link form)))
+             "" (bld-static-forms natives)))
 
 ;; A statically-linked native is only in the OUTPUT binary, but build step 1
 ;; evaluates the app's `foreign-procedure` forms in THIS process (to register its
-;; macros/vars), and Chez resolves a foreign entry eagerly. So make the archive's
-;; symbols resolvable here: build a throwaway shared object from it (force-loading
-;; every member) and load it. The output binary still cc-links the static archive;
-;; this temp .so is build-time only. Only the "archive" form is preloaded — the
-;; "lib" form names a system library the OS loader already finds by soname.
+;; macros/vars), and Chez resolves a foreign entry eagerly. So make the archives'
+;; symbols resolvable here: build a throwaway shared object from them (force-
+;; loading every member) and load it. The output binary still cc-links the static
+;; archives; this temp object is build-time only. Only the "archive" form is
+;; preloaded — the "lib" form names a system library the OS loader already finds
+;; by soname.
 ;;
-;; An archive compiled without -fPIC cannot become a shared object at all — no
-;; linker flag makes an absolute relocation work in a library the loader may map
-;; anywhere — so that one is skipped rather than fatal (jolt#1060). The binary's
-;; own link still gets it (a non-PIE executable, see bld-link-executable); what
-;; is lost is only build-time resolution, which matters when a macro or a
-;; top-level form CALLS the native while the build runs. The same hole the
-;; ["static" "lib" …] form has always had, and the warning says so.
+;; ONE object from every archive, not one per archive (jolt-lang/jolt#1205): an
+;; archive that calls into another — libssl.a into libcrypto.a — must resolve
+;; against it the way it will in the binary. Built alone, its references to the
+;; other were left undefined; a PE loader cannot bind those at all, and an ELF or
+;; Mach-O loader binding at load time refuses the object whenever the dependent
+;; archive happened to load first. On Windows the object also links the
+;; binary's own system libraries (bld-link-libs): a DLL resolves its imports when
+;; it loads, not from the process it loads into, so an archive calling CryptoAPI
+;; or Winsock needs those import libraries here as much as in the final link.
+;; Elsewhere an undefined symbol resolves against the running process, which
+;; already has libc and the kernel's libraries.
+;;
+;; An archive compiled without -fPIC cannot become part of a shared object at all
+;; — no linker flag makes an absolute relocation work in a library the loader may
+;; map anywhere — so that one is left out rather than fatal (jolt#1060). The
+;; binary's own link still gets it (a non-PIE executable, see
+;; bld-link-executable); what is lost is only build-time resolution, which
+;; matters when a macro or a top-level form CALLS the native while the build
+;; runs. The same hole the ["static" "lib" …] form has always had, and the
+;; warning says so. The combined link names no culprit, so when it fails that way
+;; each archive is linked alone to find the ones that are not position-
+;; independent, and the object is rebuilt from the rest.
+(define (bld-preload-link-cmd archives so)
+  (let ((qs (apply string-append (map (lambda (a) (string-append " " (bld-sh-quote a))) archives))))
+    (if bld-osx?
+        (string-append (bld-cc) " -dynamiclib -undefined dynamic_lookup -Wl,-all_load" qs
+                       " -o " (bld-sh-quote so))
+        (string-append (bld-cc) " -shared -Wl,--whole-archive" qs " -Wl,--no-whole-archive"
+                       (if bld-nt? (string-append " " (bld-link-libs)) "")
+                       " -Wl,--unresolved-symbols=ignore-all -o " (bld-sh-quote so)))))
+
+(define (bld-preload-so builddir name)
+  (string-append builddir "/" name (if bld-osx? ".dylib" ".so")))
+
+(define (bld-warn-not-pic archive)
+  (display (string-append
+             "jolt build: warning: " archive " is not position-independent, so its\n"
+             "  symbols cannot be resolved while the build runs (it is still linked into\n"
+             "  the binary). Compile it with -fPIC if the build itself has to call it.\n")))
+
 (define (bld-preload-static-natives! natives builddir)
-  (let ((n 0))
-    (for-each
-      (lambda (entry)
-        (let ((parts (bld-strs entry)))
-          (when (and (string=? (car parts) "static") (string=? (cadr parts) "archive"))
-            (let* ((archive (caddr parts))
-                   (so (string-append builddir "/native-" (number->string n)
-                                      (if bld-osx? ".dylib" ".so")))
-                   (log (string-append so ".log"))
-                   (cmd (if bld-osx?
-                            (string-append "cc -dynamiclib -undefined dynamic_lookup -Wl,-all_load '"
-                                           archive "' -o '" so "'")
-                            (string-append "cc -shared -Wl,--whole-archive '" archive
-                                           "' -Wl,--no-whole-archive -Wl,--unresolved-symbols=ignore-all -o '" so "'"))))
-              (set! n (+ n 1))
-              (let ((rc (bld-system->log cmd log)))
-                (cond
-                  ((zero? rc) (bld-echo-log log) (sa-load-shared-object so))
-                  ((bld-pie-relocation-error? (bld-log-string log))
-                   (display (string-append
-                              "jolt build: warning: " archive " is not position-independent, so its\n"
-                              "  symbols cannot be resolved while the build runs (it is still linked into\n"
-                              "  the binary). Compile it with -fPIC if the build itself has to call it.\n")))
-                  (else (bld-echo-log log) (bld-command-failed rc cmd))))))))
-      (seq->list natives))))
+  (let loop ((archives (map cadr (filter (lambda (f) (string=? (car f) "archive"))
+                                         (bld-static-forms natives)))))
+    (unless (null? archives)
+      (let* ((so (bld-preload-so builddir "native-static"))
+             (log (string-append so ".log"))
+             (cmd (bld-preload-link-cmd archives so))
+             (rc (bld-system->log cmd log)))
+        (cond
+          ((zero? rc) (bld-echo-log log) (sa-load-shared-object so))
+          ((bld-pie-relocation-error? (bld-log-string log))
+           (let ((not-pic
+                   (filter (lambda (a)
+                             (let* ((probe (bld-preload-so builddir "native-probe"))
+                                    (plog (string-append probe ".log")))
+                               (and (not (zero? (bld-system->log (bld-preload-link-cmd (list a) probe) plog)))
+                                    (bld-pie-relocation-error? (bld-log-string plog)))))
+                           archives)))
+             (when (null? not-pic)
+               (bld-echo-log log) (bld-command-failed rc cmd))
+             (for-each bld-warn-not-pic not-pic)
+             (loop (filter (lambda (a) (not (member a not-pic))) archives))))
+          (else (bld-echo-log log) (bld-command-failed rc cmd)))))))
 
 (define (bld-one-static-link form)
   (let ((kind (car form)))
@@ -1359,19 +1405,133 @@
       acc
       (directory-list dir))))
 
-;; Emit register-embedded-resource! per file under each embed dir. Emitted BEFORE
-;; the app forms. File contents are read at BUILD time and emitted as bytevector
-;; literals (1B/char) — flat.ss top-level forms run at every startup with no source
-;; on disk, so read-file-string at runtime would fail.
-(define (bld-emit-embeds out embed-dirs)
+;; A file's bytes as a Scheme expression that rebuilds them. Text that is valid
+;; UTF-8 goes out as (string->utf8 "…"), the compact spelling; anything else (an
+;; image, a font, a keystore) as a #vu8 literal, because decoding it as UTF-8
+;; would replace every invalid sequence with U+FFFD and bake a corrupted copy.
+(define (bld-bytes-lit bv)
+  (let ((s (utf8->string bv)))
+    (if (bytevector=? (string->utf8 s) bv)
+        (ei-bytes-lit s)
+        (with-output-to-string (lambda () (write bv))))))
+
+(define (bld-emit-embedded-resource out name bv)
+  (put-string out (string-append
+                    "(register-embedded-resource! " (ei-str-lit name)
+                    " " (bld-bytes-lit bv) ")\n")))
+
+;; --- dependency roots, packed like an uberjar (#1232) ------------------------
+;; A dependency's files are reached through the roots the build resolved: its
+;; gitlibs checkout, its ~/.m2 jar, its :local/root. Those are absolute paths on
+;; the BUILD machine, so a library that reads its own resource
+;; (selmer.validator slurps "selmer-error-template.html" at load) worked there
+;; and nowhere else. The build bakes every dependency root into the binary
+;; instead, the way an uberjar packs the whole classpath, keyed by the
+;; root-relative name io/resource asks for.
+;;
+;; The classpath's precedence carries over: the first root that holds a name
+;; wins, the project's own paths shadow every dependency, and a name jolt itself
+;; supplies (an install root, or a source this jolt carries embedded) stays
+;; jolt's — an embedded key outranks every root at runtime, so baking a
+;; library's copy of, say, babashka/fs.clj would replace jolt's. Left out:
+;; compiled JVM classes and ClojureScript sources, which jolt never loads, and
+;; the source of every
+;; namespace the build compiled into the image, which the binary never reads
+;; again (its namespaces are pre-registered, so a require of one is a no-op).
+;; Any other source stays: a file a namespace (load)s runs in the binary, and a
+;; namespace reached only at runtime is loaded from its embedded copy.
+
+;; The dependency roots: every source root that is not one of the project's own
+;; paths (EXT-ROOTS, project-relative, resolved the way jolt.deps resolves them
+;; against JOLT_PWD), one of its :embed dirs, or one of jolt's install roots.
+(define (bld-project-roots ext-roots)
+  (let ((pdir (or (getenv "JOLT_PWD") ".")))
+    (map (lambda (r) (if (path-absolute? r) r (string-append pdir "/" r)))
+         (bld-strs ext-roots))))
+(define (bld-dep-roots ext-roots embed-dirs)
+  (let ((own (append (bld-project-roots ext-roots) (bld-strs embed-dirs) ldr-install-roots)))
+    (filter (lambda (r) (and (string? r) (not (member r own))))
+            (get-source-roots))))
+
+;; (name . thunk) per file under ROOT, the thunk reading its bytes: a directory
+;; is walked, a jar's entries are listed from its central directory.
+(define (bld-root-files root)
+  (cond
+    ((file-directory? root)
+     (map (lambda (rp) (cons (car rp) (lambda () (read-file-bytes-on-disk (cdr rp)))))
+          (reverse (bld-walk-files root "" '()))))
+    ((root-jar-index root)
+     => (lambda (d)
+          (fold-right
+            (lambda (n acc)
+              (if (bld-suffix? n "/")
+                  acc
+                  (cons (cons n (lambda () (zipdir-entry-bytes d (hashtable-ref (zipdir-table d) n #f))))
+                        acc)))
+            '()
+            (zipdir-names d))))
+    (else '())))
+
+(define (bld-root-has? root name) (and (cdr (resource-candidate root name)) #t))
+
+;; Is NAME the source file of one of the namespaces in BAKED — a table of their
+;; root-relative paths without extension (ns-name->rel)?
+(define (bld-baked-source? baked name)
+  (exists (lambda (ext)
+            (and (bld-suffix? name ext)
+                 (hashtable-ref baked (substring name 0 (- (string-length name) (string-length ext))) #f)))
+          ldr-source-exts))
+
+;; ((name . bytes) ...) to bake from the dependency roots, first root first.
+(define (bld-dep-resources ext-roots embed-dirs baked-ns)
+  (let ((seen (make-hashtable string-hash string=?))
+        (baked (make-hashtable string-hash string=?))
+        (project (bld-project-roots ext-roots)))
+    (for-each (lambda (n) (hashtable-set! baked (ns-name->rel n) #t)) baked-ns)
+    ;; a project :embed file is baked under its own name below; the dependency's
+    ;; copy would be overwritten by it, so it is not baked at all
+    (for-each (lambda (root)
+                (when (file-directory? root)
+                  (for-each (lambda (rp) (hashtable-set! seen (car rp) #t))
+                            (bld-walk-files root "" '()))))
+              (bld-strs embed-dirs))
+    (let loop ((roots (bld-dep-roots ext-roots embed-dirs)) (acc '()))
+      (if (null? roots)
+          (reverse acc)
+          (loop (cdr roots)
+                (fold-left
+                  (lambda (acc f)
+                    (let ((n (car f)))
+                      (cond
+                        ((hashtable-ref seen n #f) acc)
+                        (else
+                         (hashtable-set! seen n #t)
+                         (if (or (bld-suffix? n ".class")
+                                 (bld-suffix? n ".cljs")
+                                 (bld-baked-source? baked n)
+                                 (embedded-resource-has? n)
+                                 (exists (lambda (r) (bld-root-has? r n)) project)
+                                 (exists (lambda (r) (bld-root-has? r n)) ldr-install-roots))
+                             acc
+                             (cons (cons n ((cdr f))) acc))))))
+                  acc
+                  (bld-root-files (car roots))))))))
+
+;; Emit register-embedded-resource! per file under each embed dir, after the
+;; dependency roots' files (bld-dep-resources; BAKED-NS names the namespaces
+;; compiled into the image). Emitted BEFORE the app forms.
+;; File contents are read at BUILD time and emitted as bytevector literals —
+;; flat.ss top-level forms run at every startup with no source on disk, so
+;; reading the file at runtime would fail.
+(define (bld-emit-embeds out embed-dirs ext-roots baked-ns)
+  (for-each (lambda (nb) (bld-emit-embedded-resource out (car nb) (cdr nb)))
+            (bld-dep-resources ext-roots embed-dirs baked-ns))
   (for-each
     (lambda (root)
       (when (file-directory? root)
         (for-each
           (lambda (rp)
-            (put-string out (string-append
-                              "(register-embedded-resource! " (ei-str-lit (car rp))
-                              " " (ei-bytes-lit (read-file-string (cdr rp))) ")\n")))
+            (bld-emit-embedded-resource out (car rp) (read-file-bytes-on-disk (cdr rp))))
           (bld-walk-files root "" '()))))
     (bld-strs embed-dirs)))
 
@@ -1407,6 +1567,18 @@
 (define (bld-suffix? s suf)
   (let ((n (string-length s)) (m (string-length suf)))
     (and (>= n m) (string=? (substring s (- n m) n) suf))))
+;; Does the last segment of path P carry an extension? A leading dot (a dotfile)
+;; is not one. Both separators count, so a Windows -o is read the same way.
+(define (bld-has-extension? p)
+  (let loop ((i (fx- (string-length p) 1)))
+    (cond ((fx<? i 1) #f)
+          ((memv (string-ref p i) '(#\/ #\\)) #f)
+          ((char=? (string-ref p i) #\.)
+           (not (memv (string-ref p (fx- i 1)) '(#\/ #\\))))
+          (else (loop (fx- i 1))))))
+;; The shared-library suffix for the OUTPUT's platform.
+(define (bld-library-suffix)
+  (cond ((bld-tgt-nt?) ".dll") ((bld-tgt-osx?) ".dylib") (else ".so")))
 ;; --- derive namespace roots from the require graph ---------------------------
 ;; Data-reader namespaces load during project setup, before build-binary arms its
 ;; ns-loaded hook, so the entry walk records nothing for them. Collect their ns
@@ -1698,11 +1870,15 @@
         (error 'jolt-build (string-append "cannot include " n " — no source file on the roots"))))
     includes)
   ;; Windows executables carry .exe; normalize here so the append-payload and
-  ;; cc paths agree and the shell can run the result. A library keeps its own
-  ;; suffix (.dll/.so/.dylib) — never rewrite it to .exe.
-  (let ((out-path (if (and (bld-tgt-nt?) (not library?) (not (bld-suffix? out-path ".exe")))
-                      (string-append out-path ".exe")
-                      out-path)))
+  ;; cc paths agree and the shell can run the result. A library keeps whatever
+  ;; suffix -o gave it (never rewritten to .exe), but a bare `-o libadd` gets the
+  ;; target's .so/.dylib/.dll appended (jolt#1235) — otherwise the file and its
+  ;; @rpath install name carry no suffix and -ladd style linking cannot find it.
+  (let ((out-path (cond ((and (bld-tgt-nt?) (not library?) (not (bld-suffix? out-path ".exe")))
+                         (string-append out-path ".exe"))
+                        ((and library? (not (bld-has-extension? out-path)))
+                         (string-append out-path (bld-library-suffix)))
+                        (else out-path))))
   ;; The self-contained path (jolt-embedded-bytes "stub/launcher") needs no csv
   ;; kernel files, no Chez, no cc — only the legacy cc path does. A --library build
   ;; always takes build-shared, any cross build takes a spawned cc path, and
@@ -1726,7 +1902,7 @@
     ;; procedure forms eval below) with an actionable message.
     (unless (bld-have-cc?)
       (error 'jolt-build
-        "static native linking needs a C compiler (cc) on PATH; install one, or pass --dynamic to load the library at runtime."))
+        "static native linking needs a C compiler (JOLT_CC, or cc on PATH); install one, or pass --dynamic to load the library at runtime."))
     ;; Preload static archives' symbols into this process so step 1's foreign-
     ;; procedure evals resolve; the .build dir must exist first.
     (bld-mkdir-p (string-append out-path ".build"))
@@ -2059,15 +2235,20 @@
           (bld-emit-natives out natives 'required)
           (bld-emit-startup-profile-mark! out "required native libraries")
            (put-string out "\n;; === embedded resources ===\n")
-           (bld-emit-embeds out embed-dirs)
+           (bld-emit-embeds out embed-dirs ext-roots (map car ordered))
             (bld-emit-data-readers out)
            ;; set-source-roots!* (not the scanning set-source-roots!): data readers
            ;; are baked just above, and re-scanning would eagerly reload reader
            ;; namespaces via jolt-compile-eval-form — dropped by a tree-shaken binary.
+           ;; Not the dependency roots: they are absolute paths into this
+           ;; machine's checkouts, which let a resource the binary did not carry
+           ;; resolve here and fail on every other machine (#1232). Their files
+           ;; are embedded above.
            (put-string out (string-append
                              "(set-source-roots!* (list "
-                             (fold-left (lambda (s r) (string-append s (ei-str-lit r) " ")) ""
-                                        (get-source-roots))
+                             (let ((deps (bld-dep-roots ext-roots embed-dirs)))
+                               (fold-left (lambda (s r) (if (member r deps) s (string-append s (ei-str-lit r) " "))) ""
+                                          (get-source-roots)))
                              "))\n"))
           (bld-emit-startup-profile-mark! out "embedded resources and source roots")
           ;; Pre-register every app namespace in ns-registry BEFORE any app form
@@ -3301,10 +3482,12 @@
     (parameterize ((bld-bundled-archives archives))
       ;; bld-link-executable, not bld-system: the kernel spilled just above is
       ;; the one archive in this link jolt built itself, and it is not PIC.
-      (bld-link-executable "cc"
+      ;; (bld-cc), as build-with-cc and the static preload link with: JOLT_CC
+      ;; names the compiler the kernel was built with (#788)
+      (bld-link-executable (bld-cc)
         (lambda (extra)
           (string-append
-            "cc -O2 " (bld-export-symbols-flag) extra
+            (bld-cc) " -O2 " (bld-export-symbols-flag) extra
             "-I'" builddir "' '" lc "' '" lk "' -o '" out-path "' "
             native-link " " (bld-link-libs)))
         (string-append builddir "/relink.log")))))
@@ -3430,7 +3613,8 @@
 ;; --- shared-library link (jolt build --library) -----------------------------
 ;; The cc path adapted to emit a shared object instead of an executable: the same
 ;; compile-file + make-boot-file + xxd boot embedding, but a library.c stub
-;; (jolt_library_init / jolt_lookup / jolt_library_shutdown instead of main) and
+;; (jolt_library_init / jolt_lookup / jolt_library_release_thread /
+;; jolt_library_shutdown instead of main) and
 ;; a -shared/-dynamiclib link. Only the cc path supports libraries today — the
 ;; self-contained append-to-prebuilt-stub path would need a library stub variant
 ;; baked into the distributed jolt (a follow-up).
@@ -3470,7 +3654,16 @@
     "  Sbuild_heap(0, jolt_register_zlib);\n"
     "  Sforeign_symbol(\"jolt_set_lookup_addr\", (void*)jolt_set_lookup_addr);\n"
     "  return Sscheme_start(argc, (const char**)argv); }\n"
-    "void jolt_library_shutdown(void) { Sscheme_deinit(); }\n"))
+    "/* The thread that called jolt_library_init stays an ACTIVE Chez thread when\n"
+    "   init returns. Parked in host code (a run loop, a frame loop, a join), it\n"
+    "   never reaches a safe point, so a collection started by any other thread\n"
+    "   waits on it for good (#1234). Releasing it deactivates that thread; from\n"
+    "   then on every call in, from it too, goes through a :collect-safe export,\n"
+    "   which activates its caller on the way in. Repeating it is a no-op. */\n"
+    "void jolt_library_release_thread(void) { Sdeactivate_thread(); }\n"
+    "/* Sscheme_deinit runs Scheme on the calling thread, so a released thread is\n"
+    "   reactivated first. Sactivate_thread is a no-op on an active thread. */\n"
+    "void jolt_library_shutdown(void) { Sactivate_thread(); Sscheme_deinit(); }\n"))
 
 ;; The library scheme-start tail BODY: publish the export table to the embedder,
 ;; then return 0 so Sscheme_start returns to jolt_library_init's caller. The guard

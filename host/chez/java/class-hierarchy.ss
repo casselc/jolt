@@ -357,10 +357,10 @@
 ;; Class.getModifiers is a JVM bitmask; jolt derives it from the graph rather than
 ;; from bytecode it does not have. Visibility is PUBLIC unless the class is in the
 ;; visibility table below (package-private contributes nothing, private its own
-;; bit); a nested class — a $ in a modeled name — is STATIC, since every nested
-;; class the graph models is a static nested class on the JVM and jolt models no
-;; inner (instance-bound) one; INTERFACE implies ABSTRACT the way javac emits it;
-;; and FINAL / ABSTRACT / ENUM come from the marks below.
+;; bit); a nested class — a $ in a modeled name — is STATIC unless it is marked
+;; INNER below (an instance-bound or anonymous class, which the JVM reports
+;; without the bit: TreeMap$Values, AbstractMap$2); INTERFACE implies ABSTRACT the
+;; way javac emits it; and FINAL / ABSTRACT / ENUM come from the marks below.
 ;;
 ;; The lists were derived by probing the reference JVM for every java.* class and
 ;; every nested class this graph models (Class/getModifiers on each), so they say
@@ -377,6 +377,7 @@
 (define jch-final-set (make-hashtable string-hash string=?))
 (define jch-abstract-set (make-hashtable string-hash string=?))
 (define jch-enum-set (make-hashtable string-hash string=?))
+(define jch-inner-set (make-hashtable string-hash string=?))
 ;; name -> the visibility bits that REPLACE public for that class
 (define jch-visibility-tbl (make-hashtable string-hash string=?))
 (define (jch-mark-final! name)
@@ -385,6 +386,8 @@
   (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-abstract-set name #t)))
 (define (jch-mark-enum! name)
   (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-enum-set name #t)))
+(define (jch-mark-inner! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-inner-set name #t)))
 (define (jch-mark-package-private! name)
   (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-visibility-tbl name 0)))
 (define (jch-mark-private! name)
@@ -398,7 +401,8 @@
 (define (jch-modifiers name)
   (let ((n (if (jch-known? name) (jch-fqn-of-simple name) name)))
     (+ (hashtable-ref jch-visibility-tbl n jch-mod-public)
-       (if (and (str-has-dollar? n) (jch-known-exact? n)) jch-mod-static 0)
+       (if (and (str-has-dollar? n) (jch-known-exact? n) (not (hashtable-ref jch-inner-set n #f)))
+           jch-mod-static 0)
        (if (jch-final? n) jch-mod-final 0)
        (if (jch-interface? n) jch-mod-interface 0)
        (if (jch-abstract? n) jch-mod-abstract 0)
@@ -578,14 +582,22 @@
 ;; interface is grafted on from there). NOT Counted, though the JVM's is: jolt's
 ;; range is one chunk followed by a lazy continuation, so it cannot answer its own
 ;; length without realizing the whole thing.
-(jch-register-supers! "clojure.lang.LongRange" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.LongRange" '("clojure.lang.ASeq" "clojure.lang.IReduce" "clojure.lang.IDrop"))
 ;; The non-all-longs range — (range 0 1.0 0.1) and friends. Same shape as
 ;; LongRange, and chunked for the same reason.
-(jch-register-supers! "clojure.lang.Range" '("clojure.lang.ASeq"))
-(jch-register-supers! "clojure.lang.Iterate" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.Range" '("clojure.lang.ASeq" "clojure.lang.IReduce"))
+;; iterate (and the unbounded range) and cycle are IPending — realized? answers
+;; for their first cell — and reduce themselves (IReduce), as on the JVM.
+(jch-register-supers! "clojure.lang.Iterate" '("clojure.lang.ASeq" "clojure.lang.IPending" "clojure.lang.IReduce"))
+(jch-register-supers! "clojure.lang.Cycle" '("clojure.lang.ASeq" "clojure.lang.IPending" "clojure.lang.IReduce"))
 ;; (range start end 0), which the JVM answers with Repeat.create(start). Lazy and
 ;; unbounded, so not chunked and not Counted.
-(jch-register-supers! "clojure.lang.Repeat" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.Repeat" '("clojure.lang.ASeq" "clojure.lang.IReduce" "clojure.lang.IDrop"))
+;; IReduce is IReduceInit's two-arity extension; IDrop is drop's fast path (1.12).
+(jch-register-supers! "clojure.lang.IReduce" '("clojure.lang.IReduceInit"))
+(jch-mark-interface! "clojure.lang.IReduce")
+(jch-register-supers! "clojure.lang.IDrop" '())
+(jch-mark-interface! "clojure.lang.IDrop")
 (jch-register-supers! "clojure.lang.PersistentQueue" '("clojure.lang.IPersistentList" "clojure.lang.IPersistentCollection" "java.util.Collection"))
 ;; scalars / named / callable
 (jch-register-supers! "clojure.lang.Keyword" '("clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable" "java.io.Serializable"))
@@ -599,6 +611,47 @@
 ;; extends ARef.
 (jch-register-supers! "clojure.lang.IReference" '("clojure.lang.IMeta"))
 (jch-register-supers! "clojure.lang.AReference" '("clojure.lang.IReference"))
+;; Clojure 1.12: IDeref extends the five java.util.function suppliers, so every
+;; reference type (atom, delay, future, promise, var, volatile, reduced) is a
+;; Supplier — (.get (atom 1)) and (instance? Supplier (delay 1)).
+(jch-register-supers! "clojure.lang.IDeref"
+  '("java.util.function.Supplier" "java.util.function.BooleanSupplier"
+    "java.util.function.IntSupplier" "java.util.function.LongSupplier"
+    "java.util.function.DoubleSupplier"))
+;; The java.util.function interfaces themselves, so a reify of one is an instance
+;; of it, a ^Predicate / ^Function hint resolves to its FQN (the analyzer's
+;; functional-interface coercion of a hinted let binding reads that), and an
+;; :import of one names a class jolt models. UnaryOperator and BinaryOperator
+;; extend Function and BiFunction, as in the JDK.
+(for-each (lambda (n) (jch-register-supers! n '()) (jch-mark-interface! n))
+          '("java.util.function.Supplier" "java.util.function.BooleanSupplier"
+            "java.util.function.IntSupplier" "java.util.function.LongSupplier"
+            "java.util.function.DoubleSupplier"
+            "java.util.function.Function" "java.util.function.BiFunction"
+            "java.util.function.IntFunction" "java.util.function.LongFunction"
+            "java.util.function.DoubleFunction"
+            "java.util.function.Predicate" "java.util.function.BiPredicate"
+            "java.util.function.IntPredicate" "java.util.function.LongPredicate"
+            "java.util.function.DoublePredicate"
+            "java.util.function.Consumer" "java.util.function.BiConsumer"
+            "java.util.function.IntConsumer" "java.util.function.LongConsumer"
+            "java.util.function.DoubleConsumer" "java.util.function.ObjIntConsumer"
+            "java.util.function.ObjLongConsumer" "java.util.function.ObjDoubleConsumer"
+            "java.util.function.ToIntFunction" "java.util.function.ToLongFunction"
+            "java.util.function.ToDoubleFunction" "java.util.function.ToIntBiFunction"
+            "java.util.function.ToLongBiFunction" "java.util.function.ToDoubleBiFunction"
+            "java.util.function.IntUnaryOperator" "java.util.function.LongUnaryOperator"
+            "java.util.function.DoubleUnaryOperator" "java.util.function.IntBinaryOperator"
+            "java.util.function.LongBinaryOperator" "java.util.function.DoubleBinaryOperator"
+            "java.util.function.IntToLongFunction" "java.util.function.IntToDoubleFunction"
+            "java.util.function.LongToIntFunction" "java.util.function.LongToDoubleFunction"
+            "java.util.function.DoubleToIntFunction" "java.util.function.DoubleToLongFunction"))
+(for-each (lambda (n) (jch-register-supers! n '()) (jch-mark-interface! n))
+          '("java.io.FileFilter" "java.io.FilenameFilter"))
+(jch-register-supers! "java.util.function.UnaryOperator" '("java.util.function.Function"))
+(jch-mark-interface! "java.util.function.UnaryOperator")
+(jch-register-supers! "java.util.function.BinaryOperator" '("java.util.function.BiFunction"))
+(jch-mark-interface! "java.util.function.BinaryOperator")
 (jch-register-supers! "clojure.lang.IRef" '("clojure.lang.IDeref"))
 (jch-register-supers! "clojure.lang.ARef" '("clojure.lang.AReference" "clojure.lang.IRef"))
 (jch-register-supers! "clojure.lang.IAtom" '())
@@ -661,6 +714,13 @@
 (jch-register-supers! "java.io.UncheckedIOException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.util.concurrent.RejectedExecutionException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.util.concurrent.ExecutionException" '("java.lang.Exception"))
+;; The other three java.util.concurrent exceptions a caller constructs or matches
+;; on. TimeoutException was already thrown by the runtime (a timed Future.get, an
+;; invokeAny) and a catch naming it matched, but with no row here the ctor sweep
+;; gave it no constructor and it did not answer instance? Exception.
+(jch-register-supers! "java.util.concurrent.TimeoutException" '("java.lang.Exception"))
+(jch-register-supers! "java.util.concurrent.BrokenBarrierException" '("java.lang.Exception"))
+(jch-register-supers! "java.util.concurrent.CompletionException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.time.DateTimeException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.time.format.DateTimeParseException" '("java.time.DateTimeException"))
 (jch-register-supers! "java.text.ParseException" '("java.lang.Exception"))
@@ -682,6 +742,7 @@
 (jch-register-supers! "java.nio.file.NotDirectoryException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.NotLinkException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.DirectoryNotEmptyException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.FileSystemNotFoundException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.net.UnknownHostException" '("java.io.IOException"))
 (jch-register-supers! "java.net.SocketException" '("java.io.IOException"))
 (jch-register-supers! "java.net.ConnectException" '("java.net.SocketException"))
@@ -825,7 +886,7 @@
 (jch-register-supers! "java.lang.Appendable" '())
 (jch-register-supers! "java.util.StringTokenizer" '())
 (jch-register-supers! "java.nio.charset.Charset" '())
-(jch-register-supers! "java.nio.CharBuffer" '("java.lang.CharSequence" "java.lang.Appendable"))
+(jch-register-supers! "java.nio.CharBuffer" '("java.nio.Buffer" "java.lang.Comparable" "java.lang.CharSequence" "java.lang.Appendable" "java.lang.Readable"))
 (jch-register-supers! "java.nio.charset.CharsetDecoder" '())
 (jch-register-supers! "java.nio.charset.CharsetEncoder" '())
 (jch-register-supers! "java.nio.charset.CoderResult" '())
@@ -886,6 +947,99 @@
 (jch-register-supers! "java.util.Hashtable" '("java.util.Map"))
 (jch-register-supers! "java.util.Properties" '("java.util.Hashtable"))
 (jch-register-supers! "java.util.HashSet" '("java.util.Set"))
+;; java.util.TreeMap / TreeSet and the views they hand out (tree-map.ss), with
+;; the sorted/navigable/sequenced interfaces between them and Map / Set, and
+;; the Comparator objects Comparator/reverseOrder and naturalOrder return.
+;; Direct supers and modifiers probed on JDK 21.
+(jch-register-supers! "java.util.SequencedMap" '("java.util.Map"))
+(jch-register-supers! "java.util.SortedMap" '("java.util.SequencedMap"))
+(jch-register-supers! "java.util.NavigableMap" '("java.util.SortedMap"))
+(jch-register-supers! "java.util.SequencedSet" '("java.util.SequencedCollection" "java.util.Set"))
+(jch-register-supers! "java.util.SortedSet" '("java.util.Set" "java.util.SequencedSet"))
+(jch-register-supers! "java.util.NavigableSet" '("java.util.SortedSet"))
+(for-each jch-mark-interface!
+          '("java.util.SequencedMap" "java.util.SortedMap" "java.util.NavigableMap"
+            "java.util.SequencedSet" "java.util.SortedSet" "java.util.NavigableSet"))
+(jch-register-supers! "java.util.AbstractMap" '("java.util.Map"))
+(jch-register-supers! "java.util.AbstractCollection" '("java.util.Collection"))
+(jch-register-supers! "java.util.AbstractSet" '("java.util.AbstractCollection" "java.util.Set"))
+(jch-register-supers! "java.util.TreeMap"
+  '("java.util.AbstractMap" "java.util.NavigableMap" "java.lang.Cloneable" "java.io.Serializable"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap"
+  '("java.util.AbstractMap" "java.util.NavigableMap" "java.io.Serializable"))
+(jch-register-supers! "java.util.TreeMap$AscendingSubMap" '("java.util.TreeMap$NavigableSubMap"))
+(jch-register-supers! "java.util.TreeMap$DescendingSubMap" '("java.util.TreeMap$NavigableSubMap"))
+(jch-register-supers! "java.util.TreeMap$KeySet" '("java.util.AbstractSet" "java.util.NavigableSet"))
+(jch-register-supers! "java.util.TreeMap$Values" '("java.util.AbstractCollection"))
+(jch-register-supers! "java.util.TreeMap$EntrySet" '("java.util.AbstractSet"))
+(jch-register-supers! "java.util.TreeMap$PrivateEntryIterator" '("java.util.Iterator"))
+(jch-register-supers! "java.util.TreeMap$Entry" '("java.util.Map$Entry"))
+;; java.util.Spliterator: an interface with no super-interfaces, which the
+;; sub-map key iterators implement
+(jch-register-supers! "java.util.Spliterator" '())
+(jch-mark-interface! "java.util.Spliterator")
+;; the concrete iterators and a sub-map's entry-set and values views
+(jch-register-supers! "java.util.TreeMap$EntryIterator" '("java.util.TreeMap$PrivateEntryIterator"))
+(jch-register-supers! "java.util.TreeMap$KeyIterator" '("java.util.TreeMap$PrivateEntryIterator"))
+(jch-register-supers! "java.util.TreeMap$ValueIterator" '("java.util.TreeMap$PrivateEntryIterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$SubMapIterator" '("java.util.Iterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$SubMapEntryIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$DescendingSubMapEntryIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$SubMapKeyIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator" "java.util.Spliterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$DescendingSubMapKeyIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator" "java.util.Spliterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$EntrySetView" '("java.util.AbstractSet"))
+(jch-register-supers! "java.util.TreeMap$AscendingSubMap$AscendingEntrySetView"
+  '("java.util.TreeMap$NavigableSubMap$EntrySetView"))
+(jch-register-supers! "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView"
+  '("java.util.TreeMap$NavigableSubMap$EntrySetView"))
+(jch-register-supers! "java.util.AbstractMap$2" '("java.util.AbstractCollection"))
+(jch-register-supers! "java.util.AbstractMap$2$1" '("java.util.Iterator"))
+(define jch-treemap-iterator-classes
+  '("java.util.TreeMap$EntryIterator" "java.util.TreeMap$KeyIterator" "java.util.TreeMap$ValueIterator"
+    "java.util.TreeMap$NavigableSubMap$SubMapEntryIterator"
+    "java.util.TreeMap$NavigableSubMap$DescendingSubMapEntryIterator"
+    "java.util.TreeMap$NavigableSubMap$SubMapKeyIterator"
+    "java.util.TreeMap$NavigableSubMap$DescendingSubMapKeyIterator"))
+(for-each jch-mark-final! jch-treemap-iterator-classes)
+(for-each jch-mark-final!
+          '("java.util.TreeMap$AscendingSubMap$AscendingEntrySetView"
+            "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView"))
+(for-each jch-mark-abstract!
+          '("java.util.TreeMap$NavigableSubMap$SubMapIterator" "java.util.TreeMap$NavigableSubMap$EntrySetView"))
+;; package-private and INNER (no static bit) on JDK 21, modifiers 0 / 16 / 1024
+(for-each (lambda (n) (jch-mark-package-private! n) (jch-mark-inner! n))
+          (append jch-treemap-iterator-classes
+                  '("java.util.TreeMap$PrivateEntryIterator" "java.util.TreeMap$Values" "java.util.TreeMap$EntrySet"
+                    "java.util.TreeMap$NavigableSubMap$SubMapIterator"
+                    "java.util.TreeMap$NavigableSubMap$EntrySetView"
+                    "java.util.TreeMap$AscendingSubMap$AscendingEntrySetView"
+                    "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView"
+                    "java.util.AbstractMap$2" "java.util.AbstractMap$2$1")))
+(jch-register-supers! "java.util.AbstractMap$SimpleImmutableEntry" '("java.util.Map$Entry" "java.io.Serializable"))
+(jch-register-supers! "java.util.TreeSet"
+  '("java.util.AbstractSet" "java.util.NavigableSet" "java.lang.Cloneable" "java.io.Serializable"))
+(jch-register-supers! "java.util.Collections$ReverseComparator" '("java.util.Comparator" "java.io.Serializable"))
+(jch-register-supers! "java.util.Collections$ReverseComparator2" '("java.util.Comparator" "java.io.Serializable"))
+(jch-register-supers! "java.util.Comparators$NaturalOrderComparator" '("java.lang.Enum" "java.util.Comparator"))
+(for-each jch-mark-abstract!
+          '("java.util.AbstractMap" "java.util.AbstractCollection" "java.util.AbstractSet"
+            "java.util.TreeMap$NavigableSubMap" "java.util.TreeMap$PrivateEntryIterator"))
+(for-each jch-mark-final!
+          '("java.util.TreeMap$AscendingSubMap" "java.util.TreeMap$DescendingSubMap"
+            "java.util.TreeMap$KeySet" "java.util.Comparators$NaturalOrderComparator"
+            "java.util.TreeMap$Entry"))
+(for-each jch-mark-package-private!
+          '("java.util.TreeMap$NavigableSubMap" "java.util.TreeMap$AscendingSubMap"
+            "java.util.TreeMap$DescendingSubMap" "java.util.TreeMap$KeySet"
+            "java.util.TreeMap$Values" "java.util.TreeMap$EntrySet"
+            "java.util.Comparators$NaturalOrderComparator" "java.util.TreeMap$Entry"))
+(for-each jch-mark-private!
+          '("java.util.Collections$ReverseComparator" "java.util.Collections$ReverseComparator2"))
+(jch-mark-enum! "java.util.Comparators$NaturalOrderComparator")
 
 ;; ---- the rows typed.clojure's annotation corpus names ------------------------
 ;; typed.ann.clojure.base's override-classes resolves every class it annotates
@@ -1056,6 +1210,20 @@
 (jch-register-supers! "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask"
                       '("java.util.concurrent.FutureTask"
                         "java.util.concurrent.RunnableScheduledFuture"))
+;; CompletableFuture (concurrency.ss): a Future and a CompletionStage, and the
+;; enum its state() answers. delayedExecutor's Executor is a nested class.
+(jch-register-supers! "java.util.concurrent.CompletionStage" '())
+(jch-mark-interface! "java.util.concurrent.CompletionStage")
+(jch-register-supers! "java.util.concurrent.CompletableFuture"
+                      '("java.util.concurrent.Future" "java.util.concurrent.CompletionStage"))
+(jch-register-supers! "java.util.concurrent.CompletableFuture$DelayedExecutor"
+                      '("java.util.concurrent.Executor"))
+(jch-register-supers! "java.util.concurrent.Future$State" '("java.lang.Enum"))
+;; ManagementFactory/getThreadMXBean (concurrency.ss): the JDK's own class for it.
+(jch-register-supers! "java.lang.management.ManagementFactory" '())
+(jch-register-supers! "java.lang.management.ThreadMXBean" '())
+(jch-mark-interface! "java.lang.management.ThreadMXBean")
+(jch-register-supers! "com.sun.management.internal.HotSpotThreadImpl" '("java.lang.management.ThreadMXBean"))
 ;; locks, latches and the four atomics. Every one of these had a shim with
 ;; methods and NO class row, so (class x) answered the :object placeholder and
 ;; (instance? java.util.concurrent.locks.Lock a-reentrant-lock) was false.
@@ -1125,6 +1293,27 @@
 (jch-mark-interface! "java.util.Enumeration")
 (jch-register-supers! "java.util.StringTokenizer" '("java.util.Enumeration"))
 (jch-register-supers! "java.util.Optional" '())
+;; java.util.stream: each pipeline head is its stream interface, and every
+;; stream a BaseStream, which is AutoCloseable.
+(for-each (lambda (n) (jch-register-supers! n '()) (jch-mark-interface! n))
+          '("java.util.stream.Collector"))
+(jch-register-supers! "java.util.stream.BaseStream" '("java.lang.AutoCloseable"))
+(jch-mark-interface! "java.util.stream.BaseStream")
+(for-each (lambda (n)
+            (jch-register-supers! n '("java.util.stream.BaseStream"))
+            (jch-mark-interface! n))
+          '("java.util.stream.Stream" "java.util.stream.IntStream"
+            "java.util.stream.LongStream" "java.util.stream.DoubleStream"))
+(jch-register-supers! "java.util.stream.ReferencePipeline$Head" '("java.util.stream.Stream"))
+(jch-register-supers! "java.util.stream.IntPipeline$Head" '("java.util.stream.IntStream"))
+(jch-register-supers! "java.util.stream.LongPipeline$Head" '("java.util.stream.LongStream"))
+(jch-register-supers! "java.util.stream.DoublePipeline$Head" '("java.util.stream.DoubleStream"))
+(jch-register-supers! "java.util.stream.Collectors$CollectorImpl" '("java.util.stream.Collector"))
+(jch-register-supers! "java.util.ImmutableCollections$ListN" '("java.util.List" "java.util.RandomAccess"))
+(jch-register-supers! "java.util.IntSummaryStatistics" '("java.util.function.IntConsumer"))
+(jch-register-supers! "java.util.LongSummaryStatistics" '("java.util.function.LongConsumer" "java.util.function.IntConsumer"))
+(jch-register-supers! "java.util.DoubleSummaryStatistics" '("java.util.function.DoubleConsumer"))
+(jch-register-supers! "java.util.stream.SpinedBuffer" '("java.util.function.Consumer"))
 (jch-register-supers! "java.util.Base64" '())
 (jch-register-supers! "java.util.Base64$Encoder" '())
 (jch-register-supers! "java.util.Base64$Decoder" '())
@@ -1146,7 +1335,7 @@
 (jch-register-supers! "java.util.Date" '("java.lang.Comparable" "java.io.Serializable"))
 (jch-register-supers! "java.sql.Date" '("java.util.Date"))
 (jch-register-supers! "java.sql.Timestamp" '("java.util.Date"))
-(jch-register-supers! "java.nio.ByteBuffer" '("java.lang.Comparable"))
+(jch-register-supers! "java.nio.ByteBuffer" '("java.nio.Buffer" "java.lang.Comparable"))
 ;; java.nio.file (nio-file.ss). The JVM's concrete classes here are private
 ;; implementation details (sun.nio.fs.UnixPath, sun.nio.fs.MacOSXFileSystem), so
 ;; the shims report the public interface a caller can actually name, the way the
@@ -1165,6 +1354,8 @@
 (define jhost-tag->fqn (make-hashtable string-hash string=?))
 (for-each (lambda (p) (hashtable-set! jhost-tag->fqn (car p) (cdr p)))
   '(("user-thread" . "java.lang.Thread")
+    ("vthread-builder" . "java.lang.ThreadBuilders$VirtualThreadBuilder")
+    ("vthread-factory" . "java.lang.ThreadBuilders$VirtualThreadFactory")
     ("abq" . "java.util.concurrent.ArrayBlockingQueue")
     ("lbq" . "java.util.concurrent.LinkedBlockingQueue")
     ("future-task" . "java.util.concurrent.FutureTask")
@@ -1175,6 +1366,12 @@
     ("j-future" . "java.util.concurrent.FutureTask")
     ("scheduled-executor" . "java.util.concurrent.ScheduledThreadPoolExecutor")
     ("scheduled-future" . "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask")
+    ("completable-future" . "java.util.concurrent.CompletableFuture")
+    ("thread-group" . "java.lang.ThreadGroup")
+    ("thread-mx-bean" . "com.sun.management.internal.HotSpotThreadImpl")
+    ("thread-state" . "java.lang.Thread$State")
+    ("cf-delayed-executor" . "java.util.concurrent.CompletableFuture$DelayedExecutor")
+    ("future-state" . "java.util.concurrent.Future$State")
     ("instant" . "java.time.Instant")
     ("local-date" . "java.time.LocalDate")
     ("local-time" . "java.time.LocalTime")
@@ -1207,7 +1404,14 @@
     ("nio-filesystem" . "java.nio.file.FileSystem")
     ("nio-path-matcher" . "java.nio.file.PathMatcher")
     ("byte-buffer" . "java.nio.ByteBuffer")
-    ("char-buffer" . "java.nio.CharBuffer")
+    ;; java.nio's buffers and ByteOrder (byte-buffer.ss)
+    ("nio-char-buffer" . "java.nio.CharBuffer")
+    ("short-buffer" . "java.nio.ShortBuffer")
+    ("int-buffer" . "java.nio.IntBuffer")
+    ("long-buffer" . "java.nio.LongBuffer")
+    ("float-buffer" . "java.nio.FloatBuffer")
+    ("double-buffer" . "java.nio.DoubleBuffer")
+    ("byte-order" . "java.nio.ByteOrder")
     ("coder-result" . "java.nio.charset.CoderResult")
     ("coding-error-action" . "java.nio.charset.CodingErrorAction")
     ("arraylist" . "java.util.ArrayList")
@@ -1217,6 +1421,31 @@
     ("hashmap" . "java.util.HashMap")
     ("properties" . "java.util.Properties")
     ("hashset" . "java.util.HashSet")
+    ;; tree-map.ss: a TreeMap, its views, a TreeSet, and the Comparator objects
+    ("treemap" . "java.util.TreeMap")
+    ("treemap-asc-sub" . "java.util.TreeMap$AscendingSubMap")
+    ("treemap-desc-sub" . "java.util.TreeMap$DescendingSubMap")
+    ("treemap-keyset" . "java.util.TreeMap$KeySet")
+    ("treemap-values" . "java.util.TreeMap$Values")
+    ("treemap-entryset" . "java.util.TreeMap$EntrySet")
+    ("treeset" . "java.util.TreeSet")
+    ("treemap-entry" . "java.util.TreeMap$Entry")
+    ("immutable-entry" . "java.util.AbstractMap$SimpleImmutableEntry")
+    ;; a sub-map's entrySet() and values(), and the iterators: one tag per JDK class
+    ("treemap-asc-entryset" . "java.util.TreeMap$AscendingSubMap$AscendingEntrySetView")
+    ("treemap-desc-entryset" . "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView")
+    ("treemap-submap-values" . "java.util.AbstractMap$2")
+    ("treemap-entry-iterator" . "java.util.TreeMap$EntryIterator")
+    ("treemap-key-iterator" . "java.util.TreeMap$KeyIterator")
+    ("treemap-value-iterator" . "java.util.TreeMap$ValueIterator")
+    ("treemap-submap-entry-iterator" . "java.util.TreeMap$NavigableSubMap$SubMapEntryIterator")
+    ("treemap-submap-key-iterator" . "java.util.TreeMap$NavigableSubMap$SubMapKeyIterator")
+    ("treemap-desc-submap-entry-iterator" . "java.util.TreeMap$NavigableSubMap$DescendingSubMapEntryIterator")
+    ("treemap-desc-submap-key-iterator" . "java.util.TreeMap$NavigableSubMap$DescendingSubMapKeyIterator")
+    ("treemap-submap-value-iterator" . "java.util.AbstractMap$2$1")
+    ("reverse-comparator" . "java.util.Collections$ReverseComparator")
+    ("reverse-comparator2" . "java.util.Collections$ReverseComparator2")
+    ("natural-comparator" . "java.util.Comparators$NaturalOrderComparator")
     ;; io writer/reader shims: *out* is a PrintWriter like the JVM REPL's
     ("port-writer" . "java.io.PrintWriter")
     ("print-writer" . "java.io.PrintWriter")
@@ -1271,11 +1500,6 @@
     ;; answered false to (instance? ThreadLocal x).
     ("threadlocal" . "java.lang.ThreadLocal")
     ("inheritable-threadlocal" . "java.lang.InheritableThreadLocal")
-    ;; Thread/currentThread hands back a "thread" handle (io.ss) while (Thread. f)
-    ;; makes a "user-thread" (concurrency.ss). Two tags, ONE class — like the two
-    ;; writer tags and the two field tags above. Only user-thread had a row, so the
-    ;; handle every caller actually gets from currentThread reported :object.
-    ("thread" . "java.lang.Thread")
     ;; the four atomics (host-static-classes.ss), one tag each so instance? can
     ;; tell the Number-extending pair from the other two
     ("atomic-integer" . "java.util.concurrent.atomic.AtomicInteger")
@@ -1288,6 +1512,17 @@
     ("splittable-random" . "java.util.SplittableRandom")
     ("securerandom" . "java.security.SecureRandom")
     ("optional" . "java.util.Optional")
+    ;; java.util.stream (streams.ss): the JDK's pipeline head classes
+    ("stream" . "java.util.stream.ReferencePipeline$Head")
+    ("int-stream" . "java.util.stream.IntPipeline$Head")
+    ("long-stream" . "java.util.stream.LongPipeline$Head")
+    ("double-stream" . "java.util.stream.DoublePipeline$Head")
+    ("stream-collector" . "java.util.stream.Collectors$CollectorImpl")
+    ("immutable-list" . "java.util.ImmutableCollections$ListN")
+    ("int-summary-stats" . "java.util.IntSummaryStatistics")
+    ("long-summary-stats" . "java.util.LongSummaryStatistics")
+    ("double-summary-stats" . "java.util.DoubleSummaryStatistics")
+    ("stream-sink" . "java.util.stream.SpinedBuffer")
     ("string-tokenizer" . "java.util.StringTokenizer")
     ("b64-encoder" . "java.util.Base64$Encoder")
     ("b64-decoder" . "java.util.Base64$Decoder")

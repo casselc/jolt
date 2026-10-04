@@ -82,6 +82,105 @@
 (define (ac-broadcast! ch)
   (when (fx>? (async-chan-cvw ch) 0) (condition-broadcast (async-chan-cv ch))))
 
+;; --- the blocking ops are interruptible, the parking ones are not ------------
+;; <!!, >!! and alts!! block a thread on the JVM by deref'ing a promise, so
+;; .interrupt throws InterruptedException out of them and clears the flag, and a
+;; flag already set makes them throw as soon as they would wait. <!, >! and alts!
+;; park a go block, which on the JVM holds no thread to interrupt. So INTR? below
+;; is #t only for the three blocking vars; the parking ones, go bodies on the
+;; thread backend, the fallback threads put!/take! fork, and every other piece of
+;; channel plumbing pass #f and wait exactly as before (locks.ss: interrupting
+;; runtime plumbing breaks the runtime, not the caller's code).
+;;
+;; THE FLAG IS READ ONLY WHEN THE OP WOULD WAIT, at entry and after every wake.
+;; An op that can complete completes, and leaves a set flag set. That is the JVM's
+;; rule for the entry (the op returns straight from take!/put! without touching
+;; the promise), and applied after a wake it keeps every outcome linearizable:
+;; either the op finished before the interrupt (value returned, flag still set)
+;; or the interrupt came first (nothing consumed, flag cleared, throw). The JVM
+;; deref can do neither: its handler stays registered after the throw, so a later
+;; put hands a value to a taker that is gone, and a later taker takes the value of
+;; a put that threw. jolt retracts instead (known-divergences.edn).
+;;
+;; (ac-intr-wait! mu cv wait reg) — with MU held and the op committed to waiting.
+;; REG is what the previous round answered: #f before the first wait, else the
+;; op's registration. Answers #f when the calling thread is interrupted (flag
+;; consumed, registration dropped, nothing waited), else runs WAIT (which waits on
+;; cv, releasing mu) and answers the registration to pass to the next round.
+;;
+;; The registration is locks.ss's jolt-cv-wait-interruptibly protocol: the waiter
+;; lists (mu . cv) where its interrupt box's wake will find it and re-reads the
+;; flag after, because the interrupter sets the flag BEFORE the wake reads the
+;; entry and takes mu to wake — so it either found the entry and its broadcast
+;; waits on the mu held here, or it did not and the re-read sees its flag. It is
+;; made ONCE PER OP and kept across wakes, and the op drops it (ac-unreg!) on every
+;; way out; the listing itself is the thread's standing cell below. Made per round, it put
+;; two operations on the registry's one global mutex into every wake, and a put to
+;; a channel with 1000 threads blocked in <!! wakes all 1000 (the condition is a
+;; broadcast): 2000 contended acquisitions per put, which cost a 1000-taker fan-out
+;; about 35%. Kept across rounds, a wake reads the flag and nothing else, since the
+;; mu held from that read to the next wait closes the same window the re-read does.
+;; Threads only: a fiber never reaches these waits (the fiber ops divert first,
+;; fibers-async.ss).
+
+;; Drop an op's registration, if it made one (REG from ac-intr-wait!, or #f/#t).
+;; A plain write: a wake that still reads the old entry broadcasts on a condition
+;; nobody it concerns is waiting on, which every waiter already survives.
+(define-syntax ac-unreg!                ; a macro: it sits on every op's exit
+  (syntax-rules () ((_ reg) (let ((r reg)) (when (vector? r) (vector-set! r 1 #f))))))
+(define-syntax ac-done                  ; (ac-done reg value): leave the op
+  (syntax-rules () ((_ reg e) (begin (ac-unreg! reg) e))))
+
+(define (ac-intr-wait! mu cv wait reg)
+  (let ((b (current-interrupt-box)))
+    (cond
+      ((jolt-interrupt-take! b) (ac-unreg! reg) #f)
+      ((vector? reg) (wait) reg)
+      (else
+       (let* ((cell (ac-thread-wait-cell b)) (cmu (vector-ref cell 0)))
+         ;; the entry is written and the flag re-read under the cell's mutex,
+         ;; which the wake takes to read the entry after setting the flag: one of
+         ;; the two sees the other's write
+         (jolt-lock! cmu)
+         (vector-set! cell 1 (cons mu cv))
+         (let ((set? (jolt-interrupt-take! b)))
+           (jolt-unlock! cmu)
+           (if set?
+               (begin (vector-set! cell 1 #f) #f)
+               (begin (wait) cell))))))))
+
+;; THE THREAD'S STANDING REGISTRATION. A thread waits on one channel at a time, so
+;; instead of adding and removing a registry entry per op — a global mutex and two
+;; hashtable operations, about 5% of a thread-to-thread <!!/>!! handoff — each
+;; thread registers ONE wake against its box, the first time it blocks here, and
+;; points a cell at the (mu . cv) of whatever it is waiting on now. The cell is
+;; #(mutex entry), kept in a virtual register with the box it was made for, since a
+;; thread can adopt another box (a future's worker, a Thread.). Slot 11, rt.ss's
+;; map.
+(define jolt-vreg-chan-wait 11)
+(define (ac-thread-wait-cell b)
+  (let ((v (virtual-register jolt-vreg-chan-wait)))
+    (if (and (pair? v) (eq? (car v) b))
+        (cdr v)
+        (let ((cell (vector (make-mutex) #f)))
+          (jolt-interrupt-wait-add! b
+            (lambda ()
+              (let ((cmu (vector-ref cell 0)))
+                (jolt-lock! cmu)
+                (let ((e (vector-ref cell 1)))
+                  (jolt-unlock! cmu)
+                  ;; outside the cell's mutex: the waiter takes it under mu
+                  (when e (jolt-with-mutex (car e) (jolt-cv-wake! (cdr e))))))))
+          (set-virtual-register! jolt-vreg-chan-wait (cons b cell))
+          cell))))
+
+;; One wait on the channel's condition: the next REG, or #f when interrupted
+;; (INTR? only). A non-interruptible wait answers #t and never registers.
+(define (ac-wait! ch intr? reg)
+  (if intr?
+      (ac-intr-wait! (async-chan-mu ch) (async-chan-cv ch) (lambda () (ac-cv-wait ch)) reg)
+      (begin (ac-cv-wait ch) #t)))
+
 (define (ac-qnew) (vector '() '() 0))
 (define (ac-qlen ch) (vector-ref (async-chan-items ch) 2))
 (define (ac-qempty? ch) (fx=? 0 (vector-ref (async-chan-items ch) 2)))
@@ -100,6 +199,11 @@
       (vector-set! q 0 (cdr out))
       (vector-set! q 2 (fx- (vector-ref q 2) 1))
       (car out))))
+(define (ac-qremove! ch entry)          ; retract a pending entry, by identity
+  (let ((q (async-chan-items ch)))
+    (cond ((memq entry (vector-ref q 0)) (vector-set! q 0 (remq entry (vector-ref q 0))))
+          (else (vector-set! q 1 (remq entry (vector-ref q 1)))))
+    (vector-set! q 2 (fx- (vector-ref q 2) 1))))
 (define (ac-qdrop-oldest! ch)
   (let ((q (async-chan-items ch)))
     (ac-qfront! q)
@@ -128,6 +232,58 @@
     (and (alt-handler-active? h)
          (begin (alt-handler-active?-set! h #f) #t))))
 
+;; (alt-claim-pair! putter taker) -> 'ok when BOTH were claimed together, else
+;; which one was already dead ('putter / 'taker), with neither claimed. Pairing a
+;; parked putter with a parked taker commits two handlers, and claiming them one
+;; after the other cannot be undone when the second claim loses: the first is
+;; then spent on an exchange that never happened. So both fmus are held for the
+;; check and the claim. Each is a leaf taken for a field test, but a handler can
+;; be a putter on one channel and a taker on another (one alts!!), so two pairings
+;; could take the same two in opposite orders: the second is TRIED, and on failure
+;; the first is let go and the pair retried, which cannot deadlock.
+(define (alt-claim-pair! p t)
+  (let ((pm (alt-handler-fmu p)) (tm (alt-handler-fmu t)))
+    (let retry ()
+      (jolt-lock! pm)
+      (if (jolt-lock! tm #f)
+          (let ((r (cond ((not (alt-handler-active? p)) 'putter)
+                         ((not (alt-handler-active? t)) 'taker)
+                         (else (alt-handler-active?-set! p #f)
+                               (alt-handler-active?-set! t #f)
+                               'ok))))
+            (jolt-unlock! tm)
+            (jolt-unlock! pm)
+            r)
+          ;; let the holder of tm finish before trying again, so two pairings
+          ;; taking the pair in opposite orders cannot keep failing in step
+          (begin (jolt-unlock! pm) (sleep (make-time 'time-duration 1000 0)) (retry))))))
+
+;; Hand V straight to the first live alt-taker on CH (mu held), claiming it FIRST:
+;; #t when one received it, #f when none was live. Dead registrations met on the
+;; way are dropped. Claim-then-commit is the rendezvous: a put that answered true
+;; after only SEEING an active taker could lose that taker to its alts!!'s other
+;; port, or to an interrupt, before claiming it, and leave the value buffered for
+;; whoever took next.
+(define (ac-hand-to-taker! ch v)
+  (let loop ()
+    (let ((ts (async-chan-alt-takers ch)))
+      (and (pair? ts)
+           (let ((h (car ts)))
+             (async-chan-alt-takers-set! ch (cdr ts))
+             (if (alt-claim! h)
+                 (begin (alt-deliver! h v ch) #t)
+                 (loop)))))))
+
+;; A thread blocked in a take (takew) is not a handler and cannot be claimed, but
+;; it can be COUNTED: it takes one queued rendezvous value when it wakes, and a
+;; value queued on it is never abandoned (a woken take takes what is there before
+;; it reads the interrupt flag). So an unbuffered channel has room for a put
+;; without a waiting putter only while blocked takers outnumber the values already
+;; queued for them. Testing takew > 0 instead let two offers in a row both answer
+;; true to one blocked taker, the second value left for a later one.
+(define (ac-thread-taker-free? ch)
+  (> (async-chan-takew ch) (ac-qlen ch)))
+
 ;; alt-deliver! — call ONLY after alt-claim! returned #t. The mailbox write and
 ;; the wake decision happen under wmu so a fiber-waiter's park (which checks the
 ;; mailbox and sets its state under the SAME wmu, see jolt-fiber-waiter-wait!)
@@ -137,7 +293,8 @@
 ;; The resume runs under wmu and takes the run-queue mutex — a leaf lock never
 ;; acquired by the fiber park path, so the order above has no cycle.
 (define jolt-fiber-wake-fn #f)  ; set by fibers-async.ss (loads after this file)
-;; R4: the fiber alts! await — (jolt-fiber-alt-await-fn h) -> [val port], parked.
+;; R4: the fiber alts! await — (jolt-fiber-alt-await-fn h ibox) -> [val port],
+;; parked; #f when IBOX (alts!!'s interrupt box, else #f) interrupted it.
 ;; Set by fibers-async.ss (loads after this file); #f until then, which is fine
 ;; because no alts! can run before the boot finishes loading.
 (define jolt-fiber-alt-await-fn #f)
@@ -181,7 +338,7 @@
                  (else
                   (if (> (async-chan-cap ch) 0)
                       (< (ac-qlen ch) (async-chan-cap ch))
-                      (> (async-chan-takew ch) 0))))
+                      (ac-thread-taker-free? ch))))
                (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
                (if (alt-claim! h)
                    (begin
@@ -209,31 +366,36 @@
                    (set! progress #t)) ; dead registration
                (drain-putters))
               (else #f)))))
-      ;; Step 3: pair alt-putters with alt-takers directly (unbuffered channels
-      ;; where a putter and taker are both parked). Only when a blocking taker
-      ;; or active alt-taker exists to consume the value.
-      (let pair-loop ()
-        (when (and (pair? (async-chan-alt-putters ch))
-                   (pair? (async-chan-alt-takers ch))
-                   (or (> (async-chan-takew ch) 0)
-                       (ormap (lambda (h) (alt-handler-active? h))
-                              (async-chan-alt-takers ch))))
-          (let* ((hp (car (async-chan-alt-putters ch)))
-                 (h (car hp)) (v (cdr hp)))
-            (if (alt-claim! h)
-                (begin
-                  (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
-                  ;; Commit the value: unbuffered rendezvous push
-                  (let ((box (vector #f)))
-                    (ac-qpush! ch (cons v box))
-                    (ac-broadcast! ch))
-                  (alt-deliver! h #t ch)
-                  (set! progress #t)
-                  (pair-loop))
-                (begin
-                  (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
-                  (set! progress #t)
-                  (pair-loop))))))
+      ;; Step 3: pair a parked alt-putter with a parked alt-taker directly, on an
+      ;; unbuffered channel. Both handlers are claimed together (alt-claim-pair!)
+      ;; and the value goes straight into the taker's mailbox, so the putter hears
+      ;; true only when a live taker received it. A handler never pairs with
+      ;; itself: an alts!! that both takes from and puts to the same channel is
+      ;; two ops that cannot be each other's partner.
+      ;; The first putter with a partner pairs, not only the head: a head putter
+      ;; whose one taker is itself must not keep a later putter from that taker.
+      (when (and (eqv? (async-chan-cap ch) 0) (not (async-chan-xrf ch)))
+        (let pair-loop ()
+          (when (pair? (async-chan-alt-takers ch))
+            (let scan ((ps (async-chan-alt-putters ch)))
+              (when (pair? ps)
+                (let* ((hp (car ps)) (h (car hp)) (v (cdr hp))
+                       (t (find (lambda (x) (not (eq? x h))) (async-chan-alt-takers ch))))
+                  (if (not t)
+                      (scan (cdr ps))
+                      (begin
+                        (case (alt-claim-pair! h t)
+                          ((ok)
+                           (async-chan-alt-putters-set! ch (remq hp (async-chan-alt-putters ch)))
+                           (async-chan-alt-takers-set! ch (remq t (async-chan-alt-takers ch)))
+                           (alt-deliver! t v ch)
+                           (alt-deliver! h #t ch))
+                          ((putter)
+                           (async-chan-alt-putters-set! ch (remq hp (async-chan-alt-putters ch))))
+                          (else
+                           (async-chan-alt-takers-set! ch (remq t (async-chan-alt-takers ch)))))
+                        (set! progress #t)
+                        (pair-loop)))))))))
       (when progress (loop))))
   (ac-broadcast! ch))
 
@@ -304,7 +466,9 @@
 ;; >! / >!! — put, blocking. false if closed; nil may not be put. With a
 ;; transducer the value is run through it (one put -> zero or more channel values);
 ;; a `reduced` result closes the channel.
-(define (jolt-async-give ch v)
+(define (jolt-async-give ch v) (ac-give ch v #f))
+(define (jolt-async-give!! ch v) (ac-give ch v #t))
+(define (ac-give ch v intr?)
   (async-check-put! v)
   (jolt-with-mutex (async-chan-mu ch)
     (cond
@@ -314,13 +478,15 @@
            ;; Fixed buffered with xform: wait for room, then apply xform.
            ;; The xform step may overfill transiently (e.g. mapcat); the NEXT put
            ;; will wait again.
-           (let loop ()
-             (cond ((async-chan-closed? ch) #f)
+           (let loop ((reg #f))
+             (cond ((async-chan-closed? ch) (ac-done reg #f))
                    ((< (ac-qlen ch) (async-chan-cap ch))
+                    (ac-unreg! reg)
                     (let ((r (ac-xrf-apply ch v)))
                       (when (jolt-reduced? r) (ac-close! ch))
                       #t))
-                   (else (ac-cv-wait ch) (loop))))
+                   ((ac-wait! ch intr? reg) => loop)
+                   (else (jolt-interrupted-throw! ">!!"))))
            ;; Unbuffered with xform: apply immediately (output goes to rendezvous queue)
            (let ((r (ac-xrf-apply ch v)))
              (when (jolt-reduced? r) (ac-close! ch))
@@ -336,18 +502,30 @@
                      #t)
           (else
            (if (> (async-chan-cap ch) 0)
-               (let loop ()                                    ; buffered fixed: wait for room
-                 (cond ((async-chan-closed? ch) #f)
+               (let loop ((reg #f))                            ; buffered fixed: wait for room
+                 (cond ((async-chan-closed? ch) (ac-done reg #f))
                        ((< (ac-qlen ch) (async-chan-cap ch))
+                        (ac-unreg! reg)
                         (ac-qpush! ch (cons v #f)) (ac-notify! ch) #t)
-                       (else (ac-cv-wait ch) (loop))))
-               (let ((box (vector #f)))                        ; unbuffered: rendezvous
-                 (ac-qpush! ch (cons v box))
+                       ((ac-wait! ch intr? reg) => loop)
+                       (else (jolt-interrupted-throw! ">!!"))))
+               (let* ((box (vector #f)) (entry (cons v box))  ; unbuffered: rendezvous
+                      ;; a blocked thread taker is counted before the push: it
+                      ;; takes this value when it wakes and never abandons it, so
+                      ;; the put is done now, as on the JVM, and an interrupt
+                      ;; flag already set stays set rather than withdrawing it
+                      (taken? (ac-thread-taker-free? ch)))
+                 (ac-qpush! ch entry)
                  (ac-notify! ch)
-                  (let loop ()
-                   (if (vector-ref box 0)
-                       #t
-                       (begin (ac-cv-wait ch) (loop))))))))))))
+                 (let loop ((reg #f))
+                   (cond ((or taken? (vector-ref box 0)) (ac-done reg #t))
+                         ((ac-wait! ch intr? reg) => loop)
+                         ;; Interrupted before any taker reached it: the entry is
+                         ;; still queued (only a take removes it, and a take sets
+                         ;; box), so retract it — a put that threw must not hand
+                         ;; its value to the next taker.
+                         (else (ac-qremove! ch entry)
+                               (jolt-interrupted-throw! ">!!"))))))))))))
 
 ;; remove + return the head value, waking a parked rendezvous putter.
 (define (ac-take-head! ch)
@@ -365,15 +543,18 @@
 ;; <! / <!! — take, blocking. Drains buffered values, then nil once closed + empty.
 ;; A promise channel PEEKS — its one value stays for every taker.
 ;; When the queue is empty, drains pending alt-putters before parking.
-(define (jolt-async-take ch)
+(define (jolt-async-take ch) (ac-take ch #f))
+(define (jolt-async-take!! ch) (ac-take ch #t))
+(define (ac-take ch intr?)
   (jolt-with-mutex (async-chan-mu ch)
-    (let loop ()
+    (let loop ((reg #f))
       (cond ((eq? (async-chan-kind ch) 'promise)
-             (cond ((not (ac-qempty? ch)) (ac-peek ch))
-                   ((async-chan-closed? ch) jolt-nil)
-                   (else (ac-take-wait ch) (loop))))
-            ((not (ac-qempty? ch)) (ac-take-head! ch))
-            ((async-chan-closed? ch) jolt-nil)
+             (cond ((not (ac-qempty? ch)) (ac-done reg (ac-peek ch)))
+                   ((async-chan-closed? ch) (ac-done reg jolt-nil))
+                   ((ac-take-wait ch intr? reg) => loop)
+                   (else (jolt-interrupted-throw! "<!!"))))
+            ((not (ac-qempty? ch)) (ac-done reg (ac-take-head! ch)))
+            ((async-chan-closed? ch) (ac-done reg jolt-nil))
             ;; drain an alt-putter if one is parked (no xform chans — those
             ;; complete immediately into the buffer via ac-buf-give!)
             ((and (pair? (async-chan-alt-putters ch))
@@ -388,16 +569,22 @@
                      (let ((box (vector #f)))
                        (ac-qpush! ch (cons v box))
                        (ac-broadcast! ch))
-                     (ac-take-head! ch))
-                   (loop))))  ; dead registration, retry
-            (else (ac-take-wait ch) (loop))))))
+                     (ac-done reg (ac-take-head! ch)))
+                   (loop reg))))  ; dead registration, retry
+            ;; An interrupted take leaves nothing behind: it holds no value (it
+            ;; only ever takes one under mu and returns it) and ac-take-wait gives
+            ;; its takew count back, so an offer! after the throw no longer
+            ;; mistakes it for a waiting taker.
+            ((ac-take-wait ch intr? reg) => loop)
+            (else (jolt-interrupted-throw! "<!!"))))))
 
 ;; park in a take, tracking the waiter count so a concurrent offer! to an
-;; unbuffered channel can see that a taker is ready.
-(define (ac-take-wait ch)
+;; unbuffered channel can see that a taker is ready. Answers as ac-wait! does.
+(define (ac-take-wait ch intr? reg)
   (async-chan-takew-set! ch (fx+ 1 (async-chan-takew ch)))
-  (ac-cv-wait ch)
-  (async-chan-takew-set! ch (fx- (async-chan-takew ch) 1)))
+  (let ((next (ac-wait! ch intr? reg)))
+    (async-chan-takew-set! ch (fx- (async-chan-takew ch) 1))
+    next))
 
 ;; non-blocking take for alts!/poll!: a value, jolt-nil (closed+empty), or ac-poll-empty.
 ;; Drains pending alt-putters when the queue is empty (same drain path as jolt-async-take).
@@ -444,15 +631,15 @@
            (if (< (ac-qlen ch) (async-chan-cap ch))
                (begin (ac-qpush! ch (cons v #f)) (ac-notify! ch) 'ok)
                'full))
-          ;; a waiting taker makes the rendezvous possible: a thread parked in a
-          ;; blocking take (takew), or a fiber parked as an alt-taker (R3 — the
-          ;; fiber's <! registers an alt-handler, invisible to takew). Without
-          ;; the alt-taker clause, offer!/put! to an unbuffered channel would
-          ;; report 'full while a fiber waited, and put! would fork a thread
-          ;; instead of completing on the caller.
-          ((or (> (async-chan-takew ch) 0)
-               (ormap (lambda (h) (alt-handler-active? h))
-                      (async-chan-alt-takers ch)))
+          ;; a waiting taker makes the rendezvous possible: a fiber or alts!!
+          ;; parked as an alt-taker (R3 — the fiber's <! registers an
+          ;; alt-handler, invisible to takew), claimed before the value is handed
+          ;; over, or a thread blocked in a take that no queued value is already
+          ;; spoken for by. Without the alt-taker clause, offer!/put! to an
+          ;; unbuffered channel would report 'full while a fiber waited, and put!
+          ;; would fork a thread instead of completing on the caller.
+          ((ac-hand-to-taker! ch v) 'ok)
+          ((ac-thread-taker-free? ch)
            (let ((box (vector #f)))
              (ac-qpush! ch (cons v box))
              (ac-notify! ch)
@@ -510,15 +697,29 @@
 ;;     once true never stops being true.
 (define timeout-mu (make-mutex))
 (define timeout-cv (make-condition))
-;; Pending timeouts as a binary min-heap on deadline — #(deadline . thunk)
+;; Pending timeouts as a binary min-heap on deadline — (deadline . thunk)
 ;; entries in timeout-heap[0..n), guarded by timeout-mu like the sorted list it
 ;; replaces. The list insert walked O(k) per (timeout ms) with k pending —
 ;; O(k^2) to arm a burst — and the consumer only ever takes the MIN, which is
 ;; the heap's O(log k) case. Entries with EQUAL deadlines pop in arbitrary
 ;; order; they were already batched into one collect, so nothing promised an
 ;; order between them.
+;;
+;; CANCELLING IS LAZY. A wait that ends before its deadline — a timed socket read
+;; that got its data, a timed deref that got its value — cancels its entry
+;; (jolt-timer-cancel!), which drops the thunk on the spot: the entry's cdr
+;; becomes #f, so the heap no longer keeps the waiter, or anything the thunk
+;; closes over, reachable. Before this, a fiber that parked with a 5-minute
+;; SO_TIMEOUT stayed pinned by the heap for 5 minutes after its read returned.
+;; The dead entry itself stays in place and is dropped when it reaches the top;
+;; once dead entries outnumber live ones the heap is rebuilt from the live ones,
+;; so it never holds more than twice what is pending. An eager remove would need
+;; every entry to carry its slot, and keeping that slot current costs every sift
+;; a write — measured at 1.25x on arming, which pays for cancels that most
+;; deadlines never see. This way arming is unchanged and a cancel is O(1).
 (define timeout-heap (make-vector 64 #f))
 (define timeout-heap-n 0)
+(define timeout-heap-dead 0)       ; cancelled entries still in the heap
 (define timeout-running? #f)       ; the one timer thread has been forked
 
 (define (theap-less? a b) (< (car a) (car b)))
@@ -536,33 +737,52 @@
               (begin (vector-set! timeout-heap i pv) (sift p))
               (vector-set! timeout-heap i entry)))))
   (set! timeout-heap-n (fx+ timeout-heap-n 1)))
+;; Put ITEM at slot i of a heap of n entries and sift it down into place.
+(define (theap-sift-down! i item n)
+  (let sift ((i i))
+    (let* ((l (fx+ (fx* 2 i) 1))
+           (r (fx+ l 1))
+           (m (if (and (fx<? l n) (theap-less? (vector-ref timeout-heap l) item)) l i))
+           (m (if (and (fx<? r n)
+                       (theap-less? (vector-ref timeout-heap r)
+                                    (if (fx=? m i) item (vector-ref timeout-heap m))))
+                  r m)))
+      (if (fx=? m i)
+          (vector-set! timeout-heap i item)
+          (begin (vector-set! timeout-heap i (vector-ref timeout-heap m)) (sift m))))))
 (define (theap-pop-min!)
   (let ((top (vector-ref timeout-heap 0))
         (n (fx- timeout-heap-n 1)))
     (set! timeout-heap-n n)
     (let ((item (vector-ref timeout-heap n)))
       (vector-set! timeout-heap n #f)
-      (when (fx>? n 0)
-        (let sift ((i 0))
-          (let* ((l (fx+ (fx* 2 i) 1))
-                 (r (fx+ l 1))
-                 (m (if (and (fx<? l n) (theap-less? (vector-ref timeout-heap l) item)) l i))
-                 (m (if (and (fx<? r n)
-                             (theap-less? (vector-ref timeout-heap r)
-                                          (if (fx=? m i) item (vector-ref timeout-heap m))))
-                        r m)))
-            (if (fx=? m i)
-                (vector-set! timeout-heap i item)
-                (begin (vector-set! timeout-heap i (vector-ref timeout-heap m)) (sift m)))))))
+      (when (fx>? n 0) (theap-sift-down! 0 item n)))
     top))
+;; Drop the dead entries and restore the order bottom-up, O(n).
+(define (theap-compact!)
+  (let ((n timeout-heap-n))
+    (let copy ((i 0) (j 0))
+      (if (fx<? i n)
+          (let ((e (vector-ref timeout-heap i)))
+            (vector-set! timeout-heap i #f)
+            (if (cdr e)
+                (begin (vector-set! timeout-heap j e) (copy (fx+ i 1) (fx+ j 1)))
+                (copy (fx+ i 1) j)))
+          (begin
+            (set! timeout-heap-n j)
+            (set! timeout-heap-dead 0)
+            (do ((k (fx- (fxquotient j 2) 1) (fx- k 1))) ((fx<? k 0))
+              (theap-sift-down! k (vector-ref timeout-heap k) j)))))))
 
 ;; -> #t iff the new entry became the earliest deadline, i.e. the caller must
 ;; signal the timer to re-read its wake time (same contract as the old list:
-;; empty, or strictly earlier than the previous minimum).
-(define (timeout-insert! deadline-ms thunk)
+;; empty, or strictly earlier than the previous minimum). A dead minimum only
+;; makes that answer #f where it could have been #t — the timer then wakes at
+;; the dead deadline, which is no later than it was already going to.
+(define (timeout-insert! entry)
   (let ((prev-min (theap-min)))
-    (theap-insert! (cons deadline-ms thunk))
-    (or (not prev-min) (< deadline-ms (car prev-min)))))
+    (theap-insert! entry)
+    (or (not prev-min) (< (car entry) (car prev-min)))))
 
 ;; Everything due, removed from the list, newest deadline last. Called with
 ;; timeout-mu held; answers '() after waiting when nothing is due yet, so the
@@ -570,8 +790,17 @@
 (define (timeout-collect-due!)
   (let due ((acc '()))
     (cond
+      ;; a cancelled entry that reached the top is dropped whatever its deadline
+      ((let ((m (theap-min))) (and m (not (cdr m))))
+       (theap-pop-min!)
+       (set! timeout-heap-dead (fx- timeout-heap-dead 1))
+       (due acc))
       ((let ((m (theap-min))) (and m (<= (car m) (now-millis))))
-       (due (cons (cdr (theap-pop-min!)) acc)))
+       ;; the cdr is cleared as the entry leaves, so a cancel from here on
+       ;; answers #f: the thunk is already on its way to run
+       (let* ((e (theap-pop-min!)) (thunk (cdr e)))
+         (set-cdr! e #f)
+         (due (cons thunk acc))))
       ((pair? acc) (reverse acc))
       (else
        (let ((m (theap-min)))
@@ -598,14 +827,51 @@
 
 ;; (jolt-timer-at! deadline-ms thunk) — run thunk on the timer thread once the
 ;; epoch-millisecond deadline has passed. The one deadline facility in the runtime.
+;; Answers the entry, which is the handle jolt-timer-cancel! takes; a caller with
+;; no use for cancelling ignores it.
 (define (jolt-timer-at! deadline-ms thunk)
-  (jolt-lock! timeout-mu)
-  (when (timeout-insert! deadline-ms thunk)
-    (condition-signal timeout-cv))
-  (unless timeout-running?
-    (set! timeout-running? #t)
-    (fork-thread timeout-thread))
-  (jolt-unlock! timeout-mu))
+  (let ((e (cons deadline-ms thunk)))
+    (jolt-lock! timeout-mu)
+    (when (timeout-insert! e)
+      (condition-signal timeout-cv))
+    (unless timeout-running?
+      (set! timeout-running? #t)
+      (fork-thread/daemon #t timeout-thread))      ; a runtime thread: never keeps the process up
+    (jolt-unlock! timeout-mu)
+    e))
+
+;; (jolt-timer-cancel! handle) — drop a pending deadline before it fires, so the
+;; heap lets go of its thunk now rather than at the deadline. #t when it was still
+;; pending and its thunk will not run; #f when it had already been collected to
+;; run (it may be running now), or was cancelled before. timeout-mu is a leaf
+;; lock — no thunk runs under it — so this is safe to call holding any other lock.
+;; No signal: a cancelled minimum wakes the timer at its old deadline, which
+;; drops it and re-reads.
+(define (jolt-timer-cancel! e)
+  (jolt-with-mutex timeout-mu
+    (and (cdr e)
+         (begin
+           (set-cdr! e #f)
+           (set! timeout-heap-dead (fx+ timeout-heap-dead 1))
+           (when (and (fx>? timeout-heap-n 64)
+                      (fx>? (fx* 2 timeout-heap-dead) timeout-heap-n))
+             (theap-compact!))
+           #t))))
+
+;; Deadlines still to fire, not counting cancelled ones awaiting their drop.
+(define (timeout-pending-count) (fx- timeout-heap-n timeout-heap-dead))
+
+;; The same facility for the Clojure layer: jolt.io-poller wakes a fiber parked
+;; on a socket once its SO_TIMEOUT or connect deadline passes. F runs on the
+;; timer thread, so it must not block; the poller's thunk takes its table lock
+;; and resumes the fiber after releasing it. timer-at! answers the handle
+;; timer-cancel! takes, which a wait that ends first uses to drop its deadline.
+(def-var! "jolt.host" "timer-at!"
+  (lambda (deadline-ms f)
+    (jolt-timer-at! deadline-ms (lambda () (jolt-invoke f)))))
+
+(def-var! "jolt.host" "timer-cancel!"
+  (lambda (h) (jolt-timer-cancel! h)))
 
 ;; (timeout ms) — a channel that closes after ms milliseconds.
 (define (jolt-async-timeout ms)
@@ -617,14 +883,16 @@
 ;; (put! ch v [cb [on-caller?]]) — async put, optional completion callback. If the
 ;; put completes immediately and on-caller? (default #t), the callback runs on the
 ;; calling thread; otherwise on another thread. Returns true unless already closed.
+;; That thread (and take!'s) is a daemon: it stands for core.async's dispatch pool,
+;; and a put or take nobody ever completes must not hold the process up.
 (define (jolt-async-put! ch v . rest)
   (let* ((cb (if (pair? rest) (car rest) jolt-nil))
          (on-caller? (if (and (pair? rest) (pair? (cdr rest))) (jolt-truthy? (cadr rest)) #t))
          (call-cb (lambda (ok) (unless (jolt-nil? cb) (jolt-invoke cb ok)))))
     (case (ac-try-give! ch v)
-      ((ok) (if on-caller? (call-cb #t) (fork-thread (lambda () (*txn* #f) (call-cb #t)))) #t)
-      ((closed) (if on-caller? (call-cb #f) (fork-thread (lambda () (*txn* #f) (call-cb #f)))) #f)
-      (else (fork-thread (lambda () (*txn* #f) (call-cb (jolt-async-give ch v)))) #t))))
+      ((ok) (if on-caller? (call-cb #t) (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb #t)))) #t)
+      ((closed) (if on-caller? (call-cb #f) (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb #f)))) #f)
+      (else (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb (jolt-async-give ch v)))) #t))))
 
 ;; (take! ch cb [on-caller?]) — async take. Same on-caller? rule as put!.
 (define (jolt-async-take! ch cb . rest)
@@ -632,9 +900,9 @@
          (call-cb (lambda (v) (unless (jolt-nil? cb) (jolt-invoke cb v))))
          (r (ac-poll! ch)))
     (cond
-      ((eq? r ac-poll-empty) (fork-thread (lambda () (*txn* #f) (call-cb (jolt-async-take ch)))))
+      ((eq? r ac-poll-empty) (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb (jolt-async-take ch)))))
       (on-caller? (call-cb r))
-      (else (fork-thread (lambda () (*txn* #f) (call-cb r)))))
+      (else (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb r)))))
     jolt-nil))
 
 ;; (go-spawn thunk) — run thunk on a thread; return a buffered(1) channel that
@@ -731,7 +999,8 @@
     ;; registry with no entry for it, and every later monitor would read the
     ;; missing entry as "nothing to report" — the clean-completion answer.
     (go-chan-register! w)
-    (fork-thread
+    ;; a daemon, as core.async's thread and go pools' threads are on the JVM
+    (fork-thread/daemon #t
      (lambda ()
        (*txn* #f)                          ; go/thread body must not inherit parent's txn
        (dyn-binding-stack snap)
@@ -834,8 +1103,9 @@
 ;; put specs. Returns a jolt vector [val port]. priority? is a boolean: #t
 ;; starts scanning at index 0 (declared order); #f picks a random start.
 ;; LOCK ORDER: channel mu → fmu → wmu. Never hold two channel mutexes at once.
-(define (jolt-async-do-alts ports priority?)
-  (let* ((n (pvec-count ports))
+(define (jolt-async-do-alts ports priority? . blocking?)
+  (let* ((intr? (and (pair? blocking?) (jolt-truthy? (car blocking?))))
+         (n (pvec-count ports))
          (start (if (jolt-truthy? priority?) 0 (jolt-random n)))
          (idx-of (lambda (k) (let ((m (fx+ start k))) (if (fx<? m n) m (fx- m n))))))
     ;; FAST PASS: one non-blocking attempt per op, no handler. Consumption here IS
@@ -899,21 +1169,44 @@
                     (lambda ()
                       (if (and f jolt-fiber-alt-await-fn)
                           ;; fiber waiter: park, never block the carrier (the
-                          ;; handler's channel mutexes are all released here)
-                          (let ((r (jolt-fiber-alt-await-fn h)))
+                          ;; handler's channel mutexes are all released here).
+                          ;; #f is an interrupted alts!! — the handler is
+                          ;; claimed, so no op on any port committed.
+                          (let ((r (jolt-fiber-alt-await-fn
+                                    h (and intr? (current-interrupt-box)))))
                             (unregister!)
-                            r)
+                            (or r (jolt-interrupted-throw! "alts!!")))
                           ;; thread waiter: condvar
-                          (begin
-                            (jolt-with-mutex (alt-handler-wmu h)
-                              (let ((mb (alt-handler-mailbox h)))
-                                (let wait-loop ()
-                                  (unless (vector-ref mb 0)
-                                    (jolt-condition-wait (alt-handler-wcv h) (alt-handler-wmu h))
-                                    (wait-loop)))))
-                            (unregister!)
-                            (let ((mb (alt-handler-mailbox h)))
-                              (jolt-vector (vector-ref mb 1) (vector-ref mb 2))))))))
+                          (let* ((wmu (alt-handler-wmu h)) (wcv (alt-handler-wcv h))
+                                 (mb (alt-handler-mailbox h))
+                                 (wait (lambda () (jolt-condition-wait wcv wmu)))
+                                 (await-mailbox
+                                  (lambda (intr?)
+                                    (jolt-with-mutex wmu
+                                      (let wait-loop ((reg #f))
+                                        (cond ((vector-ref mb 0) (ac-done reg #t))
+                                              ((not intr?) (wait) (wait-loop #f))
+                                              ((ac-intr-wait! wmu wcv wait reg) => wait-loop)
+                                              (else #f)))))))
+                            (cond
+                              ((await-mailbox intr?)
+                               (unregister!)
+                               (jolt-vector (vector-ref mb 1) (vector-ref mb 2)))
+                              ;; Interrupted. Claiming the handler is what makes
+                              ;; the throw true: once claimed no port can commit
+                              ;; to it, so nothing was taken and no put landed.
+                              ((alt-claim! h)
+                               (unregister!)
+                               (jolt-interrupted-throw! "alts!!"))
+                              ;; A deliverer claimed it first, so an op DID
+                              ;; complete and its result is on the way. Return it
+                              ;; and give the interrupt back to the flag: the op
+                              ;; finished before the interrupt, not after.
+                              (else
+                               (set-box! (current-interrupt-box) #t)
+                               (await-mailbox #f)
+                               (unregister!)
+                               (jolt-vector (vector-ref mb 1) (vector-ref mb 2)))))))))
               (let reg-loop ((j 0))
                 (if (fx=? j n)
                     (await)
@@ -930,8 +1223,8 @@
                                                (memq (async-chan-kind ch) '(dropping sliding promise))
                                                (and (> (async-chan-cap ch) 0)
                                                     (< (ac-qlen ch) (async-chan-cap ch)))
-                                               (and (fx=? (async-chan-cap ch) 0)
-                                                    (> (async-chan-takew ch) 0)))))
+                                               (and (eqv? (async-chan-cap ch) 0)
+                                                    (ac-thread-taker-free? ch)))))
                                       (cond
                                         ((not ready?)
                                          (async-chan-alt-putters-set! ch
@@ -1003,8 +1296,8 @@
 (cca-def! "__promise-buffer" (lambda () (make-async-buffer 1 'promise)))
 (cca-def! "unblocking-buffer?" jolt-async-unblocking-buffer?)
 (cca-def! "close!" jolt-async-close!)
-(cca-def! "<!" jolt-async-take)   (cca-def! "<!!" jolt-async-take)
-(cca-def! ">!" jolt-async-give)   (cca-def! ">!!" jolt-async-give)
+(cca-def! "<!" jolt-async-take)   (cca-def! "<!!" jolt-async-take!!)
+(cca-def! ">!" jolt-async-give)   (cca-def! ">!!" jolt-async-give!!)
 (cca-def! "timeout" jolt-async-timeout)
 (cca-def! "put!" jolt-async-put!)
 (cca-def! "take!" jolt-async-take!)
@@ -1020,7 +1313,7 @@
 (cca-def! "__poll!" jolt-async-poll!)
 (cca-def! "__offer!" jolt-async-offer!)
 ;; alts! entry point — handler-registration, not poll loop
-(cca-def! "__do-alts" jolt-async-do-alts)
+(cca-def! "__do-alts" jolt-async-do-alts)   ; (ports priority? [blocking?])
 (cca-def! "thread" cca-thread-macro)   (mark-macro! "clojure.core.async" "thread")
 
 ;; go / go-loop are defined by the overlay, but the primitives above pre-seed this

@@ -104,11 +104,16 @@
 ;; fork; we also install an explicit snapshot for certainty). The result — value
 ;; or thrown condition — is latched and broadcast; a cancel that already finalized
 ;; the future makes the late result a no-op.
+;; A future runs on the agent system's cached pool on the JVM, so after
+;; shutdown-agents it is refused, and after it finishes its worker idles for the
+;; pool's keep-alive, holding the process up (exit-linger!, below).
 (define (jolt-future-call thunk)
+  (when (jolt-agents-shutdown?)
+    (jolt-throw (jolt-host-throwable "java.util.concurrent.RejectedExecutionException" jolt-nil)))
   (let* ((ibox (box #f))
          (f (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition) ibox))
          (snap (dyn-binding-stack)))
-    (fork-thread
+    (fork-agent-thread
      (lambda ()
        (*txn* #f)                          ; child thread must not inherit parent's txn
        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
@@ -124,7 +129,8 @@
              (jolt-future-ok?-set! f (car r))
              (jolt-future-payload-set! f (cdr r))
              (jolt-future-done?-set! f #t))
-           (jolt-cv-wake! (jolt-future-cv f))))))
+           (jolt-cv-wake! (jolt-future-cv f)))
+         (exit-linger-after-task!))))
     f))
 
 ;; Wrap a task's captured throw in an ExecutionException, the original as the
@@ -191,7 +197,7 @@
 ;; takes the registry's mutex and then each waiter's, and the worker may itself be
 ;; waiting on something; doing that under mu here would order this future's mutex
 ;; above the whole set of them for no reason.
-(define (jolt-future-cancel f)
+(define (jolt-future-cancel f . interrupt?)
   (let ((cancelled (jolt-with-mutex (jolt-future-mu f)
                      (if (jolt-future-done? f)
                          #f
@@ -199,17 +205,45 @@
                                 (jolt-future-done?-set! f #t)
                                 (jolt-cv-wake! (jolt-future-cv f))
                                 #t)))))
-    (when cancelled
+    ;; Future.cancel(false) cancels without interrupting the worker
+    (when (and cancelled (or (null? interrupt?) (car interrupt?)))
       (let ((b (jolt-future-ibox f)))
         (set-box! b #t)
         (jolt-interrupt-wake-waits! b)))
     cancelled))
 
+
+;; future? / future-done? / future-cancelled? / future-cancel over ANY
+;; java.util.concurrent.Future, as clojure.core defines them on the JVM:
+;; (instance? Future x), .isDone, .isCancelled and .cancel(true). A jolt future
+;; answers from its record; a FutureTask, an executor's future, a
+;; ScheduledFutureTask or a CompletableFuture (or a reify of Future) through its
+;; own methods. They used to accept the jolt future only, so (future? a-FutureTask)
+;; was false and future-done? threw on one. Anything that is not a Future is the
+;; JVM's failed cast.
+(define future-type-sym (jolt-symbol #f "java.util.concurrent.Future"))
+(define (jolt-java-future? x)
+  (let ((r (instance-check future-type-sym x))) (and r (not (jolt-nil? r)))))
+(define (jolt-any-future? x) (or (jolt-future? x) (jolt-java-future? x)))
+(define (future-cast-error x)
+  (jolt-throw
+   (jolt-host-throwable "java.lang.ClassCastException"
+     (string-append "class " (guard (e (#t "?")) (jolt-class-name x))
+                    " cannot be cast to class java.util.concurrent.Future"))))
+(define (future-method x name . args)
+  (record-method-dispatch x name (if (null? args) jolt-nil (list->cseq args))))
 (define (jolt-native-future-done? x)
-  (if (jolt-future? x) (jolt-future-done? x)
-      (jolt-throw (jolt-ex-info "future-done? requires a future" (jolt-hash-map)))))
+  (cond ((jolt-future? x) (jolt-future-done? x))
+        ((jolt-java-future? x) (jolt-truthy? (future-method x "isDone")))
+        (else (future-cast-error x))))
 (define (jolt-native-future-cancelled? x)
-  (and (jolt-future? x) (jolt-future-cancelled? x)))
+  (cond ((jolt-future? x) (jolt-future-cancelled? x))
+        ((jolt-java-future? x) (jolt-truthy? (future-method x "isCancelled")))
+        (else (future-cast-error x))))
+(define (jolt-any-future-cancel x)
+  (cond ((jolt-future? x) (jolt-future-cancel x))
+        ((jolt-java-future? x) (jolt-truthy? (future-method x "cancel" #t)))
+        (else (future-cast-error x))))
 
 ;; --- promises ---------------------------------------------------------------
 ;; A blocking promise (like the JVM): deref parks until deliver, then caches the
@@ -281,7 +315,87 @@
 ;; workers still drain their queues). Mirrors the JVM executor shutdown.
 (define agents-shutdown? (box #f))
 (define (jolt-agents-shutdown?) (unbox agents-shutdown?))
-(define (jolt-shutdown-agents) (set-box! agents-shutdown? #t) jolt-nil)
+(define (jolt-shutdown-agents)
+  (set-box! agents-shutdown? #t)
+  (exit-release-pools!)
+  jolt-nil)
+
+;; --- the process's exit wait ----------------------------------------------------
+;; The JVM ends when the program's main returns only once every live non-daemon
+;; thread has finished; clojure.main does nothing else, so a script whose last act
+;; starts work on a non-daemon thread waits for it. The live count is kept where
+;; every thread is forked (lazy-bridge.ss, exit-nondaemon-live), and a thread's
+;; daemon flag is the one Thread.isDaemon answers, so the two cannot disagree.
+;;
+;; Two more holds stand for the agent system's pools, which jolt does not run
+;; (futures and agent actions get threads of their own) but whose idle workers
+;; keep a JVM up all the same, certified with timing probes on JDK 21:
+;;
+;;   future / future-call / pmap / send-off  the cached "solo" pool: its worker
+;;       idles 60s after its last task, so the process ends 60s after the last one
+;;       finishes. exit-linger-after-task! is called as each task ends, on the
+;;       task's own thread, and only a non-daemon one counts (a pool thread made
+;;       on a daemon thread is a daemon).
+;;   send / await / await-for  the fixed pool: its workers never time out, so
+;;       after one of these the process never ends by itself.
+;;
+;; shutdown-agents ends both at once; what is still running is waited for, as the
+;; JVM's shutdown lets running tasks finish. System/exit, Runtime.halt and an
+;; uncaught error end the process without any of this, as there.
+;; A babashka task (`jolt run`) is the one entry that is not clojure.main: bb's
+;; agent pools are made of DAEMON threads (certified on bb: a future's, a
+;; send-off's isDaemon is true), so a task that leaves a future running ends
+;; without it, and nothing lingers. jolt.main switches this on before a task runs.
+;; A plain Thread and an Executors pool behave as on the JVM under bb too.
+(define agent-threads-daemon? #f)
+(def-var! "jolt.host" "agent-threads-daemon!"
+  (lambda () (set! agent-threads-daemon? #t) jolt-nil))
+;; Otherwise an agent pool thread is never a daemon, whatever thread starts it,
+;; as clojure.core's pools are not, so the exit waits for it.
+(define (fork-agent-thread thunk)
+  (fork-thread/daemon agent-threads-daemon? thunk))
+(define solo-pool-keep-alive-ms 60000)     ; Executors.newCachedThreadPool's 60L, SECONDS
+(define (exit-linger-after-task!)
+  (unless (jolt-thread-daemon? (get-thread-id))
+    (let ((until (+ (now-millis) solo-pool-keep-alive-ms)))
+      (jolt-with-mutex exit-mu
+        (unless exit-pools-shut?
+          (when (or (not exit-linger-until) (> until exit-linger-until))
+            (set! exit-linger-until until)))))))
+(define (exit-hold-pooled!)
+  (unless (or agent-threads-daemon? (jolt-thread-daemon? (get-thread-id)))
+    (jolt-with-mutex exit-mu
+      (unless exit-pools-shut? (set! exit-pooled-held? #t)))))
+(define (exit-release-pools!)
+  (jolt-with-mutex exit-mu
+    (set! exit-pools-shut? #t)
+    (set! exit-pooled-held? #f)
+    (set! exit-linger-until #f)
+    (condition-broadcast exit-cv)))
+;; Blocks the calling THREAD until nothing holds the process up. Called at
+;; process end on the main thread (the CLI's normal return and a built binary's
+;; launcher), never from a fiber.
+(define (jolt-await-user-threads!)
+  (unless exit-wait-skipped? (await-exit-holds!)))
+;; The tooling commands — `jolt build` and its compile workers, the AOT cache
+;; worker — are the compiler, not the program: they load the program's
+;; namespaces to compile them, and a namespace whose top level starts a future
+;; or a pool would otherwise hold the compiler up for that pool's keep-alive
+;; (60s per build for test/chez/build-app, whose app.core derefs a future at
+;; load). They end when their work is done, as a build tool's compile process
+;; does. Set by the CLI dispatch before the command runs.
+(define exit-wait-skipped? #f)
+(define (jolt-skip-exit-wait!) (set! exit-wait-skipped? #t))
+(define (await-exit-holds!)
+  (jolt-with-mutex exit-mu
+    (let loop ()
+      (cond
+        ((fx>? exit-nondaemon-live 0) (jolt-condition-wait exit-cv exit-mu) (loop))
+        (exit-pooled-held? (jolt-condition-wait exit-cv exit-mu) (loop))
+        ((and exit-linger-until (> exit-linger-until (now-millis)))
+         (jolt-condition-wait exit-cv exit-mu (jolt-millis->time exit-linger-until))
+         (loop))
+        (else (void))))))
 
 ;; Thread-local list of (agent f . args) sent from within the action currently
 ;; running on this thread (#f outside an action). Holds nested sends until the
@@ -363,7 +477,7 @@
     (jagent-q-push! a (cons f args))
     (unless (jolt-agent-running? a)
       (jolt-agent-running?-set! a #t)
-      (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
+      (fork-agent-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
   a)
 
 ;; Dispatch the held nested sends accumulated on this thread, returning the count
@@ -393,6 +507,8 @@
                      (begin (jolt-agent-running?-set! a #f)
                             (jolt-cv-wake! (jolt-agent-cv a)) #f)
                      (jagent-q-pop! a)))))
+      ;; idle: the pool worker this stands for would linger (exit wait, below)
+      (unless act (exit-linger-after-task!))
       (when act
         (parameterize ((*agent-nested* (box '())))
           (let ((err #f))
@@ -424,12 +540,31 @@
 ;; them identically — one serialized worker per agent — observably a superset of
 ;; the JVM fixed/cached pool split.) A send after shutdown-agents, to a failed
 ;; agent, inside a transaction, or from within an action is handled specially.
+;; A send after shutdown-agents is the pool REJECTING the action, which the JVM's
+;; Agent catches and hands to the agent's error handler: the send itself returns
+;; the agent and the action never runs (certified: (send a inc) after
+;; shutdown-agents answers the agent). It used to throw RejectedExecutionException.
+;;
+;; send and send-off differ only in the pool the JVM runs the action on, and so in
+;; what keeps the process up after it: send's fixed pool for good, send-off's cached
+;; pool for its keep-alive (the exit wait, below). send-via takes the caller's
+;; executor and holds nothing of the agent system's.
+;; The fixed pool gains a worker only once an action reaches it: a send that
+;; throws (a failed agent) or is rejected holds nothing up.
 (define (jolt-agent-send a f . args)
+  (apply jolt-agent-dispatch a f args)
+  (unless (jolt-agents-shutdown?) (exit-hold-pooled!))
+  a)
+(define (jolt-agent-send-off a f . args)
+  (apply jolt-agent-dispatch a f args))
+(define (jolt-agent-dispatch a f . args)
   (cond
     ((jolt-agents-shutdown?)
-     (jolt-throw (jolt-host-throwable
-                  "java.util.concurrent.RejectedExecutionException"
-                  "Agent pool has been shut down")))
+     (let ((handler (jolt-agent-err-handler a)))
+       (unless (jolt-nil? handler)
+         (guard (_ (#t #f))
+           (jolt-invoke handler a (jolt-host-throwable
+                                   "java.util.concurrent.RejectedExecutionException" jolt-nil))))))
     ((not (jolt-nil? (jolt-agent-err a)))
      (jolt-throw (jolt-host-throwable "java.lang.RuntimeException"
                                       "Agent is failed, needs restart")))
@@ -466,8 +601,11 @@
 ;; it, which is the same two cases the retake makes one: the agent failed before we
 ;; got here, or it failed while we waited (the worker halts and wakes us). Either
 ;; way the JVM throws on a failed agent rather than returning normally.
+;; await and await-for dispatch their latch action with send on the JVM, so they
+;; hold the process up as a send does.
 (define (jolt-agent-await . agents)
   (jolt-agent-await-check)
+  (unless (null? agents) (exit-hold-pooled!))
   (for-each
     (lambda (a)
       (jolt-cv-wait-interruptibly "agent await" (jolt-agent-mu a) (jolt-agent-cv a) #f
@@ -483,6 +621,7 @@
     (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "await-for in transaction")))
   (when (jolt-in-agent-action?)
     (jolt-throw (jolt-host-throwable "java.lang.Exception" "Can't await in agent action")))
+  (unless (null? agents) (exit-hold-pooled!))
   (let ((deadline (ms->deadline-millis ms)) (ok #t))
     (for-each
       (lambda (a)
@@ -542,8 +681,10 @@
   (jolt-with-mutex (jolt-agent-mu a) (jagent-q-count a)))
 (define (jagent-restart-2 a new-state clear?)
   (jolt-agent-restart a new-state (keyword #f "clear-actions") (jolt-truthy? clear?)))
+;; The action runs on jolt's agent worker whatever executor is named; it holds
+;; the exit as that worker does (the 60s linger), not as the fixed send pool.
 (define (jagent-dispatch-3 a f args _exec)
-  (apply jolt-agent-send a f (rd-args->list args)))
+  (apply jolt-agent-dispatch a f (rd-args->list args)))
 (define (jagent-method name argc)
   (cond ((string=? name "getError")        (and (fx=? argc 0) jolt-agent-error))
         ((string=? name "getErrorMode")    (and (fx=? argc 0) jolt-agent-get-error-mode))
@@ -559,6 +700,31 @@
     (if (jolt-agent? obj)
         (let* ((rest (if (jolt-nil? rest-args) (quote ()) (seq->list rest-args)))
                (f (jagent-method method-name (length rest))))
+          (if f (apply f obj rest) (quote pass)))
+        (quote pass))))
+
+;; --- java.util.concurrent.Future on a clojure.core future --------------------
+;; A future is a reify of IDeref, IBlockingDeref, IPending and Future on the JVM,
+;; and records-dispatch.ss answers the IDeref half (.deref, the no-arg .get). The
+;; Future half was missing: (.get f 100 TimeUnit/MILLISECONDS), .isDone,
+;; .isCancelled and .cancel all failed with "No matching method". Same tier as the
+;; agent arm below it, on a disjoint type.
+(define jfuture-timeout (list 'jfuture-timeout))
+(define (jfuture-get-2 f amount unit)
+  (let ((r (jolt-future-deref-timed f (tu->ms amount unit) jfuture-timeout)))
+    (if (eq? r jfuture-timeout) (future-timeout-throw) r)))
+(define (jfuture-method name argc)
+  (cond ((string=? name "get")         (and (fx=? argc 2) jfuture-get-2))
+        ((string=? name "isDone")      (and (fx=? argc 0) jolt-future-done?))
+        ((string=? name "isCancelled") (and (fx=? argc 0) jolt-future-cancelled?))
+        ((string=? name "cancel")
+         (and (fx=? argc 1) (lambda (f b) (jolt-future-cancel f (jolt-truthy? b)))))
+        (else #f)))
+(register-method-arm! arm-priority-agent
+  (lambda (obj method-name rest-args)
+    (if (jolt-future? obj)
+        (let* ((rest (if (jolt-nil? rest-args) (quote ()) (seq->list rest-args)))
+               (f (jfuture-method method-name (length rest))))
           (if f (apply f obj rest) (quote pass)))
         (quote pass))))
 
@@ -623,7 +789,7 @@
           (cond (clear? (jagent-q-clear! a))
                 ((and (not (jagent-q-empty? a)) (not (jolt-agent-running? a)))
                  (jolt-agent-running?-set! a #t)
-                 (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))))))
+                 (fork-agent-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))))))
   ;; Agent.restart answers the NEW STATE, not the agent (and clear-agent-errors,
   ;; which is restart-agent over the current state, answers that state in turn).
   new-state)
@@ -688,7 +854,7 @@
 (define (start-tap-thread!)
   (unless (unbox tap-thread-started?)
     (set-box! tap-thread-started? #t)
-    (fork-thread
+    (fork-thread/daemon #t                 ; clojure.core's tap-loop thread is a daemon
      (lambda ()
        (*txn* #f)
        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
@@ -869,8 +1035,8 @@
 
 ;; --- bind into clojure.core -------------------------------------------------
 (def-var! "clojure.core" "future-call" jolt-future-call)
-(def-var! "clojure.core" "future-cancel" jolt-future-cancel)
-(def-var! "clojure.core" "future?" jolt-future?)
+(def-var! "clojure.core" "future-cancel" jolt-any-future-cancel)
+(def-var! "clojure.core" "future?" jolt-any-future?)
 (def-var! "clojure.core" "future-done?" jolt-native-future-done?)
 (def-var! "clojure.core" "future-cancelled?" jolt-native-future-cancelled?)
 (def-var! "clojure.core" "promise" jolt-promise-new)
@@ -888,10 +1054,10 @@
 (def-var! "clojure.core" "agent" jolt-agent-new)
 (def-var! "clojure.core" "agent?" jolt-agent?)
 (def-var! "clojure.core" "send" jolt-agent-send)
-(def-var! "clojure.core" "send-off" jolt-agent-send)
+(def-var! "clojure.core" "send-off" jolt-agent-send-off)
 ;; send-via takes an executor jolt has no model for; behave as send and ignore it.
 (def-var! "clojure.core" "send-via"
-  (lambda (_exec a f . args) (apply jolt-agent-send a f args)))
+  (lambda (_exec a f . args) (apply jolt-agent-dispatch a f args)))
 ;; Documented superset no-ops: jolt has no executor pool, so these accept and
 ;; ignore their argument, returning nil (as the JVM setters would).
 (def-var! "clojure.core" "set-agent-send-executor!" (lambda (_e) jolt-nil))
@@ -1024,8 +1190,9 @@
 ;;   count  reentrancy depth for the owner
 ;;   cv     thread waiters; condition-wait releases bk atomically with blocking
 ;;   fibers parked fiber waiters, resumed by the release
-;;   box    the interrupt box of the thread the owner took it on — the THREAD
-;;          identity, which is what monitor-owner? needs when the owner is a fiber
+;;   box    the interrupt box of the OS thread the owner took it on — the THREAD
+;;          identity (current-os-thread-box, not the fiber's own box), which is
+;;          what monitor-owner? needs when the owner is a fiber
 ;;   wcv    the WAIT SET's condition — Object.wait/notify, not monitor entry
 ;;   waiters the wait set itself, FIFO. The last two are the condition-variable
 ;;          half and are documented at monitor-object-wait! below; every monitor
@@ -1083,7 +1250,7 @@
     (or (eq? owner me)
         (and (jolt-fiber? owner)
              (not (jolt-current-fiber))
-             (eq? (vector-ref m monitor-i-box) (current-interrupt-box))
+             (eq? (vector-ref m monitor-i-box) (current-os-thread-box))
              (memq (jolt-fiber-state owner) '(done dead))
              #t))))
 
@@ -1107,11 +1274,19 @@
     (if f
         (begin
           (vector-set! m monitor-i-fibers (cons f (vector-ref m monitor-i-fibers)))
+          (jolt-fiber-wstate-set! f (thread-enter-state))
           (jolt-fiber-state-set! f 'parked)
           jolt-lock-parked)
         (begin
-          (jolt-condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))
+          ;; BLOCKED, as the JVM reports a thread entering a monitor; a
+          ;; ReentrantLock's acquire says WAITING instead (thread-enter-state)
+          (call-with-thread-state (thread-enter-state)
+            (lambda ()
+              (jolt-condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))))
           #f))))
+;; What a thread waiting in monitor-wait! is: BLOCKED for a monitor (locking), and
+;; WAITING for a ReentrantLock, which parks on the JVM rather than blocking.
+(define thread-enter-state (make-thread-parameter 'BLOCKED))
 
 ;; The decision is made under bk; a fiber's SWITCH is made outside it, and then the
 ;; whole decision is retaken, because a resume says only that something changed. All
@@ -1129,7 +1304,7 @@
                #f)
               ((not owner)
                (vector-set! m monitor-i-owner me)
-               (vector-set! m monitor-i-box (current-interrupt-box))
+               (vector-set! m monitor-i-box (current-os-thread-box))
                (vector-set! m monitor-i-count 1)
                #f)
               ;; a thread's wait ends under this same bk, so it loops HERE; a fiber
@@ -1159,7 +1334,7 @@
            #t)
           ((not owner)
            (vector-set! m monitor-i-owner me)
-           (vector-set! m monitor-i-box (current-interrupt-box))
+           (vector-set! m monitor-i-box (current-os-thread-box))
            (vector-set! m monitor-i-count 1)
            #t)
           (else #f))))))
@@ -1699,10 +1874,16 @@
     (let ((n jthread-name-counter))
       (set! jthread-name-counter (+ n 1))
       (string-append "Thread-" (number->string n)))))
+;; Slots 8 and 9, daemon and priority, start as the CREATING thread's, which is
+;; the JVM's rule: a Thread made on a daemon thread is a daemon, and one made on a
+;; thread of priority 3 has priority 3.
 (define (make-jthread thunk name)
-  (make-jhost "user-thread"
-              (vector thunk #f (make-mutex) (make-condition) (box #f) #f
-                      (box (or name (next-jthread-name))) #f #f)))
+  (let ((me (get-thread-id)))
+    (let ((t (make-thread-object thunk (or name (next-jthread-name)) #f #f
+                                 (jolt-thread-daemon? me) (jolt-thread-priority me) (box #f))))
+      ;; its creator's group, as on the JVM
+      (vector-set! (jhost-state t) 12 (thread-group-of (current-thread-handle)))
+      t)))
 ;; slot 7: the id of the thread the start forked, #f until then. A rename needs
 ;; it to reach the id-keyed name table the handles read.
 (define (jthread-id st) (vector-ref st 7))
@@ -1711,57 +1892,97 @@
 ;; flag said when it STARTED, and setDaemon on a live thread is an
 ;; IllegalThreadStateException. jolt used to exit the moment -main returned,
 ;; live threads or not, and accept setDaemon silently, so a program whose work
-;; ran on a Thread it started lost that work at exit. Each non-daemon start
-;; counts itself in and its completion counts itself out; the CLI's normal-
-;; return path and a built binary's launcher wait for zero before the shutdown
-;; hooks run (jolt-await-user-threads!). System/exit does not wait -- neither
-;; does the JVM's.
+;; ran on a Thread it started lost that work at exit. The fork counts a non-
+;; daemon thread in and its end counts it out (lazy-bridge.ss), whatever started
+;; it; the CLI's normal-return path and a built binary's launcher wait before the
+;; shutdown hooks run (jolt-await-user-threads!). System/exit does not wait --
+;; neither does the JVM's.
 (define (jthread-daemon? st) (vector-ref st 8))
-(define user-threads-mu (make-mutex))
-(define user-threads-cv (make-condition))
-(define user-threads-live 0)
-(define (user-thread-started!)
-  (jolt-with-mutex user-threads-mu (set! user-threads-live (+ user-threads-live 1))))
-(define (user-thread-finished!)
-  (jolt-with-mutex user-threads-mu
-    (set! user-threads-live (- user-threads-live 1))
-    (when (<= user-threads-live 0) (jolt-cv-wake! user-threads-cv))))
-;; Blocks the calling THREAD until every started non-daemon Thread has finished.
-;; Called at process end on the main thread, never from a fiber.
-(define (jolt-await-user-threads!)
-  (jolt-with-mutex user-threads-mu
-    (let loop ()
-      (when (> user-threads-live 0)
-        (jolt-condition-wait user-threads-cv user-threads-mu)
-        (loop)))))
+;; The runtime id of a thread that is running, else #f. While it runs its name,
+;; daemon status and priority are the id-keyed tables' (every object for it reads
+;; the same); once it has finished they are the object's own slots, which the exit
+;; hook (io.ss) filled before the tables let go.
+(define (jthread-running-id st) (and (not (vector-ref st 1)) (jthread-id st)))
+;; Read one of those: the table's answer, unless the thread finished while it was
+;; read — the hook sets done before it deletes the entry, so a read that missed
+;; the entry for that reason sees done and takes the slot.
+(define (jthread-attr st table-ref slot-ref)
+  (let ((id (jthread-running-id st)))
+    (if id
+        (let ((v (table-ref id)))
+          (if (vector-ref st 1) (slot-ref st) v))
+        (slot-ref st))))
 ;; alive = started and not yet completed. join waits on exactly this, so a thread
 ;; that was never started is not waited for at all (JVM: isAlive is false before
 ;; .start, so join returns at once).
 (define (jthread-alive? st) (and (vector-ref st 5) (not (vector-ref st 1))))
+;; Under st's mutex: the thread is done. The object takes the name, priority and
+;; daemon status the id-keyed tables held, is marked done and its joiners woken,
+;; in that order (jthread-attr relies on it) — ONCE. The body's end and the exit
+;; hook (io.ss) both finish a thread, and the hook runs after the body has
+;; already woken join; copying the tables again there overwrote whatever the
+;; joiner had set since. Thread.setDaemon is legal on a finished thread, so
+;; (.join t) (.setDaemon t true) (.isDaemon t) answered false whenever the hook
+;; landed between the two.
+(define (jthread-finish! st id)
+  (unless (vector-ref st 1)
+    (set-box! (vector-ref st 6) (jolt-thread-name id))
+    (vector-set! st 9 (jolt-thread-priority id))
+    (vector-set! st 8 (jolt-thread-daemon? id))
+    (vector-set! st 1 #t)
+    (jolt-cv-wake! (vector-ref st 3))))
 ;; JVM Thread() is legal: the target is null and run/start are no-ops.
 ;; Thread(), Thread(runnable) and Thread(runnable, name) — the name argument used
 ;; to be accepted and dropped, so a thread the caller had named answered with a
 ;; generated one.
+;; The group forms too — Thread(group, target), Thread(group, target, name),
+;; Thread(group, target, name, stackSize) and Thread(group, name) — and
+;; Thread(String name), whose lone string is the name and not a target.
+(define (thread-ctor-args args)            ; -> (group target name)
+  (let* ((group (and (pair? args) (thread-group? (car args)) (car args)))
+         (rest (if group (cdr args) args))
+         (str-arg (lambda (x) (if (jolt-nil? x) #f (jolt-final-str x)))))
+    (cond ((null? rest) (list group #f #f))
+          ((string? (car rest)) (list group #f (car rest)))           ; (name)
+          (else (list group (if (jolt-nil? (car rest)) #f (car rest))
+                      (if (pair? (cdr rest)) (str-arg (cadr rest)) #f))))))
 (for-each (lambda (nm)
             (register-class-ctor! nm
               (lambda args
-                (make-jthread (if (null? args) #f (car args))
-                              (if (or (null? args) (null? (cdr args)) (jolt-nil? (cadr args)))
-                                  #f
-                                  (jolt-final-str (cadr args)))))))
+                (let* ((a (thread-ctor-args args))
+                       (t (make-jthread (cadr a) (caddr a))))
+                  (when (car a) (vector-set! (jhost-state t) 12 (car a)))
+                  t))))
           '("Thread" "java.lang.Thread"))
 (register-host-methods! "user-thread"
   ;; another thread's frames live on its own continuation, which this thread
   ;; cannot walk: an empty StackTraceElement[]
-  (list (cons "getStackTrace" (lambda (self) (jolt-vector)))
+  (list
+        ;; the calling thread's frames, reconstructed the way an uncaught error's
+        ;; backtrace is (source-registry.ss); another thread's stack is not
+        ;; reachable, so it answers an empty array
+        ;; Self is the running fiber's own object on a fiber (a virtual thread's
+        ;; object has no thread id), the thread's on a thread.
+        (cons "getStackTrace" (lambda (self)
+          (let* ((st (jhost-state self)) (f (jolt-current-fiber)))
+            (if (if f (eq? (jthread-fiber st) f) (eqv? (jthread-id st) (get-thread-id)))
+                (jolt-current-stack-trace)
+                (jolt-vector)))))
+        (cons "getId" (lambda (self) (vector-ref (jhost-state self) 10)))
+        (cons "threadId" (lambda (self) (vector-ref (jhost-state self) 10)))
+        (cons "getContextClassLoader" (lambda (self) (thread-context-class-loader)))
         (cons "start" (lambda (self)
           (let ((st (jhost-state self)))
             (when (vector-ref st 5)
               (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
                                                "Thread already started")))
             (vector-set! st 5 #t)  ; mark started before forking
-            (unless (jthread-daemon? st) (user-thread-started!))
-            (fork-thread (lambda ()
+            (if (jthread-fiber st)
+                (start-virtual-thread! self)
+            ;; born with the object's daemon flag; the object is registered as
+            ;; the thread's by the parent once the fork returns (below) and by the
+            ;; child as its first act, so it is what every way of asking finds
+            (let ((t (fork-thread/daemon (jthread-daemon? st) (lambda ()
                (*txn* #f)                          ; child thread must not inherit parent's txn
                (rdr-default-modes!)                ; and not the reader modes of a read it forked from
                ;; Adopt the Thread object's own interrupt flag, so .interrupt from
@@ -1772,9 +1993,9 @@
                ;; Thread/currentThread (and getAllStackTraces) hands out
                (vector-set! st 7 (get-thread-id))
                (jolt-thread-name-set! (get-thread-id) (unbox (vector-ref st 6)))
-               ;; and register that handle now, so a handle someone else takes for
-               ;; this thread before it first asks who it is is the live one
-               (current-thread-handle)
+               (jolt-thread-priority-set! (get-thread-id) (vector-ref st 9))
+               (register-thread-object! (get-thread-id) self)
+               (thread-handle-cell (cons (get-thread-id) self))
                ;; Thread.start conveys NOTHING: the new thread begins with no
                ;; thread bindings on the JVM, and bound-fn is how a body carries
                ;; the caller's in. Chez hands a forked thread the forking thread's
@@ -1785,18 +2006,31 @@
                ;; surface a thread body's throw like the JVM's default uncaught-
               ;; exception handler; the thread still completes (isAlive/join
               ;; semantics unchanged). Reporting failures are swallowed.
-              (guard (e (#t (guard (_ (#t #f))
-                              (display "Exception in Thread body:\n" (current-error-port))
-                              (jolt-report-throwable e (current-error-port)))))
+              (guard (e (#t (jolt-thread-uncaught! self e "Exception in Thread body:\n")))
                 ;; runnable->thunk and not a bare jolt-invoke: Thread(Runnable)
                 ;; accepts any Runnable on the JVM, and a FutureTask is one (it is
                 ;; registered as such in the class graph). Invoking it directly
                 ;; hung — a FutureTask is a shim value, not a procedure.
                 (let ((th (vector-ref st 0))) (when th (jolt-invoke (runnable->thunk th)))))
               (jolt-with-mutex (vector-ref st 2)
-                 (vector-set! st 1 #t)
-                 (jolt-cv-wake! (vector-ref st 3)))
-              (unless (jthread-daemon? st) (user-thread-finished!))))
+                 (jthread-finish! st (get-thread-id)))))))
+              (let ((id (sa-thread-id-of t)))
+                (when id
+                  ;; the id-keyed name and priority first: getName and
+                  ;; getPriority read them as soon as slot 7 is set
+                  ;; ...unless the child already has, and may have renamed itself
+                  ;; Nothing is registered for a thread that has already
+                  ;; finished: its exit hook has run, and an entry made now
+                  ;; would outlive it (ids are never reused).
+                  (jolt-with-mutex thread-handles-mutex
+                    (when (jolt-started-thread? id)
+                      (unless (hashtable-contains? thread-names-by-id id)
+                        (hashtable-set! thread-names-by-id id (unbox (vector-ref st 6)))
+                        (unless (eqv? 5 (vector-ref st 9))
+                          (hashtable-set! thread-priorities-by-id id (vector-ref st 9))))
+                      (hashtable-set! thread-handles-by-id id self)))
+                  (jolt-with-mutex (vector-ref st 2)
+                    (unless (vector-ref st 7) (vector-set! st 7 id)))))))
             jolt-nil)))
         (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
         ;; join() and join(0) wait indefinitely; join(ms) waits at most ms and
@@ -1826,31 +2060,317 @@
           jolt-nil))
         (cons "isAlive" (lambda (self) (jthread-alive? (jhost-state self))))
         ;; flag then poke, so a wait already parked on a condition this thread
-        ;; registered is thrown out of it rather than merely told afterwards
+        ;; registered is thrown out of it rather than merely told afterwards. A
+        ;; virtual thread's fiber owns its box, so the poke also resumes it from a
+        ;; channel wait (locks.ss jolt-interrupt-owner-set!).
         (cons "interrupt" (lambda (self . _)
-          (let ((b (vector-ref (jhost-state self) 4)))
+          (let* ((st (jhost-state self)) (b (vector-ref st 4)))
             (set-box! b #t)
             (jolt-interrupt-wake-waits! b))
           jolt-nil))
         (cons "isInterrupted" (lambda (self) (and (unbox (vector-ref (jhost-state self) 4)) #t)))
-        (cons "getName" (lambda (self) (unbox (vector-ref (jhost-state self) 6))))
+        ;; once running, the thread's name is the id-keyed table's, which is what
+        ;; an executor's ThreadFactory and a rename from inside write
+        (cons "getName" (lambda (self)
+          (let ((st (jhost-state self)))
+            (jthread-attr st jolt-thread-name (lambda (st) (unbox (vector-ref st 6)))))))
         ;; A rename after .start has to reach the running thread too, or the two
         ;; spellings of the same thread's name disagree.
         (cons "setName" (lambda (self nm)
           (let* ((st (jhost-state self)) (s (jolt-final-str nm)))
             (set-box! (vector-ref st 6) s)
-            (when (jthread-id st) (jolt-thread-name-set! (jthread-id st) s)))
+            (when (jthread-running-id st) (jolt-thread-name-set! (jthread-id st) s)))
           jolt-nil))
         ;; refused while the thread is ALIVE, as Thread.setDaemon checks isAlive():
         ;; before start and after it has finished the flag can still be set.
+        ;; A virtual thread is always a daemon: false is refused before the
+        ;; liveness check, as Thread.setDaemon orders them.
         (cons "setDaemon" (lambda (self flag)
           (let ((st (jhost-state self)))
+            (when (and (not (jolt-truthy? flag))
+                       (let ((f (jthread-fiber st))) (or (eq? f 'virtual) (jolt-fiber? f))))
+              (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
+                                               "'false' not legal for virtual threads")))
             (when (jthread-alive? st)
-              (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
-                                               "Thread is alive")))
+              (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException" jolt-nil)))
             (vector-set! st 8 (and (jolt-truthy? flag) #t)))
           jolt-nil))
-        (cons "isDaemon" (lambda (self) (and (jthread-daemon? (jhost-state self)) #t)))))
+        (cons "isDaemon" (lambda (self)
+          (let ((st (jhost-state self)))
+            (jthread-attr st jolt-thread-daemon? (lambda (st) (and (jthread-daemon? st) #t))))))
+        ;; Priority: advisory, as the JVM documents it, and jolt schedules no
+        ;; differently for it — but it is stored, validated and inherited as there,
+        ;; and once started it is the thread's, so the handle reads the same value.
+        (cons "getPriority" (lambda (self)
+          (let ((st (jhost-state self)))
+            (jthread-attr st jolt-thread-priority (lambda (st) (vector-ref st 9))))))
+        ;; a virtual thread's priority is always NORM_PRIORITY; the argument is
+        ;; still checked, and then ignored, as the JVM does
+        (cons "setPriority" (lambda (self p)
+          (let ((st (jhost-state self)) (p (jolt-thread-priority-arg p)))
+            (unless (jthread-fiber st)
+              (vector-set! st 9 p)
+              (when (jthread-running-id st) (jolt-thread-priority-set! (jthread-id st) p))))
+          jolt-nil))
+        (cons "isVirtual" (lambda (self) (and (jthread-fiber (jhost-state self)) #t)))
+        ;; its group while it lives; nil once it has terminated, as on the JVM
+        (cons "getThreadGroup" (lambda (self) (thread-group-of self)))
+        ;; NEW before start, TERMINATED after; while it runs, what it is waiting in
+        ;; (locks.ss records it), else RUNNABLE. A thread object the fiber layer
+        ;; answers for (jolt-thread-state-hook) reports what that says.
+        (cons "getState" (lambda (self)
+          (let ((st (jhost-state self)))
+            (thread-state-constant
+              (cond ((not (vector-ref st 5)) "NEW")
+                    ((vector-ref st 1) "TERMINATED")
+                    ((jolt-thread-state-hook self) => values)
+                    (else (let ((w (and (jthread-id st) (thread-wait-state (jthread-id st)))))
+                            (if w (symbol->string w) "RUNNABLE"))))))))
+        (cons "setUncaughtExceptionHandler" (lambda (self h)
+          (vector-set! (jhost-state self) 11 (if (jolt-nil? h) #f h))
+          jolt-nil))
+        ;; nil once the thread has terminated, whatever was set; before that the
+        ;; handler set on it, else its ThreadGroup (itself a handler on the JVM)
+        (cons "getUncaughtExceptionHandler" (lambda (self)
+          (let ((st (jhost-state self)))
+            (cond ((vector-ref st 1) jolt-nil)
+                  ((vector-ref st 11) => values)
+                  (else (thread-group-of self))))))))
+
+;; --- uncaught exceptions ---------------------------------------------------
+;; A throw that ends a thread goes to that thread's handler if it has one, else
+;; to the default handler (Thread/setDefaultUncaughtExceptionHandler), else it is
+;; reported — which is the JVM's dispatch through the thread's ThreadGroup. A
+;; handler's own throw is ignored, as the JVM ignores it.
+(define default-uncaught-handler #f)
+(define (jolt-thread-uncaught! th e label)
+  (let* ((x (jolt-unwrap-throw e))
+         (h (or (and th (jhost? th) (vector-ref (jhost-state th) 11))
+                default-uncaught-handler)))
+    (if h
+        (guard (_ (#t #f)) (jolt-fi-call h "uncaughtException" th x))
+        (guard (_ (#t #f))
+          (display label (current-error-port))
+          (jolt-report-throwable e (current-error-port))))))
+(let ((statics
+       (list (cons "setDefaultUncaughtExceptionHandler"
+                   (lambda (h) (set! default-uncaught-handler (if (jolt-nil? h) #f h)) jolt-nil))
+             (cons "getDefaultUncaughtExceptionHandler"
+                   (lambda () (or default-uncaught-handler jolt-nil))))))
+  (register-class-statics! "Thread" statics)
+  (register-class-statics! "java.lang.Thread" statics))
+
+;; --- java.lang.ThreadGroup --------------------------------------------------
+;; A minimal, consistent model: the JVM's two built-in groups, "system" and its
+;; child "main" (every thread jolt runs that no one placed elsewhere is in main,
+;; as the JVM's main thread, its pools' and its futures' threads are), groups a
+;; program makes, and a thread's membership, which a new Thread takes from its
+;; creator. activeCount counts live threads in a group and its subgroups.
+;; State: #(name parent max-priority subgroups).
+(define (make-thread-group name parent)
+  (let ((g (make-jhost "thread-group" (vector name parent 10 '()))))
+    (when parent
+      (let ((pst (jhost-state parent)))
+        (jolt-with-mutex thread-groups-mu
+          (vector-set! pst 3 (cons g (vector-ref pst 3))))))
+    g))
+(define thread-groups-mu (make-mutex))
+(define (thread-group? x) (and (jhost? x) (string=? (jhost-tag x) "thread-group")))
+(define system-thread-group (make-thread-group "system" #f))
+(define main-thread-group (make-thread-group "main" system-thread-group))
+(define (thread-group-parent g) (vector-ref (jhost-state g) 1))
+;; A thread's group: the one it was made in, main when nobody placed it, and nil
+;; once it has terminated.
+(define (thread-group-of th)
+  (let ((st (jhost-state th)))
+    (if (vector-ref st 1) jolt-nil (or (vector-ref st 12) main-thread-group))))
+(define (thread-group-within? g ancestor)
+  (let loop ((g g)) (and g (or (eq? g ancestor) (loop (thread-group-parent g))))))
+(define (live-thread-objects)
+  (let loop ((ids (cons (get-thread-id) (cons jolt-boot-thread-id (live-thread-ids)))) (seen '()) (acc '()))
+    (cond ((null? ids) acc)
+          ((memv (car ids) seen) (loop (cdr ids) seen acc))
+          (else (loop (cdr ids) (cons (car ids) seen) (cons (thread-handle-for-id (car ids)) acc))))))
+(define (thread-group-active-count g)
+  (let loop ((ts (live-thread-objects)) (n 0))
+    (if (null? ts)
+        n
+        (let ((tg (thread-group-of (car ts))))
+          (loop (cdr ts) (if (and (thread-group? tg) (thread-group-within? tg g)) (+ n 1) n))))))
+(define (thread-group-subgroups g)
+  (jolt-with-mutex thread-groups-mu (vector-ref (jhost-state g) 3)))
+(define (thread-group-group-count g)
+  (let loop ((gs (thread-group-subgroups g)) (n 0))
+    (if (null? gs) n (loop (cdr gs) (+ n 1 (thread-group-group-count (car gs)))))))
+;; ThreadGroup(name) is a child of the current thread's group; ThreadGroup(parent, name).
+(for-each (lambda (nm)
+            (register-class-ctor! nm
+              (case-lambda
+                ((name) (make-thread-group (jolt-final-str name)
+                                           (let ((g (thread-group-of (current-thread-handle))))
+                                             (if (thread-group? g) g main-thread-group))))
+                ((parent name)
+                 (unless (thread-group? parent) (throw-jvm 'NullPointerException jolt-nil))
+                 (make-thread-group (jolt-final-str name) parent)))))
+          '("ThreadGroup" "java.lang.ThreadGroup"))
+(register-host-methods! "thread-group"
+  (list (cons "getName" (lambda (self) (vector-ref (jhost-state self) 0)))
+        (cons "getParent" (lambda (self) (or (thread-group-parent self) jolt-nil)))
+        (cons "getMaxPriority" (lambda (self) (vector-ref (jhost-state self) 2)))
+        (cons "setMaxPriority" (lambda (self p)
+          (let ((n (jnum->exact p)))
+            (when (and (integer? n) (<= 1 n 10)) (vector-set! (jhost-state self) 2 n)))
+          jolt-nil))
+        ;; true of this group and of any group under it
+        (cons "parentOf" (lambda (self g) (and (thread-group? g) (thread-group-within? g self) #t)))
+        (cons "activeCount" (lambda (self) (thread-group-active-count self)))
+        (cons "activeGroupCount" (lambda (self) (thread-group-group-count self)))
+        (cons "isDaemon" (lambda (self) #f))
+        ;; a ThreadGroup is its threads' uncaught-exception handler by default
+        (cons "uncaughtException" (lambda (self th e)
+          (jolt-thread-uncaught! #f e "Exception in Thread body:\n") jolt-nil))
+        (cons "toString" (lambda (self)
+          (string-append "java.lang.ThreadGroup[name=" (vector-ref (jhost-state self) 0)
+                         ",maxpri=" (number->string (vector-ref (jhost-state self) 2)) "]")))))
+(register-str-render! thread-group?
+  (lambda (g) (string-append "java.lang.ThreadGroup[name=" (vector-ref (jhost-state g) 0)
+                             ",maxpri=" (number->string (vector-ref (jhost-state g) 2)) "]")))
+;; Thread/activeCount: the live threads in the current thread's group.
+(let ((statics (list (cons "activeCount"
+                           (lambda () (let ((g (thread-group-of (current-thread-handle))))
+                                        (if (thread-group? g) (thread-group-active-count g) 0)))))))
+  (register-class-statics! "Thread" statics)
+  (register-class-statics! "java.lang.Thread" statics))
+
+;; --- java.lang.Thread$State --------------------------------------------------
+;; The enum getState answers, one object per constant so = compares them.
+(define thread-state-names '("NEW" "RUNNABLE" "BLOCKED" "WAITING" "TIMED_WAITING" "TERMINATED"))
+(define thread-state-constants
+  (map (lambda (nm) (cons nm (make-jhost "thread-state" nm))) thread-state-names))
+(define (thread-state-constant nm) (cdr (assoc nm thread-state-constants)))
+;; For a thread the runtime does not track by id — a fiber's own Thread object —
+;; the fiber layer answers its state name here ("WAITING" while it is parked, say),
+;; or #f to fall through to the OS-thread answer.
+(define jolt-thread-state-hook (lambda (th) #f))
+(let ((statics (append thread-state-constants
+                       (list (cons "values" (lambda () (apply jolt-vector (map cdr thread-state-constants))))
+                             (cons "valueOf"
+                                   (lambda (nm)
+                                     (let ((hit (assoc (jolt-final-str nm) thread-state-constants)))
+                                       (if hit
+                                           (cdr hit)
+                                           (throw-jvm 'IllegalArgumentException
+                                                      (string-append "No enum constant java.lang.Thread.State."
+                                                                     (jolt-final-str nm)))))))))))
+  (register-class-statics! "java.lang.Thread$State" statics)
+  (register-class-statics! "Thread$State" statics))
+(register-host-methods! "thread-state"
+  (list (cons "name" (lambda (self) (jhost-state self)))
+        (cons "toString" (lambda (self) (jhost-state self)))
+        (cons "ordinal" (lambda (self)
+          (let loop ((ns thread-state-names) (i 0))
+            (if (string=? (car ns) (jhost-state self)) i (loop (cdr ns) (+ i 1))))))))
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "thread-state")))
+                      (lambda (x) (jhost-state x)))
+
+;; --- java.lang.management.ThreadMXBean (the current thread's CPU clock) -----
+;; ManagementFactory/getThreadMXBean, for what callers time with it: the CPU time
+;; of the CALLING thread, which — unlike wall time — does not grow while other
+;; processes hold the CPU. Chez's thread clock counts user and system time
+;; together, so getCurrentThreadUserTime answers the same total (the JVM's
+;; excludes system time; it is never larger than the CPU time on either).
+(define (current-thread-cpu-nanos)
+  (let ((t (current-time 'time-thread)))
+    (+ (* (time-second t) 1000000000) (time-nanosecond t))))
+(define the-thread-mx-bean (make-jhost "thread-mx-bean" #f))
+;; How many mutexes the runtime has allocated so far (locks.ss).
+(def-var! "jolt.host" "mutex-allocations" (lambda () (unbox jolt-mutex-allocations)))
+(register-host-methods! "thread-mx-bean"
+  (list (cons "getCurrentThreadCpuTime" (lambda (self) (current-thread-cpu-nanos)))
+        (cons "getCurrentThreadUserTime" (lambda (self) (current-thread-cpu-nanos)))
+        (cons "isCurrentThreadCpuTimeSupported" (lambda (self) #t))
+        (cons "isThreadCpuTimeSupported" (lambda (self) #t))
+        (cons "isThreadCpuTimeEnabled" (lambda (self) #t))))
+(let ((statics (list (cons "getThreadMXBean" (lambda () the-thread-mx-bean)))))
+  (register-class-statics! "ManagementFactory" statics)
+  (register-class-statics! "java.lang.management.ManagementFactory" statics))
+
+;; --- virtual threads --------------------------------------------------------
+;; getState for a virtual thread is its fiber's: RUNNABLE while it runs or waits
+;; for a turn, WAITING while parked, or what the park recorded (TIMED_WAITING for a
+;; wait with a deadline, BLOCKED entering a monitor). NEW and TERMINATED are the
+;; object's own, answered before the hook.
+(set! jolt-thread-state-hook
+  (lambda (th)
+    (let ((f (jthread-fiber (jhost-state th))))
+      (and (jolt-fiber? f)
+           (case (jolt-fiber-state f)
+             ((parked) (symbol->string (or (jolt-fiber-wstate f) 'WAITING)))
+             ((done dead) "TERMINATED")
+             (else "RUNNABLE"))))))
+;; A virtual thread's group while it lives, as the JVM's: "VirtualThreads", under
+;; "system".
+(define virtual-thread-group (make-thread-group "VirtualThreads" system-thread-group))
+;; A virtual thread is a fiber (fibers.ss), and its Thread object is the one
+;; Thread/currentThread answers inside it (io.ss virtual-thread-object). Its fiber
+;; slot is 'virtual on an object made by a builder and not started yet, then the fiber.
+;; The body's throw is reported as an uncaught exception, as the JVM's default
+;; handler does, and the fiber ends normally.
+(define (start-virtual-thread! obj)
+  (let* ((st (jhost-state obj))
+         (r (vector-ref st 0))
+         (thunk (lambda ()
+                  (*txn* #f)
+                  (guard (e (#t (jolt-thread-uncaught! obj e "Exception in virtual thread:\n")))
+                    (when r (jolt-invoke (runnable->thunk r))))
+                  jolt-nil)))
+    (jolt-fiber-spawn* thunk (vector-ref st 4) (lambda (f) (bind-virtual-thread! obj f)))
+    (jolt-fiber-ensure-carrier!)
+    obj))
+(define (unstarted-virtual-thread r name)
+  (let ((obj (make-thread-object r name #f #f #t 5 (box #f))))
+    (jthread-fiber-set! (jhost-state obj) 'virtual)
+    (vector-set! (jhost-state obj) 12 virtual-thread-group)
+    obj))
+;; Thread.ofVirtual(): a builder. name(String) names every thread it makes;
+;; name(prefix, start) numbers them from start. unstarted/start/factory as on the
+;; JVM. State #(name counter mutex). A factory is a SNAPSHOT of its builder's name
+;; and counter, counting on its own from there, and is thread-safe as the JDK's
+;; is (the mutex); a builder is not, and has none.
+(define (vbuilder-next-name! st)
+  (define (next!)
+    (let ((n (vector-ref st 1)))
+      (if n
+          (begin (vector-set! st 1 (+ n 1))
+                 (string-append (vector-ref st 0) (number->string n)))
+          (vector-ref st 0))))
+  (let ((mu (vector-ref st 2)))
+    (if mu (jolt-with-mutex mu (next!)) (next!))))
+(define (vbuilder-unstarted st r) (unstarted-virtual-thread r (vbuilder-next-name! st)))
+(register-host-methods! "vthread-builder"
+  (list (cons "name" (lambda (self nm . start)
+          (let ((st (jhost-state self)))
+            (vector-set! st 0 (jolt-final-str nm))
+            (vector-set! st 1 (if (pair? start) (jnum->exact (car start)) #f)))
+          self))
+        (cons "unstarted" (lambda (self r) (vbuilder-unstarted (jhost-state self) r)))
+        (cons "start" (lambda (self r)
+          (let ((t (vbuilder-unstarted (jhost-state self) r)))
+            (vector-set! (jhost-state t) 5 #t)
+            (start-virtual-thread! t))))
+        (cons "factory" (lambda (self)
+          (let ((st (jhost-state self)))
+            (make-jhost "vthread-factory" (vector (vector-ref st 0) (vector-ref st 1) (make-mutex))))))))
+(register-host-methods! "vthread-factory"
+  (list (cons "newThread" (lambda (self r) (vbuilder-unstarted (jhost-state self) r)))))
+(let ((statics (list (cons "ofVirtual" (lambda () (make-jhost "vthread-builder" (vector "" #f #f))))
+                     (cons "startVirtualThread"
+                           (lambda (r)
+                             (let ((t (unstarted-virtual-thread r "")))
+                               (vector-set! (jhost-state t) 5 #t)
+                               (start-virtual-thread! t)))))))
+  (register-class-statics! "Thread" statics)
+  (register-class-statics! "java.lang.Thread" statics))
 
 (define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _) (make-jlatch (jnum->exact n)))))
@@ -1900,38 +2420,67 @@
 ;; #f unconditionally, which left invokeAll's deadline and invokeAny's losers with
 ;; nothing to cancel WITH.
 ;;
-;; Cancelling a task that is already RUNNING does not stop it: an executor worker
-;; carries no interrupt flag for a cancel to set (the same limit shutdownNow
-;; documents below). The future still finalizes as cancelled, so .get raises and
-;; the late result is dropped, exactly as a cancel that lands during the JVM's
-;; own window does.
+;; Cancelling a task that is already RUNNING finalizes the future as cancelled —
+;; .get raises and the late result is dropped — and cancel(true) also interrupts
+;; the thread running it (task-runners, below), as the JVM's does.
 (define (make-j-future) (make-jhost "j-future" (vector 'new jolt-nil #f (make-mutex) (make-condition))))
 (define (j-future-settled? status) (and (memq status '(done cancelled)) #t))
 ;; A missed deadline, as a value the waiter can test: eq?-unique, so no task
 ;; result can be mistaken for one.
 (define j-future-timed-out (list 'j-future-timed-out))
+;; THE RUNNER, for cancel(true). A task future records the interrupt box of the
+;; thread running it while it runs — under the future's own mutex, the one its
+;; claim and its completion take — so a cancel that finds it still unsettled
+;; finds the runner too, and one that finds it settled interrupts nobody. Kept
+;; aside rather than in the futures' vectors because three layouts share this
+;; (j-future, the scheduled future that extends it, FutureTask).
+(define task-runners (make-weak-eq-hashtable))
+(define task-runners-mu (make-mutex))
+(define (task-runner-set! fut)
+  (jolt-with-mutex task-runners-mu (hashtable-set! task-runners fut (current-interrupt-box))))
+(define (task-runner-clear! fut)
+  (jolt-with-mutex task-runners-mu (hashtable-delete! task-runners fut)))
+(define (task-runner fut)
+  (jolt-with-mutex task-runners-mu (hashtable-ref task-runners fut #f)))
+;; cancel(true)'s second half: the runner's flag is SET under the future's mutex
+;; (so it cannot land after the task has completed and the worker moved on), and
+;; the poke that throws it out of an interruptible wait comes after, outside it.
+;; A stale poke reaching the worker's next task finds the flag cleared and waits
+;; on (executor-worker-loop* clears it before each task, as the JVM's runWorker
+;; does).
+(define (task-interrupt-runner! b)
+  (when b (jolt-interrupt-wake-waits! b)))
 (define (j-future-complete! self thunk)
   (let ((st (jhost-state self)))
     ;; claim the task, or leave it alone: a cancelled future's thunk never runs.
     (when (jolt-with-mutex (vector-ref st 3)
             (and (eq? (vector-ref st 0) 'new)
-                 (begin (vector-set! st 0 'running) #t)))
+                 (begin (vector-set! st 0 'running) (task-runner-set! self) #t)))
       (let ((r (guard (e (#t (vector-set! st 2 e) #f)) (jolt-invoke thunk))))
         (jolt-with-mutex (vector-ref st 3)
+          (task-runner-clear! self)
           ;; a cancel that landed while this ran keeps the future cancelled
           (unless (eq? (vector-ref st 0) 'cancelled)
             (unless (vector-ref st 2) (vector-set! st 1 r))
             (vector-set! st 0 'done))
           (jolt-cv-wake! (vector-ref st 4)))))))
-;; Answers #t iff THIS call cancelled it, as Future.cancel does.
-(define (j-future-cancel! self)
-  (let ((st (jhost-state self)))
-    (jolt-with-mutex (vector-ref st 3)
-      (if (j-future-settled? (vector-ref st 0))
-          #f
-          (begin (vector-set! st 0 'cancelled)
-                 (jolt-cv-wake! (vector-ref st 4))
-                 #t)))))
+;; Future.cancel(mayInterruptIfRunning): wins over a task that has not settled,
+;; running or not, and with MAY set interrupts the thread running it — which is
+;; what cancel(true), future-cancel, invokeAll's deadline and invokeAny's losers
+;; all mean on the JVM. It used to only mark the future, and the task ran on.
+(define (j-future-cancel! self . may)
+  (let* ((st (jhost-state self))
+         (may? (and (pair? may) (car may)))
+         (r (jolt-with-mutex (vector-ref st 3)
+              (if (j-future-settled? (vector-ref st 0))
+                  #f
+                  (let ((b (and may? (task-runner self))))
+                    (vector-set! st 0 'cancelled)
+                    (when b (set-box! b #t))
+                    (jolt-cv-wake! (vector-ref st 4))
+                    (or b #t))))))
+    (when (box? r) (task-interrupt-runner! r))
+    (and r #t)))
 ;; get() waits for the task; get(timeout, unit) gives up at the deadline and throws
 ;; TimeoutException, like the JVM. The timeout used to be discarded, so the bounded
 ;; overload waited forever on a task that never finished.
@@ -1960,15 +2509,15 @@
 (define (j-future-get* self ms on-timeout)
   (j-future-get-until self (and ms (ms->deadline-millis ms)) on-timeout))
 (define (future-timeout-throw)
-  (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException"
-                                   "timed out waiting for the task")))
+  ;; no message: FutureTask.get's TimeoutException carries none on the JVM
+  (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException" jolt-nil)))
 (define (j-future-get self . args)
   (j-future-get* self (tu-args->ms args) future-timeout-throw))
 (register-host-methods! "j-future"
   (list (cons "get" j-future-get)
         (cons "isDone" (lambda (self) (j-future-settled? (vector-ref (jhost-state self) 0))))
         (cons "isCancelled" (lambda (self) (eq? (vector-ref (jhost-state self) 0) 'cancelled)))
-        (cons "cancel" (lambda (self . _) (j-future-cancel! self)))))
+        (cons "cancel" (lambda (self may) (j-future-cancel! self (jolt-truthy? may))))))
 ;; executor-service state: #(shutdown? queue-box queue-mutex task-cond
 ;; live-workers advisory-queue-capacity core-workers max-workers keep-alive-ms
 ;; idle-workers queue-depth term-cond starting-workers delayed lead seq) — the
@@ -2031,11 +2580,19 @@
 ;; way, which is why the test is a depth against a count rather than a handoff.
 (define executor-unbounded-workers 2147483647)   ; Integer.MAX_VALUE, as the JVM passes
 (define cached-pool-keep-alive-ms 60000)         ; 60L, TimeUnit.SECONDS, as the JVM passes
-(define (make-executor* tag core-n max-n keep-alive-ms cap)
+;; SPEC is (daemon factory), both optional: slots 16 and 17, what the pool's
+;; workers are born as. A pool Executors builds with its defaultThreadFactory has
+;; non-daemon workers, which is the default; a ForkJoin-style pool's are daemons;
+;; and a ThreadFactory the caller passed decides for itself, per worker, through
+;; the Thread its newThread answers (executor-spawn-worker!).
+(define (make-executor* tag core-n max-n keep-alive-ms cap . spec)
   (let ((self (make-jhost tag
                           (vector #f (box (cons '() '())) (make-mutex) (make-condition) 0
                                   cap core-n max-n keep-alive-ms 0 0 (make-condition) 0
-                                  '() #f 0))))
+                                  '() #f 0
+                                  (and (pair? spec) (car spec) #t)
+                                  (and (pair? spec) (pair? (cdr spec)) (cadr spec))
+                                  '() #f #f))))
     (let ((st (jhost-state self)))
       ;; The core workers, eagerly. Above core, a worker appears when a task
       ;; arrives with nobody idle to take it, and not before: a cached pool that
@@ -2046,19 +2603,26 @@
             (executor-spawn-worker! st))
           (spawn (fx- k 1))))
       self)))
-;; A fixed pool: n eager workers that never retire, and the advisory capacity a
-;; ThreadPoolExecutor's queue argument contributes to .getQueue's view.
-(define (make-executor n-workers . cap)
-  (make-executor* "executor-service" n-workers n-workers #f (if (null? cap) #f (car cap))))
-;; newCachedThreadPool / newVirtualThreadPerTaskExecutor.
-(define (make-cached-executor)
-  (make-executor* "executor-service" 0 executor-unbounded-workers cached-pool-keep-alive-ms #f))
+;; newCachedThreadPool / newVirtualThreadPerTaskExecutor. SPEC as make-executor*.
+(define (make-cached-executor . spec)
+  (apply make-executor* "executor-service" 0 executor-unbounded-workers cached-pool-keep-alive-ms #f spec))
 ;; newScheduledThreadPool / newSingleThreadScheduledExecutor / the
 ;; ScheduledThreadPoolExecutor ctor: a fixed pool (the JVM's grows to
 ;; Integer.MAX_VALUE on paper and never does in practice, its queue being
 ;; unbounded) whose tag adds the three schedule methods.
-(define (make-scheduled-executor n-workers)
-  (make-executor* "scheduled-executor" n-workers n-workers #f #f))
+(define (make-scheduled-executor n-workers . spec)
+  (apply make-executor* "scheduled-executor" n-workers n-workers #f #f spec))
+
+;; The ThreadFactory argument of an Executors factory or a pool constructor, or
+;; #f: anything answering newThread. (A RejectedExecutionHandler in the same
+;; position of the other ThreadPoolExecutor overload does not.)
+(define (thread-factory-arg x)
+  (and (not (jolt-nil? x)) (not (procedure? x))
+       (or (iface-method x "newThread" 2)
+           (and (jhost? x) (host-method-ref (jhost-tag x) "newThread")))
+       x))
+(define (thread-factory-in args)
+  (let loop ((as args)) (cond ((null? as) #f) ((thread-factory-arg (car as)) => values) (else (loop (cdr as))))))
 
 ;; Claim a worker slot, or answer #f because the pool is at max. Called with the
 ;; queue mutex HELD, and the slot is claimed BEFORE the fork rather than counted
@@ -2090,10 +2654,29 @@
                                     (jolt-cv-wake! (vector-ref st 11))
                                     (fx=? 0 (vector-ref st 4)))))
                   (when none-left? (raise e)))))
-    (fork-thread (lambda ()
-      (*txn* #f)      ; worker must not inherit the creating thread's txn
-      (rdr-default-modes!)                ; and not the reader modes of a read it forked from
-      (executor-worker-loop st)))))
+    ;; A pool with a ThreadFactory hands it the worker, as the JVM's does —
+    ;; newThread(worker) — and STARTS the Thread it answers: the worker runs on
+    ;; that Thread, so Thread/currentThread in a task is it (its name, daemon
+    ;; flag, priority and uncaught-exception handler), and a factory that wraps
+    ;; the Runnable it was handed sees its wrapper run. Without a factory, the
+    ;; worker is a thread of the pool's own daemon status (a factory answering
+    ;; nil gets the same).
+    (let* ((worker (lambda ()
+                     (*txn* #f)                ; not the creating thread's txn
+                     (rdr-default-modes!)      ; nor the reader modes of a read it forked from
+                     (executor-worker-loop st)
+                     jolt-nil))
+           (factory (vector-ref st 17))
+           (t (and factory
+                   (let ((t (record-method-dispatch factory "newThread" (jolt-list worker))))
+                     (and (not (jolt-nil? t)) t)))))
+      (if t
+          (record-method-dispatch t "start" jolt-nil)
+          (fork-thread/daemon (vector-ref st 16)
+            (lambda ()
+              (guard (e (#t (jolt-thread-uncaught! (current-thread-handle) e
+                                                   "Exception in executor task:\n")))
+                (worker))))))))
 
 ;; Dequeue, with the mutex held. Callers test queue-depth first.
 (define (executor-dequeue! st)
@@ -2180,7 +2763,8 @@
 ;; the waits above carry deadlines rather than durations.
 (define (executor-take-job! st)
   (let poll ((deadline #f))
-    (cond ((fx>? (vector-ref st 10) 0) (executor-lead-handoff! st) (executor-dequeue! st))
+    (cond ((executor-stopping? st) (executor-worker-exit! st))    ; shutdownNow: take nothing
+          ((fx>? (vector-ref st 10) 0) (executor-lead-handoff! st) (executor-dequeue! st))
           ((executor-delayed-due? st)                      ; the head's time has come
            (let ((sf (executor-delayed-pop! st)))
              (executor-lead-handoff! st)
@@ -2188,7 +2772,8 @@
                         (scheduled-future-run! sf st))))
           ((and (vector-ref st 0) (null? (vector-ref st 13)))
            (executor-worker-exit! st))                     ; shutdown + drained
-          ((and (vector-ref st 8) (fx>? (vector-ref st 4) (vector-ref st 6)))
+          ;; above core, or any worker once allowCoreThreadTimeOut is on
+          ((and (vector-ref st 8) (or (vector-ref st 19) (fx>? (vector-ref st 4) (vector-ref st 6))))
            (let ((dl (or deadline (+ (now-millis) (vector-ref st 8)))))
              (if (>= (now-millis) dl)
                  (executor-worker-exit! st)                ; idle past keep-alive
@@ -2212,15 +2797,31 @@
   ;; over-spawn it prevents, because the growth rule would then read a taker that
   ;; is never coming and decline to grow for good — a pool that strands the task
   ;; instead of one that runs it on a thread too many.
+  ;; Slot 18 lists the live workers' interrupt boxes, so shutdownNow can
+  ;; interrupt the tasks they are running, as the JVM's does.
+  (let ((box (current-interrupt-box)))
+    (jolt-with-mutex (vector-ref st 2) (vector-set! st 18 (cons box (vector-ref st 18))))
+    (dynamic-wind
+      void
+      (lambda () (executor-worker-loop* st))
+      (lambda ()
+        (jolt-with-mutex (vector-ref st 2) (vector-set! st 18 (remq box (vector-ref st 18))))))))
+(define (executor-worker-loop* st)
   (let ((arriving? #t))
     (define (arrived!)
       (when arriving?
         (set! arriving? #f)
         (vector-set! st 12 (fx- (vector-ref st 12) 1))))
-    (guard (e (#t (jolt-with-mutex (vector-ref st 2) (arrived!) (executor-worker-exit! st))
-                  (guard (_ (#t #f))
-                    (display "Exception in executor worker:\n" (current-error-port))
-                    (jolt-report-throwable e (current-error-port)))))
+    ;; A worker that ends ABRUPTLY — an executed task threw — gives its slot
+    ;; back and, unless the pool is stopping, starts its replacement, as the
+    ;; JVM's processWorkerExit does; then the throw goes on to end this thread,
+    ;; where its uncaught-exception handler sees it (executor-spawn-worker!).
+    (guard (e (#t (let ((again? (jolt-with-mutex (vector-ref st 2)
+                                  (arrived!) (executor-worker-exit! st)
+                                  (and (not (executor-stopping? st))
+                                       (executor-claim-worker! st)))))
+                    (when again? (executor-spawn-worker! st))
+                    (raise e))))
       (let loop ()
         (let ((job (jolt-with-mutex (vector-ref st 2)
                      ;; Out of STARTING and into whatever executor-take-job! decides,
@@ -2229,7 +2830,13 @@
                      ;; executor-idle-wait!, and is never absent from all three.
                      (arrived!)
                      (executor-take-job! st))))
-          (when job (job) (loop)))))))
+          ;; the JVM's runWorker clears the worker's interrupt before each task
+          ;; (unless the pool is stopping), so a cancel(true) that reached the
+          ;; last task is not carried into the next one
+          (when job
+            (unless (executor-stopping? st) (set-box! (current-interrupt-box) #f))
+            (job)
+            (loop)))))))
 
 ;; shutdown: stop accepting, let what is queued drain — the delayed one-shots
 ;; included, which the workers wait out (executor-take-job!). The periodic tasks
@@ -2262,11 +2869,8 @@
 ;; returned rather than discarded: the returned procedures are callable, and calling
 ;; one runs that task on the caller's thread, the same recovery .run gives there.
 ;;
-;; What jolt CANNOT do is the other half of shutdownNow, interrupting the tasks
-;; already running: the workers do not carry an interrupt flag for a shutdown to
-;; set, so a task in Thread/sleep or a blocking read keeps going. The JVM
-;; interrupts those threads. Tracked; a worker would have to adopt an interrupt box
-;; the way Thread.start does.
+;; The other half of shutdownNow, interrupting the tasks already running, is in
+;; executor-shutdown-now! below: each worker registers its interrupt box.
 (define (executor-drain-queue! st)
   (let* ((q (unbox (vector-ref st 1)))
          (jobs (append (car q) (reverse (cdr q)))))
@@ -2274,18 +2878,37 @@
     (set-cdr! q '())
     (vector-set! st 10 0)
     jobs))
+;; Slot 20: STOP, which only shutdownNow reaches — the state in which a worker
+;; keeps its interrupt rather than having it cleared before a task.
+(define (executor-stopping? st) (vector-ref st 20))
 (define (executor-shutdown-now! st)
-  (vector-set! st 0 #t)
-  (let ((dropped (jolt-with-mutex (vector-ref st 2)
-                   ;; the delayed tasks come back too, in due order after the
-                   ;; immediate ones, and come back AS THEY ARE — the JVM hands the
-                   ;; ScheduledFutureTasks over neither cancelled nor done, and each
-                   ;; still answers .run.
-                   (let ((jobs (append (executor-drain-queue! st) (vector-ref st 13))))
-                     (vector-set! st 13 '())
-                     (jolt-cv-wake! (vector-ref st 3))
-                     (jolt-cv-wake! (vector-ref st 11))
-                     jobs))))
+  ;; STOP, and the queue drained, under ONE hold of the queue mutex, and the
+  ;; workers interrupted only after it. A worker takes its next task under that
+  ;; same mutex and takes none once it reads STOP (executor-take-job!), which is
+  ;; the JVM's getTask; so no queued task can slip past the drain and run. The
+  ;; interrupt used to come first: a worker it woke could take the mutex ahead
+  ;; of the drain and run what was queued, and shutdownNow handed back nothing
+  ;; for tasks that had run anyway (unit row executor-shutdown, seen on CI).
+  (let* ((boxes #f)
+         (dropped (jolt-with-mutex (vector-ref st 2)
+                    (vector-set! st 0 #t)
+                    (vector-set! st 20 #t)
+                    ;; the delayed tasks come back too, in due order after the
+                    ;; immediate ones, and come back AS THEY ARE — the JVM hands the
+                    ;; ScheduledFutureTasks over neither cancelled nor done, and each
+                    ;; still answers .run.
+                    (let ((jobs (append (executor-drain-queue! st) (vector-ref st 13))))
+                      (vector-set! st 13 '())
+                      (set! boxes (vector-ref st 18))
+                      (jolt-cv-wake! (vector-ref st 3))
+                      (jolt-cv-wake! (vector-ref st 11))
+                      jobs))))
+    ;; ...then interrupt what is running: each worker's flag, then a poke at
+    ;; whatever interruptible wait it is in (the protocol Thread.interrupt uses).
+    ;; A task in Thread/sleep or a deref is thrown out with InterruptedException,
+    ;; and one that polls Thread/interrupted sees it; the worker then finds the
+    ;; pool stopped and exits.
+    (for-each (lambda (b) (set-box! b #t) (jolt-interrupt-wake-waits! b)) boxes)
     (apply jolt-vector dropped)))
 
 ;; The wait awaitTermination and close share. DEADLINE #f waits for as long as it
@@ -2383,14 +3006,17 @@
       ((spawn) (executor-spawn-worker! st))
       ((reject) (executor-reject-task! st))
       (else (void)))))
-(let ((single (lambda _ (make-executor 1)))
-      (fixed  (lambda (n . _) (make-executor (max 1 (jnum->exact n)))))
+(let ((single (lambda args (make-executor* "executor-service" 1 1 #f #f #f (thread-factory-in args))))
+      (fixed  (lambda (n . args)
+                (let ((n (max 1 (jnum->exact n))))
+                  (make-executor* "executor-service" n n #f #f #f (thread-factory-in args)))))
       ;; the two scheduled factories: the same fixed pools under the tag that
       ;; answers schedule (jolt-hgjo). newSingleThreadScheduledExecutor's class
       ;; is a private delegating wrapper on the JVM, which jolt does not model —
       ;; it reports the pool it wraps, as newSingleThreadExecutor already does.
-      (scheduled-single (lambda _ (make-scheduled-executor 1)))
-      (scheduled-fixed  (lambda (n . _) (make-scheduled-executor (max 1 (jnum->exact n)))))
+      (scheduled-single (lambda args (make-scheduled-executor 1 #f (thread-factory-in args))))
+      (scheduled-fixed  (lambda (n . args)
+                          (make-scheduled-executor (max 1 (jnum->exact n)) #f (thread-factory-in args))))
       ;; cached / virtual-thread-per-task: the two factories that are UNBOUNDED on
       ;; the JVM. A cached pool is (0, Integer.MAX_VALUE, 60s, SynchronousQueue)
       ;; there, and a virtual thread per task is a thread per task with no pool at
@@ -2408,19 +3034,24 @@
       ;; substitution — a pooled thread for a fresh virtual one, which nothing here
       ;; can tell apart, since jolt has no thread-locals and a task's identity is
       ;; its own.
-      (cached (lambda _ (make-cached-executor)))
+      (cached (lambda args (make-cached-executor #f (thread-factory-in args))))
+      ;; ...whose workers are daemons, as every virtual thread is: a script that
+      ;; never closes the executor exits when it returns, not 60s after its last
+      ;; task.
+      (vcached (lambda _ (make-cached-executor #t)))
       ;; newWorkStealingPool is NOT one of those and stays a fixed pool: a
       ;; ForkJoinPool is sized at availableProcessors, because work stealing is for
       ;; CPU-bound tasks that would only contend if there were more of them than
       ;; cores. It does grow past that, but only to REPLACE a worker the JVM can
       ;; see is blocked in a join, which is a thing jolt cannot see; a flat 32 sits
       ;; between the two bounds and errs toward not stranding a blocking task.
-      (stealing (lambda _ (make-executor 32))))
+      ;; ForkJoinPool's workers are daemons.
+      (stealing (lambda _ (make-executor* "executor-service" 32 32 #f #f #t))))
   (for-each (lambda (nm) (register-class-statics! nm
               (list (cons "newSingleThreadExecutor" single)
                     (cons "newSingleThreadScheduledExecutor" scheduled-single)
                     (cons "newFixedThreadPool" fixed) (cons "newScheduledThreadPool" scheduled-fixed)
-                    (cons "newVirtualThreadPerTaskExecutor" cached)
+                    (cons "newVirtualThreadPerTaskExecutor" vcached)
                     (cons "newCachedThreadPool" cached) (cons "newWorkStealingPool" stealing))))
             '("Executors" "java.util.concurrent.Executors")))
 ;; submit, as a named procedure: invokeAll and invokeAny below are defined in
@@ -2453,11 +3084,11 @@
   (list (cons "submit" executor-submit)
         (cons "execute" (lambda (self thunk*)
           (let ((thunk (runnable->thunk thunk*)))
+            ;; A task's throw is NOT caught here: on the JVM it ends the worker
+            ;; running it, goes to that thread's uncaught-exception handler, and
+            ;; the pool starts a replacement (executor-worker-loop*).
             (executor-enqueue! self (lambda () (dyn-binding-stack '())   ; no conveyance, as submit
-              (guard (e (#t (guard (_ (#t #f))
-                              (display "Exception in executor task:\n" (current-error-port))
-                              (jolt-report-throwable e (current-error-port)))))
-                (jolt-invoke thunk))))
+              (jolt-invoke thunk)))
           jolt-nil)))
         ;; Shutdown wakes BOTH conditions, and every waiter on each: task-cond so
         ;; that all the idle workers see the flag and leave (the one place a
@@ -2485,7 +3116,7 @@
                 (if (eq? j-future-timed-out
                          (guard (e (#t #f))
                            (j-future-get-until (car fs) deadline (lambda () j-future-timed-out))))
-                    (for-each j-future-cancel! fs)
+                    (for-each (lambda (f) (j-future-cancel! f #t)) fs)
                     (loop (cdr fs)))))
             (apply jolt-vector futs))))
         ;; invokeAny answers the first task that succeeded, skipping the ones that
@@ -2503,7 +3134,7 @@
             (when (null? ts)
               (throw-jvm (quote IllegalArgumentException) "tasks is empty"))
             (let* ((all (executor-submit-all self ts))
-                   (cancel-rest! (lambda (fs) (for-each j-future-cancel! fs))))
+                   (cancel-rest! (lambda (fs) (for-each (lambda (f) (j-future-cancel! f #t)) fs))))
               (let loop ((futs all) (err #f))
                 (if (null? futs)
                     (raise err)                       ; every task failed
@@ -2519,6 +3150,18 @@
                             (else (loop (cdr futs) (cdr r)))))))))))
         (cons "shutdown" (lambda (self) (executor-shutdown! (jhost-state self)) jolt-nil))
         (cons "shutdownNow" (lambda (self) (executor-shutdown-now! (jhost-state self))))
+        ;; ThreadPoolExecutor.allowCoreThreadTimeOut: core workers retire after the
+        ;; keep-alive too, so an idle pool stops holding the process up. The JVM
+        ;; refuses it for a pool whose keep-alive is not positive.
+        (cons "allowCoreThreadTimeOut" (lambda (self on)
+          (let ((st (jhost-state self)) (on (jolt-truthy? on)))
+            (when (and on (not (and (vector-ref st 8) (> (vector-ref st 8) 0))))
+              (throw-jvm 'IllegalArgumentException "Core threads must have nonzero keep alive times"))
+            (jolt-with-mutex (vector-ref st 2)
+              (vector-set! st 19 on)
+              (jolt-cv-wake! (vector-ref st 3))))   ; idle core workers: start timing
+          jolt-nil))
+        (cons "allowsCoreThreadTimeOut" (lambda (self) (and (vector-ref (jhost-state self) 19) #t)))
         ;; close is shutdown plus an unbounded awaitTermination, and it BLOCKS —
         ;; "blocks until all tasks have completed execution", as the JVM has it
         ;; since 19. It used to return the moment the flag was set, so the one
@@ -2556,7 +3199,7 @@
 ;; (ThreadPoolExecutor. 1 1 keepAlive unit (ArrayBlockingQueue. n)) plus
 ;; FutureTask. ArrayBlockingQueue is a real bounded blocking queue (fiber-aware
 ;; through jolt-cv-wait); FutureTask a run-once future; the ThreadPoolExecutor
-;; ctor builds on make-executor above, sized by maximumPoolSize, its queue
+;; ctor builds on make-executor* above, sized by maximumPoolSize, its queue
 ;; argument contributing capacity to .getQueue's view. Tasks flow through the
 ;; executor's own unbounded queue — the JVM REJECTS a submit when the bounded
 ;; queue is full, jolt queues it; that is the deliberate divergence here.
@@ -2703,21 +3346,28 @@
 
 ;; FutureTask — a run-once task with a blocking get. State:
 ;; #(status override-flag override value error mutex cond thunk); status is one
-;; of new/running/done/cancelled. cancel wins only before run starts (the JVM
-;; can interrupt a RUNNING task; jolt cannot, so cancel answers #f there).
+;; of new/running/done/cancelled. cancel wins until the task settles, and
+;; cancel(true) interrupts the thread running it, as on the JVM.
 (define (make-future-task thunk override-flag override)
   (make-jhost "future-task"
-              (vector 'new override-flag override jolt-nil #f (make-mutex) (make-condition) thunk)))
+              ;; a reified Callable or Runnable is called through its method, as
+              ;; submit calls one (it was invoked as a fn and failed the task)
+              (vector 'new override-flag override jolt-nil #f (make-mutex) (make-condition)
+                      (runnable->thunk thunk))))
 (define (future-task? x) (and (jhost? x) (string=? (jhost-tag x) "future-task")))
 (define (future-task-run! self)
   (let ((st (jhost-state self)))
     (when (jolt-with-mutex (vector-ref st 5)
             (and (eq? (vector-ref st 0) 'new)
-                 (begin (vector-set! st 0 'running) #t)))
+                 (begin (vector-set! st 0 'running) (task-runner-set! self) #t)))
       (let ((r (guard (e (#t (vector-set! st 4 e) jolt-nil)) (jolt-invoke (vector-ref st 7)))))
         (jolt-with-mutex (vector-ref st 5)
-          (vector-set! st 3 (if (vector-ref st 1) (vector-ref st 2) r))
-          (vector-set! st 0 'done)
+          (task-runner-clear! self)
+          ;; a cancel that landed while it ran keeps it cancelled, as the JVM's
+          ;; does (this used to overwrite it with the result)
+          (unless (eq? (vector-ref st 0) 'cancelled)
+            (vector-set! st 3 (if (vector-ref st 1) (vector-ref st 2) r))
+            (vector-set! st 0 'done))
           (jolt-cv-wake! (vector-ref st 6)))))
     jolt-nil))
 (for-each (lambda (nm) (register-class-ctor! nm
@@ -2750,32 +3400,45 @@
     (cond ((string=? tag "future-task") future-task-get*)
           ((string=? tag "j-future") j-future-get*)
           ((string=? tag "scheduled-future") j-future-get*)   ; the same five slots (below)
+          ((string=? tag "completable-future") cf-get*)      ; CompletableFuture (below)
           (else #f))))
 (register-host-methods! "future-task"
   (list (cons "run" (lambda (self) (future-task-run! self)))
         (cons "get" future-task-get)
         (cons "isDone" (lambda (self) (and (memq (vector-ref (jhost-state self) 0) '(done cancelled)) #t)))
         (cons "isCancelled" (lambda (self) (eq? (vector-ref (jhost-state self) 0) 'cancelled)))
-        (cons "cancel" (lambda (self . _)
-          (let ((st (jhost-state self)))
-            (jolt-with-mutex (vector-ref st 5)
-              (if (eq? (vector-ref st 0) 'new)
-                  (begin (vector-set! st 0 'cancelled)
-                         (jolt-cv-wake! (vector-ref st 6))
-                         #t)
-                  #f)))))
+        ;; cancel wins while the task has not settled, running or not, and
+        ;; cancel(true) interrupts the thread running it (j-future-cancel!)
+        (cons "cancel" (lambda (self may)
+          (let* ((st (jhost-state self))
+                 (r (jolt-with-mutex (vector-ref st 5)
+                      (if (memq (vector-ref st 0) '(new running))
+                          (let ((b (and (jolt-truthy? may) (task-runner self))))
+                            (vector-set! st 0 'cancelled)
+                            (when b (set-box! b #t))
+                            (jolt-cv-wake! (vector-ref st 6))
+                            (or b #t))
+                          #f))))
+            (when (box? r) (task-interrupt-runner! r))
+            (and r #t))))
         (cons "toString" (lambda (self)
           (string-append "FutureTask[" (symbol->string (vector-ref (jhost-state self) 0)) "]")))))
 ;; submit/execute above route a FutureTask through its own run (a Runnable on
-;; the JVM); anything else is an invokable thunk.
+;; the JVM), and a reify or deftype implementing Callable or Runnable through its
+;; call or run — invoking one directly was "cannot be cast to clojure.lang.IFn",
+;; so (.submit pool (reify Callable (call [_] …))) failed its future. Anything
+;; else is an invokable thunk.
 (define (runnable->thunk x)
-  (if (future-task? x)
-      (lambda () (future-task-run! x) jolt-nil)
-      x))
+  (cond ((future-task? x) (lambda () (future-task-run! x) jolt-nil))
+        ((procedure? x) x)
+        ((iface-method x "call" 1) (lambda () (record-method-dispatch x "call" jolt-nil)))
+        ((iface-method x "run" 1) (lambda () (record-method-dispatch x "run" jolt-nil) jolt-nil))
+        (else x)))
 
 ;; ThreadPoolExecutor ctor: (core max keepAlive unit [queue] [factory]
 ;; [handler]) — core, max and keepAlive all reach the pool now that the pool can
-;; grow and retire; factory and handler are accepted and ignored. The workers up
+;; grow and retire; a factory decides each worker's daemon flag and name
+;; (executor-spawn-worker!), and a handler is accepted and ignored. The workers up
 ;; to core are eager, the rest appear as tasks arrive with nobody idle, and an
 ;; above-core worker retires after keepAlive.
 ;;
@@ -2795,7 +3458,8 @@
                      ;; idle" and stays 0.
                      (keep (and (>= (length rest) 2) (tu->ms (car rest) (cadr rest)))))
                 (make-executor* "executor-service" core-n max-n keep
-                                (and q (vector-ref (jhost-state q) 0)))))))
+                                (and q (vector-ref (jhost-state q) 0))
+                                #f (thread-factory-in (if (>= (length rest) 3) (cddr rest) '())))))))
           '("ThreadPoolExecutor" "java.util.concurrent.ThreadPoolExecutor"))
 ;; .getQueue answers a live VIEW of the executor's internal queue — size reads
 ;; the real depth, remainingCapacity subtracts it from the advisory capacity
@@ -2917,9 +3581,10 @@
   (let ((st (jhost-state sf)))
     (when (jolt-with-mutex (vector-ref st 3)
             (and (eq? (vector-ref st 0) 'new)
-                 (begin (vector-set! st 0 'running) #t)))
+                 (begin (vector-set! st 0 'running) (task-runner-set! sf) #t)))
       (let* ((r (guard (e (#t (vector-set! st 2 e) #f)) (jolt-invoke (vector-ref st 7))))
              (again? (jolt-with-mutex (vector-ref st 3)
+                       (task-runner-clear! sf)
                        (let ((again? (cond ((eq? (vector-ref st 0) 'cancelled) #f)
                                            ((vector-ref st 2) (vector-set! st 0 'done) #f)
                                            ((sf-periodic? sf) (vector-set! st 0 'new) #t)
@@ -2969,7 +3634,8 @@
 ;; one worker, as every pool here (a pool with no worker runs nothing; the JVM's
 ;; ensurePrestart starts one on demand for core 0).
 (for-each (lambda (nm) (register-class-ctor! nm
-            (lambda (core-n . _) (make-scheduled-executor (max 1 (jnum->exact core-n))))))
+            (lambda (core-n . rest)
+              (make-scheduled-executor (max 1 (jnum->exact core-n)) #f (thread-factory-in rest)))))
           '("ScheduledThreadPoolExecutor" "java.util.concurrent.ScheduledThreadPoolExecutor"))
 ;; The future's own members over the j-future's: Delayed's getDelay (remaining
 ;; time in UNIT, negative once overdue, truncated toward zero as TimeUnit.convert
@@ -2988,6 +3654,560 @@
           (cond ((eq? self other) 0) ((sf-before? self other) -1) ((sf-before? other self) 1) (else 0))))
         (cons "isPeriodic" (lambda (self) (sf-periodic? self)))
         (cons "run" (lambda (self) (scheduled-future-run! self (vector-ref (jhost-state self) 9)) jolt-nil))))
+
+;; --- java.util.concurrent.CompletableFuture ----------------------------------
+;; A settable Future whose completion drives a graph of dependent stages. State:
+;;   #(result mutex condition dependents)
+;; result is cf-pending until the future settles, then the value itself (nil is
+;; jolt-nil, so false and nil results need no box) or a cf-alt carrying the
+;; throwable — the JVM's AltResult, and for the same reason: a result slot that
+;; holds either a value or a failure, written once under the mutex.
+;;
+;; DEPENDENTS are thunks of one argument, the result, pushed onto a list while
+;; the future is pending and run by whichever call settles it, AFTER the mutex is
+;; released. A thunk registered once the future has settled runs at once in the
+;; registering thread instead. Both decisions are taken under the mutex, so every
+;; thunk runs exactly once: either it was on the list when the settle took it, or
+;; the registrar saw the result and ran it itself. The list is a stack and runs
+;; newest first, which is the order the JVM's Treiber stack of completions runs
+;; them in (certified: five thenRuns registered 0..4 run 4 3 2 1 0).
+;;
+;; THE EXCEPTION WRAPPING is the JVM's, and it is what most code catching around
+;; a CompletableFuture depends on, so it is spelled out:
+;;   - completeExceptionally / failedFuture / orTimeout store the throwable RAW;
+;;   - a dependent stage stores a failure WRAPPED in CompletionException, once
+;;     (a failure that already is one is reused, not wrapped again), and so does
+;;     supplyAsync's own failure;
+;;   - get throws ExecutionException over the underlying cause (unwrapping one
+;;     CompletionException), join and getNow throw CompletionException (wrapping
+;;     a raw failure), and a CancellationException is rethrown as is by both;
+;;   - exceptionally / handle / whenComplete hand their function the stored
+;;     throwable: raw on the stage that failed, the CompletionException on a
+;;     stage downstream of it.
+;;
+;; get is interruptible, as every jolt wait a JVM caller can name is (locks.ss,
+;; jolt-cv-wait-interruptibly); join is NOT, on the JVM or here: it keeps waiting
+;; and leaves the interrupt flag set. Both park a fiber rather than block its
+;; carrier, through the same seam.
+(define-record-type cf-alt (fields ex) (nongenerative jolt-cf-alt-v1))
+(define cf-pending (list 'cf-pending))
+(define cf-timed-out (list 'cf-timed-out))
+(define (cf-pending? r) (eq? r cf-pending))
+(define (make-cf* r) (make-jhost "completable-future" (vector r (make-mutex) (make-condition) '())))
+(define (make-cf) (make-cf* cf-pending))
+(define (cf? x) (and (jhost? x) (string=? (jhost-tag x) "completable-future")))
+;; The result, read under the mutex: it is published by another thread, and the
+;; lock is what orders the read after the write on a weakly-ordered machine.
+(define (cf-result c)
+  (let ((st (jhost-state c)))
+    (jolt-with-mutex (vector-ref st 1) (vector-ref st 0))))
+
+;; Class tests on a stored throwable, by the class graph like a catch clause.
+(define (cf-exc-isa? x simple)
+  (and (jolt-ex-info-record? x) (exception-isa? (last-dot (ex-info-class x)) simple)))
+(define (cf-cancellation? x) (cf-exc-isa? x "CancellationException"))
+(define (cf-completion? x) (cf-exc-isa? x "CompletionException"))
+(define (cf-cause x) (if (jolt-ex-info-record? x) (jolt-ex-info-record-cause x) jolt-nil))
+(define (cf-npe) (throw-jvm 'NullPointerException jolt-nil))
+
+;; new CompletionException(x): the message is x.toString(), as Throwable(cause) makes it.
+(define (cf-completion-exception x)
+  (jolt-host-throwable "java.util.concurrent.CompletionException" (jolt-str-render-one x) x))
+(define (cf-new-cancellation)
+  (jolt-host-throwable "java.util.concurrent.CancellationException" jolt-nil))
+;; encodeThrowable(x): a failure a dependent stage stores.
+(define (cf-encode-throwable x)
+  (make-cf-alt (if (cf-completion? x) x (cf-completion-exception x))))
+;; encodeRelay(r): a source's result carried into a dependent — a value as is, a
+;; raw failure wrapped, an already-wrapped one reused (the same AltResult).
+(define (cf-encode-relay r)
+  (if (and (cf-alt? r) (not (cf-completion? (cf-alt-ex r))))
+      (make-cf-alt (cf-completion-exception (cf-alt-ex r)))
+      r))
+
+;; Settle C with R — a value or a cf-alt. #t iff this call did it. FORCE? is
+;; obtrude's overwrite of a result already there. Dependents run after the
+;; mutex is released, in the settling thread.
+(define (cf-settle! c r force?)
+  (let* ((st (jhost-state c))
+         (deps (jolt-with-mutex (vector-ref st 1)
+                 (and (or force? (cf-pending? (vector-ref st 0)))
+                      (let ((ds (vector-ref st 3)))
+                        (vector-set! st 0 r)
+                        (vector-set! st 3 '())
+                        (jolt-cv-wake! (vector-ref st 2))
+                        ds)))))
+    (and deps
+         (begin (for-each (lambda (d) (d r)) deps) #t))))
+
+;; Run (thunk result) once C has settled: now, or from whichever call settles it.
+(define (cf-when-done! c thunk)
+  (let* ((st (jhost-state c))
+         (r (jolt-with-mutex (vector-ref st 1)
+              (let ((r (vector-ref st 0)))
+                (when (cf-pending? r)
+                  (vector-set! st 3 (cons thunk (vector-ref st 3))))
+                r))))
+    (unless (cf-pending? r) (thunk r))))
+
+;; Settle D with what THUNK answers, or with the failure it throws, wrapped.
+(define (cf-complete-with! d thunk)
+  (cf-settle! d (guard (e (#t (cf-encode-throwable (jolt-unwrap-throw e)))) (thunk)) #f))
+
+;; The functional-interface argument of a stage method — a Clojure fn, or a
+;; reified Function/Supplier/Consumer/Runnable/BiFunction/BiConsumer — goes
+;; through jolt-fi-call (host-static-classes.ss), named for its one method.
+(define cf-fn-call jolt-fi-call)
+(define (cf-require! x) (when (jolt-nil? x) (cf-npe)) x)
+
+;; The async pool: the JVM's is ForkJoinPool.commonPool. jolt's is a cached pool
+;; (the one newCachedThreadPool builds), made on first use, whose workers do not
+;; hold the process open — the commonPool's are daemons too.
+(define cf-default-pool #f)
+(define cf-default-pool-mu (make-mutex))
+(define (cf-default-executor)
+  (jolt-with-mutex cf-default-pool-mu
+    ;; daemon workers, as the commonPool's are
+    (unless cf-default-pool (set! cf-default-pool (make-cached-executor #t)))
+    cf-default-pool))
+;; Hand THUNK to an Executor: 'default is the async pool, anything else answers
+;; execute(Runnable) — a pool shim, a delayedExecutor, a reified Executor. The
+;; thunk is a jolt fn, so it is a Runnable to code that calls (.run r).
+(define (cf-execute! exec thunk)
+  (let ((e (if (eq? exec 'default) (cf-default-executor) exec)))
+    (record-method-dispatch e "execute" (jolt-list (lambda () (thunk) jolt-nil)))))
+;; Run a dependent's work inline (EXEC #f) or on EXEC. An executor that refuses
+;; the task (a shut-down pool) fails the dependent with the rejection, as the
+;; JVM's claim() does.
+(define (cf-fire! d exec thunk)
+  (if exec
+      (guard (e (#t (cf-settle! d (cf-encode-throwable (jolt-unwrap-throw e)) #f)))
+        (cf-execute! exec thunk))
+      (thunk)))
+;; The two overloads of an *Async method: without an Executor it is the async
+;; pool, with one it is that (a nil one is a NullPointerException). G takes the
+;; executor ahead of the function; a two-stage method passes the other stage.
+(define (cf-async-1 g)
+  (case-lambda ((self f) (g self 'default f))
+               ((self f e) (g self (cf-require! e) f))))
+(define (cf-async-2 g)
+  (case-lambda ((self o f) (g self o 'default f))
+               ((self o f e) (g self o (cf-require! e) f))))
+
+;; Another CompletionStage argument, as the CompletableFuture its methods read.
+(define (cf-as-cf x)
+  (cond ((cf? x) x)
+        ((jolt-nil? x) (cf-npe))
+        ((iface-method x "toCompletableFuture" 1)
+         (cf-as-cf (record-method-dispatch x "toCompletableFuture" jolt-nil)))
+        (else (throw-jvm 'ClassCastException
+                         (string-append "class " (guard (e (#t "?")) (jolt-class-name x))
+                                        " cannot be cast to class java.util.concurrent.CompletionStage")))))
+
+;; reportGet / reportJoin: a settled result as get and join answer it.
+(define (cf-report-get r)
+  (if (cf-alt? r)
+      (let ((x (cf-alt-ex r)))
+        (if (cf-cancellation? x)
+            (jolt-throw x)
+            (let ((x (if (and (cf-completion? x) (not (jolt-nil? (cf-cause x)))) (cf-cause x) x)))
+              (jolt-throw (jolt-host-throwable "java.util.concurrent.ExecutionException"
+                                               (jolt-str-render-one x) x)))))
+      r))
+(define (cf-report-join r)
+  (if (cf-alt? r)
+      (let ((x (cf-alt-ex r)))
+        (jolt-throw (if (or (cf-cancellation? x) (cf-completion? x)) x (cf-completion-exception x))))
+      r))
+
+;; The wait. The result is read FIRST: a future that has settled answers even to
+;; a thread whose interrupt flag is set (JVM: get and join both return it and
+;; leave the flag alone), where the wait seam would throw before looking.
+(define (cf-await c who interruptible? deadline)
+  (let ((r (cf-result c)))
+    (if (not (cf-pending? r))
+        r
+        (let* ((st (jhost-state c))
+               (decide (lambda (timed-out?)
+                         (let ((r (vector-ref st 0)))
+                           (cond ((not (cf-pending? r)) r)
+                                 (timed-out? cf-timed-out)
+                                 (else jolt-cv-again))))))
+          (if interruptible?
+              (jolt-cv-wait-interruptibly who (vector-ref st 1) (vector-ref st 2) deadline decide)
+              (jolt-cv-wait (vector-ref st 1) (vector-ref st 2) deadline decide))))))
+(define (cf-timeout-throw)
+  (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException" jolt-nil)))
+;; get and its timed overload, in the shape future-shim-get* hands deref.
+(define (cf-get* c ms on-timeout)
+  (let ((r (cf-await c "CompletableFuture.get" #t (and ms (ms->deadline-millis ms)))))
+    (if (eq? r cf-timed-out) (on-timeout) (cf-report-get r))))
+
+(define (cf-cancelled? c)
+  (let ((r (cf-result c))) (and (cf-alt? r) (cf-cancellation? (cf-alt-ex r)))))
+
+;; --- the stage methods --------------------------------------------------------
+;; thenApply / thenAccept / thenRun and their Async forms. A failure is carried
+;; to the dependent inline, without the executor — the JVM propagates before it
+;; claims — and only the function call goes to the executor.
+(define (cf-uni src exec f kind)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (if (cf-alt? r)
+            (cf-settle! d (cf-encode-relay r) #f)
+            (cf-fire! d exec
+              (lambda ()
+                (cf-complete-with! d
+                  (lambda ()
+                    (case kind
+                      ((apply) (cf-fn-call f "apply" r))
+                      ((accept) (cf-fn-call f "accept" r) jolt-nil)
+                      (else (cf-fn-call f "run") jolt-nil)))))))))
+    d))
+
+;; thenCombine / thenAcceptBoth / runAfterBoth: both sides settle first, then the
+;; first failure in (this, other) order wins, or the function runs.
+(define (cf-both a other exec f kind)
+  (cf-require! f)
+  (let ((b (cf-as-cf other)) (d (make-cf)))
+    (cf-when-done! a
+      (lambda (r)
+        (cf-when-done! b
+          (lambda (s)
+            (cond ((cf-alt? r) (cf-settle! d (cf-encode-relay r) #f))
+                  ((cf-alt? s) (cf-settle! d (cf-encode-relay s) #f))
+                  (else
+                   (cf-fire! d exec
+                     (lambda ()
+                       (cf-complete-with! d
+                         (lambda ()
+                           (case kind
+                             ((apply) (cf-fn-call f "apply" r s))
+                             ((accept) (cf-fn-call f "accept" r s) jolt-nil)
+                             (else (cf-fn-call f "run") jolt-nil))))))))))))
+    d))
+
+;; applyToEither / acceptEither / runAfterEither: whichever side settles first,
+;; this one if both already have. The claim box makes the loser a no-op.
+(define (cf-either a other exec f kind)
+  (cf-require! f)
+  (let* ((b (cf-as-cf other)) (d (make-cf)) (claimed (box #f))
+         (fire (lambda (r)
+                 (when (sa-box-cas! claimed #f #t)
+                   (if (cf-alt? r)
+                       (cf-settle! d (cf-encode-relay r) #f)
+                       (cf-fire! d exec
+                         (lambda ()
+                           (cf-complete-with! d
+                             (lambda ()
+                               (case kind
+                                 ((apply) (cf-fn-call f "apply" r))
+                                 ((accept) (cf-fn-call f "accept" r) jolt-nil)
+                                 (else (cf-fn-call f "run") jolt-nil)))))))))))
+    (cf-when-done! a fire)
+    (cf-when-done! b fire)
+    d))
+
+;; Settle D with whatever stage G settles with, relayed — thenCompose's second half.
+(define (cf-relay-stage! d g)
+  (let ((g (guard (e (#t (cf-settle! d (cf-encode-throwable (jolt-unwrap-throw e)) #f) #f))
+             (if (jolt-nil? g)
+                 (throw-jvm 'NullPointerException "the function answered null where a CompletionStage is required")
+                 (cf-as-cf g)))))
+    (when g
+      (cf-when-done! g (lambda (s) (cf-settle! d (cf-encode-relay s) #f))))))
+;; Call F for the stage it answers, or settle D with the failure: #f then.
+(define (cf-call-for-stage d f method arg)
+  (guard (e (#t (cf-settle! d (cf-encode-throwable (jolt-unwrap-throw e)) #f) #f))
+    (cons 'stage (cf-fn-call f method arg))))
+
+(define (cf-compose src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (if (cf-alt? r)
+            (cf-settle! d (cf-encode-relay r) #f)
+            (cf-fire! d exec
+              (lambda ()
+                (let ((g (cf-call-for-stage d f "apply" r)))
+                  (when g (cf-relay-stage! d (cdr g)))))))))
+    d))
+
+(define (cf-exceptionally-compose src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (if (cf-alt? r)
+            (cf-fire! d exec
+              (lambda ()
+                (let ((g (cf-call-for-stage d f "apply" (cf-alt-ex r))))
+                  (when g (cf-relay-stage! d (cdr g))))))
+            (cf-settle! d r #f))))
+    d))
+
+;; handle: the function sees (value, nil) or (nil, the stored throwable) and its
+;; answer is the dependent's value.
+(define (cf-handle src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (cf-fire! d exec
+          (lambda ()
+            (cf-complete-with! d
+              (lambda ()
+                (if (cf-alt? r)
+                    (cf-fn-call f "apply" jolt-nil (cf-alt-ex r))
+                    (cf-fn-call f "apply" r jolt-nil))))))))
+    d))
+
+;; whenComplete: the action sees what handle's function sees; the dependent
+;; keeps the source's result, unless the action throws over a NORMAL result,
+;; which then fails the dependent. (The JVM also records the action's throw as
+;; suppressed on an earlier failure; jolt throwables carry no suppressed list.)
+(define (cf-when-complete src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (cf-fire! d exec
+          (lambda ()
+            (let ((thrown (guard (e (#t (jolt-unwrap-throw e)))
+                            (if (cf-alt? r)
+                                (cf-fn-call f "accept" jolt-nil (cf-alt-ex r))
+                                (cf-fn-call f "accept" r jolt-nil))
+                            cf-pending)))
+              (cf-settle! d
+                          (if (or (eq? thrown cf-pending) (cf-alt? r))
+                              (cf-encode-relay r)
+                              (cf-encode-throwable thrown))
+                          #f))))))
+    d))
+
+;; exceptionally: a value passes through inline; a failure goes to the function.
+(define (cf-exceptionally src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (if (cf-alt? r)
+            (cf-fire! d exec
+              (lambda () (cf-complete-with! d (lambda () (cf-fn-call f "apply" (cf-alt-ex r))))))
+            (cf-settle! d r #f))))
+    d))
+
+;; supplyAsync / runAsync / completeAsync. An executor that refuses the task
+;; raises to the caller here, as it does on the JVM.
+(define (cf-async-supply d s exec kind)
+  (cf-require! s)
+  (cf-execute! exec
+    (lambda ()
+      (cf-complete-with! d
+        (lambda ()
+          (if (eq? kind 'supply) (cf-fn-call s "get") (begin (cf-fn-call s "run") jolt-nil))))))
+  d)
+
+(define (cf-stage-list args)
+  (let ((xs (if (and (= 1 (length args)) (not (cf? (car args))))
+                (let ((s (jolt-seq (cf-require! (car args)))))
+                  (if (jolt-nil? s) '() (seq->list s)))
+                args)))
+    (let loop ((xs xs) (acc '()))
+      (if (null? xs) (reverse acc) (loop (cdr xs) (cons (cf-as-cf (car xs)) acc))))))
+
+;; allOf: settles once every stage has, with nil, or with the first failure in
+;; argument order (the JVM's tree of pairwise relays prefers the left side at
+;; every node, which is the same thing).
+(define (cf-all-of cfs)
+  (let ((d (make-cf)) (left (box (length cfs))))
+    (if (null? cfs)
+        (cf-settle! d jolt-nil #f)
+        (for-each
+          (lambda (c)
+            (cf-when-done! c
+              (lambda (_)
+                (when (let retry ()
+                        (let ((n (unbox left)))
+                          (if (box-cas! left n (fx- n 1)) (fx=? n 1) (retry))))
+                  (cf-settle! d
+                              (let loop ((cs cfs))
+                                (if (null? cs)
+                                    jolt-nil
+                                    (let ((r (cf-result (car cs))))
+                                      (if (cf-alt? r) (cf-encode-relay r) (loop (cdr cs))))))
+                              #f)))))
+          cfs))
+    d))
+;; anyOf: the first stage to settle, and of stages already settled the first in
+;; argument order (each registers in turn, and one already settled fires as it
+;; registers). Of none, a future that never completes.
+(define (cf-any-of cfs)
+  (let ((d (make-cf)))
+    (for-each (lambda (c) (cf-when-done! c (lambda (r) (cf-settle! d (cf-encode-relay r) #f)))) cfs)
+    d))
+
+;; orTimeout / completeOnTimeout. The deadline is the shared timer's (async.ss),
+;; and the settle is handed to the async pool rather than run on the timer
+;; thread, so dependents never run there; settling the future cancels the timer.
+(define (cf-on-timeout! self amount unit r)
+  (when (cf-pending? (cf-result self))
+    (let ((e (jolt-timer-at! (ms->deadline-millis (tu->ms amount unit))
+               (lambda () (cf-execute! 'default (lambda () (cf-settle! self (r) #f)))))))
+      (cf-when-done! self (lambda (_) (jolt-timer-cancel! e)))))
+  self)
+
+;; CompletableFuture.delayedExecutor(delay, unit[, executor]): an Executor that
+;; hands each task to the base executor once the delay has passed.
+(define (make-cf-delayed-executor amount unit base)
+  (make-jhost "cf-delayed-executor" (vector (tu->ms amount unit) base)))
+(register-host-methods! "cf-delayed-executor"
+  (list (cons "execute" (lambda (self r)
+          (cf-require! r)
+          (let ((st (jhost-state self)))
+            (jolt-timer-at! (ms->deadline-millis (vector-ref st 0))
+              (lambda () (cf-execute! (vector-ref st 1) (lambda () (cf-fn-call r "run"))))))
+          jolt-nil))
+        (cons "toString" (lambda (self) "java.util.concurrent.CompletableFuture$DelayedExecutor"))))
+
+;; java.util.concurrent.Future.State, what state() answers: an enum, so each
+;; constant is one object and = compares them by identity.
+(define future-state-constants
+  (map (lambda (nm) (cons nm (make-jhost "future-state" nm)))
+       '("RUNNING" "SUCCESS" "FAILED" "CANCELLED")))
+(define (future-state nm) (cdr (assoc nm future-state-constants)))
+(register-class-statics! "java.util.concurrent.Future$State" future-state-constants)
+(register-class-statics! "Future$State" future-state-constants)
+(register-host-methods! "future-state"
+  (list (cons "name" (lambda (self) (jhost-state self)))
+        (cons "toString" (lambda (self) (jhost-state self)))))
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "future-state")))
+                      (lambda (x) (jhost-state x)))
+
+(define (cf-to-string self)
+  (let* ((st (jhost-state self))
+         (snap (jolt-with-mutex (vector-ref st 1)
+                 (cons (vector-ref st 0) (length (vector-ref st 3)))))
+         (r (car snap)) (n (cdr snap)))
+    (string-append
+      "java.util.concurrent.CompletableFuture@"
+      ;; Integer.toHexString of the identity hash: unsigned, lowercase
+      (string-downcase (number->string (bitwise-and (jolt-identity-hasheq self) #xFFFFFFFF) 16))
+      (cond ((cf-pending? r)
+             (if (fx=? n 0)
+                 "[Not completed]"
+                 (string-append "[Not completed, " (number->string n) " dependents]")))
+            ((cf-alt? r) (string-append "[Completed exceptionally: " (jolt-str-render-one (cf-alt-ex r)) "]"))
+            (else "[Completed normally]")))))
+(register-str-render! cf? cf-to-string)
+
+(for-each (lambda (nm) (register-class-ctor! nm (case-lambda (() (make-cf)))))
+          '("CompletableFuture" "java.util.concurrent.CompletableFuture"))
+(let ((statics
+       (list
+         (cons "completedFuture" (lambda (v) (make-cf* v)))
+         (cons "failedFuture" (lambda (x) (make-cf* (make-cf-alt (cf-require! x)))))
+         (cons "supplyAsync" (case-lambda
+           ((s) (cf-async-supply (make-cf) s 'default 'supply))
+           ((s exec) (cf-require! s) (cf-async-supply (make-cf) s (cf-require! exec) 'supply))))
+         (cons "runAsync" (case-lambda
+           ((r) (cf-async-supply (make-cf) r 'default 'run))
+           ((r exec) (cf-require! r) (cf-async-supply (make-cf) r (cf-require! exec) 'run))))
+         (cons "allOf" (lambda cfs (cf-all-of (cf-stage-list cfs))))
+         (cons "anyOf" (lambda cfs (cf-any-of (cf-stage-list cfs))))
+         (cons "delayedExecutor" (case-lambda
+           ((amount unit) (make-cf-delayed-executor amount (cf-require! unit) 'default))
+           ((amount unit exec) (make-cf-delayed-executor amount (cf-require! unit) (cf-require! exec))))))))
+  (register-class-statics! "CompletableFuture" statics)
+  (register-class-statics! "java.util.concurrent.CompletableFuture" statics))
+
+(register-host-methods! "completable-future"
+  (list
+    (cons "complete" (lambda (self v) (cf-settle! self v #f)))
+    (cons "completeExceptionally" (lambda (self x) (cf-settle! self (make-cf-alt (cf-require! x)) #f)))
+    ;; cancel(mayInterruptIfRunning): the flag is ignored on the JVM too — a
+    ;; CompletableFuture has no thread of its own to interrupt. It answers true
+    ;; for a future that is cancelled, whichever call cancelled it.
+    (cons "cancel" (lambda (self _may-interrupt)
+      (or (cf-settle! self (make-cf-alt (cf-new-cancellation)) #f)
+          (cf-cancelled? self))))
+    (cons "isDone" (lambda (self) (not (cf-pending? (cf-result self)))))
+    (cons "isCancelled" (lambda (self) (cf-cancelled? self)))
+    (cons "isCompletedExceptionally" (lambda (self) (cf-alt? (cf-result self))))
+    (cons "get" (case-lambda
+      ((self) (cf-get* self #f cf-timeout-throw))
+      ((self amount unit) (cf-get* self (tu->ms amount unit) cf-timeout-throw))))
+    (cons "join" (lambda (self) (cf-report-join (cf-await self "CompletableFuture.join" #f #f))))
+    (cons "getNow" (lambda (self v)
+      (let ((r (cf-result self))) (if (cf-pending? r) v (cf-report-join r)))))
+    (cons "resultNow" (lambda (self)
+      (let ((r (cf-result self)))
+        (if (or (cf-pending? r) (cf-alt? r))
+            (throw-jvm 'IllegalStateException jolt-nil)
+            r))))
+    (cons "exceptionNow" (lambda (self)
+      (let ((r (cf-result self)))
+        (if (and (cf-alt? r) (not (cf-cancellation? (cf-alt-ex r))))
+            (let ((x (cf-alt-ex r)))
+              (if (and (cf-completion? x) (not (jolt-nil? (cf-cause x)))) (cf-cause x) x))
+            (throw-jvm 'IllegalStateException jolt-nil)))))
+    (cons "state" (lambda (self)
+      (let ((r (cf-result self)))
+        (future-state (cond ((cf-pending? r) "RUNNING")
+                            ((not (cf-alt? r)) "SUCCESS")
+                            ((cf-cancellation? (cf-alt-ex r)) "CANCELLED")
+                            (else "FAILED"))))))
+    (cons "obtrudeValue" (lambda (self v) (cf-settle! self v #t) jolt-nil))
+    (cons "obtrudeException" (lambda (self x) (cf-settle! self (make-cf-alt (cf-require! x)) #t) jolt-nil))
+    (cons "getNumberOfDependents" (lambda (self)
+      (let ((st (jhost-state self)))
+        (jolt-with-mutex (vector-ref st 1) (length (vector-ref st 3))))))
+    (cons "toCompletableFuture" (lambda (self) self))
+    (cons "copy" (lambda (self)
+      (let ((d (make-cf)))
+        (cf-when-done! self (lambda (r) (cf-settle! d (cf-encode-relay r) #f)))
+        d)))
+    (cons "newIncompleteFuture" (lambda (self) (make-cf)))
+    (cons "toString" cf-to-string)
+    (cons "orTimeout" (lambda (self amount unit)
+      (cf-on-timeout! self amount (cf-require! unit)
+        (lambda () (make-cf-alt (jolt-host-throwable "java.util.concurrent.TimeoutException" jolt-nil))))))
+    (cons "completeOnTimeout" (lambda (self v amount unit)
+      (cf-on-timeout! self amount (cf-require! unit) (lambda () v))))
+    (cons "completeAsync" (case-lambda
+      ((self s) (cf-async-supply self s 'default 'supply))
+      ((self s exec) (cf-require! s) (cf-async-supply self s (cf-require! exec) 'supply))))
+    (cons "thenApply" (lambda (self f) (cf-uni self #f f 'apply)))
+    (cons "thenApplyAsync" (cf-async-1 (lambda (self exec f) (cf-uni self exec f 'apply))))
+    (cons "thenAccept" (lambda (self f) (cf-uni self #f f 'accept)))
+    (cons "thenAcceptAsync" (cf-async-1 (lambda (self exec f) (cf-uni self exec f 'accept))))
+    (cons "thenRun" (lambda (self f) (cf-uni self #f f 'run)))
+    (cons "thenRunAsync" (cf-async-1 (lambda (self exec f) (cf-uni self exec f 'run))))
+    (cons "thenCombine" (lambda (self o f) (cf-both self o #f f 'apply)))
+    (cons "thenCombineAsync" (cf-async-2 (lambda (self o exec f) (cf-both self o exec f 'apply))))
+    (cons "thenAcceptBoth" (lambda (self o f) (cf-both self o #f f 'accept)))
+    (cons "thenAcceptBothAsync" (cf-async-2 (lambda (self o exec f) (cf-both self o exec f 'accept))))
+    (cons "runAfterBoth" (lambda (self o f) (cf-both self o #f f 'run)))
+    (cons "runAfterBothAsync" (cf-async-2 (lambda (self o exec f) (cf-both self o exec f 'run))))
+    (cons "applyToEither" (lambda (self o f) (cf-either self o #f f 'apply)))
+    (cons "applyToEitherAsync" (cf-async-2 (lambda (self o exec f) (cf-either self o exec f 'apply))))
+    (cons "acceptEither" (lambda (self o f) (cf-either self o #f f 'accept)))
+    (cons "acceptEitherAsync" (cf-async-2 (lambda (self o exec f) (cf-either self o exec f 'accept))))
+    (cons "runAfterEither" (lambda (self o f) (cf-either self o #f f 'run)))
+    (cons "runAfterEitherAsync" (cf-async-2 (lambda (self o exec f) (cf-either self o exec f 'run))))
+    (cons "thenCompose" (lambda (self f) (cf-compose self #f f)))
+    (cons "thenComposeAsync" (cf-async-1 (lambda (self exec f) (cf-compose self exec f))))
+    (cons "handle" (lambda (self f) (cf-handle self #f f)))
+    (cons "handleAsync" (cf-async-1 (lambda (self exec f) (cf-handle self exec f))))
+    (cons "whenComplete" (lambda (self f) (cf-when-complete self #f f)))
+    (cons "whenCompleteAsync" (cf-async-1 (lambda (self exec f) (cf-when-complete self exec f))))
+    (cons "exceptionally" (lambda (self f) (cf-exceptionally self #f f)))
+    (cons "exceptionallyAsync" (cf-async-1 (lambda (self exec f) (cf-exceptionally self exec f))))
+    (cons "exceptionallyCompose" (lambda (self f) (cf-exceptionally-compose self #f f)))
+    (cons "exceptionallyComposeAsync" (cf-async-1 (lambda (self exec f) (cf-exceptionally-compose self exec f))))))
 
 ;; java.util.concurrent.locks.ReentrantLock — a reentrant mutual-exclusion lock.
 ;; State: #(monitor), one MONITOR record of its own (make-monitor above), not the
@@ -3036,7 +4256,9 @@
 (register-host-methods! "reentrant-lock"
   ;; An uninterruptible acquire: a fiber contender parks on the monitor's waiter
   ;; list and a thread waits on its condition. monitor-exit! wakes both.
-  (list (cons "lock" (lambda (self) (monitor-enter! (rlock-monitor self)) jolt-nil))
+  (list (cons "lock" (lambda (self)
+          (parameterize ((thread-enter-state 'WAITING)) (monitor-enter! (rlock-monitor self)))
+          jolt-nil))
         ;; monitor-exit! is where "unlock from a non-owner throws" already lives, and
         ;; it throws the IllegalMonitorStateException the JVM does.
         (cons "unlock" (lambda (self) (monitor-exit! (rlock-monitor self)) jolt-nil))
@@ -3049,23 +4271,27 @@
           (let* ((m (rlock-monitor self))
                  (ms (tu-args->ms args))
                  (deadline (and ms (ms->deadline ms))))
-            (let attempt ()
-              (cond ((monitor-try-enter! m) #t)
-                    ;; Chez has no timed acquire, so poll. The wait is bounded by the
-                    ;; deadline; the round yields first so the holder can run.
-                    ((and deadline (time<=? (current-time 'time-utc) deadline))
-                     (monitor-poll-round!)
-                     (attempt))
-                    (else #f))))))
+            (call-with-thread-state 'TIMED_WAITING
+              (lambda ()
+                (let attempt ()
+                  (cond ((monitor-try-enter! m) #t)
+                        ;; Chez has no timed acquire, so poll. The wait is bounded by the
+                        ;; deadline; the round yields first so the holder can run.
+                        ((and deadline (time<=? (current-time 'time-utc) deadline))
+                         (monitor-poll-round!)
+                         (attempt))
+                        (else #f))))))))
         (cons "lockInterruptibly" (lambda (self)
           (let ((m (rlock-monitor self))
                 (me (current-interrupt-box)))
             (rlock-interrupted-check! me)
-            (let loop ()
-              (unless (monitor-try-enter! m)
-                (monitor-poll-round!)
-                (rlock-interrupted-check! me)
-                (loop)))
+            (call-with-thread-state 'WAITING
+              (lambda ()
+                (let loop ()
+                  (unless (monitor-try-enter! m)
+                    (monitor-poll-round!)
+                    (rlock-interrupted-check! me)
+                    (loop)))))
             jolt-nil)))
         ;; isLocked is "held by ANY thread"; getHoldCount and isHeldByCurrentThread are
         ;; about the CURRENT one, and the count is 0 rather than the raw depth for a

@@ -41,7 +41,7 @@
 ;; wraps the overlay (which still handles delay/lazy-seq/atom) for non-futures.
 (def-var! "clojure.core" "future-done?" jolt-native-future-done?)
 (def-var! "clojure.core" "future-cancelled?" jolt-native-future-cancelled?)
-(def-var! "clojure.core" "future?" jolt-future?)
+(def-var! "clojure.core" "future?" jolt-any-future?)
 (def-var! "clojure.core" "promise" jolt-promise-new)
 (def-var! "clojure.core" "deliver" jolt-deliver)
 ;; agents: the overlay (50-io) is a synchronous shim (agent = atom, send applies
@@ -50,7 +50,7 @@
 (def-var! "clojure.core" "agent" jolt-agent-new)
 (def-var! "clojure.core" "agent?" jolt-agent?)
 (def-var! "clojure.core" "send" jolt-agent-send)
-(def-var! "clojure.core" "send-off" jolt-agent-send)
+(def-var! "clojure.core" "send-off" jolt-agent-send-off)
 (def-var! "clojure.core" "await" jolt-agent-await)
 (def-var! "clojure.core" "agent-error" jolt-agent-error)
 (def-var! "clojure.core" "restart-agent" jolt-agent-restart)
@@ -76,7 +76,14 @@
         ;; whose message renders the (possibly infinite) seq.
         ;; a PLAIN seq (list/cons/range — not a lazy-seq wrapper) is not an
         ;; IPending on the JVM: realized? throws.
-        ((or (cseq? x) (empty-list-t? x))
+        ;; ...and neither is a java.util.concurrent.Future that is not a clojure
+        ;; future (a FutureTask, a CompletableFuture): the overlay would read it
+        ;; through its own future? test and answer false.
+        ;; ...except an Iterate (iterate, the unbounded range) or a Cycle, which
+        ;; are IPending: a cell's first element is computed with the cell, so
+        ;; each answers true, as the JVM's do once their first is known.
+        ((and (cseq? x) (let ((k (cseq-kind x))) (or (fx=? k sk-iterate) (fx=? k sk-cycle)))) #t)
+        ((or (cseq? x) (empty-list-t? x) (jolt-java-future? x))
          (jolt-throw (jolt-host-throwable
                       "java.lang.ClassCastException"
                       (string-append "class " (guard (e (#t "?")) (jolt-class-name x))

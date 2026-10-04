@@ -177,6 +177,15 @@
 (check "[(munge \"a-b?\") (clojure.lang.Compiler/demunge \"a_b_QMARK_\")]" "[\"a_b_QMARK_\" \"a-b?\"]")
 (check "[(Math/floor 2.5) (Math/abs -3) (String/join \",\" [\"a\" \"b\"]) (Character/isWhitespace \\space) (clojure.lang.Util/equiv 1 1)]"
        "[2.0 3 \"a,b\" true true]")
+;; java.lang.Math and clojure.math are math.ss, shared with Chez; number
+;; printing is number-print.ss, also shared (a subnormal prints its two nearest
+;; digits, as Double.toString does).
+(check "[(clojure.math/sqrt 16) (clojure.math/next-up 1.0) (clojure.math/ulp 1.0) (str (clojure.math/copy-sign 1.0 -0.0)) (clojure.math/IEEE-remainder 11.0 3.0) (clojure.math/get-exponent 1024.5)]"
+       "[4.0 1.0000000000000002 2.220446049250313E-16 \"-1.0\" -1.0 10]")
+(check "[(try (clojure.math/add-exact 9223372036854775807 1) (catch ArithmeticException e (ex-message e))) (Math/multiplyExact 6 7) (str (Math/min -0.0 0.0)) (Math/signum -2.5)]"
+       "[\"long overflow\" 42 \"-0.0\" -1.0]")
+(check "[(Double/doubleToLongBits 1.5) (str (Double/longBitsToDouble 1)) (Float/floatToIntBits 0.1) (str 9.9E-324)]"
+       "[4609434218613702656 \"4.9E-324\" 1036831949 \"9.9E-324\"]")
 (check "[(= (class (Object.)) Object) (identical? (Object.) (Object.)) (System/getProperty \"line.separator\")]"
        "[true false \"\\n\"]")
 (check "(let [sb (StringBuilder.)] (.append sb \"a\") (.append sb 1) (.append sb \\c) (str sb))" "\"a1c\"")
@@ -197,6 +206,43 @@
        "[\"java.lang.Long\" \"String\" true \"class java.lang.Number\"]")
 (check "[(str (class [])) (str Sequential) (pr-str Long)]"
        "[\"class clojure.lang.PersistentVector\" \"interface clojure.lang.Sequential\" \"java.lang.Long\"]")
+;; java/byte-buffer.ss (shared with Chez): ByteBuffer over a bytevector — the
+;; widths, byte order, the exact-arithmetic float codecs, views, the JDK's
+;; exceptions and value semantics, and compact's in-place block move
+(check "(let [b (java.nio.ByteBuffer/allocate 16)] (.putInt b 258) (.putDouble b 1.5) (.flip b) [(.getInt b) (.getDouble b) (.remaining b)])"
+       "[258 1.5 0]")
+(check "(let [b (.order (java.nio.ByteBuffer/allocate 4) java.nio.ByteOrder/LITTLE_ENDIAN)] (.putInt b 1) (.rewind b) [(.get b) (.get b 1) (str (.order b))])"
+       "[1 0 \"LITTLE_ENDIAN\"]")
+(check "(let [b (java.nio.ByteBuffer/allocate 4)] (.putFloat b 0.1) [(.getFloat b 0) (.getInt b 0)])"
+       "[0.1 1036831949]")
+(check "[(str (java.nio.ByteBuffer/allocate 2)) (.getName (class (java.nio.ByteBuffer/allocateDirect 1))) (instance? java.nio.Buffer (java.nio.ByteBuffer/allocate 1))]"
+       "[\"java.nio.HeapByteBuffer[pos=0 lim=2 cap=2]\" \"java.nio.DirectByteBuffer\" true]")
+(check "(let [b (java.nio.ByteBuffer/allocate 8) i (.asIntBuffer b)] (.put i 1 7) [(.getInt b 4) (str (.asCharBuffer (doto (java.nio.ByteBuffer/allocate 4) (.putChar \\h) (.putChar \\i) .flip)))])"
+       "[7 \"hi\"]")
+(check "[(try (.getInt (java.nio.ByteBuffer/allocate 2)) (catch java.nio.BufferUnderflowException e :underflow)) (try (.put (.asReadOnlyBuffer (java.nio.ByteBuffer/allocate 1)) (byte 1)) (catch java.nio.ReadOnlyBufferException e :read-only))]"
+       "[:underflow :read-only]")
+(check "[(= (java.nio.ByteBuffer/allocate 2) (java.nio.ByteBuffer/allocate 2)) (.hashCode (doto (java.nio.ByteBuffer/allocate 2) (.put (byte 1)) .flip)) (compare (doto (java.nio.ByteBuffer/allocate 1) (.put 0 (byte 5))) (java.nio.ByteBuffer/allocate 1))]"
+       "[true 32 5]")
+(check "(let [b (java.nio.ByteBuffer/allocate 4)] (.putInt b 16909060) (.flip b) (.get b) (.compact b) [(.position b) (.get b 0) (.get b 2)])"
+       "[3 2 4]")
+;; a StringCharBuffer needs no array, so CharBuffer/wrap of a string is here too
+(check "(let [s (java.nio.CharBuffer/wrap \"hi\") v (.asCharBuffer (doto (java.nio.ByteBuffer/allocate 4) (.putChar \\h) (.putChar \\i) .flip))] [(= s v) (.hashCode s) (str (.subSequence s 1 2)) (.getName (class s)) (.isReadOnly s)])"
+       "[true 4320 \"i\" \"java.nio.StringCharBuffer\" true]")
+
+;; java/tree-map.ss + java/jutil-colls.ss (shared with Chez): a TreeMap over
+;; clojure.core's sorted map, its live views, TreeSet, the Comparator statics,
+;; and the java.util.Map seam (=, pr, str, reduce-kv). Values from the Chez build.
+(check "(let [m (java.util.TreeMap. {:c 3 :a 1 :b 2})] [(vec (keys m)) (str m) (pr-str m) (.firstKey m) (.floorKey m :bb) (vec (keys (.headMap m :b true)))])"
+       "[[:a :b :c] \"{:a=1, :b=2, :c=3}\" \"{:a 1, :b 2, :c 3}\" :a :b [:a :b]]")
+(check "(let [m (java.util.TreeMap. >) d (.descendingMap m)] (.put m 1 :a) (.put d 3 :c) [(vec (keys m)) (vec (keys d)) (count m) (get m 3) (try (.put (.headMap m 2) 0 :x) (catch IllegalArgumentException e :iae))])"
+       "[[3 1] [1 3] 2 :c :iae]")
+(check "(let [s (java.util.TreeSet. (java.util.Comparator/reverseOrder))] (.addAll s [1 3 2]) [(vec s) (.first s) (vec (.headSet s 2)) (= s #{1 2 3}) (str s)])"
+       "[[3 2 1] 3 [3] true \"[3, 2, 1]\"]")
+(check "[(try (.put (java.util.TreeMap.) nil 1) (catch NullPointerException e :npe)) (try (let [m (java.util.TreeMap.)] (.put m :a 1) (.put m \"b\" 2)) (catch ClassCastException e :cce)) (= (java.util.TreeMap. {:a 1}) {:a 1}) (reduce-kv (fn [a k v] (conj a k v)) [] (java.util.TreeMap. {2 :b 1 :a}))]"
+       "[:npe :cce true [1 :a 2 :b]]")
+
+(check "(let [m (java.util.TreeMap. {:a 1 :b 2})] (doseq [e (.entrySet m)] (.setValue e (* 10 (val e)))) [(str m) (str (first m)) (into {} m) (try (.setValue (.firstEntry m) 0) (catch UnsupportedOperationException e :uoe))])"
+       "[\"{:a=10, :b=20}\" \":a=10\" {:a 10, :b 20} :uoe]")
 
 ;; a ^double-hinted fn compiles WITHOUT #3% in the emitted text (the R9
 ;; target-prims table at :gambit maps the unsafe prefix to "")

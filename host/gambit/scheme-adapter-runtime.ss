@@ -70,6 +70,14 @@
             (begin (vector-set! r k new) #t)
             #f)))))
 
+;; sa-box-cas!: the same swap on a box, under the same mutex.
+(define (sa-box-cas! b old new)
+  (jwm-call sa-record-cas-mu
+    (lambda ()
+      (if (eq? (unbox b) old)
+          (begin (set-box! b new) #t)
+          #f))))
+
 (define (sa-gc-collect)
   #f)
 
@@ -169,6 +177,16 @@
 ;; Permitted degradation: Gambit has no in-place collection mode, so this is
 ;; ignored.
 (define (sa-gc-tight! on?) (if #f #f))
+
+;; (sa-make-large-bytevector n) -> bytevector
+;; Permitted degradation: an ordinary bytevector; Gambit has no immobile
+;; allocation to ask for.
+(define (sa-make-large-bytevector n) (make-bytevector n 0))
+;; (sa-pin-for-owner! owner obj) / (sa-unpin-for-owner! owner) -> void
+;; Permitted degradation: both no-op; Gambit cannot be asked not to move an
+;; object, and does not load the arrays that ask.
+(define (sa-pin-for-owner! owner obj) (if #f #f))
+(define (sa-unpin-for-owner! owner) (if #f #f))
 
 ;; (sa-gc-reserve-ratio! r) -> void
 ;; Permitted degradation: Gambit sizes its own heap reserve, so this is ignored.
@@ -624,6 +642,8 @@
   (vector-copy! to at from start end))
 (define (sa-string-copy-range! to at from start end)
   (string-copy! to at from start end))
+(define (sa-bytevector-copy-range! to at from start end)
+  (bytevector-copy! to at from start end))
 (define (sa-vector-copy v) (subvector v 0 (vector-length v)))
 (define (sa-subvector v start end) (subvector v start end))
 (define sa-vector-append vector-append)

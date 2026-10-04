@@ -14,7 +14,7 @@
    :impl-detail
    "representation detail: syntax-quote yields a list? (JVM yields a Cons)",
   :seq-type-model
-  "jolt reifies the JVM's specialized seq class for nearly every producer now (Cons/Iterate/LongRange/Range/Repeat/ChunkedSeq/StringSeq/KeySeq/RSeq/ArraySeq/SubVector). What still collapses to LazySeq is cycle (JVM: Cycle) — see its :entries row below. Values and laziness are correct, only (class …) differs. jolt-aei7",
+  "jolt reifies the JVM's specialized seq class for nearly every producer now (Cons/Iterate/LongRange/Range/Repeat/Cycle/ChunkedSeq/StringSeq/KeySeq/RSeq/ArraySeq/SubVector). The :documented entries under this category are the classes that still differ. Values and laziness are correct, only (class …) differs. jolt-aei7",
   :chunking-model
   "jolt now chunks range/vector seqs through map/filter like the JVM (forcing one element realizes the whole ~32-element chunk). What remains finer-grained: dedupe realizes 0 at construction where the JVM's sequence transformer forces the first chunk just to build the seq. (mapcat realizes like the JVM's (apply concat …): four elements, or the first chunk.) jolt-mm6v",
   :integer-box-model
@@ -122,6 +122,23 @@
    :check {:expr "(let [ex (java.util.concurrent.Executors/newScheduledThreadPool 1)] (try (.getName (class (.submit ex ^java.util.concurrent.Callable (fn [] 1)))) (finally (.shutdown ex))))"
            :jvm "\"java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask\""
            :jolt "\"java.util.concurrent.FutureTask\""}}
+  ;; CompletableFuture. The stage graph, its exception wrapping and its waits are
+  ;; certified by the corpus rows under "interop / completable future"; these are
+  ;; the two details of it jolt does not reproduce.
+  {:category :host-model
+   :behavior "whenComplete whose action throws over a stage that already failed"
+   :jvm "the stage keeps its own failure and the action's throwable is added to it with addSuppressed"
+   :jolt "the stage keeps its own failure; jolt throwables carry no suppressed list (getSuppressed is always empty), so the action's throwable is dropped"
+   :check {:expr "(let [c (.whenComplete (java.util.concurrent.CompletableFuture/failedFuture (RuntimeException. \"boom\")) (fn [v e] (throw (IllegalStateException. \"wc\"))))] (try (.join c) (catch Throwable e (count (.getSuppressed (.getCause e))))))"
+           :jvm "1"
+           :jolt "0"}}
+  {:category :host-model
+   :behavior "the thread an async stage runs on"
+   :jvm "a ForkJoinPool.commonPool worker (\"ForkJoinPool.commonPool-worker-N\"), and orTimeout/completeOnTimeout fire on the \"CompletableFutureDelayScheduler\" thread"
+   :jolt "a worker of a cached thread pool jolt makes on first use (the pool newCachedThreadPool builds, which does not hold the process open either); a timeout fires on the runtime's shared timer and is handed to that pool, so dependents never run on the timer thread"
+   :check {:expr "(.startsWith (.join (java.util.concurrent.CompletableFuture/supplyAsync (fn [] (.getName (Thread/currentThread))))) \"ForkJoinPool.commonPool-worker-\")"
+           :jvm "true"
+           :jolt "false"}}
   {:category :host-model
    :behavior "(contains? P :on) / :on-interface / :method-builders on a protocol value"
    :jvm "true — defprotocol also generates the interface my.ns.P, and these three keys describe it"
@@ -351,19 +368,6 @@
            :jvm "\"true\""
            :jolt "\"false\""}
    :note "Same root as the row above, seen through a collection. Util.equiv tests reference identity before value, and the JVM compiler hands both lists the SAME boxed Double for the ##NaN constant, so the elements are identical and the lists compare equal — clojure.org/guides/equality documents this as a surprise rather than a rule, and the clojure-test-suite calls it undefined behavior. jolt compares element values, so it answers false, which is what (= ##NaN ##NaN) already says."}
-  ;; The shortest decimal digits of Double/MIN_VALUE. Java's FloatingDecimal
-  ;; prints the smallest denormal as 4.9E-324; Chez's free-format printer, which
-  ;; is what format and str read a flonum's digits from, prints 5e-324 -- both
-  ;; round-trip to the same double, so both are shortest, and only this one
-  ;; value (one significant bit) has two shortest spellings.
-  {:category :numeric-model
-   :behavior "(format \"%.2e\" 4.9e-324)"
-   :jvm "\"4.90e-324\""
-   :jolt "\"5.00e-324\""
-   :check {:expr "(format \"%.2e\" 4.9e-324)"
-           :jvm "\"4.90e-324\""
-           :jolt "\"5.00e-324\""}
-   :note "Only Double/MIN_VALUE: every other double has one shortest digit string and the two printers agree on it. format's %e/%f/%g round those digits half up exactly as java.util.Formatter does."}
   ;; ex-info's data map is unchecked here. ExceptionInfo's constructor takes an
   ;; IPersistentMap, so a non-map is a ClassCastException on the JVM; jolt stores
   ;; whatever it is handed and ex-data reads it back. A superset: portable code
@@ -377,6 +381,21 @@
            :jvm "throws ClassCastException"
            :jolt "5"}
    :note "Unchecked data argument; a map behaves identically. Verified against Clojure 1.12.5."}
+  ;; A reference array's elements are not checked against its component class:
+  ;; the JVM raises "array element type mismatch" from into-array and
+  ;; ArrayStoreException from aset, while jolt stores the value. Typed arrays
+  ;; carry their component class (into-array String … is a String[]), but jolt's
+  ;; class model does not know every JDK class's ancestry — a StandardCopyOption
+  ;; is a CopyOption on the JVM and not here — so a check would refuse arrays the
+  ;; JVM builds. A superset: an array of the right elements behaves identically.
+  {:category :permissive
+   :behavior "(into-array String [1]) — an element that is not of the component class"
+   :jvm "throws IllegalArgumentException"
+   :jolt "a String[] holding 1"
+   :check {:expr "(vec (into-array String [1]))"
+           :jvm "throws IllegalArgumentException"
+           :jolt "[1]"}
+   :note "aset into a typed array is unchecked the same way. Verified against Clojure 1.12.5."}
   ;; doseq with an unknown keyword among its bindings: the reference fails from
   ;; inside its own expansion (a NullPointerException, its "steppair" is null),
   ;; while for refuses the same keyword by name. jolt refuses both by name.
@@ -889,6 +908,17 @@
            :jvm "[\"java.lang.Float\" false]"
            :jolt "[\"java.lang.Double\" true]"}
    :note "Chez has one flonum. instance? is deliberately permissive for Float/Double and Integer/Long — a value answers to both spellings of its collapsed class — while Short and Byte stay false. Since #627 the big classes are value-sensitive: BigInt/BigInteger answer only for bignums (which also class as clojure.lang.BigInt), Long/Integer only for fixnums, matching the JVM. A bignum still answers BigInteger (one big representation serves both classes; the JVM says false) — the remaining superset."}
+  ;; The same collapse at the java.nio seam: a float read out of a buffer has no
+  ;; Float to be, so it is the double jolt's (float x) would have made of the
+  ;; digits Float.toString prints.
+  {:category :integer-box-model
+   :behavior "(.getFloat b) on a ByteBuffer, (.get fb) on a FloatBuffer"
+   :jvm "a java.lang.Float; widened to double it is the float's exact value (0.10000000149011612 for 0.1f), and a NaN keeps its payload bits"
+   :jolt "a Double holding the shortest decimal that reads back as that float (0.1), so it prints as the JVM's Float does and equals (float 0.1); a NaN re-encodes as the canonical 0x7fc00000"
+   :check {:expr "(let [b (java.nio.ByteBuffer/allocate 4)] (.putFloat b 0.1) (double (.getFloat b 0)))"
+           :jvm "0.10000000149011612"
+           :jolt "0.1"}
+   :note "putFloat rounds to single precision exactly as the JDK does (every finite pattern round-trips byte for byte, checked against JDK 21 over 4000 random patterns). NaN payloads are not observable on jolt: the encoders are exact arithmetic over the value, which has no payload to read."}
   ;; Thread.getStackTrace names the frames jolt can reconstruct: the live
   ;; continuation, plus callers TCO erased that the compile-time callsite tables
   ;; name (a static tail edge, or the one most recent tail site bridging a gap).
@@ -936,11 +966,11 @@
   {:category :host-model
    :behavior "java.lang.management.ManagementFactory/getMemoryMXBean and the MXBean API"
    :jvm "returns a MemoryMXBean reporting heap/non-heap usage, GC counts, and more"
-   :jolt "absent; resolve answers nil and the call raises \"Unknown class java.lang.management.ManagementFactory\""
-   :check {:expr "(pr-str (resolve 'java.lang.management.ManagementFactory))"
-           :jvm "\"java.lang.management.ManagementFactory\""
-           :jolt "\"nil\""}
-   :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is JMX itself. Affects criterium's benchmark reporting, not its timing."}
+   :jolt "absent: ManagementFactory answers only getThreadMXBean (the current thread's CPU clock); getMemoryMXBean and the rest raise"
+   :check {:expr "(try (java.lang.management.ManagementFactory/getMemoryMXBean) :present (catch Throwable e :absent))"
+           :jvm ":present"
+           :jolt ":absent"}
+   :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is the rest of JMX. Affects criterium's benchmark reporting, not its timing."}
   ;; A recv error reads as EOF: io-call classifies the captured errno itself and
   ;; returns only the syscall result, so ECONNRESET reaches the read side as a
   ;; bare -1 with no way to raise Java's SocketException for it.
@@ -951,15 +981,6 @@
    :check :prose
    :why "needs a live TCP peer that resets the connection"
    :note "errno IS captured atomically per syscall; io-call just consumes it for retry classification instead of returning it, so error and orderly shutdown collapse to EOF. Writes DO throw (send's return distinguishes); only the read side is permissive."}
-  ;; connect's timeout argument is accepted and ignored — the underlying
-  ;; connect(2) is always blocking (equivalent to Java's timeout 0).
-  {:category :host-model
-   :behavior "(.connect socket endpoint 5000) — requires (require 'jolt.socket)"
-   :jvm "aborts with SocketTimeoutException after 5000 ms"
-   :jolt "blocks until the OS-level connect resolves"
-   :check :prose
-   :why "needs an unroutable address to time out against"
-   :note "A timed connect needs non-blocking mode + poll; not modeled. The no-timeout arity behaves identically on both."}
   ;; getHostName does no reverse lookup. The JVM reverse-resolves a
   ;; literal-address InetSocketAddress ("127.0.0.1" answers "localhost" when
   ;; the nameservice maps it), which makes its value machine-dependent —
@@ -976,35 +997,59 @@
   ;; deref, agent await, Thread.sleep/join, CountDownLatch.await, a task Future's
   ;; get, a blocking queue take/put, awaitTermination and Process.waitFor all throw
   ;; InterruptedException and leave the flag cleared, as on the JVM (jolt-qdi8).
-  ;; What remains divergent is narrower, and both halves are listed here.
   ;;
-  ;; A FIBER has no interrupt flag of its own. jolt's interrupt identity is the
-  ;; thread's interrupt box, and N fibers SHARE a carrier, so an interrupt aimed at
-  ;; a carrier can be consumed by a different parked fiber than the interrupter had
-  ;; in mind. On the JVM a parked go block occupies no thread at all, so there is
-  ;; nothing on that thread to interrupt but the block currently running.
-  ;; A go block that interrupts (Thread/currentThread) and then blocks does throw on
-  ;; both — that part matches.
+  ;; A FIBER IS A VIRTUAL THREAD, with its own Thread object and its own interrupt
+  ;; flag, so interrupting one fiber throws that fiber and no other out of its wait,
+  ;; and a fiber's Thread/sleep parks it and is interruptible — as a JDK 21 virtual
+  ;; thread's does. io-thread runs on one, as on the JVM. What stays different is a
+  ;; go block on the :fiber backend: core.async 1.9.865 runs go blocks on its :mixed
+  ;; pool of PLATFORM threads (dispatch/executor-for :core-async-dispatch), so
+  ;; Thread/currentThread inside one is whichever pool thread runs that segment, and
+  ;; may differ after each park. jolt's :fiber go block is a fiber, so it answers
+  ;; the fiber's own virtual thread, the same one for the block's whole life.
+  ;; Interrupting it reaches that block's blocking waits (<!!, deref, sleep), never
+  ;; its parks (<!, >!, alts!), which matches what interrupting the pool thread a
+  ;; running go block is on does to that block on the JVM.
   {:category :concurrency-model
-   :behavior "(.interrupt t) for a dispatch thread t while several go blocks are parked in blocking derefs that ran on it"
-   :jvm "a parked go block holds no thread; only whatever is running on t at that moment can be interrupted"
-   :jolt "the parked fibers registered against t's interrupt box are all woken and one of them consumes the interrupt and throws"
+   :behavior "(binding [*go-backend* :fiber] (<!! (go [(.isVirtual (Thread/currentThread)) (.getName (Thread/currentThread))])))"
+   :jvm "go blocks run on core.async's platform dispatch pool: [false \"async-mixed-N\"], and the thread can change across a park"
+   :jolt "[true \"\"] — the go block's own virtual thread, stable for its life"
    :check :prose
-   :why "needs several go blocks parked on one dispatch thread with an interrupt landing mid-park"
-   :note "jolt has no per-fiber interrupt flag to key on and .interrupt is handed a box and nothing else. The check CLEARS, so one interrupt still produces exactly one InterruptedException — but which fiber gets it is not determined. Pinned by the \"interrupt / blocking fibers\" rows in test/chez/unit.edn, which bind *go-backend* :fiber — go defaults to :thread, so an unbound (go ...) runs on an OS thread and tests nothing about fibers. The reasoning is at jolt-cv-wait-interruptibly in host/chez/locks.ss."}
-  ;; A fiber's Thread/sleep gets the ALREADY-SET half of the rule but not the other
-  ;; half. Chez's sleep has no wakeup, and Thread/sleep on a fiber deliberately
-  ;; sleeps its CARRIER (fibers-pool-test case 6 pins that, and a go block doing
-  ;; Thread/sleep occupies its thread on the JVM too), so there is nothing to poke.
-  ;; Parking the fiber with a deadline instead would fix it and would also release
-  ;; the carrier, which is the behavior that gate deliberately pins the other way.
+   :why "*go-backend* :fiber has no JVM counterpart; the default :thread backend runs a go block on a platform thread, as the JVM does"
+   :note "Pinned by the \"virtual threads / fibers\" rows in test/chez/unit.edn. The fiber's Thread object is virtual-thread-object in host/chez/java/io.ss and its flag is read by current-interrupt-box in host/chez/java/host-static-methods.ss."}
+  ;; An alts that both takes from and puts to the same unbuffered channel. On the
+  ;; JVM the put finds the alts's own take registered and commits against it: the
+  ;; alts answers [true ch] and the value goes to a callback nobody reads. jolt
+  ;; claims a putter and a taker together and never pairs a handler with itself, so
+  ;; the two ops wait for real partners.
   {:category :concurrency-model
-   :behavior "(.interrupt carrier) while a fiber on it is inside (Thread/sleep n) — under (binding [*go-backend* :fiber] ...)"
-   :jvm "a go block's Thread/sleep runs on a pool thread and throws InterruptedException at once"
-   :jolt "the sleep runs to its full duration; the flag is set and readable the moment it returns"
+   :behavior "(let [c (chan)] (alts!! [c [c :v] (timeout 100)] :priority true))"
+   :jvm "[true c] — the put pairs with the alts's own take, and :v is lost"
+   :jolt "[nil timeout-chan] — neither op completes, and nothing is lost or left in c"
    :check :prose
-   :why "timing-dependent: asserts when a sleep returns relative to an interrupt"
-   :note "Entering the sleep with the flag ALREADY set does throw, so the pre-set half matches. Only mid-sleep delivery is missing. Pinned by the last \"interrupt / blocking fibers\" row in test/chez/unit.edn, which also shows the flag surviving the nap. A fiber that must be interruptible mid-wait should park on a promise or channel rather than sleep."}
+   :why "the JVM answer loses a value, and the jolt answer depends on a timeout firing"
+   :note "Probed on core.async 1.9.865. Pinned by the \"core.async / rendezvous\" rows in test/chez/unit.edn; the pairing is alt-claim-pair! in host/chez/java/async.ss."}
+  ;; The blocking channel ops: <!!, >!! and alts!! throw InterruptedException and
+  ;; clear the flag, as on the JVM, and a flag already set makes an op that would
+  ;; wait throw at once while one that can complete completes. What differs is what
+  ;; the interrupted op leaves behind. JVM core.async blocks by deref'ing a promise
+  ;; its handler will deliver, and the throw out of that deref does not take the
+  ;; handler off the channel. So a later put hands its value to the taker that is
+  ;; gone, and a later taker takes the value of a put that threw — probed on
+  ;; core.async 1.9.865: after an interrupted (<!! c), (offer! c 1) answers true and
+  ;; the 1 is never seen again; after an interrupted (>!! c :v), (poll! c) answers
+  ;; :v; after an interrupted (alts!! [c [d :v]]), (poll! d) answers :v. jolt
+  ;; retracts the op before it throws, so each of those answers nil and no value is
+  ;; lost or delivered by an op that failed. For the same reason, when a delivery
+  ;; races the interrupt and wins, jolt returns the value and leaves the flag set
+  ;; (the op completed first), where the JVM throws with the value already taken.
+  {:category :concurrency-model
+   :behavior "(let [c (chan)] (interrupt a thread blocked in (<!! c)) (offer! c 1)) — likewise (poll! c) after an interrupted (>!! c :v), and (poll! d) after an interrupted (alts!! [c [d :v]])"
+   :jvm "true — the interrupted taker's handler is still registered and swallows the 1; the poll! answers :v, delivered by a put that threw"
+   :jolt "nil — the interrupted op was retracted before it threw, so nothing is taken or delivered on its behalf"
+   :check :prose
+   :why "needs a thread blocked in a channel op with an interrupt landing mid-wait"
+   :note "Pinned by the \"interrupt / blocking channels\" rows in test/chez/unit.edn. The mechanism is ac-intr-wait! in host/chez/java/async.ss. The parking ops (<!, >!, alts!) are not interruptible on either runtime; on jolt's default :thread go backend a go body IS its thread, so an interrupt of that thread leaves the flag set where the go body reads it afterwards (the JVM resumes a parked go on a pool thread with its own flag)."}
   ;; The piped streams are the one blocking read left outside the interruptible set.
   {:category :concurrency-model
    :behavior "(.interrupt t) while t is blocked in (.read a-PipedInputStream)"
@@ -1050,26 +1095,6 @@
    :check :prose
    :why "Windows-only; the gate runs on whichever host invoked it"
    :note "POSIX is unaffected and enumerates through getifaddrs as before. InetAddress/getLocalHost and getByName DO work on Windows — they go through gethostname and the resolver, not the interface table. Code that needs a Windows adapter list has no answer here yet; the fix is a GetAdaptersAddresses walk."}
-  ;; A socket on jolt is set O_NONBLOCK so a fiber that would block can park on
-  ;; jolt.io-poller instead of pinning its carrier (fibers R8). That poller is
-  ;; kqueue or epoll, and Windows has neither: WSAPoll is a stateless poll rather
-  ;; than a kernel-held registration set, and its own wake channel would have to
-  ;; be a loopback socket pair, since it accepts only sockets. So sockets stay
-  ;; BLOCKING on Windows (jolt-lang/jolt#1107).
-  ;;
-  ;; Worth being precise about which direction this diverges in: blocking is what
-  ;; java.net.Socket IS on the JVM — the non-blocking descriptor and the readiness
-  ;; poller are jolt's fiber extension OVER java.net, not part of its contract.
-  ;; What Windows is missing is therefore a jolt superset, not a java.net
-  ;; behaviour, and the visible consequence is throughput under fibers rather than
-  ;; a different answer from any java.net call.
-  {:category :host-model
-   :behavior "a fiber blocked on a java.net socket read or write ON WINDOWS"
-   :jvm "n/a — the JVM has no fibers over java.net.Socket; a virtual thread unmounts because the JDK's own socket implementation is non-blocking underneath"
-   :jolt "the fiber's carrier thread blocks in recv/send; the fibers queued behind it wait"
-   :check :prose
-   :why "Windows-only; the gate runs on whichever host invoked it"
-   :note "POSIX is unaffected — kqueue/epoll park the fiber as before. Every java.net call answers the same value on Windows; only the concurrency of a fiber pool changes. jolt.io-poller/nonblock! is the no-op that makes this deliberate rather than a broken non-blocking socket with nothing able to wait for it."}
   {:category :host-model
    :behavior "(System/getProperty \"line.separator\") and clojure.core/system-newline, ON WINDOWS"
    :jvm "\"\\r\\n\" — the platform's own convention"
@@ -1657,12 +1682,6 @@
   {:suite "untested / chunk family (eager equivalents) + cat",
    :label "chunk round-trip",
    :category :host-model}
-  ;; A seq now reports the concrete clojure.lang class of whatever produced it
-  ;; (cons, vector seq, string seq, keys, vals, rseq, sort, range, iterate,
-  ;; repeat, the map/set seq views, drop over an IDrop coll), so those rows
-  ;; certify. cycle is still modelled as a lazy seq and keeps its class; the JVM
-  ;; has clojure.lang.Cycle.
-  {:suite "seq-type-model / remaining class collapse", :label "cycle", :category :seq-type-model}
   {:suite "chunking-model / unchunked realization granularity", :label "dedupe is fully lazy at construction", :category :chunking-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "byte class", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "short class", :category :integer-box-model}

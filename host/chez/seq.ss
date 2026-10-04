@@ -92,9 +92,10 @@
 (define sk-array-bool   21)
 (define sk-array-byte   22)
 (define sk-array-char   23)
+(define sk-cycle        24)   ; (cycle coll): clojure.lang.Cycle
 ;; How many there are — the java layer sizes its kind-indexed tables from this,
 ;; so adding a flavor above needs no second edit to keep them in step.
-(define sk-count        24)
+(define sk-count        25)
 
 ;; The cseq record (head tail kind meta, chez-cseq-v8) and its vector-backed
 ;; subtype cseqv (+ cvec ci crest) are defined in values.ss with the other collection layouts, ahead of every
@@ -207,6 +208,19 @@
     (lambda (n end+step) (range-chunked n (car end+step) (cdr end+step) sk-repeat))))
 (define lz-iterate
   (register-lazy-src! 'iterate (lambda (f x) (jolt-iterate f (jolt-invoke1 f x)))))
+;; (cycle coll): clojure.lang.Cycle — one lazy cell per element, walking the
+;; coll's seq and starting over at its end. A cell holds the whole seq and its
+;; place in it, so no element is realized ahead of the walk.
+(define lz-cycle
+  (register-lazy-src! 'cycle
+    (lambda (all cur)
+      (let ((n (jolt-next cur)))
+        (cycle-cells all (if (jolt-nil? n) all n))))))
+(define (cycle-cells all cur)
+  (cseq-lazy/k (jolt-first cur) (make-lazy-src lz-cycle all cur) sk-cycle))
+(define (jolt-cycle coll)
+  (let ((s (jolt-seq coll)))
+    (if (jolt-nil? s) jolt-empty-list (cycle-cells s s))))
 ;; (repeat x) / (repeat n x): clojure.lang.Repeat, one lazy cell per element whose
 ;; tail holds x and how many elements follow it (#f = unbounded), so a drop can
 ;; skip ahead instead of walking (repeat-skip), as Repeat's IDrop does.
@@ -1321,10 +1335,13 @@
 (define (jolt-proc-arity-name f)
   (let ((p (proc-name-of f)))
     (if p (string-append (car p) "/" (cdr p)) "fn")))
+;; ArityException's count: the number, or "> 20" past twenty (CLJ-2739).
+(define (jvm-arity-count n)
+  (if (and (number? n) (> n 20)) "> 20" (if (number? n) (number->string n) (jolt-str-render-one n))))
 (define (jolt-arity-error-name name nargs)
   (jolt-throw (jolt-host-throwable "clojure.lang.ArityException"
                 (string-append "Wrong number of args ("
-                               (number->string nargs)
+                               (jvm-arity-count nargs)
                                ") passed to: " name))))
 (define (jolt-proc-arity-error f nargs)
   (jolt-arity-error-name (jolt-proc-arity-name f) nargs))
@@ -1831,11 +1848,23 @@
                  (cond ((jolt-reduced? acc) acc)
                        ((fx>=? j clen) (outer k acc))
                        (else (inner (fx+ j 1) (fx+ k 1) (step acc k (vector-ref chunk j))))))))))))
+;; IKVReduce over a java.util.Map shim: its entries in iteration order, or #f
+;; for anything else. The java layer (java/jutil-colls.ss) set!s this; it is a
+;; hook rather than a predicate list here because the shims are its to know.
+(define jolt-reduce-kv-entries (lambda (x) #f))
 (define (jolt-reduce-kv f init coll)
   (let ((r (cond
              ((pmap? coll) (pmap-kv-reduce coll f init))
              ((pvec? coll) (vec-kv-reduce coll f init))
              ((jolt-nil? coll) init)
+             ((jolt-reduce-kv-entries coll)
+              => (lambda (es)
+                   (let ((step (kv-step f)))
+                     (let loop ((acc init) (es es))
+                       (cond ((null? es) acc)
+                             ((jolt-reduced? acc) acc)
+                             (else (loop (step acc (jolt-nth (car es) 0) (jolt-nth (car es) 1))
+                                         (cdr es))))))))
              ((iface-method coll "kvreduce" 3) => (lambda (m) (jolt-invoke m coll f init)))
              ((jolt-map? coll)
               (let ((step (kv-step f)))
@@ -1956,6 +1985,27 @@
                       (repeat-cells (cseq-head s) (- (+ left 1) n))
                       s)))
                (else #f)))))
+;; Is s (a seq) one of the JVM's infinite seq classes — Iterate (iterate, the
+;; unbounded range), Cycle, or a Repeat with no count? Their hash and hashCode
+;; throw UnsupportedOperationException rather than walk forever (CLJ-2839), so
+;; the hash paths ask this first. An unbounded repeat is found by walking to the
+;; first cell whose tail is still a source and reading the count it carries; a
+;; bounded one fully realized ends at the empty list.
+(define (seq-unbounded? s)
+  (and (cseq? s)
+       (let ((k (cseq-kind s)))
+         (or (fx=? k sk-iterate) (fx=? k sk-cycle)
+             (and (fx=? k sk-repeat)
+                  (let loop ((s s))
+                    (let ((t (cseq-tail s)))
+                      (cond ((lazy-src? t)
+                             (cond ((eq? (lazy-src-fn t) lz-repeat) #t)
+                                   ((eq? (lazy-src-fn t) lz-repeat-val) (not (lazy-src-b t)))
+                                   (else #f)))
+                            ((and (cseq? t) (fx=? (cseq-kind t) sk-repeat)) (loop t))
+                            (else #f)))))))))
+(define (seq-hash-refuse-unbounded! s)
+  (when (seq-unbounded? s) (throw-jvm 'UnsupportedOperationException jolt-nil)))
 ;; A count no fixnum reaches drops everything from a lazy source: the countdown
 ;; never ends, so the source is walked to its end, realizing it as the JVM's
 ;; step loop does.
@@ -2206,7 +2256,8 @@
 ;; characters). A plain 2-element vector is accepted where the JVM casts: jolt
 ;; reads a vector of pairs as a seq of entries, a documented superset.
 (define (entry-like? e)
-  (and (pvec? e) (= 2 (pvec-count e))))
+  (or (and (pvec? e) (= 2 (pvec-count e)))
+      (and (jolt-host-entry e) #t)))
 (define (entry-cast-error e)
   (jolt-throw (jolt-host-throwable "java.lang.ClassCastException"
                 (string-append

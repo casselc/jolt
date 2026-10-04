@@ -61,9 +61,13 @@
                                (raise e))))
                (collect (collect-maximum-generation))
                'ok)))
-      (when (and (eq? r 'busy) (fx>? tries 0))
-        (sleep (make-time 'time-duration 1000000 0))   ; 1 ms
-        (loop (fx- tries 1))))))
+      (case r
+        ;; no collect-request-handler ran, so undo the pins of arrays this one
+        ;; found dead here, or they stay locked (and live) until the next pin
+        ((ok) (sa-pin-drain-after-collect!))
+        ((busy) (when (fx>? tries 0)
+                  (sleep (make-time 'time-duration 1000000 0))   ; 1 ms
+                  (loop (fx- tries 1))))))))
 
 ;; (sa-gc-max-generation) -> exact integer
 ;; The deepest collectable generation, for callers mapping JVM generations.
@@ -115,6 +119,26 @@
   (set! sa-young-tight? on?)
   (in-place-minimum-generation
     (if on? (min sa-gc-tight-generation (collect-maximum-generation)) (collect-maximum-generation))))
+
+;; (sa-make-large-bytevector n) -> bytevector
+;; A fresh zero-filled bytevector of N bytes that the collector marks where it is
+;; instead of copying, for a large pointer-free backing (rt natives-array.ss: byte
+;; arrays from 64KB up). Chez pins a huge allocation on its own (segment.c
+;; S_find_segments: over 128 segments, must_mark), but only when the request
+;; takes FRESH segments. One served from the free segments of an existing chunk
+;; is an ordinary mobile object, and a full collection marks a segment in place
+;; only when its chunk is at least a quarter used (gc.c
+;; chunk_sufficiently_compact) -- so in a chunk a bigger freed object left nearly
+;; empty it is copied, at every full collection, each copy reusing free segments
+;; again. A live 8MB byte array after a freed 64MB long array cost ~1ms a full
+;; collection instead of ~100us that way, on a layout no program controls
+;; (#1225). An immobile object is always marked, and still reclaimed when
+;; unreachable. Contract: a mutable bytevector of length N, all zero.
+;; Degradation: an ordinary bytevector.
+(define (sa-make-large-bytevector n)
+  (let ((bv (make-immobile-bytevector n)))
+    (bytevector-fill! bv 0)
+    bv))
 
 ;; (sa-max-memory-bytes) -> exact integer
 ;; Peak heap bytes: the most the collector has held from the OS since the last
@@ -1116,7 +1140,7 @@
              (if room
                  (let ((saved (in-place-minimum-generation)))
                    (dynamic-wind
-                     (lambda () (in-place-minimum-generation (min saved sa-gc-tight-generation)))
+                     (lambda () (in-place-minimum-generation 1))
                      (lambda () (sa-collect-tight room))
                      (lambda () (in-place-minimum-generation saved))))
                  (collect (collect-maximum-generation)))))))
@@ -1125,37 +1149,33 @@
         (let ((t0 (sa-monotonic-ns)))
           (sa-collect-young!)
           (maintain collect-full!)
+          (sa-pin-drain-after-collect!)
           (let ((t1 (sa-monotonic-ns)))
             (observe (- t1 t0) (- t1 last-end))
             (set! last-end t1))))))
   #t)
-;; A tight full collection within ROOM free bytes. Marking in place does not
-;; keep a tight collection from copying: Chez still copies a segment whose chunk
-;; is under a quarter used, or that was marked before and is now under three
-;; quarters live, and after a run of tight young collections that can be most of
-;; the younger generations. A copied object's source is freed only when its
-;; collection ends, so one (collect max) peaks at the heap in use plus everything
-;; it copies: the gcpolicy gate's forced case, with ~140MB in generations 1-3
-;; and none yet in the oldest, peaked at 322MB under a 256MB ceiling.
+;; A tight full collection within ROOM free bytes: every generation from 1 up
+;; is marked where it is rather than copied, in ONE collection. Chez marks a
+;; segment only when its generation is at least both in-place-minimum-generation
+;; and the collection's min-tg (gc.c), so (collect max 1 max) with the minimum at
+;; 1 copies generation 0 and the sparse segments Chez always recopies (a chunk
+;; under a quarter used, a segment marked before and now under three quarters
+;; live), and promotes the rest in place.
 ;;
-;; So when the younger generations hold more than ROOM, collect them a step at a
-;; time first -- 1 into 2, 2 into 3, up to the one below the oldest -- and then
-;; everything into the oldest. A step frees its sources before the next copies,
-;; so the peak is the heap plus the largest step (269MB there). The steps are
-;; passes a single collection would not make, so they are only taken when the
-;; younger generations would not fit: once the oldest holds the compacted bulk,
-;; one collection copies little, and staging every forced collection ran that
-;; gate 1.15x slower.
+;; A copying collection peaks at what the heap holds plus everything it copies,
+;; since a source is freed only when the collection ends. The collection this
+;; replaces staged 1 into 2, 2 into 3, then everything, so each step copied a
+;; whole generation: on bionic a scheduled promotion had just left 251MB held
+;; under a 256MB ceiling, the first step copied generation 1's 35MB on top, and
+;; the gcpolicy gate peaked at 317MB. Marking in place needs no to-space, which
+;; is how GHC treats the oldest generation near -M and why HotSpot's full
+;; collections are in place. The young collections keep the minimum at 2 (1
+;; fragmented more over a long run); only this one marks generation 1.
+;;
+;; ROOM is unused: the collection no longer needs any to fit.
 (define (sa-collect-tight room)
   (let ((cmg (collect-maximum-generation)))
-    (when (> (let sum ((g 1) (n 0))
-               (if (fx< g cmg) (sum (fx+ g 1) (+ n (bytes-allocated g))) n))
-             room)
-      (let loop ((g 1))
-        (when (fx< g (fx- cmg 1))
-          (collect g (fx+ g 1))
-          (loop (fx+ g 1)))))
-    (collect cmg)))
+    (collect cmg 1 cmg)))
 
 ;; The collection the hook runs in place of Chez's (collect). Chez's schedule
 ;; collects generation g every radix^g collections and otherwise only
@@ -1406,6 +1426,14 @@
     (cond ((#%$record-cas! r i old new) #t)
           ((eq? (#%$record-ref r i) old) (retry))
           (else #f))))
+;; (sa-box-cas! b old new) -> the same strong compare-and-swap on a box: box-cas!
+;; refuses spuriously on Apple silicon just as $record-cas! does, so a one-shot
+;; claim built on it can be lost by every claimant.
+(define (sa-box-cas! b old new)
+  (let retry ()
+    (cond ((box-cas! b old new) #t)
+          ((eq? (unbox b) old) (retry))
+          (else #f))))
 
 ;; (sa-disable-count) -> how many nested disable-interrupts this thread is
 ;; inside; 0 when interrupts are on. Chez keeps it in the thread context, and
@@ -1459,9 +1487,90 @@
 ;; (string-copy! from from-start to to-start count).
 (define (sa-string-copy-range! to at from start end)
   (string-copy! from start to at (fx- end start)))
+;; (sa-bytevector-copy-range! to at from start end): the same reorder over Chez's
+;; R6RS (bytevector-copy! from from-start to to-start count).
+(define (sa-bytevector-copy-range! to at from start end)
+  (bytevector-copy! from start to at (fx- end start)))
+
+;; Every Chez mutex the runtime allocates is counted. A mutex is a finalized
+;; object — the collector visits each one — so how many a workload allocates is
+;; a cost in itself, and the lazy-seq scaling gate (test/lazyseq_mt_scaling_test.clj)
+;; asserts on this count: realizing lazy cells must allocate none per cell, before
+;; or after a thread has existed. Read through jolt.host/mutex-allocations.
+;; #%make-mutex names Chez's primitive outright: the devboot and the binary are
+;; compiled as ONE program, where a plain `make-mutex` here would be this file's
+;; own definition below and the wrapper would call itself. Here and not in
+;; locks.ss because naming a primitive that way is the Chez target's business.
+(define %chez-make-mutex #%make-mutex)
+(define jolt-mutex-allocations (box 0))
+(define (count-mutex-allocation!)
+  (let retry ()
+    (let ((n (unbox jolt-mutex-allocations)))
+      (unless (box-cas! jolt-mutex-allocations n (fx+ n 1)) (retry)))))
+(define make-mutex
+  (case-lambda
+    (() (count-mutex-allocation!) (%chez-make-mutex))
+    ((name) (count-mutex-allocation!) (%chez-make-mutex name))))
 
 ;; locks.ss first: fibers.ss uses the counting lock wrapper, and jolt-with-mutex
 ;; is a macro, so it must be defined before this load rather than captured at
 ;; run time the way the sa-* seams are.
 (load "host/chez/locks.ss")
 (load "host/chez/fibers.ss")
+
+;; (sa-pin-for-owner! owner obj) -> void
+;; (sa-unpin-for-owner! owner) -> void
+;; Keep OBJ where it is -- marked in place by every collection, never copied --
+;; for as long as OWNER is reachable, or until sa-unpin-for-owner! (which also
+;; runs when OWNER pins something else: an owner holds at most one pin). Then OBJ
+;; is an ordinary object again, reclaimed once nothing else holds it. It is the
+;; large-array backings that have no immobile constructor, the fxvector and
+;; flvector a long or double array lives in (rt natives-array.ss), hazarded
+;; exactly as a byte array was before sa-make-large-bytevector: a mobile backing
+;; in a mostly free chunk is copied at every full collection (#1227).
+;;
+;; A locked object is a root, so a guardian cannot watch OBJ itself: it watches
+;; OWNER, and the box it hands back is what says OBJ is still locked. Every lock
+;; is undone exactly once -- Chez's unlock-object decrements the segment's pin
+;; count without checking the object was locked, so a second unlock would unpin
+;; whatever else shares the segment. Dead owners are drained on each pin and after
+;; each collection (sa-gc-install-after-collect!'s handler). The handler only
+;; TRIES the mutex: a thread parked at the collection rendezvous may hold it, and
+;; waiting there would deadlock; the next pin or collection drains instead.
+;; Contract: OBJ is not relocated while pinned, and nothing pinned outlives its
+;; owner by more than a collection. Degradation: both no-op (a collector that
+;; does not move such objects, or one that cannot be asked not to).
+(define sa-pin-guardian (make-guardian))
+(define sa-pin-boxes (make-weak-eq-hashtable))
+(define sa-pin-mutex (make-mutex))
+;; under sa-pin-mutex
+(define (sa-pin-release! b)
+  (when (unbox b)
+    (unlock-object (unbox b))
+    (set-box! b #f)))
+(define (sa-pin-drain-locked!)
+  (let loop ()
+    (let ((b (sa-pin-guardian)))
+      (when b (sa-pin-release! b) (loop)))))
+(define (sa-pin-for-owner! owner obj)
+  (jolt-with-mutex sa-pin-mutex
+    (sa-pin-drain-locked!)
+    (let ((old (hashtable-ref sa-pin-boxes owner #f)))
+      (when old (sa-pin-release! old)))
+    (lock-object obj)
+    (let ((b (box obj)))
+      (hashtable-set! sa-pin-boxes owner b)
+      (sa-pin-guardian owner b))))
+(define (sa-unpin-for-owner! owner)
+  (jolt-with-mutex sa-pin-mutex
+    (let ((b (hashtable-ref sa-pin-boxes owner #f)))
+      (when b
+        (sa-pin-release! b)
+        (hashtable-delete! sa-pin-boxes owner)))))
+(define (sa-pin-drain-after-collect!)
+  (when (jolt-lock! sa-pin-mutex #f)
+    (dynamic-wind
+      void
+      sa-pin-drain-locked!
+      (lambda () (jolt-unlock! sa-pin-mutex)))))
+

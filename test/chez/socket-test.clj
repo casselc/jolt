@@ -3,7 +3,8 @@
 ;; for "SOCKET-TEST OK"). Every server binds port 0 (kernel-assigned), so
 ;; parallel gates never collide on a port.
 (ns socket-test
-  (:require [clojure.string :as str]))
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]))
 
 (require 'jolt.socket)
 
@@ -264,6 +265,260 @@
     (.close (.getInputStream conn))
     (check-eq "stream close closes socket" (.isClosed conn) true)))
 
+;; a closed socket's streams raise instead of touching the fd: the number is
+;; free once closed, and the next socket to open gets it. Without the guard A's
+;; read takes B's first byte and A's write reaches B's peer (jolt#1183). The JVM
+;; prints SocketException "Socket closed" for every call below.
+(let [server (java.net.ServerSocket. 0)
+      port   (.getLocalPort server)
+      a      (java.net.Socket. "127.0.0.1" port)
+      a-peer (.accept server)
+      a-in   (.getInputStream a)
+      a-out  (.getOutputStream a)
+      _      (.close a)
+      b      (java.net.Socket. "127.0.0.1" port)
+      b-peer (.accept server)
+      raised (fn [f] (try (f) :no-throw
+                          (catch java.net.SocketException e [:socket-exception (ex-message e)])))]
+  (try
+    (let [msg (.getBytes "hello-B" "UTF-8")]
+      (.write (.getOutputStream b-peer) msg 0 (alength msg)))
+    (check-eq "read() on a closed socket" (raised #(.read a-in)) [:socket-exception "Socket closed"])
+    (check-eq "read(b) on a closed socket" (raised #(.read a-in (byte-array 4)))
+              [:socket-exception "Socket closed"])
+    (check-eq "read(b off len) on a closed socket" (raised #(.read a-in (byte-array 4) 0 4))
+              [:socket-exception "Socket closed"])
+    (check-eq "write(int) on a closed socket" (raised #(.write a-out 65))
+              [:socket-exception "Socket closed"])
+    (check-eq "write(b) on a closed socket" (raised #(.write a-out (.getBytes "from-A")))
+              [:socket-exception "Socket closed"])
+    (check-eq "write(b off len) on a closed socket" (raised #(.write a-out (.getBytes "from-A") 0 6))
+              [:socket-exception "Socket closed"])
+    ;; zero-length calls never reach the fd, and the JVM answers them closed
+    (check-eq "zero-length calls on a closed socket"
+              [(.read a-in (byte-array 0)) (.read a-in (byte-array 4) 0 0)
+               (.write a-out (byte-array 0)) (.write a-out (byte-array 4) 0 0)]
+              [0 0 nil nil])
+    (let [buf (byte-array 64) n (.read (.getInputStream b) buf 0 64)]
+      (check-eq "the next socket keeps its own bytes" (String. buf 0 n "UTF-8") "hello-B"))
+    (check-eq "the next socket's peer got nothing from the closed one"
+              (.available (.getInputStream b-peer)) 0)
+    (finally (.close b-peer) (.close b) (.close a-peer) (.close server))))
+
+;; the rest of a closed socket's surface answers from the object, never the fd
+;; (which may be another socket's by now), and raises what the JVM raises.
+(let [server (java.net.ServerSocket. 0)
+      port   (.getLocalPort server)
+      a      (java.net.Socket. "127.0.0.1" port)
+      a-peer (.accept server)
+      u      (java.net.Socket.)
+      raised (fn [f] (try (f) :no-throw
+                          (catch java.net.SocketException e [:socket-exception (ex-message e)])))]
+  (check-eq "an unbound socket's local port is -1" (.getLocalPort u) -1)
+  (.close a) (.close u)
+  (check-eq "getInputStream on a closed socket" (raised #(.getInputStream a))
+            [:socket-exception "Socket is closed"])
+  (check-eq "getOutputStream on a closed socket" (raised #(.getOutputStream a))
+            [:socket-exception "Socket is closed"])
+  (check-eq "a closed unbound socket's local port is -1" (.getLocalPort u) -1)
+  (check-eq "connect on a closed socket"
+            (raised #(.connect u (java.net.InetSocketAddress. "127.0.0.1" port)))
+            [:socket-exception "Socket is closed"])
+  (.close a-peer) (.close server)
+  (check-eq "accept on a closed server socket" (raised #(.accept server))
+            [:socket-exception "Socket is closed"]))
+
+;; Closing a socket is how another thread stops a blocked read or accept, and the
+;; blocked call raises. It used to wait on in a private kqueue/epoll that close
+;; never signalled, so it hung for good. The JVM prints
+;; [SocketException "Socket closed"] for each of these; a write stuck on a full
+;; send buffer answers "Broken pipe" there instead.
+(defn blocked-then-closed [call target]
+  (let [p (promise)
+        _ (future (deliver p (try (call) :no-throw
+                                  (catch java.net.SocketException e
+                                    [:socket-exception (ex-message e)]))))]
+    (Thread/sleep 200)
+    (.close target)
+    (deref p 5000 :hung)))
+
+(with-pair
+  (fn [server client conn]
+    (let [in (.getInputStream conn)]
+      (check-eq "close wakes a thread blocked in read"
+                (blocked-then-closed #(.read in) conn)
+                [:socket-exception "Socket closed"]))))
+
+(let [server (java.net.ServerSocket. 0)]
+  (check-eq "close wakes a thread blocked in accept"
+            (blocked-then-closed #(.accept server) server)
+            [:socket-exception "Socket closed"]))
+
+(with-pair
+  (fn [server client conn]
+    ;; The peer never reads, so the send buffer fills and a write blocks. A slow
+    ;; machine can still be copying a chunk when close lands, and the next write
+    ;; then raises "Socket closed", which is also what the JVM does there; what
+    ;; matters is that the writer wakes and raises.
+    (let [out (.getOutputStream client)
+          chunk (byte-array (* 64 1024))
+          r (blocked-then-closed #(loop [] (.write out chunk) (recur)) client)]
+      (check-eq "close wakes a thread blocked in write"
+                (if (contains? #{[:socket-exception "Broken pipe"]
+                                 [:socket-exception "Socket closed"]} r)
+                  :raised
+                  r)
+                :raised))))
+
+;; The same on a fiber, where the woken read used to retry recv on the fd number
+;; close had freed: B, opened right after, is handed that number, and A's read
+;; took B's bytes. A's fd stays reserved until its read has left.
+(require '[jolt.fibers :as fib])
+(let [server (java.net.ServerSocket. 0)
+      port   (.getLocalPort server)
+      a      (java.net.Socket. "127.0.0.1" port)
+      a-peer (.accept server)
+      a-in   (.getInputStream a)
+      p      (promise)
+      _      (fib/spawn (fn [] (deliver p (try (.read a-in) :no-throw
+                                               (catch java.net.SocketException e
+                                                 [:socket-exception (ex-message e)])))))
+      _      (Thread/sleep 200)
+      _      (.close a)
+      b      (java.net.Socket. "127.0.0.1" port)
+      b-peer (.accept server)]
+  (try
+    (.write (.getOutputStream b-peer) (.getBytes "B" "UTF-8") 0 1)
+    (check-eq "close wakes a fiber blocked in read" (deref p 5000 :hung)
+              [:socket-exception "Socket closed"])
+    (check-eq "the woken fiber left the next socket's bytes alone"
+              (.read (.getInputStream b)) (int \B))
+    (finally (.close b-peer) (.close b) (.close a-peer) (.close server))))
+
+;; Half-close (jolt-lang/jolt#1208): shutdownOutput sends FIN and keeps the read
+;; direction, shutdownInput reads EOF and keeps the write direction, and the two
+;; is*Shutdown predicates report it. Every expected value below is what JDK 21
+;; answers for the same forms over loopback TCP (certify.clj over these forms as
+;; corpus rows: 6/6 certified). They cannot live in the corpus itself, whose
+;; runner has no jolt.socket to install.
+(defn- sock-msg [f]
+  (try (f) :ok (catch java.net.SocketException e (.getMessage e))))
+
+(with-pair
+  (fn [server c s]
+    (.write (.getOutputStream c) 120)
+    (let [before (.isOutputShutdown c)
+          _ (.shutdownOutput c)
+          si (.getInputStream s)]
+      (.write (.getOutputStream s) 122)
+      (check-eq "shutdownOutput sends the peer EOF and leaves this side reading"
+                [before (.isOutputShutdown c) (.isInputShutdown c)
+                 (.read si) (.read si) (.read si)
+                 (.read (.getInputStream c)) (.isClosed c) (.isConnected c)]
+                [false true false 120 -1 -1 122 false true]))))
+
+(with-pair
+  (fn [server c s]
+    (let [o (.getOutputStream c)]
+      (.shutdownOutput c)
+      (check-eq "after shutdownOutput a write throws and the state is named"
+                [(sock-msg #(.write o 1)) (sock-msg #(.write o (byte-array [1 2])))
+                 (sock-msg #(.write o (byte-array 0))) (sock-msg #(.flush o))
+                 (sock-msg #(.shutdownOutput c)) (sock-msg #(.getOutputStream c))
+                 (sock-msg #(.getInputStream c))]
+                ["Broken pipe" "Broken pipe" :ok :ok "Socket output is already shutdown"
+                 "Socket output is shutdown" :ok]))))
+
+(with-pair
+  (fn [server c s]
+    (.write (.getOutputStream s) 113)
+    (Thread/sleep 100)
+    (let [i (.getInputStream c)]
+      (.shutdownInput c)
+      (check-eq "shutdownInput reads EOF over pending data and leaves this side writing"
+                [(.isInputShutdown c) (.isOutputShutdown c)
+                 (.read i) (.read i (byte-array 4)) (.read i (byte-array 4) 0 4)
+                 (.read i (byte-array 0)) (.available i)
+                 (.readLine (java.io.BufferedReader. (java.io.InputStreamReader. i)))
+                 (sock-msg #(.getInputStream c)) (sock-msg #(.shutdownInput c))
+                 (do (.write (.getOutputStream c) 119) (.read (.getInputStream s)))]
+                [true false -1 -1 -1 0 0 nil "Socket input is shutdown"
+                 "Socket input is already shutdown" 119]))))
+
+(let [u (java.net.Socket.)]
+  (check-eq "a half-close needs a connected, open socket"
+            [(sock-msg #(.shutdownOutput u)) (sock-msg #(.shutdownInput u))
+             (.isOutputShutdown u) (.isInputShutdown u)
+             (sock-msg #(.getInputStream u)) (sock-msg #(.getOutputStream u))
+             (do (.close u) (sock-msg #(.shutdownOutput u))) (sock-msg #(.getInputStream u))]
+            ["Socket is not connected" "Socket is not connected" false false
+             "Socket is not connected" "Socket is not connected"
+             "Socket is closed" "Socket is closed"]))
+
+(with-pair
+  (fn [server c s]
+    (.shutdownOutput c)
+    (.close c)
+    (check-eq "the half-closed state outlives close, which then refuses a shutdown"
+              [(.isOutputShutdown c) (.isInputShutdown c) (sock-msg #(.shutdownOutput c))
+               (sock-msg #(.shutdownInput c)) (sock-msg #(.getInputStream c))]
+              [true false "Socket is closed" "Socket is closed" "Socket is closed"])))
+
+(with-pair
+  (fn [server c s]
+    (let [f (future (.read (.getInputStream c)))]
+      (Thread/sleep 200)
+      (.shutdownInput c)
+      (check-eq "shutdownInput wakes a thread blocked in read with EOF"
+                (deref f 5000 :blocked) -1))))
+
+;; On a fiber the read is parked on the poller rather than blocked in recv, and
+;; the shutdown has to reach it the same way.
+(with-pair
+  (fn [server c s]
+    (let [p (promise)
+          in (.getInputStream c)]
+      (fib/spawn (fn [] (deliver p (try (.read in) (catch Throwable e [:threw (str e)])))))
+      (Thread/sleep 200)
+      (.shutdownInput c)
+      (check-eq "shutdownInput wakes a fiber blocked in read with EOF"
+                (deref p 5000 :blocked) -1))))
+
+;; The peer of a half-closed socket sees a whole conversation: request, FIN,
+;; then the response and the close — what a proxy pumping one direction does.
+(with-pair
+  (fn [server c s]
+    (let [co (.getOutputStream c)]
+      (.write co (.getBytes "request" "UTF-8"))
+      (.shutdownOutput c)
+      ;; not slurp: it closes the stream, and closing a socket's stream closes
+      ;; the socket, on the JVM as here
+      (let [in (.getInputStream s)
+            req (loop [acc []]
+                  (let [b (.read in)]
+                    (if (neg? b) (String. (byte-array acc) "UTF-8") (recur (conj acc b)))))]
+        (.write (.getOutputStream s) (.getBytes (str "echo:" req) "UTF-8"))
+        (.close s)
+        (check-eq "a request half-closed by the client reads to EOF, and the reply arrives"
+                  (slurp (.getInputStream c)) "echo:request")))))
+
+;; A socket's streams are java.io streams to clojure.java.io: io/reader,
+;; io/writer, io/input-stream, io/output-stream and io/copy all raised "Cannot
+;; open" over them, so the ordinary (io/reader (.getInputStream sock)) did not
+;; work. Measured against JDK 21 (the flush is the JVM's: io/output-stream is a
+;; BufferedOutputStream there).
+(with-pair
+  (fn [server c s]
+    (io/copy "abc\n" (.getOutputStream c))
+    (let [w (io/writer (.getOutputStream c))] (.write w "de\n") (.flush w))
+    (let [o (io/output-stream (.getOutputStream c))]
+      (io/copy (.getBytes "x\ny\n" "UTF-8") o)
+      (.flush o))
+    (.shutdownOutput c)
+    (check-eq "clojure.java.io reads and writes a socket's streams"
+              [(vec (line-seq (io/reader (io/input-stream (.getInputStream s))))) (.isClosed c)]
+              [["abc" "de" "x" "y"] false])))
+
 ;; available() is a real byte count, from the same ioctl(FIONREAD) the JVM asks.
 ;; It answered 0 always, which java.io permits ("an estimate") but which leaves
 ;; (pos? (.available in)) false forever. ioctl is variadic, and binding it
@@ -327,6 +582,160 @@
                      (catch java.io.IOException e [(class e) (.getMessage e)]))
                 [java.net.SocketException "Socket closed"]))))
 
+
+;; -- SO_TIMEOUT and the timed connect (jolt-lang/jolt#1191, #1192) -------------
+;; Every expectation here was read off JDK 20, messages included. A timed-out
+;; read or accept raises SocketTimeoutException and leaves the socket open and
+;; usable; a timed-out or refused connect closes it.
+(defn thrown [f]
+  (try (f) :no-throw
+       (catch Exception e [(.getSimpleName (class e)) (ex-message e)])))
+
+(defn elapsed-ms [f]
+  (let [t0 (System/currentTimeMillis)]
+    [(f) (- (System/currentTimeMillis) t0)]))
+
+(with-pair
+  (fn [server client conn]
+    (check-eq "getSoTimeout defaults to 0" (.getSoTimeout client) 0)
+    (.setSoTimeout client 300)
+    (check-eq "getSoTimeout round-trips" (.getSoTimeout client) 300)
+    (check-eq "a negative SO_TIMEOUT is refused"
+              (thrown #(.setSoTimeout client -1))
+              ["IllegalArgumentException" "timeout can't be negative"])
+    (check-eq "an accepted socket does not inherit the listener's timeout"
+              (.getSoTimeout conn) 0)
+    (let [in (.getInputStream client)
+          [r ms] (elapsed-ms #(thrown (fn [] (.read in))))]
+      (check-eq "a read with nothing to read times out" r
+                ["SocketTimeoutException" "Read timed out"])
+      (check-eq "…after about the timeout" (<= 250 ms 2000) true)
+      (check-eq "…and is an InterruptedIOException"
+                (try (.read in) (catch java.io.InterruptedIOException _ :caught))
+                :caught)
+      (check-eq "…and leaves the socket open" (.isClosed client) false)
+      (.write (.getOutputStream conn) (.getBytes "ok" "UTF-8") 0 2)
+      (let [buf (byte-array 8)
+            n (.read in buf 0 8)]
+        (check-eq "the next read after a timeout gets the data" (String. buf 0 n "UTF-8") "ok"))
+      ;; bytes already there are returned, whatever the timeout
+      (.write (.getOutputStream conn) 65)
+      (check-eq "a read with data waiting returns it" (.read in) 65)
+      (check-eq "the timed-out read is not EOF"
+                (thrown #(.read in (byte-array 4)))
+                ["SocketTimeoutException" "Read timed out"])
+      ;; 0 is infinite again
+      (.setSoTimeout client 0)
+      (future (Thread/sleep 400) (.write (.getOutputStream conn) 66))
+      (check-eq "SO_TIMEOUT 0 blocks until data" (.read in) 66))
+    (.close client)
+    (check-eq "setSoTimeout on a closed socket"
+              (thrown #(.setSoTimeout client 5)) ["SocketException" "Socket is closed"])
+    (check-eq "getSoTimeout on a closed socket"
+              (thrown #(.getSoTimeout client)) ["SocketException" "Socket is closed"])))
+
+(let [server (java.net.ServerSocket. 0)]
+  (check-eq "ServerSocket getSoTimeout defaults to 0" (.getSoTimeout server) 0)
+  (.setSoTimeout server 200)
+  (check-eq "ServerSocket getSoTimeout round-trips" (.getSoTimeout server) 200)
+  (check-eq "ServerSocket refuses a negative timeout"
+            (thrown #(.setSoTimeout server -1)) ["IllegalArgumentException" "timeout < 0"])
+  (let [[r ms] (elapsed-ms #(thrown (fn [] (.accept server))))]
+    (check-eq "accept with nobody dialing times out" r
+              ["SocketTimeoutException" "Accept timed out"])
+    (check-eq "…after about the timeout" (<= 150 ms 2000) true))
+  (let [c (java.net.Socket. "127.0.0.1" (.getLocalPort server))
+        a (.accept server)]
+    (check-eq "the listener still accepts after a timeout" (.isConnected a) true)
+    (.close a) (.close c))
+  (.close server)
+  (check-eq "ServerSocket getSoTimeout on a closed socket"
+            (thrown #(.getSoTimeout server)) ["SocketException" "Socket is closed"]))
+
+;; The same on a fiber: the timeout wakes the parked fiber with the exception, not
+;; EOF and not a hang, and close still wins over a timeout that has not expired.
+(with-pair
+  (fn [server client conn]
+    (.setSoTimeout client 200)
+    (let [p (promise)]
+      (fib/spawn (fn [] (deliver p (thrown #(.read (.getInputStream client))))))
+      (check-eq "a fiber's read times out" (deref p 5000 :hung)
+                ["SocketTimeoutException" "Read timed out"]))
+    (let [p (promise)]
+      (fib/spawn (fn [] (deliver p (thrown #(.read (.getInputStream client))))))
+      (Thread/sleep 50)
+      (.write (.getOutputStream conn) 67)
+      (check-eq "a fiber's timed read still gets data that arrives in time"
+                (deref p 5000 :hung) :no-throw))
+    (.setSoTimeout client 5000)
+    (let [p (promise)]
+      (fib/spawn (fn [] (deliver p (thrown #(.read (.getInputStream client))))))
+      (Thread/sleep 200)
+      (.close client)
+      (check-eq "close wakes a fiber in a timed read" (deref p 3000 :hung)
+                ["SocketException" "Socket closed"]))))
+
+(let [server (java.net.ServerSocket. 0)
+      p (promise)]
+  (.setSoTimeout server 200)
+  (fib/spawn (fn [] (deliver p (thrown #(.accept server)))))
+  (check-eq "a fiber's accept times out" (deref p 5000 :hung)
+            ["SocketTimeoutException" "Accept timed out"])
+  (.close server))
+
+;; connect(endpoint, timeout). A listener that never accepts, with a backlog of
+;; one, stops completing handshakes once the queue is full, so a connect to it
+;; hangs until its timeout — on the JVM as here. macOS stalls the second dial,
+;; Linux the third; the loop takes whichever.
+(defn dial-until-stalled [port ms]
+  (loop [held [] i 0]
+    (let [s (java.net.Socket.)
+          [r el] (elapsed-ms #(thrown (fn [] (.connect s (java.net.InetSocketAddress. "127.0.0.1" port) ms))))]
+      (if (and (= r :no-throw) (< i 16))
+        (recur (conj held s) (inc i))
+        {:held held :result r :ms el :closed? (.isClosed s)}))))
+
+(let [server (java.net.ServerSocket. 0 1)
+      {:keys [held result ms closed?]} (dial-until-stalled (.getLocalPort server) 300)]
+  (check-eq "a connect that cannot complete times out" result
+            ["SocketTimeoutException" "Connect timed out"])
+  (check-eq "…after about the timeout" (<= 250 ms 2000) true)
+  (check-eq "…and closes the socket" closed? true)
+  (let [p (promise) port (.getLocalPort server)]
+    (fib/spawn (fn [] (deliver p (thrown #(.connect (java.net.Socket.)
+                                                    (java.net.InetSocketAddress. "127.0.0.1" port) 200)))))
+    (check-eq "a fiber's connect times out" (deref p 5000 :hung)
+              ["SocketTimeoutException" "Connect timed out"]))
+  (let [s (java.net.Socket.) p (promise) port (.getLocalPort server)]
+    (future (deliver p (thrown #(.connect s (java.net.InetSocketAddress. "127.0.0.1" port) 5000))))
+    (Thread/sleep 200)
+    (.close s)
+    (check-eq "close wakes a timed connect" (deref p 3000 :hung)
+              ["SocketException" "Socket closed"]))
+  (doseq [s held] (.close s))
+  (.close server))
+
+(let [s (java.net.Socket.)]
+  (check-eq "a negative connect timeout is refused"
+            (thrown #(.connect s (java.net.InetSocketAddress. "127.0.0.1" 1) -1))
+            ["IllegalArgumentException" "connect: timeout can't be negative"])
+  (check-eq "…and leaves the socket open" (.isClosed s) false)
+  (.close s))
+
+(let [server (java.net.ServerSocket. 0)
+      port (.getLocalPort server)
+      s (java.net.Socket.)]
+  (.close server)
+  (check-eq "a refused connect is a ConnectException"
+            (thrown #(.connect s (java.net.InetSocketAddress. "127.0.0.1" port) 1000))
+            ["ConnectException" "Connection refused"])
+  (check-eq "…and closes the socket" (.isClosed s) true))
+
+(let [server (java.net.ServerSocket. 0)
+      s (java.net.Socket.)]
+  (.connect s (java.net.InetSocketAddress. "127.0.0.1" (.getLocalPort server)) 1000)
+  (check-eq "a timed connect that completes is connected" (.isConnected s) true)
+  (.close s) (.close server))
 
 ;; -- host identity: InetAddress statics + NetworkInterface --------------------
 ;; What a program asks about the machine it is on. The loopback interface is
@@ -477,7 +886,38 @@
             (.getProperty p "k"))
           "default")
 
+;; -- jolt.socket.native: the addrinfo layout probe (#979) ------------------------
+;; ai_canonname and ai_addr trade places between libcs (glibc: ai_addr at 24; the
+;; BSDs, Win64 and bionic: 32), and bionic calls itself Linux, so the resolver
+;; finds ai_addr by checking which slot holds a sockaddr of ai_family. A node is
+;; built by hand in each layout, so every host checks both — including the one
+;; that broke Android when the offset came from os.name.
+(require '[jolt.socket.native :as native] '[jolt.ffi :as ffi])
+(let [ai-addr @(ns-resolve 'jolt.socket.native 'ai-addr)
+      [sa _] (native/make-sockaddr native/af-inet "10.1.2.3" 80)
+      node (fn [off]
+             (let [ai (ffi/alloc 48)]
+               (ffi/write ai :int native/af-inet 4)
+               (ffi/write ai :pointer sa off)
+               ai))
+      glibc (node 24)
+      bsd (node 32)
+      canon (ffi/string->ptr "example.org")
+      both (doto (node 32) (ffi/write :pointer canon 24))
+      none (ffi/alloc 48)]
+  (try
+    (check-eq "ai_addr probe: glibc order" (native/sockaddr-ip (ai-addr glibc native/af-inet)) "10.1.2.3")
+    (check-eq "ai_addr probe: BSD/bionic order" (native/sockaddr-ip (ai-addr bsd native/af-inet)) "10.1.2.3")
+    (check-eq "ai_addr probe: a canonname in the other slot is not taken for it"
+              (native/sockaddr-ip (ai-addr both native/af-inet)) "10.1.2.3")
+    (check-eq "ai_addr probe: no address in either slot" (ai-addr none native/af-inet) nil)
+    (finally (doseq [p [sa glibc bsd canon both none]] (ffi/free p)))))
+
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))
       (println "SOCKET-TEST FAILED:" (count @failures))))
+
+;; Done with the agent system's pools (futures, agents): end them, as a JVM
+;; program does, or their idle workers hold the process up for their keep-alive.
+(shutdown-agents)

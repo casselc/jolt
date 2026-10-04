@@ -5,7 +5,798 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] - cumulative performance candidate
+
+- Compose the retained JSON/string/interop, callback-domain, map-fold, owned-byte,
+  and guarded WAL performance work with Jolt 0.8.17 on an isolated branch.
+  This is a qualification candidate, not the canonical aspects branch or a
+  supported compiler release.
+- Capture a cold host-protocol memo lookup and its epoch under the registration
+  mutex. Keep warmed hits unlocked and publish after releasing that mutex, so
+  an overlapping registration cannot cache the old method under its new epoch.
+  A deterministic paused-registration regression test exercises the real body.
+- Retain zero-copy adoption of fresh UTF-8/WAL bytevectors while pinning outputs
+  of 64 KiB and larger to their array's lifetime. This preserves 0.8.17's
+  large-buffer address stability without introducing an extra full-buffer copy;
+  storage identity, small-array non-pinning, and owner-death reclamation are tested.
+
+## [0.8.17] - 2026-10-04
+
+A built binary now carries its dependencies' resources, as an uberjar does, so
+it runs away from the machine that built it. A `--library` object gains
+`jolt_library_release_thread`, and `-o libadd` gets its platform suffix.
+Large typed arrays no longer get copied at every full collection, protocol
+calls on plain values are memoized, and `clojure.edn` reads about 2.5x faster.
+
+### Added
+
+- **`jolt_library_release_thread`** (#1234). A `jolt build --library` object's
+  C ABI gains a fourth symbol, `void jolt_library_release_thread(void)`, which
+  deactivates the thread that called `jolt_library_init`. An embedder that
+  parks that thread (in `pthread_join`, say) while workers call in through
+  `:collect-safe` exports no longer stalls the collector waiting on it. Every
+  later call in, from that thread too, activates its caller on the way in, and
+  `jolt_library_shutdown` reactivates the calling thread before it tears the
+  runtime down, so it can be called from a released thread. An embedder that
+  never releases sees no change.
+
+### Changed
+
+- **`jolt build` embeds dependencies' files in the binary, like an uberjar**
+  (#1232). Before, only the project's `:jolt/build {:embed [...]}` dirs were
+  baked in, and the binary found a dependency's own resources through the
+  build machine's gitlibs and `~/.m2` paths. A library that reads one at load
+  (`selmer.validator` slurps its error template) worked where it was built and
+  died everywhere else with `Cannot open <nil> as a Reader.` Every dependency
+  root, directory or jar, is now packed under the name `io/resource` asks for,
+  with classpath precedence: the first root holding a name wins, the project's
+  own paths shadow every dependency, and a name jolt supplies itself stays
+  jolt's. `.class` and `.cljs` files are left out, as are the sources of
+  namespaces compiled into the image. The binary no longer puts dependency
+  roots on its source path at startup, so a resource it does not carry fails
+  on the build machine too instead of only after it ships.
+
+### Fixed
+
+- **`jolt build --library -o libadd` writes `libadd.so` / `libadd.dylib` /
+  `libadd.dll`** (#1235), as the README says. It wrote `libadd` with no
+  suffix and the install name `@rpath/libadd`. The target's suffix is
+  appended when the `-o` name has no extension; a name that has one
+  (`libadd.so.1`) is left as given.
+
+- **Embedded files are read as bytes.** A non-UTF-8 `:embed` resource, such as
+  an image, was decoded as UTF-8 when it was baked and came out corrupted. It
+  now round-trips byte for byte.
+
+- **A full collection no longer copies a large live array** (#1225, #1227).
+  Chez pins a huge allocation only when it takes fresh segments from the OS,
+  so an 8MB array that landed in the free space of an older chunk was copied
+  at every full collection: ~1ms each rather than ~100µs on Linux, on a layout
+  no program controls. A byte array of 64KB or more is now an immobile
+  bytevector, and a long, int, short, double or float array of 8192 elements
+  or more has its backing locked for the array's life and released when the
+  array dies, including after `System/gc`. Smaller arrays are unchanged, and
+  so is element access.
+
+### Performance
+
+- **A protocol call on a plain value is memoized.** On a value that is not a
+  record or a reify, each call walked the value's host tags through the
+  string-keyed registry, hashing three strings per tag. The answer is now kept
+  per method and tag list and dropped on any registration or class-graph
+  change. On a protocol extended to `Object`, a call on a vector goes from
+  ~4.3µs to ~0.23µs and on a map from ~2.8µs to ~0.24µs; core.logic's unifier,
+  which dispatches a protocol on every term it walks, gains the most.
+
+- **`clojure.edn/read-string` is about 2.5x faster on large documents.** The
+  rebuild after parsing returns scalars at once instead of asking each one for
+  its `:jolt/type` twice, rebuilds a map with `reduce-kv` into a transient
+  instead of a lazy seq of entry vectors, and skips `with-meta` for a
+  collection with no metadata. A 4.7MB document reads in 1.55s, down from
+  3.8s.
+
+## [0.8.16] - 2026-10-02
+
+jolt reports Clojure 1.12 and has what it added: `Class/new` and
+`Class/.method` values, array class symbols, functional-interface adaptation
+and `java.util.stream`. Threads follow the JVM: the process waits for its
+non-daemon threads before it exits (a behaviour change, see Changed), a fiber
+is a virtual thread, and channel ops and futures are interruptible, with
+`CompletableFuture` new. `java.util.TreeMap` and `TreeSet` are new, and
+`java.nio.ByteBuffer` and `clojure.math` are complete, all on the Gambit host
+too. Windows gets a readiness poller for sockets. Also fixed: a damaged AOT
+cache entry no longer recompiles against its own later definitions, subnormal
+and tied doubles print as the JVM prints them, and conj onto a vector sliced
+just past a trie boundary.
+
+### Added
+
+- **`java.util.TreeMap` and `java.util.TreeSet`.** `(java.util.TreeMap. {...})`
+  was "No matching ctor". Both are mutable now, ordered by natural ordering, a
+  Clojure fn, a reified `java.util.Comparator` or `Comparator/reverseOrder`,
+  with the full NavigableMap / NavigableSet surface: put/get/remove and the
+  compute/merge family, first/last/poll, floor/ceiling/lower/higher, and
+  headMap/tailMap/subMap, descendingMap and the key sets as live views, so a
+  write through a view lands in the map and a put outside its range is
+  IllegalArgumentException. A nil key under natural ordering is
+  NullPointerException and keys that do not compare (a keyword and a string,
+  a Long and a Double) are ClassCastException, as on the JVM. The tree is
+  clojure.core's own sorted map held in a mutable root, so a copy or `clone`
+  is O(1). The entries iteration hands out are `TreeMap$Entry` objects whose
+  `setValue` writes through to the map; `firstEntry`, `floorEntry` and the
+  other navigation methods answer immutable snapshots. Both work with `key`,
+  `val`, destructuring and `into`, print as `k=v`, and are not vectors, as on
+  the JVM. `Comparator/reverseOrder`, `Comparator/naturalOrder` and
+  `Collections/reverseOrder` are new too, and all of it runs on the Gambit
+  target as well. Views and iterators report the JDK 21 classes, supers and
+  modifiers: `TreeMap$KeyIterator` for the map's keys,
+  `NavigableSubMap$DescendingSubMapEntryIterator` for a descending map's
+  entries, `AbstractMap$2` for a sub-map's values, and inner classes such as
+  `TreeMap$Values` without the static bit.
+
+  ```clojure
+  (let [m (java.util.TreeMap. {:c 3 :a 1 :b 2})
+        h (.headMap m :c)]
+    (.put h :aa 0)
+    [(str m) (.floorKey m :bb) (try (.put h :z 9) (catch IllegalArgumentException _ :out))])
+  ;; => ["{:a=1, :aa=0, :b=2, :c=3}" :b :out]
+  ```
+
+- **The rest of `java.nio.ByteBuffer`, the typed buffers and `ByteOrder`.**
+  A buffer has a byte order now (`ByteOrder/BIG_ENDIAN`, `LITTLE_ENDIAN`,
+  `nativeOrder`; `.order` reads and sets it) and every multi-byte get and put
+  honours it. `getFloat`/`putFloat`/`getDouble`/`putDouble`, `mark`/`reset`,
+  `isDirect`, `isReadOnly`, `equals`/`hashCode`/`compareTo`/`mismatch` over the
+  remaining bytes, `slice(index, length)`, the absolute bulk forms
+  (`get(int, byte[])`, `put(int, byte[], int, int)`, `put(int, ByteBuffer, int,
+  int)`) and `toString` are there, and `=`, `hash` and `compare` on buffers
+  agree with them. `asShortBuffer`, `asCharBuffer`, `asIntBuffer`,
+  `asLongBuffer`, `asFloatBuffer` and `asDoubleBuffer` are views sharing the
+  buffer's bytes, and `IntBuffer`, `LongBuffer`, `ShortBuffer`, `FloatBuffer`
+  and `DoubleBuffer` have `wrap` and `allocate` over their arrays.
+
+  ```clojure
+  (let [b (.order (ByteBuffer/allocate 12) ByteOrder/LITTLE_ENDIAN)]
+    (.putInt b 1) (.putDouble b 1.0) (vec (.array b)))
+  ;; before: No dependency provides java.nio.ByteOrder
+  ;; after:  [1 0 0 0 0 0 0 0 0 0 -16 63]
+  ```
+
+  A float reads back as the shortest decimal that names it, so `(.getFloat
+  b)` after `(.putFloat b 0.1)` is `0.1`, which is what `(float 0.1)` is on
+  jolt. The same file runs on the Gambit target, where a buffer's bytes are a
+  bytevector; there are no arrays there, so `.array` and the typed buffers'
+  `wrap` and `allocate` are not available.
+
+- **Clojure 1.12.** `*clojure-version*` reports 1.12, and the 1.12 language
+  features jolt was missing are in: `Class/new` and `Class/.method` as values
+  (with `^[...]` param-tags picking the arity), array class symbols (`String/1`,
+  `long/2`) as values, hints and `instance?`/`resolve` targets, a
+  `^java.util.function.Predicate`-style hinted let binding adapting a fn to the
+  interface, `IDeref` types as `Supplier`s, and `java.util.stream` with
+  `stream-seq!`, `stream-reduce!`, `stream-transduce!` and `stream-into!`.
+  Collections answer `.stream`, and `forEach`/`removeIf`/`replaceAll`/`sort`
+  take fns. `partitionv`, `partitionv-all` (now with its transducer arity) and
+  `splitv-at` are the reference definitions. clojure.java.process,
+  clojure.java.basis, clojure.repl.deps and clojure.tools.deps.interop are not
+  ported.
+
+- **The rest of `clojure.math`.** `IEEE-remainder`, `copy-sign`,
+  `get-exponent`, `next-after`, `next-up`, `next-down`, `ulp`, `scalb`,
+  `random`, and the exact long arithmetic (`add-exact`, `subtract-exact`,
+  `multiply-exact`, `increment-exact`, `decrement-exact`, `negate-exact`, which
+  raise ArithmeticException "long overflow"), with the `java.lang.Math`
+  statics behind them (`Math/nextUp`, `Math/addExact`, …). All 45 vars
+  upstream defines are there now; 15 were missing. `java.lang.Math` and
+  `clojure.math` are one portable file, so the Gambit host has both too (it
+  had no `clojure.math` at all, and `Math` there was only `floor` and `abs`).
+
+- **`Double/doubleToLongBits`, `doubleToRawLongBits`, `longBitsToDouble` and
+  the `Float` int-bits trio.** `floatToIntBits` casts like `(float x)`, so a
+  value past `Float/MAX_VALUE` is IllegalArgumentException as on the JVM, and
+  `intBitsToFloat` answers the float's value as a double, since jolt has one
+  flonum type.
+
+- **A readiness poller on Windows.** jolt.io-poller has a WSAPoll backend, so
+  sockets on Windows are non-blocking and wait on it the way they wait on
+  kqueue and epoll elsewhere: a fiber reading a socket parks instead of holding
+  its carrier, `setSoTimeout` bounds a read or accept, the connect timeout is
+  enforced, and `close` wakes a read blocked on another thread. Those were
+  recorded Windows divergences. `JOLT_IO_POLLER=poll` selects the same backend
+  over poll(2) on POSIX, which is how the gates exercise it there.
+
+- **`jolt.socket.native`, the fd-level socket layer.** The C socket calls
+  jolt.socket used privately are now a public namespace for code that wants
+  sockets without the java.net object model, such as an HTTP server that owns
+  its accept loop: socket/bind/listen/accept/connect/recv/send/shutdown/close,
+  setsockopt with per-OS timeout encoding, sockaddr build and parse for IPv4
+  and IPv6, getaddrinfo, poll (WSAPoll on Windows), close-on-exec, blocking
+  mode, FIONREAD, and error classification that knows errno from Winsock's
+  error codes. Every call answers `[result error]`, the error captured on the
+  call's own return path. `consts-for` gives the numbers for macOS, Linux and
+  Windows. jolt.socket, jolt.nrepl and jolt.mvn-http are rebuilt on it, so
+  their sockets are close-on-exec (from birth on Linux: SOCK_CLOEXEC and
+  accept4) and each carries no bindings of its own.
+
+- **A fiber is a virtual thread.** `Thread/currentThread` inside a fiber (an
+  `io-thread`, a `go` block on the `:fiber` backend, a `jolt.fibers/spawn`) is
+  the fiber's own `java.lang.Thread`: the same object for its whole life,
+  distinct from every other fiber's, `isVirtual` and `isDaemon` true, its own
+  `threadId`, and the empty name a JDK 21 virtual thread gets. It used to be
+  the carrier's thread, shared by every fiber on that carrier. Each fiber has
+  its own interrupt flag, so `.interrupt` throws exactly that fiber out of an
+  interruptible wait (`<!!`, `>!!`, `alts!!`, a promise or future deref,
+  `Thread.join`, `Object.wait`, `lockInterruptibly`, `Thread/sleep`) and leaves
+  every other fiber alone; it used to wake every fiber parked on the carrier and
+  let one of them take it. `Thread/sleep` on a fiber parks it with a deadline
+  and gives the carrier to other fibers, and is interruptible mid-sleep; it
+  used to sleep the carrier. `Thread/yield` on a fiber yields to the carrier's
+  other fibers.
+
+  `Thread/startVirtualThread` and `Thread/ofVirtual` (`name`, `start`,
+  `unstarted`, `factory`) start virtual threads as fibers, certified against
+  JDK 21. A `go` block on the `:fiber` backend is a virtual thread too, where
+  core.async on the JVM runs go blocks on a platform thread pool; that is
+  recorded in `known-divergences.edn`. `jolt.fibers/interrupt!` is unchanged:
+  it raises an arbitrary throwable in a fiber at its next park, which
+  `Thread.interrupt` does not.
+
+- **`java.util.concurrent.CompletableFuture`.** `(CompletableFuture.)` was "No
+  matching ctor", so nothing written against the class ran. It is a Future and
+  a CompletionStage now: `complete`, `completeExceptionally`, `cancel`,
+  `obtrudeValue`/`obtrudeException`, the statics `completedFuture`,
+  `failedFuture`, `supplyAsync`, `runAsync`, `allOf`, `anyOf` and
+  `delayedExecutor`; `get` and its timed overload, `join`, `getNow`,
+  `resultNow`, `exceptionNow`, `state` and the predicates; and the stage
+  methods — `thenApply`, `thenAccept`, `thenRun`, `thenCompose`,
+  `thenCombine`, `thenAcceptBoth`, `runAfterBoth`, the `Either` three,
+  `handle`, `whenComplete`, `exceptionally`, `exceptionallyCompose`, each with
+  its `Async` forms — plus `orTimeout`, `completeOnTimeout`, `completeAsync`,
+  `copy` and `toCompletableFuture`. The exception wrapping is the JVM's: a
+  dependent stage fails with a `CompletionException` over the cause, `get`
+  raises `ExecutionException` and `join` `CompletionException`, and
+  `exceptionally`/`handle` see the raw throwable on the stage that failed and
+  the wrapped one downstream. Dependents registered before completion run
+  newest first, as the JVM's do. `get` and `deref` are interruptible and `join`
+  is not, from a thread or a fiber; a completion race has one winner and a
+  callback registered while the future completes runs exactly once. A
+  function argument can be a Clojure fn or a reified `java.util.function`
+  interface, an `Executor` any pool shim or a reify. The async pool is a
+  cached thread pool rather than the ForkJoin common pool. 83 corpus rows
+  certify the surface against Clojure 1.12.5 on JDK 21; the interrupt and
+  fiber cases are unit rows and `fiber-blocking.clj` cases. Two details are
+  documented divergences: `whenComplete` cannot record the action's throwable
+  as suppressed, and async stages do not run on threads named
+  `ForkJoinPool.commonPool-worker-N`. Left out: `completedStage`,
+  `failedStage` and `minimalCompletionStage` (the `MinimalStage` view), and
+  `defaultExecutor`.
+
+- **`ManagementFactory/getThreadMXBean`** with the current thread's CPU clock:
+  `getCurrentThreadCpuTime`, `getCurrentThreadUserTime` (the same total — the
+  runtime's thread clock does not split user from system time) and the
+  `is...Supported`/`Enabled` checks.
+- **`Thread.getState` and the `Thread$State` enum.** NEW before `start`,
+  TERMINATED after the thread ends, and while it runs what it is actually
+  doing, as the JVM reports it: WAITING in an untimed wait (`join`, a promise
+  or future deref, `<!!`/`>!!`, `Object.wait`, a latch, a queue `take`, a
+  `ReentrantLock` acquire), TIMED_WAITING in a timed one (`Thread/sleep`, a
+  timed deref, `wait` or `await`), BLOCKED waiting to enter a `locking`
+  monitor, RUNNABLE otherwise. `Thread$State/values` and `valueOf` work. A
+  fiber's state is left to the fiber layer through a hook.
+- **`java.lang.ThreadGroup` and `Thread.getThreadGroup`.** A minimal model of
+  the JVM's: the built-in `system` group and its child `main`, which every
+  thread is in unless placed elsewhere (as the JVM's main thread, its pools'
+  and its futures' threads are); `(ThreadGroup. name)` and
+  `(ThreadGroup. parent name)`; the `Thread` constructors that take a group;
+  a new `Thread` in its creator's group; `getName`, `getParent`, `parentOf`,
+  `activeCount` (live threads in the group and its subgroups),
+  `activeGroupCount`, `getMaxPriority`; `Thread/activeCount`; and
+  `getThreadGroup` answering nil once a thread has terminated.
+  `(Thread. "name")` now takes its string as the name rather than as a target.
+
+- **`Socket.shutdownOutput`, `shutdownInput`, `isOutputShutdown` and
+  `isInputShutdown`.** The half-close, as on the JVM: after `shutdownOutput`
+  the peer reads EOF, this side still reads, and a write throws "Broken
+  pipe"; after `shutdownInput` reads return EOF, even over data that had
+  already arrived, and writes still work. A read blocked on another thread or
+  parked on a fiber wakes with EOF. A second call, a closed or unconnected
+  socket, and `getInputStream`/`getOutputStream` of a shut-down side throw
+  `SocketException` with the JDK's messages, and the state survives `close`.
+  `getInputStream` and `getOutputStream` of an unconnected socket now throw
+  "Socket is not connected" as the JDK's do. Without the half-close a proxy
+  closing a socket its peer was still reading got a reset on Windows (#1208).
+
+### Changed
+
+- **The process waits for its non-daemon threads before it exits, as the JVM
+  does.** jolt used to end the moment `-main`, a script, `-e` or the REPL
+  returned, waiting only for a `Thread.` the program had started itself, so work
+  still running on a future, an agent or an executor was silently dropped. The
+  rule is now clojure.main's, each case measured against JVM Clojure 1.12.5 on
+  JDK 21: every live non-daemon thread holds the process up, whatever started
+  it, and daemon threads never do. That includes the idle holds a JVM Clojure
+  program has — **this is the part that can change how an existing script
+  behaves**:
+  - after a `future`, `pmap`, `pcalls` or `send-off`, the process stays up for
+    60 s after the last one finishes (the agent system's cached pool keeps its
+    idle worker that long), unless the program calls `shutdown-agents`;
+  - after a `send`, `await` or `await-for` it does not end by itself at all
+    (that pool's workers never time out) until `shutdown-agents`;
+  - an Executors pool that is never shut down keeps it up for good, as a
+    non-daemon thread blocked forever does; after `.shutdown` it ends once the
+    queue drains.
+
+  A script that relied on exiting with a future or a pool still pending now
+  waits, or hangs, exactly as it would on the JVM; end it the JVM way, with
+  `shutdown-agents`, `.shutdown`, a daemon thread, or `System/exit`.
+  `System/exit`, `Runtime.halt` (new) and an uncaught error still end the
+  process at once; shutdown hooks run after the wait, as there. Daemon threads
+  are never waited for: `core.async`'s `thread`, `go` and `io-thread`,
+  CompletableFuture's async pool, `newVirtualThreadPerTaskExecutor`, a pool
+  whose `ThreadFactory` makes daemons, and jolt's own runtime threads. A future
+  or send-off is never a daemon, whatever thread starts it. `jolt run <task>` follows babashka's rule
+  instead of clojure.main's: bb's future and agent threads are daemons, so a
+  task does not wait on them (a `Thread.` it starts, or a pool it never shuts
+  down, still holds the process up there as here). Built binaries wait the same
+  way as the CLI. `jolt build` and its compile workers do not: they are the
+  compiler, and a namespace that starts a future at load (to be compiled, it is
+  loaded) must not hold the build up for the pool's keep-alive.
+
+  Along with it, as on the JVM: a `future` after `shutdown-agents` throws
+  `RejectedExecutionException`, and a `send` after it returns the agent and
+  hands the rejection to the agent's error handler (it used to throw);
+  `shutdownNow` interrupts the tasks its workers are running (it used to leave
+  them running); `ThreadPoolExecutor.allowCoreThreadTimeOut` is implemented;
+  and `put!`/`take!` callbacks, `core.async`'s mixed and compute executors and
+  the io poller run on daemon threads, so none of them holds the process up.
+  jolt's nREPL server runs on plain threads rather than futures, so evaluating
+  `(shutdown-agents)` over a connection leaves it serving the next one.
+
+### Fixed
+
+- **A failed git clone can be retried on Windows.** `fetch-git!` clears its
+  staging directory with `delete-tree!` before each attempt, but git writes its
+  objects read-only, Windows refuses to delete a read-only file, and the
+  failure was swallowed. The partial clone stayed and every retry died on
+  "destination path ... already exists and is not an empty directory".
+  `delete-tree!` now clears the read-only attribute on a file it cannot delete
+  and tries again.
+
+- **A double halfway between two 16- or 17-digit decimals prints the even
+  one.** Chez breaks that tie upward and `Double.toString` to the even digit,
+  so a few long doubles printed one digit off the JVM.
+
+  ```clojure
+  (pr-str 1.3381632805467082E15)
+  ;; before: "1.3381632805467083E15"
+  ;; after:  "1.3381632805467082E15"
+  ```
+
+- **ByteBuffer raises the JDK's exceptions and reports the JDK's classes.**
+  Reading or writing past the limit was `ArrayIndexOutOfBoundsException` (or
+  wrote past the limit into the backing array) where the JDK throws
+  `BufferUnderflowException`, `BufferOverflowException` or, for an absolute
+  index, `IndexOutOfBoundsException`; `position` and `limit` accepted any
+  value, and a limit below the position left the position past it.
+  `asReadOnlyBuffer` returned a writable buffer. `(class b)` was
+  `java.nio.ByteBuffer` for every buffer and `(instance? java.nio.Buffer b)`
+  was false; it is `java.nio.HeapByteBuffer`, `DirectByteBuffer` or their
+  read-only classes now, as on the JDK, and `allocateDirect` answers
+  `isDirect` true and `hasArray` false. `CharBuffer/allocate` is a
+  `java.nio.HeapCharBuffer`, and `CharBuffer/wrap` of a string is the
+  read-only `java.nio.StringCharBuffer` it is on the JDK, so a `put` into it
+  throws `ReadOnlyBufferException` instead of writing to a copy.
+  `CharBuffer/wrap` of a `char[]` shares the array, with `wrap(arr, off, len)`
+  setting position and limit as the JDK does, `wrap` of a StringBuilder
+  reads it live, and `equals`, `hashCode`,
+  `compareTo` and `mismatch` agree across every kind of CharBuffer, a
+  ByteBuffer's `asCharBuffer` view included.
+
+- **Recovering a damaged AOT cache entry no longer compiles against the
+  failed load's own definitions** (#1219). When a cached artifact was
+  truncated, incomplete or built on a stale assumption, jolt recompiled the
+  namespace in the same process the artifact had just run in. Its later
+  definitions were already in place, so a `(get m k)` above a same-namespace
+  `(defn get ...)` bound to the namespace's `get` instead of `clojure.core`'s,
+  and the result went back into the cache for every later run:
+
+  ```clojure
+  (ns shadow-ns)
+  (defn f [] (get {:a 1} :a))
+  (defn get [url opts] [:shadow url opts])
+  ;; after a truncated cache entry, before: (shadow-ns/f) => [:shadow {:a 1} :a]
+  ;;                                after:  (shadow-ns/f) => 1
+  ```
+
+  The recovery now takes back the definitions the failed load made before it
+  recompiles, so it compiles what a fresh process would.
+
+- **SCI's constructor reflection.** `Class.getConstructors` and
+  `getParameterTypes` answer typed arrays (`Constructor[]`, `Class[]`) instead
+  of vectors, which an `^objects` aget refused, and `Constructor.newInstance`
+  spreads an Object[] argument (nil is no arguments) the way the JVM does. With
+  `clojure.lang.Compiler/subsumes` added, `(Exception. "m")`, `@(delay 1)` and
+  `case` work through SCI's reflector. Reference arrays carry their component
+  class: `(into-array String ...)` is a `String[]`, an untyped `into-array` takes
+  the first element's class, and `make-array` builds every dimension.
+- `Class.isAssignableFrom` answered true for Object against a primitive class.
+- Hashing an infinite `iterate`, `cycle`, `repeat` or `(range)` hung; it throws
+  UnsupportedOperationException as on 1.12. `cycle` is a `clojure.lang.Cycle`.
+- `#(%a)` and other bad arg literals read as symbols instead of raising.
+- An ArityException past 20 arguments says `(> 20)`.
+- `Objects/deepEquals` was false for two typed reference arrays (a `String[]`
+  against another, or against an `Object[]`); `Arrays/deepEquals` was missing.
+- Stream `anyMatch`/`allMatch`/`noneMatch` realized the whole stream first, so
+  they never returned on an infinite one, and every stage ran a whole chunk
+  before the next saw it. A pipeline now pulls one element at a time. Added
+  `Collectors/groupingBy`, `toMap` and `partitioningBy`, `summaryStatistics` and
+  `mapMulti`; `Stream.toList` is an unmodifiable List rather than a vector.
+- `realized?` threw on `cycle`, `iterate` and `(range)`; they are IPending and
+  IReduce (with `.reduce`), as on the JVM.
+- A `^Predicate`/`^Function`-hinted local had none of the interface's default
+  methods (`negate`, `and`, `andThen`, `compose`, ...); any reify of the
+  interface now answers them. A non-fn under the hint is a ClassCastException
+  and a Predicate fn answering nil a NullPointerException, as on the JVM.
+- `.forEach` on a persistent map with a fn is the JVM's ambiguity error; a
+  BiConsumer or Consumer picks its overload.
+- `to-array-2d` returns an `Object[][]`. An unknown array component
+  (`NoSuch/1`) raises ClassNotFoundException.
+- `.hashCode` of a seq or list was its hasheq instead of `List.hashCode`, and
+  ArrayList/HashSet/HashMap had no `.equals`/`.hashCode`.
+- A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque
+  `#object` under `pr`, compared unequal to the Clojure collection with the same
+  elements, had the wrong `str`/`toString`, hashed (`hash`) differently from its
+  `.hashCode`, and `reduce-kv` refused a HashMap. One registry shared by both
+  hosts (`java/jutil-colls.ss`) answers all of these for every java.util shim.
+- `.hashCode` of a number was not Java's: a long outside int range answered
+  itself, a double its truncation (`(.hashCode 1.5)` was 1, not 1073217536)
+  and `##NaN` threw, so the List/Set/Map hashes built on them were wrong too.
+
+- **`Math/copySign`, `max`, `min` and `signum` follow the JVM on -0.0 and
+  NaN.**
+
+  ```clojure
+  [(Math/copySign 2.0 -0.0) (Math/min -0.0 0.0) (Math/max ##NaN 1.0) (Math/signum -0.0)]
+  ;; before: [2.0 0.0 1.0 0.0]
+  ;; after:  [-2.0 -0.0 ##NaN -0.0]
+  ```
+
+  A mixed long/double `Math/max` returns a double, as the double overload does.
+
+- **A subnormal double prints as `Double.toString` does.** The JVM prints at
+  least two significant digits and picks the two nearest the value, so
+  `Double/MIN_VALUE` is `4.9E-324`; jolt padded the shortest digits and printed
+  `5.0E-324`, and `9.9E-324` as `1.0E-323`. Checked against the JVM over every
+  subnormal below 2000 ulps and 20,000 random ones. `format` starts from the
+  same digits, so `(format "%.2e" 4.9E-324)` is `"4.90e-324"`, and number
+  printing is one shared file for both hosts now.
+
+- **Stopping the nREPL server no longer leaves its accept thread on a freed
+  fd.** stop closed the listen socket under a blocked accept(), which Linux
+  does not wake, so the thread stayed in accept() on a number the next socket
+  could take. The listener is non-blocking now and the accept loop waits in
+  poll slices and closes the socket as it leaves; stop waits for it, so the
+  port is free when stop returns.
+
+- **A collection forced by the heap ceiling no longer copies its way past
+  it.** It collected the younger generations one step at a time, each step
+  copying a whole generation on top of what the heap already held; when a
+  scheduled promotion had just run, the gcpolicy gate's 256MB ceiling peaked
+  at 317MB. It is one collection now that marks every generation from 1 up in
+  place, as GHC treats its oldest generation near `-M` and HotSpot's full
+  collections do. Under a 200MB ceiling with ~100MB held, the churn loop
+  also runs 1.2x faster.
+
+- **A vector sliced just past a trie boundary can be conj'd onto.**
+  `(reduce conj (subvec (vec (range 1100)) 0 1025) (range 3000))` threw
+  `vector-length: ... is not a vector`. When the tail of a relaxed vector was
+  pushed into its trie, the root could come back as a plain node over a
+  relaxed child, which the next conj read as a classic trie. The root now
+  stays relaxed.
+
+- **A `ServerSocket` whose bind address does not resolve closes its socket.**
+  The constructor threw UnknownHostException and left the fd it had opened.
+
+- **Attributes set on a finished thread stick.** A thread's exit hook ran
+  after its body had already woken `join`, and copied the thread's name,
+  priority and daemon flag onto the object a second time, undoing a
+  `setDaemon`, `setName` or `setPriority` made after the join. It was about one
+  run in two thousand under contention; now the thread is finished once.
+
+- **A `ThreadFactory`'s Thread runs the pool worker.** A pool asked its
+  factory for a Thread only to read its daemon flag and name, and ran the
+  worker on a thread of its own, so a factory that wraps the Runnable it is
+  handed (to set up context, count, catch) never saw its wrapper run, and
+  `Thread/currentThread` in a task was not the factory's Thread. The pool now
+  starts the Thread `newThread` answers, as the JVM does. A task handed to
+  `execute` that throws ends its worker as there: the throw goes to the
+  thread's uncaught-exception handler and the pool starts a replacement.
+  `Thread.setUncaughtExceptionHandler`/`getUncaughtExceptionHandler` and
+  `Thread/setDefaultUncaughtExceptionHandler`/`getDefaultUncaughtExceptionHandler`
+  are implemented, and a `Thread`'s body that throws goes through them.
+- **`cancel(true)` interrupts the task it cancels.** On an executor's future
+  (`submit`, a scheduled task, `invokeAll`'s deadline, `invokeAny`'s losers,
+  `future-cancel`) and on a `FutureTask` run on a pool or a `Thread`, cancel
+  marked the future and the task ran on to completion; the running thread is
+  now interrupted, as on the JVM, and `cancel(false)` still leaves it to finish.
+  A pool worker clears its interrupt before its next task, as the JVM's
+  `ThreadPoolExecutor` does, so a cancel does not leak into unrelated work. A
+  `FutureTask` cancelled while it runs stays cancelled (its result used to
+  overwrite the cancellation), `FutureTask.cancel` wins over a running task,
+  and a `FutureTask` takes a reified `Callable`.
+- **A thread has one `java.lang.Thread` object.** Inside a thread started from
+  `(Thread. f)`, `(Thread/currentThread)` was a separate handle, never
+  `identical?` to the object, and the two answered different members: the
+  handle had no `join`, the object no `getId` or `getContextClassLoader`. Now
+  the started thread IS its object — its `currentThread`, its key in
+  `getAllStackTraces`, and a handle another thread took for it earlier are all
+  the same object — and every thread jolt did not start from a `Thread.`
+  (main, futures, pool workers, core.async threads) has one stable object
+  made the first time anyone asks. Every member answers through it the same
+  way: `join` and `isAlive` work on any thread's object, `getId`/`threadId`
+  are assigned at construction (main is 1, as on the JVM) rather than once
+  started, and `getAllStackTraces` now includes the main thread when another
+  thread asks. `getState` and `getThreadGroup` are still not implemented.
+- **`Thread.isDaemon` answers for every thread.** `(.isDaemon
+  (Thread/currentThread))` was "No matching field found" everywhere — on the
+  main thread, in a future, a `go` block, an executor task, even in a started
+  `Thread.` looking at itself — because the handle `currentThread` and
+  `getAllStackTraces` hand out had no such method, only the `(Thread. f)`
+  object did. Daemon status is now recorded where each thread is forked, so
+  the object and every handle for the thread agree. The values are the JVM's,
+  each probed on JDK 21: the main thread, futures, agents and executor workers
+  are not daemons; `core.async` thread, `go` and `io-thread` threads, the tap
+  thread, a work-stealing pool's and CompletableFuture's async threads are; a
+  `Thread.` inherits its creator's status, as on the JVM, where it was always
+  false. A `ThreadFactory` passed to `Executors` or a pool constructor was
+  ignored; it now decides each worker's daemon flag and name. `setDaemon` on a
+  live thread's handle is `IllegalThreadStateException`, as on the JVM. The
+  handle also gains `isAlive`, `isVirtual`, `threadId`, and `getPriority`/
+  `setPriority`, which both representations now share: validated to 1–10,
+  inherited by a new `Thread.`, and carried to the started thread.
+- **`<!!`, `>!!` and `alts!!` are interrupted.** On the JVM these block by
+  deref'ing a promise, so `.interrupt` throws `InterruptedException` out of them
+  and clears the flag. jolt kept waiting and left the flag set, so a worker shut
+  down by interrupting it hung in its channel read. They now throw and clear the
+  flag, on a thread and on a fiber; a flag already set makes an op that would
+  have to wait throw at once, and an op that can complete immediately completes
+  and leaves the flag set, as the JVM's does. The parking ops `<!`, `>!` and
+  `alts!` are not interruptible, as a parked go block holds no thread on the
+  JVM, and neither is the runtime's own channel plumbing.
+
+  An interrupted op leaves nothing behind: a take holds no value and is no
+  longer counted as a waiting taker, a put on an unbuffered channel is
+  retracted, and an `alts!!` has claimed none of its ops. The JVM leaves the
+  promise's handler registered, so there a later put is swallowed by the taker
+  that threw and a later take receives the value of a put that threw; that
+  difference is recorded in `known-divergences.edn`. The fiber side follows the
+  0.7.26 rule for fibers sharing a carrier. Inside a `go` body `<!!` and `>!!`
+  keep the cheap park (a stored closure rather than a captured stack, about 1.3
+  KB per parked block against 5.1 KB), which now carries the interrupt arm;
+  `<!`, `>!` and `alts!` keep the one without it.
+
+- **An unbuffered put succeeds only when a live taker receives the value.**
+  `offer!`, `put!`, `alts!`'s put and a fiber's `>!` counted a thread blocked in
+  `<!!` as room for any number of puts, so two `offer!`s in a row to one blocked
+  taker both answered true and the second value waited in the channel for
+  whoever took next. A parked taker was likewise counted by looking at it rather
+  than claiming it, so a taker whose `alts!!` completed on another port in
+  between left the put answered true and its value buffered. A put now claims a
+  parked taker before handing it the value, counts blocked threads against the
+  values already queued for them, and pairs a parked putter with a parked taker
+  by claiming both together; an `alts!!` that takes from and puts to the same
+  channel no longer pairs with itself.
+
+- **`java.util.concurrent.TimeoutException` can be constructed.**
+  `(TimeoutException.)` and `(TimeoutException. "msg")` raised "No matching ctor
+  found", and the one the runtime throws from a timed `Future.get` did not answer
+  `instance? Exception`. `BrokenBarrierException` and `CompletionException` had
+  the same gap. All three now have the JDK's constructors and superclasses.
+
+- **A `future` answers `java.util.concurrent.Future`'s methods.** `(.get f 100
+  TimeUnit/MILLISECONDS)`, `.isDone`, `.isCancelled` and `.cancel` on a
+  `clojure.core/future` raised "No matching method"; only the no-arg `.get` and
+  `.deref` worked. The timed `.get` throws `TimeoutException`, and
+  `(.cancel f false)` cancels without interrupting the worker.
+
+- **An exception built from a cause takes the cause's `toString` as its
+  message.** `(ExecutionException. (IllegalStateException. "bad"))` had a nil
+  message; the JVM's `Throwable(Throwable)` sets it to
+  `"java.lang.IllegalStateException: bad"`, and jolt now does too, for every
+  exception class.
+
+- **`Process.onExit` returns a real CompletableFuture** that completes with the
+  Process. It was a stub that answered `thenRun` only, and its `thenApply`
+  returned the stub without calling the function.
+- **`future?`, `future-done?`, `future-cancel` and `future-cancelled?` accept
+  any `java.util.concurrent.Future`**, as they do on the JVM — a `FutureTask`,
+  an executor's future, a CompletableFuture. `(future? a-future-task)` was
+  false and `future-done?` threw on one; on a value that is not a Future the
+  last three are now the JVM's `ClassCastException`, and so is `realized?` of
+  a FutureTask, which answered `false`.
+- **A reified `Callable` or `Runnable` submitted to an executor runs.** It was
+  invoked as a fn, so its future failed with "cannot be cast to
+  clojure.lang.IFn". `(.run f)` and `(.call f)` on a fn work too.
+- **Reified `java.util.function` arguments** to `HashMap`'s `computeIfAbsent`,
+  `computeIfPresent`, `compute`, `merge` and `forEach`,
+  `AtomicReference.updateAndGet`/`getAndUpdate`, and `Optional.orElseGet`/
+  `ifPresent` are called through their method; they failed the same way.
+- **A timed `Future.get` that runs out raises `TimeoutException` with no
+  message**, as the JVM does. It said "timed out waiting for the task".
+
+- **A `:static` native no longer loads a shared object by its name.** For a
+  `:jolt/native` spec that declares no candidates for the platform, `jolt run`
+  and `jolt build` try the conventional names of its `:name`
+  (`libcrypto.dylib` for `"crypto"`) — for `:static` specs too, whose symbols
+  come from their archive. Whatever the loader found then answered the build's
+  calls in place of the archive, and for `{:name "crypto" :static …}` on macOS
+  it found Apple's `libcrypto.dylib`, which aborts the process. A `:static`
+  spec now loads only the candidates it declares.
+- **`clojure.java.io` takes a socket's streams.** `io/reader`, `io/writer`,
+  `io/input-stream`, `io/output-stream`, `io/copy`, `slurp` and `spit` all
+  raised "Cannot open" over a `Socket`'s `getInputStream` or
+  `getOutputStream`, so `(line-seq (io/reader (.getInputStream sock)))` did
+  not work. They drive them as the `java.io` streams they are.
+
+- **`jolt.loader` opens `file:` resource hits on Windows.** It dropped the
+  scheme with `(subs url 5)`, so a resource's `file:/C:/proj/…` became
+  `/C:/proj/…`, which Windows reads as a path on the current drive; on every
+  platform a `%20` escape or a `localhost` authority stayed in the path. The
+  path is now read through `clojure.java.io`'s `file:` URL handling. A
+  classpath root's hit carries the URL the JDK's classloader would
+  (`File.toURI`: `file:/C:/…`, escaped) instead of `file:C:/…` with the name
+  unescaped (#1203).
+- **`jolt build` creates a missing output directory from a Windows path.** The
+  walk that creates `<out>.build` (and the AOT cache's directories) took a
+  path's parent by splitting on `/` only, so `C:\proj\out\app.exe` had no
+  parent and the walk handed `#f` to a string comparison. It now splits on
+  both separators and stops at a drive or UNC root. A bare-name `JOLT_CHEZ`
+  (`scheme`, found on `PATH`) no longer fails the same way when `build.ss`
+  loads (#1207).
+- **`:static` archives that call into each other build.** To let the app's
+  foreign calls resolve while it builds, each `:static {:archive …}` native was
+  turned into a throwaway shared object of its own, so one archive calling into
+  another (OpenSSL's `libssl.a` into `libcrypto.a`) was left with undefined
+  references: Windows refused to load it, and so did macOS and Linux whenever
+  the dependent archive was declared first. The build now makes one object from
+  all of the app's archives. An archive that is not position-independent is
+  still skipped with a warning without affecting the rest, and an archive two
+  natives name is linked once (#1205).
+- **Windows static builds link OpenSSL 3.** The Windows link line lacked
+  `-lcrypt32`, and OpenSSL 3's static `libcrypto.a` calls the CryptoAPI
+  certificate store, so an app linking it as a `:static` native failed its
+  final link. The build-time preload of `:static` archives now also links the
+  same system libraries on Windows, where a DLL has to resolve its imports
+  when it loads (#1206).
+
+## [0.8.15] - 2026-09-29
+
+Sockets gain read, accept and connect timeouts, and a closed socket behaves
+like the JVM's: its streams stop touching a reused fd and blocked callers wake.
+`jolt.loader/eval-in` evaluates a string inside a loader context, and
+`unload!` lets the loader be collected. Also fixed: spawned children inherit
+`SIGPIPE` ignored, `file:` URIs as paths, `java.time` `Month` overloads,
+image dumps of protocol-implementing records, and `clojure.walk` over sets.
+
+### Added
+
+- **`jolt.loader/eval-in`: evaluate a source string in a context.** `eval` and
+  `load-string` never consult the ambient loader (`with-loader`), because the
+  context-carrying rewrite is bound only while a namespace source the loader
+  itself reads compiles; a string evaluated under `with-loader` therefore
+  requires from the runtime's global roots. `(eval-in l ns-name source)`
+  evaluates SOURCE form by form in NS-NAME through L: `require`, `use`,
+  `refer`, `resolve`, `ns-resolve` and `find-var` carry the context, a
+  dependency the loader cannot serve fails `:loader/unreadable`, and the last
+  form's value is returned. A name the loader already owns is evaluated in
+  place (var cells other code links stay); an installed namespace the loader
+  does not own is refused rather than evicted; the namespace and its var links
+  are installed in the loader, so `resolve`/`find` answer them and `unload!`
+  unmaps the namespace. An `(ns NS-NAME ...)` prefix is allowed (its requires
+  are preloaded through the loader); an `ns` form for another name is refused
+  before it runs, and a form that leaves NS-NAME — `in-ns`, or a switch
+  nested in a `do` — fails `:loader/bad-request` when it returns.
+  Evaluating through a policy wrapper (`allow`, `deny`, …) owns the namespace
+  at the nearest ancestor that releases one, so the base loader's `unload!`
+  unmaps it.
+- **`Socket`/`ServerSocket` `setSoTimeout`/`getSoTimeout`.** A read or an
+  accept that waits longer than SO_TIMEOUT raises
+  `java.net.SocketTimeoutException` ("Read timed out"/"Accept timed out") and
+  leaves the socket usable, on threads and on fibers; 0 is still forever.
+  The poller gained a deadline arity for this, and a parked fiber is woken by
+  the runtime's shared timer, so untimed waits are unchanged. Not enforced on
+  Windows, whose sockets are blocking (recorded divergence) (#1191).
+
+### Changed
+
+- **`(.-field x)` on a deftype or defrecord caches its slot at the call site.**
+  A field read looked the name up in the type's table on every call (~40 ns);
+  each site now remembers the last type it read and that type's slot (~14 ns).
+  A deftype `equals` that reads the other instance's field pays this per key a
+  map lookup compares, so a map keyed on core.logic-style LVars probes about
+  1.25x faster.
+- **`jolt.loader`: `unload!` releases the loader's graph.** The id→loader
+  registry (`loaders-by-id`) used to keep every loader ever constructed
+  reachable, so a process that minted a context per request accumulated them.
+  `unload!` now replaces the entry with a closed stand-in carrying the id and
+  an unloaded state: links, closures, roots and the delegate become
+  collectable, while evaluated source that still carries the id keeps failing
+  `:loader/unloaded` rather than `:loader/bad-context`. The stand-ins are
+  small but are not reclaimed; that waits for per-context var tables.
+
+### Fixed
+
+- **`new File(uri)`, `Paths.get(uri)` and `Path.of(uri)` read the URI's path.**
+  They took the URI's string as the path, so `file:///tmp/a%20b` became the
+  relative path `file:/tmp/a%20b` and nothing under it existed. They now decode
+  the path of a `file:` URI and refuse the rest with the JDK's messages — an
+  authority (even `localhost`), a query, a fragment, an opaque or relative URI;
+  `Paths.get` of another scheme is a `FileSystemNotFoundException`.
+  `clojure.java.io/file` of a URI reads it the lenient way, through its URL, as
+  Clojure does (#1198).
+- **`java.time`'s `Month` overloads.** `LocalDate/of`, `LocalDateTime/of`,
+  `YearMonth/of`, `MonthDay/of` and `Year.atMonth` take a `java.time.Month`
+  where the month number goes, as the JDK's do; a `Month` was a
+  `ClassCastException`. `LocalDateTime/ofInstant` and an `ofEpochSecond` that
+  applies its offset come from jolt-lang/time, which owns zones (#1197).
+- **Spawned processes start with `SIGPIPE` at its default, as on the JVM.**
+  The runtime ignores `SIGPIPE` for its own writes, and an ignored signal
+  survives `exec`, so every child and everything it ran inherited it. A
+  producer whose consumer exited early (`yes | head`, `cmd | grep -q`) got
+  `EPIPE` and ran its error path — "Broken pipe" on stderr, a different exit
+  status — instead of being ended by the signal. A shell cannot undo that
+  itself, so the spawn now resets it (#1196).
+- **A timed wait on a fiber no longer pins the fiber until its deadline.** The
+  runtime's timer had no cancel, so a fiber's timed socket read, accept or
+  connect, or a timed `deref`, left its deadline armed after the wait ended,
+  and the timer held the fiber until it passed. With a long `SO_TIMEOUT` that
+  kept one finished fiber per parked read alive for the whole timeout. Waits
+  now cancel their deadline when they end; arming costs the same as before.
+- **`Socket.connect(endpoint, timeout)` honours its timeout.** It was accepted
+  and ignored, so a connect to a peer that never answered blocked until the OS
+  gave up. It now raises `SocketTimeoutException` ("Connect timed out"), a
+  negative timeout is an `IllegalArgumentException`, a refused connect is a
+  `ConnectException` rather than a bare `IOException`, and a failed connect
+  closes the socket as the JDK's does. "Already connected" is a
+  `SocketException` and an unresolvable host an `UnknownHostException`, also
+  as on the JDK (#1192).
+- **`unsigned-bit-shift-right` by zero keeps a negative long.** A shift count
+  of 0 (or any multiple of 64) returned the operand's unsigned value as a
+  BigInt, so `(unsigned-bit-shift-right -1 0)` read `18446744073709551615N`
+  instead of `-1`. The result now wraps back to a signed long like Java's
+  `>>>` (#1187).
+- **`jolt.image` writes records whose type implements a protocol.** `dump!`
+  refused any such record, inline in `defrecord` or through `extend-protocol`,
+  with `cannot write #<procedure>`, while `scan` called it clean: the type's
+  per-process dispatch cache rode along in the image. The image now carries the
+  type without the cache, and a restored record is relinked to the live type of
+  the same name and fields, so it dispatches as before.
+- **A closed `java.net.Socket`'s streams no longer read or write its old fd.**
+  `read` and `write` on a stream taken before `.close` went straight to the fd
+  number, which the next socket to open reuses: the stale stream took that
+  socket's bytes and sent to its peer. They now throw
+  `java.net.SocketException "Socket closed"`, as `available` already did and
+  as the JVM does; zero-length calls still answer `0` / `nil`, like the JVM's
+  (#1183).
+- **The rest of a closed `Socket` answers like the JVM's.** `getInputStream`,
+  `getOutputStream`, `connect` and `ServerSocket.accept` on a closed socket throw
+  `SocketException "Socket is closed"`, and `getLocalPort` of an unbound socket
+  is `-1` instead of a `getsockname` on an fd that may be another socket's.
+- **Closing a socket wakes the calls blocked on it.** A thread blocked in `read`,
+  `write`, `accept` or `connect` hung for good when another thread closed the
+  socket; it now throws `SocketException` — `"Socket closed"`, or
+  `"Broken pipe"` for a write — as the JVM's does. A fiber was woken, but its
+  read then retried on the freed fd number, which the next socket had been
+  handed. The fd now stays open until the last call using it has left. Closing
+  a child process's pipe stream under a thread blocked reading it likewise ends
+  the read with `-1` instead of hanging. A write to a dead peer throws
+  `SocketException` rather than a plain `IOException`, as on the JVM.
+- **`clojure.walk` walks into sets.** `walk` had no branch for a set, so a set
+  fell through to `outer` with its elements untouched:
+  `(walk inc identity #{1 3})` was `#{1 3}` and `postwalk-replace` left a set's
+  elements alone. Any other collection is now rebuilt with
+  `(into (empty form) (map inner form))`, as in Clojure, which also keeps a
+  sorted set sorted.
 
 - Synchronize cold weak-table equality-domain metadata reads and registration
   publication. Preserve weak retirement, lock-free warm snapshots and callbacks
@@ -1812,7 +2603,6 @@ boot revived with the gates that keep it alive.
   overtaken class land as any library's on a runtime class do, and the warning
   names the library to upgrade. The refusal remains what it was for: two
   declared providers of one class.
-
 
 ## [0.8.8] - 2026-09-15
 

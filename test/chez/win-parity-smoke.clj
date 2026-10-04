@@ -14,6 +14,12 @@
          '[clojure.string :as str])
 
 (def windows? (str/starts-with? (System/getProperty "os.name") "Windows"))
+
+;; ONE carrier for the fiber rows below: a fiber that blocked its carrier on a
+;; socket instead of parking would then stop every other fiber, which is what
+;; they assert does not happen. Set before anything spawns.
+(require 'jolt.fibers)
+(jolt.fibers/set-carrier-count! 1)
 (def fails (atom 0))
 (def total (atom 0))
 
@@ -103,6 +109,137 @@
   (check "#1118 jar:file: over toURI opens"
          (slurp (java.net.URL. (str "jar:" (.toURI (io/file jar-path)) "!/data.txt")))
          "in-jar"))
+
+;; --- #1203: jolt.loader opens a file: resource hit -------------------------------
+;; The loader stripped "file:" with (subs url 5), so the drive form a resource
+;; URL has on Windows, file:/C:/…, became /C:/… and could not be opened; on every
+;; platform a %hh escape or a localhost authority was left in the path. A hit's
+;; URL is the JDK's spelling: absolute, the drive behind a "/", escaped.
+(require '[jolt.loader :as jl])
+(let [d (under "res dir")
+      f (str d "/r.txt")
+      abs (str (fs/absolutize f))
+      uri (str (.toURI (io/file abs)))
+      slashed (str/replace abs "\\" "/")
+      url-path (if windows? (str "/" slashed) slashed)
+      located (fn [url] (jl/->loader (fn [req] (when (= :resource (:kind req))
+                                                 {:kind :resource :url url}))))]
+  (fs/create-dirs d)
+  (spit f "resource")
+  (doseq [[label url] [["an escaped file: URI" uri]
+                       ["a localhost authority" (str "file://localhost" url-path)]
+                       ["an empty authority" (str "file://" url-path)]
+                       ["the unescaped spelling" (str "file:" url-path)]]]
+    (let [l (located url)
+          hit (first (jl/find l {:kind :resource :name "r.txt"}))]
+      (check (str "#1203 open-hit: " label) (slurp (jl/open-hit l hit)) "resource")
+      (check (str "#1203 getResource: " label)
+             (slurp (.getResource (jl/as-classloader l) "r.txt")) "resource")))
+  (let [l (jl/classpath [d])
+        hit (first (jl/find l {:kind :resource :name "r.txt"}))]
+    (check "#1203 a classpath root's hit is the JDK's URL" (:url hit) uri)
+    (check "#1203 ...and opens" (slurp (jl/open-hit l hit)) "resource")
+    (check "#1203 ...and getResource answers the same URL"
+           (str (.getResource (jl/as-classloader l) "r.txt")) uri)))
+
+;; --- #1208: Socket half-close -----------------------------------------------------
+;; Winsock's shutdown takes SD_SEND / SD_RECEIVE, and a proxy that closed without
+;; half-closing first got a reset on Windows where Linux closed gracefully. The
+;; exchange a proxy pumps: the client sends and half-closes, the server reads to
+;; EOF and answers, the client reads the answer, and each side's state is named.
+(defn- read-all [in]
+  (loop [acc []]
+    (let [b (.read in)]
+      (if (neg? b) (String. (byte-array acc) "UTF-8") (recur (conj acc b))))))
+(let [ss (java.net.ServerSocket. 0)
+      c (java.net.Socket. "127.0.0.1" (.getLocalPort ss))
+      s (.accept ss)
+      cin (.getInputStream c)
+      cout (.getOutputStream c)
+      msg (fn [f] (try (f) :ok (catch java.net.SocketException e (.getMessage e))))]
+  (try
+    (.write cout (.getBytes "req" "UTF-8"))
+    (.shutdownOutput c)
+    (let [req (read-all (.getInputStream s))]
+      (.write (.getOutputStream s) (.getBytes (str "echo:" req) "UTF-8"))
+      (.shutdownOutput s)
+      (check "#1208 shutdownOutput: the peer reads to EOF and answers"
+             [req (read-all cin) (.isOutputShutdown c) (.isInputShutdown c) (.isClosed c)]
+             ["req" "echo:req" true false false]))
+    (check "#1208 a write after shutdownOutput throws" (msg #(.write cout 1)) "Broken pipe")
+    (check "#1208 shutdownOutput twice" (msg #(.shutdownOutput c)) "Socket output is already shutdown")
+    (.shutdownInput c)
+    (check "#1208 shutdownInput reads EOF"
+           [(.isInputShutdown c) (.read cin) (msg #(.getInputStream c))]
+           [true -1 "Socket input is shutdown"])
+    (finally (.close s) (.close c) (.close ss))))
+
+;; --- sockets wait on jolt.io-poller everywhere --------------------------------------
+;; Windows sockets were blocking, for want of a readiness poller there: a fiber
+;; reading one held its carrier, and SO_TIMEOUT and the connect timeout were
+;; stored but never enforced. The WSAPoll backend makes them what they are on
+;; POSIX.
+(defn- pair []
+  (let [ss (java.net.ServerSocket. 0)
+        c (java.net.Socket. "127.0.0.1" (.getLocalPort ss))
+        s (.accept ss)]
+    [ss c s]))
+
+(let [[ss c s] (pair)]
+  (try
+    (.setSoTimeout s 300)
+    (let [t0 (System/currentTimeMillis)
+          r (try (.read (.getInputStream s)) :no-timeout
+                 (catch java.net.SocketTimeoutException e (.getMessage e)))
+          dt (- (System/currentTimeMillis) t0)]
+      (check "SO_TIMEOUT: a read with no data times out"
+             [r (<= 250 dt 5000)] ["Read timed out" true]))
+    (.write (.getOutputStream c) 65)
+    (check "SO_TIMEOUT: the socket still reads after a timeout"
+           (.read (.getInputStream s)) 65)
+    (finally (.close s) (.close c) (.close ss))))
+
+(let [ss (java.net.ServerSocket. 0)]
+  (try
+    (.setSoTimeout ss 300)
+    (check "SO_TIMEOUT: accept with no client times out"
+           (try (.accept ss) :accepted
+                (catch java.net.SocketTimeoutException e (.getMessage e)))
+           "Accept timed out")
+    (finally (.close ss))))
+
+(check "connect to a closed port is refused"
+       (let [ss (java.net.ServerSocket. 0) port (.getLocalPort ss)]
+         (.close ss)
+         (try (java.net.Socket. "127.0.0.1" (int port)) :connected
+              (catch java.net.ConnectException e (.getMessage e))))
+       "Connection refused")
+
+(let [[ss c s] (pair)
+      r (promise)
+      t (Thread. (fn [] (deliver r (try (.read (.getInputStream s)) :read
+                                         (catch java.net.SocketException e (.getMessage e))))))]
+  (.start t)
+  (Thread/sleep 200)
+  (.close s)
+  (check "close wakes a read blocked on another thread"
+         (deref r 3000 :still-blocked) "Socket closed")
+  (.close c) (.close ss))
+
+;; eight fibers park reading silent sockets on the ONE carrier, and a ninth
+;; still runs; then every reader gets its byte
+(let [pairs (vec (repeatedly 8 pair))
+      readers (mapv (fn [[_ _ s]] (jolt.fibers/spawn (fn [] (.read (.getInputStream s)))))
+                    pairs)
+      other (jolt.fibers/spawn (fn [] :ran))]
+  (try
+    (check "fibers park on socket reads: another fiber still runs"
+           (jolt.fibers/join other 3000 :starved) :ran)
+    (doseq [[_ c _] pairs] (.write (.getOutputStream c) 7))
+    (check "fibers park on socket reads: every reader wakes with its byte"
+           (mapv #(jolt.fibers/join % 3000 :stuck) readers) (vec (repeat 8 7)))
+    (finally
+      (doseq [[ss c s] pairs] (.close s) (.close c) (.close ss)))))
 
 ;; --- #1119: last-modified time ---------------------------------------------------
 (let [d (under "lock")

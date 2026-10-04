@@ -13,6 +13,24 @@
 ;; conversion accidentally starts adopting retained mutable source storage.
 (let* ((bv (bytevector 1 255)) (a (na-owned-bv->bytearray bv)))
   (ok "owned helper adopts exact storage" (eq? bv (jolt-array-vec a))))
+(let* ((bv (make-bytevector 65536 7)) (a (na-owned-bv->bytearray bv))
+       (address (#%$fxaddress bv)))
+  (ok "large owned helper adopts exact storage" (eq? bv (jolt-array-vec a)))
+  (do ((i 0 (+ i 1))) ((= i 3)) (sa-gc-collect))
+  (ok "large adopted backing never moves while its owner is live"
+      (and (= address (#%$fxaddress (jolt-array-vec a))) (= 7 (ja-ref a 65535)))))
+(let* ((bv (make-bytevector 1024 7)) (a (na-owned-bv->bytearray bv)))
+  (ok "small adopted output does not create a pin"
+      (not (hashtable-ref sa-pin-boxes a #f))))
+(sa-gc-collect)
+(let ((before (bytes-allocated)))
+  ;; Several full collections both retire guardian owners and reclaim their
+  ;; released backings. Negative control: a leaked pin retains at least 20 MiB.
+  (do ((i 0 (+ i 1))) ((= i 20))
+    (na-owned-bv->bytearray (make-bytevector (* 1024 1024) i)))
+  (do ((i 0 (+ i 1))) ((= i 3)) (sa-gc-collect))
+  (ok "dropped adopted byte arrays release their pins and storage"
+      (< (- (bytes-allocated) before) (* 4 1024 1024))))
 (let* ((bv (bytevector 1 255)) (a (na-bv->bytearray bv)))
   (bytevector-u8-set! bv 0 42)
   (ok "public raw seam still copies"

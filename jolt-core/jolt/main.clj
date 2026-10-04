@@ -144,7 +144,17 @@
       (doseq [spec natives]
         (if (:process spec)
           (jolt.ffi/load-library)
-          (let [cands (native-candidates spec plat base)
+          (let [;; a :static spec's conventional names are not derived here: its
+                ;; symbols come from its archive (preloaded by `jolt build`,
+                ;; linked into the binary), and a same-named shared object the
+                ;; loader happens to find is a different library — it answered
+                ;; the build's calls in the archive's place, and for "crypto"
+                ;; on macOS it is Apple's libcrypto.dylib, which aborts the
+                ;; process. Candidates the spec DECLARES are still loaded.
+                cands (if (:static spec)
+                        (mapv #(native-candidate (native-root spec plat base) %)
+                              (native-declared spec plat))
+                        (native-candidates spec plat base))
                 ;; Load the native RTLD_LOCAL and register its handle, so the
                 ;; spec's defcfns resolve from the handle (isolated from the
                 ;; process-global namespace) rather than depending on global
@@ -743,6 +753,10 @@
     ;; tolerant: see load-natives! — the task may be the build step for a
     ;; :jolt/native library that does not exist yet
     (apply-project! resolved false)
+    ;; babashka's exit rule, not clojure.main's: bb's future and agent threads are
+    ;; daemons, so a task ends without waiting on them (a Thread it starts, or a
+    ;; pool it never shuts down, still holds the process up, as there)
+    (jolt.host/agent-threads-daemon!)
     ;; a task is an entry too (clojure.main -T): its body is user code running
     ;; after the load, and :run-main-opts lands in run-ns' own entry frame.
     (with-entry-bindings

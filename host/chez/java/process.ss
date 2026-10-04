@@ -176,17 +176,22 @@
         #f
         (begin (jolt-invoke2 f fd filt-kw) #t))))
 
+;; Bridge to jolt.io-poller/cancel!: a port being shut wakes every wait on its fd,
+;; parked fiber or blocked thread, and makes any later wait return at once until
+;; the release forgets the fd. Without it a thread blocked in the poller's private
+;; wait never learned of the shut, and a fiber that registered just after the shut
+;; slept on a quiet pipe for good. Same unbound-var guard as proc-poller-forget!.
+(define (proc-poller-cancel! fd)
+  (let ((f (var-deref "jolt.io-poller" "cancel!")))
+    (unless (jolt-var-unbound? f) (jolt-invoke1 f fd))))
+
 ;; Bridge to jolt.io-poller/forget!, same shape as proc-poller-wait-ready above.
-;; A closed fd is auto-removed from the kernel's kqueue/epoll set, so no
-;; event is ever coming for a fiber still parked on it -- without telling
-;; the poller to drop its registration, that fiber sleeps forever, and a
-;; leaked ready=true tombstone in the poller's shared :fds table (keyed by
-;; bare fd integer, shared with jolt.socket) can then be consumed by a
-;; REUSED fd number belonging to an unrelated later socket. Mirrors
-;; jolt.socket's socket-close! (stdlib/jolt/socket.clj), which does the
-;; identical close-then-forget for the same reason. Same unbound-var guard
-;; as proc-poller-wait-ready, and no autoload: a poller that was never loaded
-;; holds no registration for this fd, so there is nothing to forget.
+;; Run by the release, just before the close: the poller's table is keyed by bare
+;; fd number and shared with jolt.socket, so anything it still holds for this fd
+;; -- a ready=true tombstone, the cancelled mark -- would otherwise answer the
+;; first wait of whatever socket or pipe is handed the number next. jolt.socket's
+;; release does the same. Same unbound-var guard as proc-poller-wait-ready, and
+;; no autoload: a poller that was never loaded holds nothing for this fd.
 (define (proc-poller-forget! fd)
   (let ((f (var-deref "jolt.io-poller" "forget!")))
     (unless (jolt-var-unbound? f) (jolt-invoke1 f fd))))
@@ -490,7 +495,7 @@
                     (flush-output-port dst) #t)))))
 (define (proc-pump src dst close-dst?)
   (let ((m (make-mutex)) (c (make-condition)) (done (box #f)))
-    (fork-thread
+    (fork-thread/daemon #t                 ; jolt's own plumbing, like the JVM's process reaper
       (lambda ()
         (guard (e (#t #f))
           (let loop () (when (proc-copy-chunk src dst) (loop))))
@@ -551,6 +556,30 @@
   (jolt-foreign-proc-safe "posix_spawn_file_actions_addinherit_np" '(void* int) 'int))
 (define proc-POSIX-SPAWN-CLOEXEC-DEFAULT #x4000)   ; <sys/spawn.h>, Darwin
 
+;; A child starts with SIGPIPE at SIG_DFL, as the JVM's do (jolt-lang/jolt#1196).
+;; This process ignores SIGPIPE — Chez's runtime does, so a write to a closed pipe
+;; answers EPIPE instead of killing jolt — and an IGNORED disposition survives
+;; exec, unlike a handler. Left alone, every child and everything it runs saw a
+;; closed pipe as an error: `yes | head` printed "Broken pipe" from yes and exited
+;; through its error path instead of dying of the signal. The shell cannot undo it
+;; either; POSIX has a non-interactive sh keep a signal ignored on entry ignored.
+;; POSIX_SPAWN_SETSIGDEF resets the signals in the attribute's set in the child,
+;; between fork and exec. The flag is 4 and SIGPIPE 13 on every host that spawns
+;; here (Linux glibc/musl/bionic, Darwin). sigset_t is 4 bytes on Darwin and 128
+;; on glibc; a posix_spawnattr_t is a pointer on Darwin and bionic and 336 bytes
+;; on glibc — the allocations below cover the widest.
+(define proc-attr-setsigdefault
+  (jolt-foreign-proc-safe "posix_spawnattr_setsigdefault" '(void* void*) 'int))
+(define proc-c-sigemptyset (jolt-foreign-proc-safe "sigemptyset" '(void*) 'int))
+(define proc-c-sigaddset   (jolt-foreign-proc-safe "sigaddset"   '(void* int) 'int))
+(define proc-POSIX-SPAWN-SETSIGDEF #x04)
+(define proc-SIGPIPE 13)
+(define proc-attr-bytes 512)
+(define proc-sigset-bytes 256)
+(define (proc-sigdefault-ok?)
+  (and proc-attr-init proc-attr-setflags proc-attr-destroy proc-attr-setsigdefault
+       proc-c-sigemptyset proc-c-sigaddset #t))
+
 ;; What posix_spawn-with-pipes needs, and nothing more. The R8 fiber-parking
 ;; extension's own bindings (fcntl, errno) are gated separately by
 ;; proc-nonblock-ok? above: losing parking is a performance story, losing this
@@ -604,15 +633,16 @@
 ;;
 ;; Each port's fd and buf are owned by a lifetime (proc-fd-life): a count of the
 ;; reads and writes in flight, and a shut? flag. Shutting stops new operations,
-;; wakes a fiber parked on the fd (proc-poller-forget!), and releases -- frees
+;; wakes whatever is waiting on the fd (proc-poller-cancel!), and releases -- frees
 ;; buf, closes fd -- only when the count reaches zero, so the release is done by
 ;; whichever of the closer or the last operation out comes second. That is the
 ;; JDK's FileDescriptor use count, and it is what makes a shut from another
 ;; thread safe: a closed fd number is reused at once by any open/pipe/accept in
 ;; the process, so an operation still holding it would read, write, or register
-;; with jolt.io-poller on someone else's descriptor, into freed memory. The
-;; forget runs while the fd is still ours, both at the shut and again just
-;; before the close.
+;; with jolt.io-poller on someone else's descriptor, into freed memory. The shut
+;; cancels the fd with the poller (proc-poller-cancel!), which wakes whatever is
+;; waiting on it, and the release forgets it just before the close; both run
+;; while the fd is still ours.
 ;;
 ;; A port is shut by close-port, by reading a true EOF on it (the write end is
 ;; gone for good, and the JVM's pipe stream likewise lets go of its descriptor
@@ -622,11 +652,7 @@
 ;;
 ;; A shut port reads as EOF and raises on write, with its own message, so a
 ;; port shut under a parked write is not misreported as a failing child.
-;;
-;; Not covered: a fiber that has decided to call proc-poller-wait-ready but has
-;; not yet registered when the shut runs registers on a live fd that nothing will
-;; wake if the pipe stays quiet. That is a strand (a hang), not a use-after-free;
-;; closing it needs coordination on the jolt.io-poller side.
+
 (define proc-fd-buf-size 32768)
 (define-record-type proc-fd-life
   (fields fd buf mutex (mutable busy) (mutable shut?) (mutable released?))
@@ -657,7 +683,7 @@
                   (and (not (proc-fd-life-shut? l))
                        (begin (proc-fd-life-shut?-set! l #t) #t)))))
     (when first?
-      (proc-poller-forget! (proc-fd-life-fd l))
+      (proc-poller-cancel! (proc-fd-life-fd l))
       (when (jolt-with-mutex (proc-fd-life-mutex l) (proc-fd-claim-release! l))
         (proc-fd-release! l)))))
 ;; OP inside a counted operation; SHUT is the answer for a port already shut
@@ -1019,14 +1045,24 @@
              (err-p (and (not inherit-err?) (mk-pipe #t #f)))
              (barrier (proc-exec-barrier-pipe))
              (fa (sa-foreign-alloc 128))
-             ;; posix_spawnattr_t is one pointer on Darwin, the only place this
-             ;; is allocated; 64 bytes leaves room for a wider layout regardless.
-             (attr (and (proc-cloexec-default?) (sa-foreign-alloc 64)))
+             (cloexec? (proc-cloexec-default?))
+             (sigdef? (proc-sigdefault-ok?))
+             (attr (and (or cloexec? sigdef?) (sa-foreign-alloc proc-attr-bytes)))
              (pidbuf (sa-foreign-alloc 8)))
         (proc-fa-init fa)
         (when attr
           (proc-attr-init attr)
-          (proc-attr-setflags attr proc-POSIX-SPAWN-CLOEXEC-DEFAULT)
+          (proc-attr-setflags attr
+            (fxior (if cloexec? proc-POSIX-SPAWN-CLOEXEC-DEFAULT 0)
+                   (if sigdef? proc-POSIX-SPAWN-SETSIGDEF 0)))
+          (when sigdef?
+            (let ((set (sa-foreign-alloc proc-sigset-bytes)))
+              (proc-c-sigemptyset set)
+              (proc-c-sigaddset set proc-SIGPIPE)
+              ;; the attribute keeps its own copy
+              (proc-attr-setsigdefault attr set)
+              (sa-foreign-free set))))
+        (when cloexec?
           ;; An inherited stream has no dup2 naming it, so under the flag it
           ;; would be closed with everything else: name it.
           (when inherit-in?  (proc-fa-inherit fa 0))
@@ -1043,7 +1079,7 @@
         ;; LAST of the file actions, so the dup2s above have already moved the
         ;; child's ends onto 0/1/2 by the time everything else goes. Under
         ;; CLOEXEC_DEFAULT the kernel does this part.
-        (unless attr
+        (unless cloexec?
           (proc-close-inherited-fds!
             fa (append (if in-p  (list (car in-p)  (cdr in-p))  '())
                        (if out-p (list (car out-p) (cdr out-p)) '())
@@ -1054,7 +1090,7 @@
                (envp (proc-marshal-argv
                       (map (lambda (p) (string-append (car p) "=" (cdr p)))
                            (proc-child-env-pairs))))
-               ;; attrp is NULL — or carries only the CLOEXEC_DEFAULT flag, never
+               ;; attrp carries CLOEXEC_DEFAULT and SETSIGDEF at most, never
                ;; SETSIGMASK — so the child inherits this thread's signal mask,
                ;; which must carry none of jolt's own blocking (concurrency.ss).
                (rc (jolt-with-empty-sigmask
@@ -2268,16 +2304,21 @@
                 (jt-optional #t (make-proc-handle p))
                 jt-optional-empty))))))
 
-;; --- CompletableFuture (Process.onExit().thenRun(f)) -------------------------
-;; A minimal one-shot: thenRun spawns a thread that waits for the process to exit
-;; and then runs the callback. Enough for babashka's :shutdown / :exit-fn hooks.
-(define (make-proc-completable proc-st) (make-jhost "jolt-completable" proc-st))
-(register-host-methods! "jolt-completable"
-  (list (cons "thenRun" (lambda (self f)
-          (let ((proc-st (jhost-state self)))
-            (fork-thread (lambda () (guard (e (#t #f)) (proc-wait-blocking proc-st) (jolt-invoke f)))))
-          self))
-        (cons "thenApply" (lambda (self f) self))))
+;; --- Process.onExit ------------------------------------------------------------
+;; A CompletableFuture (concurrency.ss) that completes with the Process once it has
+;; exited, as the JVM's does, so every stage method works on it. It was a stub
+;; that answered thenRun and nothing else, and whose thenApply returned the stub
+;; without calling the function. A thread waits for the exit; a wait that fails
+;; fails the future with what it threw.
+(define (make-proc-completable proc)
+  (let ((d (make-cf)))
+    (fork-thread/daemon #t                 ; the JVM's process reaper thread is a daemon
+     (lambda ()
+       (let ((r (guard (e (#t (make-cf-alt (jolt-unwrap-throw e))))
+                  (proc-wait-blocking proc)
+                  proc)))
+         (cf-settle! d r #f))))
+    d))
 
 ;; --- java.lang.Runtime shutdown hooks ----------------------------------------
 ;; addShutdownHook registers a Thread hook to run at jolt exit; babashka.process's
@@ -2351,7 +2392,15 @@
         ;; No finalizers on this host, so running them is genuinely a no-op — which
         ;; is also all the JVM promises (a hint, deprecated for removal since 18).
         (cons "runFinalization" (lambda (self) jolt-nil))
-        (cons "exec" (lambda (self . args) (proc-runtime-exec args)))))
+        (cons "exec" (lambda (self . args) (proc-runtime-exec args)))
+        ;; Runtime.halt: end the process NOW — no shutdown hooks and no wait for
+        ;; live threads, which is what separates it from System/exit. Our own
+        ;; buffered output is flushed first, as the JVM's System.out has none.
+        (cons "halt" (lambda (self code)
+          (guard (_ (#t #f)) (flush-output-port (current-output-port)))
+          (guard (_ (#t #f)) (flush-output-port (current-error-port)))
+          (let ((n (jnum->exact code)))
+            (if c-underscore-exit (c-underscore-exit n) (exit n)))))))
 (register-class-statics! "java.lang.Runtime" (list (cons "getRuntime" (lambda () the-jolt-runtime))))
 
 ;; instance? and (class x) for the ProcessBuilder / Process / Redirect shims are

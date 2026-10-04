@@ -546,7 +546,12 @@
     (if (null? cs)
         ;; (io/file url) strips the scheme — File of url.toURI on the JVM; only a
         ;; file: url names a path. url-file-coercion is defined below; call-time ref.
-        (if (and (null? rest) (jhost? path) (string=? (jhost-tag path) "url")) (url-file-coercion path) (make-jfile p))
+        (cond ((null? rest)
+               (cond ((url-jhost? path) (url-file-coercion path))
+                     ;; as-file of a URI is as-file of its URL (clojure.java.io)
+                     ((uri-jhost? path) (url-spec-file-coercion (uri-field path 'string)))
+                     (else (make-jfile p))))
+              (else (make-jfile p)))
         (loop (string-append p "/" (file-path-of (car cs))) (cdr cs)))))
 ;; the on-disk path of a value: a relative path resolves against JOLT_PWD.
 (define (jfile-fs f) (project-relative (file-path-of f)))
@@ -652,14 +657,48 @@
                          (string-append "//" host path)))
                    rest))
          (p (uri-decode-lenient rest)))
-    (if (and windows?
-             (>= (string-length p) 3)
-             (char=? (string-ref p 0) #\/)
-             (windows-drive-prefix? (substring p 1 (string-length p)))
-             (or (= (string-length p) 3) (path-separator-char? (string-ref p 3))))
-        (substring p 1 (string-length p))
-        p)))
+    (uri-path->drive-path windows? p)))
 (define (file-url->path spec) (file-url->path-for (win32?) spec))
+
+;; A URI path names a drive as "/C:/..."; on Windows the path is "C:/...".
+(define (uri-path->drive-path windows? p)
+  (if (and windows?
+           (>= (string-length p) 3)
+           (char=? (string-ref p 0) #\/)
+           (windows-drive-prefix? (substring p 1 (string-length p)))
+           (or (= (string-length p) 3) (path-separator-char? (string-ref p 3))))
+      (substring p 1 (string-length p))
+      p))
+
+;; new File(URI), and the default filesystem's getPath(URI) under Paths.get and
+;; Path.of (jolt-lang/jolt#1198). Unlike a file: URL, which clojure.java.io reads
+;; leniently above, the JDK takes only an absolute, hierarchical file: URI with
+;; no authority, query or fragment, and says which rule failed, in this order.
+;; A localhost authority is refused here, not dropped. Both callers used to hand
+;; the URI's string on as the path, so "file:///tmp/a%20b" became the relative
+;; path "file:/tmp/a%20b".
+(define (uri->file-path-for windows? u)
+  (define (bad msg) (throw-jvm 'IllegalArgumentException msg))
+  (let ((scheme (uri-field u 'scheme)))
+    (when (jolt-nil? scheme) (bad "URI is not absolute"))
+    (when (uri-opaque? u) (bad "URI is not hierarchical"))
+    (unless (string-ci=? scheme "file") (bad "URI scheme is not \"file\""))
+    (unless (jolt-nil? (uri-field u 'authority)) (bad "URI has an authority component"))
+    (unless (jolt-nil? (uri-field u 'fragment)) (bad "URI has a fragment component"))
+    (unless (jolt-nil? (uri-field u 'query)) (bad "URI has a query component"))
+    (let ((p (uri-field u 'dec-path)))
+      (when (or (jolt-nil? p) (string=? p "")) (bad "URI path component is empty"))
+      (uri-path->drive-path windows? p))))
+(define (uri->file-path u) (uri->file-path-for (win32?) u))
+;; Path.of(URI): the scheme picks the filesystem provider first, and only the
+;; default one ("file") is installed.
+(define (nio-uri->path u)
+  (let ((scheme (uri-field u 'scheme)))
+    (cond ((jolt-nil? scheme) (throw-jvm 'IllegalArgumentException "Missing scheme"))
+          ((string-ci=? scheme "file") (uri->file-path u))
+          (else (jolt-throw (jolt-host-throwable
+                              "java.nio.file.FileSystemNotFoundException"
+                              (string-append "Provider \"" scheme "\" not installed")))))))
 
 ;; The path a STRING names as a clojure.java.io source or sink. Its Coercions
 ;; try (URL. s) before (File. s), so "file:/a/b" is the file /a/b rather than a
@@ -785,16 +824,28 @@
                 (else (loop (+ i 1)))))
     (throw-jvm (quote java.io.IOException) "Invalid file path")))
 
-;; "/a/b" -> "/a", "/a" -> "/", "/" -> #f. The directory half of an output
-;; path, POSIX-only on purpose: its callers are the AOT cache and the build
-;; driver (loader.ss aot-mkdir-p, build-jolt.ss), which write under paths jolt
-;; itself composed with "/". Canonicalization no longer uses it -- that walk
-;; needs the platform's root form and lives below.
-(define (path-parent p)
-  (let loop ((i (- (string-length p) 1)))
-    (cond ((< i 0) #f)
-          ((char=? (string-ref p i) #\/) (if (= i 0) "/" (substring p 0 i)))
-          (else (loop (- i 1))))))
+;; The directory half of an output path: "/a/b" -> "/a", "/a" -> "/", and #f for
+;; a root or a bare name, which have nothing above them to create. Its callers
+;; walk up with it until something exists (build.ss bld-mkdir-p, loader.ss
+;; aot-mkdir-p) or take an executable's directory (build.ss, build-jolt.ss).
+;;
+;; Those paths are not only ones jolt composed with "/": `jolt build -o` takes
+;; whatever the user typed, and on Windows that is "C:\proj\out\app.exe". The
+;; POSIX-only version found no "/" in it and answered #f for its parent, which
+;; the walk then handed to string=? (jolt-lang/jolt#1207). So it splits on the
+;; platform's separators and stops at the platform's root: "C:\a" -> "C:\",
+;; "\\srv\sh\a" -> "\\srv\sh", and a drive or share root is terminal. The
+;; spelling is kept — a parent is a prefix of the path, never a re-rendering.
+;; The platform is a parameter so the Windows rows are pinned from a POSIX host
+;; (test/chez/win-path-test.ss).
+(define (path-parent-for windows? p)
+  (let ((root (path-root-end windows? p)))
+    (let loop ((i (- (string-length p) 1)))
+      (cond ((< i root)
+             (and (> root 0) (< root (string-length p)) (substring p 0 root)))
+            ((path-sep-for? windows? (string-ref p i)) (substring p 0 i))
+            (else (loop (- i 1)))))))
+(define (path-parent p) (path-parent-for (win32?) p))
 
 ;; --- the lexical half of canonicalization ------------------------------------
 ;; Everything below splits a path ONCE into its root and the segments under it,
@@ -2577,17 +2628,19 @@
 ;; io/as-file of a file: URL yields the file it points at (JVM: new
 ;; File(url.toURI())); a URL with any other protocol has no filesystem path —
 ;; IllegalArgumentException, as the JVM's File(URI) throws.
-(define (url-file-coercion u)
-  (if (string=? (url-protocol (url-spec u)) "file")
-      (make-jfile (file-url->path (url-spec u)))
-      (throw-jvm 'IllegalArgumentException (string-append "Not a file: " (url-spec u)))))
+(define (url-file-coercion u) (url-spec-file-coercion (url-spec u)))
+(define (url-spec-file-coercion spec)
+  (if (string=? (url-protocol spec) "file")
+      (make-jfile (file-url->path spec))
+      (throw-jvm 'IllegalArgumentException (string-append "Not a file: " spec))))
 (def-var! "clojure.java.io" "as-file"
   ;; Clojure extends Coercions to nil, so (io/as-file nil) is nil -- NOT a File
   ;; whose path is "". The difference is load-bearing one call downstream, where
   ;; the JVM raises on the nil and jolt was quietly reading the process's cwd.
   (lambda (x) (cond ((jolt-nil? x) x)
                     ((jfile? x) x)
-                    ((and (jhost? x) (string=? (jhost-tag x) "url")) (url-file-coercion x))
+                    ((url-jhost? x) (url-file-coercion x))
+                    ((uri-jhost? x) (url-spec-file-coercion (uri-field x 'string)))
                     (else (make-jfile (file-path-of x))))))
 ;; "reader" is bound by natives-array.ss (loaded later) so a char[] argument is
 ;; handled; that binding delegates here via jolt-io-reader for everything else.
@@ -2861,19 +2914,66 @@
              (cons "sneakyThrow" (lambda (t) (jolt-throw t))))))
   (register-class-statics! "Util" util-statics)
   (register-class-statics! "clojure.lang.Util" util-statics))
-;; Thread/currentThread -> a fresh thread jhost wrapping THIS thread's interrupt
-;; flag (the box from current-interrupt-box, host-static.ss), so .interrupt from
-;; any thread sets the target thread's flag and .isInterrupted reads it without
-;; clearing (instance semantics; the static Thread/interrupted reads-and-clears).
-;; getContextClassLoader hands back the loader.
-;; A handle STANDS FOR one thread, and every question asked through it is about
-;; that thread — including when some other thread is holding it, which is the
-;; only shape Thread/getAllStackTraces hands back. So the id travels IN the
-;; handle: reading (get-thread-id) here answered about whoever was asking, so
-;; every entry in that map reported the caller's id and its name was the constant
-;; "main". State is (interrupt-box . thread-id).
-(define (thread-handle-box h) (car (jhost-state h)))
-(define (thread-handle-id h) (cdr (jhost-state h)))
+;; java.lang.Thread — ONE object per thread, whoever asks and however. A thread
+;; started from a (Thread. f) object IS that object: its Thread/currentThread, the
+;; key getAllStackTraces gives for it, and a handle anyone took for it earlier are
+;; all identical? to it, as on the JVM. A thread jolt did not start from a Thread
+;; object (main, a future's, a pool worker, a core.async thread, a fiber carrier)
+;; gets one made the first time anyone asks, kept for as long as it lives. It used
+;; to be two representations — the Thread object and a separate currentThread
+;; handle — which answered some members each and were never identical?.
+;;
+;; State (concurrency.ss reads the same slots):
+;;   #(thunk done? mutex cond interrupt-box started? name-box thread-id daemon
+;;     priority java-id uncaught-handler thread-group fiber)
+;; fiber is the fiber a VIRTUAL thread's object stands for, #f for a platform
+;; thread's (virtual-thread-object below).
+;; thread-id is the runtime's (get-thread-id) of the running thread, #f before
+;; start; java-id is getId/threadId, assigned at construction as the JVM assigns
+;; it, 1 for the boot thread as the JVM's main is. Once a thread runs, its name,
+;; daemon status and priority live in the id-keyed tables below and in
+;; lazy-bridge.ss, so an object made for it from another thread reads the same.
+(define java-thread-id-next 2)                 ; 1 is main's
+(define java-thread-id-mu (make-mutex))
+(define (next-java-thread-id!)
+  (jolt-with-mutex java-thread-id-mu
+    (let ((n java-thread-id-next)) (set! java-thread-id-next (+ n 1)) n)))
+(define (make-thread-object thunk name started? tid daemon priority ibox)
+  (make-jhost "user-thread"
+              (vector thunk #f (make-mutex) (make-condition) ibox started? (box name) tid
+                      daemon priority
+                      (if (eqv? tid jolt-boot-thread-id) 1 (next-java-thread-id!))
+                      #f #f #f)))
+;; A fiber's Thread object: a JVM virtual thread's surface. Its flag is the fiber's
+;; own box, it is a daemon, its name is the empty string a virtual thread gets when
+;; none is given, and it has no runtime thread id (slot 7 #f), since the OS thread
+;; under it changes nothing about it. It is started, and done once the fiber
+;; finishes, which is what isAlive and join read; the fiber's monitor marks it.
+;; The fiber slot's index, named: the thread object's slots are shared with
+;; concurrency.ss and grow.
+(define jthread-fiber-slot 13)
+(define (jthread-fiber st) (vector-ref st jthread-fiber-slot))
+(define (jthread-fiber-set! st f) (vector-set! st jthread-fiber-slot f))
+(define (virtual-thread-object f)
+  (let ((obj (make-thread-object #f "" #t #f #t 5 (jolt-fiber-ibox! f))))
+    (bind-virtual-thread! obj f)
+    obj))
+;; Make OBJ fiber F's Thread: the fiber slot, the fiber's field, and done when it ends.
+(define (bind-virtual-thread! obj f)
+  (let ((st (jhost-state obj)))
+    (jthread-fiber-set! st f)
+    (vector-set! st 12 virtual-thread-group)          ; its ThreadGroup (concurrency.ss)
+    (jolt-fiber-thread-set! f obj)
+    (jolt-fiber-monitor! f
+      (lambda (_err)
+        (jolt-with-mutex (vector-ref st 2)
+          (vector-set! st 1 #t)
+          (jolt-cv-wake! (vector-ref st 3)))))))
+;; The fiber's object, made once. Only the fiber's own code and whoever it hands
+;; the object to can ask, and the fiber runs on one thread at a time, so the
+;; field needs no lock when the fiber asks for itself.
+(define (fiber-thread-object f)
+  (or (jolt-fiber-thread f) (virtual-thread-object f)))
 ;; Names live in an id-keyed table for the same reason, under the handle mutex:
 ;; a thread parameter is only readable by its own thread. A thread nobody named
 ;; answers the JVM's default shape — the boot thread is "main", anything else
@@ -2886,85 +2986,118 @@
       (if (eqv? id jolt-boot-thread-id)
           "main"
           (string-append "Thread-" (number->string id)))))
-(register-host-methods! "thread"
-  ;; TCCL follows the ambient loader the way io/resource's 1-arity does: inside
-  ;; `with-loader` it is that context's facade (so a library finding its own
-  ;; resources the Java way gets the context's roots), outside one the host
-  ;; singleton. `current-base-loader` answers with the facade itself, and only a
-  ;; classloader-shaped answer (a jhost, or a tagged table like the facade) is
-  ;; taken — a library that rebound RT/baseLoader to something else keeps the
-  ;; historical answer, the rule the resource path above follows too. There is no
-  ;; setContextClassLoader: the getter is ambient-derived, not per-thread state.
-  (list (cons "getContextClassLoader"
-              (lambda (self)
-                (let ((cl (current-base-loader)))
-                  (if (and cl (or (jhost? cl) (htable? cl))) cl the-classloader))))
-        (cons "getName" (lambda (self) (jolt-thread-name (thread-handle-id self))))
-        (cons "setName" (lambda (self nm)
-                          (jolt-thread-name-set! (thread-handle-id self) (jolt-final-str nm))
-                          jolt-nil))
-        (cons "getId" (lambda (self) (thread-handle-id self)))
-        ;; the calling thread's frames, reconstructed the way an uncaught error's
-        ;; backtrace is (source-registry.ss); another thread's stack is not
-        ;; reachable, so it answers an empty array.
-        (cons "getStackTrace" (lambda (self)
-                                (if (eqv? (thread-handle-id self) (get-thread-id))
-                                    (jolt-current-stack-trace)
-                                    (jolt-vector))))
-        ;; The flag first, then the poke: a waiter woken by the poke reads the
-        ;; flag, so a wake that arrives before it is set says nothing. Waking is
-        ;; what turns .interrupt from "the target will notice next time it looks"
-        ;; into the JVM's "the target is thrown out of its wait now"
-        ;; (jolt-cv-wait-interruptibly, host/chez/locks.ss).
-        (cons "interrupt" (lambda (self)
-                            (let ((b (thread-handle-box self)))
-                              (when (box? b)
-                                (set-box! b #t)
-                                (jolt-interrupt-wake-waits! b)))
-                            jolt-nil))
-        (cons "isInterrupted" (lambda (self)
-                                (let ((b (thread-handle-box self)))
-                                  (and (box? b) (unbox b) #t))))))
-;; ONE handle per thread, cached in a thread parameter. The JVM's
-;; Thread/currentThread is identity-stable, and code relies on it: keying a map by
-;; the current thread, or comparing two calls with identical?/=. Allocating a fresh
-;; jhost per call made every such comparison false — tools.logging's suite tags each
-;; log entry with its calling thread and then asks whether it was logged directly.
-;; The cell carries the owning thread's id for the same reason current-interrupt-box
-;; does: a Chez thread parameter is inherited by a forked thread, and a child must
-;; not report the parent's handle as its own.
-(define thread-handle-cell (make-thread-parameter #f))      ; (thread-id . handle)
-;; Mirror of the per-thread cache keyed by thread id, so another thread can name
-;; this one — Thread/getAllStackTraces has to hand back the SAME handle
-;; currentThread does, or a caller cannot find itself in the map.
+;; Priorities, id-keyed like the names and for the same reason. Only a priority
+;; other than NORM_PRIORITY (5) has an entry.
+(define thread-priorities-by-id (make-eqv-hashtable))
+(define (jolt-thread-priority id)
+  (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-priorities-by-id id 5)))
+(define (jolt-thread-priority-set! id p)
+  (jolt-with-mutex thread-handles-mutex
+    (if (eqv? p 5)
+        (hashtable-delete! thread-priorities-by-id id)
+        (hashtable-set! thread-priorities-by-id id p))))
+;; Thread.setPriority's argument: MIN_PRIORITY..MAX_PRIORITY, else
+;; IllegalArgumentException (with no message, as the JVM's).
+(define (jolt-thread-priority-arg p)
+  (let ((n (and (number? p) (jnum->exact p))))
+    (if (and (integer? n) (<= 1 n 10))
+        n
+        (throw-jvm 'IllegalArgumentException jolt-nil))))
+;; A handle's thread is alive while it runs: it is the caller, the boot thread
+;; (whose end is the process's), or a thread jolt started that has not finished.
+(define (thread-handle-alive? id)
+  (or (eqv? id (get-thread-id)) (eqv? id jolt-boot-thread-id) (jolt-started-thread? id)))
+;; A running thread is alive while it runs: it is the caller, the boot thread
+;; (whose end is the process's), or a thread jolt started that has not finished.
+(define (thread-handle-alive? id)
+  (or (eqv? id (get-thread-id)) (eqv? id jolt-boot-thread-id) (jolt-started-thread? id)))
+;; TCCL follows the ambient loader the way io/resource's 1-arity does: inside
+;; `with-loader` it is that context's facade (so a library finding its own
+;; resources the Java way gets the context's roots), outside one the host
+;; singleton. `current-base-loader` answers with the facade itself, and only a
+;; classloader-shaped answer (a jhost, or a tagged table like the facade) is
+;; taken — a library that rebound RT/baseLoader to something else keeps the
+;; historical answer, the rule the resource path above follows too. There is no
+;; setContextClassLoader: the getter is ambient-derived, not per-thread state.
+(define (thread-context-class-loader)
+  (let ((cl (current-base-loader)))
+    (if (and cl (or (jhost? cl) (htable? cl))) cl the-classloader)))
+;; The object for each running thread, by id, so another thread finds the same
+;; one; and this thread's own, cached in a thread parameter. The cell carries the
+;; owning thread's id because a Chez thread parameter is inherited by a forked
+;; thread, and a child must not report the parent's object as its own.
+(define thread-handle-cell (make-thread-parameter #f))      ; (thread-id . object)
 (define thread-handles-by-id (make-eqv-hashtable))
 (define thread-handles-mutex (make-mutex))
+;; Thread.start: the started thread IS its object. Registered by the parent right
+;; after the fork and again by the child, so it is there whichever runs first.
+(define (register-thread-object! id obj)
+  (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id obj)))
+(define (thread-object-for-id! id)
+  (let ((mine? (eqv? id (get-thread-id))))
+    (jolt-with-mutex thread-handles-mutex
+      (or (hashtable-ref thread-handles-by-id id #f)
+          (if (or mine? (thread-handle-alive? id))
+              (let ((obj (make-thread-object #f #f #t id #f 5
+                                             (if mine? (current-os-thread-box) (thread-box-for-id! id)))))
+                (hashtable-set! thread-handles-by-id id obj)
+                obj)
+              ;; already finished, its exit hook run: an object that registers
+              ;; nothing, or the entries would outlive the thread
+              (let ((obj (make-thread-object #f (jolt-thread-name id) #t id #f 5 (box #f))))
+                (vector-set! (jhost-state obj) 1 #t)
+                obj))))))
+;; On a fiber, the FIBER's object: a fiber is a virtual thread, and its carrier is
+;; not something its code can see (the JVM hides a virtual thread's carrier the
+;; same way).
 (define (current-thread-handle)
-  (let ((c (thread-handle-cell))
-        (id (get-thread-id)))
-    (if (and (pair? c) (eqv? (car c) id))
-        (cdr c)
-        (let ((h (make-jhost "thread" (cons (current-interrupt-box) id))))
-          (thread-handle-cell (cons id h))
-          (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
-          h))))
-;; A handle for a thread that has never asked who it is. Its interrupt box is its
-;; own, so .interrupt through it does not reach that thread — the thread adopts a
-;; real handle the moment it calls currentThread.
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (fiber-thread-object f)
+        (let ((c (thread-handle-cell))
+              (id (get-thread-id)))
+          (if (and (pair? c) (eqv? (car c) id))
+              (cdr c)
+              (let ((h (thread-object-for-id! id)))
+                (thread-handle-cell (cons id h))
+                h))))))
 (define (thread-handle-for-id id)
-  (if (eqv? id (get-thread-id))
-      (current-thread-handle)              ; the caller must find ITSELF in the map
-      (or (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))
-          (let ((h (make-jhost "thread" (cons (box #f) id))))
-            (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
-            h))))
+  (if (and (eqv? id (get-thread-id)) (not (jolt-current-fiber)))
+      (current-thread-handle)
+      (thread-object-for-id! id)))
+;; A thread that ends: its object is no longer alive (join returns), and the
+;; tables keyed by its id let go. The object keeps what it knew.
+(set! jolt-thread-exit-hook
+  (lambda (id)
+    (let ((obj (jolt-with-mutex thread-handles-mutex
+                 (let ((o (hashtable-ref thread-handles-by-id id #f)))
+                   (hashtable-delete! thread-handles-by-id id)
+                   o))))
+      (thread-box-forget! id)
+      (thread-state-forget! id)
+      ;; the object takes over the name, priority and daemon status the tables
+      ;; held, and is marked done, BEFORE the entries go (concurrency.ss
+      ;; jthread-finish!; a thread whose body already finished it keeps what
+      ;; it has, which may since have been set on the object)
+      (when obj
+        (let ((st (jhost-state obj)))
+          (jolt-with-mutex (vector-ref st 2)
+            (jthread-finish! st id))))
+      (jolt-with-mutex thread-handles-mutex
+        (hashtable-delete! thread-names-by-id id)
+        (hashtable-delete! thread-priorities-by-id id)))))
+(set! jolt-thread-box-adopted-hook
+  (lambda (id b)
+    (let ((obj (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))))
+      (when obj (vector-set! (jhost-state obj) 4 b)))))
 ;; Thread/getAllStackTraces: the live threads mapped to EMPTY stack traces. jolt
 ;; reifies no call stack (TCO erases caller frames) and .getStackTrace is already
 ;; an empty StackTraceElement[], so the traces are honestly empty; the thread set
 ;; is real, which is what the callers want — ring's suites count threads before
-;; and after a request to check for leaks.
+;; and after a request to check for leaks. The boot thread is among them, as the
+;; JVM's main is, whoever asks.
 (define (all-stack-traces)
-  (let loop ((ids (cons (get-thread-id) (live-thread-ids)))
+  (let loop ((ids (cons (get-thread-id) (cons jolt-boot-thread-id (live-thread-ids))))
              (seen '())
              (m empty-pmap))
     (cond ((null? ids) m)
@@ -3048,6 +3181,7 @@
 (define (jolt-file-ctor a . rest)
   (cond ((pair? rest) (jolt-make-file (jolt-file-join a (car rest))))
         ((jolt-nil? a) (throw-jvm (quote NullPointerException) jolt-nil))
+        ((uri-jhost? a) (make-jfile (uri->file-path a)))
         (else (jolt-make-file a))))
 (register-class-ctor! "File" jolt-file-ctor)
 ;; File statics: the platform separators plus createTempFile / listRoots.

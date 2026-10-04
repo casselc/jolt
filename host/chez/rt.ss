@@ -460,8 +460,8 @@
 ;; bounded by HARD, and a live set that cannot fit still raises.
 ;;
 ;; Under SOFT the wait is a quarter of that room, not half. The forced collection
-;; needs room of its own: a tight one still copies the sparse old segments
-;; (sa-collect-tight), and waiting for half the room put the first one at
+;; needs room of its own: a tight one still copies the nursery and the sparse
+;; old segments (sa-collect-tight), and waiting for half the room put the first one at
 ;; 199MB of a 256MB ceiling with ~90MB to copy, peaking at 291MB. A quarter
 ;; still keeps a live set just under SOFT from collecting after every young
 ;; collection.
@@ -1048,7 +1048,7 @@
 ;; value in fibers.ss so the standalone gate can load it without rt.ss. Slot 1
 ;; was freed by R3 (jolt-230w), which moved the R1 ring/mark vregs onto the
 ;; continuation, and re-claimed by fibers.ss for park-unwinding; the next free
-;; slot is 10. The surviving slots keep their R2 numbers.
+;; slot is 12. The surviving slots keep their R2 numbers.
 (define jolt-vreg-site 2)        ; ('ns/fn' . line) of the innermost live call site
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
@@ -1073,6 +1073,9 @@
 ;;   child the parent's stored VALUE, which is the one thing ThreadLocal promises
 ;;   it will not do (jolt-uecg). InheritableThreadLocal, whose contract is the
 ;;   opposite, keeps a per-instance thread parameter and its inheritance.
+;; slot 11: java/async.ss jolt-vreg-chan-wait — (box . cell): the cell a thread
+;;   blocked in <!! / >!! / alts!! points at the channel it waits on, so the one
+;;   interrupt wake registered for its box can find it
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
@@ -1826,7 +1829,23 @@
 ;; counts only when it was running THIS namespace — a require nested in a form
 ;; loads another namespace's defs, and those are not visible to the requiring
 ;; file at any ordinal.
+;; The defs a cached artifact's load makes in its own namespace, for the loader
+;; to take back if it then recompiles in this same process (loader.ss
+;; aot-safe-load-or-recompile). #f, or #(ns table): TABLE maps "ns/name" to
+;; whether that var was already defined before the load's first def of it. Only
+;; NS is recorded — a require nested in the load defines another namespace's
+;; vars for real, and the recompile will not load that namespace again.
+(define jolt-def-capture (make-parameter #f))
+(define (jolt-def-capture-note! cap ns name)
+  (when (string=? ns (vector-ref cap 0))
+    (let ((k (string-append ns "/" name)) (t (vector-ref cap 1)))
+      (unless (hashtable-contains? t k)
+        (hashtable-set! t k (jolt-with-mutex var-table-mu
+                              (let ((c (hashtable-ref var-table k #f)))
+                                (and c (var-cell-defined? c) #t))))))))
 (define (var-def-ordinal-set! ns name)
+  (let ((cap (jolt-def-capture)))
+    (when cap (jolt-def-capture-note! cap ns name)))
   (let loop ((fs (jolt-load-frames)) (inner #t))
     (unless (null? fs)
       (let ((f (car fs)))
@@ -2052,84 +2071,8 @@
 (load "host/chez/predicates.ss")
 
 ;; --- jolt number printing ----------------------------------------------------
-;; jolt has a numeric tower (exact integer / ratio / double, distinguished by
-;; class). Exact integer-valued values print without a ".0" ((+ 1 2) -> "3");
-;; a double prints with one ((* 1.0 5) -> "5.0", as the JVM does).
+(load "host/chez/number-print.ss")
 
-;; Double.toString layout: plain decimal when 1e-3 <= |x| < 1e7, otherwise
-;; scientific d.dddE±x with one digit before the point; the mantissa always
-;; carries a decimal point ("1.0E100", "2.3E-4", "1.2345678E7"). Chez's
-;; shortest-round-trip digits are kept; only the layout is rearranged.
-(define (jolt-flonum->string x)
-  (let* ((s (number->string x))
-         (neg? (char=? (string-ref s 0) #\-))
-         (body0 (if neg? (substring s 1 (string-length s)) s))
-         ;; Chez appends a "|prec" suffix to subnormal strings (e.g. "5e-324|1").
-         ;; Strip it before the exponent substring is parsed, else string->number
-         ;; misreads "-324|1" as a precision-qualified flonum (-256.0) and corrupts
-         ;; the value.
-         (bar (let loop ((i 0))
-                (cond ((fx>=? i (string-length body0)) #f)
-                      ((char=? (string-ref body0 i) #\|) i)
-                      (else (loop (fx+ i 1))))))
-         (body (if bar (substring body0 0 bar) body0))
-         (blen (string-length body))
-         (epos (let loop ((i 0))
-                 (cond ((fx>=? i blen) #f)
-                       ((memv (string-ref body i) '(#\e #\E)) i)
-                       (else (loop (fx+ i 1))))))
-         (mant (if epos (substring body 0 epos) body))
-         (eexp (if epos (string->number (substring body (fx+ epos 1) blen)) 0))
-         (mlen (string-length mant))
-         (dot (let loop ((i 0))
-                (cond ((fx>=? i mlen) #f)
-                      ((char=? (string-ref mant i) #\.) i)
-                      (else (loop (fx+ i 1))))))
-         (digits (if dot
-                     (string-append (substring mant 0 dot) (substring mant (fx+ dot 1) mlen))
-                     mant))
-         (point (+ (if dot dot mlen) eexp)))
-    ;; normalize: drop leading zeros (adjusting the point), then trailing zeros
-    (let* ((dlen0 (string-length digits))
-           (lead (let loop ((i 0))
-                   (if (and (fx<? i (fx- dlen0 1)) (char=? (string-ref digits i) #\0))
-                       (loop (fx+ i 1)) i)))
-           (digits (substring digits lead dlen0))
-           (point (- point lead))
-           (dlen (let loop ((i (string-length digits)))
-                   (if (and (fx>? i 1) (char=? (string-ref digits (fx- i 1)) #\0))
-                       (loop (fx- i 1)) i)))
-           (digits (substring digits 0 dlen))
-           (res (cond
-                  ((string=? digits "0") "0.0")
-                  ((and (>= point -2) (<= point 7))   ; 1e-3 <= |x| < 1e7
-                   (cond
-                     ((<= point 0)
-                      (string-append "0." (make-string (- point) #\0) digits))
-                     ((>= point dlen)
-                      (string-append digits (make-string (- point dlen) #\0) ".0"))
-                     (else (string-append (substring digits 0 point) "."
-                                          (substring digits point dlen)))))
-                  (else
-                   (string-append (substring digits 0 1) "."
-                                  (if (fx>? dlen 1) (substring digits 1 dlen) "0")
-                                  "E" (number->string (- point 1)))))))
-      (if neg? (string-append "-" res) res))))
-
-(define (jolt-num->string x)
-  (cond
-    ;; the -e / element printer renders the infinities and NaN in READABLE form
-    ;; (##Inf reads back, like Clojure's REPL/pr); str/print uses "Infinity"/"NaN"
-    ;; (see jolt-str-render-one in converters.ss).
-    ((and (flonum? x) (fl= x +inf.0)) "##Inf")
-    ((and (flonum? x) (fl= x -inf.0)) "##-Inf")
-    ((and (flonum? x) (not (fl= x x))) "##NaN")
-    ;; str of a bigint has NO N suffix (BigInt.toString); only the readable
-    ;; printer adds it (see jolt-pr-readable-base).
-    ((fixnum? x) (jolt-fixnum->string x))
-    ((and (exact? x) (integer? x)) (number->string x))
-    ((flonum? x) (jolt-flonum->string x))
-    (else (number->string x))))
 ;; true when an exact integer prints with the BigInt N suffix under pr.
 ;; number? first — Chez's exact? raises on a non-number, and the readable
 ;; printer probes every value through this.
@@ -2594,7 +2537,12 @@
 (load "host/chez/java/text-normalize.ss")       ; java.text.Normalizer's quick-check fast paths
 (load "host/chez/java/host-static-methods.ss")  ; Class/member static methods + fields
 (load "host/chez/java/class-model.ss")          ; java.lang.Class values + the class model core reads (shared)
+(load "host/chez/java/jutil-colls.ss")         ; java.util Map/Set/List shims to =, hash, pr, str (shared)
+(load "host/chez/java/tree-map.ss")            ; TreeMap / TreeSet + Comparator objects (shared)
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
+;; clojure.math and the IEEE 754 bit patterns (dbl->bits, flt->bits, ...).
+;; Self-contained; ahead of byte-buffer.ss, which encodes floats with them.
+(load "host/chez/java/math.ss")
 (load "host/chez/java/byte-buffer.ss")          ; java.nio.ByteBuffer over a byte-array
 (load "host/chez/java/charset-coding.ss")       ; CharBuffer + the CharsetDecoder decode loop
 
@@ -2631,10 +2579,6 @@
 ;; constructors, and the reader needs the full value/collection layer above.
 (load "host/chez/reader.ss")
 
-;; clojure.math: native flonum-math shims def-var!'d into the
-;; clojure.math ns. Self-contained (only def-var! + Chez math), order-independent.
-(load "host/chez/java/math.ss")
-
 ;; reader/macro runtime support: #?() feature set, reader-conditional + re-matcher
 ;; tagged-map ctors, macroexpand. After ns.ss; macroexpand call-time-refs the macro
 ;; table (host-contract) + analyzer ctx.
@@ -2644,6 +2588,15 @@
 ;; backing; extends count/nth/seq/get/ref-put! so the overlay aget/aset/alength see
 ;; it. After the dispatchers it chains.
 (load "host/chez/java/natives-array.ss")
+
+;; java.util.stream: Stream / IntStream / LongStream / DoubleStream over lazy
+;; seqs, Collectors, and Collection.stream(). After natives-array.ss (toArray,
+;; Arrays/stream) and host-static-classes.ss (Optional, the collection shims).
+(load "host/chez/java/streams.ss")
+
+;; java.util.function default methods (negate/andThen/…) for every implementer,
+;; the lambdas they answer, and Function/identity & co. After streams.ss.
+(load "host/chez/java/fi-defaults.ss")
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and

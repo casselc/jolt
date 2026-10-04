@@ -47,6 +47,7 @@
 ;; Slot 7: how many locks this carrier currently holds. Per thread, like the
 ;; other virtual registers, and a fresh thread starts it at fixnum 0 — which is
 ;; the correct answer for a thread that never runs fibers.
+
 (define jolt-vreg-locks 7)
 (define (jolt-locks-held) (virtual-register jolt-vreg-locks))
 ;; Always ERR TOWARDS HELD. enter! runs BEFORE the acquire and exit! runs AFTER
@@ -278,6 +279,7 @@
             ;; decision be retaken: its wake is not "something changed".
             (when (jolt-fiber-switch-for-park? f)
               (jolt-fiber-to-scheduler! f))
+            (jolt-fiber-wstate-set! f #f)
             (when (and abandon? (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
               (decide 'abandon))
             (jolt-fiber-check-interrupt! f)
@@ -323,14 +325,49 @@
 ;; ever reached by a thread" a fact rather than an intention: every one of these was
 ;; documented as thread-only, and the four that were wrong about it were found by
 ;; asking rather than by reading.
+;; --- what a THREAD is doing, for Thread.getState ------------------------------
+;; Every thread that waits records it in a box of its own: WAITING or
+;; TIMED_WAITING while it is in a condition wait (below), BLOCKED while it waits to
+;; enter a monitor (java/concurrency.ss), nothing — RUNNABLE — otherwise. Another
+;; thread reads it by the thread's id. The box is made on a thread's first wait and
+;; found again through a thread parameter; the parameter carries the owning id
+;; because a forked thread inherits it. Writing it costs a box store on a wait that
+;; is about to block anyway. A fiber never waits here; its state is the fiber
+;; layer's to report (jolt-thread-state-hook, java/concurrency.ss).
+(define thread-state-boxes (make-eqv-hashtable))          ; thread id -> box
+(define thread-state-mu (make-mutex))
+(define thread-state-cell (make-thread-parameter #f))     ; (thread id . box)
+(define (thread-state-box)
+  (let ((c (thread-state-cell)) (id (get-thread-id)))
+    (if (and (pair? c) (eqv? (car c) id))
+        (cdr c)
+        (let ((b (box #f)))
+          (jolt-with-mutex thread-state-mu (hashtable-set! thread-state-boxes id b))
+          (thread-state-cell (cons id b))
+          b))))
+;; The recorded state of thread ID — WAITING, TIMED_WAITING or BLOCKED — or #f.
+(define (thread-wait-state id)
+  (let ((b (jolt-with-mutex thread-state-mu (hashtable-ref thread-state-boxes id #f))))
+    (and b (unbox b))))
+(define (thread-state-forget! id)
+  (jolt-with-mutex thread-state-mu (hashtable-delete! thread-state-boxes id)))
+;; Run THUNK recorded as STATE, for a wait that is not a condition wait (a polled
+;; lock acquire) or that is one of a more specific kind (entering a monitor). An
+;; outer state wins over the inner condition wait's.
+(define (call-with-thread-state state thunk)
+  (let* ((b (thread-state-box)) (old (unbox b)))
+    (set-box! b (or old state))
+    (dynamic-wind void thunk (lambda () (set-box! b old)))))
 (define jolt-condition-wait
   (case-lambda
     ((cv mu)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
-     (condition-wait cv mu))
+     ;; dynamic-wind: an interrupt handler that escapes the wait must not leave
+     ;; the thread reading WAITING
+     (call-with-thread-state 'WAITING (lambda () (condition-wait cv mu))))
     ((cv mu abs-time)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
-     (condition-wait cv mu abs-time))))
+     (call-with-thread-state 'TIMED_WAITING (lambda () (condition-wait cv mu abs-time))))))
 
 ;; --- the wait beneath the fiber layer ---------------------------------------
 ;; (jolt-stop-the-world-wait cv mu timeout) -> #t signalled | #f timed out
@@ -500,13 +537,38 @@
 ;; deref 1.15x against a 1.1x ceiling (release binary, A/B/A). Threaded through,
 ;; the fast path is an `(if ibox ...)` that falls through (jolt-a0f1).
 (define (jolt-cv-wait/ibox mu cv deadline decide ibox who)
-  ;; before the deadline timer below registers a wake for this wait
+  ;; The deadline wake is registered only for a fiber; a thread waits on cv with
+  ;; the deadline itself. It is cancelled as the wait ends, however it ends, so a
+  ;; timed deref answered in a millisecond does not leave its wake — and, through
+  ;; mu and cv, whatever those keep reachable — pending on the timer until the
+  ;; deadline. Arming and cancelling only take timeout-mu, a leaf (async.ss: no
+  ;; thunk runs under it), so the handler below may do either at the raise point,
+  ;; under mu or not.
+  ;;
+  ;; A raise passing through is not necessarily the end of the wait: a handler
+  ;; further out may resume it. So the handler cancels, and if the raise comes
+  ;; back, re-arms — otherwise the resumed wait parks with nothing to wake it at
+  ;; its deadline. A wake that had already been collected to run is not re-armed;
+  ;; it is on its way. The park's own may-park! assertion (the park/lock gate
+  ;; wants it in jolt-cv-wait/park, next to the commit) runs after arming; when it
+  ;; refuses, its raise passes through the handler and the wake is cancelled.
+  (if (and deadline (jolt-current-fiber))
+      (let* ((arm (lambda ()
+                    (jolt-timer-at! deadline (lambda () (jolt-with-mutex mu (jolt-cv-wake! cv))))))
+             (timer (arm))
+             (r (with-exception-handler
+                  (lambda (e)
+                    (let* ((pending? (jolt-timer-cancel! timer))
+                           (v (raise-continuable e)))
+                      (when pending? (set! timer (arm)))
+                      v))
+                  (lambda () (jolt-cv-wait/park mu cv deadline decide ibox who)))))
+        (jolt-timer-cancel! timer)
+        r)
+      (jolt-cv-wait/park mu cv deadline decide ibox who)))
+
+(define (jolt-cv-wait/park mu cv deadline decide ibox who)
   (jolt-fiber-may-park! who)
-  ;; Registered OUTSIDE mu, and only for a fiber. Outside because the timer's
-  ;; thunks run with timeout-mu released but registering takes it, so doing this
-  ;; under mu would order mu above timeout-mu here and below it there.
-  (when (and deadline (jolt-current-fiber))
-    (jolt-timer-at! deadline (lambda () (jolt-with-mutex mu (jolt-cv-wake! cv)))))
   ;; The (mu . cv) this wait is findable by while it is willing to be interrupted,
   ;; or #f. It lives OUT here and not inside the thunk below because jolt-lock-wait
   ;; RETAKES that thunk when a parked fiber resumes: a loop-local would forget a
@@ -576,6 +638,7 @@
                  ((jolt-current-fiber)
                   => (lambda (f)
                        (jolt-cv-register! cv f)
+                       (when deadline (jolt-fiber-wstate-set! f 'TIMED_WAITING))
                        (jolt-fiber-state-set! f 'parked)
                        jolt-lock-parked))
                  (else
@@ -623,33 +686,46 @@
 ;; already-delivered promise takes no lock this file did not already take, and
 ;; allocates nothing this file did not already allocate.
 ;;
-;; THE IDENTITY IS THE INTERRUPT BOX, not the fiber, and that is a decision rather
-;; than an oversight. The flag lives in the box, .interrupt is handed a box and
-;; nothing else, and jolt has no per-fiber interrupt flag to key on — so a fiber
-;; waiting here registers under the box of the carrier it is running on (a fiber
-;; cannot migrate, so that box is stable for its lifetime) and is woken when that
-;; thread is interrupted. Every waiter woken re-checks, and the check CLEARS, so
-;; exactly one of them consumes the interrupt and throws while the rest go back to
-;; waiting — one interrupt, one InterruptedException, as on the JVM. The reachable
-;; shape is a go block that interrupts (Thread/currentThread), which is its carrier;
-;; test/chez/unit.edn pins it and known-divergences.edn records it.
-(define jolt-interrupt-waits (make-weak-eq-hashtable))   ; interrupt box -> (mu . cv) list
+;; THE IDENTITY IS THE INTERRUPT BOX. A thread's box is its own; a FIBER's is the
+;; fiber's own too (current-interrupt-box answers it while the fiber runs), since a
+;; fiber is a virtual thread with its own Thread object and flag. So a fiber
+;; waiting here registers under its own box and is woken when IT is interrupted,
+;; and no other fiber on its carrier is disturbed. Every waiter woken re-checks,
+;; and the check CLEARS — one interrupt, one InterruptedException, as on the JVM.
+(define jolt-interrupt-waits (make-weak-eq-hashtable))   ; interrupt box -> entry set
 (define jolt-interrupt-waits-mu (make-mutex))
 
+;; An ENTRY is what the interrupter wakes: a (mu . cv) pair, poked as
+;; (jolt-with-mutex mu (jolt-cv-wake! cv)), or a procedure of no arguments that
+;; does its own waking — the cheap park's, which resumes one fiber directly rather
+;; than listing it on a condition (java/sm.ss jolt-sm-commit!/intr).
+;;
+;; Per box the entries are a SET (an eq table), not a list, so a removal does not
+;; scan whatever else a box has listed. The set is kept when it empties: it is
+;; weak-keyed with its box, so it goes when the thread or fiber does, and one that
+;; waits again reuses it.
+;;
 ;; Both called with the waiter's mu held. The table's own mutex is a leaf — taken
 ;; around one hashtable operation with nothing inside it — so it cannot be part of
 ;; a cycle, the same argument jolt-cv-waiters-mu rests on.
+;;
+;; jolt-lock! / jolt-unlock! by hand rather than jolt-with-mutex: nothing between
+;; them can raise, and a go body parked in <!! pays for both on every park, where
+;; the dynamic-wind was a measurable share.
 (define (jolt-interrupt-wait-add! b entry)
-  (jolt-with-mutex jolt-interrupt-waits-mu
-    (hashtable-set! jolt-interrupt-waits b
-                    (cons entry (hashtable-ref jolt-interrupt-waits b '())))))
+  (jolt-lock! jolt-interrupt-waits-mu)
+  (let ((es (or (hashtable-ref jolt-interrupt-waits b #f)
+                (let ((t (make-eq-hashtable)))
+                  (hashtable-set! jolt-interrupt-waits b t)
+                  t))))
+    (hashtable-set! es entry #t))
+  (jolt-unlock! jolt-interrupt-waits-mu))
 
 (define (jolt-interrupt-wait-remove! b entry)
-  (jolt-with-mutex jolt-interrupt-waits-mu
-    (let ((es (remq entry (hashtable-ref jolt-interrupt-waits b '()))))
-      (if (null? es)
-          (hashtable-delete! jolt-interrupt-waits b)
-          (hashtable-set! jolt-interrupt-waits b es)))))
+  (jolt-lock! jolt-interrupt-waits-mu)
+  (let ((es (hashtable-ref jolt-interrupt-waits b #f)))
+    (when es (hashtable-delete! es entry)))
+  (jolt-unlock! jolt-interrupt-waits-mu))
 
 ;; (jolt-interrupt-wake-waits! b) — poke every condition the thread owning b is
 ;; willing to be interrupted out of. Call AFTER setting the flag: the flag is what
@@ -657,14 +733,36 @@
 ;;
 ;; READ AND NOT DRAINED, unlike jolt-cv-take-waiters!. An entry is owned by the wait
 ;; that made it and is removed by that wait when it stops waiting, so deleting it
-;; here would unregister a waiter that is still waiting — the one that did not win
-;; the flag, when several share a carrier — and the next interrupt would not reach
-;; it. The entries are woken OUTSIDE the table's mutex, so this path holds one lock
+;; here would unregister a waiter that is still waiting, and the next interrupt
+;; would not reach it. The entries are woken OUTSIDE the table's mutex, so this path holds one lock
 ;; at a time.
+;;
+;; A box can also have an OWNER, registered once for its life rather than per
+;; wait: a fiber owns its box (fibers.ss jolt-fiber-ibox!), and its channel waits
+;; register nowhere and are resumed through the fiber itself. So whoever holds a
+;; fiber's box — a FutureTask's cancel(true), a pool's shutdownNow, Thread.interrupt
+;; — reaches those waits by this same call, with nothing to know about fibers:
+;; jolt-interrupt-owner-wake, set by fibers.ss, is handed the owner. Ephemeron-
+;; keyed, so an owner that holds its own box (a fiber does) is not kept by it.
+(define jolt-interrupt-owners (make-ephemeron-eq-hashtable))  ; interrupt box -> owner
+(define jolt-interrupt-owner-wake #f)
+(define (jolt-interrupt-owner-set! b owner)
+  (jolt-lock! jolt-interrupt-waits-mu)
+  (hashtable-set! jolt-interrupt-owners b owner)
+  (jolt-unlock! jolt-interrupt-waits-mu))
 (define (jolt-interrupt-wake-waits! b)
-  (let ((es (jolt-with-mutex jolt-interrupt-waits-mu
-              (hashtable-ref jolt-interrupt-waits b '()))))
-    (for-each (lambda (e) (jolt-with-mutex (car e) (jolt-cv-wake! (cdr e)))) es)))
+  (let-values (((es owner)
+                (jolt-with-mutex jolt-interrupt-waits-mu
+                  (let ((t (hashtable-ref jolt-interrupt-waits b #f)))
+                    (values (if t (hashtable-keys t) '#())
+                            (hashtable-ref jolt-interrupt-owners b #f))))))
+    (vector-for-each
+      (lambda (e)
+        (if (procedure? e)
+            (e)
+            (jolt-with-mutex (car e) (jolt-cv-wake! (cdr e)))))
+      es)
+    (when (and owner jolt-interrupt-owner-wake) (jolt-interrupt-owner-wake owner))))
 
 ;; The flag, read-and-cleared — java.lang.Thread's own rule for a wait that throws:
 ;; "the interrupted status is cleared and an InterruptedException is thrown."

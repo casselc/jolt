@@ -119,7 +119,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke durablewalnative \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
-  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
+  devbootsmoke devirt directlink ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy lazyretain \
   deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
@@ -183,16 +183,16 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash callbackbridges callbackdomains protocolsite \
-  protoret accfix pic narrow directlink directcall defmetacells staticsite durablewalnative mapseqfold arraymap arraybacking unitcontext numeric oparity mathfl flarr \
+  protoret accfix pic narrow directlink directcall defmetacells staticsite durablewalnative mapseqfold arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher regexstatic winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling buildnatives compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams utf8decode \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -313,6 +313,7 @@ callbackdomains:
 .PHONY: protocolsite
 protocolsite:
 	@$(CHEZ) --script test/chez/protocol-method-site-test.ss
+	@$(CHEZ) --script test/chez/protocol-resolve-registration-test.ss
 
 # Record predicates/accessors/mutators/constructors are open-coded: the
 # define-record-type in scheme-adapter-runtime.ss binds them as syntax over the
@@ -365,6 +366,21 @@ narrowhash:
 # carrier. It runs with the pool pinned to ONE carrier, which is what makes "8
 # bodies parked at the same time, all of them resuming" mean that a fiber released
 # its carrier rather than held it.
+# The WSAPoll backend jolt.io-poller uses on Windows, run on POSIX: with
+# JOLT_IO_POLLER=poll the poller is the poll(2) one, which is the same code over
+# the same contract (native/c-poll is poll there and WSAPoll on Windows). So the
+# Windows backend's parking, wake channel, cancel and timed waits are exercised
+# by every POSIX gate run, not only on a Windows runner.
+fiberspoll:
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poll-backend-active.clj
+	@JOLT_IO_POLLER=poll $(CHEZ) --script test/chez/fibers-io-test.ss
+	@out="$$(JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/socket-test.clj 2>&1)"; \
+	  if printf '%s' "$$out" | grep -q 'SOCKET-TEST OK'; then echo "fiberspoll: socket-test OK"; \
+	  else printf '%s\n' "$$out" | tail -5; echo "fiberspoll: socket-test FAILED"; exit 1; fi
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/win-parity-smoke.clj
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poller-registration.clj
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poller-retirement.clj
+
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
 	@$(CHEZ) --script test/chez/fibers-state-test.ss
@@ -766,6 +782,12 @@ taskssmoke: testbin
 scriptsmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/script-smoke.sh
 
+# The process ends when main returns only once every live non-daemon thread has
+# finished, with the agent pools' idle holds, as a JVM running clojure.main does:
+# each case's outcome was measured on JDK 21.
+exitwait: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/exit-wait-smoke.sh
+
 # `jolt completions`: the name/doc lines a completing shell asks for, and the
 # zsh/bash/fish snippets it installs — parsed by their own shells, and the bash
 # one actually run against a project to see what it offers.
@@ -1112,6 +1134,20 @@ arraybacking:
 	@$(CHEZ) --script test/chez/array-backing-test.ss
 	@$(CHEZ) --script test/chez/owned-byte-results-test.ss
 
+# A large byte array (64KB up) is one the collector marks in place, never copies:
+# Chez pins a huge allocation only when it takes fresh segments, and an unpinned
+# one in a mostly-free chunk was copied at every full collection (#1225). Pinned
+# by address across collections, which is deterministic where a pause is not.
+largebytesgc:
+	@$(CHEZ) --script test/chez/large-bytes-gc-test.ss
+
+# ...and so is a large long, int or double array's: Chez has no immobile fxvector
+# or flvector, so the backing is pinned to its array (lock-object) and released
+# when the array is dropped (#1227). Pinned by address, and the release by the
+# heap getting the memory back.
+largefxgc:
+	@$(CHEZ) --script test/chez/large-fx-gc-test.ss
+
 # Direct-linking emission: a closed-world build binds top-level app defs to jv$
 # Scheme bindings and routes app->app calls/refs to them, skipping var-deref +
 # jolt-invoke; ^:dynamic/^:redef and nested defs opt out.
@@ -1415,6 +1451,14 @@ vfaslceiling:
 # the per-unit compile/convert caches.
 buildscaling:
 	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/build-scaling-test.ss
+
+# The build driver's :static native plumbing below `jolt build` (#1205, #1207):
+# the build-time preload resolves one archive against another (one object from
+# all of them, a dependent archive first here), a non-PIC archive in the set is
+# skipped on its own, the same archive is linked once, bld-mkdir-p ends its walk
+# at a root, and build.ss loads under a bare-name JOLT_CHEZ.
+buildnatives:
+	@$(CHEZ) --script test/chez/build-natives-test.ss
 
 # The other half of the same rule: knowing the platform is only useful if the
 # struct stat offsets it selects are the ones this machine actually uses. The

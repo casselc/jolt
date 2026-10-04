@@ -622,12 +622,21 @@
 ;; The same thing said exactly, where the OS will show the table: three stdio
 ;; pipes, no jolt source file, no socket. Linux-only (/proc); the port case above
 ;; is the portable half.
+;; Read until the table settles: a freshly exec'd `sleep` opens files of its own
+;; for a moment (the dynamic loader's ld.so.cache and libc, setlocale's locale
+;; files) as fd 3, and a read that lands there sees it. A descriptor jolt leaked
+;; is there on every read, so it still fails.
 (when (fs/exists? "/proc/self/fd")
   (let [child (process ["sleep" "30"])
-        fds   (-> (sh ["ls" (str "/proc/" (.pid (:proc child)) "/fd")]) :out
-                  str/split-lines)]
+        read-fds #(->> (sh ["ls" (str "/proc/" (.pid (:proc child)) "/fd")]) :out
+                       str/split-lines (remove str/blank?) sort vec)
+        fds   (loop [n 0]
+                (let [fds (read-fds)]
+                  (if (or (= fds ["0" "1" "2"]) (>= n 20))
+                    fds
+                    (do (Thread/sleep 50) (recur (inc n))))))]
     (check-eq "a child's descriptor table is its own stdio and nothing else"
-              (vec (sort (remove str/blank? fds))) ["0" "1" "2"])
+              fds ["0" "1" "2"])
     (p/destroy child)
     @child))
 
@@ -778,7 +787,34 @@
                   (catch Exception _ :threw))])
           [3 "x\n" :threw])
 
+;; Closing a child's stdout under a thread blocked reading it ends the read with
+;; EOF, as the JVM's does (it prints -1). With the readiness poller loaded, the
+;; thread waits on it, and close never woke that wait, so the read hung.
+(require 'jolt.io-poller)
+(check-eq "closing a pipe wakes a thread blocked reading it"
+          (let [pr (.start (java.lang.ProcessBuilder. ["sleep" "5"]))
+                in (.getInputStream pr)
+                r  (future (.read in))]
+            (Thread/sleep 200)
+            (.close in)
+            (try (deref r 5000 :hung) (finally (.destroy pr))))
+          -1)
+
+;; A child starts with SIGPIPE at SIG_DFL, as the JVM's do (jolt-lang/jolt#1196).
+;; The runtime ignores SIGPIPE for its own writes, and an ignored disposition
+;; survives exec, so a producer whose consumer quit early got EPIPE and took its
+;; error path ("yes: stdout: Broken pipe") instead of dying quietly. No shell can
+;; undo it: POSIX forbids a non-interactive sh resetting a signal ignored on entry.
+(check-eq "a child's SIGPIPE is at its default"
+          (let [err (:err (sh ["sh" "-c" "yes e | head -c 100000 >&2"] {:err :string}))]
+            [(count err) (str/includes? err "Broken pipe")])
+          [100000 false])
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))
       (println "PROCESS-TEST FAILED:" (count @failures))))
+
+;; Done with the agent system's pools (futures, agents): end them, as a JVM
+;; program does, or their idle workers hold the process up for their keep-alive.
+(shutdown-agents)

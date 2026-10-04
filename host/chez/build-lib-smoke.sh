@@ -89,8 +89,13 @@ case "$(uname -s)" in
   *)      lib="$work/libadd.so" ;;
 esac
 
-echo "build-lib smoke: compiling libadd.core -> $lib"
-build_out="$(JOLT_PWD="$app" "$jolt" build --library -m libadd.core -o "$lib" 2>&1)"
+# -o names the library WITHOUT a suffix, the README's form: the build appends the
+# platform's .so/.dylib (jolt#1235), so "$lib" is where it must land.
+echo "build-lib smoke: compiling libadd.core -o $work/libadd -> $lib"
+build_out="$(JOLT_PWD="$app" "$jolt" build --library -m libadd.core -o "$work/libadd" 2>&1)"
+if [ -f "$work/libadd" ]; then
+  echo "  FAIL: -o $work/libadd wrote the library with no suffix, want $lib"; exit 1
+fi
 if [ ! -f "$lib" ]; then
   # A shared object folds Chez's libkernel.a in, so that archive must be PIC. A
   # kernel built without -fPIC (the common default, incl. a stock source build)
@@ -104,6 +109,14 @@ if [ ! -f "$lib" ]; then
   exit 1
 fi
 
+# The install name follows the file name, suffix included.
+if [ "$(uname -s)" = Darwin ] && command -v otool >/dev/null 2>&1; then
+  case "$(otool -D "$lib")" in
+    *"@rpath/libadd.dylib"*) ;;
+    *) echo "  FAIL: install name, want @rpath/libadd.dylib, got:"; otool -D "$lib"; exit 1 ;;
+  esac
+fi
+
 echo "build-lib smoke: compiling driver + calling add(2,3) through dlopen"
 if ! cc -O2 "$app/driver.c" -ldl -o "$work/driver" 2>"$work/driver.err"; then
   echo "  FAIL: driver compile failed"; cat "$work/driver.err"; exit 1
@@ -113,4 +126,23 @@ if [ "$got" != "5 8 1" ] || [ "$rc" != "0" ]; then
   echo "  FAIL: exports — want '5 8 1' rc 0, got '$got' rc $rc"; exit 1
 fi
 
-echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 + gzip_ok()=1 via dlopen+jolt_lookup)"
+# The #1234 handoff: release the init thread, park it in host code while a
+# thread the embedder started calls a :collect-safe export that allocates, then
+# shut down from the released thread. Before jolt_library_release_thread the
+# worker's first collection waited forever on the parked init thread. The driver
+# arms alarm(30), so a hang comes back as a SIGALRM death. POSIX threads only.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "build-lib smoke: release-thread handoff skipped (POSIX threads driver)" ;;
+  *)
+    echo "build-lib smoke: init, release the thread, call in from a worker, shut down"
+    if ! cc -O2 "$app/driver-release.c" -ldl -lpthread -o "$work/driver-release" 2>"$work/driver-release.err"; then
+      echo "  FAIL: release driver compile failed"; cat "$work/driver-release.err"; exit 1
+    fi
+    got="$("$work/driver-release" "$lib" 2>&1)"; rc=$?
+    if [ "$got" != "20255 20000" ] || [ "$rc" != "0" ]; then
+      echo "  FAIL: release-thread handoff, want '20255 20000' rc 0, got '$got' rc $rc"; exit 1
+    fi ;;
+esac
+
+echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 + gzip_ok()=1 via dlopen+jolt_lookup, and a released init thread)"

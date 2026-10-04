@@ -253,10 +253,12 @@
 ;; the interop registries are host-statics.ss, which loads before the prelude:
 ;; its own (import …) forms intern class tokens through class-model.ss.)
 (define (reader-jhost? x) #f)
-(define (jhost-seqable-shim? x) #f)
+;; jhost-seqable-shim? is java/jutil-colls.ss's, which this boot includes.
 ;; No array can be built here (every constructor is degraded below), so nothing
 ;; is one; the host callables are multimethods, since no promise exists either.
 (def-var! "jolt.host" "array-value?" (lambda (x) jolt-nil))
+;; concurrency.ss is not in this boot, so there are no agent threads to mark
+(def-var! "jolt.host" "agent-threads-daemon!" (lambda () jolt-nil))
 (def-var! "jolt.host" "callable-host?"
   (lambda (x) (if (jolt-multifn? x) #t jolt-nil)))
 ;; Per-object identity for the back end's constant pool (rt.ss on Chez).
@@ -299,7 +301,7 @@
 (def-var! "jolt.host" "fn-form-parse"
   (gambit-unsupported-fn "fn-form-parse" "there is no fn-form registry on this target"))
 
-(degrade-core-vars! '("aclone" "into-array" "to-array" "object-array" "int-array"
+(degrade-core-vars! '("aclone" "into-array" "to-array" "make-array" "object-array" "int-array"
                       "long-array" "double-array" "float-array" "boolean-array"
                       "byte-array" "char-array" "short-array")
                     "arrays are not wired up on this target (java/natives-array.ss)")
