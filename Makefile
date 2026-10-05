@@ -118,7 +118,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke durablewalnative \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize hotscaling applyscaling zipmemory lazyscaling \
   devbootsmoke devirt directlink ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy lazyretain \
@@ -748,6 +748,7 @@ ioscaling: testbin
 
 # Mechanism controls: size must not extract/concatenate a growing byte stream;
 # stock writer blocks avoid array copies, but live overrides retain dispatch.
+.PHONY: bytestreamsize
 bytestreamsize: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:paths ["test"]}' -m byte-array-output-stream-size-test
 
