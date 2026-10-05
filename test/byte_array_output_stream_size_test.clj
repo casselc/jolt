@@ -88,6 +88,20 @@
     (is (true? (check false)))
     (is (true? (check true)))))
 
+(deftest compression-keeps-its-stream-write-path
+  (let [bytes (java.io.ByteArrayOutputStream.)
+        compressed (java.util.zip.DeflaterOutputStream. bytes)
+        writer (java.io.OutputStreamWriter. compressed "UTF-8")
+        stock? (scheme/eval-string "out-stream-stock-write?")]
+    (is (false? (stock? compressed)))
+    (.append writer "β😀 compress me")
+    (.close writer)
+    (let [input (java.util.zip.InflaterInputStream.
+                  (java.io.ByteArrayInputStream. (.toByteArray bytes)))]
+      (try
+        (is (= "β😀 compress me" (String. (.readAllBytes input) "UTF-8")))
+        (finally (.close input))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (t/run-tests 'byte-array-output-stream-size-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))

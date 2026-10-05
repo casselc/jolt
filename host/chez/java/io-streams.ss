@@ -352,8 +352,10 @@
 ;; override must remain observable by OutputStreamWriter's sink callback.
 (define out-stream-stock-write
   (hashtable-ref (hashtable-ref host-methods-tbl "out-stream" #f) "write" #f))
+(define out-stream-stock-domain? (lambda (out) #t))
 (define (out-stream-stock-write? out)
   (and (out-stream? out)
+       (out-stream-stock-domain? out)
        (eq? out-stream-stock-write
             (hashtable-ref (hashtable-ref host-methods-tbl "out-stream" #f) "write" #f))))
 ;; (str baos) is its toString — the collected bytes as text — as str is on the

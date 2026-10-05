@@ -249,6 +249,13 @@
         (cons "finish" zout-finish)
         (cons "close" (zout-method "close" '(0) zout-prior-close zout-close))))
 
+;; This internal wrapper delegates plain streams to the stock method but owns
+;; compression semantics for zout streams. Trust its plain-stream branch only;
+;; later user overrides still invalidate the selected-method identity guard.
+(set! out-stream-stock-write
+  (hashtable-ref (hashtable-ref host-methods-tbl "out-stream" #f) "write" #f))
+(set! out-stream-stock-domain? (lambda (out) (not (zout-of out))))
+
 ;; class and instance? answer from the record's class name and the hierarchy: a
 ;; known class the stream's class does not extend is #f, not the out-stream's
 ;; general answer.
