@@ -72,6 +72,42 @@ false ordering, warmed-site registration invalidation, Object precedence,
 exception identity, invalid-domain rejection, Var replacement and callable
 prefix fallback.
 
-Remaining: independent review, rebuilt candidate and actual collector/Durable
-measurements, followed by canonical integration/aspects port. Do not merge or
-claim the throughput targets from these component results.
+## Rebuilt collector checkpoint
+
+Release candidate built successfully from `2223c24a`, banner
+`v0.8.17-24-g2223c24a`, SHA-256
+`5b8167ae087ab1ac59585e6bbaece5a32ed4502aec8d13912d2ad1cf883d7889`.
+Eight primitive record checks invoke the time predicate zero times in the
+rebuilt executable, compared with eight times in the original executable.
+
+Same exporter `1af91f3`, chDB key-cache consumer `7dcaec0`, data.json `993b906`,
+OTel `19fc49d`, native package 26.7.3, AOT disabled. Actual local POSIX Durable
+collector, ten batches of 5,000 items across five tables, per-physical-insert
+commit boundary unchanged:
+
+| Executable | Physical rows/s | Scheme heap allocated |
+| --- | ---: | ---: |
+| Original `976dd9d` | 17,348.69 | 9,365,633,952 B |
+| Candidate `2223c24a` | 17,676.32 | 9,365,567,952 B |
+
+Both writers and separate fresh snapshot readers reached terminal exit zero;
+each reader confirmed 50,000 service rows in each table (250,000 total). Counts
+do not prove full-row recovery equivalence. The ~1.9% sequential throughput
+difference is not a causal win: allocation is effectively unchanged, as expected
+because the existing scalar shortcut already bypasses these record predicates.
+No additional collector improvement should be booked from this domain change.
+
+Receipts: `exporter-instance-domain-{baseline,candidate}-durable-20261005.edn`
+and their `.recovery.edn` companions. Driver:
+`exporter-instance-domain-durable-driver-20261005.clj`. The baseline writer used
+the package's default native resolution; subsequent runs explicitly selected
+the cached 26.7.3 library with `JOLT_CHDB_LIB`.
+
+The current benchmark's export timers include synthetic record generation.
+Next attribution must separate that preparation from row construction,
+encoding, and confirmed persistence before treating collector throughput as a
+pure ingestion limit. Keep the original end-to-end measurement available.
+
+Remaining: independent review, broader compiler gates and canonical
+integration/aspects port. The collector target remains unmet; no S3, robust
+tail, matched Rust or full-row recovery qualification is claimed.
