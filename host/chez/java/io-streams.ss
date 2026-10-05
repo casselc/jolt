@@ -300,6 +300,13 @@
     (flush-output-port port)
     (let ((merged (bv-concat acc (extract))))
       (vector-set! st 2 merged) merged)))
+;; Extraction resets the memory port. Count its current position plus the
+;; previously extracted accumulator without extracting or concatenating it.
+;; A size check after every write must not copy the growing prefix (O(n^2)).
+(define (baos-size self)
+  (let ((st (jhost-state self)))
+    (+ (bytevector-length (vector-ref st 2))
+       (port-position (vector-ref st 0)))))
 (register-host-methods! "out-stream"
   (list
    (cons "write"
@@ -337,10 +344,18 @@
    (cons "connect" (lambda (self other) (pipe-connect! self other) jolt-nil))
    ;; Retain one snapshot copy: baos-bytes remains owned by the stream.
    (cons "toByteArray" (lambda (self) (na-byte-array (baos-bytes self))))
-   (cons "size" (lambda (self) (->num (bytevector-length (baos-bytes self)))))
+   (cons "size" (lambda (self) (->num (baos-size self))))
    (cons "reset" (lambda (self) (baos-bytes self) (vector-set! (jhost-state self) 2 (make-bytevector 0)) jolt-nil))
    (cons "toString" (lambda (self . cs) (decode-bytevector (baos-bytes self)
                                           (if (pair? cs) (list (jolt-str-render-one (car cs))) '()))))))
+;; Capture the registered method, including its declared-arity adapter. A later
+;; override must remain observable by OutputStreamWriter's sink callback.
+(define out-stream-stock-write
+  (hashtable-ref (hashtable-ref host-methods-tbl "out-stream" #f) "write" #f))
+(define (out-stream-stock-write? out)
+  (and (out-stream? out)
+       (eq? out-stream-stock-write
+            (hashtable-ref (hashtable-ref host-methods-tbl "out-stream" #f) "write" #f))))
 ;; (str baos) is its toString — the collected bytes as text — as str is on the
 ;; JVM. It rendered as #object[java.io.OutputStream]; transit clients read the
 ;; payload back with (str baos).
@@ -1478,11 +1493,17 @@
   (make-custom-binary-output-port
    "stream-sink"
    (lambda (bv start count)
-     (let ((chunk (make-bytevector count)))
-       (bytevector-copy! bv start chunk 0 count)
-       ;; write(byte[],int,int), the overload the JVM's encoder calls — a
-       ;; proxy's fn sees three arguments there, not one
-       (record-method-dispatch out "write" (list->cseq (list (na-byte-array chunk) (->num 0) (->num count)))))
+     (if (out-stream-stock-write? out)
+         ;; Borrow only for this synchronous call: put-bytevector copies into
+         ;; the port before returning. Never retain or adopt the encoder buffer.
+         (let ((port (out-stream-live-port out)))
+           (put-bytevector port bv start count)
+           (when (piped-pipe out) (flush-output-port port)))
+         (let ((chunk (make-bytevector count)))
+           (bytevector-copy! bv start chunk 0 count)
+           ;; Proxies and live overrides keep the exact mutable array/range
+           ;; call shape and their own write method, including its effects.
+           (record-method-dispatch out "write" (list->cseq (list (na-byte-array chunk) (->num 0) (->num count))))))
      count)
    #f #f (lambda () #f)))
 (reg-ctor! '("OutputStreamWriter" "java.io.OutputStreamWriter")

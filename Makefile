@@ -183,7 +183,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash callbackbridges callbackdomains protocolsite \
@@ -745,6 +745,11 @@ complexity: testbin
 # whole remaining input per item until the [string offset] cursor rework.
 ioscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/io_scaling_test.clj
+
+# Mechanism controls: size must not extract/concatenate a growing byte stream;
+# stock writer blocks avoid array copies, but live overrides retain dispatch.
+bytestreamsize: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:paths ["test"]}' -m byte-array-output-stream-size-test
 
 # The constant-factor fast paths, each judged as a RATIO against a reference arm
 # the same run measures: reading a form off a stream vs off a string, the

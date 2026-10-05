@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Make `ByteArrayOutputStream.size()` read its accumulated length and memory-port
+  position without extracting/copying the buffer. Incremental byte-budget checks
+  no longer copy the growing prefix after every write; snapshots/reset/close and
+  returned-array ownership are unchanged.
+- Send `OutputStreamWriter` encoder blocks directly to concrete streams only
+  while their stock write method is selected. Avoid temporary byte-array copies;
+  proxies and live method overrides retain ordinary dispatch and call shape.
+
 - Add an optional `:host-table` receiver domain to library `instance?` callbacks
   and opt java.time into it. Primitive/collection checks skip that callback;
   in-domain answers remain live, ordered, and uncached. Legacy registrations
