@@ -31,8 +31,18 @@ Full-value equivalence is not established by table counts.
 The source-level suite checks admitted text, declined boundaries, public
 `str`/`pr-str`/`Double.toString` and a nonvacuous mechanism control. A general-only
 mutant must fail that mechanism control while keeping text equivalence green.
-Rebuilt artifact qualification, full compiler CI, independent review and
-canonical `integration/aspects` integration remain separate gates.
+Rebuilt artifact `v0.8.17-32-gbff1e47c` (SHA256
+`c559f82eaf3092c385096e9cab899ff80ccee5b1e74e6ea6fade28e6e0afcba2`)
+passes the four-test / 20,030-assertion formatter suite, retained byte-stream
+suite (five / 20), and existing data.json native suite (23 / 500). Source-mode
+tests use Chez 10.4.1. No formatter replacement is installed for these gates.
+
+Actual exporter with that rebuilt artifact and no diagnostic replacement:
+18,133.91 rows/s, 8,342,326,896 allocated bytes. Against the preceding baseline,
+this retains the ~4% allocation reduction but only ~1.2% observed throughput
+gain. Neither run proves a repeatable speedup; allocation is the more consistent
+signal. Full compiler CI, independent review and canonical `integration/aspects`
+integration remain separate gates.
 
 ## Related pipeline attribution
 
