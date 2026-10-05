@@ -138,7 +138,8 @@
      (when (jt? v)
        (boolean (or (contains? (:classes (spec-of v)) class-name)
                     (contains? #{"java.io.Serializable" "Serializable"
-                                 "java.lang.Object" "Object"} class-name))))))
+                                 "java.lang.Object" "Object"} class-name)))))
+   :host-table)
   ;; (class x)/(type x) and — crucially — protocol dispatch on these values, which
   ;; keys on value-host-tags. Without this a value's class is :object and
   ;; (extend-protocol P java.time.X …) never fires (tick extends its protocols this way).

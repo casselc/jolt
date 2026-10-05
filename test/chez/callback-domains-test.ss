@@ -10,6 +10,7 @@
   (unless pred (set! fails (+ fails 1)) (printf "FAIL: ~a\n" name)))
 (define register-eq (var-deref "clojure.core" "__register-eq!"))
 (define register-class (var-deref "clojure.core" "__register-class!"))
+(define register-instance (var-deref "clojure.core" "__register-instance-check!"))
 (define domain (keyword #f "host-table"))
 (define (table) (jolt-tagged-table (keyword "callback.domain" "test")))
 (define (thrown thunk)
@@ -181,6 +182,78 @@
     (register-eq (lambda (x) #t) (lambda (a b) #t) domain)
     (ok "wrong arity remains invocation-time fallback"
       (error-class? "clojure.lang.ArityException" (lambda () (jolt=2 obj "child")))))))
+
+;; Instance callbacks are oldest-first and tri-state. Never cache their result,
+;; even for values with the same kind and an unchanged registration epoch.
+(define (isolated-instance thunk)
+  (let ((saved user-instance-checks))
+    (dynamic-wind
+      (lambda () (set! user-instance-checks '())
+        (set! instance-arms-epoch (fx+ instance-arms-epoch 1)))
+      thunk
+      (lambda () (set! user-instance-checks saved)
+        (set! instance-arms-epoch (fx+ instance-arms-epoch 1))))))
+(isolated-instance (lambda ()
+  (let ((saved user-instance-checks) (epoch instance-arms-epoch) (calls 0))
+    (for-each (lambda (bad)
+      (ok "invalid instance domain throws before registration"
+        (error-class? "java.lang.IllegalArgumentException"
+          (lambda () (register-instance (lambda args (set! calls (+ calls 1)) #t) bad)))))
+      (list jolt-nil #f "host-table" (keyword "other" "host-table")))
+    (ok "invalid instance domain preserves registry, epoch and effects"
+      (and (eq? saved user-instance-checks) (= epoch instance-arms-epoch) (= calls 0))))))
+(isolated-instance (lambda ()
+  (let ((obj (table)) (answer #t) (trace '())
+        (name (jolt-symbol #f "domain.Instance"))
+        (site (jolt-instance-site-make)))
+    (register-instance
+      (lambda (cn v) (set! trace (cons (list cn v) trace)) answer) domain)
+    (for-each (lambda (v)
+      (ok "non-table instance falls through" (not (jolt-instance-site site name v))))
+      (list "child" 7 #f empty-pmap (jolt-vector 1) car jolt-nil))
+    (ok "no instance callbacks outside domain" (null? trace))
+    (ok "in-domain instance true" (jolt-instance-site site name obj))
+    (set! answer #f)
+    (ok "same-kind false answer stays live" (not (jolt-instance-site site name obj)))
+    (set! answer jolt-nil)
+    (register-instance (lambda (cn v) #t))
+    (ok "nil instance answer falls through to legacy" (jolt-instance-site site name obj))
+    (ok "legacy can claim primitive through warmed site" (jolt-instance-site site name "child"))
+    (ok "domain callback receives unchanged class name and receiver"
+      (equal? (list (list "domain.Instance" obj) (list "domain.Instance" obj)
+                    (list "domain.Instance" obj)) (reverse trace)))
+    (set! trace '())
+    (ok "Object rule remains ahead of callbacks" (instance-check (jolt-symbol #f "Object") obj))
+    (ok "Object invokes no callbacks" (null? trace)))))
+(isolated-instance (lambda ()
+  (let ((obj (table)) (marker (vector 'instance-error)))
+    (register-instance (lambda (cn v) (raise marker)) domain)
+    (ok "in-domain instance exception identity"
+      (eq? marker (thrown (lambda () (instance-check (jolt-symbol #f "domain.Bad") obj)))))
+    (ok "instance exception suppressed outside domain"
+      (not (instance-check (jolt-symbol #f "domain.Bad") "child"))))))
+(isolated-instance (lambda ()
+  (let ((obj (table)) (calls 0) (name (jolt-symbol #f "domain.Order")))
+    (register-instance (lambda (cn v) #f) domain)
+    (register-instance (lambda (cn v) (set! calls (+ calls 1)) #t))
+    (ok "oldest definitive false wins" (not (instance-check name obj)))
+    (ok "false does not invoke later callbacks" (= calls 0)))))
+(isolated-instance (lambda ()
+  (let ((obj (table)) (cell (jolt-var "callback.domain.test" "instance"))
+        (name (jolt-symbol #f "domain.Live")))
+    (var-cell-root-set! cell (lambda (cn v) #f))
+    (register-instance cell domain)
+    (ok "instance Var starts false" (not (instance-check name obj)))
+    (var-cell-root-set! cell (lambda (cn v) #t))
+    (ok "instance Var replacement stays live" (instance-check name obj)))))
+(isolated (lambda () (isolated-instance (lambda ()
+  (let ((obj (table)) (callback (keyword "domain" "instance")) (calls 0))
+    (register-invoke-prefix-arm! (lambda (f) (eq? f callback))
+      (lambda (f args) (set! calls (+ calls 1)) #t))
+    (register-instance callback domain)
+    (ok "instance nonprocedure invokes prefix fallback"
+      (instance-check (jolt-symbol #f "domain.Prefix") obj))
+    (ok "instance prefix effect count" (= calls 1)))))))
 
 (printf "callback-domains: ~a/~a assertions passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))

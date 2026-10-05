@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Add an optional `:host-table` receiver domain to library `instance?` callbacks
+  and opt java.time into it. Primitive/collection checks skip that callback;
+  in-domain answers remain live, ordered, and uncached. Legacy registrations
+  remain unrestricted. This is the same explicit representation contract as
+  equality/class domains, not inferred purity or class-name ownership.
 - Compose the retained JSON/string/interop, callback-domain, map-fold, owned-byte,
   and guarded WAL performance work with Jolt 0.8.17 on an isolated branch.
   This is a qualification candidate, not the canonical aspects branch or a

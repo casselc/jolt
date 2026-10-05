@@ -2135,11 +2135,19 @@
               (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f))))))))
 ;; the bump retires every instance? answer cached while no library arm existed
 ;; (records-interop.ss jolt-instance-site) — the arm may claim any of them now
-(def-var! "clojure.core" "__register-instance-check!"
-  (lambda (f)
+(define (hsc-register-instance-check! f)
     (set! user-instance-checks (append user-instance-checks (list f)))
     (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
-    jolt-nil))
+    jolt-nil)
+(def-var! "clojure.core" "__register-instance-check!"
+  (case-lambda
+    ((f) (hsc-register-instance-check! f))
+    ((f domain)
+     (hsc-host-table-domain! "__register-instance-check!" domain)
+     (let ((callback (hsc-callback2 f)))
+       (hsc-register-instance-check!
+         (lambda (cn val)
+           (if (htable? val) (callback cn val) jolt-nil)))))))
 
 ;; ---- value-semantics seams -------------------------------------------------
 ;; A library that models its own host values (java.time via jolt-lang/time) needs
