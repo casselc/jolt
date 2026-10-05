@@ -37,12 +37,44 @@ mechanism controls:
 - 512 size checks must perform zero extractions and retain the same accumulator.
 - Stock encoded blocks create no temporary arrays; a live write override must
   still receive one normal array/range call.
+- Compressed streams must stay outside the raw-block domain, and a real
+  deflate/inflate roundtrip must preserve UTF-8.
 
 Against the existing compiler artifact, baseline has **16 passing assertions,
 two failures**; an overlay of the exact candidate definitions has **18 passing
 assertions, zero failures**. This is a source-overlay gate, **not a rebuilt
 compiler or full CI qualification**. `make bytestreamsize` is wired into the CI
 gate for the rebuilt artifact.
+
+The first rebuilt artifact exposed a startup distinction absent from the
+overlay: compression installs an internal write wrapper after io-streams loads.
+Its method identity made the raw-block guard decline (correct bytes, no fast
+path). The follow-up `97d93c8f` recognizes only that wrapper's plain-stream
+domain. Compressed streams still use compression, and subsequent user overrides
+still invalidate the guard. The rebuilt artifact now passes **five tests,
+20 assertions, zero failures** without runtime definition overlays.
+
+Artifact: `evidence/jolt-baos-size-release-20261005/jolt` in the workspace;
+banner `v0.8.17-28-g97d93c8f`, SHA-256
+`1f0c78fc2fbbbb1728c12941fbe0bd18417e72abcfcad09312996001aac64ca6`.
+This focused rebuilt gate is not full compiler CI or canonical-aspects port
+qualification.
+
+The unchanged actual five-table collector on this artifact completed at
+**17,326 physical rows/s**, 14.429 seconds and 9.365 GB allocated. A separate
+fresh snapshot reader confirmed 50,000 rows in each table (250,000 total).
+Receipts: `exporter-baos-runtime-20261005.edn` and `.edn.recovery.edn` under
+workspace evidence. That remains within the previous diagnostic screen range,
+not a new throughput win or p99/S3 qualification. The product still uses its
+original string encoder; no experimental byte-oriented sink was applied.
+
+The same artifact also passed the exporter's `:typed-log-socket-test` alias:
+real loopback OTLP transport, direct/socket row equivalence, exact Int64 typed
+status/native readback, capability-removal control, typed string/Boolean/Int64
+filters, historical coverage, and stale binding rejection before SQL. The first
+manual namespace invocation omitted the alias's jolt-http dependency and failed
+at require; using the declared alias resolved it. This is ordinary native typed
+ingestion, not a combined typed-Durable or Langfuse qualification.
 
 ## Same-encoder byte-oriented experiment
 
