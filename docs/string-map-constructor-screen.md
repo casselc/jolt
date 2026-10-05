@@ -57,11 +57,12 @@ Workspace receipts/drivers: `exporter-string-map-builder-screen-20261005.*`,
 
 ## Correctness controls and an invalid oracle
 
-`string-map-builder-controls-20261005.clj` passed **275 controls**: values,
+`string-map-builder-controls-20261005.clj` and its `.edn` receipt passed **277 controls**: values,
 count, iteration order, duplicate keys, Unicode field names, mixed/non-string
 fallback and actual colliding strings such as `Aa`/`BB` (their hashes are
 checked before use). Sizes cover 0 through 128 fields and larger collision
-cases. The empty singleton is checked separately.
+cases. The empty singleton, key/value identity, equal-but-distinct duplicate
+keys and independent snapshots are also checked.
 
 An initial forced-collision control replaced only `key-hash`. Inline String
 lookups use another fast hashing path, so that mutation made even the baseline
@@ -70,8 +71,8 @@ The corrected control uses real colliding inputs and no hashing mutations.
 General lesson: a partial internal-entry-point mutation is not automatically a
 valid semantic oracle; authenticate it against every lookup path it exercises.
 
-Remaining gates before any production change: key/value identity and independent
-snapshot controls, fuller constructor/collection suites, source integration and
+Remaining gates before any production change: fuller constructor/collection
+suites, source integration and
 rebuilt artifact, independent review, and repeated actual workload/tail measures.
 Retain the allocation result for cumulative work, but do not promote it as the
 missing large throughput win.
