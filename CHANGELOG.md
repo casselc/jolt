@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Render nonzero integral doubles inside the plain-decimal range through the
+  runtime's integer formatter. Zero signs, fractions, scientific notation,
+  subnormals and nonfinite values retain the general floating-point formatter.
+  This is a cumulative compiler candidate, not a whole-pipeline throughput claim.
+
 - Make `ByteArrayOutputStream.size()` read its accumulated length and memory-port
   position without extracting/copying the buffer. Incremental byte-budget checks
   no longer copy the growing prefix after every write; snapshots/reset/close and

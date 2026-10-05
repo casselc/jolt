@@ -118,7 +118,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke durablewalnative \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize hotscaling applyscaling zipmemory lazyscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize smalldoubleprint hotscaling applyscaling zipmemory lazyscaling \
   devbootsmoke devirt directlink ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy lazyretain \
@@ -183,7 +183,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize smalldoubleprint hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash callbackbridges callbackdomains protocolsite \
@@ -751,6 +751,10 @@ ioscaling: testbin
 .PHONY: bytestreamsize
 bytestreamsize: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:paths ["test"]}' -m byte-array-output-stream-size-test
+
+.PHONY: smalldoubleprint
+smalldoubleprint: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:paths ["test"]}' -m small-integral-double-print-test
 
 # The constant-factor fast paths, each judged as a RATIO against a reference arm
 # the same run measures: reading a form off a stream vs off a string, the

@@ -65,7 +65,7 @@
                              (loop (fx- k 1))
                              (substring s 0 k))))))))))
 
-(define (jolt-flonum->string x)
+(define (jolt-flonum->string-general x)
   (let* ((s (number->string x))
          (neg? (char=? (string-ref s 0) #\-))
          (body0 (if neg? (substring s 1 (string-length s)) s))
@@ -134,6 +134,20 @@
                                   (if (fx>? dlen 1) (substring digits 1 dlen) "0")
                                   "E" (number->string (- point 1)))))))
       (if neg? (string-append "-" res) res))))
+
+;; Exact nonzero integral doubles inside Double.toString's plain-decimal range
+;; do not need the host's general shortest-round-trip formatter. Keep zero on
+;; the general path to preserve its sign. Fractions, scientific notation,
+;; subnormals and nonfinite values likewise retain the established formatter.
+;; The bounded exact conversion produces a fixnum on supported runtimes; use
+;; the existing runtime-owned integer codec, never cache rendered value text.
+(define (jolt-flonum->string x)
+  (if (and (flonum? x)
+           (or (and (<= 1.0 x) (< x 10000000.0))
+               (and (< -10000000.0 x) (<= x -1.0)))
+           (integer? x))
+      (string-append (jolt-fixnum->string (exact x)) ".0")
+      (jolt-flonum->string-general x)))
 
 (define (jolt-num->string x)
   (cond
