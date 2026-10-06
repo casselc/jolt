@@ -632,6 +632,12 @@
          => jch-tags)
         (else '("Object"))))
 
+;; Ownership is advanced only by audited runtime wrappers whose string arm
+;; delegates unchanged. An unknown wrapper can never regain this capability.
+(define protocol-string-tag-chain-owner value-host-tags)
+;; Host-class setup installs an explicit, pointer-qualified domain proof. Until
+;; that setup has run, and whenever legacy callbacks exist, the proof declines.
+(define protocol-string-tags-domain (lambda () #f))
 
 ;; assoc every entry of a map onto a record — the __extmap of the record
 ;; class's full constructor, carried as extension fields.
@@ -1073,13 +1079,16 @@
                       (else (loop (cdr tags))))))))
     (else (resolve-by-host-tags proto-name method-name obj (value-host-tags obj)))))
 
-;; A reusable method-resolution site for host values. This is NOT a type/stock
-;; method shortcut: value-host-tags (including every live user predicate) runs
-;; once per dispatch, BEFORE consulting the cache. Records and reify instances
-;; retain protocol-resolve's descriptor/instance-local precedence unchanged.
+;; A reusable method-resolution site for host values. Ordinary hits still run
+;; value-host-tags once, including every live predicate that might apply. Only
+;; raw strings with an audited runtime-owned tag chain AND an explicit coherent
+;; host-table-only domain proof can omit pure classification. That ownership
+;; marker trusts the audited runtime helpers, not arbitrary private Scheme edits.
+;; Records/reify keep descriptor/instance-local precedence unchanged.
 ;;
 ;; Each snapshot is #(protocol-epoch graph-epoch ((tags . impl) ...)), with at
-;; most eight entries. The vector, list and pairs are never mutated after their
+;; most eight entries, plus one independent qualified string-family entry.
+;; The vector, list and pairs are never mutated after their
 ;; single-reference publication; no shared mutable hashtable is read on hits.
 ;; Only graph-owned tag lists are retained, not user-created/mutable per-call
 ;; lists. A graph mutation replaces its owned lists and changes its epoch.
@@ -1093,20 +1102,32 @@
 ;; production, method invocation or error formatting run under this lock.
 (define (make-protocol-method-site proto-name method-name)
   (let ((proto (string-copy proto-name)) (method (string-copy method-name))
-        (cache #f))
+        (cache #f) (string-cache #f))
     (lambda (obj)
       (if (or (jrec? obj) (jreify? obj))
           (protocol-resolve proto method obj)
-          (let* ((ge jch-graph-epoch)
-                 (tags (value-host-tags obj))
+          (let* ((domains (and (string? obj)
+                              (eq? value-host-tags protocol-string-tag-chain-owner)
+                              (protocol-string-tags-domain)))
+                 (string-snapshot (and domains string-cache)))
+            (when string-snapshot (memory-order-acquire))
+            (if (and string-snapshot
+                     (fx= jolt-proto-epoch (vector-ref string-snapshot 0))
+                     (fx= jch-graph-epoch (vector-ref string-snapshot 1))
+                     (eq? value-host-tags (vector-ref string-snapshot 2))
+                     (eq? domains (vector-ref string-snapshot 3)))
+                (vector-ref string-snapshot 4)
+          (let* ((ge jch-graph-epoch) (pe-before jolt-proto-epoch)
+                 (tag-chain value-host-tags)
+                 (tags (tag-chain obj))
                  (snapshot cache))
             (memory-order-acquire)
-            (let ((hit (and snapshot
+            (let* ((hit (and snapshot
                             (fx= ge jch-graph-epoch)
                             (fx= ge (vector-ref snapshot 1))
                             (fx= jolt-proto-epoch (vector-ref snapshot 0))
-                            (assq tags (vector-ref snapshot 2)))))
-              (if hit
+                            (assq tags (vector-ref snapshot 2))))
+                   (f (if hit
                   (cdr hit)
                   (let* ((owned? (and (fx= ge jch-graph-epoch)
                                      (graph-owned-tags? tags)))
@@ -1135,7 +1156,18 @@
                                         (memory-order-release)
                                         (set! cache next)))))
                                 f))))
-                    (or f (protocol-miss-throw proto method obj))))))))))
+                    f))))
+              ;; Only an audited, callback-free string classification can omit
+              ;; tag production on a later hit. Never retain a receiver value.
+              (when (and f domains
+                         (fx= pe-before jolt-proto-epoch) (fx= ge jch-graph-epoch)
+                         (eq? tag-chain value-host-tags)
+                         (eq? tag-chain protocol-string-tag-chain-owner)
+                         (eq? domains (protocol-string-tags-domain)))
+                (let ((next (vector pe-before ge tag-chain domains f)))
+                  (memory-order-release)
+                  (set! string-cache next)))
+              (or f (protocol-miss-throw proto method obj))))))))))
 ;; Fixed-arity entry points the protocol-method shims call: no rest-list, no seq
 ;; round-trip — apply the resolved impl directly. defprotocol emits one clause per
 ;; declared arity that calls the matching dispatchN.

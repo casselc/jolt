@@ -313,6 +313,7 @@ callbackdomains:
 .PHONY: protocolsite
 protocolsite:
 	@$(CHEZ) --script test/chez/protocol-method-site-test.ss
+	@$(CHEZ) --script test/chez/protocol-string-family-site-test.ss
 	@$(CHEZ) --script test/chez/protocol-resolve-registration-test.ss
 
 # Record predicates/accessors/mutators/constructors are open-coded: the
