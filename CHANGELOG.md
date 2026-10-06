@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Extend guarded method-site family reuse to primitive numeric, Boolean, nil,
+  keyword, plain vector and concrete map families under a separate runtime
+  ownership capability. Keep Long/BigInt and array/hash maps distinct; vector
+  views, entries, records, legacy callbacks and unknown chains retain ordinary
+  dispatch. Publish only immutable snapshots and honor live registry epochs.
+
 - Give core protocol method sites a bounded string-family shortcut only when
   the runtime owns the complete tag chain and every callback arm has a coherent
   explicit host-table domain. Preserve live epoch invalidation, conservative

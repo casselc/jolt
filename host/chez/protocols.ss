@@ -638,6 +638,19 @@
 ;; Host-class setup installs an explicit, pointer-qualified domain proof. Until
 ;; that setup has run, and whenever legacy callbacks exist, the proof declines.
 (define protocol-string-tags-domain (lambda () #f))
+;; Independent capability: audited wrappers preserve classification for the
+;; primitive families below. String ownership alone grants no such promise.
+(define protocol-primitive-tag-chain-owner value-host-tags)
+(define protocol-primitive-tags-domain (lambda () #f))
+(define (protocol-method-family obj)
+  (cond ((string? obj) 0)
+        ((and (integer? obj) (exact? obj)) (if (jolt-bigint-print? obj) 2 1))
+        ((flonum? obj) 3) ((boolean? obj) 4) ((jolt-nil? obj) 5)
+        ((keyword? obj) 6)
+        ((and (pvec? obj) (not (jolt-map-entry? obj))
+              (not (jolt-subvec-view? obj))) 7)
+        ((pmap? obj) (if (pmap-array? obj) 8 9))
+        (else #f)))
 
 ;; assoc every entry of a map onto a record — the __extmap of the record
 ;; class's full constructor, carried as extension fields.
@@ -1087,7 +1100,7 @@
 ;; Records/reify keep descriptor/instance-local precedence unchanged.
 ;;
 ;; Each snapshot is #(protocol-epoch graph-epoch ((tags . impl) ...)), with at
-;; most eight entries, plus one independent qualified string-family entry.
+;; most eight entries, plus ten independent qualified representation families.
 ;; The vector, list and pairs are never mutated after their
 ;; single-reference publication; no shared mutable hashtable is read on hits.
 ;; Only graph-owned tag lists are retained, not user-created/mutable per-call
@@ -1102,21 +1115,28 @@
 ;; production, method invocation or error formatting run under this lock.
 (define (make-protocol-method-site proto-name method-name)
   (let ((proto (string-copy proto-name)) (method (string-copy method-name))
-        (cache #f) (string-cache #f))
+        (cache #f) (family-cache #f))
     (lambda (obj)
       (if (or (jrec? obj) (jreify? obj))
           (protocol-resolve proto method obj)
-          (let* ((domains (and (string? obj)
-                              (eq? value-host-tags protocol-string-tag-chain-owner)
-                              (protocol-string-tags-domain)))
-                 (string-snapshot (and domains string-cache)))
-            (when string-snapshot (memory-order-acquire))
-            (if (and string-snapshot
-                     (fx= jolt-proto-epoch (vector-ref string-snapshot 0))
-                     (fx= jch-graph-epoch (vector-ref string-snapshot 1))
-                     (eq? value-host-tags (vector-ref string-snapshot 2))
-                     (eq? domains (vector-ref string-snapshot 3)))
-                (vector-ref string-snapshot 4)
+          (let* ((family (protocol-method-family obj))
+                 (owner (if (and family (fx=? family 0))
+                            protocol-string-tag-chain-owner
+                            protocol-primitive-tag-chain-owner))
+                 (domain-proof (if (and family (fx=? family 0))
+                                   protocol-string-tags-domain
+                                   protocol-primitive-tags-domain))
+                 (domains (and family (eq? value-host-tags owner) (domain-proof)))
+                 (families family-cache)
+                 (_ (when families (memory-order-acquire)))
+                 (family-snapshot (and domains families (vector-ref families family))))
+            (when family-snapshot (memory-order-acquire))
+            (if (and family-snapshot
+                     (fx= jolt-proto-epoch (vector-ref family-snapshot 0))
+                     (fx= jch-graph-epoch (vector-ref family-snapshot 1))
+                     (eq? value-host-tags (vector-ref family-snapshot 2))
+                     (eq? domains (vector-ref family-snapshot 3)))
+                (vector-ref family-snapshot 4)
           (let* ((ge jch-graph-epoch) (pe-before jolt-proto-epoch)
                  (tag-chain value-host-tags)
                  (tags (tag-chain obj))
@@ -1157,16 +1177,21 @@
                                         (set! cache next)))))
                                 f))))
                     f))))
-              ;; Only an audited, callback-free string classification can omit
+              ;; Only an audited, callback-free family classification can omit
               ;; tag production on a later hit. Never retain a receiver value.
               (when (and f domains
                          (fx= pe-before jolt-proto-epoch) (fx= ge jch-graph-epoch)
                          (eq? tag-chain value-host-tags)
-                         (eq? tag-chain protocol-string-tag-chain-owner)
-                         (eq? domains (protocol-string-tags-domain)))
-                (let ((next (vector pe-before ge tag-chain domains f)))
+                         (eq? tag-chain (if (fx=? family 0)
+                                             protocol-string-tag-chain-owner
+                                             protocol-primitive-tag-chain-owner))
+                         (eq? domains (domain-proof)))
+                (let* ((current family-cache)
+                       (_ (when current (memory-order-acquire)))
+                       (next (if current (vector-copy current) (make-vector 10 #f))))
+                  (vector-set! next family (vector pe-before ge tag-chain domains f))
                   (memory-order-release)
-                  (set! string-cache next)))
+                  (set! family-cache next)))
               (or f (protocol-miss-throw proto method obj))))))))))
 ;; Fixed-arity entry points the protocol-method shims call: no rest-list, no seq
 ;; round-trip — apply the resolved impl directly. defprotocol emits one clause per

@@ -87,4 +87,6 @@
     (lambda (obj)
       (if (proxy-value? obj) (value-host-tags (reify-delegate obj)) (prev obj))))
   (when (eq? prev protocol-string-tag-chain-owner)
-    (set! protocol-string-tag-chain-owner value-host-tags)))
+    (set! protocol-string-tag-chain-owner value-host-tags))
+  (when (eq? prev protocol-primitive-tag-chain-owner)
+    (set! protocol-primitive-tag-chain-owner value-host-tags)))

@@ -286,6 +286,8 @@
     (else (%h-value-host-tags obj)))))
 (when (eq? %h-value-host-tags protocol-string-tag-chain-owner)
   (set! protocol-string-tag-chain-owner value-host-tags))
+(when (eq? %h-value-host-tags protocol-primitive-tag-chain-owner)
+  (set! protocol-primitive-tag-chain-owner value-host-tags))
 
 ;; (class e) on a throwable tagged-table (a library's ex-info envelope carrying a
 ;; JVM :class, e.g. jolt-lang/http-client's UnknownHostException) reads that
