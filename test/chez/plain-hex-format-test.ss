@@ -1,0 +1,61 @@
+(import (chezscheme))
+(load "host/chez/rt.ss")
+(define total 0)
+(define fails 0)
+(define (ok label value)
+  (set! total (+ total 1))
+  (unless value (set! fails (+ fails 1)) (printf "FAIL: ~a\n" label)))
+(define format-var (var-cell-root (jolt-var "clojure.core" "format")))
+(for-each
+  (lambda (n)
+    (ok "plain hex exactly matches generic formatter"
+        (string=? (format-var "%x" n) (fmt-general-format* #f "%x" (list n)))))
+  (list 0 1 15 16 17 255 256 4095 4096 65535 65536 2147483647
+        (most-positive-fixnum) 9223372036854775807 9223372036854775808
+        -1 -128 -129 -32768 -2147483648 -9223372036854775808))
+(for-each
+  (lambda (spec)
+    (ok "other format modes preserve output"
+        (string=? (format-var spec 255) (fmt-general-format* #f spec '(255)))))
+  '("%X" "%o" "%d" "%08x" "%#x" "%1$x" "%x!" "prefix%x" "%s"))
+;; Compare actual raised condition messages as well as successful output.
+(for-each
+  (lambda (args)
+    (let ((general (guard (e (#t e)) (fmt-general-format* #f "%x" args)))
+          (actual (guard (e (#t e)) (jolt-format* #f "%x" args))))
+      (ok "invalid and non-fixnum cases retain result or condition message"
+          (if (string? general) (and (string? actual) (string=? general actual))
+              (and (condition? general) (condition? actual)
+                   (equal? (condition-message general) (condition-message actual)))))))
+  (list '() '(1 2) '(1.5) (list jolt-nil) '("abc")))
+(let ((original fmt-lower-fixnum-hex) (calls 0))
+  (dynamic-wind
+    (lambda () (set! fmt-lower-fixnum-hex (lambda (n)
+                  (set! calls (+ calls 1)) (original n))))
+    (lambda ()
+      (ok "actual core format reaches specialization" (string=? "ff" (format-var "%x" 255)))
+      (ok "specialization is positively intercepted" (= calls 1))
+      (format-var "%x" -1) (format-var "%08x" 255)
+      (format-var "%x" 9223372036854775807) (format-var "%x" 1 2)
+      (ok "declined variants never invoke specialized codec" (= calls 1)))
+    (lambda () (set! fmt-lower-fixnum-hex original))))
+(let ((actual-pieces '()) (expected-pieces '()))
+  (let ((actual (jolt-format* (lambda (s) (set! actual-pieces (cons s actual-pieces))) "%x" '(255)))
+        (expected (fmt-general-format* (lambda (s) (set! expected-pieces (cons s expected-pieces))) "%x" '(255))))
+    (ok "streaming sink keeps generic result and exact callback pieces"
+        (and (equal? actual expected) (equal? actual-pieces expected-pieces)
+             (equal? actual-pieces '("ff"))))))
+(let ((expected (fmt-general-format* #f "%x" (list (most-positive-fixnum))))
+      (mu (make-mutex)) (done 0) (errors 0))
+  (do ((worker 0 (+ worker 1))) ((= worker 4))
+    (fork-thread (lambda ()
+      (guard (e (#t (with-mutex mu (set! errors (+ errors 1)))))
+        (do ((i 0 (+ i 1))) ((= i 200))
+          (unless (string=? expected (format-var "%x" (most-positive-fixnum)))
+            (error 'hex "wrong independent output"))))
+      (with-mutex mu (set! done (+ done 1))))))
+  (let wait () (unless (with-mutex mu (= done 4))
+                (sleep (make-time 'time-duration 1000000 0)) (wait)))
+  (ok "parallel calls produce independent strings" (= errors 0)))
+(printf "plain-hex-format: ~a/~a checks passed\n" (- total fails) total)
+(exit (if (= fails 0) 0 1))

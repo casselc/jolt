@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Render plain `%x` formatting of nonnegative fixnums without the generic
+  parser/output port. Preserve generic behavior for signed or wide integers,
+  flags, widths, extra/invalid arguments, other formats and streaming sinks.
+
 - Extend guarded method-site family reuse to primitive numeric, Boolean, nil,
   keyword, plain vector and concrete map families under a separate runtime
   ownership capability. Keep Long/BigInt and array/hash maps distinct; vector

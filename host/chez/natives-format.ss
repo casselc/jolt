@@ -604,4 +604,23 @@
                          (loop end
                                (if (or idx (fmt-flag? flags #\<)) ordinary (fx+ ordinary 1))
                                k)))))))))))))
+;; Plain positive fixnum hex is common in IDs. Avoid the generic directive
+;; parser, output port, radix formatter and lowercase copy for this exact form.
+;; No width/flags, invalid arguments, signed values or bignums take this path.
+(define fmt-lower-hex-digits "0123456789abcdef")
+(define (fmt-lower-fixnum-hex n)
+  (let* ((size (let count ((x n) (k 1))
+                 (if (fx<? x 16) k (count (fxsra x 4) (fx+ k 1)))))
+         (out (make-string size #\0)))
+    (let fill ((x n) (i (fx- size 1)))
+      (string-set! out i (string-ref fmt-lower-hex-digits (fxand x 15)))
+      (if (fx=? i 0) out (fill (fxsra x 4) (fx- i 1))))))
+(define fmt-general-format* jolt-format*)
+(set! jolt-format*
+  (lambda (sink fmt args)
+    (if (and (not sink) (string? fmt) (string=? fmt "%x")
+             (pair? args) (null? (cdr args))
+             (fixnum? (car args)) (fx>=? (car args) 0))
+        (fmt-lower-fixnum-hex (car args))
+        (fmt-general-format* sink fmt args))))
 (def-var! "clojure.core" "format" jolt-format)
