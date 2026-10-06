@@ -46,6 +46,9 @@
       (register-protocol-method "clojure.lang.PersistentArrayMap" proto "m" changed)
       (ok "array-map extension invalidates its family" (eq? changed (site empty-pmap)))
       (ok "hash map does not inherit array-map method" (eq? ordinary (site hashmap)))
+      (register-protocol-method "clojure.lang.Keyword" proto "m" changed)
+      (ok "keyword extension invalidates its family" (eq? changed (site (keyword #f "changed"))))
+      (ok "keyword method does not leak into string family" (eq? ordinary (site "changed")))
       (register-protocol-method "clojure.lang.PersistentVector" proto "m" changed)
       (ok "plain vector sees completed extension" (eq? changed (site (jolt-vector 1))))
       (ok "map entry retains ordinary concrete dispatch" (eq? (site (make-map-entry 1 2)) (protocol-resolve proto "m" (make-map-entry 1 2))))
@@ -59,6 +62,7 @@
 (register-protocol-method "java.lang.Long" proto "m" ordinary)
 (register-protocol-method "clojure.lang.PersistentVector" proto "m" ordinary)
 (register-protocol-method "clojure.lang.PersistentArrayMap" proto "m" ordinary)
+(register-protocol-method "clojure.lang.Keyword" proto "m" ordinary)
 
 (let ((arms jt-user-value-tags-arms) (snapshot jt-user-value-tags-domain-snapshot) (effects 0))
   (site #t)
