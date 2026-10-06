@@ -2227,25 +2227,41 @@
 ;; plus supertypes), which value-host-tags (records.ss) feeds to protocol dispatch.
 ;; Without this, (class x) is :object and (extend-protocol P TheClass …) never fires.
 (define jt-user-value-tags-arms '())
+;; A pointer-qualified summary: a changed/replaced arm list never inherits a
+;; stale all-domain verdict. Publish only after the new list is installed.
+(define jt-user-value-tags-domain-snapshot #f)
 (let ((prev value-host-tags))
   (set! value-host-tags
     (lambda (obj)
-      (let loop ((as jt-user-value-tags-arms))
-        (cond ((null? as) (prev obj))
-              (((caar as) obj) ((cdar as) obj))
-              (else (loop (cdr as))))))))
+      (let ((arms jt-user-value-tags-arms)
+            (domain-snapshot jt-user-value-tags-domain-snapshot))
+        (if (and domain-snapshot (vector-ref domain-snapshot 1)
+                 (eq? arms (vector-ref domain-snapshot 0))
+                 (not (htable? obj)))
+            (prev obj)
+            (let loop ((as arms))
+              (cond ((null? as) (prev obj))
+                    (((caar as) obj) ((cdar as) obj))
+                    (else (loop (cdr as))))))))))
 (define (jt-jolt-strs->list v)
   (let loop ((s (jolt-seq v)) (acc '()))
     (if (jolt-nil? s) (reverse acc) (loop (jolt-seq (jolt-rest s)) (cons (jolt-first s) acc)))))
-(define (hsc-register-class! pred class-fn tags-fn)
+(define (hsc-register-class! pred class-fn tags-fn . domain-flags)
   (let* ((pred (hsc-callback1 pred))
          (class-fn (hsc-callback1 class-fn))
          (tags-fn (hsc-callback1 tags-fn))
          (p (lambda (x) (jolt-truthy? (pred x)))))
     (register-class-arm-checked! p (lambda (x) (class-fn x)))
-    (set! jt-user-value-tags-arms
-          (append jt-user-value-tags-arms
-                  (list (cons p (lambda (x) (jt-jolt-strs->list (tags-fn x))))))))
+    (let* ((old jt-user-value-tags-arms)
+           (summary jt-user-value-tags-domain-snapshot)
+           (only-tables? (and (pair? domain-flags) (car domain-flags)
+                             (or (null? old)
+                                 (and summary (eq? old (vector-ref summary 0))
+                                      (vector-ref summary 1)))))
+           (next (append old
+                         (list (cons p (lambda (x) (jt-jolt-strs->list (tags-fn x))))))))
+      (set! jt-user-value-tags-arms next)
+      (set! jt-user-value-tags-domain-snapshot (vector next only-tables?))))
   jolt-nil)
 ;; The same opt-in gates both class and protocol-tag predicates. In-domain
 ;; callbacks retain their live dispatch, truthiness and existing arm order.
@@ -2256,7 +2272,7 @@
      (hsc-host-table-domain! "__register-class!" domain)
      (let ((p (hsc-callback1 pred)))
        (hsc-register-class! (lambda (x) (and (htable? x) (p x)))
-                            class-fn tags-fn)))))
+                            class-fn tags-fn #t)))))
 
 ;; values that carry metadata (mirrors jolt-with-meta's set in natives-meta.ss).
 (define (hsc-imeta? x)

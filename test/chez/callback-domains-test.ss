@@ -23,11 +23,14 @@
 ;; Synchronous cases only: no fibers park through these test-local winders.
 (define (isolated thunk)
   (let ((eqs jolt-eq-arms) (classes jolt-class-arms)
-        (tags jt-user-value-tags-arms) (prefix jolt-invoke-prefix-arms))
+        (tags jt-user-value-tags-arms) (prefix jolt-invoke-prefix-arms)
+        (tag-domains jt-user-value-tags-domain-snapshot))
     (dynamic-wind
       (lambda () (set! jt-user-value-tags-arms '())) thunk
       (lambda () (set! jolt-eq-arms eqs) (set! jolt-class-arms classes)
-        (set! jt-user-value-tags-arms tags) (set! jolt-invoke-prefix-arms prefix)))))
+        (set! jt-user-value-tags-arms tags)
+        (set! jt-user-value-tags-domain-snapshot tag-domains)
+        (set! jolt-invoke-prefix-arms prefix)))))
 
 ;; Preserve the new upstream class fast-path guard, including atomic rejection.
 (isolated (lambda ()
@@ -254,6 +257,43 @@
     (ok "instance nonprocedure invokes prefix fallback"
       (instance-check (jolt-symbol #f "domain.Prefix") obj))
     (ok "instance prefix effect count" (= calls 1)))))))
+
+;; A summary qualifies only its exact immutable arm list. Domain fast rejection
+;; is a consequence of explicit opt-in, never inferred predicate purity.
+(isolated (lambda ()
+  (let ((obj (table)) (domain-calls 0) (legacy-calls 0))
+    (register-class
+      (lambda (x) (set! domain-calls (+ domain-calls 1)) (eq? x obj))
+      (lambda (x) "tag.domain.Test")
+      (lambda (x) (jolt-vector "tag.domain.Test" "Object")) domain)
+    (ok "tag domain summary matches current list"
+      (eq? jt-user-value-tags-arms (vector-ref jt-user-value-tags-domain-snapshot 0)))
+    (ok "one explicit domain proves all-domain summary"
+      (vector-ref jt-user-value-tags-domain-snapshot 1))
+    (set! domain-calls 0)
+    (for-each value-host-tags (list "plain" 42 #f empty-pvec empty-pmap))
+    (ok "fast domain rejection has no user effects" (= domain-calls 0))
+    (ok "positive table route retains tags"
+      (equal? (value-host-tags obj) '("tag.domain.Test" "Object")))
+    (ok "positive table predicate still executes once" (= domain-calls 1))
+    (let ((old-summary jt-user-value-tags-domain-snapshot))
+      (register-class
+        (lambda (x) (set! legacy-calls (+ legacy-calls 1)) #f)
+        (lambda (x) "tag.domain.Never") (lambda (x) empty-pvec))
+      (ok "legacy registration invalidates all-domain claim"
+        (not (vector-ref jt-user-value-tags-domain-snapshot 1)))
+      (set! legacy-calls 0)
+      (value-host-tags "plain")
+      (ok "legacy predicate effects remain visible" (= legacy-calls 1))
+      ;; Simulate the publication gap / stale metadata after a changed arm list.
+      (set! jt-user-value-tags-domain-snapshot old-summary)
+      (set! legacy-calls 0)
+      (value-host-tags "plain")
+      (ok "stale summary cannot skip newly installed legacy arm" (= legacy-calls 1))
+      (register-class (lambda (x) #f) (lambda (x) "tag.domain.Never2")
+                      (lambda (x) empty-pvec) domain)
+      (ok "uncertain prior summary cannot regain all-domain claim"
+        (not (vector-ref jt-user-value-tags-domain-snapshot 1)))))))
 
 (printf "callback-domains: ~a/~a assertions passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))

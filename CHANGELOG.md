@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Reject non-table protocol tag receivers before the callback-arm loop when
+  every arm explicitly opts into the host-table domain. Qualify the summary
+  by its exact arm-list identity; legacy registrations or changed lists keep
+  live predicate traversal. This does not cache receiver classes or methods.
+
 - Render nonzero integral doubles inside the plain-decimal range through the
   runtime's integer formatter. Zero signs, fractions, scientific notation,
   subnormals and nonfinite values retain the general floating-point formatter.
