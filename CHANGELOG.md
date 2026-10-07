@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Pin the measured runtime producer to `bcb376a0`, including removal of two
+  unused private helpers exposed by the dead-host gate. Preserve all CI gates
+  and require the matching source/tree/version/artifact identity.
+
 - Qualify the same measured Chez implementation with its regenerated Gambit
   record mirror (`f1116c53`). Keep full behavioral/shared CI mandatory after
   the stale-mirror failure; require the matching source/tree/version and artifact
