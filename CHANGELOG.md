@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Add a source/tree/ancestry-pinned CI capability artifact producer for the
+  measured 0.8.17-lineage plain runtime. Require behavioral CI and shared-build
+  gates before packaging; keep compiler and workflow identities separate.
+  This is not an aspect-compiler, consumer, S3 or performance qualification.
+
 - Render plain `%x` formatting of nonnegative fixnums without the generic
   parser/output port. Preserve generic behavior for signed or wide integers,
   flags, widths, extra/invalid arguments, other formats and streaming sinks.
