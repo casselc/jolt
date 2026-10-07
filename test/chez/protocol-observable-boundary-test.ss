@@ -73,5 +73,31 @@
     (thrown (lambda () (make-protocol-method-site proto "m" (lambda () #t) (lambda () #t)))))
 (ok "existing two-argument site remains supported"
     (eq? changed ((make-protocol-method-site proto "m") "plain")))
+
+;; Custom writer receivers take these descriptor/instance-local branches.
+;; The hook can mutate either selection before lookup; neither cache nor
+;; ordinary receiver-kind fast paths may omit that observable boundary.
+(let* ((desc (make-jrdesc "boundary.Record" '()))
+       (obj (make-jrec desc (vector) jolt-nil))
+       (r (make-reified (jolt-hash-map "m" ordinary)))
+       (methods (cdr (jreify-methods r)))
+       (record-calls 0) (reify-calls 0))
+  (register-protocol-method "boundary.Record" proto "m" ordinary)
+  (let ((record-site
+         (make-site proto "m" (lambda ()
+           (ok "record boundary outside counted lock" (= (jolt-locks-held) 0))
+           (set! record-calls (+ record-calls 1))
+           (register-protocol-method "boundary.Record" proto "m" changed))))
+        (reify-site
+         (make-site proto "m" (lambda ()
+           (ok "reify boundary outside counted lock" (= (jolt-locks-held) 0))
+           (set! reify-calls (+ reify-calls 1))
+           (vector-set! methods 0 changed)))))
+    (ok "record observes hook mutation before descriptor lookup" (eq? changed (record-site obj)))
+    (ok "record boundary remains live on repeated dispatch" (eq? changed (record-site obj)))
+    (ok "record hook runs once per resolution" (= record-calls 2))
+    (ok "reify observes hook mutation before instance lookup" (eq? changed (reify-site r)))
+    (ok "reify boundary remains live on repeated dispatch" (eq? changed (reify-site r)))
+    (ok "reify hook runs once per resolution" (= reify-calls 2))))
 (printf "protocol-observable-boundary: ~a/~a checks passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))
