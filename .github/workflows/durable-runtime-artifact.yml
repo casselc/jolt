@@ -50,8 +50,10 @@ jobs:
           test -z "$(git status --porcelain)"
       - name: Install build dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev default-jdk rlwrap
+          echo "CI_BUILD_JOBS=$(nproc)" >> "$GITHUB_ENV"
       - name: Cache Chez Scheme
         id: cache-chez
         uses: actions/cache@v4
@@ -78,9 +80,12 @@ jobs:
         run: |
           set -euo pipefail
           curl --fail --retry 5 --retry-delay 10 --retry-all-errors -L -o linux-install.sh \
-            https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-          head -1 linux-install.sh | grep -q '^#!'
-          sudo bash linux-install.sh
+            https://github.com/clojure/brew-install/releases/download/1.12.6.1673/linux-install.sh
+          printf '%s  %s\n' 5ae63b082ed33bf4c29bf1a8317c5c15249d1bc753676b2f5177fb3804ad6f77 linux-install.sh | sha256sum -c -
+          # This exact script also checks its exact CLI archive before extraction.
+          # Install into runner-owned space; the oracle bootstrap needs no root.
+          bash linux-install.sh --prefix "$RUNNER_TEMP/clojure-oracle"
+          echo "$RUNNER_TEMP/clojure-oracle/bin" >> "$GITHUB_PATH"
           echo 'JAVA_CMD=/usr/lib/jvm/default-java/bin/java' >> "$GITHUB_ENV"
           echo 'JAVA_HOME=/usr/lib/jvm/default-java' >> "$GITHUB_ENV"
       - name: Full behavioral CI gate and shared standalone build
@@ -88,7 +93,7 @@ jobs:
           JOLT_REQUIRE_BUILDLIB: "1"
         # CI excludes the dev-only selfhost byte-fixpoint (seed Chez dependent),
         # not behavioral/compiler/library gates. Require shared-build coverage.
-        run: make CHEZ=/opt/chez/bin/chez -j"$(nproc)" -Oline ci
+        run: make CHEZ=/opt/chez/bin/chez -j"$CI_BUILD_JOBS" -Oline ci
       - name: Require selected version and ranged-append capability
         run: |
           set -euo pipefail
@@ -113,6 +118,7 @@ jobs:
       - name: Package binary and allowlisted build provenance
         env:
           WORKFLOW_SOURCE: ${{ github.sha }}
+          CHEZ_CACHE_HIT: ${{ steps.cache-chez.outputs.cache-hit }}
         run: |
           set -euo pipefail
           mkdir -p ../runtime-artifact
@@ -130,8 +136,12 @@ jobs:
             printf 'chez_sha256=%s\n' "$(sha256sum /opt/chez/bin/scheme | cut -d ' ' -f 1)"
             printf 'cc_version=%s\n' "$(cc --version | head -1)"
             printf 'cc_sha256=%s\n' "$(sha256sum "$(readlink -f "$(command -v cc)")" | cut -d ' ' -f 1)"
-            printf 'build_command=make CHEZ=/opt/chez/bin/chez -j(nproc) -Oline ci\n'
-            printf 'chez_configure=--threads --disable-x11 CFLAGS+=-fPIC\nrequire_buildlib=1\n'
+            printf 'build_command=make CHEZ=/opt/chez/bin/chez -j%s -Oline ci\n' "$CI_BUILD_JOBS"
+            printf 'chez_configure=--installprefix=/opt/chez --threads --disable-x11 CFLAGS+=-fPIC\n'
+            if [[ "$CHEZ_CACHE_HIT" == true ]]; then printf 'chez_origin=cache\n'; else printf 'chez_origin=source-build\n'; fi
+            printf 'clojure_cli_version=1.12.6.1673\n'
+            printf 'clojure_installer_sha256=5ae63b082ed33bf4c29bf1a8317c5c15249d1bc753676b2f5177fb3804ad6f77\n'
+            printf 'require_buildlib=1\n'
             printf 'binary_version=%s\n' "$(target/release/jolt --version)"
             printf 'binary_sha256=%s\n' "$(sha256sum target/release/jolt | cut -d ' ' -f 1)"
             printf 'gate=pass\nranged_append_ascii=98\nruntime_kind=plain\n'
