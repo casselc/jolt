@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Regenerate the Gambit record mirror from the current Chez record/protocol
+  sources after the guarded method-site changes. Restore the derived-source
+  consistency gate without changing Chez runtime code or skipping CI checks.
+
 - Render plain `%x` formatting of nonnegative fixnums without the generic
   parser/output port. Preserve generic behavior for signed or wide integers,
   flags, widths, extra/invalid arguments, other formats and streaming sinks.
