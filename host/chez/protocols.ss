@@ -1113,12 +1113,22 @@
 ;; an extension overlaps, as ordinary dispatch does; an extension completed
 ;; before the next dispatch invalidates that snapshot. No callbacks, tag
 ;; production, method invocation or error formatting run under this lock.
-(define (make-protocol-method-site proto-name method-name)
+(define (make-protocol-method-site proto-name method-name . boundary-hooks)
+  ;; Buffered library sinks may need to publish their prefix BEFORE receiver
+  ;; classification invokes user predicates. No hook on proven callback-free
+  ;; family hits. Hooks never run under the registry mutex and may throw or
+  ;; reenter; acquire classification/epoch state AFTER the hook returns.
+  (unless (or (null? boundary-hooks)
+              (and (null? (cdr boundary-hooks)) (procedure? (car boundary-hooks))))
+    (error 'make-protocol-method-site "expected at most one boundary procedure"))
   (let ((proto (string-copy proto-name)) (method (string-copy method-name))
-        (cache #f) (family-cache #f))
+        (cache #f) (family-cache #f)
+        (boundary (and (pair? boundary-hooks) (car boundary-hooks))))
     (lambda (obj)
       (if (or (jrec? obj) (jreify? obj))
-          (protocol-resolve proto method obj)
+          (begin
+            (when boundary (boundary))
+            (protocol-resolve proto method obj))
           (let* ((family (protocol-method-family obj))
                  (owner (if (and family (fx=? family 0))
                             protocol-string-tag-chain-owner
@@ -1137,6 +1147,8 @@
                      (eq? value-host-tags (vector-ref family-snapshot 2))
                      (eq? domains (vector-ref family-snapshot 3)))
                 (vector-ref family-snapshot 4)
+          (begin
+          (when boundary (boundary))
           (let* ((ge jch-graph-epoch) (pe-before jolt-proto-epoch)
                  (tag-chain value-host-tags)
                  (tags (tag-chain obj))
@@ -1192,7 +1204,7 @@
                   (vector-set! next family (vector pe-before ge tag-chain domains f))
                   (memory-order-release)
                   (set! family-cache next)))
-              (or f (protocol-miss-throw proto method obj))))))))))
+              (or f (protocol-miss-throw proto method obj)))))))))))
 ;; Fixed-arity entry points the protocol-method shims call: no rest-list, no seq
 ;; round-trip — apply the resolved impl directly. defprotocol emits one clause per
 ;; declared arity that calls the matching dispatchN.

@@ -313,6 +313,7 @@ callbackdomains:
 .PHONY: protocolsite
 protocolsite:
 	@$(CHEZ) --script test/chez/protocol-method-site-test.ss
+	@$(CHEZ) --script test/chez/protocol-observable-boundary-test.ss
 	@$(CHEZ) --script test/chez/protocol-string-family-site-test.ss
 	@$(CHEZ) --script test/chez/protocol-primitive-family-site-test.ss
 	@$(CHEZ) --script test/chez/protocol-resolve-registration-test.ss

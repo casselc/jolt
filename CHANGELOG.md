@@ -14664,3 +14664,9 @@ Clojure-compatible standard library.
 [0.1.2]: https://github.com/jolt-lang/jolt/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jolt-lang/jolt/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jolt-lang/jolt/releases/tag/v0.1.0
+# Experimental work
+
+- Allow an optional pre-classification boundary on host protocol method sites
+  for buffered library sinks. Proven callback-free family hits omit it;
+  observable classification and record/reify resolution publish before effects.
+  Existing two-argument call sites are unchanged. Includes red/green tests.
