@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Qualify the same measured Chez implementation with its regenerated Gambit
+  record mirror (`f1116c53`). Keep full behavioral/shared CI mandatory after
+  the stale-mirror failure; require the matching source/tree/version and artifact
+  label rather than admitting a partial failed gate.
+
 - Add a source/tree/ancestry-pinned CI capability artifact producer for the
   measured 0.8.17-lineage plain runtime. Require behavioral CI and shared-build
   gates before packaging; keep compiler and workflow identities separate.
