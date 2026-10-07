@@ -747,14 +747,6 @@
         (10 . 110) (13 . 114) (9 . 116)))
     table))
 
-(define (durable-wal-put-hex4! port n)
-  (define (hex-digit x) (if (< x 10) (+ 48 x) (+ 87 x)))
-  (put-u8 port 92) (put-u8 port 117)
-  (put-u8 port (hex-digit (bitwise-and (bitwise-arithmetic-shift-right n 12) #xf)))
-  (put-u8 port (hex-digit (bitwise-and (bitwise-arithmetic-shift-right n 8) #xf)))
-  (put-u8 port (hex-digit (bitwise-and (bitwise-arithmetic-shift-right n 4) #xf)))
-  (put-u8 port (hex-digit (bitwise-and n #xf))))
-
 (define (jolt-str-durable-wal-bytes s)
   ;; One scalar scan, block port writes, and fresh per-call scratch/output.
   ;; Reserve twelve octets before a scalar: the widest spelling is one escaped

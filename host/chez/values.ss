@@ -509,8 +509,6 @@
 (define (eq-domain-metadata-mark! arm)
   (hashtable-set! eq-value-domain-arms arm #t))
 (define eq-scalar-arm-snapshot (cons #f '()))
-(define (eq-extension-value? x)
-  (not (or (procedure? x) (base-scalar? x))))
 (define (register-eq-arm! pred handler)
   (eq-arm-reject-fast-type! 'register-eq-arm! pred)
   ;; Predicates/probes run above, never under the metadata/publication lock.

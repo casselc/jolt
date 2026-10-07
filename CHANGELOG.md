@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Remove two unreferenced private helper procedures left by the guarded
+  equality/WAL implementations. Keep the dead-host consistency gate enabled;
+  live equality dispatch and WAL escaping paths are unchanged.
+
 - Regenerate the Gambit record mirror from the current Chez record/protocol
   sources after the guarded method-site changes. Restore the derived-source
   consistency gate without changing Chez runtime code or skipping CI checks.
