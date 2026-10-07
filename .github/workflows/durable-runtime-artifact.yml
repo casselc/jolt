@@ -44,6 +44,10 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$COMPILER_SOURCE"
           test "$(git rev-parse HEAD^{tree})" = "$COMPILER_TREE"
+          # Fork refs need not contain upstream release tags. Fetch this exact
+          # tag read-only, without force; verify its pinned objects below before
+          # it can supply the version label used by the build.
+          git fetch --no-tags https://github.com/jolt-lang/jolt.git refs/tags/v0.8.17:refs/tags/v0.8.17
           test "$(git rev-parse v0.8.17^{commit})" = "$UPSTREAM_SOURCE"
           test "$(git rev-parse v0.8.17^{tree})" = "$UPSTREAM_TREE"
           git merge-base --is-ancestor "$UPSTREAM_SOURCE" "$COMPILER_SOURCE"
