@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finite runtime-owned Repeat of a String. Preserve generic behavior for
   nonstrings, custom functions, fixed leading arguments and other sequences.
 
+- Render multiargument `str` values left-to-right, including custom `toString`
+  callbacks and exceptional exits. Preserve single-argument String identity.
+
 - Remove two unreferenced private helper procedures left by the guarded
   equality/WAL implementations. Keep the dead-host consistency gate enabled;
   live equality dispatch and WAL escaping paths are unchanged.

@@ -183,7 +183,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize smalldoubleprint plainhexformat finitestringrepeat hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize smalldoubleprint plainhexformat finitestringrepeat strrenderorder hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash callbackbridges callbackdomains protocolsite \
@@ -446,6 +446,11 @@ plainhexformat:
 .PHONY: finitestringrepeat
 finitestringrepeat:
 	@$(CHEZ) --script test/chez/finite-string-repeat-apply-test.ss
+
+.PHONY: strrenderorder
+strrenderorder: testbin
+	@$(CHEZ) --script test/chez/str-render-order-test.ss
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/str_render_order_test.clj
 
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss

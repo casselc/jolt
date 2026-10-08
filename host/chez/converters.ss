@@ -110,13 +110,20 @@
     ;; x.toString(), and core.logic's non-unique lvar equality compares those by
     ;; identity.
     ((a) (jolt-str-one a))
-    ((a b) (string-append (jolt-str-piece a) (jolt-str-piece b)))
-    ((a b c) (string-append (jolt-str-piece a) (jolt-str-piece b) (jolt-str-piece c)))
+    ((a b)
+     (let* ((sa (jolt-str-piece a)) (sb (jolt-str-piece b)))
+       (string-append sa sb)))
+    ((a b c)
+     (let* ((sa (jolt-str-piece a)) (sb (jolt-str-piece b)) (sc (jolt-str-piece c)))
+       (string-append sa sb sc)))
     ((a b c . rest)
-     (let loop ((xs rest) (acc (list (jolt-str-piece c) (jolt-str-piece b) (jolt-str-piece a))))
+     ;; Rendering may call user toString or throw. Scheme argument order is
+     ;; unspecified; establish the reference's left-to-right order explicitly.
+     (let* ((sa (jolt-str-piece a)) (sb (jolt-str-piece b)) (sc (jolt-str-piece c)))
+     (let loop ((xs rest) (acc (list sc sb sa)))
        (if (null? xs)
            (apply string-append (reverse acc))
-           (loop (cdr xs) (cons (jolt-str-piece (car xs)) acc)))))))
+           (loop (cdr xs) (cons (jolt-str-piece (car xs)) acc))))))))
 
 ;; jolt indices are flonums; substring etc. need exact ints. A fixnum is already
 ;; one — this sits on the proven-string .charAt/.substring path, so it must not
