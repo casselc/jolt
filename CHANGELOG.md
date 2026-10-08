@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Avoid per-element lazy cells and argument lists for `apply str` on a fresh,
+  finite runtime-owned Repeat of a String. Preserve generic behavior for
+  nonstrings, custom functions, fixed leading arguments and other sequences.
+
 - Remove two unreferenced private helper procedures left by the guarded
   equality/WAL implementations. Keep the dead-host consistency gate enabled;
   live equality dispatch and WAL escaping paths are unchanged.

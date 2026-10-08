@@ -2189,10 +2189,38 @@
   (cond ((jrec? f) (find-method-any-protocol (jrec-tag f) "applyTo"))
         ((jreify? f) (reify-method-ref f "applyTo"))
         (else #f)))
+(define (apply-str-finite-repeat tail)
+  ;; Only runtime-owned, still-unforced finite Repeat of an actual String.
+  ;; Its immutable source has no realization or rendering callbacks. Unknown
+  ;; tails, already-forced cells, infinite repeats and nonstrings stay generic.
+  (and (cseq? tail) (fx=? (cseq-kind tail) sk-repeat)
+       (string? (cseq-head tail))
+       (let ((source (cseq-tail tail)))
+         (and (lazy-src? source) (eq? (lazy-src-fn source) lz-repeat-val)
+              (let ((left (lazy-src-b source)) (piece (cseq-head tail)))
+                (and (fixnum? left) (fx>=? left 0)
+                     (fx<? left (most-positive-fixnum))
+                     (let ((n (fx+ left 1)) (width (string-length piece)))
+                       (and (or (fx=? width 0)
+                                (fx<=? n (fxquotient (most-positive-fixnum) width)))
+                            (cond
+                              ;; str's single-argument arm returns the original
+                              ;; String; preserve identity, not just characters.
+                              ((fx=? n 1) piece)
+                              ((fx=? width 0) "")
+                              ((fx=? width 1) (make-string n (string-ref piece 0)))
+                              (else
+                               (let* ((length (fx* n width)) (out (make-string length)))
+                                 (let loop ((offset 0))
+                                   (unless (fx=? offset length)
+                                     (sa-string-copy-range! out offset piece 0 width)
+                                     (loop (fx+ offset width))))
+                                 out)))))))))))
 (define (jolt-apply f . args)
   (let* ((r (reverse args)) (tail (car r)) (fixed (reverse (cdr r)))
          (v (and (procedure? f) (variadic-fixed-arity-of f))))
     (cond
+      ((and (eq? f jolt-str) (null? fixed) (apply-str-finite-repeat tail)))
       ((eq? f jolt-concat)
        ;; the reference's RestFn.applyTo first measures the args against concat's
        ;; two required ones (RT.boundedLength(args, 2)): three next() calls, so
