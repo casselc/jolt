@@ -253,7 +253,10 @@
 ;; assoc! is variadic. JVM: a complete first key/val pair present (>=3 kvs) with a
 ;; trailing lone key fills nil; a lone key alone (1 kv) is a wrong-arity throw.
 (define (assoc-pad kvs) (if (and (>= (length kvs) 3) (odd? (length kvs))) (append kvs (list jolt-nil)) kvs))
-(define (jolt-assoc! t . kvs0)
+(define jolt-assoc!
+  (case-lambda
+    ((t k v) (jolt-assoc-one! t k v))
+    ((t . kvs0)
   (cond
     ((jrec-trans-method t "assoc")
      => (lambda (m) (let lp ((xs (assoc-pad kvs0)))
@@ -266,7 +269,20 @@
       ((map) (let lp ((xs kvs)) (unless (null? xs) (tmap-put! t (car xs) (cadr xs)) (lp (cddr xs)))))
       ((vec) (let lp ((xs kvs)) (unless (null? xs) (tvec-assoc1! t (car xs) (cadr xs)) (lp (cddr xs)))))
       (else (jolt-transient-buf-set! t (apply jolt-assoc (jolt-transient-buf t) kvs)))))
-  t)))
+  t)))))
+(define (jolt-assoc-one! t k v)
+  ;; The common assoc! call has exactly one pair. Keep the same custom-method,
+  ;; active-transient and collection-kind ordering without a two-cell rest list.
+  (cond
+    ((jrec-trans-method t "assoc")
+     => (lambda (m) (jolt-invoke m t k v) t))
+    (else
+     (jolt-trans-check t "assoc!")
+     (case (jolt-transient-kind t)
+       ((map) (tmap-put! t k v))
+       ((vec) (tvec-assoc1! t k v))
+       (else (jolt-transient-buf-set! t (jolt-assoc (jolt-transient-buf t) k v))))
+     t)))
 (define (jolt-dissoc! t . ks)
   (cond
     ((jrec-trans-method t "without")

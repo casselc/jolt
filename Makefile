@@ -194,6 +194,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   systemstreams utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
+CI-GATES += transientassoc
 
 GATE-RECEIPT := target/gate-receipt
 
@@ -965,6 +966,10 @@ flow:
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
 	@$(CHEZ) --script test/chez/transient-test.ss
+
+.PHONY: transientassoc
+transientassoc: testbin
+	@JOLT_AOT_CACHE=0 target/release/jolt -Srepro -Sdeps '{:paths ["test"]}' -m transient-assoc-fixed-arity-test
 
 # RRB vector: catvec/slice against a list model with structural invariants
 # (seeded sequences, seed printed on failure), and the n-vs-4n complexity

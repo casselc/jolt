@@ -35,6 +35,18 @@
 (ok "use after persistent!"  (guard (e (#t #t)) (ev "(let [t (transient [])] (persistent! t) (conj! t 1))") #f))
 
 ;; --- one-way promotion: a transient that grew past the array limit and shrank
+(is "one pair returns original transient"
+    "(let [t (transient {})] (identical? t (assoc! t :a 1)))" "true")
+(is "one pair vector overwrites and appends"
+    "(persistent! (assoc! (assoc! (transient [1]) 0 2) 1 3))" "[2 3]")
+(ok "one pair rejects inactive map"
+    (guard (e (#t #t)) (ev "(let [t (transient {})] (persistent! t) (assoc! t :a 1))") #f))
+(ok "one pair rejects non-transient"
+    (guard (e (#t #t)) (ev "(assoc! {} :a 1)") #f))
+(is "one pair custom method called once"
+    "(do (deftype AssocProbe [calls] clojure.lang.ITransientMap (assoc [this k v] (swap! calls conj [k v]) this)) (let [calls (atom []) t (AssocProbe. calls)] [(identical? t (assoc! t :key :value)) @calls]))"
+    "[true [[:key :value]]]")
+
 ;; back comes down a HASH map (JVM TransientArrayMap promotes on the way up and
 ;; never returns; jolt used to decide lazily from the final count).
 (is "promoted stays hash (type)"

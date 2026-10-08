@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Avoid a temporary rest list for the ordinary three-argument `assoc!` call.
+  Preserve custom transient dispatch, active-state checks, map/vector/copy-on-write
+  updates, and the existing variadic padding and error behavior.
+
 - Avoid per-element lazy cells and argument lists for `apply str` on a fresh,
   finite runtime-owned Repeat of a String. Preserve generic behavior for
   nonstrings, custom functions, fixed leading arguments and other sequences.
