@@ -183,7 +183,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize smalldoubleprint plainhexformat hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize smalldoubleprint plainhexformat strrenderorder hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash callbackbridges callbackdomains protocolsite \
@@ -441,6 +441,10 @@ corpus:
 .PHONY: plainhexformat
 plainhexformat:
 	@$(CHEZ) --script test/chez/plain-hex-format-test.ss
+
+.PHONY: strrenderorder
+strrenderorder:
+	@$(CHEZ) --script test/chez/str-render-order-test.ss
 
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
