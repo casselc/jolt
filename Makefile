@@ -443,8 +443,9 @@ plainhexformat:
 	@$(CHEZ) --script test/chez/plain-hex-format-test.ss
 
 .PHONY: strrenderorder
-strrenderorder:
+strrenderorder: testbin
 	@$(CHEZ) --script test/chez/str-render-order-test.ss
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/str_render_order_test.clj
 
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
