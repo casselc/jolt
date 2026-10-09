@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Select the locally qualified cumulative sorted-dispatch runtime for the
+  plain collector artifact producer. Retain existing source/tree custody and
+  CI gates; require actual built sorted-lookup allocation and an old-dispatch
+  negative control before publishing allowlisted capability metadata.
+
 ### Changed
 
 - Advance the selected Durable runtime artifact producer to the exact plain

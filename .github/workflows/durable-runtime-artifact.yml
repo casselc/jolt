@@ -32,10 +32,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: collector-string-vector
-            compiler_source: 20f25cf4cbef710ab00cd7ea7b903233477557e0
-            compiler_tree: 3aee47cd18b1e86c44b5e8db478af524afe98314
-            artifact_name: durable-runtime-20f25cf4-linux-x64
+          - label: collector-sorted-dispatch
+            compiler_source: 7c57cf7e5bca789efe31706d4f9830df8a08306a
+            compiler_tree: d5dca7ebaba66cf429d2c63219026b8415675dec
+            artifact_name: durable-runtime-7c57cf7e-linux-x64
     env:
       COMPILER_SOURCE: ${{ matrix.compiler_source }}
       COMPILER_TREE: ${{ matrix.compiler_tree }}
@@ -149,6 +149,37 @@ jobs:
               (assert (false? negative))
               (println :fixed-vector-constructor-capability-pass :old-body-control-rejected))'
 
+      - name: Require sorted dispatch source and built allocation capabilities
+        run: |
+          set -euo pipefail
+          timeout --kill-after=5s 60s /opt/chez/bin/chez --script test/chez/sorted-op-dispatch-test.ss
+          timeout --kill-after=5s 30s target/release/jolt -Srepro -e '
+            (require (quote [jolt.host :as host]) (quote [jolt.scheme :as scheme]))
+            (let [codes (sorted-map :absent 1 :historical-untyped 0 :invalid 4
+                                    :present-empty 2 :valid 3)
+                  run (fn [] (loop [i 0 sum 0]
+                               (if (= i 20000) sum
+                                 (recur (inc i) (+ sum (get codes :valid))))))
+                  allocated (fn []
+                              (dotimes [_ 3] (assert (= 60000 (run))))
+                              (let [before (+ (host/gc-bytes) (host/bytes-allocated))]
+                                (dotimes [_ 20] (assert (= 60000 (run))))
+                                (/ (- (+ (host/gc-bytes) (host/bytes-allocated)) before) 20.0)))
+                  [install-old restore]
+                  (scheme/eval-string
+                    "(let ((saved sc-call))
+                       (jolt-vector
+                         (lambda () (set! sc-call
+                           (lambda (sc op . args) (apply jolt-invoke (sc-op sc op) sc args))))
+                         (lambda () (set! sc-call saved))))")]
+              (assert (< (allocated) 8192))
+              (try
+                (install-old)
+                (assert (> (allocated) 65536))
+                (finally (restore)))
+              (assert (< (allocated) 8192))
+              (println :sorted-dispatch-capability-pass :old-body-control-rejected))'
+
       - name: Verify built source remains unchanged
         run: |
           set -euo pipefail
@@ -188,6 +219,7 @@ jobs:
             printf 'binary_version=%s\n' "$(target/release/jolt --version)"
             printf 'binary_sha256=%s\n' "$(sha256sum target/release/jolt | cut -d ' ' -f 1)"
             printf 'gate=ci-pass\nranged_append_ascii=98\nfixed_vector_constructor=pass\nfixed_vector_constructor_control=old-rejected\n'
+            printf 'sorted_dispatch_allocation=pass\nsorted_dispatch_control=old-rejected\n'
             printf 'submodules_begin\n'
             git submodule status --recursive
             printf 'submodules_end\n'
