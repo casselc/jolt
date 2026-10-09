@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Advance the selected Durable runtime artifact producer to the exact plain
+  collector string/vector compiler. Require its compiler CI/build-library and
+  executable capability gates; retain historical artifact receipts without
+  rebuilding unchanged baselines. This does not migrate the aspect compiler or
+  qualify downstream applications, hosted S3 or a new release.
+
 - Synchronize cold weak-table equality-domain metadata reads and registration
   publication. Preserve weak retirement, lock-free warm snapshots and callbacks
   outside locks; add deterministic lock witnesses and concurrent registration
