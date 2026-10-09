@@ -1054,7 +1054,7 @@
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
 (define jolt-vreg-current-fiber 0)  ; fibers.ss: the running fiber record, or 0 (fixnum) when not on a fiber
 ;; slot 1: fibers.ss jolt-vreg-park-unwinding — a park escape is unwinding this carrier
-;; slot 5: hasheq.ss jolt-vreg-hasheq-caches — this thread's (symbol . string) hasheq tables
+;; slot 5: hasheq.ss jolt-vreg-hasheq-caches — per-thread (symbol table . string cache slots)
 ;; slot 7: locks.ss jolt-vreg-locks — how many locks this carrier holds; the
 ;;   scheduler refuses to preempt a fiber while it is non-zero
 ;; slot 6: fibers.ss jolt-vreg-fiber-winder-base — the winder chain this carrier

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Bound the per-thread string-hash cache with fixed identity-checked slots,
+  avoiding cache-entry allocation on fresh telemetry keys. Preserve exact
+  JVM-compatible hash values; selector collisions only evict entries.
+
 - Avoid a temporary rest list for the ordinary three-argument `assoc!` call.
   Preserve custom transient dispatch, active-state checks, map/vector/copy-on-write
   updates, and the existing variadic padding and error behavior.

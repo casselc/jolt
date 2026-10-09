@@ -332,6 +332,7 @@ recordinline:
 # sweep over every length and char class.
 hasheq:
 	@$(CHEZ) --script test/chez/hasheq-test.ss
+	@$(CHEZ) --script test/chez/string-hash-cache-test.ss
 
 # The same suites again with the hash engine's NARROW arms selected. hasheq.ss
 # and collections.ss compute in the Java int window, which is fixnum on a 64-bit
@@ -343,6 +344,7 @@ hasheq:
 # read during expansion, so gate-boot has to compile the preamble from source.
 narrowhash:
 	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/hasheq-test.ss
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/string-hash-cache-test.ss
 	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/values-test.ss
 	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/transient-test.ss
 

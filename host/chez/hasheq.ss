@@ -574,11 +574,13 @@
 ;; thread-parameter, and a freshly forked thread starts every slot at fixnum 0,
 ;; which is what "not allocated yet" means here.
 (define jolt-vreg-hasheq-caches 5)
+(define string-hasheq-cap 2048)
 
 (define (hasheq-caches)
   (let ((c (virtual-register jolt-vreg-hasheq-caches)))
     (if (eq? c 0)
-        (let ((v (cons (make-weak-eq-hashtable) (make-eq-hashtable))))
+        (let ((v (cons (make-weak-eq-hashtable)
+                       (make-vector (fx* 2 string-hasheq-cap) #f))))
           (set-virtual-register! jolt-vreg-hasheq-caches v)
           v)
         c)))
@@ -631,23 +633,31 @@
 ;; The JVM caches String.hashCode in the object; jolt strings are plain Chez
 ;; strings with nowhere to put it, so they use the per-thread table above.
 ;;
-;; The table is BOUNDED and STRONG, not weak, for the reason the symbol cache
-;; left weak tables (see symbol-hasheq): a string hashed once and dropped — a
-;; substring cut for one map lookup, a key built by str — misses, is inserted,
-;; and is then an entry every collection must trace and clear. Eight threads
-;; hashing fresh strings ran 12x slower per thread than one under that churn.
-;; A hot working set of keys stays far below the cap; a miss-heavy workload
-;; clears and refills, amortized O(1), and gives the collector nothing to scan.
-(define string-hasheq-cap 2048)
+;; Fixed per-thread storage retains at most 2048 identities, with no entry
+;; allocation or table clearing on misses. The selector is NOT the public
+;; hash: only eq? authorizes a hit, so collisions merely evict. It examines
+;; constant-size string boundaries rather than walking long strings on hits.
+;; The masked length bounds arithmetic even on narrow fixnum hosts; Unicode
+;; scalar values times 33 fit the narrow fixnum window. Jolt strings are
+;; immutable at the API boundary, as required by the prior identity cache.
+(define (string-hasheq-cache-slot s)
+  (let* ((n (string-length s))
+         (selector (if (fx=? n 0) 0
+                       (fx+ (fx* (fxand n 2047) 131)
+                         (fx+ (char->integer (string-ref s 0))
+                           (fx* 33 (char->integer (string-ref s (fx- n 1)))))))))
+    (fx* 2 (fxand selector 2047))))
 (define (compute-string-hasheq s)
   (murmur3-hash-int (java-string-hashcode s)))
 
 (define (string-hasheq s)
-  (let ((t (cdr (hasheq-caches))))
-    (or (hashtable-ref t s #f)
+  (let* ((slots (cdr (hasheq-caches))) (at (string-hasheq-cache-slot s)))
+    (if (eq? s (vector-ref slots at))
+        (vector-ref slots (fx+ at 1))
         (let ((h (compute-string-hasheq s)))
-          (when (fx>=? (hashtable-size t) string-hasheq-cap) (hashtable-clear! t))
-          (hashtable-set! t s h)
+          ;; This thread owns both slots; this native path cannot park a fiber.
+          (vector-set! slots (fx+ at 1) h)
+          (vector-set! slots at s)
           h))))
 
 ;; ============================================================================
