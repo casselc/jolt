@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Avoid rest/apply argument lists for sorted-collection operations with up to
+  three operation arguments. Resolve the current operation on every call and
+  preserve generic callable/large-arity fallback. A process-local prototype
+  saved 80 bytes per ordinary sorted-map lookup; built-runtime qualification
+  and complete collector throughput remain separate gates.
+
+- Read the fixed sorted-collection type field without reconstructing its
+  namespaced keyword string. Read current tags on every classification;
+  public tagged-table key conversion and mutation semantics are unchanged.
+
 - Bound the per-thread string-hash cache with fixed identity-checked slots,
   avoiding cache-entry allocation on fresh telemetry keys. Preserve exact
   JVM-compatible hash values; selector collisions only evict entries.

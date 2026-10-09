@@ -114,12 +114,22 @@
 (define kw-op-conj (keyword #f "conj"))
 (define kw-op-disj (keyword #f "disj"))
 
-(define (htable-sorted-map? x) (and (htable? x) (jolt=2 (jolt-ref-get x kw-jtype) kw-sorted-map)))
-(define (htable-sorted-set? x) (and (htable? x) (jolt=2 (jolt-ref-get x kw-jtype) kw-sorted-set)))
+;; This canonical field name is fixed; do not concatenate its namespace/name
+;; on every classifier call. Read the current table value, never cache a tag.
+(define (htable-sorted-map? x)
+  (and (htable? x) (jolt=2 (hashtable-ref (htable-h x) "jolt/type" jolt-nil) kw-sorted-map)))
+(define (htable-sorted-set? x)
+  (and (htable? x) (jolt=2 (hashtable-ref (htable-h x) "jolt/type" jolt-nil) kw-sorted-set)))
 (define (htable-sorted? x) (or (htable-sorted-map? x) (htable-sorted-set? x)))
 ;; the op fn for `op-kw` from the value's attached :ops map, then invoke it on sc.
 (define (sc-op sc op-kw) (jolt-get (jolt-ref-get sc kw-ops) op-kw jolt-nil))
-(define (sc-call sc op-kw . args) (apply jolt-invoke (sc-op sc op-kw) sc args))
+(define sc-call
+  (case-lambda
+    ((sc op-kw) (jolt-invoke1 (sc-op sc op-kw) sc))
+    ((sc op-kw a) (jolt-invoke2 (sc-op sc op-kw) sc a))
+    ((sc op-kw a b) (jolt-invoke3 (sc-op sc op-kw) sc a b))
+    ((sc op-kw a b c) (jolt-invoke4 (sc-op sc op-kw) sc a b c))
+    ((sc op-kw . args) (apply jolt-invoke (sc-op sc op-kw) sc args))))
 
 ;; --- extend the collection dispatchers with a sorted arm ---------------------
 ;; A sorted coll's seq is clojure.lang.PersistentTreeMap$Seq, and the :seq op hands

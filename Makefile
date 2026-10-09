@@ -1395,6 +1395,10 @@ foreignhandles:
 dispatchalloc:
 	@$(CHEZ) --script test/chez/method-dispatch-alloc-test.ss
 
+.PHONY: sorteddispatchalloc
+sorteddispatchalloc:
+	@$(CHEZ) --script test/chez/sorted-op-dispatch-test.ss
+
 # A Matcher owns its match vector and source triple: repeated finds allocate
 # the result, not the machinery; .group reads the last match, none after a miss.
 regexmatcher:
