@@ -298,6 +298,7 @@ selfhost:
 values:
 	@$(CHEZ) --script test/chez/values-test.ss
 	@$(CHEZ) --script test/chez/string-builder-materialize.ss
+	@$(CHEZ) --script test/chez/vector-constructor-test.ss
 
 # Registration-time callback adapters retain invocation and equality semantics.
 .PHONY: callbackbridges

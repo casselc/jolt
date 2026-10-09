@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   avoiding cache-entry allocation on fresh telemetry keys. Preserve exact
   JVM-compatible hash values; selector collisions only evict entries.
 
+- Construct dynamic vectors of up to one 32-element tail chunk without a
+  temporary rest-argument list. Preserve fresh result/element identity and the
+  original larger-arity fallback. A process-local typed-row screen removed
+  about 4.5 MB per 10k rows; no end-to-end throughput gain is claimed yet.
+
 - Avoid a temporary rest list for the ordinary three-argument `assoc!` call.
   Preserve custom transient dispatch, active-state checks, map/vector/copy-on-write
   updates, and the existing variadic padding and error behavior.
