@@ -1766,7 +1766,11 @@
                 (set! bits (+ bits 6))
                 (when (>= bits 8)
                   (set! bits (- bits 8))
-                  (set! out (cons (bitwise-and (bitwise-arithmetic-shift-right acc bits) 255) out))))
+                  (set! out (cons (bitwise-and (bitwise-arithmetic-shift-right acc bits) 255) out))
+                  ;; Retain only the unconsumed low bits. Keeping the emitted
+                  ;; prefix makes acc grow with input and every shift copy an
+                  ;; increasingly large bignum (quadratic work/allocations).
+                  (set! acc (bitwise-and acc (- (bitwise-arithmetic-shift-left 1 bits) 1)))))
               (string->list str))
     (u8-list->bytevector (reverse out))))
 ;; .encode / .decode return byte[] on the JVM, so they return a jolt byte-array here

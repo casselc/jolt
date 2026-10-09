@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Keep only unconsumed bits in the Base64 decoder accumulator. Avoid growing
+  bignum shifts and quadratic allocation on large nonzero payloads, preserving
+  the existing basic/URL/MIME output and filtering behavior. Add a bounded
+  allocation regression with a byte-equivalent known-bad recurrence control.
+
 - Bound the per-thread string-hash cache with fixed identity-checked slots,
   avoiding cache-entry allocation on fresh telemetry keys. Preserve exact
   JVM-compatible hash values; selector collisions only evict entries.

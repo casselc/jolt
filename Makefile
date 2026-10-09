@@ -195,6 +195,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
 CI-GATES += transientassoc
+CI-GATES += base64bounded
 
 GATE-RECEIPT := target/gate-receipt
 
@@ -448,6 +449,10 @@ plainhexformat:
 .PHONY: finitestringrepeat
 finitestringrepeat:
 	@$(CHEZ) --script test/chez/finite-string-repeat-apply-test.ss
+
+.PHONY: base64bounded
+base64bounded:
+	@$(CHEZ) --script test/chez/base64-bounded-accumulator-test.ss
 
 .PHONY: strrenderorder
 strrenderorder: testbin
