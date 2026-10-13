@@ -488,6 +488,10 @@ strrenderorder: testbin
 	@$(CHEZ) --script test/chez/str-render-order-test.ss
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/str_render_order_test.clj
 
+.PHONY: base64directoutput
+base64directoutput: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/base64_direct_output_test.clj
+
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
 
