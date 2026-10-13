@@ -1215,7 +1215,25 @@
 ;; so it gets its own record rather than the object's — but the hard part it needs
 ;; is exactly this (jolt-ga8o). One implementation, two locks.
 (define (make-monitor)
-  (vector (make-mutex) #f 0 #f '() #f #f '()))
+  (vector #f #f 0 #f '() #f #f '()))
+
+;; Cold-path publication seam, also used by the spurious-CAS regression gate.
+(define (monitor-publish-backing-mutex! m candidate)
+  (vector-cas! m monitor-i-bk #f candidate))
+(define (monitor-backing-mutex! m)
+  (let ((published (vector-ref m monitor-i-bk)))
+    (memory-order-acquire)
+    (if published published
+        (let ((candidate (make-mutex)))
+          ;; Construct before publishing. A failed weak CAS with no winner is
+          ;; retried with this SAME candidate; losing candidates are never used.
+          (memory-order-release)
+          (let retry ()
+            (if (monitor-publish-backing-mutex! m candidate)
+                candidate
+                (let ((winner (vector-ref m monitor-i-bk)))
+                  (memory-order-acquire)
+                  (if winner winner (retry)))))))))
 
 ;; Called only with this monitor's bk held. Install once before any waiter can
 ;; publish itself or release bk; the identity is then stable for every wake.
@@ -1352,7 +1370,7 @@
           (call-with-thread-state (thread-enter-state)
             (lambda ()
               (jolt-condition-wait (monitor-condition-under-bk! m monitor-i-cv)
-                                   (vector-ref m monitor-i-bk))))
+                                   (monitor-backing-mutex! m))))
           #f))))
 ;; What a thread waiting in monitor-wait! is: BLOCKED for a monitor (locking), and
 ;; WAITING for a ReentrantLock, which parks on the JVM rather than blocking.
@@ -1391,7 +1409,7 @@
   (monitor-enter-masked! m)
   (jolt-locks-exit!))
 (define (monitor-enter-slow! m me)
-  (jolt-lock-wait (vector-ref m monitor-i-bk)
+  (jolt-lock-wait (monitor-backing-mutex! m)
     (lambda ()
       (let loop ()
         (let ((w (vector-ref m monitor-i-owner)))
@@ -1440,17 +1458,17 @@
 ;; would tell a live thread it holds a lock a dead fiber took. Release is lenient
 ;; because the alternative is leaking the monitor; a query has no such excuse.
 (define (monitor-held-by-self? m)
-  (jolt-with-mutex (vector-ref m monitor-i-bk)
+  (jolt-with-mutex (monitor-backing-mutex! m)
     (eq? (monitor-owner-id m) (monitor-self))))
 ;; getHoldCount is "holds by the CURRENT thread" on the JVM — 0 for anyone else,
 ;; not the raw depth.
 (define (monitor-self-count m)
-  (jolt-with-mutex (vector-ref m monitor-i-bk)
+  (jolt-with-mutex (monitor-backing-mutex! m)
     (if (eq? (monitor-owner-id m) (monitor-self))
         (vector-ref m monitor-i-count)
         0)))
 (define (monitor-locked? m)
-  (jolt-with-mutex (vector-ref m monitor-i-bk)
+  (jolt-with-mutex (monitor-backing-mutex! m)
     (and (vector-ref m monitor-i-owner) #t)))
 
 ;; One round of a POLLED wait — the bounded and interruptible acquires, which
@@ -1502,7 +1520,7 @@
     (when masked? (jolt-locks-exit!))))
 (define (monitor-exit-slow! m me masked?)
   (let ((wake
-         (jolt-with-mutex (vector-ref m monitor-i-bk)
+         (jolt-with-mutex (monitor-backing-mutex! m)
            (unless (monitor-owner? m me)
              (when masked? (jolt-locks-exit!))
              (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
@@ -1650,7 +1668,7 @@
 ;; default; arbitrary permits fair, and a wait set is short enough that the append
 ;; is not worth a second data structure.
 (define (monitor-wait-enter! m me w)
-  (let ((r (jolt-with-mutex (vector-ref m monitor-i-bk)
+  (let ((r (jolt-with-mutex (monitor-backing-mutex! m)
              (unless (monitor-owner? m me)
                (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
                                                 "current thread is not owner")))
@@ -1698,7 +1716,7 @@
 ;; able to make progress.
 (define (monitor-wait-exit! m saved w threw?)
   (monitor-enter-masked! m)
-  (jolt-with-mutex (vector-ref m monitor-i-bk)
+  (jolt-with-mutex (monitor-backing-mutex! m)
     (vector-set! m monitor-i-count saved)
     (let ((ws (vector-ref m monitor-i-waiters)))
       (cond
@@ -1733,7 +1751,7 @@
         (jolt-locks-exit!)
         (guard (e (#t (retake! #t) (raise e)))
           (jolt-cv-wait-interruptibly "Object.wait"
-            (vector-ref m monitor-i-bk) (vector-ref m monitor-i-wcv) deadline
+            (monitor-backing-mutex! m) (vector-ref m monitor-i-wcv) deadline
             (lambda (timed-out?)
               (cond ((unbox w) #t)
                     ;; the deadline is read by decide, never signalled, so a timeout
@@ -1752,7 +1770,7 @@
 
 (define (monitor-notify! m all?)
   (let ((me (monitor-self)))
-    (jolt-with-mutex (vector-ref m monitor-i-bk)
+    (jolt-with-mutex (monitor-backing-mutex! m)
       (unless (monitor-owner? m me)
         (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
                                          "current thread is not owner")))

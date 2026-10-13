@@ -56,7 +56,7 @@
         (sleep (make-time 'time-duration 1000000 0))
         (loop)))))
 (await "writer append did not contend on buffer monitor"
-       (lambda () (jolt-with-mutex (vector-ref attached monitor-i-bk)
+       (lambda () (jolt-with-mutex (monitor-backing-mutex! attached)
                     (and (vector-ref attached monitor-i-cv) #t))))
 (gate-check "writer append blocked before buffer unlock" (with-mutex mu done) #f)
 (monitor-exit! (object-monitor buffer))

@@ -199,6 +199,11 @@ CI-GATES += transientassoc
 CI-GATES += writernativeseam
 CI-GATES += monitorlazyconditions
 CI-GATES += attachedbuffermonitor
+CI-GATES += monitorlazybacking
+
+.PHONY: monitorlazybacking
+monitorlazybacking:
+	@$(CHEZ) --script test/chez/monitor-lazy-backing-test.ss
 
 .PHONY: attachedbuffermonitor
 attachedbuffermonitor:
