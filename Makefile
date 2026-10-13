@@ -198,6 +198,11 @@ TEST-GATES := submodules selfhost ci
 CI-GATES += transientassoc
 CI-GATES += writernativeseam
 CI-GATES += monitorlazyconditions
+CI-GATES += attachedbuffermonitor
+
+.PHONY: attachedbuffermonitor
+attachedbuffermonitor:
+	@$(CHEZ) --script test/chez/attached-string-buffer-monitor-test.ss
 
 .PHONY: monitorlazyconditions
 monitorlazyconditions:

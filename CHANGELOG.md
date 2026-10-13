@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Keep the concrete StringBuffer's monitor on its already-owned state instead
+  of registering it in the global weak table. Public buffer locking/wait/notify
+  and writer methods resolve the same monitor; locking the StringWriter object
+  itself retains a separate ordinary Object monitor. No synchronization removed.
+
 - Allocate monitor entry and Object.wait conditions only when used, under the
   existing backing mutex before waiter publication. Uncontended synchronization
   keeps the same ownership protocol without allocating unused wait conditions.

@@ -1275,10 +1275,19 @@
   (vector-set! m monitor-i-owner #f))
 
 (define (object-monitor obj)
-  (jolt-with-mutex monitor-table-lock
-    (or (hashtable-ref monitor-table obj #f)
-        (let ((m (make-monitor)))
-          (hashtable-set! monitor-table obj m) m))))
+  ;; Only the concrete runtime StringBuffer owns an attached monitor. A
+  ;; StringWriter shares its buffer's state but is a DIFFERENT Object monitor;
+  ;; locking the writer must therefore keep the ordinary table path.
+  (or (and (jhost? obj) (string? (jhost-tag obj))
+           (string=? (jhost-tag obj) "string-buffer")
+           (let ((st (jhost-state obj)))
+             (and (vector? st) (fx=? (vector-length st) 8)
+                  (eq? (vector-ref st 2) obj)
+                  (vector-ref st 4))))
+      (jolt-with-mutex monitor-table-lock
+        (or (hashtable-ref monitor-table obj #f)
+            (let ((m (make-monitor)))
+              (hashtable-set! monitor-table obj m) m)))))
 
 ;; Who is asking. The FIBER when there is one, and this is the field that decides
 ;; reentrancy, so it is also what stopped a sibling fiber walking into a held

@@ -263,7 +263,12 @@
 (define (make-locked-sb tag st)
   (let ((h (make-jhost tag st)))
     (vector-set! st 2 h)
-    (vector-set! st 4 (object-monitor h))
+    ;; This runtime-owned concrete buffer publishes its monitor with its state.
+    ;; object-monitor reads the same slot for locking/wait/notify; other tags
+    ;; retain ordinary monitor-table identity.
+    (vector-set! st 4 (if (string=? tag "string-buffer")
+                         (make-monitor)
+                         (object-monitor h)))
     h))
 
 ;; The JDK compares builders char by char, then by length.
