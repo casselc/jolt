@@ -298,19 +298,28 @@
 ;; Same accumulator as StringBuilder, and for the same reason: writing to a
 ;; StringWriter a piece at a time — which is what printStackTrace and every
 ;; print-to-a-writer path does — used to copy the whole buffer per write.
-(register-class-ctor! "StringWriter" (lambda args (make-jhost "writer" (vector "" '() 0))))
 ;; The compiler's guarded Appendable fast path recognizes only this concrete
 ;; accumulator tag. Other Writer/Appendable implementations keep dispatch.
 (define (string-writer? x) (and (jhost? x) (string=? (jhost-tag x) "writer")))
+;; As on the JDK, a StringWriter writes into a StringBuffer and synchronizes on
+;; it: the writer and its getBuffer share one store, whose lock is that buffer.
+(register-class-ctor! "StringWriter"
+  (lambda args
+    (let ((size (if (null? args) 16 (jnum->exact (car args)))))
+      (when (< size 0) (throw-jvm 'IllegalArgumentException "Negative buffer size"))
+      (let ((st (make-sb-state "" size)))
+        (make-locked-sb "string-buffer" st)
+        (make-jhost "writer" st)))))
 (register-host-methods! "writer"
-  (list (cons "write" (lambda (self x . rest) (sb-append! self (writer-piece-range x rest)) jolt-nil))
-        (cons "append" (lambda (self x . rest) (sb-append! self (append-text x rest)) self))
+  (list (cons "write" (lambda (self x . rest) (sb-append*! self (writer-piece-range x rest)) jolt-nil))
+        (cons "append" (lambda (self x . rest) (sb-append*! self (append-text x rest)) self))
         (cons "flush" (lambda (self) jolt-nil))
         (cons "close" (lambda (self) jolt-nil))
-        (cons "toString" (lambda (self) (sb-str self)))))
+        (cons "getBuffer" (lambda (self) (vector-ref (jhost-state self) 2)))
+        (cons "toString" (lambda (self) (sb-str* self)))))
 ;; (str sw) / print a StringWriter -> its accumulated content, like the JVM
 ;; (str calls toString) — data.csv writes CSV to a StringWriter and reads it back.
-(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "writer"))) sb-str)
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "writer"))) sb-str*)
 
 ;; a file-backed writer (clojure.java.io/writer of a File/path): accumulates like
 ;; StringWriter, then persists to the path on flush/close, so
@@ -467,7 +476,7 @@
     ;; a with-out-str writes to the capture rather than past it.
     ((and (jhost? t) (string=? (jhost-tag t) "port-writer"))
      (display s (port-writer-port t)))
-    ((jhost? t) (sb-append! t s))
+    ((jhost? t) (sb-append*! t s))
     (else (jolt-invoke (var-deref "clojure.pprint" "-write") t s))))
 (define (pw-text! self s)
   (let ((t (pw-target self)))
@@ -1534,7 +1543,7 @@
 (define (indexed->rseq v i)
   (if (fx<? i 0)
       jolt-nil
-      (cseq-lazy/k (jolt-nth v i) (make-lazy-src lz-indexed-rseq v (fx- i 1)) sk-rseq)))
+      (make-cseqn (jolt-nth v i) (make-lazy-src lz-indexed-rseq v (fx- i 1)) sk-rseq jolt-nil (fx+ i 1))))
 (let ((rseq-ctor (lambda (v i) (indexed->rseq v (jnum->exact i)))))
   (register-class-ctor! "APersistentVector$RSeq" rseq-ctor)
   (register-class-ctor! "clojure.lang.APersistentVector$RSeq" rseq-ctor))
@@ -3270,7 +3279,7 @@
 (define %shim-nth jolt-nth)
 (define (shim-nth-target coll)
   (cond ((al-family? coll) (list->cseq (al->list coll)))
-        ((sb-jhost? coll) (sb-str coll))
+        ((sb-jhost? coll) (sb-str* coll))
         (else coll)))
 (set! jolt-nth
   (case-lambda

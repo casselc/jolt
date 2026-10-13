@@ -36,13 +36,32 @@
 (ok "actual metadata read and write hold counted lock"
     (and (> reads 0) (> writes 0) locked?))
 (define previous-reads reads)
-(define original-enter jolt-locks-enter!)
-(define entered-locks 0)
-(set! jolt-locks-enter! (lambda ()
-  (set! entered-locks (+ entered-locks 1)) (original-enter)))
-(ok "warm lookup returns identical immutable snapshot" (eq? cold (eq-scalar-arms captured)))
-(set! jolt-locks-enter! original-enter)
-(ok "warm lookup acquires no counted lock" (= entered-locks 0))
+;; Lock-depth edges are syntax on 0.8.19+, not replaceable procedures. Poison
+;; the actual cold-path mutex instead: any attempted acquire raises, whereas a
+;; genuinely warm lookup does not consult it. Restore before registration/stress.
+(define original-metadata-mu eq-domain-metadata-mu)
+(define original-lock-depth (jolt-locks-held))
+(define warm-answer #f)
+(define warm-threw? #f)
+(define cold-rejected? #f)
+(dynamic-wind
+  (lambda () (set! eq-domain-metadata-mu #f))
+  (lambda ()
+    (guard (e (#t (set! warm-threw? #t)))
+      (set! warm-answer (eq-scalar-arms captured)))
+    ;; Positive control: changing only registry identity forces the cold path,
+    ;; which must attempt this same poisoned mutex and fail.
+    (guard (e (#t (set! cold-rejected? #t)))
+      (eq-scalar-arms (cons (cons unclaimed (lambda (a b) #f)) captured))))
+  (lambda ()
+    (set! eq-domain-metadata-mu original-metadata-mu)
+    ;; The deliberately invalid mutex raises in the acquire before-thunk,
+    ;; before a lock exists or its after-thunk is installed. Reset only this
+    ;; injected witness's depth so later real-lock assertions remain meaningful.
+    (set-virtual-register! jolt-vreg-locks original-lock-depth)))
+(ok "warm lookup returns identical immutable snapshot" (eq? cold warm-answer))
+(ok "warm lookup does not acquire metadata mutex" (not warm-threw?))
+(ok "cold control rejects poisoned metadata mutex" cold-rejected?)
 (ok "warm lookup performs no table reads" (= reads previous-reads))
 (define original-snapshot eq-scalar-arm-snapshot)
 (register-eq-arm! (lambda (a b)

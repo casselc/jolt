@@ -274,30 +274,31 @@
                      a)
                  #f)))))
 
-;; The warning for a data_readers namespace that failed to load — everything the
-;; reader needs to act on it: which namespace, why, WHERE it failed (the throw's
+;; The warning (under JOLT_WARNINGS, rt.ss jolt-warnings?) for a data_readers
+;; namespace that failed to load — everything the reader needs to act on it: which namespace, why, WHERE it failed (the throw's
 ;; own position, in the shape the uncaught report uses), and which tags of the
 ;; file now have no reader. The load's position does not outlive the warning:
 ;; load-jolt-file* unwinds it, so the next error in the process is not reported
 ;; "at" this namespace's failing form.
 (define (ldr-warn-reader-ns-failed! ns-name e readers)
-  (let ((port (current-error-port))
-        (msg (guard (_ (#t "(unprintable error)"))
-               ((var-deref "jolt.host" "condition-message") e)))
-        (where (jolt-throwable-source-string e))
-        (tags (sort string<?
-                    (pmap-fold readers
-                               (lambda (k v a)
-                                 (if (and (symbol-t? v) (equal? (symbol-t-ns v) ns-name))
-                                     (cons (string-append "#" (jolt-pr-str k)) a)
-                                     a))
-                               '()))))
-    (display (string-append "jolt: warning: data-reader namespace " ns-name
-                            " failed to load: " msg "\n")
-             port)
-    (when where (display (string-append "  at " where "\n") port))
-    (unless (null? tags)
-      (display (string-append "  tags " (jolt-str-join tags) " will not read\n") port))))
+  (when (jolt-warnings?)
+    (let ((port (current-error-port))
+          (msg (guard (_ (#t "(unprintable error)"))
+                 ((var-deref "jolt.host" "condition-message") e)))
+          (where (jolt-throwable-source-string e))
+          (tags (sort string<?
+                      (pmap-fold readers
+                                 (lambda (k v a)
+                                   (if (and (symbol-t? v) (equal? (symbol-t-ns v) ns-name))
+                                       (cons (string-append "#" (jolt-pr-str k)) a)
+                                       a))
+                                 '()))))
+      (display (string-append "jolt: warning: data-reader namespace " ns-name
+                              " failed to load: " msg "\n")
+               port)
+      (when where (display (string-append "  at " where "\n") port))
+      (unless (null? tags)
+        (display (string-append "  tags " (jolt-str-join tags) " will not read\n") port)))))
 (define (load-data-readers!)
   ;; one settle point for the whole scan: see aot-call-with-readers-batch
   (aot-call-with-readers-batch
@@ -1184,8 +1185,9 @@
   (let* ((scm (car job))
          (so (cadr job))
          (tmp (string-append so ".part" (number->string (get-process-id)))))
-    (guard (e (else (display (string-append "jolt: aot worker: compile failed for " scm "\n")
-                              (current-error-port))
+    (guard (e (else (when (jolt-warnings?)
+                      (display (string-append "jolt: aot worker: compile failed for " scm "\n")
+                               (current-error-port)))
                     (guard (e2 (#t #f)) (delete-file tmp #f))))
       (parameterize ((current-output-port (open-output-string)))
         (sa-compile-file scm tmp #f))
@@ -1758,10 +1760,11 @@
 (define (aot-call-with-readers-batch thunk)
   (if (jolt-with-mutex ldr-tbl-mu (hashtable-contains? aot-open-compiles aot-readers-batch-key))
       (thunk)
-      (dynamic-wind
+      (jolt-wind*
         (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-open-compiles aot-readers-batch-key '())))
+        #f
         (lambda () (thunk) (aot-settle! aot-readers-batch-key))
-        (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles aot-readers-batch-key))))))
+        (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles aot-readers-batch-key)))))
 ;; KEY's compile (or the batch) has settled: close it and publish what waited on
 ;; it. Each goes back through aot-publish-when-readers-settle!, since another
 ;; settle point may still be open above this one.
@@ -1813,8 +1816,9 @@
         (stamps (vector file '())))
     ;; open until the sidecars are written; an unwind drops whatever was queued
     ;; on it, which then only misses next run
-    (dynamic-wind
+    (jolt-wind*
       (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-open-compiles name '())))
+      #f
       (lambda ()
         (let ((captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink)
                                        (jolt-def-ordinal-sink stamps))
@@ -1830,7 +1834,7 @@
           ;; with or without sidecars this namespace's digest is final now, so
           ;; what waited on it goes ahead either way
           (aot-settle! name)))
-      (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles name))))))
+      (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles name)))))
 ;; Everything a later run reads back BEFORE it can compute the full key: the
 ;; sidecars are named by the own hash alone.
 (define (aot-write-sidecars! name own obase deps res)
@@ -2692,7 +2696,12 @@
                (or (ldr-wait-for-load! name deadline) (loop)))
               ((and (not force?) (not (ldr-reload-all?)) (ns-dedup-loaded? name))
                (ldr-decided! me 'loaded))                     ; step 4
-              (else (hashtable-set! ldr-loading name me)      ; step 6
+              ;; step 6. Masked from the claim on (jolt-wind*, locks.ss), and
+              ;; load-namespace* drops it once its wind holds the claim: an
+              ;; interrupt's escape in between left the claim standing and every
+              ;; later require of the namespace waiting on it.
+              (else (hashtable-set! ldr-loading name me)
+                    (jolt-locks-enter!)
                     (ldr-decided! me 'claimed)))))))))
 
 ;; Step 11: drop the claim and wake everyone waiting on this namespace. Broadcast
@@ -2757,7 +2766,8 @@
     ;; read AFTER claiming, not before: while this thread was waiting in step 2
     ;; another may have loaded the namespace and then had its own load fail, and
     ;; a stale #t here would make the guard below skip the rollback.
-    (let ((was-loaded? (ns-dedup-loaded? name))
+    (let ((lv (fx- (jolt-locks-held) 1))
+          (was-loaded? (ns-dedup-loaded? name))
           (finished? #f))
       ;; step 11/12: drop the claim and wake the waiters on EVERY exit. dynamic-wind
       ;; and not a guard: a guard only sees a raise, and any other way out of the
@@ -2799,14 +2809,20 @@
       ;;
       ;; The load's jar reads share one reader per archive (zip-file.ss
       ;; call-with-zipdir-read-scope); a nested load joins the outer one's scope.
+      ;;
+      ;; ldr-begin-load! returned masked; the wind drops the mask as the body
+      ;; starts and holds it again from the body's return through the release
+      ;; (jolt-wind*, locks.ss), so no escape lands with the claim unowned by a
+      ;; winder. lv is the depth before ldr-begin-load! raised it.
       (dynamic-wind
         (lambda () (ldr-assert-claim! name))
-        (lambda ()
-          (call-with-zipdir-read-scope
-            (lambda ()
-              (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))))
-          (set! finished? #t))
-        (lambda ()
+        (jolt-masked-body
+          (lambda ()
+            (call-with-zipdir-read-scope
+              (lambda ()
+                (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))))
+            (set! finished? #t)))
+        (jolt-masked-cleanup lv
           (unless (jolt-park-unwinding?)
             (unless (or finished? was-loaded?) (ldr-unmark-loaded! name))
             (ldr-end-load! name)))))))
@@ -2831,8 +2847,11 @@
          ;; that used to reach it — a load leaving *ns* pointing at the file it was
          ;; part way through is the kind of damage that surfaces three forms later
          ;; somewhere else, so it happens however the body exits.
-         (dynamic-wind
+         ;; Masked at its edges (jolt-wind*, locks.ss), so an interrupt cannot
+         ;; skip the restore.
+         (jolt-wind*
            (lambda () #f)
+           #f
            (lambda ()
              (guard (e (else
                          (unless was-loaded? (ldr-unmark-loaded! name)) ; roll the mark back
@@ -2845,7 +2864,7 @@
                  ((cpath-compiling-dir file)
                   => (lambda (dir) (cpath-compile-load name file dir)))
                  (else (aot-load-or-compile name file force?)))))
-           (lambda () (set-chez-ns! saved)))   ; the current ns is thread-local
+           (set-chez-ns! saved))   ; the current ns is thread-local
          ;; the hook feeds `jolt build`, which needs the SOURCE path; an
          ;; artifact-only namespace has none to give.
          (ns-loaded-hook name (or file art))))
@@ -2879,10 +2898,7 @@
 ;; duration, so an `ns` form in the loaded file never leaks into the caller.
 (define (load-jolt-file/restoring-ns path)
   (let ((saved (chez-current-ns)))
-    (dynamic-wind
-      (lambda () #f)
-      (lambda () (load-jolt-file path))
-      (lambda () (set-chez-ns! saved)))))
+    (jolt-wind* (lambda () #f) #f (lambda () (load-jolt-file path)) (set-chez-ns! saved))))
 
 ;; load-file: load an explicit path, in the current ns.
 (define (jolt-load-file path)
@@ -2919,7 +2935,7 @@
           (parameterize ((ldr-verbose? verbose?))
             (k (and (member "reload" flags) #t)))))))
 
-(def-var! "clojure.core" "load-file" jolt-load-file)
+(def-var! "clojure.core" "load-file" (lambda (p) (jolt-load-file (host-user-path p))))
 
 ;; The directory of a namespace's resource path: "clojure.tools.reader-test" ->
 ;; "clojure/tools" (drop the last segment of ns-name->rel). "" for a top-level ns.
@@ -2961,7 +2977,20 @@
 ;; and bash — /bin/sh on macOS and several Linuxes — does not clear it. The
 ;; child and everything it starts would then ignore ^C and a plain `kill`.
 (define (jolt-sh cmd) (jolt-with-empty-sigmask (lambda () (system cmd))))
-(def-var! "jolt.host" "sh" jolt-sh)
+;; The Clojure-facing sh runs where a ProcessBuilder child does: in the user's
+;; directory, not the checkout bin/jolt cd'd to (#1241) — so a bb.edn string
+;; task sees the project — and without JOLT_PWD, which names THIS process's
+;; directory and would hand a child jolt the parent's (process.ss,
+;; proc-child-env-pairs). jolt-sh itself stays as is: the runtime's own callers
+;; (the AOT worker spawn) mean the process cwd. Windows runs `system` through
+;; cmd.exe and has no bin/jolt, so it is left alone.
+(define (user-dir-sh-prefix)
+  (let ((dir (proc-effective-dir #f)))
+    (if (and dir (not (eq? (sa-os-family) 'windows))
+             (not (string=? dir (current-directory))))
+        (string-append "cd " (sh-quote dir) " || exit 1\nunset JOLT_PWD\n")
+        "")))
+(def-var! "jolt.host" "sh" (lambda (cmd) (jolt-sh (string-append (user-dir-sh-prefix) cmd))))
 
 (define (jolt-sh-out cmd)
   (call-with-values
@@ -2978,7 +3007,8 @@
     (apply string-append
       (map (lambda (c) (if (char=? c #\') "'\\''" (string c))) (string->list s)))
     "'"))
-(def-var! "jolt.host" "sh-out" jolt-sh-out)
+(def-var! "jolt.host" "sh-out"
+  (lambda (cmd) (jolt-sh-out (string-append (user-dir-sh-prefix) cmd))))
 
 ;; Expose source-root control + ns loading to Clojure (jolt.main / jolt.deps).
 (def-var! "jolt.host" "set-source-roots!"
@@ -2999,12 +3029,12 @@
 ;; it resolves the project, before any of the project compiles.
 (def-var! "jolt.host" "replace-builtin-ns!"
   (lambda (n) (replace-builtin-ns! (jolt-str-render-one n)) jolt-nil))
-(def-var! "jolt.host" "file-exists?" (lambda (p) (if (file-exists? p) #t #f)))
+(def-var! "jolt.host" "file-exists?" (lambda (p) (if (file-exists? (host-user-path p)) #t #f)))
 ;; …and whether it is a DIRECTORY, which file-exists? also answers #t for. A bare
 ;; argv token is dispatched as a file to run before a :tasks lookup (main.clj's
 ;; run-file-arg?), so `jolt test` in any project with a test/ dir — which is every
 ;; jolt library — took the file path and died decoding a directory.
-(def-var! "jolt.host" "directory?" (lambda (p) (if (file-directory? p) #t #f)))
+(def-var! "jolt.host" "directory?" (lambda (p) (if (file-directory? (host-user-path p)) #t #f)))
 ;; jolt.host/getenv is defined in rt.ss, not here — the compiler image reads it
 ;; as it loads, which is before this file (see the comment there).
 
@@ -3030,17 +3060,26 @@
   (if (eq? (sa-os-family) 'windows)
       (list->string (map (lambda (c) (if (char=? c #\\) #\/ c)) (string->list p)))
       p))
+;; A path a Clojure caller hands jolt.host, as the filesystem should see it: a
+;; relative one resolves against the user's directory (JOLT_PWD), as java.io's
+;; do (io.ss project-relative), not against the checkout bin/jolt cd'd to —
+;; otherwise (spit "a") then (jolt.host/delete-file! "a") touched two different
+;; files (#1241). When the two directories agree (a built binary sets no
+;; JOLT_PWD and never cd's) the path is left as given, so nothing changes there.
+(define (host-user-path p)
+  (host-fs-path
+    (if (string=? (jolt-user-dir) (current-directory)) p (project-relative p))))
 (def-var! "jolt.host" "mkdirs!"
-  (lambda (p) (if (mkdirs! (host-fs-path p)) #t #f)))
+  (lambda (p) (if (mkdirs! (host-user-path p)) #t #f)))
 ;; `rm -f`: an absent path is success, not failure.
 (def-var! "jolt.host" "delete-file!"
   (lambda (p)
-    (let ((p (host-fs-path p)))
+    (let ((p (host-user-path p)))
       (if (file-exists? p) (if (delete-path! p) #t #f) #t))))
 ;; `rm -rf`, reusing the AOT cache's pruner (which does not follow symlinks).
 (def-var! "jolt.host" "delete-tree!"
   (lambda (p)
-    (let ((p (host-fs-path p)))
+    (let ((p (host-user-path p)))
       (aot-delete-tree p)
       (if (file-exists? p) #f #t))))
 ;; `mv` within one filesystem: rename(2), which is the atomicity the publish
@@ -3049,24 +3088,24 @@
 ;; (java/io.ss rename-replace!, jolt-lang/jolt#1074).
 (def-var! "jolt.host" "rename-file!"
   (lambda (from to)
-    (guard (e (#t #f)) (rename-replace! (host-fs-path from) (host-fs-path to)) #t)))
+    (guard (e (#t #f)) (rename-replace! (host-user-path from) (host-user-path to)) #t)))
 ;; last-modified in epoch milliseconds, 0 when absent — what `test -nt` compared.
 (def-var! "jolt.host" "file-mtime"
   (lambda (p)
-    (let ((p (host-fs-path p)))
+    (let ((p (host-user-path p)))
       (if (file-exists? p) (sa-file-mtime-ms p) 0))))
 ;; directory entries (names only), nil when p is not a directory — the pieces a
 ;; `find` walk is built from on the Clojure side.
 (def-var! "jolt.host" "list-dir"
   (lambda (p)
-    (let ((p (host-fs-path p)))
+    (let ((p (host-user-path p)))
       (if (file-directory? p)
           (guard (e (#t jolt-nil)) (list->cseq (directory-list p)))
           jolt-nil))))
 ;; …and whether it is a symlink, so that walk can decline to follow one, as
 ;; `find` does by default.
 (def-var! "jolt.host" "symlink?"
-  (lambda (p) (if (file-symbolic-link? (host-fs-path p)) #t #f)))
+  (lambda (p) (if (file-symbolic-link? (host-user-path p)) #t #f)))
 
 ;; --- jars on the roots (jolt.host) -------------------------------------------
 ;; What jolt.deps and jolt.loader ask about a jar: whether a file is a whole

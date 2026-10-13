@@ -48,12 +48,18 @@
 ;; active" when any OTHER thread is active at that instant, and jolt always
 ;; has service threads (io-poller, fiber carriers, the timer) that are
 ;; collect-safe while blocked but active for the microseconds between waits —
-;; so a single attempt can lose that race at any time. Retry over a short
-;; window; a thread that stays active through all of it (a compute loop)
-;; degrades the call to a no-op, because System.gc must hint, never throw.
-;; Any other collector error still raises.
+;; so a single attempt can lose that race at any time. Where jolt's own
+;; collect-request handler is installed, a refused attempt asks it for the full
+;; collection and joins the rendezvous every automatic collection uses: the
+;; handler runs once all threads have stopped, which is when Chez allows it, so
+;; a compute loop on another thread no longer turns System.gc into a no-op (nor
+;; a startup check that needs the boot's garbage gone, rt.ss). Without the
+;; handler, retry over a short window and degrade to a no-op, because
+;; System.gc must hint, never throw. Any other collector error still raises.
+(define sa-full-collect-requested? #f)
+(define sa-collect-handler-installed? #f)
 (define (sa-gc-collect)
-  (let loop ((tries 100))
+  (let loop ((tries (if sa-collect-handler-installed? 0 100)))
     (let ((r (guard (e (#t (if (and (message-condition? e)
                                     (string=? (condition-message e)
                                               "cannot collect when multiple threads are active"))
@@ -65,9 +71,13 @@
         ;; no collect-request-handler ran, so undo the pins of arrays this one
         ;; found dead here, or they stay locked (and live) until the next pin
         ((ok) (sa-pin-drain-after-collect!))
-        ((busy) (when (fx>? tries 0)
-                  (sleep (make-time 'time-duration 1000000 0))   ; 1 ms
-                  (loop (fx- tries 1))))))))
+        ((busy) (cond
+                  (sa-collect-handler-installed?
+                   (set! sa-full-collect-requested? #t)
+                   (collect-rendezvous))
+                  ((fx>? tries 0)
+                   (sleep (make-time 'time-duration 1000000 0))   ; 1 ms
+                   (loop (fx- tries 1)))))))))
 
 ;; (sa-gc-max-generation) -> exact integer
 ;; The deepest collectable generation, for callers mapping JVM generations.
@@ -660,6 +670,47 @@
 ;; Byte order of the host. Contract: the byte order. Degradation: none — the
 ;; runtime always knows its own byte order, so a tag that does not name one is
 ;; answered by native-endianness rather than by #f.
+;; (sa-flonum->bits x) / (sa-bits->flonum b): binary64 pattern as an unsigned
+;; 64-bit integer and back, through an 8-byte buffer of the call's own (a
+;; shared one would race between threads).
+(define (sa-flonum->bits x)
+  (let ((bv (make-bytevector 8)))
+    (bytevector-ieee-double-set! bv 0 x (endianness little))
+    (bytevector-u64-ref bv 0 (endianness little))))
+(define (sa-bits->flonum b)
+  (let ((bv (make-bytevector 8)))
+    (bytevector-u64-set! bv 0 b (endianness little))
+    (bytevector-ieee-double-ref bv 0 (endianness little))))
+;; The high word is read straight out of the flonum, without a buffer, which is
+;; most of a bit cast's cost (fdlibm's cbrt makes four). The payload's offset in
+;; the object is found once at load by scanning forward from the object's start
+;; for 2.5's bytes; a flonum's payload sits inside its first 16 bytes, so the
+;; scan never reads outside the object. The high word is the payload's upper
+;; half in the machine's byte order.
+(define sa-flonum-disp
+  (let loop ((d 0))
+    (cond ((fx> d 8) (error 'sa-flonum-disp "no flonum payload"))
+          ((eqv? (#%$object-ref 'double 2.5 d) 2.5) d)
+          (else (loop (fx+ d 1))))))
+(define sa-flonum-hi-disp
+  (if (eq? (native-endianness) (endianness little)) (fx+ sa-flonum-disp 4) sa-flonum-disp))
+(define (sa-flonum-hi32 x) (#%$object-ref 'unsigned-32 x sa-flonum-hi-disp))
+;; Built arithmetically, exactly: (1 + m/2^20) * 2^(e-1023) for a normal field,
+;; m * 2^-1042 for a subnormal one, each power of two from a table.
+(define sa-pow2-base 1100)
+(define sa-pow2
+  (let ((v (make-flvector 2200)))
+    (do ((k 0 (fx+ k 1))) ((fx= k 2200) v)
+      (flvector-set! v k (inexact (expt 2 (- k sa-pow2-base)))))))
+(define (sa-hi32->flonum h)
+  (let* ((e (fxand (fxsrl h 20) #x7ff))
+         (m (fxand h #xfffff))
+         (mag (cond ((fx= e #x7ff) (if (fx= m 0) +inf.0 +nan.0))
+                    ((fx= e 0) (fl* (fixnum->flonum m) (flvector-ref sa-pow2 (fx- sa-pow2-base 1042))))
+                    (else (fl* (fixnum->flonum (fx+ #x100000 m))
+                               (flvector-ref sa-pow2 (fx+ sa-pow2-base (fx- e 1043))))))))
+    (if (fx= 0 (fxand h #x80000000)) mag (fl- mag))))
+
 (define (sa-endian)
   (or (sa-endian-for-tag (sa-host-tag)) (native-endianness)))
 
@@ -709,18 +760,6 @@
               (reverse acc)
               (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1) (cons io acc))))
         '())))
-
-;; (sa-thread-id-of t) -> fixnum | #f
-;; The numeric id a thread OBJECT's own get-thread-id answers, read from any
-;; thread: its context's thread number. Contract: the id, or #f once the
-;; thread has exited (its context is released and the object marks it dead).
-;; Degradation: #f — the caller then records nothing for the thread.
-(define (sa-thread-id-of t)
-  (guard (e (#t #f))
-    (let ((tc (#%$thread-tc t)))
-      (and (not (eqv? tc 0))
-           (let ((n (#%$tc-field 'threadno tc)))
-             (and (fixnum? n) n))))))
 
 ;; (sa-procedure-info x) -> (name . ((free-name . value) ...)) | #f
 ;; A procedure's inspector name and live free-variable captures, in
@@ -1105,6 +1144,21 @@
       (vfasl-convert-file in out #f))
     #t))
 
+;; (sa-strip-compile-time-info! in out) -> boolean
+;; Copy the compiled object file IN to OUT without its compile-time
+;; information: the visit-time code and expander data of its macros
+;; (define-syntax transformers, their syntax objects and ribcages), plus any
+;; inspector and source annotations. What remains is the code that runs. For a
+;; binary that cannot expand Scheme code at run time (booted from petite, no
+;; compiler): 3.3MB of a closed-world app's 20MB runtime heap, and a third of
+;; its runtime fasl. Contract: OUT loads and runs as IN does. Degradation: #f
+;; (OUT not written), and the caller ships IN.
+(define (sa-strip-compile-time-info! in out)
+  (guard (e (#t (sa-delete-partial! out) #f))
+    (strip-fasl-file in out (fasl-strip-options compile-time-information inspector-source
+                                                source-annotations profile-source))
+    #t))
+
 ;; (sa-gc-install-after-collect! maintain observe) -> boolean
 ;; Hook every collection: the target performs its normal collection, then calls
 ;; (MAINTAIN collect-full!) -- collect-full! collects EVERY generation now, the
@@ -1146,13 +1200,22 @@
                  (collect (collect-maximum-generation)))))))
     (collect-request-handler
       (lambda ()
-        (let ((t0 (sa-monotonic-ns)))
-          (sa-collect-young!)
-          (maintain collect-full!)
-          (sa-pin-drain-after-collect!)
-          (let ((t1 (sa-monotonic-ns)))
-            (observe (- t1 t0) (- t1 last-end))
-            (set! last-end t1))))))
+        (if sa-full-collect-requested?
+            ;; sa-gc-collect's full collection, run here because another thread
+            ;; was active: what its direct path does, and no more -- it is not a
+            ;; young collection for the nursery's time share to count
+            (begin
+              (set! sa-full-collect-requested? #f)
+              (collect (collect-maximum-generation))
+              (sa-pin-drain-after-collect!))
+            (let ((t0 (sa-monotonic-ns)))
+              (sa-collect-young!)
+              (maintain collect-full!)
+              (sa-pin-drain-after-collect!)
+              (let ((t1 (sa-monotonic-ns)))
+                (observe (- t1 t0) (- t1 last-end))
+                (set! last-end t1)))))))
+  (set! sa-collect-handler-installed? #t)
   #t)
 ;; A tight full collection within ROOM free bytes: every generation from 1 up
 ;; is marked where it is rather than copied, in ONE collection. Chez marks a
@@ -1235,10 +1298,13 @@
 ;; So the rendezvous itself is where the stall is seen. This installs a copy
 ;; of Chez 10.4's $collect-rendezvous (s/7.ss) whose waits carry a timeout:
 ;; a thread that has waited SECONDS with the request still pending and other
-;; threads still active calls ON-STALL once per stalled request — with the
-;; tc mutex released and interrupts disabled, so it may allocate and print
+;; threads still active calls ON-STALL once per stalled request — with the tc
+;; mutex released and interrupts disabled, so it may allocate and print
 ;; without re-entering the rendezvous — then goes on waiting exactly as
-;; before. The protocol is otherwise the original's: the same conditions,
+;; before. SECONDS is a positive real, or a thunk answering one, read at each
+;; wait: a caller that changes its threshold later does so through the thunk
+;; rather than by installing again, which would swap the copy under a thread
+;; already waiting in it. The protocol is otherwise the original's: the same conditions,
 ;; the same last-one-standing rule, the same hand-over to the main thread
 ;; when it is waiting, so a stall that ends (the call returned) completes the
 ;; collection as it always did. $collect-rendezvous is immutable in the system
@@ -1256,17 +1322,20 @@
 ;; caller, i.e. the threads that have not reached a safe point.
 ;; Degradation: answer #f without installing anything, leaving the target's
 ;; own rendezvous in place (no diagnostic, the behaviour of every release
-;; before 0.8.9). The copy is of ONE protocol, so it is installed only on the
-;; Chez it was read from — 10.4 — and only when every name it needs is bound;
-;; a Chez whose protocol has not been compared answers #f rather than run a
-;; rendezvous it might disagree with. The ffi gate (make ffi) asserts the
+;; before 0.8.9). The copy is of ONE protocol, so it is installed only on a
+;; Chez whose protocol was compared with it, and only when every name it needs
+;; is bound; any other Chez answers #f rather than run a rendezvous it might
+;; disagree with. Compared: 10.4 (read from), and 10.5, whose s/7.ss
+;; $collect-rendezvous and s/library.ss are unchanged from v10.4.1 (checked at
+;; cisco/ChezScheme 35c2f4b3, 10.5.0 pre-release; the c/ changes since touch
+;; W^X code pages and gen-0 marking, not the rendezvous). The ffi gate (make ffi) asserts the
 ;; watch is live on the Chez CI builds, so a Chez bump re-asks the question.
 (define (sa-gc-install-stall-watch! seconds on-stall)
   (let ((se (#%$system-environment)))
     (define (bound? name) (top-level-bound? name se))
     (define (sysval name) (top-level-value name se))
     (and (call-with-values scheme-version-number
-           (lambda (major minor sub) (and (= major 10) (= minor 4))))
+           (lambda (major minor sub) (and (= major 10) (memv minor '(4 5)))))
          (bound? '$collect-rendezvous)
          (bound? '$collect-cond) (bound? '$collect-thread0-cond)
          (bound? '$tc-mutex) (bound? '$active-threads)
@@ -1274,7 +1343,10 @@
          (let ((tc-mutex (sysval '$tc-mutex))
                (collect-cond (sysval '$collect-cond))
                (thread0-cond (sysval '$collect-thread0-cond))
-               (timeout (make-time 'time-duration 0 seconds))
+               ;; the time object for the threshold last read, rebuilt only
+               ;; when the threshold changes
+               (timeout-for #f)
+               (timeout #f)
                ;; #t once ON-STALL has run for the request now pending; cleared
                ;; where the request is cleared, so the next stall reports again.
                (reported? #f)
@@ -1284,8 +1356,16 @@
            (define (pending-set! v) (#%$set-top-level-value! '$collect-request-pending v))
            ;; condition-wait's #t is a signal, #f the timeout. On a timeout with
            ;; the request still pending and others still active, report once.
+           (define (current-timeout)
+             (let ((secs (if (procedure? seconds) (seconds) seconds)))
+               (unless (eqv? secs timeout-for)
+                 (let* ((ns (exact (round (* secs 1000000000))))
+                        (s (quotient ns 1000000000)))
+                   (set! timeout (make-time 'time-duration (- ns (* s 1000000000)) s))
+                   (set! timeout-for secs)))
+               timeout))
            (define (timed-wait c)
-             (or (jolt-stop-the-world-wait c tc-mutex timeout)
+             (or (jolt-stop-the-world-wait c tc-mutex (current-timeout))
                  (begin
                    (when (and (pending?) (> (active-threads) 1) (not reported?))
                      (set! reported? #t)
@@ -1458,6 +1538,89 @@
 (define (sa-disable-count) (#3%$tc-field 'disable-count (#3%$tc)))
 
 
+;; ---- terminal tier (capability: terminal) -----------------------------------
+;; The interactive REPL's line editor drives the console through the terminal
+;; layer of Chez's own expression editor: the kernel's "(cs)ee_*" entries, a
+;; terminfo implementation on Unix and a console-API one on Windows, where key
+;; presses come back as the same ANSI escape sequences a Unix terminal sends.
+;; Cursor motion and clearing go through them rather than through escape
+;; sequences written to stdout, which is what makes the editor portable to the
+;; Windows console.
+;;
+;; A kernel configured --disable-curses has no expeditor and none of these
+;; entries, so they are looked up when the terminal is first claimed, never at
+;; load: sa-term-open answers #f there and the REPL keeps its plain reader.
+;; ee_read_char deactivates the calling thread while it blocks, so a collection
+;; or another thread's work proceeds while the editor waits for a key.
+(define sa-term-procs #f)  ; vector of the entry points once claimed, else #f
+
+(define (sa-term-proc i)
+  (if sa-term-procs
+      (vector-ref sa-term-procs i)
+      (error 'sa-term "the terminal is not open")))
+
+(define (sa-term-open)
+  (or (and sa-term-procs #t)
+      (and (foreign-entry? "(cs)ee_init_term")
+           ((foreign-procedure "(cs)ee_init_term" (iptr iptr) boolean) -1 -1)
+           (begin
+             (set! sa-term-procs
+               (vector
+                 (foreign-procedure "(cs)ee_raw" () void)                       ; 0
+                 (foreign-procedure "(cs)ee_noraw" () void)                     ; 1
+                 (foreign-procedure "(cs)ee_read_char" (boolean) scheme-object) ; 2
+                 (foreign-procedure "(cs)ee_get_screen_size" () scheme-object)  ; 3
+                 (foreign-procedure "(cs)ee_write_char" (wchar_t) void)         ; 4
+                 (foreign-procedure "(cs)ee_char_width" (wchar_t) int)          ; 5
+                 (foreign-procedure "(cs)ee_flush" () void)                     ; 6
+                 (foreign-procedure "(cs)ee_up" (integer-32) void)              ; 7
+                 (foreign-procedure "(cs)ee_down" (integer-32) void)            ; 8
+                 (foreign-procedure "(cs)ee_left" (integer-32) void)            ; 9
+                 (foreign-procedure "(cs)ee_right" (integer-32) void)           ; 10
+                 (foreign-procedure "(cs)ee_clr_eol" () void)                   ; 11
+                 (foreign-procedure "(cs)ee_clr_eos" () void)                   ; 12
+                 (foreign-procedure "(cs)ee_clear_screen" () void)              ; 13
+                 (foreign-procedure "(cs)ee_carriage_return" () void)           ; 14
+                 (foreign-procedure "(cs)ee_line_feed" () void)                 ; 15
+                 (foreign-procedure "(cs)ee_bell" () void)                      ; 16
+                 (foreign-procedure "(cs)ee_pause" () void)                     ; 17
+                 (foreign-procedure "(cs)ee_set_color" (int boolean) void)))    ; 18
+             #t))))
+
+(define (sa-term-raw!) ((sa-term-proc 0)))
+(define (sa-term-cooked!) ((sa-term-proc 1)))
+
+;; A char, the eof object, or 'resize when the window changed size; without
+;; block?, #f when no input is waiting.
+(define (sa-term-read-char block?)
+  (let ((c ((sa-term-proc 2) block?)))
+    (if (eq? c #t) 'resize c)))
+
+(define (sa-term-size) ((sa-term-proc 3)))
+(define (sa-term-write-char c) ((sa-term-proc 4) c))
+(define (sa-term-char-width c) ((sa-term-proc 5) c))
+(define (sa-term-flush) ((sa-term-proc 6)))
+
+(define (sa-term-move! dir n)
+  (when (> n 0)
+    ((sa-term-proc (case dir ((up) 7) ((down) 8) ((left) 9) ((right) 10)
+                     (else (error 'sa-term-move! "unknown direction" dir))))
+     n)))
+
+(define (sa-term-clear! what)
+  ((sa-term-proc (case what ((eol) 11) ((eos) 12) ((screen) 13)
+                   (else (error 'sa-term-clear! "unknown region" what))))))
+
+(define (sa-term-cr!) ((sa-term-proc 14)))
+(define (sa-term-lf!) ((sa-term-proc 15)))
+(define (sa-term-bell!) ((sa-term-proc 16)))
+(define (sa-term-pause!) ((sa-term-proc 17)))
+
+;; Color ids are the expeditor's: -1 resets, 0-7 the base colors (black red
+;; green yellow blue magenta cyan white), 8-15 their bright forms.
+(define (sa-term-color! id background?) ((sa-term-proc 18) id background?))
+
+
 ;; --- capability-unchecked ---------------------------------------------------
 ;; Unchecked fixnum / vector primitives, SYNTAX (CONTRACT.txt). A call site
 ;; carries its own range proof; here each is the #3% primitive — what the
@@ -1517,6 +1680,33 @@
 ;; run time the way the sa-* seams are.
 (load "host/chez/locks.ss")
 (load "host/chez/fibers.ss")
+
+;; (sa-thread-id-of t) -> fixnum | #f
+;; The numeric id a thread OBJECT's own get-thread-id answers, read from any
+;; thread: its context's thread number. Contract: the id, or #f once the
+;; thread has exited (its context is released and the object marks it dead).
+;; Degradation: #f — the caller then records nothing for the thread.
+;;
+;; Both reads happen under Chez's thread-context mutex, interrupts off, as its own
+;; with-tc-mutex does. An exiting thread frees its context and only then marks
+;; the object dead, both under that mutex, and a new thread's context is malloc'd
+;; and copied from its parent's under it too. Read without it, a child that had
+;; just finished could hand back a freed context, and the threadno read from that
+;; memory was whatever was there now: often 0, the boot thread's number, copied
+;; in for a thread the boot thread was creating. Thread.start then filed the
+;; child's object under the boot thread, whose Thread/currentThread became the
+;; child. Defined after locks.ss, since jolt-with-mutex is a macro.
+(define (sa-thread-id-of t)
+  (guard (e (#t #f))
+    (dynamic-wind
+      disable-interrupts
+      (lambda ()
+        (jolt-with-mutex #%$tc-mutex
+          (let ((tc (#%$thread-tc t)))
+            (and (not (eqv? tc 0))
+                 (let ((n (#%$tc-field 'threadno tc)))
+                   (and (fixnum? n) n))))))
+      enable-interrupts)))
 
 ;; (sa-pin-for-owner! owner obj) -> void
 ;; (sa-unpin-for-owner! owner) -> void

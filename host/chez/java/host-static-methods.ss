@@ -109,7 +109,7 @@
 ;; honour an interrupt that was already set.
 (define (jolt-thread-sleep-ms ms)
   (let ((ms (exact (floor ms))) (mu (make-mutex)) (cv (make-condition)))
-    (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (+ (now-millis) ms)
+    (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (mono-deadline ms)
       (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
     jolt-nil))
 
@@ -304,6 +304,21 @@
 (define (now-millis)
   (let ((t (current-time 'time-utc)))
     (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
+;; The clock every DEADLINE in the runtime is on: milliseconds from an arbitrary
+;; origin, never stepping (System/nanoTime's clock, in millis). now-millis is the
+;; wall clock, for dating things; a deadline read off it fires early or holds on
+;; for hours when ntp or a user steps the clock mid-wait (#1303).
+(define (mono-millis)
+  (let ((t (current-time 'time-monotonic)))
+    (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
+;; (mono-deadline ms) — the deadline ms from now, the one way to build one. Now is
+;; rounded UP: a wait ends once (mono-millis), which truncates, reaches the
+;; deadline, so a deadline off the truncated now came due up to 1ms early, and a
+;; timed wait could return before its timeout, which the JDK's never do.
+(define (mono-deadline ms)
+  (let ((t (current-time 'time-monotonic)))
+    (+ (* 1000 (time-second t)) (quotient (+ (time-nanosecond t) 999999) 1000000)
+       (exact (floor ms)))))
 
 ;; clojure.core/current-time-ms — epoch milliseconds.
 (def-var! "clojure.core" "current-time-ms" (lambda () (->num (now-millis))))
@@ -510,28 +525,19 @@
         (cons "TRUE" #t) (cons "FALSE" #f)))
 
 (register-class-ctor! "Double" ->double)
-(register-class-ctor! "Float" ->double)
+(register-class-ctor! "Float" (lambda (x) (jolt-parse-float x)))
 (register-class-statics! "Double"
   (list (cons "TYPE" "double")
         (cons "parseDouble" parse-double-or-throw)
         (cons "valueOf" ->double)
         (cons "toString" (lambda (x) (jolt-str-render-one (->double x))))
-        (cons "isNaN" (lambda (x) (and (flonum? x) (nan? x))))
-        (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
+        ;; a Float argument widens, as the double parameter takes it
+        (cons "isNaN" (lambda (x) (let ((d (jfloat-unbox x))) (and (flonum? d) (nan? d)))))
+        (cons "isInfinite" (lambda (x) (let ((d (jfloat-unbox x))) (and (flonum? d) (infinite? d)))))
         (cons "MAX_VALUE" 1.7976931348623157e308) (cons "MIN_VALUE" 4.9e-324)
         (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0) (cons "NaN" +nan.0)))
-;; Float's bounds and specials are the float ones, not double's — data.json's
-;; suite round-trips them by name. jolt has one flonum type, so the values are
-;; doubles carrying the float magnitudes.
-(register-class-statics! "Float"
-  (list (cons "TYPE" "float")
-        (cons "parseFloat" parse-double-or-throw) (cons "valueOf" ->double)
-        (cons "toString" (lambda (x) (jolt-str-render-one (->double x))))
-        (cons "isNaN" (lambda (x) (and (flonum? x) (nan? x))))
-        (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
-        (cons "MAX_VALUE" 3.4028235e38) (cons "MIN_VALUE" 1.4e-45)
-        (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0)
-        (cons "NaN" +nan.0)))
+;; Float's values, parsing and printing live with the float codecs in math.ss.
+(register-class-statics! "Float" (list (cons "TYPE" "float")))
 
 ;; Character: the JVM's classification is the Unicode general category, and Chez's
 ;; char-general-category IS that property (the same table the JVM reads), so

@@ -120,8 +120,20 @@
 ;; --target cross-compiling always takes, since the in-process compiler
 ;; can't load a target's xpatch); --signable is what makes it reachable for
 ;; an ordinary, same-machine, non-cross build too, without requiring a
-;; source checkout that happens not to carry the stub.
+;; source checkout that happens not to carry the stub. A jolt that carries the
+;; kernel files (bld-embedded-kernel?) takes build-self-contained-cc instead:
+;; the in-process compile, then the same cc link against its own kernel, so
+;; it needs a C compiler but no Chez install (jolt#1255).
 (define bld-signable (make-parameter #f))
+;; Does this process carry everything a cc link needs in place of a Chez install
+;; — the boots, scheme.h and libkernel.a (the self-contained jolt does)? Then a
+;; --signable build compiles in process and needs only the C compiler.
+(define (bld-embedded-kernel?)
+  (for-all jolt-embedded-bytes
+           '("stub/launcher" "csv/petite.boot" "csv/scheme.boot" "csv/scheme.h" "csv/libkernel.a")))
+;; deps.edn :jolt/build {:exclude-resources [glob …]}: dependency-root files
+;; NOT to bake into the binary (bld-dep-resources), as a list of glob strings.
+(define bld-exclude-resources (make-parameter '()))
 ;; The effective target machine, and whether this is a cross build.
 (define (bld-eff-machine) (or (bld-target) bld-machine))
 (define (bld-cross?) (and (bld-target) (not (string=? (bld-target) bld-machine)) #t))
@@ -717,22 +729,119 @@
 ;; shipped binary carries the coarse set, and each mark costs a statistics call.
 (define bld-profile-inline? (and (getenv "JOLT_PROFILE_INLINE") #t))
 
+;; --- boot image segments ----------------------------------------------------
+;; A vfasl boot is loaded one image segment at a time, each decompressed into a
+;; buffer that lives beside the static image it is building, and
+;; vfasl-convert-file folds every entry it can into ONE segment. The runtime
+;; was one segment: 60MB of buffer next to 62MB of image, a boot peak of 2.2x
+;; jolt's live heap (and 2.5x a closed-world app's). The converter closes a
+;; segment at an entry that mentions the symbol $install-library-entry (Chez
+;; s/vfasl.ss fasl-can-combine?, which documents that a non-boot mention only
+;; costs sharing), so bld-emit-runtime puts a top-level define naming it at a
+;; form boundary every BLD-SEGMENT-SOURCE-BYTES of emitted source. Collections
+;; clear the buffer (mkgc.ss), Chez compacts before each segment, and an
+;; oversize chunk is freed once it empties (chez-patches/0002), so the peak is
+;; one segment's buffer.
+;;
+;; A segment's image is placed as ONE contiguous block. At 1MB of source that
+;; block was 289 segments (4.6MB), more than a standard 129-segment (2MB) chunk,
+;; so when the free segments the earlier buffers left were fragmented it took a
+;; fresh oversize chunk and the fragments stayed held. Which way it went was
+;; layout luck: 28 comment lines in records-interop.ss moved a closed-world
+;; hello's boot peak from 43MB to 47MB, and jolt held a 12MB chunk with one
+;; segment in use. At 256KB a block is ~1.2MB and fits a standard chunk: the
+;; same app peaks at 41MB whatever the layout, for 0.3MB more binary (1.5%
+;; on jolt itself) and under 2% on startup.
+(define bld-segment-source-bytes (* 256 1024))
+(define bld-segment-out #f)        ; the port bld-emit-runtime is segmenting
+(define bld-segment-pending 0)     ; source bytes emitted since the last break
+(define (bld-segment-count! out n)
+  (when (eq? out bld-segment-out)
+    (set! bld-segment-pending (+ bld-segment-pending n))))
+;; At a top-level boundary of OUT: end the segment if it is full.
+(define (bld-segment-break! out)
+  (when (and (eq? out bld-segment-out) (>= bld-segment-pending bld-segment-source-bytes))
+    (set! bld-segment-pending 0)
+    (put-string out "(define jolt-boot-segment-break '$install-library-entry)\n")))
+
+;; Does LINE leave its file at a top-level boundary? Breaks only at file ends
+;; could not keep segments near the size above: a large file overshot it by its
+;; whole length. ST is the file's reader state carried across lines,
+;; #(depth mode block-depth): mode is code, string, or bar (a |symbol|). A line
+;; ending in a quote, quasiquote, unquote or datum-comment prefix is not a
+;; boundary, since its datum is on the next line. A break placed inside a string
+;; would change the string without failing the compile, so every inlined file
+;; must end clean (bld-form-state-clean?) or the build stops.
+(define (bld-make-form-state) (vector 0 'code 0))
+(define (bld-form-state-clean? st)
+  (and (eqv? (vector-ref st 0) 0) (eq? (vector-ref st 1) 'code) (eqv? (vector-ref st 2) 0)))
+(define (bld-scan-line! st line)
+  (let ((n (string-length line)))
+    (let loop ((i 0) (depth (vector-ref st 0)) (mode (vector-ref st 1))
+               (blk (vector-ref st 2)) (last #f))
+      (define (done)
+        (vector-set! st 0 depth) (vector-set! st 1 mode) (vector-set! st 2 blk)
+        (and (fx= depth 0) (eq? mode 'code) (fx= blk 0)
+             (not (memv last '(#\' #\` #\, #\@ #\;)))))
+      (define (at? j c) (and (fx< j n) (char=? (string-ref line j) c)))
+      (if (fx>= i n)
+          (done)
+          (let ((c (string-ref line i)))
+            (cond
+              ((fx> blk 0)
+               (cond ((and (char=? c #\|) (at? (fx+ i 1) #\#)) (loop (fx+ i 2) depth mode (fx- blk 1) last))
+                     ((and (char=? c #\#) (at? (fx+ i 1) #\|)) (loop (fx+ i 2) depth mode (fx+ blk 1) last))
+                     (else (loop (fx+ i 1) depth mode blk last))))
+              ((eq? mode 'string)
+               (cond ((char=? c #\\) (loop (fx+ i 2) depth mode blk last))
+                     ((char=? c #\") (loop (fx+ i 1) depth 'code blk #\"))
+                     (else (loop (fx+ i 1) depth mode blk last))))
+              ((eq? mode 'bar)
+               (cond ((char=? c #\\) (loop (fx+ i 2) depth mode blk last))
+                     ((char=? c #\|) (loop (fx+ i 1) depth 'code blk #\|))
+                     (else (loop (fx+ i 1) depth mode blk last))))
+              ((char=? c #\;) (done))
+              ((char=? c #\") (loop (fx+ i 1) depth 'string blk c))
+              ((char=? c #\|) (loop (fx+ i 1) depth 'bar blk c))
+              ((char=? c #\#)
+               (cond ((at? (fx+ i 1) #\|) (loop (fx+ i 2) depth mode 1 last))
+                     ;; a char literal: its first char is never a delimiter
+                     ((at? (fx+ i 1) #\\) (loop (fx+ i 3) depth mode blk #\a))
+                     ((at? (fx+ i 1) #\;) (loop (fx+ i 2) depth mode blk #\;))
+                     (else (loop (fx+ i 1) depth mode blk c))))
+              ((memv c '(#\( #\[)) (loop (fx+ i 1) (fx+ depth 1) mode blk c))
+              ((memv c '(#\) #\])) (loop (fx+ i 1) (fx- depth 1) mode blk c))
+              ((memv c '(#\space #\tab)) (loop (fx+ i 1) depth mode blk last))
+              (else (loop (fx+ i 1) depth mode blk c))))))))
+
 ;; Emit one line to OUT, recursively inlining a `(load ...)` of a repo file.
 (define (bld-inline-line line out depth)
   (when (> depth 50) (error 'jolt-build "load nesting too deep"))
   (let ((p (bld-load-path line)))
     (if p
-        (begin
-          (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+        (let ((st (bld-make-form-state)))
+          ;; a full segment ends at the first top-level boundary, not the file's end
+          (for-each (lambda (l)
+                      (bld-inline-line l out (+ depth 1))
+                      (when (bld-scan-line! st l) (bld-segment-break! out)))
+                    (bld-file-lines p))
+          (unless (bld-form-state-clean? st)
+            (error 'jolt-build "lost track of top-level forms (segment breaks) in" p st))
           (when bld-profile-inline?
-            (bld-emit-startup-profile-mark! out (string-append "inlined " p))))
-        (begin (put-string out line) (put-string out "\n")))))
+            (bld-emit-startup-profile-mark! out (string-append "inlined " p)))
+          ;; the end of an inlined file is a top-level boundary (the profile
+          ;; mark above relies on the same)
+          (bld-segment-break! out))
+        (begin (put-string out line) (put-string out "\n")
+               (bld-segment-count! out (+ (string-length line) 1))))))
 
 ;; Inline the runtime manifest, dispatching on the manifest tags. core-strs (the
 ;; shaken clojure.core defs, or #f) replaces the 'prelude blob; drop-compiler? (a
 ;; closed AOT app that never compiles from source) omits 'image + 'compile-eval —
 ;; the analyzer/back end are dead weight in the binary (~0.8MB).
 (define (bld-emit-runtime out drop-compiler? core-strs)
+  (set! bld-segment-out out)
+  (set! bld-segment-pending 0)
   (bld-emit-startup-profile-preamble out)
   (bld-emit-startup-profile-mark! out "runtime begin")
   (for-each
@@ -742,7 +851,10 @@
                 ((eq? entry 'prelude)
                  (if core-strs
                      (begin
-                       (for-each (lambda (s) (put-string out s) (put-string out "\n"))
+                       (for-each (lambda (s)
+                                   (put-string out s) (put-string out "\n")
+                                   (bld-segment-count! out (+ (string-length s) 1))
+                                   (bld-segment-break! out))
                                  core-strs)
                        #t)
                      (begin
@@ -761,7 +873,8 @@
           (bld-emit-startup-profile-mark!
             out
             (string-append "runtime " (bld-runtime-entry-label entry))))))
-    bld-runtime-manifest))
+    bld-runtime-manifest)
+  (set! bld-segment-out #f))
 
 ;; --- app emission -----------------------------------------------------------
 ;; Re-emit one app namespace to a list of Scheme strings: run-passes (const-fold +
@@ -1434,10 +1547,11 @@
 ;; supplies (an install root, or a source this jolt carries embedded) stays
 ;; jolt's — an embedded key outranks every root at runtime, so baking a
 ;; library's copy of, say, babashka/fs.clj would replace jolt's. Left out:
-;; compiled JVM classes and ClojureScript sources, which jolt never loads, and
-;; the source of every
-;; namespace the build compiled into the image, which the binary never reads
-;; again (its namespaces are pre-registered, so a require of one is a no-op).
+;; compiled JVM classes and ClojureScript sources, which jolt never loads; any
+;; file the project excludes (deps.edn :jolt/build {:exclude-resources [glob …]});
+;; and the source of every namespace the build compiled into the image, which
+;; the binary never reads again (its namespaces are pre-registered, so a require
+;; of one is a no-op).
 ;; Any other source stays: a file a namespace (load)s runs in the binary, and a
 ;; namespace reached only at runtime is loaded from its embedded copy.
 
@@ -1482,6 +1596,37 @@
                  (hashtable-ref baked (substring name 0 (- (string-length name) (string-length ext))) #f)))
           ldr-source-exts))
 
+;; Does glob PAT match the root-relative resource NAME? `*` is any run within one
+;; path segment, `**` any run across segments (so `**/` also matches no
+;; directory at all), `?` one character other than `/`; a pattern ending in `/`
+;; names everything under that directory. Everything else matches itself.
+(define (bld-glob-match? pat name)
+  (let* ((pat (if (bld-suffix? pat "/") (string-append pat "**") pat))
+         (pn (string-length pat)) (sn (string-length name)))
+    (let m ((i 0) (j 0))
+      (cond
+        ((= i pn) (= j sn))
+        ((char=? (string-ref pat i) #\*)
+         (if (and (< (+ i 1) pn) (char=? (string-ref pat (+ i 1)) #\*))
+             (let ((k (+ i 2)))
+               (or (and (< k pn) (char=? (string-ref pat k) #\/) (m (+ k 1) j))
+                   (let try ((jj j))
+                     (or (m k jj) (and (< jj sn) (try (+ jj 1)))))))
+             (let try ((jj j))
+               (or (m (+ i 1) jj)
+                   (and (< jj sn) (not (char=? (string-ref name jj) #\/)) (try (+ jj 1)))))))
+        ((= j sn) #f)
+        ((char=? (string-ref pat i) #\?)
+         (and (not (char=? (string-ref name j) #\/)) (m (+ i 1) (+ j 1))))
+        (else (and (char=? (string-ref pat i) (string-ref name j)) (m (+ i 1) (+ j 1))))))))
+
+;; Did the project exclude NAME from the baked dependency resources? A dependency
+;; can ship files no jolt program reads — ClojureScript externs (`*.ext.js`,
+;; Closure compiler input) are the large case, an 11 MB js-joda one among them
+;; — and only the project can tell such a file from a `.js` it serves.
+(define (bld-resource-excluded? name)
+  (exists (lambda (pat) (bld-glob-match? pat name)) (bld-exclude-resources)))
+
 ;; ((name . bytes) ...) to bake from the dependency roots, first root first.
 (define (bld-dep-resources ext-roots embed-dirs baked-ns)
   (let ((seen (make-hashtable string-hash string=?))
@@ -1508,6 +1653,7 @@
                          (hashtable-set! seen n #t)
                          (if (or (bld-suffix? n ".class")
                                  (bld-suffix? n ".cljs")
+                                 (bld-resource-excluded? n)
                                  (bld-baked-source? baked n)
                                  (embedded-resource-has? n)
                                  (exists (lambda (r) (bld-root-has? r n)) project)
@@ -1801,6 +1947,13 @@
 ;; of WHY such a namespace is preloaded, and covers any image that ever seeds
 ;; the CLI closure earlier.
 ;; Result: deps first, roots last.
+;; ns name -> the namespaces its forms require, as the closure scan read them.
+;; The shake roots each as an "ns:" ref on the namespace's ns-form records, so a
+;; required namespace embedded in the prelude keeps its load effects
+;; (dce-rec-gated) even when nothing in it is referenced. Not cleared per call:
+;; a build runs the closure more than once (its data-reader namespaces too), a
+;; rescan overwrites its entry, and only namespaces in this build are looked up.
+(define bld-ns-required (make-hashtable string-hash string=?))
 (define (bld-require-closure names)
   (let ((visited (make-hashtable string-hash string=?))
         (order '()))
@@ -1815,8 +1968,10 @@
                              (not (hashtable-ref bld-boot-loaded name #f))
                              ;; preloaded only in the CLI image, not in an app's
                              (ldr-cli-aot? name)))
-                (let ((forms (bld-scan-forms name file)))
-                  (dfs (append (bld-ns-class-providers* forms) (bld-ns-requires* forms))))
+                (let* ((forms (bld-scan-forms name file))
+                       (reqs (bld-ns-requires* forms)))
+                  (hashtable-set! bld-ns-required name reqs)
+                  (dfs (append (bld-ns-class-providers* forms) reqs)))
                 (set! order (cons (cons name file) order)))))
           (dfs (cdr ns)))))
     (reverse order)))
@@ -1882,11 +2037,17 @@
   ;; The self-contained path (jolt-embedded-bytes "stub/launcher") needs no csv
   ;; kernel files, no Chez, no cc — only the legacy cc path does. A --library build
   ;; always takes build-shared, any cross build takes a spawned cc path, and
-  ;; --signable forces that same spawned-cc path for an ordinary executable, so
-  ;; all three need the toolchain even from the self-contained jolt.
-  (when (or library? (bld-cross?) (bld-signable)
+  ;; --signable needs the same cc link for an ordinary executable — but a jolt
+  ;; carrying the kernel files (bld-embedded-kernel?) compiles in process and
+  ;; links against those, so there it needs only a C compiler (jolt#1255).
+  (when (or library? (bld-cross?)
+           (and (bld-signable) (not (bld-embedded-kernel?)))
            (not (jolt-embedded-bytes "stub/launcher")))
     (bld-check-toolchain))
+  (when (and (bld-signable) (not library?) (not (bld-cross?)) (bld-embedded-kernel?)
+             (not (bld-have-cc?)))
+    (error 'jolt-build
+      "--signable links the executable with a C compiler (JOLT_CC, or cc on PATH); install one (on macOS: xcode-select --install)."))
   ;; Static natives have to be loaded into this HOST process while the app is
   ;; emitted, so a target-architecture archive cannot be supported merely by
   ;; handing it to the target linker. Refuse before bld-preload-static-natives!
@@ -2116,9 +2277,11 @@
                                     (set! per-ns
                                       (cons (append
                                               (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
-                                              (map (lambda (s) (dce-rec #t #f '() s))
-                                                   (ei-timed "emit: ns-prelude"
-                                                     (lambda () (bld-ns-prelude (car nf) src))))
+                                              (let ((reqs (map dce-ns-ref
+                                                               (hashtable-ref bld-ns-required (car nf) '()))))
+                                                (map (lambda (s) (dce-rec #t #f reqs s))
+                                                     (ei-timed "emit: ns-prelude"
+                                                       (lambda () (bld-ns-prelude (car nf) src)))))
                                               (ei-timed "emit: per-ns total"
                                                 (lambda () (ei-emit-ns-records (car nf) src)))
                                               (list
@@ -2405,12 +2568,15 @@
         ;;    embedded stub. No external Chez, no cc. The appended boot has no
         ;;    Mach-O/PE/ELF structure of its own, so a strict signature check
         ;;    (codesign --verify --strict on macOS) correctly refuses it.
-        ;;  - CC-LINKED (dev bin/jolt, any --target cross-compile, or an
-        ;;    explicit --signable): spawn a fresh Chez for compile-file/
+        ;;  - CC-LINKED (dev bin/jolt, any --target cross-compile, or --signable
+        ;;    from a jolt without the kernel): spawn a fresh Chez for compile-file/
         ;;    make-boot-file, then xxd the boot into a C array and cc-link against
         ;;    libkernel.a. Produces a structurally complete binary a strict
         ;;    signature check accepts. Kept so `make buildsmoke` still exercises
         ;;    the cc path even when run from a self-contained jolt.
+        ;;  - EMBEDDED-KERNEL CC (--signable from a self-contained jolt): the
+        ;;    in-process compile of the first path, the C-array link of the
+        ;;    second, against the kernel this jolt carries — cc, but no Chez.
         (cond
           ;; Cross-compiling (--target) always takes a spawned cc path: the
           ;; self-contained in-process compile can't load a target xpatch, and the
@@ -2428,6 +2594,12 @@
           ;; even though this jolt carries the embedded stub. Checked before
           ;; the stub branch below so it wins regardless of which jolt is
           ;; running it from.
+          ;; A self-contained jolt compiles in process and links against the
+          ;; kernel it carries (jolt#1255): no Chez install, just cc.
+          ((and (bld-signable) (bld-embedded-kernel?))
+           (build-self-contained-cc entry-ns out-path mode builddir units boot boot-h main-c
+                                    (bld-native-link-flags natives)
+                                    (and drop-compiler? (not bld-nt?))))
           ((bld-signable)
            (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c
                           (bld-native-link-flags natives)
@@ -2596,6 +2768,35 @@
           (if (memq (caddr u) '(runtime runtime-shaken)) bld-runtime-chez-params (bld-mode-params mode))
           (car u) (cadr u))))
     "" units))
+
+;; X.so -> X-stripped.so (java/io.ss shadows Chez's path-root with its own).
+(define (bld-stripped-so-path so)
+  (let ((n (string-length so)))
+    (string-append (if (and (fx> n 3) (string=? (substring so (fx- n 3) n) ".so"))
+                       (substring so 0 (fx- n 3))
+                       so)
+                   "-stripped.so")))
+
+;; The script-side bld-strip-runtime-units, for a boot assembled in a fresh Chez
+;; (build-with-cc): the strip-fasl-file forms for each runtime unit, and UNITS
+;; renamed to the stripped copies they write.
+(define (bld-units-strip-forms units)
+  (fold-left
+    (lambda (acc u)
+      (if (memq (caddr u) '(runtime runtime-shaken))
+          (string-append acc
+            "(strip-fasl-file " (ei-str-lit (cadr u)) " "
+            (ei-str-lit (bld-stripped-so-path (cadr u)))
+            " (fasl-strip-options compile-time-information inspector-source"
+            " source-annotations profile-source))\n")
+          acc))
+    "" units))
+(define (bld-units-stripped units)
+  (map (lambda (u)
+         (if (memq (caddr u) '(runtime runtime-shaken))
+             (list (car u) (bld-stripped-so-path (cadr u)) (caddr u))
+             u))
+       units))
 
 ;; Every unit's object file, quoted, in load order — the make-boot-file tail.
 (define (bld-units-so-args units)
@@ -3296,7 +3497,9 @@
   (let* ((cache (and rt-key
                      (string-append rt-key "." (bld-files-key base-boots) "."
                                     (symbol->string (bld-vfasl-codec))
-                                    (if petite-only? ".petite" "") ".vfasl")))
+                                    ;; petite-only images are built from the
+                                    ;; stripped runtime (bld-strip-runtime-units)
+                                    (if petite-only? ".petite-stripped" "") ".vfasl")))
          (out (string-append builddir "/base.vfasl")))
     (if (and cache (bld-cache-fetch! cache out))
         (begin (ei-mark! "runtime vfasl (cached)") out)
@@ -3352,6 +3555,22 @@
                         (and (bld-vfasl-unit! (cadr (car us)) vso)
                              (loop (cdr us) (cons vso acc)))))))))))
 
+;; A binary booted from petite has no compiler, so nothing in it can expand
+;; Scheme code, and the runtime half's compile-time information -- its macros'
+;; transformers and expander data -- is dead weight: 3.3MB of a closed-world
+;; app's runtime heap. Answer UNITS with each runtime unit's fasl replaced by a
+;; stripped copy beside it (the original stays, it is the cached one); a unit
+;; that will not strip ships as it was.
+(define (bld-strip-runtime-units units)
+  (map (lambda (u)
+         (if (memq (caddr u) '(runtime runtime-shaken))
+             (let ((out (bld-stripped-so-path (cadr u))))
+               (if (sa-strip-compile-time-info! (cadr u) out)
+                   (list (car u) out (caddr u))
+                   u))
+             u))
+       units))
+
 ;; units: a list of (src so kind) compiled in order and loaded into the boot in
 ;; that order, so the runtime half's defines precede the app half's reads.
 ;;   'whole   — one unsplit flat file: kernel prologue + baked fingerprint, no cache
@@ -3361,12 +3580,102 @@
 ;;              defines are jv$-munged and so cannot shadow a Chez name) and no
 ;;              fingerprint (the runtime unit carries the one that identifies it).
 (define (build-self-contained entry-ns out-path mode builddir units boot native-link petite-only?)
+  (display (string-append "jolt build: compiling " entry-ns " (" mode " mode, self-contained)\n"))
+  (let ((boot (bld-self-contained-boot! mode builddir units boot petite-only?)))
+    ;; The stub is the native launcher the boot is appended to. With no :static
+    ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
+    ;; natives it's re-linked here from the bundled kernel + launcher source so the
+    ;; archives are baked in and their symbols resolve in the running binary.
+    (bld-clear-output! out-path)
+    (if (> (string-length native-link) 0)
+        (bld-relink-stub builddir native-link out-path)
+        (jolt-spill-embedded! "stub/launcher" out-path))
+    ;; link: stub bytes ++ boot ++ frame, then make it executable.
+    (jolt-append-payload! out-path (read-file-bytes boot))
+    (jolt-chmod-755 out-path)
+    (ei-mark! "stub + payload link")
+    (display (string-append "jolt build: wrote " out-path "\n"))
+    (when bld-osx?
+      (display (string-append
+                 "jolt build: note — on macOS this binary is unsigned; to share it,\n"
+                 "  `xattr -d com.apple.quarantine " out-path "` on the target, or sign it.\n")))))
+
+;; --signable from a self-contained jolt (jolt#1255): the same in-process compile
+;; as build-self-contained, but the boot goes into the executable as a C array
+;; linked against the kernel this jolt carries — the link build-with-cc performs,
+;; with the bundled scheme.h, libkernel.a and lz4/zlib archives standing in for a
+;; Chez install. The result is structurally complete, so a strict signature check
+;; accepts it, and the only tool it needs is the system C compiler.
+(define (build-self-contained-cc entry-ns out-path mode builddir units boot boot-h main-c native-link petite-only?)
+  (display (string-append "jolt build: compiling " entry-ns " (" mode " mode, embedded kernel, cc-linked)\n"))
+  (let ((boot (bld-self-contained-boot! mode builddir units boot petite-only?))
+        (lk (string-append builddir "/libkernel.a"))
+        (archives (bld-spill-bundled-archives builddir)))
+    (jolt-spill-embedded! "csv/scheme.h" (string-append builddir "/scheme.h"))
+    (jolt-spill-embedded! "csv/libkernel.a" lk)
+    (bld-write-boot-header! boot boot-h)
+    (ei-mark! "boot C array")
+    (bld-write-exe-main! main-c)
+    (bld-clear-output! out-path)
+    ;; bld-link-executable: the spilled kernel is not PIC (see bld-relink-stub).
+    (parameterize ((bld-bundled-archives archives))
+      (bld-link-executable (bld-cc)
+        (lambda (extra)
+          (string-append
+            (bld-cc) " -O2 " (if (> (string-length native-link) 0) (bld-export-symbols-flag) "") extra
+            "-I'" builddir "' '" main-c "' '" lk "' "
+            "-o '" out-path "' " native-link " " (bld-link-libs)))
+        (string-append builddir "/link.log")))
+    (ei-mark! "cc link")
+    (display (string-append "jolt build: wrote " out-path "\n"))))
+
+;; Write BOOT into header H as `const unsigned char jolt_boot[]` + `unsigned int
+;; jolt_boot_len` — what xxd -i plus the symbol rename produce for build-with-cc,
+;; without needing xxd on a machine that has nothing but a C compiler.
+(define bld-hex-bytes
+  (let ((v (make-vector 256)))
+    (do ((i 0 (fx+ i 1))) ((fx= i 256) v)
+      (vector-set! v i (string-append "0x" (if (fx< i 16) "0" "")
+                                      (number->string i 16) ",")))))
+(define (bld-write-boot-header! boot h)
+  (let* ((bv (read-file-bytes boot))
+         (n (bytevector-length bv))
+         (p (open-output-file h 'replace)))
+    (put-string p "const unsigned char jolt_boot[] = {\n")
+    (do ((i 0 (fx+ i 1))) ((fx= i n))
+      (put-string p (vector-ref bld-hex-bytes (bytevector-u8-ref bv i)))
+      (when (fx= (fxand i 15) 15) (put-char p #\newline)))
+    (put-string p (string-append "\n};\nunsigned int jolt_boot_len = " (number->string n) ";\n"))
+    (close-port p)))
+
+;; The cc-linked executable's main: boot the C-array image and start it. Writes
+;; jolt_zlib.h beside it, which it includes.
+(define (bld-write-exe-main! main-c)
+  (let ((mc (open-output-file main-c 'replace)))
+    (put-string mc
+      (string-append
+        "#include \"scheme.h\"\n#include \"jolt_zlib.h\"\n#include \"boot_data.h\"\n"
+        (bld-boot-prefetch-defn)
+        "int main(int argc, char *argv[]) {\n"
+        (bld-boot-prefetch-call)
+        "  Sscheme_init(0);\n"
+        "  Sregister_boot_file_bytes(\"jolt\", (void *)jolt_boot, jolt_boot_len);\n"
+        "  Sbuild_heap(0, jolt_register_zlib);\n"
+        "  int status = Sscheme_start(argc, (const char **)argv);\n"
+        "  Sscheme_deinit();\n  return status;\n}\n"))
+    (close-port mc))
+  (bld-write-zlib-header! (path-parent main-c)))
+
+;; Compile UNITS and make the app's boot IN THIS PROCESS from the Chez boots this
+;; jolt carries, answering the boot to embed (the vfasl image when conversion
+;; succeeded, else BOOT). Shared by the appended-stub link (build-self-contained)
+;; and the cc link of a --signable build (build-self-contained-cc).
+(define (bld-self-contained-boot! mode builddir units boot petite-only?)
   (let ((petite (string-append builddir "/petite.boot"))
         (scheme (string-append builddir "/scheme.boot"))
         (rt-key #f))
     (jolt-spill-embedded! "csv/petite.boot" petite)
     (unless petite-only? (jolt-spill-embedded! "csv/scheme.boot" scheme))
-    (display (string-append "jolt build: compiling " entry-ns " (" mode " mode, self-contained)\n"))
     (for-each
       (lambda (u)
         (let ((src (car u)) (so (cadr u)) (kind (caddr u)))
@@ -3382,6 +3691,7 @@
       units)
     (bld-compile-app-units! builddir mode (filter (lambda (u) (eq? (caddr u) 'app)) units)
                             (not (or (bld-cross?) (bld-vfasl-disabled?))))
+    (when petite-only? (set! units (bld-strip-runtime-units units)))
     ;; A compiler-dropped binary (no runtime eval) boots from petite alone —
     ;; scheme.boot is the Chez compiler, ~5 MB of heap and ~1 MB of binary it
     ;; would never call. Chez's interpreter (petite) can't create a
@@ -3422,23 +3732,7 @@
           ((bld-vfasl-convert! boot vboot)
            (set! boot vboot)
            (ei-mark! "vfasl-convert")))))
-    ;; The stub is the native launcher the boot is appended to. With no :static
-    ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
-    ;; natives it's re-linked here from the bundled kernel + launcher source so the
-    ;; archives are baked in and their symbols resolve in the running binary.
-    (bld-clear-output! out-path)
-    (if (> (string-length native-link) 0)
-        (bld-relink-stub builddir native-link out-path)
-        (jolt-spill-embedded! "stub/launcher" out-path))
-    ;; link: stub bytes ++ boot ++ frame, then make it executable.
-    (jolt-append-payload! out-path (read-file-bytes boot))
-    (jolt-chmod-755 out-path)
-    (ei-mark! "stub + payload link")
-    (display (string-append "jolt build: wrote " out-path "\n"))
-    (when bld-osx?
-      (display (string-append
-                 "jolt build: note — on macOS this binary is unsigned; to share it,\n"
-                 "  `xattr -d com.apple.quarantine " out-path "` on the target, or sign it.\n")))))
+    boot))
 
 ;; Spill whichever bundled compression archives this binary carries into
 ;; BUILDDIR, and answer them as bld-bundled-archives expects. Empty for a jolt
@@ -3553,6 +3847,9 @@
           ;; mode's row. No kernel prologue here — a fresh Chez has nothing of
           ;; jolt's in its interaction environment to shadow a kernel name.
           (bld-units-compile-forms units mode)
+          ;; no compiler, no use for the runtime's compile-time information
+          ;; (bld-strip-runtime-units)
+          (if petite-only? (bld-units-strip-forms units) "")
           ;; petite-only boot when the compiler image was dropped (see
           ;; build-self-contained). The unit fasls follow the Chez boots in the
           ;; order they were compiled.
@@ -3561,7 +3858,7 @@
           (if petite-only?
               ""
               (string-append "  " (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n"))
-          (bld-units-so-args units) ")\n"
+          (bld-units-so-args (if petite-only? (bld-units-stripped units) units)) ")\n"
           ;; vfasl, in THIS script so a cross build gets the xpatch's retargeted
           ;; constants the way make-boot-file above does — see build-jolt.ss.
           ;; --boot decides the codec, or omits the conversion (jolt#886).
@@ -3578,22 +3875,9 @@
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   ;; The xxd symbol is derived from the path; normalize to jolt_boot.
   (bld-system (string-append
-    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "
+    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/const unsigned char jolt_boot[]/; "
     "s/unsigned int [A-Za-z0-9_]+_len/unsigned int jolt_boot_len/' '" boot-h "'"))
-  (let ((mc (open-output-file main-c 'replace)))
-    (put-string mc
-      (string-append
-        "#include \"scheme.h\"\n#include \"jolt_zlib.h\"\n#include \"boot_data.h\"\n"
-        (bld-boot-prefetch-defn)
-        "int main(int argc, char *argv[]) {\n"
-        (bld-boot-prefetch-call)
-        "  Sscheme_init(0);\n"
-        "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
-        "  Sbuild_heap(0, jolt_register_zlib);\n"
-        "  int status = Sscheme_start(argc, (const char **)argv);\n"
-        "  Sscheme_deinit();\n  return status;\n}\n"))
-    (close-port mc))
-  (bld-write-zlib-header! (path-parent main-c))
+  (bld-write-exe-main! main-c)
   ;; -rdynamic (Linux) exports the executable's symbols into the dynamic table so
   ;; a statically-linked native lib's symbols resolve via (load-shared-object #f)
   ;; at startup. macOS keeps unstripped executable symbols dlsym-visible already.
@@ -3633,12 +3917,30 @@
     (put-string p (bld-source-string "host/chez/stub/jolt_zlib.h"))
     (close-port p)))
 
+;; Write host/chez/stub/jolt_code_region.h into DIR, beside the library stub that
+;; #includes it: on macOS arm64 it keeps the library's code in one aligned region
+;; (jolt#1246). Embedded and read the same way as jolt_zlib.h.
+(define (bld-write-code-region-header! dir)
+  (let ((p (open-output-file (string-append dir "/jolt_code_region.h") 'replace)))
+    (put-string p (bld-source-string "host/chez/stub/jolt_code_region.h"))
+    (close-port p)))
+
+;; Write host/chez/stub/jolt_host_faults.h into DIR, beside the library stub that
+;; #includes it: it keeps a host's own SIGSEGV/SIGBUS/SIGFPE/SIGILL handling
+;; (jolt#1277). Embedded and read the same way as jolt_zlib.h.
+(define (bld-write-host-faults-header! dir)
+  (let ((p (open-output-file (string-append dir "/jolt_host_faults.h") 'replace)))
+    (put-string p (bld-source-string "host/chez/stub/jolt_host_faults.h"))
+    (close-port p)))
+
 (define (bld-library-stub)
   (string-append
     "#include \"scheme.h\"\n"
     "#include \"jolt_zlib.h\"\n"
     "#include <string.h>\n"
     "#include \"boot_data.h\"\n"
+    "#include \"jolt_code_region.h\"\n"
+    "#include \"jolt_host_faults.h\"\n"
     (bld-boot-prefetch-defn)
     "/* jolt_set_lookup_addr is called from the built library's scheme-start\n"
     "   handler (registered via Sforeign_symbol after Sbuild_heap) to hand the\n"
@@ -3649,9 +3951,11 @@
     "int jolt_library_init(int argc, char** argv) {\n"
     "  if (!argv) argc = 0;  /* Sscheme_start reads argv[0..argc-1]; a NULL argv means no args */\n"
     (bld-boot-prefetch-call)
+    "  jolt_save_host_faults();\n"
     "  Sscheme_init(0);\n"
-    "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, (iptr)jolt_boot_len);\n"
+    "  Sregister_boot_file_bytes(\"jolt\", (void *)jolt_boot, (iptr)jolt_boot_len);\n"
     "  Sbuild_heap(0, jolt_register_zlib);\n"
+    "  jolt_chain_faults();\n"
     "  Sforeign_symbol(\"jolt_set_lookup_addr\", (void*)jolt_set_lookup_addr);\n"
     "  return Sscheme_start(argc, (const char**)argv); }\n"
     "/* The thread that called jolt_library_init stays an ACTIVE Chez thread when\n"
@@ -3660,10 +3964,11 @@
     "   waits on it for good (#1234). Releasing it deactivates that thread; from\n"
     "   then on every call in, from it too, goes through a :collect-safe export,\n"
     "   which activates its caller on the way in. Repeating it is a no-op. */\n"
-    "void jolt_library_release_thread(void) { Sdeactivate_thread(); }\n"
+    "void jolt_library_release_thread(void) { Sdeactivate_thread(); jolt_faults_thread_released(1); }\n"
     "/* Sscheme_deinit runs Scheme on the calling thread, so a released thread is\n"
     "   reactivated first. Sactivate_thread is a no-op on an active thread. */\n"
-    "void jolt_library_shutdown(void) { Sactivate_thread(); Sscheme_deinit(); }\n"))
+    "void jolt_library_shutdown(void) {\n"
+    "  jolt_faults_thread_released(0); Sactivate_thread(); Sscheme_deinit(); jolt_restore_host_faults(); }\n"))
 
 ;; The library scheme-start tail BODY: publish the export table to the embedder,
 ;; then return 0 so Sscheme_start returns to jolt_library_init's caller. The guard
@@ -3705,7 +4010,7 @@
       (set! boot (string-append boot ".vfasl"))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   (bld-system (string-append
-    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "
+    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/const unsigned char jolt_boot[]/; "
     "s/unsigned int [A-Za-z0-9_]+_len/unsigned int jolt_boot_len/' '" boot-h "'"))
   (let ((lc (string-append builddir "/library.c")))
     (let ((p (open-output-file lc 'replace)))
@@ -3713,6 +4018,8 @@
       (close-port p))
     (bld-clear-output! out-path)
     (bld-write-zlib-header! builddir)
+    (bld-write-code-region-header! builddir)
+    (bld-write-host-faults-header! builddir)
     (bld-system (string-append
       (bld-cc) " " (bld-arch-flag) " -O2 -fPIC "
       ;; -install_name @rpath/<base> so a binary that link-edits against the dylib
@@ -3759,7 +4066,8 @@
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
                    (bld-boot-mode (bld-opt-boot-mode opt 2))
-                   (bld-signable (bld-opt-bool opt 4)))
+                   (bld-signable (bld-opt-bool opt 4))
+                   (bld-exclude-resources (bld-opt-strs opt 6)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
@@ -3771,7 +4079,8 @@
 (def-var! "jolt.host" "build-library"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
-                   (bld-boot-mode (bld-opt-boot-mode opt 2)))
+                   (bld-boot-mode (bld-opt-boot-mode opt 2))
+                   (bld-exclude-resources (bld-opt-strs opt 6)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)

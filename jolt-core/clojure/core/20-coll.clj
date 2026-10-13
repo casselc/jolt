@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/core.clj,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; clojure.core — collection tier. Pure, eager fns expressed as compositions of
 ;; already-frozen core primitives (reduce/assoc/get/conj/filter/vec/count/>=).
 ;; No host internals, no laziness, no macros — so they compile cleanly and stay
@@ -279,12 +284,6 @@
     (mapv (fn [x] (get smap x x)) coll)
     (map (fn [x] (get smap x x)) coll)))
 
-(defn nthnext [coll n]
-  (loop [n n xs (seq coll)]
-    (if (and xs (pos? n))
-      (recur (dec n) (next xs))
-      xs)))
-
 (defn bounded-count [n coll]
   (if (counted? coll)
     (count coll)
@@ -298,21 +297,10 @@
   ([f] (completing f identity))
   ([f cf] (fn ([] (f)) ([x] (cf x)) ([x y] (f x y)))))
 
-;; Matches Clojure exactly: n<=0 returns coll unchanged; for n>0 the walk yields
-;; (seq xs), and an exhausted/nil walk falls back to () via (or ... ()) — so
-;; (nthrest nil 100) is () (not nil), while (nthrest nil 0) is nil.
-(defn nthrest [coll n]
-  (if (pos? n)
-    (or (loop [n n xs coll]
-          (let [s (and (pos? n) (seq xs))]
-            (if s (recur (dec n) (rest s)) (seq xs))))
-        (list))
-    coll))
-
 (defn abs [x] (if (neg? x) (- 0 x) x))
 
 (defn NaN? [x]
-  (if (number? x) (not (= x x)) (throw (ClassCastException. "NaN? requires a number"))))
+  (if (number? x) (not (== x x)) (throw (ClassCastException. "NaN? requires a number"))))
 
 ;; No distinct host object / undefined types on Jolt.
 (defn object? [x] false)

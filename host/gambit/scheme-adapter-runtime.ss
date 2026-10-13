@@ -242,6 +242,13 @@
 ;; Byte order of the host. Contract: the byte order. The gambit target's
 ;; double-to-raw-bits byte layout (hasheq.ss) assumes little-endian; both
 ;; supported platforms (arm64/x86-64 macOS and linux) are little-endian.
+;; (sa-flonum->bits x) / (sa-bits->flonum b): binary64 pattern as an unsigned
+;; 64-bit integer and back; the high-word pair is the upper 32 bits of it.
+(define (sa-flonum->bits x) (##flonum->ieee754-64 x))
+(define (sa-bits->flonum b) (##ieee754-64->flonum b))
+(define (sa-flonum-hi32 x) (quotient (##flonum->ieee754-64 x) 4294967296))
+(define (sa-hi32->flonum h) (##ieee754-64->flonum (* h 4294967296)))
+
 (define (sa-endian)
   'little)
 
@@ -626,6 +633,26 @@
       (if f
           (begin (jolt-fiber-run f) (loop))
           #f))))
+
+;; ---- terminal tier (capability: terminal) -----------------------------------
+;; No terminal on this target, the contract's permitted degradation: the
+;; terminal is never claimed, and the REPL reads lines as it does from a pipe.
+(define (sa-term-open) #f)
+(define (sa-term-closed . _) (error "sa-term: no terminal on this target"))
+(define sa-term-raw! sa-term-closed)
+(define sa-term-cooked! sa-term-closed)
+(define sa-term-read-char sa-term-closed)
+(define sa-term-size sa-term-closed)
+(define sa-term-write-char sa-term-closed)
+(define sa-term-char-width sa-term-closed)
+(define sa-term-flush sa-term-closed)
+(define sa-term-move! sa-term-closed)
+(define sa-term-clear! sa-term-closed)
+(define sa-term-cr! sa-term-closed)
+(define sa-term-lf! sa-term-closed)
+(define sa-term-bell! sa-term-closed)
+(define sa-term-pause! sa-term-closed)
+(define sa-term-color! sa-term-closed)
 
 ;; --- capability-unchecked ---------------------------------------------------
 ;; The unchecked fixnum / vector primitives (CONTRACT.txt): this target expands

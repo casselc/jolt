@@ -27,8 +27,15 @@
                "(jolt-str-durable-wal-bytes \"x\")"))
 (ok "unproven receiver retains dispatch"
     (let ((emitted (emit-source "((fn [x] (.toDurableWalBytes x)) \"x\")")))
-      (and (contains? emitted "record-method-dispatch")
+      (and (or (contains? emitted "record-method-dispatch")
+               (contains? emitted "jolt-host-site-call0"))
            (not (contains? emitted "jolt-str-durable-wal-bytes")))))
+;; The 0.8.21 site cache still falls through for a non-host String receiver;
+;; an unproven String must not acquire the compiler-only WAL capability.
+(ok "unproven string rejects compiler-only WAL method at runtime"
+    (guard (e (#t (contains? (condition->message-string e) "toDurableWalBytes")))
+      (jolt-compile-eval "((fn [x] (.toDurableWalBytes x)) \"x\")" "user")
+      #f))
 (ok "empty SQL has exact framing"
     (equal? (jvec->list (jolt-str-durable-wal-bytes ""))
             (ascii "{\"sql\":\"\"}\n")))

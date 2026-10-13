@@ -792,6 +792,24 @@
                       (hex! at (fx+ #xd800 (fxquotient rest #x400)))
                       (hex! (fx+ at 6) (fx+ #xdc00 (fxmodulo rest #x400)))
                       (loop (fx+ i 1) (fx+ at 12))))))))))))))
+;; String.intern: one canonical object per content, the JVM's string pool. An
+;; ephemeron table, because the entry's value is its own key and an ordinary
+;; weak table would keep every interned string alive through that value. Lookup
+;; is unlocked and the insert re-checks under the lock, the double-check the
+;; symbol-string pool (values.ss) uses for the same reason.
+;;
+;; Once an interned string is collected its entry's key reads #!bwp, and a later
+;; lookup or resize hands that to the table's procedures, so both take any key:
+;; the bare string=? threw on the first intern to land in such a bucket.
+(define (str-intern-hash s) (if (string? s) (string-hash s) 0))
+(define (str-intern=? a b) (and (string? a) (string? b) (string=? a b)))
+(define jolt-str-intern-pool (make-ephemeron-hashtable str-intern-hash str-intern=?))
+(define jolt-str-intern-mu (make-mutex))
+(define (jolt-str-intern s)
+  (or (hashtable-ref jolt-str-intern-pool s #f)
+      (jolt-with-mutex jolt-str-intern-mu
+        (or (hashtable-ref jolt-str-intern-pool s #f)
+            (begin (hashtable-set! jolt-str-intern-pool s s) s)))))
 (define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
 (define (jolt-str-replace-all s pat repl) (re-replace (str-irx pat) s repl #t))
 (define (jolt-str-replace-first s pat repl) (re-replace (str-irx pat) s repl #f))
@@ -845,6 +863,8 @@
       '(("length" 0) ("charAt" 1) ("toString" 0) ("indexOf" 1 2) ("startsWith" 1 2)
         ("hashCode" 0) ("toLowerCase" 0 1) ("toUpperCase" 0 1) ("trim" 0)
         ("isEmpty" 0) ("isBlank" 0) ("repeat" 1) ("codePointAt" 1)
+        ("codePointBefore" 1) ("codePointCount" 2) ("offsetByCodePoints" 2)
+        ("chars" 0) ("codePoints" 0)
         ("substring" 1 2) ("lastIndexOf" 1 2) ("endsWith" 1) ("contains" 1)
         ("concat" 1) ("replace" 2) ("equalsIgnoreCase" 1) ("compareTo" 1)
         ("compareToIgnoreCase" 1) ("contentEquals" 1) ("regionMatches" 4 5)
@@ -884,7 +904,7 @@
     ;; (honeysql, string codecs); a miss at the bottom of the chain cost ~100ns
     ;; per call in the string arm. Order is behavior-neutral, keep it stable.
     ((string=? method "length") (string-length s))   ; exact int (= JVM)
-    ((string=? method "charAt") (string-ref s (jolt->idx (arg 0))))
+    ((string=? method "charAt") (jolt-char-at s (arg 0)))
     ((string=? method "toString") s)
     ((string=? method "indexOf")
      (str-index-of-any s (str-arg (arg 0))
@@ -907,6 +927,21 @@
     ((string=? method "isBlank") (jolt-str-blank? s))
     ((string=? method "repeat") (jolt-str-repeat s (arg 0)))
     ((string=? method "codePointAt") (jolt-str-code-point-at s (arg 0)))
+    ((string=? method "codePointBefore")
+     (let ((j (- (jolt->idx (arg 0)) 1)) (n (string-length s)))
+       (unless (and (fixnum? j) (fx>=? j 0) (fx<? j n)) (char-index-oob j n))
+       (char->integer (string-ref s j))))
+    ;; jolt's strings hold code points, so a count or an offset in code points is
+    ;; the same count in chars; the bounds are the JDK's.
+    ((string=? method "codePointCount")
+     (let ((b (jolt->idx (arg 0))) (e (jolt->idx (arg 1))) (n (string-length s)))
+       (jvm-range-check 'IndexOutOfBoundsException n b e)
+       (- e b)))
+    ((string=? method "offsetByCodePoints")
+     (let* ((i (jolt->idx (arg 0))) (r (+ i (jolt->idx (arg 1)))) (n (string-length s)))
+       (when (or (< i 0) (> i n) (< r 0) (> r n)) (throw-jvm 'IndexOutOfBoundsException jolt-nil))
+       r))
+    ((or (string=? method "chars") (string=? method "codePoints")) (string->int-stream s))
     ((string=? method "substring")
      (jolt-substr s (jolt->idx (arg 0))
                   (if (fx>? (length rest) 1) (jolt->idx (arg 1)) (string-length s))))
@@ -972,9 +1007,7 @@
     ;; getMessage with itself; equals is value equality.
     ((or (string=? method "getMessage") (string=? method "getLocalizedMessage")) s)
     ((string=? method "equals") (jolt-str-equals? s (arg 0)))
-    ;; String.intern: jolt strings aren't pooled, but value equality holds, so the
-    ;; canonical representation is the string itself.
-    ((string=? method "intern") s)
+    ((string=? method "intern") (jolt-str-intern s))
     ;; A class token is its canonical-name string, so Class methods land here:
     ;; (.getName (.getClass x)) / (.getSimpleName …) over the name string.
     ((or (string=? method "getName") (string=? method "getCanonicalName")) s)

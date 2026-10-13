@@ -402,6 +402,8 @@
 ;; so the fiber's own try/catch sees exactly what the caller passed.
 (def-var! "jolt.host" "fiber-interrupt!"
   (lambda (fib throwable) (if (jolt-fiber-interrupt! fib throwable) #t #f)))
+(def-var! "jolt.host" "fiber-kill!"
+  (lambda (fib throwable) (if (jolt-fiber-kill! fib throwable) #t #f)))
 (def-var! "jolt.host" "fiber-masked" (lambda (f) (jolt-fiber-masked (lambda () (jolt-invoke f)))))
 (def-var! "jolt.host" "fiber-unmasked" (lambda (f) (jolt-fiber-unmasked (lambda () (jolt-invoke f)))))
 ;; Unguarded full collect for the R8 gate: System/gc swallows Chez's
@@ -423,6 +425,26 @@
     (let ((fib (sa-fiber-spawn (lambda () (*txn* #f) (jolt-invoke f)))))
       (jolt-fiber-ensure-carrier!)
       fib)))
+;; Pools besides the default (fibers.ss, jolt-fiber-pool-make). A spawn into a
+;; pool is fiber-spawn with the carrier taken from the pool; nil back means the
+;; pool is shut down, which jolt.fibers/spawn reports.
+(def-var! "jolt.host" "fiber-pool-make"
+  (lambda (name n)
+    (unless (and (fixnum? n) (fx>? n 0))
+      (jolt-throw (jolt-ex-info "pool size must be a positive int"
+                                (jolt-hash-map (jolt-keyword "given") n))))
+    (jolt-fiber-pool-make name n)))
+(def-var! "jolt.host" "fiber-pool?" (lambda (x) (if (jolt-pool? x) #t #f)))
+(def-var! "jolt.host" "fiber-pool-name" (lambda (p) (jolt-pool-name p)))
+(def-var! "jolt.host" "fiber-pool-size" (lambda (p) (jolt-fiber-pool-size p)))
+(def-var! "jolt.host" "fiber-pool-of"
+  (lambda (fib) (or (jolt-fiber-pool-of fib) jolt-nil)))
+(def-var! "jolt.host" "fiber-pool-spawn"
+  (lambda (p f)
+    (or (jolt-fiber-pool-spawn p (lambda () (*txn* #f) (jolt-invoke f)))
+        jolt-nil)))
+(def-var! "jolt.host" "fiber-pool-shutdown!"
+  (lambda (p) (jolt-fiber-pool-shutdown! p) jolt-nil))
 (def-var! "jolt.host" "fiber-instance?" (lambda (x) (if (jolt-fiber? x) #t #f)))
 (def-var! "jolt.host" "fiber-yield" (lambda () (sa-fiber-yield) jolt-nil))
 ;; The callback gets what a jolt catch would bind: the unwrapped error for a

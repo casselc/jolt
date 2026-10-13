@@ -128,8 +128,11 @@
 ;; jolt.backend-scheme/dbl-ops resp. lng-ops, or emit-numeric splices a nil op.
 (defn- dbl-spec [nm n]
   (cond
-    (and (>= n 1) (contains? #{"+" "-" "*" "/" "min" "max"
+    (and (>= n 1) (contains? #{"+" "-" "*" "min" "max"
                                "unchecked-add" "unchecked-subtract" "unchecked-multiply"} nm)) :double
+    ;; Not unary /: Clojure inlines / only at two or more operands, so (/ x) is a
+    ;; call through the Object path, which raises on a zero divisor even for 0.0.
+    (and (>= n 2) (= "/" nm)) :double
     (and (= n 1) (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec" "unchecked-negate"} nm)) :double
     (and (>= n 2) (contains? #{"<" ">" "<=" ">=" "=" "=="} nm)) :bool
     :else nil))
@@ -233,7 +236,15 @@
       ;; a call to a var with a declared numeric return (^double/^long) yields that
       ;; kind, so an accumulator over the result types. The call itself isn't an
       ;; arithmetic op to lower — its body already coerces the return.
-      (get fnode :num-ret) [(get fnode :num-ret) node1]
+      ;;
+      ;; The declaration is a claim about the var, not a proof about this call:
+      ;; redefining the var leaves this site compiled against it, and a :double or
+      ;; :float operand reaches an unsafe fl op. :num-ret-guard has the back end
+      ;; check the value the call answers. A :long needs none, since the jolt-l
+      ;; ops test their operands.
+      (get fnode :num-ret)
+      (let [k (get fnode :num-ret)]
+        [k (if (or (= k :double) (= k :float)) (assoc node1 :num-ret-guard k) node1)])
       ;; java.lang.Math over proven flonum operands -> native Chez flonum op, result
       ;; typed :double (so it doesn't de-opt the surrounding arithmetic). Requires at
       ;; least one genuine :double operand (so (Math/abs 5) keeps its int result) and
@@ -268,9 +279,14 @@
       ;; (jolt-array-vec A) I) INLINE — keeping the value unboxed across the procedure
       ;; boundary instead of boxing at the jolt-flaget call. An unproven index keeps
       ;; (jolt-flaget A I), which owns the fixnum?/na-idx coercion.
-      (and (= nm "aget") (= n 2) (= :doubles (nth (nth ars 0) 0)))
-      (let [ikind (nth (nth ars 1) 0) inode (nth (nth ars 1) 1)]
-        [:double (cond-> (assoc node1 :fl-aget true)
+      ;; A ^floats read is the same flvector read typed :float (:fl-float): an fl
+      ;; op takes the double, anything else gets the Float (the back end).
+      (and (= nm "aget") (= n 2) (contains? #{:doubles :floats} (nth (nth ars 0) 0)))
+      (let [ikind (nth (nth ars 1) 0) inode (nth (nth ars 1) 1)
+            fl? (= :floats (nth (nth ars 0) 0))]
+        [(if fl? :float :double)
+         (cond-> (assoc node1 :fl-aget true)
+                   fl? (assoc :fl-float true)
                    (or (= ikind :long)
                        (and (int-lit? inode) (fixnum-lit? (get inode :val))))
                    (assoc :fl-idx-long true))])
@@ -304,15 +320,23 @@
       ;; :fl-val-double; when BOTH hold the back end emits (flvector-set! ...) inline
       ;; (returning the stored value — JVM contract). Otherwise it keeps (jolt-flaset
       ;; ...), which owns exact->inexact for an int / non-double value.
-      (and (= nm "aset") (= n 3) (= :doubles (nth (nth ars 0) 0)))
+      ;; ^floats stores the same way, rounded to single precision, and answers the
+      ;; Float (:fl-float). A :float value (a (float x) cast) stores the double it
+      ;; holds, unboxed like any :float operand.
+      (and (= nm "aset") (= n 3) (contains? #{:doubles :floats} (nth (nth ars 0) 0)))
       (let [ikind (nth (nth ars 1) 0) inode (nth (nth ars 1) 1)
-            vkind (nth (nth ars 2) 0)]
-        [:double (cond-> (assoc node1 :fl-aset true)
+            vkind (nth (nth ars 2) 0)
+            fl? (= :floats (nth (nth ars 0) 0))]
+        [(if fl? :float :double)
+         (cond-> (assoc node1 :fl-aset true)
+                   fl? (assoc :fl-float true)
                    (or (= ikind :long)
                        (and (int-lit? inode) (fixnum-lit? (get inode :val))))
                    (assoc :fl-idx-long true)
-                   (= vkind :double)
-                   (assoc :fl-val-double true))])
+                   (or (= vkind :double) (= vkind :float))
+                   (assoc :fl-val-double true)
+                   (= vkind :float)
+                   (update :args (fn [as] (assoc as 2 (assoc (nth as 2) :fl-unbox true)))))])
       (nil? nm) [nil node1]
       :else
        (let [;; per-operand class: :double / :long / :bigdec (typed), :wild (a
@@ -322,6 +346,7 @@
              cls (mapv (fn [r] (let [k (nth r 0) nd (nth r 1)]
                                  (cond (= k :double) :double
                                        (= k :long) :long
+                                       (= k :float) :float
                                        (= k :bigdec) :bigdec
                                        (int-lit? nd) (if (fixnum-lit? (get nd :val)) :wild :wild-big)
                                        :else :no)))
@@ -343,7 +368,10 @@
            ;; widened to flonum — JVM long->double widening == fixnum->flonum, so this
            ;; is value-neutral), :wild (an integer literal coerced to flonum), or a
            ;; bigdec LITERAL — double contagion: (+ 1.5M 2.0) => 3.5 Double, the bigdec
-           ;; contributing its double value. A let-bound bigdec (kind :bigdec, not a
+           ;; contributing its double value. A :float operand (a (float x) cast, a
+           ;; jfloat) widens to the double it holds, as the JVM widens a primitive
+           ;; float, so it joins too: the back end unboxes it (:fl-unbox) and a cast
+           ;; in operand position never builds the jfloat at all. A let-bound bigdec (kind :bigdec, not a
            ;; literal) can't be turned into a compile-time flonum, so it de-opts to the
            ;; generic bigdec-aware op. min/max return the ORIGINAL operand and `=` is
            ;; exactness-aware (0 != 0.0), so int/bigdec-literal/:long contagion is
@@ -351,8 +379,8 @@
            ;; to flonum would also change exactness there). fl< and friends compare
            ;; numerically, so coercing stays sound.
            (and ds (pos? n)
-                (some (fn [c] (= c :double)) cls)
-                (every? (fn [[c nd]] (or (= c :double) (= c :long) (= c :wild) (= c :wild-big)
+                (some (fn [c] (or (= c :double) (= c :float))) cls)
+                (every? (fn [[c nd]] (or (= c :double) (= c :long) (= c :float) (= c :wild) (= c :wild-big)
                                          (and (= c :bigdec) (bigdec-lit? nd))))
                         (map vector cls argnodes))
                 (or (not (contains? #{"min" "max" "="} nm))
@@ -365,6 +393,7 @@
            (let [args' (mapv (fn [[c nd]] (cond (int-lit? nd) (assoc nd :val (double (get nd :val)))
                                                 (bigdec-lit? nd) (bigdec-lit->flonum nd)
                                                 (= c :long) (assoc nd :fl-coerce true)
+                                                (= c :float) (assoc nd :fl-unbox true)
                                                 :else nd))
                              (map vector cls argnodes))]
              [(propagate ds) (assoc node1 :args args' :num-kind :double)])
@@ -375,6 +404,17 @@
            ;; through to the generic op.
            (and bs bd-ok?)
             [(propagate bs) (assoc node1 :num-kind :bigdec)]
+           ;; Division the fl op did not take still has to pick the JVM's overload
+           ;; per step: a step with a primitive double or float operand divides as
+           ;; IEEE does, where divide(Object, Object) raises on a zero divisor.
+           ;; (/ a b c) is (/ (/ a b) c), and a primitive step answers a primitive
+           ;; double, so a step is primitive once any operand up to it is.
+           ;; :div-prim is that per-step vector; the back end emits jolt-div2-prim
+           ;; for a true step and jolt-div2 for the rest.
+           (and (= nm "/") (>= n 2) (some (fn [c] (or (= c :double) (= c :float))) cls))
+           (let [prim (mapv (fn [c] (or (= c :double) (= c :float))) cls)]
+             [nil (assoc node1 :div-prim
+                         (vec (rest (reductions (fn [acc p] (or acc p)) (first prim) (rest prim)))))])
           :else [nil node1])))))
 
 ;; Returns [kind node'] — kind is :double, :long, or nil.
@@ -391,12 +431,10 @@
       (= op :let)
       (let [res (reduce (fn [acc b]
                           (let [te (nth acc 0) binds (nth acc 1)
-                                ir (an (nth b 1) te)
-                                ;; a ^doubles/… let binding (analyzer tagged its init
-                                ;; :akind) seeds the array kind, overriding the init's
-                                ;; own numeric kind — so (aget it i) in the body unboxes.
-                                k (or (get (nth b 1) :akind) (nth ir 0))]
-                            [(assoc te (nth b 0) k) (conj binds [(nth b 0) (nth ir 1)])]))
+                                ;; a ^doubles/… let binding's init is a :coerce of the
+                                ;; array kind, which answers that kind like any coerce
+                                ir (an (nth b 1) te)]
+                            [(assoc te (nth b 0) (nth ir 0)) (conj binds [(nth b 0) (nth ir 1)])]))
                         [tenv []] (get node :bindings))
             br (an (get node :body) (nth res 0))]
         [(nth br 0) (assoc node :bindings (nth res 1) :body (nth br 1))])

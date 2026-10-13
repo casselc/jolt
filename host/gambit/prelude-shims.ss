@@ -709,6 +709,13 @@
 ;; R6RS real->flonum: seq.ss's numeric macros widen an exact operand with it
 ;; before every mixed fl* / fl+, so (* 2 1.5) reached an unbound global.
 (define (real->flonum x) (exact->inexact x))
+;; Chez flsingle: the nearest single-precision value, as a flonum
+;; (converters.ss's (float x)). An f32vector store rounds the same way, C's
+;; double-to-float conversion (round half even, a tiny double flushes to 0.0).
+(define (flsingle x)
+  (let ((v (make-f32vector 1)))
+    (f32vector-set! v 0 x)
+    (f32vector-ref v 0)))
 
 ;; Chez bignum?: an exact integer outside the fixnum range (natives-format.ss).
 (define (bignum? x) (and (exact-integer? x) (not (fixnum? x))))
@@ -775,6 +782,30 @@
 (define (jolt-current-fiber) #f)
 (define (jolt-locks-enter!) (set-virtual-register! 7 (+ 1 (virtual-register 7))))
 (define (jolt-locks-exit!) (set-virtual-register! 7 (- (virtual-register 7) 1)))
+;; locks.ss's masked winds. Nothing escapes asynchronously here, but shared files
+;; raise and drop the count by hand around these, so they keep it balanced the
+;; same way Chez's do.
+(define-syntax jolt-locks-held (syntax-rules () ((_) (virtual-register 7))))
+(define-syntax jolt-masked-body
+  (syntax-rules ()
+    ((_ thunk) (lambda () (jolt-locks-exit!) (let ((r (thunk))) (jolt-locks-enter!) r)))))
+(define-syntax jolt-masked-after
+  (syntax-rules ()
+    ((_ lv e ...) (lambda () e ... (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))))))
+(define-syntax jolt-masked-cleanup
+  (syntax-rules ()
+    ((_ lv e ...)
+     (lambda ()
+       (if (fx>? (jolt-locks-held) lv)
+           (dynamic-wind (lambda () #f) (lambda () e ...) (lambda () (jolt-locks-exit!)))
+           (begin e ...))))))
+(define-syntax jolt-wind*
+  (syntax-rules ()
+    ((_ before setup body after)
+     (let ((lv (jolt-locks-held)))
+       (jolt-locks-enter!)
+       setup
+       (dynamic-wind before (jolt-masked-body body) (jolt-masked-cleanup lv after))))))
 ;; seq.ss force-claimed!'s waiting, for a cell another fiber is forcing. No fiber
 ;; exists here, so a waiter never has a carrier to give away (wait-turn answers
 ;; #f and it waits as a thread) and none can leave the CPU holding a lock.

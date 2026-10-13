@@ -40,3 +40,28 @@
   (let [v (mapv inc (range 256))]
     (+ n (count v))))
 (ffi/export! "alloc_work" alloc-work [:int] :int :collect-safe)
+
+;; code_churn compiles and drops thousands of small functions, collecting after
+;; each round, so the Chez kernel frees code chunks and allocates new ones. On
+;; macOS arm64 that runs through the library's code region (jolt#1246), whose
+;; freed ranges are reused; this answers 1 when every compiled function still
+;; computes the right thing.
+(defn code-churn [rounds]
+  (if (every? true?
+              (for [r (range rounds)]
+                (let [fs (mapv (fn [k] (eval (list 'fn ['x] (list '+ 'x k r)))) (range 1500))
+                      ok (= (mapv #(% 1) fs) (mapv #(+ 1 % r) (range 1500)))]
+                  (System/gc)
+                  ok)))
+    1
+    0))
+(ffi/export! "code_churn" code-churn [:int] :int)
+
+;; scheme_fault reads through a null pointer and answers 1 when jolt turns the
+;; fault into an exception. The signals driver calls it while a host owns
+;; SIGSEGV too (#1277): a fault in Scheme code is still jolt's to handle, while
+;; one in host code goes to the host. :collect-safe so a host thread can call it.
+(defn scheme-fault []
+  (try (ffi/read ffi/null :int) 0
+       (catch Throwable _ 1)))
+(ffi/export! "scheme_fault" scheme-fault [] :int :collect-safe)

@@ -119,6 +119,7 @@
 (define (jolt->fl x)
   (cond ((flonum? x) x)
         ((number? x) (exact->inexact x))
+        ((jfloat? x) (jfloat-fl x))
         (else (jolt-num-cast-throw x))))
 ;; jolt `not`: only nil and false are falsey.
 ;; Mirrors rt.ss's spliced jolt-not (see values.ss jolt-nil? for why these are
@@ -1407,7 +1408,8 @@
         (let ((m (make-mutex)))
           (hashtable-set! %monitor-tbl obj m)
           m))))
-(define (jolt-with-monitor obj thunk) (jwm-call (object-monitor obj) thunk))
+(define (jolt-call-with-monitor m thunk) (jwm-call m thunk))
+(define (jolt-with-monitor obj thunk) (jolt-call-with-monitor (object-monitor obj) thunk))
 (def-var! "jolt.host" "with-monitor" jolt-with-monitor)
 
 ;; source-registry.ss is excluded (introspect off on this target); the def

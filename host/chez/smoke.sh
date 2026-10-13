@@ -1585,6 +1585,23 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.fibers pools — carrier pools besides the default one: spawn into one,
+# shut it down, and a carrier pinned by a blocking foreign call holding up only
+# its own pool's fibers.
+pools_out="$($jolt run test/chez/jolt-fiber-pools-test.clj 2>&1)"
+if printf '%s' "$pools_out" | grep -q 'JOLT-FIBER-POOLS-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.fibers pools"
+  if printf '%s\n' "$pools_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$pools_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$pools_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$pools_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.process — the stdlib sub-process API against real programs (capture, pipes,
 # stdin, :dir/:env, exit codes, signals). The file self-checks and prints a marker.
 #
@@ -1681,6 +1698,29 @@ if printf '%s' "$infix_out" | grep -q 'INFIX OK'; then
 else
   echo "  FAIL: infix"
   printf '%s\n' "$infix_out" | grep FAIL | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# jolt.parinfer — the parinfer.js port, replaying parinfer.js's own case suite
+# (indent, paren and smart mode). The file self-checks and prints one marker.
+parinfer_out="$($jolt run test/chez/parinfer-test.clj 2>/dev/null)"
+if printf '%s' "$parinfer_out" | grep -q 'PARINFER OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: parinfer"
+  printf '%s\n' "$parinfer_out" | grep -v OK | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# jolt.line-editor — the interactive REPL's editing model, driven without a
+# terminal: parinfer-balanced typing and deleting, the Enter rule, newline
+# indentation, key decoding and layout. The file self-checks.
+line_editor_out="$($jolt run test/chez/line-editor-test.clj 2>/dev/null)"
+if printf '%s' "$line_editor_out" | grep -q 'LINE-EDITOR OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: line-editor"
+  printf '%s\n' "$line_editor_out" | grep -v OK | head -5 | sed 's/^/    /'
   fails=$((fails + 1))
 fi
 
@@ -1984,6 +2024,9 @@ check '(do (require (quote jolt.nrepl) (quote [jolt.socket.native :as n])) (let 
 # Linux leaves the thread in accept() on a freed number; now it waits for the
 # accept loop to leave, and the restart is what proves the port came back.
 check '(do (require (quote jolt.nrepl)) (let [port (let [ss (java.net.ServerSocket. 0)] (try (.getLocalPort ss) (finally (.close ss)))) round (fn [] (let [stop (with-out-str (def st (jolt.nrepl/start port))) s (java.net.Socket. "127.0.0.1" (int port)) out (.getOutputStream s) in (.getInputStream s) msg "d4:code7:(+ 1 2)2:op4:evale" buf (byte-array 4096)] (.write out (.getBytes msg "ISO-8859-1")) (Thread/sleep 300) (let [n (.read in buf) r (String. buf 0 (max 0 n) "ISO-8859-1")] (.close s) (st) (boolean (re-find #"5:value1:3" r)))))] [(round) (round)]))' '[true true]'
+# Port 0: the kernel picks the port, and the banner, .nrepl-port and the stop
+# fn's :port metadata all name the one it bound. They used to report 0.
+check '(do (require (quote jolt.nrepl)) (let [banner (with-out-str (def st (jolt.nrepl/start 0))) port (:port (meta st)) file (slurp ".nrepl-port") s (java.net.Socket. "127.0.0.1" (int port)) out (.getOutputStream s) in (.getInputStream s) buf (byte-array 4096)] (.write out (.getBytes "d4:code7:(+ 1 2)2:op4:evale" "ISO-8859-1")) (Thread/sleep 300) (let [n (.read in buf) r (String. buf 0 (max 0 n) "ISO-8859-1")] (.close s) (st) [(pos? port) (= file (str port)) (boolean (re-find (re-pattern (str "on port " port " ")) banner)) (boolean (re-find #"5:value1:3" r))])))' '[true true true true]'
 
 # jolt.ffi/load-library's per-OS map form — documented since the FFI docs
 # existed, implemented only in 0.7.10 (it rendered the map to a string and

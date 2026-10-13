@@ -49,16 +49,85 @@
 ;; the correct answer for a thread that never runs fibers.
 
 (define jolt-vreg-locks 7)
-(define (jolt-locks-held) (virtual-register jolt-vreg-locks))
+;; Syntax, like the pair below: the masked winds read it at their edges, where a
+;; call would itself be a place Chez checks for an interrupt.
+(define-syntax jolt-locks-held (syntax-rules () ((_) (virtual-register 7))))
 ;; Always ERR TOWARDS HELD. enter! runs BEFORE the acquire and exit! runs AFTER
 ;; the release, so the window on each side reads "a lock is held" when one is not
 ;; quite held yet or no longer is. That costs at most a deferred preemption; the
 ;; other order would leave a real window where the lock is held and the count
 ;; says otherwise, which is the bug this file exists to prevent.
-(define (jolt-locks-enter!)
-  (set-virtual-register! jolt-vreg-locks (fx+ 1 (virtual-register jolt-vreg-locks))))
-(define (jolt-locks-exit!)
-  (set-virtual-register! jolt-vreg-locks (fx- (virtual-register jolt-vreg-locks) 1)))
+;; Syntax and not procedures: the object monitor's masked enter and exit
+;; (java/concurrency.ss) take the count on every `locking`, where a call each way
+;; was a measurable share of the section.
+(define-syntax jolt-locks-enter!
+  (syntax-rules ()
+    ((_) (set-virtual-register! 7 (fx+ 1 (virtual-register 7))))))
+(define-syntax jolt-locks-exit!
+  (syntax-rules ()
+    ((_) (set-virtual-register! 7 (fx- (virtual-register 7) 1)))))
+
+;; --- winds an interrupt cannot split -------------------------------------------
+;; run-interruptible leaves its body by jumping out of a timer interrupt, and a
+;; fiber interrupt is raised where a preemption resumed, so any event check can be
+;; an escape point. Chez has them at the edges of a dynamic-wind: one between the
+;; body's return and the after-thunk (the winder already popped), and one between
+;; state set up OUTSIDE the wind and the winder's push. An escape at either
+;; skipped the cleanup: a lazy seq's claim stayed held and every other forcer
+;; waited on it, a namespace load's claim did the same to every require, and a
+;; binding frame, *txn* or *ns* stayed set for whatever ran next on the thread.
+;;
+;; Both escapes hold off while this thread's counted-lock depth is above zero, so
+;; the depth is the mask: raised before the setup and dropped as the body starts,
+;; raised again as the body returns and dropped once the after-thunk is done. The
+;; after-thunk tells a normal exit from a raise, an escape or a park by the depth,
+;; since only the normal exit left it above the level at entry, so no flag is
+;; allocated. State set INSIDE the before-thunk needs no mask: Chez pushes the
+;; winder as the before-thunk returns, with no check in between (swept at both
+;; optimize levels), so a resume's rewind of it is safe too. Only state set up
+;; before the wind is called, and the far edge, need the mask.
+;;
+;; A cleanup runs masked on a normal exit and drops the mask last, so a raise out
+;; of it would leave the depth up for good: no interrupt would land on the thread
+;; again, and a carrier would never preempt. jolt-masked-after is for cleanups
+;; that cannot raise (a store, a CAS); jolt-masked-cleanup, which jolt-wind* uses,
+;; drops the mask on the way out of a raise too.
+;;
+;; The depth is a counted lock and a park under one is refused, so these are for
+;; the runtime's own winds, whose setup and after-thunk are short and never park.
+;; A user `finally` is masked the same way but drops the depth before its body
+;; runs (the back end's emit-try). Every piece is inline register reads and
+;; writes: a call is itself a place Chez checks for the interrupt.
+;; The body, run unmasked, masked again as it returns (single value).
+(define-syntax jolt-masked-body
+  (syntax-rules ()
+    ((_ thunk) (lambda () (jolt-locks-exit!) (let ((r (thunk))) (jolt-locks-enter!) r)))))
+;; The after-thunk: E ..., then the mask dropped if a normal exit raised it above
+;; LV, the depth before the wind. E must not raise.
+(define-syntax jolt-masked-after
+  (syntax-rules ()
+    ((_ lv e ...) (lambda () e ... (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))))))
+;; The same for a cleanup that might raise: on a normal exit E runs in a wind
+;; whose after-thunk drops the mask, so a raise out of E drops it as it unwinds.
+;; That wind's own far edge is still masked, since the drop is its after-thunk.
+(define-syntax jolt-masked-cleanup
+  (syntax-rules ()
+    ((_ lv e ...)
+     (lambda ()
+       (if (fx>? (jolt-locks-held) lv)
+           (dynamic-wind void (lambda () e ...) (lambda () (jolt-locks-exit!)))
+           (begin e ...))))))
+;; (jolt-wind* before setup body after-expr): SETUP and the push masked, BODY
+;; unmasked, AFTER-EXPR masked on a normal exit (and allowed to raise). BEFORE is the before-thunk:
+;; jolt-finally-in for a cleanup a park must not run (fibers.ss drops those
+;; winders before a park escapes), (lambda () #f) for one it must.
+(define-syntax jolt-wind*
+  (syntax-rules ()
+    ((_ before setup body after)
+     (let ((lv (jolt-locks-held)))
+       (jolt-locks-enter!)
+       setup
+       (dynamic-wind before (jolt-masked-body body) (jolt-masked-cleanup lv after))))))
 
 ;; NOTE on how a refused preemption is remembered. It is NOT remembered here.
 ;; The obvious design — a pending flag, honoured when the outermost region exits
@@ -390,7 +459,7 @@
 ;;
 ;; decide runs with mu HELD and is passed one argument, whether the deadline has
 ;; passed. It answers jolt-cv-again to wait for a change, or any other value to
-;; finish. deadline is epoch milliseconds, or #f for an unbounded wait.
+;; finish. deadline is in mono-millis, or #f for an unbounded wait.
 ;;
 ;; This is jolt-lock-wait with the two waiter kinds filled in, so it inherits the
 ;; properties that primitive exists for: the switch happens with mu released, the
@@ -485,12 +554,14 @@
 ;; the same task in 5.2us.
 (define (jolt-cv-signal-one! cv) (condition-signal cv))
 
-;; Absolute epoch millis -> the absolute time object Chez's condition-wait wants.
+;; A mono-millis deadline -> the time left until it, as the time-duration Chez's
+;; condition-wait takes for a relative timeout. Relative and not an absolute
+;; time-utc: Chez's absolute form is the wall clock, and the deadline is not.
 ;; Floored to an exact integer first: make-time will not take a flonum field, and a
 ;; deadline arriving as one is a caller's arithmetic, not something to trust.
-(define (jolt-millis->time ms)
-  (let ((ms (exact (floor ms))))
-    (make-time 'time-utc (* 1000000 (mod ms 1000)) (div ms 1000))))
+(define (jolt-deadline->timeout deadline)
+  (let ((ms (max 0 (- (exact (floor deadline)) (mono-millis)))))
+    (make-time 'time-duration (* 1000000 (mod ms 1000)) (div ms 1000))))
 
 ;; (jolt-pause-ms ms) — pause THIS execution context for ms, whatever it is: a
 ;; thread sleeps, and a fiber parks until the deadline and gives its carrier up in
@@ -515,7 +586,7 @@
 (define (jolt-pause-ms ms)
   (if (jolt-current-fiber)
       (let ((mu (make-mutex)) (cv (make-condition)))
-        (jolt-cv-wait mu cv (+ (now-millis) ms)
+        (jolt-cv-wait mu cv (mono-deadline ms)
           (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
         (void))
       (sleep (ms->duration ms))))
@@ -608,12 +679,12 @@
                        ;; the report would name this wait instead.
                        (with-exception-handler
                          (lambda (e) (jolt-interrupt-wait-remove! ibox entry) (raise-continuable e))
-                         (lambda () (decide (and deadline (>= (now-millis) deadline)))))
+                         (lambda () (decide (and deadline (>= (mono-millis) deadline)))))
                        ;; NOT REGISTERED — nothing to clean up, so decide runs with
                        ;; nothing wrapped around it. This is the arm every
                        ;; non-interruptible wait takes, and the one a wait that
                        ;; answers on its first run takes.
-                       (decide (and deadline (>= (now-millis) deadline))))))
+                       (decide (and deadline (>= (mono-millis) deadline))))))
             (cond
               ((not (eq? r jolt-cv-again))
                (when entry (jolt-interrupt-wait-remove! ibox entry) (set! entry #f))
@@ -643,7 +714,7 @@
                        jolt-lock-parked))
                  (else
                   (if deadline
-                      (jolt-condition-wait cv mu (jolt-millis->time deadline))
+                      (jolt-condition-wait cv mu (jolt-deadline->timeout deadline))
                       (jolt-condition-wait cv mu))
                   (loop)))))))))
       #t)))

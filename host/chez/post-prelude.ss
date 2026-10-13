@@ -16,11 +16,10 @@
 (def-var! "clojure.core" "remove-watch" jolt-remove-watch)
 (def-var! "clojure.core" "set-validator!" jolt-set-validator!)
 (def-var! "clojure.core" "get-validator" jolt-get-validator)
-;; volatiles: a Chez volatile is a jvol record, but the overlay vreset!/vswap!/
+;; volatiles: a Chez volatile is a jvol record, but the overlay vreset!/
 ;; volatile? drive it via jolt.host/ref-put!+get / :jolt/type (tagged-table only).
 ;; Override with the native versions (defined in natives-transduce.ss).
 (def-var! "clojure.core" "vreset!" jolt-vreset!)
-(def-var! "clojure.core" "vswap!" jolt-vswap!)
 (def-var! "clojure.core" "volatile?" jolt-volatile-pred?)
 ;; bound?: the overlay reads (get v :root) — nil on a Chez var-cell record, so it
 ;; would wrongly report every var unbound. Native version (defined in vars.ss).
@@ -114,7 +113,7 @@
 (def-var! "clojure.core" "integer?" jolt-integer?)
 (def-var! "clojure.core" "int?" jolt-integer?)
 (def-var! "clojure.core" "float?" jolt-float?)
-(def-var! "clojure.core" "double?" jolt-float?)
+(def-var! "clojure.core" "double?" jolt-double?)
 ;; ratio?/rational? now live (correctly) in the overlay, so they no longer need a
 ;; native re-assertion here. decimal? stays (bigdec re-binds it).
 (def-var! "clojure.core" "decimal?" jolt-decimal?)

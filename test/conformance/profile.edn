@@ -313,15 +313,7 @@
    :bucket :divergent,
    :features [:host/jvm-interop]}
   {:suite "integer-box-model / narrow int class collapses to Long",
-   :label "float class collapses to Double",
-   :bucket :divergent,
-   :features [:host/jvm-interop]}
-  {:suite "integer-box-model / narrow int class collapses to Long",
    :label "instance? Byte is false",
-   :bucket :divergent,
-   :features [:host/jvm-interop]}
-  {:suite "integer-box-model / narrow int class collapses to Long",
-   :label "instance? Float is true",
    :bucket :divergent,
    :features [:host/jvm-interop]}
   {:suite "integer-box-model / narrow int class collapses to Long",
@@ -457,10 +449,6 @@
   {:suite "macros / time, with-redefs, macroexpand",
    :label "with-redefs restores on throw",
    :bucket :uncertifiable,
-   :features [:host/jvm-interop]}
-  {:suite "macros / vswap! divergence",
-   :label "vswap! is a macro on JVM, fn on jolt",
-   :bucket :divergent,
    :features [:host/jvm-interop]}
   {:suite "metadata / type hints",
    :label "type hint in let",

@@ -163,6 +163,10 @@
 ;;   - a plain reify: its interned protocol list (make-reified-delegating)
 ;;   - a scalar, collection or seq: its class name — the fast path's own string
 ;;     constant for that class, so one object per class
+;;   - a reference or deferred value (atom, var, ref, volatile, delay, promise,
+;;     future, agent): its class name, from ref-kind-key below. Their classes
+;;     come from class arms, not the (class x) fast path, so a library class arm
+;;     is refused for these too (host-class.ss ref-kind-probes)
 ;; A proxy is excluded: its answer consults the delegate.
 ;;
 ;; The LIBRARY arm is never memoized. The chain is split at it: the builtin arms
@@ -173,7 +177,25 @@
 (define (instance-kind-key val)
   (cond ((jrec? val) (jrec-desc val))
         ((jreify? val) (and (not (jreify-delegate val)) (jreify-protos val)))
-        (else (class-fast-name val))))
+        ((class-fast-name val))
+        (else (ref-kind-key val))))
+;; Without a key every (instance? IRef an-atom) walked the arms and the taxonomy,
+;; 20-45x a record's check (#1299). future / promise / agent / delay live in
+;; java/concurrency.ss, which loads long after this file and is no part of the
+;; Gambit host, so it keys its own four through the hook, and hands over a probe
+;; of each for host-class.ss ref-kind-probes.
+(define ref-kind-extra-hook #f)
+(define ref-kind-extra-probes (lambda () '()))
+(define (set-ref-kind-extra-hook! key-fn probes)
+  (set! ref-kind-extra-probes probes)
+  (set! ref-kind-extra-hook key-fn))
+(define (ref-kind-key x)
+  (cond ((jolt-atom? x) "clojure.lang.Atom")
+        ((var-cell? x) "clojure.lang.Var")
+        ((jolt-ref? x) "clojure.lang.Ref")
+        ((jvol? x) "clojure.lang.Volatile")
+        (ref-kind-extra-hook (ref-kind-extra-hook x))
+        (else #f)))
 (define (instance-kind-epoch)
   (fx+ instance-arms-epoch (fx+ jch-graph-epoch jolt-proto-epoch)))
 (define instance-kind-memo (make-weak-eq-hashtable))
@@ -305,14 +327,15 @@
       (else (instance-check-walk ts val)))))
 (define (case-string tname val)
   (cond
-    ((member tname '("Number" "java.lang.Number")) (number? val))
+    ((member tname '("Number" "java.lang.Number")) (or (number? val) (jfloat? val)))
     ;; long-range only (the printer's N-suffix boundary, not the 61-bit fixnum
     ;; range — Long/MAX_VALUE is a Chez bignum but a JVM Long): beyond it a
     ;; value is the JVM's BigInt, which is not a Long (issue #627) and answers
     ;; through its BigInt/BigInteger tags instead.
     ((member tname '("Long" "java.lang.Long" "Integer" "java.lang.Integer"))
      (and (number? val) (exact? val) (integer? val) (not (jolt-bigint-print? val))))
-    ((member tname '("Double" "java.lang.Double" "Float" "java.lang.Float")) (and (number? val) (flonum? val)))
+    ((member tname '("Double" "java.lang.Double")) (flonum? val))
+    ((member tname '("Float" "java.lang.Float")) (jfloat? val))
     ((member tname '("Ratio" "clojure.lang.Ratio")) (and (number? val) (exact? val) (rational? val) (not (integer? val))))
     ((member tname '("String" "java.lang.String" "CharSequence" "java.lang.CharSequence")) (string? val))
     ((member tname '("Boolean" "java.lang.Boolean")) (boolean? val))

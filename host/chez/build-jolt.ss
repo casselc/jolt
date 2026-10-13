@@ -231,7 +231,9 @@
         (\"csv/liblz4.a\" \"jolt_liblz4_a\" \"jolt_liblz4_a_len\")
         (\"csv/libz.a\" \"jolt_libz_a\" \"jolt_libz_a_len\")
         (\"stub/launcher.c\" \"jolt_launcher_c\" \"jolt_launcher_c_len\")
-        (\"host/chez/stub/jolt_zlib.h\" \"jolt_zlib_h\" \"jolt_zlib_h_len\")))))
+        (\"host/chez/stub/jolt_zlib.h\" \"jolt_zlib_h\" \"jolt_zlib_h_len\")
+        (\"host/chez/stub/jolt_code_region.h\" \"jolt_code_region_h\" \"jolt_code_region_h_len\")
+        (\"host/chez/stub/jolt_host_faults.h\" \"jolt_host_faults_h\" \"jolt_host_faults_h_len\")))))
 
 (suppress-greeting #t)
 ;; The collector policy: a nursery sized by the time collection takes (16MB
@@ -741,11 +743,14 @@
   (bld-vfasl-regzip! jb-build jb-boot jb-vboot))
 
 ;; --- 3. embed boots/stub as C arrays + cc-link ------------------------------
-;; xxd a file into header H and rename its symbol to NAME / NAME_len.
+;; xxd a file into header H and rename its symbol to NAME / NAME_len. The array
+;; is const: nothing writes it, and in writable data the boot prefetch's madvise
+;; made every page a private dirty copy (14MB a process on macOS); read-only, the
+;; pages stay clean and shared with every other jolt running.
 (define (jb-c-array file h name)
   (bld-system (string-append "xxd -i '" file "' > '" h "'"))
   (bld-system (string-append
-    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char " name "[]/; "
+    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/const unsigned char " name "[]/; "
     "s/unsigned int [A-Za-z0-9_]+_len/unsigned int " name "_len/' '" h "'")))
 
 ;; The same header for a file that is not there: main.c's #include and the symbol
@@ -755,7 +760,7 @@
 (define (jb-empty-c-array h name)
   (let ((p (open-output-file h 'replace)))
     (put-string p (string-append
-      "unsigned char " name "[] = { 0x00 };\n"
+      "const unsigned char " name "[] = { 0x00 };\n"
       "unsigned int " name "_len = 0;\n"))
     (close-port p)))
 
@@ -793,6 +798,10 @@
 ;; relinks from this binary with no checkout on disk (build.ss
 ;; bld-write-zlib-header!).
 (jb-c-array "host/chez/stub/jolt_zlib.h" (string-append jb-build "/joltzlibh_data.h") "jolt_zlib_h")
+;; The library stub's code-region header (build.ss bld-write-code-region-header!).
+(jb-c-array "host/chez/stub/jolt_code_region.h" (string-append jb-build "/joltcoderegionh_data.h") "jolt_code_region_h")
+;; The library stub's host-fault header (build.ss bld-write-host-faults-header!).
+(jb-c-array "host/chez/stub/jolt_host_faults.h" (string-append jb-build "/jolthostfaultsh_data.h") "jolt_host_faults_h")
 ;; The embedded stdlib fasl blob (one concatenated .so per install-owned ns).
 ;; jb-emit-stdlib-fasls! wrote it during flat.ss emission; it is absent only when
 ;; that step never ran, which never happens in a real build. A 1-byte placeholder
@@ -820,6 +829,8 @@
       "#include \"z_data.h\"\n"
       "#include \"launcherc_data.h\"\n"
       "#include \"joltzlibh_data.h\"\n"
+      "#include \"joltcoderegionh_data.h\"\n"
+      "#include \"jolthostfaultsh_data.h\"\n"
       "#include \"stdlib_fasls_data.h\"\n"
       "#include \"source_blob_data.h\"\n"
       (bld-boot-prefetch-defn)
@@ -828,7 +839,7 @@
       ;; init and the runtime image top levels instead of stalling behind them.
       (bld-boot-prefetch-call)
       "  Sscheme_init(0);\n"
-      "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
+      "  Sregister_boot_file_bytes(\"jolt\", (void *)jolt_boot, jolt_boot_len);\n"
       "  Sbuild_heap(0, jolt_register_zlib);\n"
       "  int status = Sscheme_start(argc, (const char **)argv);\n"
       "  Sscheme_deinit();\n  return status;\n}\n"))

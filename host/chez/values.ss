@@ -14,6 +14,19 @@
 
 ;; --- nil ---------------------------------------------------------------------
 (define-record-type jolt-nil-t (fields) (nongenerative jolt-nil-v1))
+
+;; A java.lang.Float. Chez has one flonum, but a Float is not a Double: it
+;; prints Float.toString's digits ((float 0.1) is 0.1, its double value
+;; 0.10000000149011612), classes as java.lang.Float and hashes as
+;; Float.hashCode. So a float is a value of its own holding the single-precision
+;; value as a flonum, and arithmetic widens it to a double as the JVM does:
+;; converters.ss makes one, float.ss registers it with the numeric tower, the
+;; printer, = and hash. Defined here, ahead of every file whose numeric helpers
+;; take one, because record ops are open-coded and none may name it earlier.
+(define-record-type jfloat (fields fl) (nongenerative chez-jfloat-v1))
+;; A Float as the double it widens to; anything else unchanged.
+(define (jfloat-unbox x) (if (jfloat? x) (jfloat-fl x) x))
+
 ;; Has a second OS thread ever been started? #f until the first fork-thread
 ;; (lazy-bridge.ss shadows it to flip this), never #f again. The lock-free
 ;; paths that are only unsafe under real concurrency — a lazy node's first
@@ -140,6 +153,18 @@
 (define-record-type (cseqv make-cseqv cseqv?)
   (parent cseq) (fields cvec ci crest)
   (nongenerative chez-cseqv-v1) (sealed #t))
+;; A cell that knows how many elements it heads is the cseqn subtype, carrying
+;; cnt (this cell included): a PersistentList node (PersistentList._count), a
+;; StringSeq / ArraySeq / APersistentVector$RSeq cell (their count() is the
+;; backing length less the index), and any chain built whole from a Scheme list.
+;; jolt-count answers it in O(1) and seq=? compares two of them by count before
+;; walking. One more field costs nothing in Chez: a cseq is 40 bytes of fields and
+;; header padded to 48, and a cseqn fills that padding. A cell whose tail is lazy
+;; or unknown (a Cons, a lazy seq's cell) is never one -- its length is not known
+;; without walking.
+(define-record-type (cseqn make-cseqn cseqn?)
+  (parent cseq) (fields cnt)
+  (nongenerative chez-cseqn-v1) (sealed #t))
 ;; Macros, so they inline as the record accessors they replace did: several sit
 ;; on the step of every vector walk.
 (define-syntax cseq-cvec (syntax-rules () ((_ s) (let ((x s)) (and (cseqv? x) (cseqv-cvec x))))))

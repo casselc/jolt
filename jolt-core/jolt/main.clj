@@ -694,6 +694,28 @@
         :else       (let [nb (str buf "\n" line)]
                       (if (repl-form-complete? nb) nb (recur nb)))))))
 
+(defn- repl-entry-reader
+  "How the session reads an entry. A terminal gets jolt.line-editor (multi-line
+  editing with parinfer keeping the parens balanced, docs, history); anything
+  else, a pipe or a script or TERM=dumb, keeps repl-read-form, so input that is
+  not typed is read exactly as written. The editor ns loads only when used."
+  []
+  (or (when (jolt.host/term-open?)
+        (when-let [ed ((requiring-resolve 'jolt.line-editor/editor))]
+          (let [read-entry (requiring-resolve 'jolt.line-editor/read-entry)]
+            (fn [] (read-entry ed (str (ns-name *ns*) "=> "))))))
+      repl-read-form))
+
+(defn- repl-eval
+  "Evaluate an entry so that ^C interrupts it: while it runs, SIGINT trips token
+  instead of ending the process, stopping a computation and throwing a sleep or
+  a deref out with InterruptedException. Between entries ^C is the exit it
+  always was."
+  [form token]
+  (jolt.host/interrupt-on-sigint! token)
+  (try (jolt.host/run-interruptible token (fn [] (load-string form)))
+       (finally (jolt.host/interrupt-on-sigint! nil))))
+
 ;; `jolt repl`: resolve the project so deps (git libs) are on the roots and
 ;; native libs are loaded — same context a run gets, so (require '[some.lib])
 ;; works in the REPL — then the session. -M reaches the session directly, with
@@ -713,27 +735,38 @@
   (push-thread-bindings {#'clojure.core/*repl* true
                          #'clojure.core/*1 nil #'clojure.core/*2 nil
                          #'clojure.core/*3 nil #'clojure.core/*e nil})
-  (loop []
-    (let [form (repl-read-form)]
+  (loop [read-entry (repl-entry-reader)]
+    (let [form (read-entry)]
       (when form
         ;; :repl/quit / :exit exit the loop — a reliable gesture that works in any
         ;; terminal, unlike ^D (some terminals/editors don't deliver it as EOF).
-        (if (#{:repl/quit :exit} (try (read-string form) (catch :default _ nil)))
+        (cond
+          (#{:repl/quit :exit} (try (read-string form) (catch :default _ nil)))
           nil
-          (do
-            (try (let [v (load-string form)]
+          ;; an entry the editor submitted blank, or abandoned with ^C
+          (str/blank? form)
+          (recur read-entry)
+          :else
+          (let [token (jolt.host/make-interrupt)]
+            (try (let [v (repl-eval form token)]
                    (var-set #'clojure.core/*3 *2)
                    (var-set #'clojure.core/*2 *1)
                    (var-set #'clojure.core/*1 v)
+                   ;; the body caught the interrupt and returned
+                   (when (jolt.host/interrupted? token) (println))
                    (println (pr-str v)))
                  (catch :default e
                    (var-set #'clojure.core/*e e)
-                   (println "error:" (or (ex-message e)
-                                         (try ((resolve 'jolt.host/condition-message) e) (catch :default _ nil))
-                                         (pr-str e)))
-                   (when-let [bt (jolt.host/backtrace-string)]
-                     (print bt))))
-            (recur)))))))
+                   (let [interrupted? (jolt.host/interrupted? token)]
+                     ;; off the line the terminal echoed ^C on
+                     (when interrupted? (println))
+                     (println "error:" (or (when interrupted? "Evaluation interrupted")
+                                           (ex-message e)
+                                           (try ((resolve 'jolt.host/condition-message) e) (catch :default _ nil))
+                                           (pr-str e)))
+                     (when-let [bt (and (not interrupted?) (jolt.host/backtrace-string))]
+                       (print bt)))))
+            (recur read-entry)))))))
 
 ;; A bb.edn / deps.edn :tasks entry. The semantics live in jolt.tasks — required
 ;; here only when a task actually runs, so the CLI's startup closure (and the
@@ -1067,6 +1100,18 @@
                                           (cond (nil? v) []
                                                 (sequential? v) v
                                                 :else [v]))))
+            ;; dependency-root files NOT to bake into the binary — deps.edn
+            ;; :jolt/build {:exclude-resources [glob …]}, matched against the
+            ;; name io/resource asks for: a file no jolt program reads (a
+            ;; ClojureScript externs `*.ext.js`) that a dependency ships anyway.
+            ;; The project's only, like :embed.
+            exclude-resources (let [v (:exclude-resources build)
+                                    v (cond (nil? v) [] (sequential? v) v :else [v])]
+                                (doseq [p v]
+                                  (when-not (and (string? p) (not (str/blank? p)))
+                                    (throw (ex-info (str ":exclude-resources takes glob strings (got " (pr-str p) ")")
+                                                    {:exclude-resources p}))))
+                                (vec (distinct v)))
             ;; a shared library (callable from C/C++/Rust via jolt_library_init +
             ;; jolt_lookup) instead of an executable: --library.
             library? (some #{"--library"} flag-args)
@@ -1077,9 +1122,9 @@
             target-pack (or (:target-pack opts) (System/getenv "JOLT_TARGET_PACK"))
             ;; --signable: an ordinary, same-machine executable build still
             ;; produces a structurally complete (and therefore strictly
-            ;; signable) binary by routing through the same spawned-cc path
-            ;; --target cross-compiling always uses, rather than appending the
-            ;; boot image past this jolt's own embedded launcher stub. A
+            ;; signable) binary by cc-linking the boot in as a C array (against
+            ;; this jolt's own embedded kernel when it carries one), rather than
+            ;; appending the boot image past its embedded launcher stub. A
             ;; self-contained jolt's default output has most of its bytes
             ;; outside its own Mach-O/PE/ELF image, which a strict signature
             ;; check (codesign --verify --strict on macOS) correctly refuses.
@@ -1091,8 +1136,8 @@
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic nil include-names)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic signable? include-names))))))
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic nil include-names exclude-resources)
+          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic signable? include-names exclude-resources))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the
@@ -1164,8 +1209,8 @@
      "                         outside its own Mach-O/PE/ELF image, which a strict"
      "                         signature check (codesign --verify --strict on"
      "                         macOS) refuses; --signable produces a structurally"
-     "                         complete binary instead, at the cost of spawning a"
-     "                         separate Chez process and needing a C toolchain"
+     "                         complete binary instead, at the cost of needing a"
+     "                         C compiler to link it"
      "                         (no effect on --library, always structurally"
      "                         complete, or on a --target build, already forced"
      "                         onto this same path)"

@@ -125,11 +125,11 @@ JOLT-TARGETS-NEEDING-DEPS := \
   deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
   hostarity narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
-  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
+  shakesmoke smoke sortedcoll staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck \
+.PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck noticecheck monitormodel \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck gambitunbound gambitunbound-regen \
         gambitvars gambitvars-regen gambitstatics gambitstatics-regen gambittwins grenadinecheck \
@@ -183,18 +183,24 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling bytestreamsize smalldoubleprint plainhexformat finitestringrepeat strrenderorder hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
-  transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
-  hasheq narrowhash callbackbridges callbackdomains protocolsite \
-  protoret accfix pic narrow directlink directcall defmetacells staticsite durablewalnative mapseqfold arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flarr \
+  transient sortedcoll rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
+  hasheq narrowhash \
+  protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher regexstatic winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling buildnatives compilepathsmoke makefilesmoke versionsmoke attributioncheck \
-  systemstreams utf8decode \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest threadsafety cas flow
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
+  systemstreams userdirpaths utf8decode \
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety cas flow
+CI-GATES += bytestreamsize smalldoubleprint plainhexformat finitestringrepeat strrenderorder callbackbridges callbackdomains protocolsite durablewalnative mapseqfold regexstatic
 TEST-GATES := submodules selfhost ci
 CI-GATES += transientassoc
+CI-GATES += writernativeseam
+
+.PHONY: writernativeseam
+writernativeseam:
+	@$(CHEZ) --script test/chez/string-writer-native-seam-test.ss
 
 GATE-RECEIPT := target/gate-receipt
 
@@ -417,6 +423,18 @@ asynctimer:
 interruptnest:
 	@$(CHEZ) --script test/chez/interrupt-nesting-test.ss
 
+# An interrupt (run-interruptible's escape) swept across every check point of a
+# monitor enter/body/exit, Object.wait, and jolt-with-mutex never leaves the
+# monitor or the mutex held, nor this thread's counted-lock depth raised.
+monitorescape:
+	@$(CHEZ) --script test/chez/monitor-escape-test.ss
+
+# The same sweep over the runtime's other winds and the back end's finally: an
+# interrupt never skips a finally between its body and its cleanup, and never
+# leaves a binding frame, *txn*, *out* or a lazy seq's claim behind.
+windescape:
+	@$(CHEZ) --script test/chez/wind-escape-test.ss
+
 # The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
 # against the number of vars in one frame, push/pop throughput, and the two
 # workloads the trade-off is judged on — N nested fn literals (deep) and a real
@@ -632,6 +650,14 @@ lazyretain: testbin
 	 [ "$$fails" = 0 ] || exit 1; \
 	 echo "lazyretain: $$n cases in constant memory under a 256MB heap"
 
+# What a process holds beyond its data (test/chez/footprint-test.sh): no boot
+# chunk pinned near-empty on a patched kernel (chez-patches/0002), the embedded
+# boot arrays in a read-only section (madvise dirtied them in writable data), and
+# a GC live baseline measured after a collection rather than over the boot's
+# garbage.
+footprint: testbin
+	@sh test/chez/footprint-test.sh target/release/jolt "$(CHEZ)"
+
 # The nursery follows the collector's time share, bounded by the live set
 # (rt.ss jolt-install-gc-policy!): a churning program grows it past the 16MB floor
 # but not past its footprint bound (the fixed-cap policy grew the same loop's to
@@ -675,7 +701,7 @@ gcpolicy: testbin
 	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the heap peaked at $${pk:-?} in a ceiling-forced full collection, more than 10% over JOLT_MAX_HEAP=256m: one collection of every generation holds its copies beside their sources (collect it a generation at a time; jolt-exoj)"; exit 1; }; \
 	 set -- $$(JOLT_NO_USER_DEPS=1 $$j run $$t refresh 2>&1 | sed -n 's/^growth //p'); \
 	 echo "gcpolicy: older generations' allowance with ~100MB held $$(($${1:-0} / 1048576))MB, after dropping it and System/gc $$(($${2:-0} / 1048576))MB"; \
-	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -eq 67108864 ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \
+	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -ge 67108864 ] && [ $$(($$2 * 2)) -lt "$$1" ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \
 	 st=$$(JOLT_NO_USER_DEPS=1 $$j run $$t startup 2>&1 | sed -n 's/^trip //p'); \
 	 echo "gcpolicy: a sub-millisecond first reading then cheap collections -> nursery $$st"; \
 	 [ "$$st" = "$$floor" ] || { echo "FAIL gcpolicy: one collection right after startup grew the nursery to $${st:-?} (the share must weigh collections by their time, and wait for five)"; exit 1; }; \
@@ -940,6 +966,7 @@ ffi:
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-foreign-thread-test.sh
 	@sh test/chez/ffi-gc-stall-test.sh
+	@sh test/chez/collect-safe-activation-test.sh "$(CHEZ)"
 
 # zlib bindings (host/chez/java/zlib.ss): the z_stream layout, entry-point
 # resolution, checksums, round trips, error codes, dictionaries, parameter
@@ -970,6 +997,11 @@ continuations:
 # run on fibers, so 200 of them do not need 200 threads.
 flow:
 	@bin/jolt run test/chez/flow-test.clj
+
+# Sorted colls: the lazy tree walk behind seq/rseq/keys/vals/subseq, and hash/=
+# answered from the tree. Values pinned to the JVM; scaling pinned as allocation.
+sortedcoll:
+	@$(CHEZ) --script test/chez/sorted-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
@@ -1152,7 +1184,8 @@ staticsite:
 	@$(CHEZ) --script host/chez/run-staticsite.ss
 
 # Array-mode maps are one flat k/v slot vector (PersistentArrayMap), their
-# transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
+# transients a slot buffer, their seq views vector-backed; a hash map's seq view
+# is a lazy chunked walk of its trie (test/chez/arraymap-test.ss).
 arraymap:
 	@$(CHEZ) --script test/chez/arraymap-test.ss
 
@@ -1390,6 +1423,12 @@ hostarity:
 foreignhandles:
 	@$(CHEZ) --script test/chez/foreign-handles-test.ss
 
+# A host-object method call site caches what the host-type arm resolved: a
+# cached call answers what dispatch does, sees arms and methods registered
+# after it, and allocates nothing of its own.
+hostsite:
+	@$(CHEZ) --script test/chez/jhost-method-site-test.ss
+
 # An unhinted method call allocates its argument vector and at most one arg
 # list: no arm converts the rest args before testing the receiver.
 dispatchalloc:
@@ -1484,6 +1523,14 @@ winparity:
 vfaslceiling:
 	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/vfasl-ceiling-test.ss
 
+# Equal string constants share one object in a vfasl image (jolt-50zg,
+# chez-patches/0004): compile-file makes every literal its own object, one fasl
+# entry per form, and a hello app's heap held 788 copies of "clojure.core". The
+# patched converter keeps the first string of each content. Checked on a patched
+# kernel (or under JOLT_REQUIRE_LOCKFREE_CHEZ=1); a stock one reports and passes.
+vfaslstrings:
+	@$(CHEZ) --script test/chez/vfasl-shared-strings-test.ss
+
 # The build-side shapes `jolt build`'s back-end cost depends on (#1059): small
 # init procedures, the back end's collect trip, a failed vfasl that says so, and
 # the per-unit compile/convert caches.
@@ -1497,6 +1544,12 @@ buildscaling:
 # at a root, and build.ss loads under a bare-name JOLT_CHEZ.
 buildnatives:
 	@$(CHEZ) --script test/chez/build-natives-test.ss
+
+# Where the runtime's boot image segments end: at top-level form
+# boundaries inside a file, not only at file ends, so a segment's image stays
+# under a standard chunk; a scanner that loses its place stops the build.
+buildsegments:
+	@$(CHEZ) --script test/chez/build-segments-test.ss
 
 # The other half of the same rule: knowing the platform is only useful if the
 # struct stat offsets it selects are the ones this machine actually uses. The
@@ -1562,6 +1615,19 @@ versionsmoke:
 # range with full history.
 attributioncheck:
 	@sh tools/attributioncheck.sh
+
+# NOTICE names every third-party work jolt embeds or adapts, with its license
+# text in licenses/; this fails when a submodule, a license file, a named
+# source's copyright line or the release packaging drifts from it.
+noticecheck:
+	@sh tools/noticecheck.sh
+
+# The object monitor's lock-free owner word (host/chez/java/concurrency.ss),
+# model-checked over every interleaving. Manual: it needs SWI-Prolog, which the CI
+# images do not carry. Run it after touching monitor-enter!/monitor-exit!.
+monitormodel:
+	@command -v swipl >/dev/null || { echo "monitormodel: needs swipl (SWI-Prolog)" >&2; exit 1; }
+	@swipl -q -g main -t halt tools/monitor-model.pl
 
 # Install the repository's git hooks into .git/hooks (copies, so a clone that
 # never runs this is unaffected; re-run after a hook changes).
@@ -1896,6 +1962,13 @@ aotcachesmoke: testbin
 # corpus row.
 systemstreams:
 	@sh test/chez/system-streams-smoke.sh
+
+# Relative paths under bin/jolt resolve against the caller's directory, not the
+# checkout the launcher cd's to: the jolt.host filesystem functions, load-file,
+# jolt.host/sh and a bb.edn string task (#1241). Drives bin/jolt from a scratch
+# directory, so it is a script rather than a unit row.
+userdirpaths:
+	@sh test/chez/user-dir-paths-smoke.sh
 
 # Smoke test: clojure.core/compile writes artifacts under *compile-path* and a
 # later PROCESS loads them — including with the source removed, which is the point

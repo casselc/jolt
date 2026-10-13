@@ -341,6 +341,11 @@ word gets you.
 
 ## Tasks that parse their arguments
 
+jolt's task runner is modelled on [babashka's tasks](https://book.babashka.org/#tasks):
+it reads the same `:tasks` map, with the same `:depends`, `:requires`, `:init`,
+`:enter` and `:leave` semantics, and its `:exec-fn` / `:cmd` dispatch is adapted
+from babashka's implementation (see [NOTICE](NOTICE)).
+
 A `bb.edn` (or `deps.edn`) `:tasks` entry normally holds a body to run. An entry
 that names an `:exec-fn` instead — or a `:cmd` tree of them — has its arguments
 parsed by [babashka.cli](https://github.com/babashka/cli) first, which is
@@ -454,6 +459,21 @@ Both resolve the `deps.edn` in the current directory first, so the project's
 source roots and native libraries are loaded — `(require '[my.ns])` works live.
 `nrepl-server` writes a `.nrepl-port` file in the project dir, so CIDER / Calva /
 Cursive auto-detect the port; override it with the argument or `JOLT_NREPL_PORT`.
+Port `0` lets the OS pick a free port, and `.nrepl-port` names the one it bound.
+From code, `(jolt.nrepl/start 0)` returns the stop fn with that port as its
+`:port` metadata.
+
+A program that starts its own server from somewhere other than the project an
+editor opens (a host application loading a `--library` build, say) can say where
+the port file goes with `:port-file`, or pass `nil` to write none; the stop fn
+deletes the file `start` wrote:
+
+```clojure
+(require '[jolt.nrepl :as nrepl])
+(def stop (nrepl/start 0 nil {:port-file "/path/to/project/.nrepl-port"}))
+(:port (meta stop))   ;=> e.g. 53018
+(stop)                ; closes the server and deletes the port file it wrote
+```
 
 The server runs in dev mode — calls deref their var, so redefining a function
 takes effect on the next call without restarting the process. The built-in
@@ -581,6 +601,23 @@ jolt build -m myapp.core --include myapp.plugin
 An include with no source file on the roots fails the build, rather than baking
 nothing and leaving the failure to the binary's first lookup.
 
+A built binary carries its dependencies' resources, the way an uberjar packs
+the classpath, so a library that reads its own files at runtime still finds
+them. Compiled `.class` files and ClojureScript sources are left out, since jolt
+loads neither. Anything else a dependency ships gets baked in, including files
+no jolt program reads, such as ClojureScript externs, which can run to
+megabytes. Leave those out by name. Each pattern is a glob matched against the
+path `io/resource` asks for: `*` stays within a directory, `**` crosses
+directories, and a trailing `/` covers everything under that directory:
+
+```clojure
+:jolt/build {:exclude-resources ["**.ext.js"     ; ClojureScript externs
+                                 "cljsjs/"]}     ; a whole directory
+```
+
+An excluded file is gone from the binary, and `io/resource` answers `nil` for
+it. Only the project's own `deps.edn` is read for this key.
+
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the
 image but compresses it with gzip, and `--boot plain` drops it altogether:
@@ -640,6 +677,33 @@ through `:collect-safe` exports from then on. The same
 `--opt`/`--dev`/`--direct-link`/`--closed-world` flags apply, and the same Chez
 kernel development files + C compiler are required to link.
 
+Chez Scheme installs process-wide handlers for SIGSEGV, SIGBUS, SIGFPE and
+SIGILL when the library initialises. A host that handles those signals itself
+(a .NET or Java runtime does, to turn a null dereference in its own code into an
+exception) keeps that handling: the library passes a fault to the handler the
+host had installed when it comes from a thread that is not running jolt code (a
+thread that never called in, one whose export call has returned, or the init
+thread after `jolt_library_release_thread`), and gives the signals back at
+`jolt_library_shutdown`. A host whose init thread runs its own code should
+therefore call `jolt_library_release_thread`; until then jolt treats a fault on
+that thread as its own. One case still goes to the host: a fault in jolt code
+while the released init thread is inside an export, which a host handler
+usually reports as a crash rather than a jolt exception. On other threads, a
+fault in jolt code (an `ffi/read` through a bad pointer) is still a jolt
+exception.
+
+The host's handler runs as the kernel would have run it: on its alternate
+signal stack if it asked for `SA_ONSTACK`, under its `sa_mask` and
+`SA_NODEFER`, and once only under `SA_RESETHAND`. A host fault with no handler
+to run kills the process as it would have without the library. SIGINT and
+SIGQUIT stay the host's while the library is loaded. SIGPIPE is ignored while
+it is loaded if the host left it at the default, so a write to a closed pipe
+or socket returns EPIPE instead of killing the process. All three are the
+host's again after `jolt_library_shutdown`. macOS has two limits: `sigaction`
+doesn't report `SA_RESETHAND` back, so a one-shot handler runs every time; and
+after a fault in jolt code taken on a thread's alternate stack, that thread's
+later signals run on its normal stack.
+
 ## Documentation
 
 Full documentation is at **[jolt-lang.github.io](https://jolt-lang.github.io)** —
@@ -660,3 +724,8 @@ backends, and the test gates are in **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 ## License
 
 [Eclipse Public License 2.0](https://www.eclipse.org/legal/epl-2.0/)
+
+jolt builds on other people's work: Chez Scheme, Clojure and ClojureScript,
+babashka and its fs, process and cli libraries, and others. [NOTICE](NOTICE)
+lists each one with its copyright and license, and [licenses/](licenses/) holds
+the license texts. Those parts stay under their own licenses.

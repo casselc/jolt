@@ -79,7 +79,7 @@
       (= m "toLowerCase") (when (= argc 0) (str "(string-downcase " t ")"))
       (= m "trim")        (when (= argc 0) (str "(str-trim " t ")"))
       (= m "hashCode")    (when (= argc 0) (str "(java-string-hash " t ")"))
-      (= m "charAt")      (when (= argc 1) (str "(string-ref " t " (jolt->idx " a0 "))"))
+      (= m "charAt")      (when (= argc 1) (str "(jolt-char-at " t " " a0 ")"))
       (= m "indexOf")     (when (or (= argc 1) (= argc 2))
                             (let [from (if (= argc 2) (str "(jolt->idx " a1 ")") "0")]
                               (str "(str-index-of-any " t " " a0 " " from ")")))
@@ -123,7 +123,7 @@
                                          (= argc 2) (str "(jolt-str-split " t " " a0 " " a1 ")")
                                          :else nil)
       (= m "subSequence")          (when (= argc 2) (str "(jolt-str-sub-sequence " t " " a0 " " a1 ")"))
-      (= m "intern")               (when (= argc 0) t)
+      (= m "intern")               (when (= argc 0) (str "(jolt-str-intern " t ")"))
       :else nil)))
 
 ;; Direct emission for (.m target …) whose target is PROVEN a keyword
@@ -186,15 +186,20 @@
 ;; where a char[] becomes its characters rather than "#object[[C]". Open-coding
 ;; render-piece here meant a ^StringBuilder-tagged target got the rendering while an
 ;; untyped one got the characters.
-(defn- sb-direct-emit [m argc t args]
-  (let [a0 (first args)]
+;; LOCKED? is a StringBuffer (:sbuf): the same forms over the primitives that take
+;; the buffer's monitor, since the JDK's StringBuffer methods are synchronized.
+(defn- sb-direct-emit [m argc t args locked?]
+  (let [a0 (first args)
+        [app st len ch] (if locked?
+                          ["sb-append*!" "sb-str*" "sb-length*" "sb-char-at*"]
+                          ["sb-append!" "sb-str" "sb-length" "sb-char-at"])]
     (cond
       (= m "append")    (when (= argc 1)
-                          (str "(begin (sb-append! " t " (sb-piece " a0 ")) " t ")"))
-      (= m "toString")  (when (= argc 0) (str "(sb-str " t ")"))
-      (= m "length")    (when (= argc 0) (str "(->num (sb-length " t "))"))
-      (= m "isEmpty")   (when (= argc 0) (str "(fx=? (sb-length " t ") 0)"))
-      (= m "charAt")    (when (= argc 1) (str "(string-ref (sb-str " t ") (jolt->idx " a0 "))"))
+                          (str "(begin (" app " " t " (sb-piece " a0 ")) " t ")"))
+      (= m "toString")  (when (= argc 0) (str "(" st " " t ")"))
+      (= m "length")    (when (= argc 0) (str "(->num (" len " " t "))"))
+      (= m "isEmpty")   (when (= argc 0) (str "(fx=? (" len " " t ") 0)"))
+      (= m "charAt")    (when (= argc 1) (str "(" ch " " t " " a0 ")"))
       :else nil)))
 
 ;; clojure.data.json's public write-str creates a concrete StringWriter, then
@@ -208,13 +213,13 @@
     (cond
       (= m "append")
       (case argc
-        1 (str "(begin (sb-append! " t " (append-text " a0 " '())) " t ")")
+        1 (str "(begin (sb-append*! " t " (append-text " a0 " '())) " t ")")
         ;; append-text is a Chez helper whose rest parameter is a native Scheme
         ;; list.  jolt-list builds a Clojure persistent list, which looks right
         ;; in a rendered form but is not pair?/cdr-compatible at runtime.
-        3 (str "(begin (sb-append! " t " (append-text " a0 " (list " a1 " " a2 "))) " t ")")
+        3 (str "(begin (sb-append*! " t " (append-text " a0 " (list " a1 " " a2 "))) " t ")")
         nil)
-      (= m "toString") (when (= argc 0) (str "(sb-str " t ")"))
+      (= m "toString") (when (= argc 0) (str "(sb-str* " t ")"))
       :else nil)))
 
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
@@ -1050,8 +1055,9 @@
                   "str-index-of" "str-index-of-any" "str-replace-literal"
                   "java-string-hash" "java-symbol-hash" "jolt-str-durable-wal-bytes"
                   "keyword-t-ns" "keyword-t-name"
-                  "sb-append!" "sb-str" "sb-length" "sb-piece"
-                  "append-text" "string-writer?" "->num"
+                  "append-text" "string-writer?"
+                  "sb-append!" "sb-str" "sb-length" "sb-piece" "sb-char-at" "->num"
+                  "sb-append*!" "sb-str*" "sb-length*" "sb-char-at*"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
                   ;; devirt cached-desc lookup (emit-invoke ctor inlining).
@@ -1173,7 +1179,29 @@
   (let [s (if (and *tail?* (not (tail-transparent? node)))
             (binding [*tail?* false] (emit* node))
             (emit* node))
-        s (with-once-clears node s)]
+        s (with-once-clears node s)
+        ;; A call typed from its var's declared return (:num-ret-guard, numeric
+        ;; pass) checks what it answered: a stale site, after the var is
+        ;; redefined, otherwise hands an unsafe fl op a string. Anything else
+        ;; goes through jolt-double: a number widens, as generic arithmetic would
+        ;; take it, and a non-number raises ClassCastException. A double is safe
+        ;; wherever a :float is, since every consumer unboxes with jfloat-unbox. In
+        ;; tail position the value leaves the fn, so no fl op here takes it.
+        guard (and (not *tail?*) (:num-ret-guard node))
+        ;; An fl op taking a guarded :float call reads the double straight out of
+        ;; the Float, under the one test the guard makes (:fl-unbox below then has
+        ;; nothing left to do).
+        fused? (and (= guard :float) (:fl-unbox node))
+        s (if guard
+            (let [t (fresh-label "_nr$")]
+              (cond
+                fused?
+                (str "(let ((" t " " s ")) (if (jfloat? " t ") (jfloat-fl " t ") (jolt-double " t ")))")
+                (= guard :float)
+                (str "(let ((" t " " s ")) (if (jfloat? " t ") " t " (jolt-double " t ")))")
+                :else
+                (str "(let ((" t " " s ")) (if (flonum? " t ") " t " (jolt-double " t ")))")))
+            s)]
     ;; a :long operand of a :double-specialized op is tagged :fl-coerce by
     ;; jolt.passes.numeric so it widens to a flonum here (JVM long->double
     ;; widening). The obvious emit is a bare (fixnum->flonum s), and that is what
@@ -1186,13 +1214,18 @@
     ;; Guard the fixnum case instead of widening the contract: the fast path is
     ;; the same inlined fixnum->flonum, and a bignum falls to jolt->fl, which
     ;; converts it exactly as the reference's long->double does.
-    (if (:fl-coerce node)
+    (cond
+      (:fl-coerce node)
       (let [t (fresh-label "_fc$")]
         (str "(let ((" t " " s "))"
              " (if (fixnum? " t ")"
              " (fixnum->flonum " t ")"
              " (jolt->fl " t ")))"))
-      s)))
+      ;; a :float operand of a :double op: a float cast already emitted its
+      ;; double (the :coerce arm); anything else of the kind holds a jfloat
+      (and (:fl-unbox node) (not (= :coerce (:op node))) (not (:fl-float node)) (not fused?))
+      (str "(jfloat-unbox " s ")")
+      :else s)))
 
 ;; A Chez string literal. Every char outside printable ASCII becomes a
 ;; codepoint hex escape \x<cp>; ; the named escapes (\n \t \r \" \\) match what
@@ -1805,6 +1838,7 @@
                 (cond
                   (= "string" (nth fixed i)) (str "(jolt-ffi-string->c " param ")")
                   (= "bool" (nth fixed i)) (str "(jolt-ffi-bool->c " param ")")
+                  (#{"float" "double"} (nth fixed i)) (str "(jolt-ffi-float->c " param ")")
                   :else param))
               (range n) params)
         fixed-args (if (seq native-args) (str " " (str/join " " native-args)) "")
@@ -1816,6 +1850,7 @@
                   (cond
                     (= "string" rettype) (str "(jolt-ffi-c->string " expr ")")
                     (= "bool" rettype) (str "(jolt-ffi-c->bool " expr ")")
+                    (= "float" rettype) (str "(make-jfloat " expr ")")
                     :else expr))
         wrap (fn [call]
                (if capture
@@ -1959,6 +1994,11 @@
                       (= "bool" (nth types i))
                       (str "(jolt-ffi-bool->c " param ")")
 
+                      ;; (float x) is a boxed java.lang.Float; a Chez float or
+                      ;; double position takes only a flonum.
+                      (#{"float" "double"} (nth types i))
+                      (str "(jolt-ffi-float->c " param ")")
+
                       :else param))
                   (range n) params)
             native-destination (when ret-aggregate?
@@ -2016,12 +2056,17 @@
                         (cond
                           (= "string" (:rettype node)) "(jolt-ffi-c->string result)"
                           (= "bool" (:rettype node)) "(jolt-ffi-c->bool result)"
+                          (= "float" (:rettype node)) "(make-jfloat result)"
                           :else "result")
                         " native-error)))")
 
                    ret-aggregate? (str "(begin " call " " return-param ")")
                    (= "string" (:rettype node)) (str "(jolt-ffi-c->string " call ")")
                    (= "bool" (:rettype node)) (str "(jolt-ffi-c->bool " call ")")
+                   ;; A C float reaches Clojure on the JVM as a java.lang.Float.
+                   ;; Chez hands over the single-precision flonum, so it is boxed
+                   ;; as it is (the constructor, not a helper: one call less).
+                   (= "float" (:rettype node)) (str "(make-jfloat " call ")")
                    :else call)
             binding (str "(let ((p #f)) (lambda (" (str/join " " wrapper-params) ") " body "))")]
         (if (or (seq aggregates) ret-aggregate?)
@@ -2054,8 +2099,9 @@
 ;; the callback could not model the argument at all, and could not decline to
 ;; answer one.
 ;;
-;; The wrapper lambda is emitted only when the signature actually mentions
-;; :string; every other callable reaches sa-foreign-callable exactly as before.
+;; The wrapper lambda is emitted only when the signature has a :string, :bool or
+;; :float position or a :double result; every other callable reaches
+;; sa-foreign-callable exactly as before.
 (defn- emit-ffi-callable [node]
   ;; The mirror of the :blocking/:string rule in emit-ffi-fn, with the direction
   ;; swapped: on a __collect_safe CALLABLE it is the string RESULT Chez refuses,
@@ -2072,7 +2118,12 @@
   (let [argtypes (:argtypes node)
         rettype (:rettype node)
         converted? #{"string" "bool"}
-        converted-position? (or (converted? rettype) (some converted? argtypes))
+        ;; A float or double RESULT converts too: the fn may answer (float x), a
+        ;; boxed Float. A :float argument is boxed into one, as the JVM hands a
+        ;; C float to Clojure; a :double argument is already a double.
+        converted-position? (or (converted? rettype) (some converted? argtypes)
+                                (#{"float" "double"} rettype)
+                                (some #{"float"} argtypes))
         target
         (if-not converted-position?
           (emit (:fn node))
@@ -2085,6 +2136,7 @@
                              (cond
                                (= "string" type) (str "(jolt-ffi-c->string " param ")")
                                (= "bool" type) (str "(jolt-ffi-c->bool " param ")")
+                               (= "float" type) (str "(make-jfloat " param ")")
                                :else param))
                            params argtypes)
                 invoke (str "(" fname (when (seq args) (str " " (str/join " " args))) ")")]
@@ -2093,6 +2145,7 @@
                  (cond
                    (= "string" rettype) (str "(jolt-ffi-string->c " invoke ")")
                    (= "bool" rettype) (str "(jolt-ffi-bool->c " invoke ")")
+                   (#{"float" "double"} rettype) (str "(jolt-ffi-float->c " invoke ")")
                    :else invoke)
                  "))")))
         ;; A :collect-safe callable counts itself in and out (java/ffi.ss
@@ -2183,7 +2236,7 @@
         ;; it — and every proven aget/aset on that param indexes it directly
         ;; (*array-vecs*). The params themselves shadow any outer hoist.
         ah (into {} (:ahints a))
-        avecs (into {} (keep (fn [o] (when (= :doubles (get ah o))
+        avecs (into {} (keep (fn [o] (when (contains? #{:doubles :floats} (get ah o))
                                        [(munge-name o) (fresh-label "_av$")]))
                              orig))
         av (merge (apply dissoc *array-vecs* (concat params (when restp [restp]))) avecs)
@@ -2925,17 +2978,18 @@
     (:set :vector) (when (= 1 nargs) :coll)
     nil))
 
-;; Polymorphic inline-cache width. MUST match jolt-pic-n in host/chez/records.ss:
-;; the emitted scan reads slots [0..2N) and the epoch slot at 2N+1 of the cache
-;; vector jolt-pic-make allocates, so the two must agree.
+;; Polymorphic inline-cache width. MUST match jolt-pic-n in host/chez/protocols.ss:
+;; the emitted scan reads slots [0..2N) and the epoch slot at 2N of the cache
+;; vectors jolt-pic-empty and jolt-pic-add make, so the two must agree.
 (def ^:private pic-n 4)
-(def ^:private pic-epoch-idx (+ (* 2 pic-n) 1))
+(def ^:private pic-epoch-idx (* 2 pic-n))
 ;; the eq? scan over a PIC cache's N (desc . impl) pairs: each clause returns the
 ;; impl when its cached desc is eq? to d. Strung together with `or` so a hit short-
-;; circuits; a full miss falls through to the install helper (the caller appends it).
-;; v is always a length-(2N+2) jolt-pic-make vector (the cache cell starts #f and is
-;; only ever set to one), and the indices are constants below its length, so the
-;; vector type/bounds checks are redundant -- emit the per-site unsafe variant.
+;; circuits; a full miss falls through to the add helper (the caller appends it).
+;; v is always a length-(2N+1) cache vector (the cell starts #f, read as
+;; jolt-pic-empty, and is only ever set to one), and the indices are constants
+;; below its length, so the vector type/bounds checks are redundant -- emit the
+;; per-site unsafe variant.
 (defn- pic-scan-clauses [v d]
   (str/join " "
             (for [i (range pic-n)]
@@ -3203,19 +3257,25 @@
                         (let [c (fresh-label "_picv$")
                               scan (pic-scan-clauses v d)]
                           (swap! cells conj c)
-                          ;; hot path inlined: bind the receiver, the cache vector
-                          ;; (lazily allocated on first call), and its desc; then, if
-                          ;; the epoch still matches, eq?-scan the cached descs and
-                          ;; apply the hit impl directly — no helper call after warmup.
-                          ;; A miss (no cached desc / stale epoch) resolves + (re)fills
-                          ;; via the jolt-pic-install/-rebuild helpers.
-                          (str "(let* ((" r " " (first as) ")"
-                               " (" v " (or " c " (let ((_nv (jolt-pic-make))) (set! " c " _nv) _nv)))"
-                               " (" d " (jrec-pic-desc " r ")))"
-                               " ((if (and " d " (" (unsafe-prefix) "fx= (" (unsafe-prefix) "vector-ref " v " " pic-epoch-idx ") jolt-proto-epoch))"
-                                " (or " scan " (jolt-pic-install " v " " d " " proto " " method " " r "))"
-                                " (jolt-pic-rebuild " v " " d " " proto " " method " " r "))"
-                                " " apply-args "))"))
+                          ;; hot path inlined: bind the receiver, the site's cache
+                          ;; vector and the receiver's desc; then, if the epoch still
+                          ;; matches, eq?-scan the cached descs and apply the hit impl
+                          ;; directly — no helper call after warmup. A miss (no cached
+                          ;; desc / stale epoch) has jolt-pic-add build the next cache
+                          ;; and the cell is set! to it: a cache vector is shared by
+                          ;; every thread calling here, so none is written in place.
+                          ;; A full cache gets the impl back instead (megamorphic).
+                          ;; A receiver with no desc resolves without caching.
+                          (let [miss (str "(let ((_nv (jolt-pic-add " v " " d " " proto " " method " " r ")))"
+                                          " (if (procedure? _nv) _nv"
+                                          " (begin (set! " c " _nv) (" (unsafe-prefix) "vector-ref _nv 1))))")]
+                            (str "(let* ((" r " " (first as) ")"
+                                 " (" v " (or " c " jolt-pic-empty))"
+                                 " (" d " (jrec-pic-desc " r ")))"
+                                 " ((if (and " d " (" (unsafe-prefix) "fx= (" (unsafe-prefix) "vector-ref " v " " pic-epoch-idx ") jolt-proto-epoch))"
+                                 " (or " scan " " miss ")"
+                                 " (if " d " " miss " (protocol-resolve " proto " " method " " r ")))"
+                                 " " apply-args "))")))
                         (str "(let* ((" r " " (first as) "))"
                              " ((protocol-resolve " proto " " method " " r ") " apply-args "))")))))
       ;; a java.lang.Math call jolt.passes.numeric proved is over flonum operands:
@@ -3231,29 +3291,36 @@
       ;; check is the bounds contract on the hot path (a pre-check regresses ~11%).
       ;; A ^doubles PARAM (the local is in *array-vecs*) reads the flvector its
       ;; arity bound at entry; any other proven array re-reads the accessor.
+      ;; A ^floats read (:fl-float) is the Float unless an fl op takes it
+      ;; (:fl-unbox), which reads the double it holds and allocates nothing.
       (:fl-aget node)
       (let [an (first arg-nodes)
             hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))]
         (order-args
          (fn [as]
-           (if (:fl-idx-long node)
-             (str "(flvector-ref " (or hv (str "(jolt-array-vec " (first as) ")")) " " (second as) ")")
-             (str "(jolt-flaget " (str/join " " as) ")")))))
+           (let [r (if (:fl-idx-long node)
+                     (str "(flvector-ref " (or hv (str "(jolt-array-vec " (first as) ")")) " " (second as) ")")
+                     (str "(jolt-flaget " (str/join " " as) ")"))]
+             (if (and (:fl-float node) (not (:fl-unbox node))) (str "(make-jfloat " r ")") r)))))
       ;; (aset ^doubles a i v): proven index AND :double value (:fl-idx-long +
       ;; :fl-val-double) store inline — (let ((v V)) (flvector-set! (jolt-array-vec A)
       ;; I v) v) — and return the stored value (JVM contract; the let evaluates V once).
       ;; Otherwise keep (jolt-flaset A I V), which owns exact->inexact for a non-double.
+      ;; ^floats (:fl-float) rounds the value to single precision as it stores it,
+      ;; and answers the Float unless an fl op takes the result (:fl-unbox).
       (:fl-aset node)
       (let [an (first arg-nodes)
-            hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))]
+            hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))
+            fl? (:fl-float node)]
         (order-args
          (fn [as]
-           (if (and (:fl-idx-long node) (:fl-val-double node))
-             (let [v (fresh-label "_v$")]
-               (str "(let ((" v " " (nth as 2) ")) (flvector-set! "
-                    (or hv (str "(jolt-array-vec " (first as) ")"))
-                    " " (second as) " " v ") " v ")"))
-             (str "(jolt-flaset " (str/join " " as) ")")))))
+           (let [r (if (and (:fl-idx-long node) (:fl-val-double node))
+                     (let [v (fresh-label "_v$")]
+                       (str "(let ((" v " " (if fl? (str "(flsingle " (nth as 2) ")") (nth as 2)) ")) (flvector-set! "
+                            (or hv (str "(jolt-array-vec " (first as) ")"))
+                            " " (second as) " " v ") " v ")"))
+                     (str "(" (if fl? "jolt-flaset-float" "jolt-flaset") " " (str/join " " as) ")"))]
+             (if (and fl? (not (:fl-unbox node))) (str "(make-jfloat " r ")") r)))))
       ;; (aget ^longs/^ints/^bytes/^objects a i) and its aset twin. A boxed backing
       ;; cannot unbox, so there is no inline form and no hoisted vector — the win is
       ;; skipping jolt-nth's dispatch walk, which the call already gets.
@@ -3274,6 +3341,14 @@
       ;; hint-directed fast arithmetic: jolt.passes.numeric proved every operand a
       ;; flonum (^double) or fixnum (^long), so emit the Chez fl*/fx* op.
       (:num-kind node) (emit-numeric (:num-kind node) (:name fnode) args order-args)
+      ;; a (/ ...) with a primitive double or float operand (jolt.passes.numeric
+      ;; :div-prim, one flag per step): a primitive step divides as IEEE does, the
+      ;; rest take the Object path, which raises on a zero divisor.
+      (:div-prim node)
+      (order-args (fn [as]
+        (reduce (fn [acc [prim? a]]
+                  (str "(" (if prim? "jolt-div2-prim" "jolt-div2") " " acc " " a ")"))
+                (first as) (map vector (:div-prim node) (rest as)))))
       (and nop (= 1 (count args)) (cmp1-ops nop)) (str "(begin " (first args) " #t)")
       ;; (get coll k [default]) with a struct-typed coll — the inference marked the
       ;; receiver with :hint :struct and a :shape matching the declared field layout.
@@ -3565,8 +3640,27 @@
                  body)
                (emit (:body node)))]
     (if-let [fin (:finally node)]
-      (str "(dynamic-wind jolt-finally-in (lambda () " core ")"
-           " (lambda () " (binding [*tail?* false] (emit fin)) "))")
+      ;; The edges are masked against an interrupt's escape. run-interruptible
+      ;; leaves its body by jumping out of a timer interrupt, and Chez checks for
+      ;; one at the call into dynamic-wind (after binding's push-thread-bindings,
+      ;; before the winder is up) and between the body's return and the
+      ;; after-thunk (the winder already popped), so an escape there skipped the
+      ;; finally. The counted-lock depth (virtual register 7, host/chez/locks.ss)
+      ;; holds the escape off: raised before the wind, dropped as the body starts,
+      ;; raised again as it returns and dropped as the finally starts, which then
+      ;; runs unmasked and may park. The finally tells a normal exit from a raise
+      ;; or an escape by the depth: only the normal exit left it above the level
+      ;; at entry. Inline register ops and not the jolt-locks syntax, because the
+      ;; emission is also eval'd where only procedures are bound (Gambit's eval
+      ;; sees no shim macro, which is also why this says fx> and not fx>?).
+      (let [lv (fresh-label "_wl$")
+            r (fresh-label "_wr$")]
+        (str "(let ((" lv " (virtual-register 7))) (set-virtual-register! 7 (fx+ " lv " 1))"
+             " (dynamic-wind jolt-finally-in"
+             " (lambda () (set-virtual-register! 7 (fx- (virtual-register 7) 1))"
+             " (let ((" r " " core ")) (set-virtual-register! 7 (fx+ (virtual-register 7) 1)) " r "))"
+             " (lambda () (if (fx> (virtual-register 7) " lv ") (set-virtual-register! 7 (fx- (virtual-register 7) 1)))"
+             " " (binding [*tail?* false] (emit fin)) ")))"))
       core)))
 
 ;; Does this IR node emit to an expression that yields a Scheme boolean? Used to
@@ -3655,6 +3749,18 @@
 ;; (.method target arg*) as a Scheme form. A node carrying :sited-target /
 ;; :sited-args (the tail-site emission in emit*) uses those already-bound temps
 ;; instead of emitting the receiver and args itself.
+;; A call on an unproven receiver with up to three arguments and a plain name
+;; goes through a per-site cache (host-static.ss jolt-host-site-callN): a host
+;; object's method is then one tag test away, with no argument vector, and any
+;; other receiver takes record-method-dispatch as before. Needs the def's
+;; constant pool for the site's box, as the field-read site does.
+(defn- host-site-emit [t m args]
+  (when (and (<= (count args) 3) (not (str/starts-with? m "-"))
+             *const-pool* (var-cache?))
+    (str "(jolt-host-site-call" (count args) " " (hoist-const-per-site "(jolt-host-site-make)")
+         " " t " " (chez-str-lit m)
+         (apply str (map #(str " " %) args)) ")")))
+
 (defn- host-call-emit [node]
   (let [m (:method node)
         chez? (not= :gambit (target))
@@ -3666,7 +3772,9 @@
                      (when (= :kw (:target-type node))
                        (keyword-direct-emit m (count args) t args))
                      (when (= :sb (:target-type node))
-                       (sb-direct-emit m (count args) t args))))]
+                       (sb-direct-emit m (count args) t args false))
+                     (when (= :sbuf (:target-type node))
+                       (sb-direct-emit m (count args) t args true))))]
     (cond
       direct direct
       (supported-host-methods m)
@@ -3698,8 +3806,9 @@
                  (string-direct-emit m (count as) tt as))
             kd (keyword-direct-emit m (count as) tt as)
             wd (string-writer-direct-emit m (count as) tt as)
-            generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
-                         " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
+            generic (or (host-site-emit tt m as)
+                        (str "(record-method-dispatch " tt " " (chez-str-lit m)
+                             " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))"))]
         (if (or sd kd wd)
           (str "(let* ((" tt " " t ")"
                (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
@@ -3708,8 +3817,9 @@
                (when kd (str " ((keyword-t? " tt ") " kd ")"))
                (when wd (str " ((string-writer? " tt ") " wd ")"))
                " (else " generic ")))")
-          (str "(record-method-dispatch " t " " (chez-str-lit m)
-               " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
+          (or (host-site-emit t m args)
+              (str "(record-method-dispatch " t " " (chez-str-lit m)
+                   " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
       :else
       (str "(record-method-dispatch " t " " (chez-str-lit m)
            " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
@@ -3872,6 +3982,10 @@
                  (contains? #{"jolt-long-cast" "jolt-unchecked-long"} (:cast-fn node))
                  (let [t (fresh-label "_lc$")]
                    (str "(let ((" t " " e ")) (if (fixnum? " t ") " t " (" (:cast-fn node) " " t ")))"))
+                 ;; a float cast whose value an fl op takes (:fl-unbox, numeric
+                 ;; pass) hands it the double it widens to, never building the jfloat
+                 (and (:fl-unbox node) (contains? #{"jolt-float" "jolt-unchecked-float"} (:cast-fn node)))
+                 (str "(" (:cast-fn node) "->flonum " e ")")
                  (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
                      (= :double (:kind node)) (emit-nhint-coerce :double e)
                      (= :long (:kind node)) (emit-nhint-coerce :long e)

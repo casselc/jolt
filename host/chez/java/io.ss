@@ -787,12 +787,14 @@
 (define io-ENAMETOOLONG (if (eq? (sa-os-family) 'macos) 63 36))
 
 (define (jfile-realpath* p)                 ; -> (values path-or-#f errno)
-  (if (not c-realpath)
-      (values #f 0)
-      (let ((buf (make-bytevector 4096 0)))
-        (if (= 0 (c-realpath p buf))
-            (values #f (io-errno))
-            (values (jfile-cstr buf) 0)))))
+  (cond
+    (c-realpath
+     (let ((buf (make-bytevector 4096 0)))
+       (if (= 0 (c-realpath p buf))
+           (values #f (io-errno))
+           (values (jfile-cstr buf) 0))))
+    ((win32?) (values (win32-long-path p) 0))
+    (else (values #f 0))))
 
 (define (jfile-realpath p)
   (let-values (((rp e) (jfile-realpath* p))) rp))
@@ -1257,6 +1259,102 @@
                          (ppath-render rpp (append (ppath-segs rpp) (list-tail segs n)))))
                       (loop (- n 1))))))))))))
 
+;; --- getCanonicalPath and toRealPath on Windows -----------------------------
+;; Windows has no realpath, and the two JDK operations it stands for differ
+;; there. File.getCanonicalPath (WinNTFileSystem's canonicalize) folds "." and
+;; ".." lexically and then replaces each existing component with the name the
+;; directory lists for it, which is what turns an 8.3 alias like MARKO~1.KOC back
+;; into Marko.Kocic and fixes the case; it does not follow links. Path.toRealPath
+;; asks the filesystem for the final path of an opened handle, which does follow
+;; them. Either way a path holding a short name is spelled long, so two spellings
+;; of one directory compare equal (jolt-lang/jolt#1281).
+
+;; The canonical spelling of absolute path P, or #f when some component does not
+;; exist. FIND answers the listed name of the last component of the path it is
+;; given, or #f. A parameter so the walk is pinned from a POSIX host
+;; (test/chez/win-path-test.ss); win32-long-path passes FindFirstFileW. The drive
+;; letter is upper-cased, as the JDK spells it. A "*" or "?" in a component is a
+;; FindFirstFileW wildcard and names no single file.
+(define (win32-long-path-with find p)
+  (let* ((pp (path-parse #t (jfile-fold-dots-for #t p)))
+         (root (let ((r (ppath-root pp)))
+                 (if (windows-drive-prefix? r)
+                     (string-append (string (char-upcase (string-ref r 0))) (substring r 1 (string-length r)))
+                     r))))
+    (and (not (string=? root ""))
+         (let loop ((segs (ppath-segs pp)) (done '()))
+           (if (null? segs)
+               (path-rebuild root (reverse done))
+               (let ((seg (car segs)))
+                 (and (not (exists (lambda (c) (memv c '(#\* #\?))) (string->list seg)))
+                      (let ((nm (find (path-rebuild root (reverse (cons seg done))))))
+                        (and nm (loop (cdr segs) (cons nm done)))))))))))
+
+;; WIN32_FIND_DATAW: cFileName, MAX_PATH UTF-16 units, starts at 44.
+(define win32-find-data-size 592)
+(define win32-find-data-name-offset 44)
+(define-win32-proc win32-find-first-file-w
+  "kernel32.dll" "FindFirstFileW" (void* void*) iptr)
+(define-win32-proc win32-find-close
+  "kernel32.dll" "FindClose" (iptr) int)
+
+;; A NUL-terminated UTF-16LE string at foreign address P, offset OFF, at most
+;; MAX units.
+(define (win32-wstr-at p off max)
+  (let loop ((i 0))
+    (if (or (= i max) (= 0 (sa-foreign-ref 'unsigned-16 p (+ off (* 2 i)))))
+        (let ((bv (make-bytevector (* 2 i))))
+          (do ((j 0 (+ j 1))) ((= j (* 2 i)))
+            (bytevector-u8-set! bv j (sa-foreign-ref 'unsigned-8 p (+ off j))))
+          (utf16->string bv (endianness little)))
+        (loop (+ i 1)))))
+
+;; The name the directory lists for the last component of PATH, or #f.
+(define (win32-listed-name path)
+  (let ((ff (win32-find-first-file-w)) (fc (win32-find-close)))
+    (and ff fc
+         (let ((data (sa-foreign-alloc win32-find-data-size)))
+           (dynamic-wind
+             (lambda () #f)
+             (lambda ()
+               (let ((h (win32-with-wstr path (lambda (w) (ff w data)))))
+                 (and (not (= h win32-INVALID-HANDLE-VALUE))
+                      (let ((nm (win32-wstr-at data win32-find-data-name-offset 260)))
+                        (fc h)
+                        (and (not (string=? nm "")) nm)))))
+             (lambda () (sa-foreign-free data)))))))
+
+(define (win32-long-path p) (win32-long-path-with win32-listed-name p))
+
+;; "\\?\C:\x" -> "C:\x" and "\\?\UNC\srv\sh" -> "\\srv\sh": the
+;; prefixes GetFinalPathNameByHandleW reports a DOS path under.
+(define (win32-strip-final-prefix s)
+  (cond ((and (>= (string-length s) 8) (string=? (substring s 0 8) "\\\\?\\UNC\\"))
+         (string-append "\\\\" (substring s 8 (string-length s))))
+        ((and (>= (string-length s) 4) (string=? (substring s 0 4) "\\\\?\\"))
+         (substring s 4 (string-length s)))
+        (else s)))
+
+(define-win32-proc win32-get-final-path-name-by-handle-w
+  "kernel32.dll" "GetFinalPathNameByHandleW" (iptr void* unsigned-32 unsigned-32) unsigned-32)
+
+;; Path.toRealPath on Windows: the final path of PATH opened (a directory too,
+;; through FILE_FLAG_BACKUP_SEMANTICS) with its links followed, or #f.
+(define (win32-final-path path)
+  (let ((gf (win32-get-final-path-name-by-handle-w)))
+    (and gf
+         (win32-with-attr-handle path 0 #t
+           (lambda (h)
+             (let retry ((units 1024))
+               (let ((buf (sa-foreign-alloc (* 2 units))))
+                 (let ((n (gf h buf units 0)))
+                   (cond ((= n 0) (sa-foreign-free buf) #f)
+                         ((>= n units) (sa-foreign-free buf) (retry (+ n 1)))
+                         (else
+                          (let ((s (win32-wstr-at buf 0 n)))
+                            (sa-foreign-free buf)
+                            (win32-strip-final-prefix s))))))))))))
+
 (define (jfile-canonical p)
   (let ((abs (jfile-abs p)))
     (jfile-nul-free! abs)
@@ -1376,10 +1474,39 @@
 ;; java.io.File.renameTo keeps the bare rename-file: the JVM documents it as
 ;; platform-dependent and it fails over an existing destination on Windows too,
 ;; so matching it IS the shim's job.
+;;
+;; On Windows the rename is also retried. Real-time AV (Defender's MsMpEng) opens
+;; a freshly closed file to scan it, and while that handle is open MoveFile on it
+;; fails with ERROR_ACCESS_DENIED — "cannot rename ...: permission denied". A
+;; publish-by-rename runs microseconds after its close, the worst moment for that
+;; race, so spit failed intermittently and left its temp file behind
+;; (jolt-lang/jolt#1263). The scan finishes in milliseconds; this is the bounded
+;; retry write-file-atomic settled on for the same failure. It retries only while
+;; the source is still there and the destination is not a directory, so a rename
+;; that can never succeed fails as fast as it did.
+(define fs-retry-delays-ms '(10 25 50 100 200 400))
+(define (call-with-fs-retry thunk retry?)
+  (let loop ((delays fs-retry-delays-ms))
+    (if (null? delays)
+        (thunk)
+        (guard (e ((retry? e)
+                   (sleep (make-time 'time-duration (* (car delays) 1000000) 0))
+                   (loop (cdr delays))))
+          (thunk)))))
 (define (rename-replace! from to)
-  (when (and (eq? (sa-os-family) 'windows) (file-exists? to))
-    (delete-file to #f))
-  (rename-file from to))
+  (if (eq? (sa-os-family) 'windows)
+      (call-with-fs-retry
+       (lambda ()
+         (when (file-exists? to) (delete-file to #t))
+         (rename-file from to))
+       (lambda (e) (and (file-exists? from) (not (file-directory? to)))))
+      (rename-file from to)))
+;; Delete a file a failed publish left behind. The same AV handle that blocked the
+;; rename blocks this delete, so it waits it out too. Never raises.
+(define (delete-file-retrying! p)
+  (guard (_ (#t #f))
+    (call-with-fs-retry (lambda () (delete-file p #t))
+                        (lambda (e) (and (eq? (sa-os-family) 'windows) (file-exists? p))))))
 
 ;; --- java.net.URL (a jhost "url", state #(spec handler)) --------------------
 ;; A File.toURL value: .toString / .toExternalForm give the spec, .getPath /
@@ -2439,7 +2566,7 @@
           (with-port (guard (e ((i/o-error? e) (file-open-error given p e)))
                        (open-output-file tmp 'replace))
             (lambda (port) (put-string port text)))
-          (guard (e (#t (guard (_ (#t #f)) (delete-file tmp)) (raise e)))
+          (guard (e (#t (delete-file-retrying! tmp) (raise e)))
             (rename-replace! tmp p))))
     jolt-nil))
 

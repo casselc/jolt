@@ -126,6 +126,29 @@ if [ "$got" != "5 8 1" ] || [ "$rc" != "0" ]; then
   echo "  FAIL: exports — want '5 8 1' rc 0, got '$got' rc $rc"; exit 1
 fi
 
+# Code that is compiled and then dropped frees code chunks, and new code reuses
+# the space. On macOS arm64 the library keeps code in one aligned region
+# (host/chez/stub/jolt_code_region.h, jolt#1246) through its own hidden mmap and
+# munmap, so this is the path that recycles region ranges.
+echo "build-lib smoke: compiling and dropping code inside the library"
+if ! cc -O2 "$app/driver-churn.c" -ldl -o "$work/driver-churn" 2>"$work/driver-churn.err"; then
+  echo "  FAIL: churn driver compile failed"; cat "$work/driver-churn.err"; exit 1
+fi
+got="$("$work/driver-churn" "$lib" 2>&1)"; rc=$?
+if [ "$got" != "1" ] || [ "$rc" != "0" ]; then
+  echo "  FAIL: code churn, want '1' rc 0, got '$got' rc $rc"; exit 1
+fi
+# The region's mmap/munmap must bind the kernel's calls (defined in the image)
+# without being exported, or they would stand in for the host's own.
+if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] && command -v nm >/dev/null 2>&1; then
+  if ! nm -m "$lib" | grep -qE 'non-external .* _mmap$'; then
+    echo "  FAIL: no library-local _mmap; the code region is not linked in"; exit 1
+  fi
+  if nm -gU "$lib" | grep -qE ' _(mmap|munmap)$'; then
+    echo "  FAIL: the library exports mmap/munmap"; nm -gU "$lib" | grep -E ' _(mmap|munmap)$'; exit 1
+  fi
+fi
+
 # The #1234 handoff: release the init thread, park it in host code while a
 # thread the embedder started calls a :collect-safe export that allocates, then
 # shut down from the released thread. Before jolt_library_release_thread the
@@ -145,4 +168,47 @@ case "$(uname -s)" in
     fi ;;
 esac
 
-echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 + gzip_ok()=1 via dlopen+jolt_lookup, and a released init thread)"
+# A host that handles its own faults (a .NET or Java runtime does) keeps them
+# (#1277). Chez installs process-wide SIGSEGV/SIGBUS/SIGFPE/SIGILL handlers at
+# init and treats every fault as Scheme's; the library stub chains a fault on a
+# thread not running Scheme code to the handler installed before Chez's, runs
+# it as the kernel would have (the host's alternate stack, sa_mask and
+# SA_RESETHAND), and gives the signals back at jolt_library_shutdown. A fault in
+# Scheme code is still jolt's exception. SIGINT and SIGQUIT stay the host's, and
+# SIGPIPE is ignored only while the library is loaded. The driver prints what
+# each stage saw.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "build-lib smoke: host fault handling skipped (POSIX signals driver)" ;;
+  *)
+    echo "build-lib smoke: a host's own fault after init goes to the host's handler"
+    if ! cc -O0 "$app/driver-signals.c" -ldl -lpthread -o "$work/driver-signals" 2>"$work/driver-signals.err"; then
+      echo "  FAIL: signals driver compile failed"; cat "$work/driver-signals.err"; exit 1
+    fi
+    got="$("$work/driver-signals" "$lib" 2>&1)"; rc=$?
+    # 11, or 10 where a null dereference raises SIGBUS
+    sig="$(printf '%s\n' "$got" | sed -n 's/^before load: \([0-9]*\) .*/\1/p')"
+    # macOS hides SA_RESETHAND from sigaction, and keeps a thread "on its
+    # alternate stack" after Chez's _longjmp out of a Scheme fault taken there
+    # (driver-signals.c)
+    case "$(uname -s)" in
+      Darwin) oneshot=0; alt_after_scheme=0 ;;
+      *)      oneshot="$sig"; alt_after_scheme=1 ;;
+    esac
+    want="one-shot: 1 $oneshot
+before load: $sig 1 1
+scheme fault: 1
+after load: $sig 1 1
+signals after load: host host ign 1
+worker: $sig 1 1, 1, $sig $alt_after_scheme 1
+after shutdown: $sig 1 1
+signals after shutdown: host host dfl 1
+after reinit: $sig 1 1
+signals after reinit: host host ign 1"
+    if [ "$rc" != "0" ] || { [ "$sig" != "11" ] && [ "$sig" != "10" ]; } || [ "$got" != "$want" ]; then
+      echo "  FAIL: host fault handling, want rc 0 and:"; printf '%s\n' "$want"
+      echo "  got rc $rc:"; printf '%s\n' "$got"; exit 1
+    fi ;;
+esac
+
+echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 + gzip_ok()=1 via dlopen+jolt_lookup, code churn, and a released init thread)"

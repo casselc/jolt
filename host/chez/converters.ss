@@ -70,11 +70,14 @@
 ;; non-readable rendering into every later pr in this thread if the renderer
 ;; throws.
 (define (jolt-print-one v)
-  (let ((prev (virtual-register jolt-vreg-print-readably)))
+  ;; masked at its far edge (locks.ss), so an interrupt cannot leave the thread
+  ;; printing non-readably. The restore is a store, so the plain after-thunk.
+  (let ((prev (virtual-register jolt-vreg-print-readably)) (lv (jolt-locks-held)))
+    (jolt-locks-enter!)
     (dynamic-wind
       (lambda () (set-virtual-register! jolt-vreg-print-readably #f))
-      (lambda () (jolt-pr-readable v))
-      (lambda () (set-virtual-register! jolt-vreg-print-readably prev)))))
+      (jolt-masked-body (lambda () (jolt-pr-readable v)))
+      (jolt-masked-after lv (set-virtual-register! jolt-vreg-print-readably prev)))))
 (def-var! "clojure.core" "__print1" jolt-print-one)
 
 ;; str: a top-level string/scalar renders as jolt-str-render-one (raw string,
@@ -129,6 +132,19 @@
 ;; one — this sits on the proven-string .charAt/.substring path, so it must not
 ;; call anything for the common case.
 (define (jolt->idx n) (if (fixnum? n) n (exact (truncate (jolt-need-num n)))))
+;; String.charAt and every CharSequence charAt over a string's characters
+;; (StringBuilder reads its buffer through the same check): an index outside
+;; [0, length) is the JVM's StringIndexOutOfBoundsException with its message,
+;; not Chez's string-ref error.
+(define (char-index-oob i n)
+  (throw-jvm 'StringIndexOutOfBoundsException
+             (string-append "Index " (number->string i) " out of bounds for length "
+                            (number->string n))))
+(define (jolt-char-at s i)
+  (let ((i (jolt->idx i)))
+    (if (and (fixnum? i) (fx>=? i 0) (fx<? i (string-length s)))
+        (string-ref s i)
+        (char-index-oob i (string-length s)))))
 
 ;; Chez's `substring` walks the span a character at a time; allocating the result
 ;; and asking for the block move is ~3.7x faster for the spans a parser, a reader
@@ -267,6 +283,7 @@
 (define (jolt-double x)
   (cond ((char? x) (exact->inexact (char->integer x)))
         ((number? x) (exact->inexact x))
+        ((jfloat? x) (jfloat-fl x))
         (else (jolt-double-slow x))))
 
 ;; compare: 3-way, returns an EXACT integer (= JVM compare -> int).
@@ -477,17 +494,32 @@
 (def-var! "clojure.core" "unchecked-long" jolt-unchecked-long)
 (def-var! "clojure.core" "unchecked-int" jolt-unchecked-int)
 (def-var! "clojure.core" "double" jolt-double)
-;; float: Chez has no single-float type, so the value stays a flonum — but the
-;; cast range-checks against Float/MAX_VALUE like RT.floatCast (an infinity is
-;; out of range; NaN passes).
+;; float: a jfloat holding the nearest single-precision value (flsingle;
+;; Gambit's is an f32vector store in prelude-shims.ss), as the JVM's float
+;; holds: (double (float 0.3)) is 0.30000001192092896 and (float
+;; Double/MIN_VALUE) is 0.0. The cast range-checks against Float/MAX_VALUE
+;; first, like RT.floatCast (an infinity is out of range; NaN passes).
+;;
+;; jolt-float->flonum is the cast's value as the double it widens to: what an
+;; arithmetic operand needs, so a typed (* (float x) 2.0) never builds the
+;; jfloat (jolt.passes.numeric's :float kind).
 (define fl-float-max 3.4028234663852886e38)
-(define (jolt-float x)
-  (let ((d (jolt-double x)))
-    (if (and (flonum? d) (not (nan? d))
-             (or (< d (- fl-float-max)) (> d fl-float-max)))
-        (jolt-cast-range-throw "float" x)
-        d)))
+(define (jolt-float->flonum x)
+  (if (jfloat? x)
+      (jfloat-fl x)
+      (let ((d (jolt-double x)))
+        (if (and (not (nan? d)) (or (< d (- fl-float-max)) (> d fl-float-max)))
+            (jolt-cast-range-throw "float" x)
+            (flsingle d)))))
+(define (jolt-float x) (if (jfloat? x) x (make-jfloat (jolt-float->flonum x))))
 (def-var! "clojure.core" "float" jolt-float)
+;; unchecked-float: the same rounding without the range check, so a double past
+;; Float/MAX_VALUE is an infinity, like the JVM's (float) primitive conversion.
+(define (jolt-unchecked-float->flonum x)
+  (if (jfloat? x) (jfloat-fl x) (flsingle (jolt-double x))))
+(define (jolt-unchecked-float x)
+  (if (jfloat? x) x (make-jfloat (jolt-unchecked-float->flonum x))))
+(def-var! "clojure.core" "unchecked-float" jolt-unchecked-float)
 ;; numerator/denominator: jolt ratios are Chez exact rationals; a non-ratio is
 ;; the JVM's Ratio cast failure.
 (define (jolt-ratio-part name f)

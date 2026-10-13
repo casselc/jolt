@@ -95,9 +95,9 @@
   It is not fine for one linked against the base's STATIC archive: that library
   carries its own copy, so writes through one never appear in the other, and
   nothing raises. raygui built against libraylib.a is the case that named this
-  — every control reads a mouse that never moves. jolt reports a duplicate
-  native symbol on stderr the first time such a symbol is bound, and
-  defining-libraries answers which libraries supply distinct definitions. The
+  — every control reads a mouse that never moves. With JOLT_WARNINGS=1 jolt
+  reports a duplicate native symbol on stderr the first time such a symbol is
+  bound, and defining-libraries answers which libraries supply distinct definitions. The
   fix is always to rebuild the dependent against the shared base library.
 
   ARENAS. An arena is a group of allocations with one lifetime: allocate into
@@ -240,8 +240,8 @@
       layout-alignment, field-offset, read-field, write-field, :varargs (a
       second spelling of :&),
       :blocking, :capture-native-error, errno, export!, foreign-callable,
-      free-callable, loaded?, defining-libraries, read-bytes, write-bytes,
-      read-into!, and the exact-width type aliases.
+      free-callable, loaded?, defining-libraries, on-gc-stall, read-bytes,
+      write-bytes, read-into!, and the exact-width type aliases.
 
   VARIADIC. :& marks the fixed/variadic boundary of a C function that takes an
   ellipsis, as it does in babashka.ffi; :varargs is jolt's older spelling of the
@@ -1516,6 +1516,17 @@
           option (if option? [(nth tail 0)] [])
           tail (if option? (vec (rest tail)) tail)
           binding (cfn-form (nth args 0) (nth args 1) (nth args 2) option "defcfn")
+          ;; A bare binding of a :float or :double result always answers that
+          ;; kind, so the var declares it (:jolt/num-ret) and arithmetic over a
+          ;; call unboxes it. A wrapper fn answers whatever it returns, and a
+          ;; :capture-native-error binding answers a [result errno] vector.
+          ret (nth args 2)
+          num-ret (when (and (contains? #{:float :double} ret)
+                             (zero? (count tail))
+                             (not (and option? (map? (nth option 0))
+                                       (get (nth option 0) :capture-native-error))))
+                    ret)
+          attrs (if num-ret (assoc (or attrs {}) :jolt/num-ret num-ret) attrs)
           named (if attrs (with-meta name (merge (or (meta name) {}) attrs)) name)
           value (if (zero? (count tail))
                   binding
@@ -1592,9 +1603,10 @@
 ;; pthread_join, pthread_cond_wait, dispatch_semaphore_wait under
 ;; DISPATCH_TIME_FOREVER, WaitForSingleObject under INFINITE and every other
 ;; "wait until it is done" entry point have none, and with one of those left
-;; unmarked the process would simply stop. What surfaces instead is the
-;; runtime's own report (issue #1046): two seconds into a collection that is
-;; waiting for a thread to reach a safe point, stderr says so — how many
+;; unmarked the process would simply stop. What can surface instead is the
+;; runtime's own report (issue #1046), opt-in since #1292: with JOLT_GC_STALL=1
+;; set (or JOLT_GC_STALL=<seconds> for another threshold), two seconds into a
+;; collection that is waiting for a thread to reach a safe point, stderr says so — how many
 ;; threads it waits for, whether a :collect-safe callback is in progress (the
 ;; thread waiting for the collection is then the one the parked call is waiting
 ;; for), and to mark the outbound call :blocking. The wait then goes on, so a
@@ -1614,6 +1626,34 @@
   (if (= opt :collect-safe)
     (list 'jolt.ffi/__ccallable f argtypes rettype :collect-safe)
     (list 'jolt.ffi/__ccallable f argtypes rettype)))
+
+(defn on-gc-stall
+  "Take the stalled-collection report (see the :collect-safe notes above)
+  instead of stderr. f receives a map:
+
+    {:seconds   the threshold that was passed
+     :threads   how many threads have not reached a safe point
+     :callbacks how many :collect-safe callbacks are in progress
+     :message   the report the runtime would have written}
+
+  once per stalled collection. Installing f is opt-in on its own: it runs
+  whether JOLT_GC_STALL is set or not. :seconds sets its threshold (a positive
+  number; default JOLT_GC_STALL's, else 2). (on-gc-stall nil) restores the
+  default: written to stderr when JOLT_GC_STALL is set, otherwise nothing.
+
+  f runs on a thread that is waiting for the collection, while every other
+  thread is stopped or parked: it may allocate and write to a file or port,
+  but it must not wait on another thread, a lock, a promise or a future.
+  Anything it throws is dropped. Answers false on a target without the watch
+  (where no report is ever made), true otherwise."
+  ([f] (on-gc-stall f nil))
+  ([f {:keys [seconds]}]
+   (when-not (or (nil? f) (ifn? f))
+     (throw (IllegalArgumentException. "on-gc-stall: f must be a function or nil")))
+   (when-not (or (nil? seconds) (and (number? seconds) (pos? seconds) (< seconds 86400)))
+     (throw (IllegalArgumentException.
+             (str "on-gc-stall: :seconds must be a positive number of seconds, got " (pr-str seconds)))))
+   (boolean (jolt.ffi/__gc-stall-reporter! f seconds))))
 
 (defn __arena-callback
   "Internal. Record an already-built callable entry point as arena-owned, so the

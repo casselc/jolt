@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Compose the retained performance capabilities with Jolt 0.8.21. Guarded
+  StringWriter lowering uses its synchronized primitives; the private JSON
+  replacement seam preserves the new shared buffer, monitor and capacity.
+  This remains an unqualified isolated candidate, not a consumer runtime pin.
+
 - Avoid rest/apply argument lists for sorted-collection operations with up to
   three operation arguments. Resolve the current operation on every call and
   preserve generic callable/large-arity fallback. A process-local prototype
@@ -95,6 +100,435 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of 64 KiB and larger to their array's lifetime. This preserves 0.8.17's
   large-buffer address stability without introducing an extra full-buffer copy;
   storage identity, small-array non-pinning, and owner-death reclamation are tested.
+## [0.8.21] - 2026-10-11
+
+jolt and the binaries it builds hold about half the memory they did: `jolt -e`
+peaks at 83MB instead of 182MB, and a hello app at 54MB instead of 122MB.
+`:blocking` foreign calls no longer cost several times a plain call, method
+calls on host objects without a type hint stop paying a dispatch walk, and
+`instance?` on atoms, refs and delays is memoized. Fiber pools let blocking
+work run on carriers of its own. Runtime timeouts move to the monotonic clock,
+and the runtime's own warnings are opt-in.
+
+### Added
+
+- **Fiber pools besides the default one.** `(jolt.fibers/pool {:name :io
+  :size 8})` starts a pool of carriers of its own, and `(jolt.fibers/spawn f
+  {:pool p})` runs a fiber on it for life. A fiber that pins its carrier, in a
+  blocking foreign call or a long computation, then holds up only its own
+  pool's fibers. Channels, promises, `interrupt!` and `kill!` work across
+  pools. `pool-of` names a fiber's pool, and `shutdown!` stops a pool taking
+  fibers while its carriers finish the ones already on them. The default pool
+  is unchanged.
+
+### Changed
+
+- **A C float reaches jolt as a `java.lang.Float`**, as it reaches Clojure on
+  the JVM: a `:float` result, `jolt.ffi/read` of `:float` (struct fields and
+  `read-array` included), and a `:float` callback argument. They answered a
+  Double before. A `:double` stays a Double. A bare `defcfn` binding of a
+  `:float` or `:double` result now declares that kind, so arithmetic over a
+  call unboxes it instead of taking generic dispatch: a loop adding `sinf`
+  results runs as fast as before, and one adding `sin` results 1.1x faster.
+- Arithmetic that mixes a Float with a double is about 1.6x faster. It was
+  dispatched twice, through the variadic `+` and then a second time after
+  unboxing.
+- **jolt and built binaries hold about half the memory.** A vfasl boot left
+  oversize chunks pinned by one stray segment, the embedded boot arrays were
+  writable (so the boot prefetch dirtied every page), the GC policy took its
+  baseline before the first collection, and the boot image was decompressed in
+  one piece beside the image it was building. On macOS arm64:
+
+  | | 0.8.20 | 0.8.21 |
+  |---|---:|---:|
+  | `jolt -e '(println 1)'`, peak footprint | 181.6MB | 82.7MB |
+  | hello app, size / peak | 11.5MB / 121.7MB | 9.6MB / 54.2MB |
+  | hello app `--closed-world`, size / peak | 10.8MB / 110.8MB | 8.2MB / 39.3MB |
+
+- **`:blocking` foreign calls are cheap.** A collect-safe call deactivated the
+  thread through the global thread-context mutex on every call, so one cost
+  about 8x a plain call and serialized threads. Release builds carry a Chez
+  patch (`chez-patches/0001`) that marks the thread with a compare-and-swap
+  instead; a `:blocking` call now costs 1.5-2.7x a plain one. A jolt on a
+  stock Chez works as before.
+- **The runtime's own diagnostics are opt-in** (#1292). The GC stall report
+  needs `JOLT_GC_STALL=1` (or `=<seconds>` for another threshold), and the
+  provider-claim, duplicate native symbol, data-reader load failure and AOT
+  worker warnings need `JOLT_WARNINGS=1`, so they no longer interleave with a
+  full-screen TUI. `jolt.ffi/on-gc-stall` hands the stall report to a function
+  instead.
+- `instance?` on atoms, vars, refs, volatiles, delays, promises, futures and
+  agents is memoized by kind, as it is for other values: `(instance? Atom a)`
+  went from 0.44 µs to 0.025 µs and `(instance? IDeref d)` on a delay from
+  0.68 µs to 0.10 µs.
+- A timed `poll` or `offer` on `LinkedBlockingQueue` and `ArrayBlockingQueue`
+  that can complete at once costs the same as the untimed one (#1303). It
+  built the whole interruptible wait first, which made a timed poll on a
+  queue with data in it 1.4x slower on macOS, and 4.9x on the reporter's
+  aarch64 Termux device. `take` and `put` get the same fast path.
+- **Method calls on host objects without a type hint are much cheaper.** A
+  call such as `(.size q)` on a queue, an executor, or a `StringBuilder`
+  reached through an unhinted local walked every dispatch arm and looked the
+  method up by name each time, about 120 ns before the method ran. The call
+  site now caches what it resolved. On macOS, `.size` on a
+  `LinkedBlockingQueue` went from 137 ns to 8 ns, an `offer` and `poll` pair
+  from 484 ns to 195 ns (babashka: 214 ns), and an unhinted `StringBuilder`
+  `.length` from 170 ns to 9 ns. Calls on other receivers cost what they did.
+- Equal string literals share one object in a built binary's image, as
+  interned literals do on the JVM. Every literal was its own object, so a
+  hello app's runtime held 788 copies of `"clojure.core"`; jolt's own heap is
+  2.9MB smaller after boot and an app's is 0.8-1.6MB smaller. Needs a Chez
+  kernel with jolt's patches (`chez-patches/0004`), as release builds have.
+
+### Fixed
+
+- **Timeouts no longer follow the wall clock.** Every runtime deadline
+  (timed waits and derefs, `Thread/sleep`, `Process.waitFor`, executor
+  keep-alive and scheduling, `tryLock`, socket timeouts, core.async `timeout`)
+  was read off the wall clock, so stepping the system clock fired a wait early
+  or held it for as long as the step. They now use the monotonic clock, as the
+  JVM does. `jolt.host/timer-at!` and `jolt.io-poller/wait-ready` take
+  deadlines on that clock; `jolt.io-poller/deadline-ms` builds one (#1303).
+- A timed wait no longer returns up to 1ms before its timeout. Deadlines were
+  built off a clock read truncated to the millisecond; they now round up, as
+  the JDK's waits never return early.
+- `System/gc` ran no collection while another thread was active, which on
+  Linux is always at startup. It now asks for the full collection and joins
+  it. `JOLT_MAX_HEAP=150m` refused to start, reading the boot image's
+  allocation as live heap.
+- `String.intern` answers one object per content, so
+  `(identical? (.intern a) (.intern b))` holds for equal strings. It returned
+  its argument.
+- **Division by zero raises where the JVM raises.** `(/ x y)` on boxed
+  operands is `Numbers.divide(Object, Object)`, which raises `Divide by zero`
+  for any zero divisor, `0.0` included, unless an operand is NaN. jolt answered
+  `##Inf` there. Now value-position (`apply`, `reduce`), unary, and boxed calls
+  raise, while a call with a primitive double or float operand still answers
+  an infinity, as the JVM's primitive overloads do. Primitive operands include
+  a literal, a `^double` param, a primitive local, a `(double x)` cast, and a
+  `Math` call. Each step of `(/ a b c)` is decided on its own, as on the JVM.
+- **A call typed from a var's `^double` return checks what it answered.** The
+  numeric pass trusted the declaration and handed the result to an unchecked
+  flonum op, so once the var was redefined, a site compiled against it read a
+  string as a double (`(+ 0.5 (f))` answered 0.5) or faulted the process on
+  an integer. The site now widens a number and raises `ClassCastException` on
+  anything else.
+- **A `java.lang.Float` crosses into C again.** 0.8.20 made `(float x)` a
+  boxed `java.lang.Float` (#1285). A Chez `float` or `double` foreign position
+  takes only a flonum, so passing one raised `invalid foreign-procedure
+  argument`. It failed wherever a jolt value crosses into C
+  as a float or double: a `defcfn` argument, a bare `:&` tail,
+  `jolt.ffi/write`, and a callback's result. Each now unboxes a Float, as
+  `(double x)` already did, and a double passes as before. glimmer-uikit binds
+  `objc_msgSend` with a `:float` priority, so every glimmer-uikit iOS app built
+  on 0.8.20 failed at mount and showed a black screen.
+
+## [0.8.20] - 2026-10-08
+
+A float is a `java.lang.Float` rounded to single precision, and primitive
+arrays narrow what they store as the JVM does. A host that loads a jolt
+library keeps its own fault and interrupt handling. The terminal REPL gets a
+line editor with parinfer, and `jolt.fibers` gains `kill!`. Protocol call
+sites in `--opt` builds are safe under concurrent callers, and two Windows
+bugs are fixed: 8.3 short names in canonical paths, and a crash when a pipe
+is closed under a reader.
+
+### Added
+
+- **A line editor for `jolt repl` at a terminal** (#1276). Multi-line entries
+  with indentation, parinfer smart mode keeping closers balanced, docs for the
+  symbol at the cursor (Alt-D, again for the full doc), Tab completion, and
+  history in `~/.jolt_repl_history`. Enter submits a complete entry with the
+  cursor at its end and opens an indented line otherwise; Alt-Enter always
+  submits, Ctrl-J always opens a line. ^C during an evaluation interrupts it
+  and the REPL carries on; at the prompt it clears the entry, and exits on an
+  empty one. Piped input, scripts and `TERM=dumb` keep the plain reader. Works
+  on the Windows console as well as Unix terminals.
+
+- **`jolt.parinfer`**, a port of parinfer.js 3.13.1 (#1276), with its 154
+  upstream cases as a gate.
+
+- **`jolt.fibers/kill!`** (#1275). An interrupt is a throwable, so a fiber
+  that catches `Throwable` in a loop swallowed `interrupt!` for good, and a
+  supervisor could never stop it. `kill!` escapes through a continuation
+  instead: no catch sees it, only `finally` blocks run, and it lands at the
+  fiber's outermost unmasked region (or its entry, which ends the fiber). A
+  later `interrupt!` does not replace a pending kill.
+
+### Changed
+
+- **A float is a `java.lang.Float`, rounded to single precision** (#1285).
+  `(double (float 0.3))` is 0.30000001192092896 and `(float Double/MIN_VALUE)`
+  is 0.0, as on the JVM.
+
+  ```clojure
+  (class (float 0.1))       ;; java.lang.Float (was java.lang.Double)
+  (pr-str (float 1/3))      ;; "0.33333334"
+  (= (float 0.5) 0.5)       ;; true
+  (= (float 0.1) 0.1)       ;; false
+  ```
+
+  `float?`, `instance? Float` and `extend-protocol` on Float dispatch on it,
+  `hash` is Float's hasheq, and arithmetic widens to Double. Float's methods
+  and statics, `(Float. x)`, ByteBuffer `getFloat` and Math's float overloads
+  answer Floats where the JDK does. `(float Float/MAX_VALUE)` no longer throws
+  "Value out of range for float". `Double/compare` is added. A hinted or cast
+  float stays unboxed, but a Float passed through generic code is now an
+  allocated value: a `reduce` over floats went from 19 to 36 ns/op and `mapv
+  float` from 91 to 116. Code that uses doubles is unaffected.
+
+- **Primitive arrays narrow what they store** (#1289). `(aget (int-array
+  [1.7]) 0)` was 1.7 and a long-array could hold a bignum. Stores through
+  array constructors, `aset`, `into-array` and `Arrays/fill` now narrow as
+  `Number.xxxValue` does: int[] holds `(int x)` (saturating a double first),
+  short[] and byte[] keep the low bits, long[] wraps a bignum to 64 bits, and
+  float[] holds the nearest float and reads back a Float. `aset-int`,
+  `aset-long` and the rest throw out of range, as `(byte 300)` does. A hinted
+  `(aset ^ints a 0 3000000000)` now stores -1294967296, as the JVM does.
+  `^floats` joins `^doubles` as a compiler hint. Where the JVM refuses a store
+  (a Double into a long[] through `aset`), jolt narrows; that is a documented
+  divergence.
+
+- **`Math/cbrt` and `clojure.math/cbrt` are fdlibm's**, as the JDK's are
+  (#1288). They went through the host libm's `pow`, so the last digit depended
+  on the platform: `(Math/cbrt 1e-300)` was 1.0000000000000127E-100 against
+  the JVM's 1.0E-100, and Android differed from Linux at 2.5. They now give
+  the JVM's digits, at about 1.27x the cost of the libm call (79 to 100 ns).
+
+### Fixed
+
+- **A host that loads a jolt library keeps its own signal handling** (#1277,
+  #1290, #1291). Chez takes SIGSEGV, SIGBUS, SIGFPE and SIGILL for the whole
+  process at init, so a .NET or JVM host aborted with "invalid memory
+  reference" on a null dereference in its own code. A fault on a thread that
+  isn't running jolt code now goes to the host's handler, run as the kernel
+  would have run it (its alternate stack, `sa_mask`, `SA_NODEFER` and
+  `SA_RESETHAND`), and the signals are given back at
+  `jolt_library_shutdown`. A fault in jolt code is still a jolt exception.
+  SIGINT and SIGQUIT stay the host's: before, a ^C sent to the host left an
+  interrupt pending in Chez that made `jolt_library_shutdown` exit the
+  process with 255. SIGPIPE is ignored while the library is loaded only if
+  the host left it at the default. A host whose init thread runs its own code
+  should call `jolt_library_release_thread`. On macOS, `SA_RESETHAND` is not
+  honoured (macOS does not report it back), and after a fault in jolt code
+  taken on a thread's alternate stack, that thread's later signals run on its
+  normal stack. A fault in jolt code while the released init thread is inside
+  an export still goes to the host; cisco/ChezScheme#1076 fixes that in Chez.
+
+- **Protocol call sites in `--opt` builds under concurrent callers** (#1284,
+  #1286). A site's inline cache was rewritten in place on a miss, so threads
+  calling one function over several record types failed with "`fx=`:
+  `#<jrdesc>` is not a fixnum", an out-of-range `vector-set!`, or dispatch to
+  the wrong type's method. A cache is never written once published now, and
+  a site that has filled its cache stops caching. An 8-type site went from 37
+  to 19 ns/call.
+
+- **`finally` and other cleanups survive an interrupted evaluation** (#1274).
+  `run-interruptible` (REPL ^C, nREPL interrupt) could land between a cleanup's
+  setup and its body, or between the body and the cleanup, leaving a
+  `binding` frame on the stack, `*out*` bound to a dead string port from
+  `with-out-str`, a transaction still open on the thread, a lazy seq claimed
+  so every other forcer waited for good, or a namespace load claim held so
+  later requires waited. Cleanups are masked across those edges now. A bare
+  `try`/`finally` costs about 1.5 ns more.
+
+- **Windows: `getCanonicalPath` spells 8.3 short names long** (#1281, #1287).
+  `%TEMP%` carries the short profile name and a child's cwd the long one, so
+  the two never compared equal. Each existing component is replaced with the
+  name its directory lists, as the JDK does, which also fixes case.
+  `Path.toRealPath` (`fs/real-path`) resolves links through
+  `GetFinalPathNameByHandleW`.
+
+- **Windows: closing a process stream while another thread reads it** (#1283,
+  #1287) freed the buffer the read was writing into, a segfault (exit 139, or
+  127 with one reader). Windows pipe ports now share the POSIX ports' lifetime,
+  which releases on the later of the close and the last operation out; the
+  parked reader answers EOF.
+
+### Performance
+
+- **`Math/nextUp`, `Math/ulp` and `Double/doubleToLongBits` are faster**
+  (#1288): 650 to 106, 530 to 218 and 387 to 82 ns/call, taking a double's bit
+  pattern from the host instead of building it in exact arithmetic.
+
+### Internal
+
+- The GC stall watch installs on Chez 10.5 as well as 10.4, after comparing
+  `$collect-rendezvous` between the two (#1279).
+
+## [0.8.19] - 2026-10-07
+
+Monitors take an uncontended `locking` without a mutex, `StringBuffer` is
+synchronized as on the JDK, and `StringBuilder` and `StringBuffer` gain the
+rest of the JDK's API. An interrupted evaluation no longer leaves a monitor or a
+runtime lock held. `jolt.parser`'s `many` is linear, and release archives
+carry the notices for the third-party code jolt ships.
+
+### Added
+
+- **The rest of `StringBuilder`/`StringBuffer`'s JDK API** (#1270).
+  `capacity`, `ensureCapacity`, `trimToSize`, `appendCodePoint`,
+  `codePointBefore`, `codePointCount`, `offsetByCodePoints`, `compareTo`,
+  `chars`, `codePoints` and `lastIndexOf(str, from)`, with the JDK's initial
+  capacities and growth. `String` gains `codePointBefore`, `codePointCount`,
+  `offsetByCodePoints`, `chars` and `codePoints`. Out-of-range errors carry the
+  JDK's messages.
+
+- **`NOTICE` and `licenses/` in release archives and the Nix flake** (#1269).
+  They list each embedded or adapted work (Chez Scheme, zlib, LZ4, irregex,
+  Grenadine, babashka's fs/process/cli and task runner, the Clojure and
+  ClojureScript ports, jasentaa) with its copyright holder and license. Files
+  with upstream code carry the upstream copyright line.
+
+### Changed
+
+- **`vswap!` is a macro**, as on the JVM (#1268).
+
+### Performance
+
+- **An uncontended `locking` takes no mutex** (#1271). The monitor's owner is a
+  word that the uncontended enter and exit take and release with one
+  compare-and-swap; a contender marks it before it waits, so the owner's exit
+  wakes it. Measured against the 0.8.18 release binary:
+
+  ```
+  (locking o nil) x 1M                 405-493 ms -> 92-103 ms
+  nested locking x 1M                  332-351 ms -> 161-176 ms
+  4 threads contending, 100k each      310-362 ms -> 79-99 ms
+  ```
+
+- **`jolt.parser`'s `many` is linear** (#1267). `>>=` realized results ahead
+  at every level, so taking the first parse of a recursive parser was
+  quadratic. `(many any)` over 8000 chars goes from 12-14 s to 27-31 ms.
+
+- **Array-hinted locals keep their hint through inlining** (#1268). A
+  `^longs`/`^objects`/`^doubles` let binding lost its hint when the inliner
+  rebuilt it, so every `aget` went through the generic `nth`. Array-hinted fns
+  are inline candidates again.
+
+- **`StringBuilder` reads between appends are O(1)** (#1268, #1273). A
+  `charAt` or `length` between appends joined the whole buffer, so a formatter
+  that looks at the line so far paid O(line) per token. 50k appends each
+  followed by a `charAt` go from 785-836 ms to 1 ms; building without reads
+  costs what it did.
+
+### Fixed
+
+- **`StringBuffer` is synchronized** (#1270). It shared `StringBuilder`'s
+  unsynchronized store, so threads appending to one could lose writes or fault.
+  Its methods now run under its own monitor and compose with
+  `(locking sb ...)`. `StringWriter` writes into a `StringBuffer` and
+  `getBuffer` returns it. `(.delete sb 2 1)` throws as on the JDK instead of
+  succeeding. The lock makes an uncontended append about 65 ns, up from about
+  5 ns unsynchronized.
+
+- **An interrupted evaluation no longer leaves a lock held** (#1272).
+  `jolt.host/run-interruptible`, which interrupts an nREPL eval, ends its body
+  from a timer interrupt, and an interrupt landing at the edge of a `locking`,
+  an `Object.wait` or an internal lock could leave the monitor held for the
+  life of the process, or the thread's lock count raised so fibers on it were
+  never preempted again. The interrupt now waits until the thread holds no
+  lock, and the monitor's enter, exit and wait cannot be split by one.
+
+- **`(.getName (Thread/currentThread))` on the main thread** could answer
+  `"Thread-<n>"` after many short-lived threads had started (#1264). Reading a
+  child thread's id raced with Chez freeing its thread context.
+
+- **`spit` on Windows retries while antivirus holds the temp file** (#1265,
+  #1263). It failed intermittently with `cannot rename ... permission denied`
+  and left the `.spit-tmp-*` file behind. `Files/move` with
+  `REPLACE_EXISTING` over a target it cannot delete raises
+  `AccessDeniedException` naming the target, as on the JDK.
+
+## [0.8.18] - 2026-10-06
+
+Collection operations that Clojure answers from a collection's shape (counts,
+transients, lazy hash and sorted seqs, queue pops, `drop` on vectors and
+ranges, large `case`) no longer walk the whole collection. `jolt.nrepl/start`
+reports the port it actually bound and takes a `:port-file` option, and
+`jolt.host` paths, `load-file` and `sh` resolve against the caller's directory.
+`jolt build` can leave dependency files out of a binary, and `--signable` no
+longer needs a separate Chez install.
+
+### Added
+
+- **`:jolt/build {:exclude-resources [glob …]}`** (#1247, #1245). A built
+  binary bakes every file in its dependency roots except `.class` and `.cljs`,
+  so a dependency that ships files no jolt program reads pays for them in every
+  build. ClojureScript externs are the large case: `cljs.java-time`'s js-joda
+  externs are 11.74 MB. The project now names what to leave out, as globs
+  matched against the name `io/resource` asks for: `*` within a directory,
+  `**` across directories, `?` one character, and a trailing `/` for
+  everything under a directory. A non-string entry fails the build.
+
+- **`jolt.nrepl/start` takes an opts map with `:port-file`** (#1242, #1239).
+  `(jolt.nrepl/start 0 nil {:port-file "/path/.nrepl-port"})` writes the port
+  file there, and `{:port-file nil}` writes none. The default is still
+  `.nrepl-port` in the working directory. Stop deletes only the file `start`
+  wrote, and the stop fn's metadata carries `:port-file`, the absolute path
+  written or nil.
+
+### Changed
+
+- **Collection operations answered from their shape, as on the JVM** (#1260).
+  Each of these was O(n) in jolt where Clojure answers in O(1), O(log n) or
+  O(k):
+  - transient vectors share their source trie, so `(into v xs)` costs `xs`,
+    not `v`;
+  - `PersistentQueue` pops in O(1) and caches its hash, and
+    `clojure.set/difference` walks the smaller set;
+  - lists carry their count, and range, `rseq`, string and array seqs count
+    in O(1); `=` compares known counts first, and `counted?` matches the JVM
+    for these seq types;
+  - hash map and set seqs walk the trie lazily a chunk at a time instead of
+    copying every entry, and `dissoc` drops emptied child nodes;
+  - sorted map and set `seq`/`rseq`/`keys`/`vals`/`subseq` are lazy, with a
+    cached hash and a count-first `=`;
+  - `nthrest`/`nthnext`/`drop` jump on vectors, ranges, `(range)` and strings.
+    `(nthrest (range 10) 2147483648)` now throws `ArithmeticException`, as on
+    the JVM;
+  - a `case` above a threshold dispatches through a constant map instead of
+    testing each clause in turn.
+
+  `bench/run.sh coll-shapes 4000` goes from 5919 ms to 8.7 ms (JVM Clojure
+  1.12: 90 ms), and joins the benches the release gate watches.
+
+- **Method calls on a `Pattern` or `Matcher` dispatch right after strings**
+  (#1244). An unhinted `.region`, `.lookingAt` or `.group` call walked the
+  stream, dotform, date and file arms first. An unhinted `.regionStart` on a
+  Matcher goes from about 410 ns to 205 ns. No call answers differently.
+
+- **`jolt build --signable` links against the embedded kernel** (#1261,
+  #1255). A self-contained jolt carries the Chez boots, `scheme.h` and
+  `libkernel.a`, but `--signable` still spawned an external Chez and read the
+  kernel from a Chez install, so on macOS you had to install Chez Scheme to get
+  a signable binary. It now compiles in process and only needs a C compiler. A
+  jolt without the embedded kernel (dev `bin/jolt`) behaves as before.
+
+- **`--library` on macOS arm64 keeps Chez's code in one aligned region**
+  (#1257, #1246). A library loaded into a host with a crowded address space
+  could run up to about 1.7x slower for the life of the process, because
+  Chez's code chunks landed gigabytes apart and calls across 1 GB or 4 GB
+  boundaries mispredict. The library now carves its code chunks out of one
+  512 MB region, reusing freed ones, until jolt builds against a Chez release
+  with cisco/ChezScheme#1074. The hidden `mmap`/`munmap` it defines don't
+  affect the host process, and other platforms are unchanged.
+
+### Fixed
+
+- **`jolt.nrepl/start` with port `0` reports the port it bound** (#1240,
+  #1238). The banner and `.nrepl-port` said `0`, so nothing could find the
+  server. The stop fn carries the bound port as `:port` metadata.
+  `jolt nrepl-server 0` gets the same fix.
+
+- **`jolt.host` paths, `load-file` and `sh` resolve against the caller's
+  directory** (#1243, #1241). Under `bin/jolt`, `jolt.host`'s filesystem
+  functions (`file-exists?`, `directory?`, `mkdirs!`, `delete-file!`,
+  `delete-tree!`, `rename-file!`, `file-mtime`, `list-dir`, `symlink?`) and
+  `load-file` resolved a relative path against the jolt checkout, and
+  `jolt.host/sh`/`sh-out` (and so a `bb.edn` string task) ran there. They now
+  use the user's directory, as `java.io`, `slurp`/`spit` and `ProcessBuilder`
+  already did. A built binary is unaffected.
 
 ## [0.8.17] - 2026-10-04
 

@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/set.clj,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ; Jolt Standard Library: clojure.set
 ; Set operations.
 
@@ -21,7 +26,12 @@
 
 (defn difference
   ([s1] s1)
-  ([s1 s2] (reduce disj s1 s2))
+  ([s1 s2]
+   ;; walk the SMALLER side (the reference's branch): disj-ing a big s2 out of a
+   ;; three-element s1 must cost 3, so a smaller s1 keeps what s2 lacks
+   (if (< (count s1) (count s2))
+     (reduce (fn [result item] (if (contains? s2 item) (disj result item) result)) s1 s1)
+     (reduce disj s1 s2)))
   ([s1 s2 & sets] (reduce difference (difference s1 s2) sets)))
 
 (defn select

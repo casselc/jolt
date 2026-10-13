@@ -142,9 +142,13 @@
   (gate-check "a StringBuilder receiver still reaches the generic arm"
               (ev "(user/uselen (doto (StringBuilder.) (.append \"ab\")))") 2))
 (let ((e (emit-dl "(def usecharat (fn [s i] (.charAt s i)))")))
-  (gate-check "unhinted .charAt takes the direct form" (gate-sub? e "(string-ref _ht$") #t)
+  ;; the direct form is String.charAt's checked read, not a bare string-ref
+  (gate-check "unhinted .charAt takes the direct form" (gate-sub? e "(jolt-char-at _ht$") #t)
   (run-emit e)
-  (gate-check "unhinted .charAt on a string answers" (call "usecharat" "abc" 1) #\b))
+  (gate-check "unhinted .charAt on a string answers" (call "usecharat" "abc" 1) #\b)
+  (gate-check "unhinted .charAt out of range is the JVM's message"
+              (ev "(try (user/usecharat \"abc\" 3) (catch StringIndexOutOfBoundsException e (ex-message e)))")
+              "Index 3 out of bounds for length 3"))
 (let ((e (emit-dl "(def usename (fn [k] (.getName k)))")))
   (gate-check "unhinted .getName tests for a keyword" (gate-sub? e "(keyword-t? _ht$") #t)
   (gate-check "unhinted .getName takes the keyword direct form" (gate-sub? e "(keyword-t-name _ht$") #t)
@@ -206,5 +210,18 @@
                 (stub 1) #f)
               #t))
 
+;; A StringBuilder local takes the unsynchronized direct forms; a StringBuffer
+;; local takes the locking ones, because the JDK's StringBuffer methods are
+;; synchronized. Routing a StringBuffer through sb-append! would race.
+(let ((e (emit-dl "(def usesbld (fn [] (let [sb (StringBuilder.)] (.append sb \"x\") (.charAt sb 0) (.toString sb))))")))
+  (gate-check "a StringBuilder local appends unsynchronized" (gate-sub? e "(sb-append! ") #t)
+  (gate-check "...and never through the locking form" (gate-sub? e "sb-append*!") #f))
+(let ((e (emit-dl "(def usesbuf (fn [] (let [sb (StringBuffer.)] (.append sb \"x\") (.charAt sb 0) (.length sb) (.toString sb))))")))
+  (gate-check "a StringBuffer local appends under its lock" (gate-sub? e "(sb-append*! ") #t)
+  (gate-check "...reads under it too" (and (gate-sub? e "(sb-char-at* ") (gate-sub? e "(sb-length* ") (gate-sub? e "(sb-str* ")) #t)
+  (gate-check "...and never through the unsynchronized forms"
+              (or (gate-sub? e "(sb-append! ") (gate-sub? e "(sb-str ") (gate-sub? e "(sb-char-at ")) #f)
+  (run-emit e)
+  (gate-check "the locked direct forms answer" (call "usesbuf") "x"))
 (gate-summary "directcall")
 

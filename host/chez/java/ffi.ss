@@ -562,6 +562,10 @@
 ;; resolution is correct and always was. A raise would turn those into a
 ;; regression; silence is what the issue is about.
 ;;
+;; Reported under JOLT_WARNINGS (rt.ss jolt-warnings?): the error port is the
+;; program's, so the runtime writes there only when asked (#1292). The
+;; jolt.ffi/defining-libraries answers the same question without it.
+;;
 ;; Once per symbol, not once per call. The emitted binding caches its address,
 ;; so a repeat would only appear if a caller resolved the same name again — and
 ;; a warning that repeats is a warning that gets filtered out.
@@ -576,7 +580,7 @@
     (cond ((hashtable-ref ffi-dup-reported sym #f) #f)
           (else (hashtable-set! ffi-dup-reported sym #t) #t))))
 (define (ffi-report-duplicate! sym defs)
-  (when (ffi-dup-claim! sym)
+  (when (and (jolt-warnings?) (ffi-dup-claim! sym))
     (let ((p (current-error-port)))
       (display (string-append
                  "jolt.ffi: duplicate native symbol " sym " — defined by "
@@ -727,6 +731,19 @@
 ;; as true/false rather than as the truthy number 0.
 (define (jolt-ffi-bool->c v) (if (or (jolt-nil? v) (eq? v #f)) 0 1))
 (define (jolt-ffi-c->bool raw) (not (eqv? (jnum->exact raw) 0)))
+;; --- :float/:double <- a java.lang.Float -------------------------------------
+;; (float x) answers a java.lang.Float, a jfloat record, and a Chez float or
+;; double position takes only a flonum: passing one raised "invalid
+;; foreign-procedure argument". Every place a jolt value crosses into C as a
+;; float or double unboxes it here, as jolt-double does — an argument, a
+;; callable's result, a write, a bare :& tail. Any other value passes through
+;; unchanged, so a wrong one still meets Chez's own check.
+(define (jolt-ffi-float->c x) (if (jfloat? x) (jfloat-fl x) x))
+;; The other direction: a C float reaches Clojure on the JVM as a
+;; java.lang.Float, so a :float result, a read of :float and a :float callback
+;; argument box the flonum Chez hands over (make-jfloat; it is already single
+;; precision, and the emitter calls the constructor itself). A :double stays a
+;; double.
 ;; read/write take the type, then the OFFSET LAST — the babashka.ffi order, so
 ;; (write p t v) and (write p t v offset) are one binding in both APIs. The jolt
 ;; wrapper in stdlib/jolt/ffi.clj supplies the offset and resolves a layout or a
@@ -738,18 +755,24 @@
     ((ptr ty off) (ffi-read* ptr ty off))))
 (define (ffi-read* ptr ty off)
   (let ((ct (ffi-type->chez ty)))
-    (if (eq? ct 'jolt-bool)
-        (jolt-ffi-c->bool (sa-foreign-ref 'unsigned-8 (jnum->exact ptr) (jnum->exact off)))
-        (sa-foreign-ref ct (jnum->exact ptr) (jnum->exact off)))))
+    (cond
+      ((eq? ct 'jolt-bool)
+       (jolt-ffi-c->bool (sa-foreign-ref 'unsigned-8 (jnum->exact ptr) (jnum->exact off))))
+      ((eq? ct 'float)
+       (make-jfloat (sa-foreign-ref 'float (jnum->exact ptr) (jnum->exact off))))
+      (else (sa-foreign-ref ct (jnum->exact ptr) (jnum->exact off))))))
 (define ffi-write
   (case-lambda
     ((ptr ty val) (ffi-write* ptr ty val 0))
     ((ptr ty val off) (ffi-write* ptr ty val off))))
 (define (ffi-write* ptr ty val off)
   (let ((ct (ffi-type->chez ty)))
-    (if (eq? ct 'jolt-bool)
-        (sa-foreign-set! 'unsigned-8 (jnum->exact ptr) (jnum->exact off) (jolt-ffi-bool->c val))
-        (sa-foreign-set! ct (jnum->exact ptr) (jnum->exact off) val)))
+    (cond
+      ((eq? ct 'jolt-bool)
+       (sa-foreign-set! 'unsigned-8 (jnum->exact ptr) (jnum->exact off) (jolt-ffi-bool->c val)))
+      ((memq ct '(float double))
+       (sa-foreign-set! ct (jnum->exact ptr) (jnum->exact off) (jolt-ffi-float->c val)))
+      (else (sa-foreign-set! ct (jnum->exact ptr) (jnum->exact off) val))))
   jolt-nil)
 ;; sizeof a foreign type (for laying out structs / arrays).
 (define (ffi-sizeof ty) (sa-foreign-sizeof (ffi-chez-width (ffi-type->chez ty))))
@@ -1018,6 +1041,7 @@
     ;; ioctl request), so it answers on the first test rather than the fourth.
     ((fixnum? v) 0)
     ((flonum? v) 1)
+    ((jfloat? v) 1)
     ((string? v) 2)
     ((number? v) (if (and (exact? v) (integer? v)) 0 1))
     ((jolt-nil? v) 0)
@@ -1059,6 +1083,7 @@
     ;; are the common ones, and they answer first.
     ((fixnum? v) v)
     ((flonum? v) v)
+    ((jfloat? v) (jfloat-fl v))
     ((string? v) v)
     ((jolt-nil? v) 0)
     ((eq? v #t) 1)
@@ -1394,6 +1419,18 @@
 (def-var! "jolt.ffi" "loaded?" (lambda (n) (if (ffi-loaded? n) #t #f)))
 (def-var! "jolt.ffi" "load-native" jolt-ffi-load-native)
 (def-var! "jolt.ffi" "defining-libraries" jolt-ffi-defining-libraries)
+;; jolt.ffi/on-gc-stall's native half (rt.ss jolt-gc-stall-set-reporter!): F
+;; nil restores the default report; otherwise F gets the report as a map.
+(def-var! "jolt.ffi" "__gc-stall-reporter!"
+  (lambda (f seconds)
+    (jolt-gc-stall-set-reporter!
+      (and (not (jolt-nil? f))
+           (lambda (secs threads callbacks message)
+             (jolt-invoke1 f (jolt-hash-map (jolt-keyword "seconds") secs
+                                            (jolt-keyword "threads") threads
+                                            (jolt-keyword "callbacks") callbacks
+                                            (jolt-keyword "message") message))))
+      (and (not (jolt-nil? seconds)) seconds))))
 (def-var! "jolt.ffi" "dlsym-native" jolt-ffi-dlsym-native)
 (def-var! "jolt.ffi" "load-system-library" ffi-load-system-library)
 ;; jolt.main/load-natives! reads it to build the fallback candidates for a spec

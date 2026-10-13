@@ -26,6 +26,7 @@
                                form-inst? form-inst-source form-uuid? form-uuid-source
                                form-bigdec? form-bigdec-source
                                form-bigdec-value? form-bigdec-value-source
+                               form-float-value? form-float-value-double
                                form-inst-value? form-inst-value-source
                                form-uuid-value? form-uuid-value-source
                                form-ns-value? form-ns-value-name
@@ -374,14 +375,16 @@
 (defn- kw-tag? [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
     (or (= s "Keyword") (= s "clojure.lang.Keyword"))))
-;; StringBuffer is the same store behind a second class name (one jhost tag over
-;; the identical state vector), so the direct-emit bodies — which call sb-append!
-;; / sb-str on that vector — are correct for it unchanged, and the legacy builder
-;; gets the same fast path rather than the slow one for being older.
+;; :sb is StringBuilder and :sbuf StringBuffer. Both take the direct-emit path,
+;; but a StringBuffer is synchronized, as on the JDK, so its direct forms are the
+;; locking primitives (sb-append*! / sb-str* ...) where a StringBuilder's are the
+;; unsynchronized ones.
 (defn- sb-tag? [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
-    (or (= s "StringBuilder") (= s "java.lang.StringBuilder")
-        (= s "StringBuffer") (= s "java.lang.StringBuffer"))))
+    (or (= s "StringBuilder") (= s "java.lang.StringBuilder"))))
+(defn- sbuf-tag? [t]
+  (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
+    (or (= s "StringBuffer") (= s "java.lang.StringBuffer"))))
 (defn- hint-of [ctx sym]
   (let [m (form-sym-meta sym)]
     (cond
@@ -392,6 +395,7 @@
                     (str-tag? t) :str
                     (kw-tag? t) :kw
                     (sb-tag? t) :sb
+                    (sbuf-tag? t) :sbuf
                     :else nil)))))
 
 ;; A hint the INIT proves rather than the programmer writes. (StringBuilder.) can
@@ -403,9 +407,9 @@
 ;; binding position, no flow analysis, no reassignment to worry about since a let
 ;; local is immutable.
 (defn- init-proves-hint [init]
-  (when (and (= :host-new (get init :op))
-             (sb-tag? (get init :class)))
-    :sb))
+  (when (= :host-new (get init :op))
+    (cond (sb-tag? (get init :class)) :sb
+          (sbuf-tag? (get init :class)) :sbuf)))
 (defn- add-hint [env nm h]
   (if h (assoc env :hints (assoc (:hints env) nm h)) env))
 
@@ -450,15 +454,17 @@
 ;; A primitive ARRAY hint on a param. Drives the aget/aset fast paths
 ;; (jolt.passes.numeric):
 ;;
-;;   :doubles  the UNBOXED flvector-ref/-set! path — a double/float array's backing
+;;   :doubles  the UNBOXED flvector-ref/-set! path — a double array's backing
 ;;             is a Chez flvector, so an element reads back a proven :double.
-;;             floats share the flvector kind.
+;;   :floats   the same flvector path, but an element is a Float: it reads back
+;;             :float (the double an fl op takes, a jfloat anywhere else) and a
+;;             store rounds to single precision.
 ;;   :longs :ints :bytes :objects
 ;;             the kind's own backing (fxvector/bytevector/vector) read direct, but
 ;;             no result type (it can widen past a fixnum) and no jolt-nth walk.
 (defn- tag->akind [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
-    (cond (= s "doubles") :doubles (= s "floats") :doubles
+    (cond (= s "doubles") :doubles (= s "floats") :floats
           (= s "longs") :longs (= s "ints") :ints
           (= s "bytes") :bytes (= s "objects") :objects
           :else nil)))
@@ -686,11 +692,14 @@
                                    (fi-adapt-form fi (nth bvec (inc i)))
                                    (nth bvec (inc i)))
                              env)
-              ;; a ^doubles/^floats/^longs/^ints let binding tags its init with the
-              ;; array kind so jolt.passes.numeric seeds the local for the unboxed
-              ;; flvector aget/aset path (mirrors the :ahints param route).
+              ;; a ^doubles/^longs/^objects/... let binding wraps its init in a
+              ;; :coerce of the array kind, so jolt.passes.numeric seeds the local
+              ;; for the direct aget/aset paths. A node, not a key on the init:
+              ;; the inline fixpoint rebuilds inits (flatten hoists a let-valued
+              ;; one, a splice replaces an invoke), and a key on the old node was
+              ;; lost with it. The back end emits an array-kind coerce as its expr.
               ak (ahint-of ctx bsym)
-              init (if ak (assoc init0 :akind ak) init0)]
+              init (if ak (coerce-node ak init0) init0)]
           ;; an explicit hint wins; init-proves-hint only fills in where the
           ;; programmer wrote nothing.
           (recur (+ i 2) (let [e (add-hint (add-locals env [nm]) nm
@@ -1530,9 +1539,9 @@
 ;; here would fix it, but nothing writes that shape and the generic path already
 ;; handles it correctly.
 (defn- sb-target-type [raw target]
-  (when (or (and (form-sym? raw) (sb-tag? (get (form-sym-meta raw) :tag)))
-            (= :sb (:hint target)))
-    :sb))
+  (let [tag (when (form-sym? raw) (get (form-sym-meta raw) :tag))]
+    (cond (or (sb-tag? tag) (= :sb (:hint target))) :sb
+          (or (sbuf-tag? tag) (= :sbuf (:hint target))) :sbuf)))
 
 ;; The list form's source position on a node, when the reader recorded one —
 ;; the same stamp an :invoke carries. A host call in tail position stores it as
@@ -1554,7 +1563,7 @@
              :args (mapv #(analyze ctx % env) (drop 2 items))}
       (str-target-type raw target) (assoc :target-type :str)
       (kw-target-type raw target) (assoc :target-type :kw)
-      (sb-target-type raw target) (assoc :target-type :sb))))
+      (sb-target-type raw target) (assoc :target-type (sb-target-type raw target)))))
 
 ;; A constructor head: `Class.` — a symbol ending in "." (but not the member
 ;; access `.method` / `..` forms). `(Class. args*)` builds an instance.
@@ -2167,7 +2176,8 @@
 ;; becomes a :coerce node carrying the checked runtime helper, so it feeds the
 ;; numeric lattice like a ^double/^long hint: (* (double x) 2.0) emits fl*. The
 ;; helper preserves clojure.core's full JVM semantics (checked, not bare
-;; jolt->fl). float -> double-kind (Jolt has no single-float); int ->
+;; jolt->fl). float -> its own :float kind (a jfloat, which an arithmetic op
+;; takes as the double it widens to: jolt.passes.numeric); int ->
 ;; long-kind (Jolt's integer-box model), routing to jolt-int-cast so the JVM int
 ;; range is still enforced. Returns {:kind .. :cast-fn ..} or nil. n is the full
 ;; item count (head + args).
@@ -2176,7 +2186,7 @@
     (cond (= hname "double") {:kind :double :cast-fn "jolt-double"}
           (= hname "long")   {:kind :long   :cast-fn "jolt-long-cast"}
           (= hname "int")    {:kind :long   :cast-fn "jolt-int-cast"}
-          (= hname "float")  {:kind :double :cast-fn "jolt-float"}
+          (= hname "float")  {:kind :float  :cast-fn "jolt-float"}
           ;; byte/short narrow to a RANGE, so their answer is a fixnum on every
           ;; tower jolt has (jolt-checked-cast returns a value inside [lo,hi] or
           ;; throws) — :long, the same kind `int` takes, and for the same reason.
@@ -2193,7 +2203,8 @@
           ;; the same reason a ^long param is admitted. Before this they were
           ;; ordinary var calls and left every loop counter they fed untyped.
           (= hname "unchecked-long") {:kind :long :cast-fn "jolt-unchecked-long"}
-          (= hname "unchecked-int")  {:kind :long :cast-fn "jolt-unchecked-int"})))
+          (= hname "unchecked-int")  {:kind :long :cast-fn "jolt-unchecked-int"}
+          (= hname "unchecked-float") {:kind :float :cast-fn "jolt-unchecked-float"})))
 
 ;; The compile-time hook over calls through a var (jolt.host/invoke-rewriter,
 ;; nil unless something bound jolt.host/*invoke-rewrite*): (f var-ns var-name
@@ -2597,6 +2608,9 @@
      ;; the tagged literal, rebuilt from the value's canonical string. Without this
      ;; an embedded 1M / #inst / #uuid value died as "unsupported form".
      (form-bigdec-value? form) {:op :bigdec :source (form-bigdec-value-source form)}
+     ;; a Float has no literal, so a live one embeds as the cast that makes it
+     (form-float-value? form)
+     (analyze ctx (list (symbol "clojure.core" "float") (form-float-value-double form)) env)
      (form-inst-value? form) {:op :inst :source (form-inst-value-source form)}
      (form-uuid-value? form) {:op :uuid :source (form-uuid-value-source form)}
      ;; a live namespace value spliced into a form (~*ns* in a macro) -> a
