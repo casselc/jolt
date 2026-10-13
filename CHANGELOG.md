@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Allocate monitor entry and Object.wait conditions only when used, under the
+  existing backing mutex before waiter publication. Uncontended synchronization
+  keeps the same ownership protocol without allocating unused wait conditions.
+  Source gates and performance qualification remain required for this candidate.
+
 - Compose the retained performance capabilities with Jolt 0.8.21. Guarded
   StringWriter lowering uses its synchronized primitives; the private JSON
   replacement seam preserves the new shared buffer, monitor and capacity.

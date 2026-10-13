@@ -1215,7 +1215,21 @@
 ;; so it gets its own record rather than the object's — but the hard part it needs
 ;; is exactly this (jolt-ga8o). One implementation, two locks.
 (define (make-monitor)
-  (vector (make-mutex) #f 0 (make-condition) '() #f (make-condition) '()))
+  (vector (make-mutex) #f 0 #f '() #f #f '()))
+
+;; Called only with this monitor's bk held. Install once before any waiter can
+;; publish itself or release bk; the identity is then stable for every wake.
+;; Entry contenders and Object.wait retain distinct condition variables.
+(define (monitor-condition-under-bk! m slot)
+  (or (vector-ref m slot)
+      (let ((cv (make-condition)))
+        (vector-set! m slot cv)
+        cv)))
+(define (monitor-broadcast-entry! m)
+  ;; No installed entry CV means no native thread has waited on it. Fiber
+  ;; wakeups still follow the separate fibers list, unchanged by this shortcut.
+  (let ((cv (vector-ref m monitor-i-cv)))
+    (when cv (condition-broadcast cv))))
 
 ;; --- the owner word -------------------------------------------------------------
 ;; A thin lock. An uncontended enter is CAS #f -> me and an uncontended exit is
@@ -1328,7 +1342,8 @@
           ;; ReentrantLock's acquire says WAITING instead (thread-enter-state)
           (call-with-thread-state (thread-enter-state)
             (lambda ()
-              (jolt-condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))))
+              (jolt-condition-wait (monitor-condition-under-bk! m monitor-i-cv)
+                                   (vector-ref m monitor-i-bk))))
           #f))))
 ;; What a thread waiting in monitor-wait! is: BLOCKED for a monitor (locking), and
 ;; WAITING for a ReentrantLock, which parks on the JVM rather than blocking.
@@ -1488,7 +1503,7 @@
                (let ((fs (vector-ref m monitor-i-fibers)))
                  (monitor-release-word! m)
                  (vector-set! m monitor-i-fibers '())
-                 (condition-broadcast (vector-ref m monitor-i-cv))
+                 (monitor-broadcast-entry! m)
                  fs)
                '()))))
     (for-each sa-fiber-resume wake)))
@@ -1630,6 +1645,9 @@
              (unless (monitor-owner? m me)
                (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
                                                 "current thread is not owner")))
+             ;; Allocate before joining the wait set or giving up ownership,
+             ;; under the same bk that every notifier holds.
+             (monitor-condition-under-bk! m monitor-i-wcv)
              ;; masked until the caller has recorded the count it must restore
              (jolt-locks-enter!)
              (let ((saved (vector-ref m monitor-i-count))
@@ -1639,7 +1657,7 @@
                (monitor-release-word! m)
                (vector-set! m monitor-i-count 0)
                (vector-set! m monitor-i-fibers '())
-               (condition-broadcast (vector-ref m monitor-i-cv))
+               (monitor-broadcast-entry! m)
                (cons saved fs)))))
     (for-each sa-fiber-resume (cdr r))
     (car r)))

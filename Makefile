@@ -197,6 +197,11 @@ CI-GATES += bytestreamsize smalldoubleprint plainhexformat finitestringrepeat st
 TEST-GATES := submodules selfhost ci
 CI-GATES += transientassoc
 CI-GATES += writernativeseam
+CI-GATES += monitorlazyconditions
+
+.PHONY: monitorlazyconditions
+monitorlazyconditions:
+	@$(CHEZ) --script test/chez/monitor-lazy-conditions-test.ss
 
 .PHONY: writernativeseam
 writernativeseam:
