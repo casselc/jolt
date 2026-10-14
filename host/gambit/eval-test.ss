@@ -198,6 +198,10 @@
 ;; once hit an unbound host fn and the def was dropped
 (check "(binding [clojure.pprint/*print-right-margin* 24] (with-out-str (clojure.pprint/with-pprint-dispatch clojure.pprint/code-dispatch (clojure.pprint/pprint '(defn f [x] (if (pos? x) (inc x) (dec x)))))))" "\"(defn \\n  f\\n  [x]\\n  (if\\n    (pos? x)\\n    (inc x)\\n    (dec x)))\\n\"")
 (check "(clojure.pprint/cl-format nil \"~,2f\" 3.14159)" "\"3.14\"")
+;; Shared finite-Repeat specialization must use the Gambit target's fixnum
+;; bound, not an unbound Chez-only spelling or a hard-coded native width.
+(check "[(apply str (repeat 0 \"-\")) (apply str (repeat 1 \"-\")) (apply str (repeat 3 \"-\")) (apply str (repeat 3 \"ab\"))]"
+       "[\"\" \"-\" \"---\" \"ababab\"]")
 (check "(with-out-str (clojure.pprint/print-table [{:a 1 :b 2}]))"
        "\"\\n| :a | :b |\\n|----+----|\\n|  1 |  2 |\\n\"")
 ;; java/class-model.ss (shared with Chez): the Class object's own methods and

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Supply Gambit's target-specific most-positive-fixnum spelling for shared
+  finite-Repeat string specialization. Restore print-table on Gambit; test the
+  target limit and ordinary finite repeats without changing the Chez encoder.
+
 - Update the materialization fixture to construct a real StringWriter and
   check the current cache/pending/indexed-buffer contract. Preserve ordered
   contents, non-flushing length, cached repeat reads and stable prior snapshots;

@@ -231,6 +231,12 @@
   (check "fxsll alias" (fxsll 1 4) 16)
   (check "fxsra alias" (fxsra 8 1) 4)
   (check "native fx+ still bound" (fx+ 1 2) 3)
+  (check "most-positive-fixnum matches target limit"
+         (most-positive-fixnum) (##greatest-fixnum))
+  (check "fixnum limit is a positive fixnum"
+         (and (fixnum? (most-positive-fixnum)) (> (most-positive-fixnum) 0)) #t)
+  (check "successor of fixnum limit is not a fixnum"
+         (fixnum? (+ (most-positive-fixnum) 1)) #f)
   ;; capability-unchecked: on this target each is the checked primitive
   (check "sa-ufx+" (sa-ufx+ 1 2) 3)
   (check "sa-ufx-" (sa-ufx- 5 2) 3)
