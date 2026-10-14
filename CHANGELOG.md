@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Update the materialization fixture to construct a real StringWriter and
+  check the current cache/pending/indexed-buffer contract. Preserve ordered
+  contents, non-flushing length, cached repeat reads and stable prior snapshots;
+  add indexed-read flush checks. No runtime or synchronization change.
+
 - Regenerate the Gambit records/protocol mirror after cumulative Chez protocol
   changes. Restore the generated-source drift gate; no handwritten runtime or
   persistence semantics change. Full hosted gates remain separate qualification.
