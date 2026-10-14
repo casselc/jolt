@@ -811,8 +811,9 @@ ioscaling: testbin
 # stock writer blocks avoid array copies, but live overrides retain dispatch.
 .PHONY: bytestreamsize
 .PHONY: byteinputview
-byteinputview:
+byteinputview: testbin
 	@$(CHEZ) --script test/chez/byte-array-input-view-test.ss
+	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:paths ["test"]}' -m byte-array-input-stream-view-test
 
 bytestreamsize: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:paths ["test"]}' -m byte-array-output-stream-size-test
