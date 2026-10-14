@@ -85,13 +85,18 @@
 (let ((e (emit-form "app" "(let [^Appendable out (identity (StringWriter.))] (.append out \"abcd\" 1 3))")))
   (ok "unproven Appendable lowering guards StringWriter" (contains? e "(string-writer? _ht$"))
   (ok "unproven Appendable lowering uses append-text" (contains? e "(append-text _ha$"))
+  (ok "unproven Appendable lowering locks the shared writer buffer" (contains? e "(sb-append*! _ht$"))
+  (ok "unproven Appendable lowering avoids the unlocked writer primitive"
+      (not (contains? e "(sb-append! _ht$")))
   (ok "unproven Appendable lowering uses native rest list" (contains? e "(list _ha$"))
   (ok "unproven Appendable lowering retains generic fallback" (contains? e "record-method-dispatch")))
 
 (set-emit-unit! (new-unit))
 (let ((e (emit-form "app" "(let [^Appendable out (identity (StringWriter.))] (.toString out))")))
   (ok "unproven StringWriter toString guards the concrete writer" (contains? e "(string-writer? _ht$"))
-  (ok "unproven StringWriter toString uses sb-str" (contains? e "(sb-str _ht$"))
+  (ok "unproven StringWriter toString locks the shared writer buffer" (contains? e "(sb-str* _ht$"))
+  (ok "unproven StringWriter toString avoids the unlocked writer primitive"
+      (not (contains? e "(sb-str _ht$")))
   (ok "unproven StringWriter toString retains generic fallback" (contains? e "record-method-dispatch")))
 
 (set-emit-unit! #f)

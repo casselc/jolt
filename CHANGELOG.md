@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Update the compilation-unit writer-emission fixture for guarded StringWriter
+  primitives. Require synchronized append/toString lowering, reject the old
+  unlocked spellings, and retain concrete-tag guards and generic fallback.
+  No compiler/runtime or synchronization behavior changes.
+
 - Supply Gambit's target-specific most-positive-fixnum spelling for shared
   finite-Repeat string specialization. Restore print-table on Gambit; test the
   target limit and ordinary finite repeats without changing the Chez encoder.
