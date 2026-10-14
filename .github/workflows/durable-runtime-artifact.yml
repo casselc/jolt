@@ -22,6 +22,7 @@ jobs:
     env:
       COMPILER_SOURCE: a77adbf116212ac036bc35f8537c85c053e485d1
       COMPILER_TREE: ac185a45ac8dfa7b7294dfd9af6d3d7120542e11
+      COMPILER_EXPECTED_VERSION: 'jolt v0.8.21-54-ga77adbf1'
       UPSTREAM_SOURCE: 5b46858a171f30949f5b09eb484bc6c5ff93c6ea
       UPSTREAM_TREE: a6e73f0343dae1cc8ae311612f2ecd9ca0a7b8c5
       CHEZ: /opt/chez/bin/chez
@@ -101,8 +102,7 @@ jobs:
       - name: Require selected version and native writer capabilities
         run: |
           set -euo pipefail
-          task_expected_version="jolt $(git describe --tags --always --dirty)"
-          test "$(target/release/jolt --version)" = "$task_expected_version"
+          test "$(target/release/jolt --version)" = "$COMPILER_EXPECTED_VERSION"
           timeout 30s target/release/jolt -Srepro -e '
             (let [out (java.io.ByteArrayOutputStream.)
                   writer (java.io.OutputStreamWriter. out "UTF-8")]
