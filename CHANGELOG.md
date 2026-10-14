@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Add an independently pinned Jolt0.8.21 cumulative runtime artifact profile
+  for local/S3 consumer qualification. Require full hosted CI, stock Chez10.4.1,
+  source/tree/upstream guards and native-writer capabilities before upload;
+  workflow source is separate from compiler source. No AWS permissions added.
+
 - Pin the measured runtime producer to `bcb376a0`, including removal of two
   unused private helpers exposed by the dead-host gate. Preserve all CI gates
   and require the matching source/tree/version/artifact identity.
