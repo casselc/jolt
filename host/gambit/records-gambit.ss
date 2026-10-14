@@ -2305,14 +2305,24 @@
        obj
        (value-host-tags obj)))))
 
-(define (make-protocol-method-site proto-name method-name)
+(define (make-protocol-method-site proto-name method-name .
+         boundary-hooks)
+  (unless (or (null? boundary-hooks)
+              (and (null? (cdr boundary-hooks))
+                   (procedure? (car boundary-hooks))))
+    (error 'make-protocol-method-site
+      "expected at most one boundary procedure"))
   (let ((proto (string-copy proto-name))
         (method (string-copy method-name))
         (cache #f)
-        (family-cache #f))
+        (family-cache #f)
+        (boundary (and (pair? boundary-hooks)
+                       (car boundary-hooks))))
     (lambda (obj)
       (if (or (jrec? obj) (jreify? obj))
-          (protocol-resolve proto method obj)
+          (begin
+            (when boundary (boundary))
+            (protocol-resolve proto method obj))
           (let* ((family (protocol-method-family obj))
                  (owner (if (and family (fx=? family 0))
                             protocol-string-tag-chain-owner
@@ -2335,108 +2345,112 @@
                      (eq? value-host-tags (vector-ref family-snapshot 2))
                      (eq? domains (vector-ref family-snapshot 3)))
                 (vector-ref family-snapshot 4)
-                (let* ((ge jch-graph-epoch)
-                       (pe-before jolt-proto-epoch)
-                       (tag-chain value-host-tags)
-                       (tags (tag-chain obj))
-                       (snapshot cache))
-                  (memory-order-acquire)
-                  (let* ((hit (and snapshot
-                                   (fx= ge jch-graph-epoch)
-                                   (fx= ge (vector-ref snapshot 1))
-                                   (fx= jolt-proto-epoch
-                                        (vector-ref snapshot 0))
-                                   (assq tags (vector-ref snapshot 2))))
-                         (f (if hit
-                                (cdr hit)
-                                (let* ((owned? (and (fx= ge
-                                                         jch-graph-epoch)
-                                                    (graph-owned-tags?
-                                                      tags)))
-                                       (f (jolt-with-mutex
-                                            rec-tbl-mu
-                                            (let* ((pe jolt-proto-epoch)
-                                                   (f (let loop ((ts tags))
-                                                        (cond
-                                                          ((null? ts) #f)
-                                                          ((find-protocol-method
-                                                             (car ts)
-                                                             proto
-                                                             method))
-                                                          (else
-                                                           (loop
-                                                             (cdr ts)))))))
-                                              (when (and f
-                                                         owned?
-                                                         (fx= ge
-                                                              jch-graph-epoch)
-                                                         (fx= pe
-                                                              jolt-proto-epoch))
-                                                (let* ((current cache)
-                                                       (entries (if (and current
-                                                                         (fx= pe
-                                                                              (vector-ref
-                                                                                current
-                                                                                0))
-                                                                         (fx= ge
-                                                                              (vector-ref
-                                                                                current
-                                                                                1)))
-                                                                    (vector-ref
-                                                                      current
-                                                                      2)
-                                                                    '())))
-                                                  (unless (assq
-                                                            tags
-                                                            entries)
-                                                    (let ((next (vector
-                                                                  pe
-                                                                  ge
-                                                                  (cons
+                (begin
+                  (when boundary (boundary))
+                  (let* ((ge jch-graph-epoch)
+                         (pe-before jolt-proto-epoch)
+                         (tag-chain value-host-tags)
+                         (tags (tag-chain obj))
+                         (snapshot cache))
+                    (memory-order-acquire)
+                    (let* ((hit (and snapshot
+                                     (fx= ge jch-graph-epoch)
+                                     (fx= ge (vector-ref snapshot 1))
+                                     (fx= jolt-proto-epoch
+                                          (vector-ref snapshot 0))
+                                     (assq tags (vector-ref snapshot 2))))
+                           (f (if hit
+                                  (cdr hit)
+                                  (let* ((owned? (and (fx= ge
+                                                           jch-graph-epoch)
+                                                      (graph-owned-tags?
+                                                        tags)))
+                                         (f (jolt-with-mutex
+                                              rec-tbl-mu
+                                              (let* ((pe jolt-proto-epoch)
+                                                     (f (let loop ((ts tags))
+                                                          (cond
+                                                            ((null? ts) #f)
+                                                            ((find-protocol-method
+                                                               (car ts)
+                                                               proto
+                                                               method))
+                                                            (else
+                                                             (loop
+                                                               (cdr ts)))))))
+                                                (when (and f
+                                                           owned?
+                                                           (fx= ge
+                                                                jch-graph-epoch)
+                                                           (fx= pe
+                                                                jolt-proto-epoch))
+                                                  (let* ((current cache)
+                                                         (entries (if (and current
+                                                                           (fx= pe
+                                                                                (vector-ref
+                                                                                  current
+                                                                                  0))
+                                                                           (fx= ge
+                                                                                (vector-ref
+                                                                                  current
+                                                                                  1)))
+                                                                      (vector-ref
+                                                                        current
+                                                                        2)
+                                                                      '())))
+                                                    (unless (assq
+                                                              tags
+                                                              entries)
+                                                      (let ((next (vector
+                                                                    pe
+                                                                    ge
                                                                     (cons
-                                                                      tags
-                                                                      f)
-                                                                    (if (< (length
-                                                                             entries)
-                                                                           8)
-                                                                        entries
-                                                                        (let take ((es entries)
-                                                                                   (n 7))
-                                                                          (if (zero?
-                                                                                n)
-                                                                              '()
-                                                                              (cons
-                                                                                (car es)
-                                                                                (take
-                                                                                  (cdr es)
-                                                                                  (- n
-                                                                                     1))))))))))
-                                                      (memory-order-release)
-                                                      (set! cache next)))))
-                                              f))))
-                                  f))))
-                    (when (and f
-                               domains
-                               (fx= pe-before jolt-proto-epoch)
-                               (fx= ge jch-graph-epoch)
-                               (eq? tag-chain value-host-tags)
-                               (eq? tag-chain
-                                    (if (fx=? family 0)
-                                        protocol-string-tag-chain-owner
-                                        protocol-primitive-tag-chain-owner))
-                               (eq? domains (domain-proof)))
-                      (let* ((current family-cache)
-                             (_ (when current (memory-order-acquire)))
-                             (next (if current
-                                       (vector-copy current)
-                                       (make-vector 10 #f))))
-                        (vector-set!
-                          next
-                          family
-                          (vector pe-before ge tag-chain domains f))
-                        (memory-order-release)
-                        (set! family-cache next)))
-                    (or f (protocol-miss-throw proto method obj))))))))))
+                                                                      (cons
+                                                                        tags
+                                                                        f)
+                                                                      (if (< (length
+                                                                               entries)
+                                                                             8)
+                                                                          entries
+                                                                          (let take ((es entries)
+                                                                                     (n 7))
+                                                                            (if (zero?
+                                                                                  n)
+                                                                                '()
+                                                                                (cons
+                                                                                  (car es)
+                                                                                  (take
+                                                                                    (cdr es)
+                                                                                    (- n
+                                                                                       1))))))))))
+                                                        (memory-order-release)
+                                                        (set! cache
+                                                          next)))))
+                                                f))))
+                                    f))))
+                      (when (and f
+                                 domains
+                                 (fx= pe-before jolt-proto-epoch)
+                                 (fx= ge jch-graph-epoch)
+                                 (eq? tag-chain value-host-tags)
+                                 (eq? tag-chain
+                                      (if (fx=? family 0)
+                                          protocol-string-tag-chain-owner
+                                          protocol-primitive-tag-chain-owner))
+                                 (eq? domains (domain-proof)))
+                        (let* ((current family-cache)
+                               (_ (when current (memory-order-acquire)))
+                               (next (if current
+                                         (vector-copy current)
+                                         (make-vector 10 #f))))
+                          (vector-set!
+                            next
+                            family
+                            (vector pe-before ge tag-chain domains f))
+                          (memory-order-release)
+                          (set! family-cache next)))
+                      (or f
+                          (protocol-miss-throw proto method obj)))))))))))
 
 (define (protocol-dispatch1 proto-name method-name obj)
   ((protocol-resolve proto-name method-name obj) obj))

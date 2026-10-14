@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Regenerate the Gambit records/protocol mirror after cumulative Chez protocol
+  changes. Restore the generated-source drift gate; no handwritten runtime or
+  persistence semantics change. Full hosted gates remain separate qualification.
+
 - Delay a monitor's backing mutex until a slow path or query needs it. Publish
   once with CAS and return only the installed winner; retry spurious failures
   with the same candidate. Ownership and condition wake protocols are unchanged.
