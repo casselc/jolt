@@ -202,6 +202,19 @@
 ;; bound, not an unbound Chez-only spelling or a hard-coded native width.
 (check "[(apply str (repeat 0 \"-\")) (apply str (repeat 1 \"-\")) (apply str (repeat 3 \"-\")) (apply str (repeat 3 \"ab\"))]"
        "[\"\" \"-\" \"---\" \"ababab\"]")
+;; Exercise rejection without realizing a huge Repeat or allocating its output.
+(for-each
+ (lambda (entry)
+   (let ((declined (guard (e (#t #f))
+                     (not (apply-str-finite-repeat
+                            (jolt-repeat (car entry) (cadr entry)))))))
+     (if declined
+         (printf "  ok     finite-repeat overflow guard ~s\n" entry)
+         (begin (printf "  FAIL   finite-repeat overflow guard ~s\n" entry)
+                (set! failures (+ failures 1))))))
+ (list (list (+ (most-positive-fixnum) 1) "a")
+       (list (most-positive-fixnum) "ab")
+       (list (+ (quotient (most-positive-fixnum) 2) 1) "ab")))
 (check "(with-out-str (clojure.pprint/print-table [{:a 1 :b 2}]))"
        "\"\\n| :a | :b |\\n|----+----|\\n|  1 |  2 |\\n\"")
 ;; java/class-model.ss (shared with Chez): the Class object's own methods and

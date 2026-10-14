@@ -347,9 +347,9 @@
 (define (fxmax . xs) (apply max xs))
 (define (fxmin . xs) (apply min xs))
 (define (fxquotient a b) (quotient a b))
-(define (most-positive-fixnum) (##greatest-fixnum))
 ;; The shared finite-Repeat string fast path bounds arithmetic using Chez's
 ;; spelling. Ask Gambit for this target's limit: native and JS widths differ.
+(define (most-positive-fixnum) (##greatest-fixnum))
 (define (fxmodulo a b) (modulo a b))
 (define (fxbit-count x) (bit-count x))
 (define (fxxor . xs) (apply bitwise-xor xs))
