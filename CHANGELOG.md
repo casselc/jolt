@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Zeroed native allocations use bounded managed scratch on Chez.** A private
   64 KiB zero template replaces a temporary bytevector as large as the requested
   allocation. Native blocks remain independently owned and fully zeroed.
+  Public-wrapper regression checks cover byte write overloads, rejected ranges,
+  mutation isolation, and manual/arena-owned allocations across that boundary.
 
 ## [0.8.22] - 2026-10-15
 
