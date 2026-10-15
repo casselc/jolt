@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entire byte-backed byte array copies directly to native memory. Ranges and
   legacy backings retain their prior path; bounds, returned counts and ownership
   are unchanged. The synchronous native copy still occurs; no pointer is loaned.
+- **Zeroed native allocations use bounded managed scratch on Chez.** A private
+  64 KiB zero template replaces a temporary bytevector as large as the requested
+  allocation. Native blocks remain independently owned and fully zeroed.
 
 ## [0.8.22] - 2026-10-15
 
