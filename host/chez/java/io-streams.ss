@@ -49,6 +49,12 @@
 ;; Two optional slots follow, each #f or absent on an ordinary stream: slot 3 is
 ;; a piped stream's shared pipe (piped-cell, below), slot 4 a
 ;; PushbackInputStream's pushback state (in-stream-pushback, below).
+;; Slot 5 is reserved for zip-in-streams.ss's zin record. Slot 6, when present,
+;; is a ByteArrayInputStream's exclusive source end.
+;; Keep the same tag/port shape so Reader and stream adapters still dispatch.
+(define (in-stream-byte-array-end self)
+  (let ((st (jhost-state self)))
+    (and (fx>? (vector-length st) 6) (vector-ref st 6))))
 
 ;; The port behind a stream, or the JVM's IOException when it has been closed.
 ;; Reading a closed Chez port raises a classless host error instead, which no
@@ -133,6 +139,8 @@
   (let ((port (in-stream-live-port self))
         (p (piped-pipe self)))
     (cond
+      ((in-stream-byte-array-end self)
+       => (lambda (end) (- end (port-position port))))
       ;; a pushback stream: what its port holds — the pushed-back bytes and any
       ;; block already pulled from the wrapped stream — plus the wrapped
       ;; stream's own count, asked through ITS available (a proxy's included)
@@ -206,8 +214,16 @@
                             (begin (ja-bv->bytes! tmp 0 buf off n) (->num n)))))))))))
    (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-live-port self))))
                                          (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
-   (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-live-port self) (jnum->exact n))))
-                                   (->num (if (eof-object? bv) 0 (bytevector-length bv))))))
+   (cons "skip" (lambda (self n)
+                  (let* ((port (in-stream-live-port self))
+                         (end (in-stream-byte-array-end self)))
+                    (if end
+                        (let* ((pos (port-position port))
+                               (count (max 0 (min (jnum->exact n) (- end pos)))))
+                          (set-port-position! port (+ pos count))
+                          (->num count))
+                        (let ((bv (get-bytevector-n port (jnum->exact n))))
+                          (->num (if (eof-object? bv) 0 (bytevector-length bv))))))))
    (cons "available" (lambda (self) (->num (in-stream-available self))))
    ;; PushbackInputStream.unread — see the pushback section below. Any other
    ;; stream has no such method, and says so the way every missing method does.
@@ -219,8 +235,9 @@
    ;; read after close has to raise the JVM's IOException, and a closed Chez port
    ;; raises a classless host error before the port's own reader is consulted.
    (cons "close" (lambda (self)
-                   (let ((p (piped-pipe self)))
-                     (if p (pipe-close-read! p) (close-port (in-stream-port self))))
+                   (unless (in-stream-byte-array-end self)
+                     (let ((p (piped-pipe self)))
+                       (if p (pipe-close-read! p) (close-port (in-stream-port self)))))
                    jolt-nil))
    (cons "connect" (lambda (self other) (pipe-connect! self other) jolt-nil))
    ;; readNBytes(len) reads UP TO len bytes and answers what it got — unlike
@@ -1039,11 +1056,6 @@
 ;; --- constructors -----------------------------------------------------------
 (define utf8-tx (make-transcoder (utf-8-codec)))
 (define (path-of x) (project-relative (file-path-of x)))
-(define (src-bytevector x)   ; a byte[] or Chez bytevector -> bytevector
-  (cond ((bytevector? x) x)
-        ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) (na-bytearray->bv x))
-        (else (throw-jvm (quote ClassCastException) "expected a byte array"))))
-
 (define (reg-ctor! names ctor) (for-each (lambda (n) (register-class-ctor! n ctor)) names))
 
 ;; Every file-opening constructor here opens through this, so a failure arrives
@@ -1081,12 +1093,36 @@
                              (buffer-mode block))))))))
 (reg-ctor! '("ByteArrayInputStream" "java.io.ByteArrayInputStream")
   (lambda (bytes . rest)
-    (let ((bv (src-bytevector bytes)))
-      (make-in-stream-markable (open-bytevector-input-port
-                       (if (>= (length rest) 2)
-                           (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
-                             (let ((sub (make-bytevector len))) (bytevector-copy! bv off sub 0 len) sub))
-                           bv))))))
+    ;; Java retains the caller array, not a snapshot. Retain the array itself
+    ;; rather than its current backing, so boxed/backing replacement stays live.
+    ;; Never change na-bytearray->bv's global snapshot contract.
+    (unless (or (bytevector? bytes)
+                (and (jolt-array? bytes) (eq? (jolt-array-kind bytes) 'byte)))
+      (throw-jvm (quote ClassCastException) "expected a byte array"))
+    (let* ((size (if (bytevector? bytes) (bytevector-length bytes) (ja-len bytes)))
+           (offset (if (>= (length rest) 2) (jnum->exact (car rest)) 0))
+           (end (if (>= (length rest) 2)
+                    (min size (+ offset (jnum->exact (cadr rest)))) size))
+           (position offset)
+           ;; One-byte buffering preserves mutation visibility after scalar reads;
+           ;; get-bytevector-some! still gives the callback the full bulk range.
+           (port (parameterize ((custom-port-buffer-size 1))
+                   (make-custom-binary-input-port
+                     "byte-array-input"
+                     (lambda (destination start count)
+                       (let ((n (max 0 (min count (- end position)))))
+                         (when (> n 0)
+                           (when (< position 0)
+                             (throw-jvm (quote ArrayIndexOutOfBoundsException) "negative source offset"))
+                           (if (bytevector? bytes)
+                               (bytevector-copy! bytes position destination start n)
+                               (ja-bytes->bv! bytes position destination start n))
+                           (set! position (+ position n)))
+                         n))
+                     (lambda () position)
+                     (lambda (next) (set! position next))
+                     (lambda () (void))))))
+      (make-jhost "in-stream" (vector port #t offset #f #f #f end)))))
 ;; --- java.io.PrintStream ------------------------------------------------------
 ;; A byte stream that renders values as text. state #(target autoflush): the target
 ;; is anything answering write/flush — an out-stream, a port-writer, or a PROXY

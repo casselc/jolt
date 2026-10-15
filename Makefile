@@ -193,7 +193,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety cas flow
-CI-GATES += bytestreamsize smalldoubleprint plainhexformat finitestringrepeat strrenderorder callbackbridges callbackdomains protocolsite durablewalnative mapseqfold regexstatic
+CI-GATES += byteinputview bytestreamsize smalldoubleprint plainhexformat finitestringrepeat strrenderorder callbackbridges callbackdomains protocolsite durablewalnative mapseqfold regexstatic
 TEST-GATES := submodules selfhost ci
 CI-GATES += transientassoc
 CI-GATES += writernativeseam
@@ -810,6 +810,11 @@ ioscaling: testbin
 # Mechanism controls: size must not extract/concatenate a growing byte stream;
 # stock writer blocks avoid array copies, but live overrides retain dispatch.
 .PHONY: bytestreamsize
+.PHONY: byteinputview
+byteinputview: testbin
+	@$(CHEZ) --script test/chez/byte-array-input-view-test.ss
+	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:paths ["test"]}' -m byte-array-input-stream-view-test
+
 bytestreamsize: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:paths ["test"]}' -m byte-array-output-stream-size-test
 

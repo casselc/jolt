@@ -19,7 +19,7 @@ fails=0
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-jolt="bin/jolt"
+jolt="${JOLT_BIN:-bin/jolt}"
 
 # run <expr> [stdin-text]: evaluate and print the LAST line of stdout.
 run() {
@@ -231,8 +231,8 @@ r9_big=""
 while [ "${#r9_big}" -lt 8000 ]; do r9_big="${r9_big}${n4_long}"; done
 check r9 "$(run '(loop [total 0 tries 0] (let [n (.available System/in)] (cond (> n 4096) (println "OK") (>= (+ total n) 8000) (println "OK") (> tries 400) (println (str "STUCK avail " n " total " total)) (pos? n) (let [b (byte-array n)] (.read System/in b 0 n) (recur (+ total n) (inc tries))) :else (do (Thread/sleep 5) (recur total (inc tries))))))' "$r9_big")" "OK"
 
-# a closed stream raises the JVM IOException rather than a classless host error
-check r7 "$(run '(let [b (java.io.ByteArrayInputStream. (.getBytes "hi"))] (.close b) (println (try (.available b) (catch java.io.IOException e (.getMessage e)))))')" "Stream closed"
+# ByteArrayInputStream.close is a no-op on Java; closed files are checked below.
+check r7 "$(run '(let [b (java.io.ByteArrayInputStream. (.getBytes "hi"))] (.close b) (println (.available b)))')" "2"
 check r8 "$(run '(let [o (java.io.PipedOutputStream.) i (java.io.PipedInputStream. o)] (.close i) (println (try (.available i) (catch java.io.IOException e (.getMessage e)))))')" "Pipe closed"
 
 # --- (s) PushbackInputStream over the process stream -------------------------
@@ -332,6 +332,12 @@ check "reader on a directory" \
 # carrying Chez's own wording -- uncatchable as the class the JVM raises and the
 # class a library branches on (jolt-3ah).
 printf 'content\n' > "$rd_dir/read.txt"
+check "closed file rejects available" \
+    "$(run "(let [in (java.io.FileInputStream. \"$rd_dir/read.txt\")] (.close in) (println (try (.available in) (catch java.io.IOException e (.getMessage e)))))")" \
+    "Stream closed"
+check "closed file rejects read" \
+    "$(run "(let [in (java.io.FileInputStream. \"$rd_dir/read.txt\")] (.close in) (println (try (.read in) (catch java.io.IOException e (.getMessage e)))))")" \
+    "Stream closed"
 check "slurp missing path" \
   "$(run "(println (try (slurp \"$rd_dir/nope.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
   "$rd_dir/nope.txt (No such file or directory)"

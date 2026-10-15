@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Keep ByteArrayInputStream as a bounded live view of its caller's byte array,
+  without copying the full source or slice during construction. Preserve reads
+  after close, source mutation visibility, offset-based marks, and clamped slice
+  lengths; skip advances the cursor without allocating skipped bytes.
+
 - Update the compilation-unit writer-emission fixture for guarded StringWriter
   primitives. Require synchronized append/toString lowering, reject the old
   unlocked spellings, and retain concrete-tag guards and generic fallback.
