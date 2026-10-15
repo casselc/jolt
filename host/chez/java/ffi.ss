@@ -858,9 +858,17 @@
                                    (jolt-hash-map (jolt-keyword "offset") off
                                                   (jolt-keyword "length") n
                                                   (jolt-keyword "capacity") cap))))
-       (let ((bv (make-bytevector n)))
-         (ja-bytes->bv! arr off bv 0 n)
-         (sa-foreign-bytes-set! p bv n))
+       (let ((backing (jolt-array-vec arr)))
+         (if (and (eq? (jolt-array-kind arr) 'byte)
+                  (bytevector? backing) (= off 0) (= n cap))
+             ;; The adapter synchronously copies through an ordinary (not
+             ;; __collect_safe) u8* call. Chez retains the managed source for
+             ;; that call; no source pointer escapes. Slices, other array kinds
+             ;; and legacy boxed backings keep their existing staging path.
+             (sa-foreign-bytes-set! p backing n)
+             (let ((bv (make-bytevector n)))
+               (ja-bytes->bv! arr off bv 0 n)
+               (sa-foreign-bytes-set! p bv n))))
        n))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-into!" ffi-read-into!)

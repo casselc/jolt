@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Whole byte-array FFI writes avoid a staging copy on Chez.** A write of an
+  entire byte-backed byte array copies directly to native memory. Ranges and
+  legacy backings retain their prior path; bounds, returned counts and ownership
+  are unchanged. The synchronous native copy still occurs; no pointer is loaned.
+
 ## [0.8.22] - 2026-10-15
 
 Regular expressions follow java.util.regex where they parted ways: a loop over
