@@ -675,6 +675,16 @@
 ;; that the two carriers agree on representation; the copy stays because the
 ;; caller's bytevector is usually a buffer it goes on writing into.
 (define (na-bv->bytearray bv) (make-jolt-array (na-bytes-copy bv) 'byte))
+;; INTERNAL ownership transfer: the producer supplies fresh exclusive storage
+;; and relinquishes all mutable aliases. Borrowed buffers/public constructors
+;; must keep copying through the existing seam above.
+(define (na-owned-bv->bytearray bv)
+  (let ((a (make-jolt-array bv 'byte)))
+    ;; Keep the stock large-array no-relocation guarantee without another copy;
+    ;; the owner-lifetime pin releases backing storage after owner death.
+    (when (fx>=? (bytevector-length bv) na-large-bytes)
+      (na-pin-large! a bv))
+    a))
 ;; (byte-array n [init]) | (byte-array coll). Also coerces the host's OTHER byte
 ;; carrier — a Chez bytevector (what the charset encoders produce) — and a string's
 ;; UTF-8 bytes, so bytevector and byte-array interconvert across interop seams.

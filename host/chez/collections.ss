@@ -1319,6 +1319,31 @@
             (if (sa-ufx>=? i n) acc
                 (loop (sa-ufx+ i 2) (proc (sa-uvector-ref root i) (sa-uvector-ref root (sa-ufx+ i 1)) acc))))))))
 
+;; Internal persistent-map fold in exactly the current seq order. Unlike
+;; pmap-fold-fwd's node-fold, visit child slots ascending and collision buckets
+;; backward, matching the current hamt-chunk-seq walk. Callback effects occur
+;; in that order; no entry sequence/vector/pairs are created.
+;; This helper is not reduced-aware. Collision buckets use linear stack space.
+(define (pmap-fold-seq-order m proc acc)
+  (let ((root (pmap-root m)))
+    (if (not (hnode? root))
+        (pmap-fold-fwd m proc acc)
+        (let walk ((node root) (acc acc))
+          (let ((arr (hnode-arr node)))
+            (let loop ((i 0) (acc acc))
+              (if (fx=? i (vector-length arr)) acc
+                  (let* ((child (vector-ref arr i))
+                         (next
+                           (cond
+                             ((hnode? child) (walk child acc))
+                             ((hcoll? child)
+                              (let backward ((al (hcoll-alist child)))
+                                (if (null? al) acc
+                                    (let ((next (backward (cdr al))))
+                                      (proc (caar al) (cdar al) next)))))
+                             (else (proc (car child) (cdr child) acc)))))
+                    (loop (fx+ i 1) next)))))))))
+
 ;; --- constructors -------------------------------------------------------------
 ;; map LITERAL ctor ({...}): RT.map/canBePAM — array map up to 8 entries, up to
 ;; 64 when every entry PAST the eighth is keyword-keyed (the first 8 slots may

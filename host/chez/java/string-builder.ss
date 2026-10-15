@@ -176,6 +176,21 @@
 (define (sb-char-at* self i)
   (if (vector-ref (jhost-state self) 4) (sb-guarded (st self) (%sb-char-at st i)) (sb-char-at self i)))
 
+;; Runtime-owned text replacement without exposing mutable backing. Preserve
+;; capacity, owner and the shared StringWriter/StringBuffer monitor identity.
+(define (sb-set! self text)
+  (define (replace! st)
+    (let ((n (string-length text)))
+      (%sb-grow-cap! st n)
+      (vector-set! st 0 "")
+      (vector-set! st 1 n)
+      (vector-set! st 3 text)
+      (vector-set! st 5 (if (fx=? n 0) '() (list text)))
+      (vector-set! st 6 0)))
+  (if (vector-ref (jhost-state self) 4)
+      (sb-guarded (st self) (replace! st))
+      (replace! (jhost-state self))))
+
 (define (render-piece x)
   (cond ((jolt-nil? x) "null") ((char? x) (string x)) ((string? x) x)
         (else (jolt-str-render-one x))))

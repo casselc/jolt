@@ -428,6 +428,7 @@ corpus:
 # Host-specific unit cases.
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
+	@$(CHEZ) --script test/chez/string-writer-replacement-test.ss
 
 # The jolt half of the known-divergences :documented gate: every entry's :check
 # must render exactly its recorded :jolt value, its :jvm and :jolt must differ,
@@ -1139,12 +1140,14 @@ staticsite:
 # is a lazy chunked walk of its trie (test/chez/arraymap-test.ss).
 arraymap:
 	@$(CHEZ) --script test/chez/arraymap-test.ss
+	@$(CHEZ) --script test/chez/map-seq-fold-test.ss
 
 # Array backings: which Chez vector type each element kind stores its elements
 # in (fxvector / bytevector / flvector / boxed vector), the fixnum-range
 # widening, and that a boxed array of a typed kind still behaves.
 arraybacking:
 	@$(CHEZ) --script test/chez/array-backing-test.ss
+	@$(CHEZ) --script test/chez/owned-byte-adoption-test.ss
 
 # A large byte array (64KB up) is one the collector marks in place, never copies:
 # Chez pins a huge allocation only when it takes fresh segments, and an unpinned

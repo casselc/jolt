@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel-barrier control detects premature body-only settlement without
   increasing timeouts or weakening the terminal-state assertions.
 
+### Added
+
+- **Internal library-support primitives on Chez.** A persistent-map fold
+  follows the actual sequence's callback order without materializing entries;
+  fresh exclusive bytevector results can be adopted using stock owner-lifetime
+  pinning; text replacement preserves a writer/buffer's shared synchronization
+  and storage identity. Public constructors still copy caller-owned buffers.
+  These are internal runtime seams, not new portable Clojure APIs or encoders.
+
 ## [0.8.22] - 2026-10-15
 
 Regular expressions follow java.util.regex where they parted ways: a loop over
