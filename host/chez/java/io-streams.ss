@@ -1056,11 +1056,6 @@
 ;; --- constructors -----------------------------------------------------------
 (define utf8-tx (make-transcoder (utf-8-codec)))
 (define (path-of x) (project-relative (file-path-of x)))
-(define (src-bytevector x)   ; a byte[] or Chez bytevector -> bytevector
-  (cond ((bytevector? x) x)
-        ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) (na-bytearray->bv x))
-        (else (throw-jvm (quote ClassCastException) "expected a byte array"))))
-
 (define (reg-ctor! names ctor) (for-each (lambda (n) (register-class-ctor! n ctor)) names))
 
 ;; Every file-opening constructor here opens through this, so a failure arrives
@@ -1100,7 +1095,7 @@
   (lambda (bytes . rest)
     ;; Java retains the caller array, not a snapshot. Retain the array itself
     ;; rather than its current backing, so boxed/backing replacement stays live.
-    ;; Never change src-bytevector/na-bytearray->bv's global snapshot contract.
+    ;; Never change na-bytearray->bv's global snapshot contract.
     (unless (or (bytevector? bytes)
                 (and (jolt-array? bytes) (eq? (jolt-array-kind bytes) 'byte)))
       (throw-jvm (quote ClassCastException) "expected a byte array"))
