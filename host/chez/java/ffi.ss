@@ -712,7 +712,9 @@
 ;; that reproduces only under load. A private read-only zero template avoids
 ;; creating a managed bytevector as large as every requested native block.
 ;; The adapter copies synchronously; no caller receives an alias to the template.
-(define ffi-zero-block (make-bytevector 65536 0))
+;; Use the adapter's zero-filled immobile backing, as other >=64 KiB byte
+;; arrays do, so a process-lifetime template is not recopied by full collections.
+(define ffi-zero-block (sa-make-large-bytevector 65536))
 (define (ffi-calloc nbytes)
   (let* ((n (jnum->exact nbytes)) (p (sa-foreign-alloc n)))
     (let loop ((offset 0))

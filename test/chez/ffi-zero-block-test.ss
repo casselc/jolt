@@ -7,6 +7,17 @@
 (define (ok name value)
   (set! total (+ total 1))
   (unless value (set! fails (+ fails 1)) (printf "FAIL: ~a~n" name)))
+;; Like other long-lived large byte backings, this shared template should not
+;; be recopied by a full collection. Compare addresses, not GC timing; a fresh
+;; ordinary bytevector is the moving control for the same collection.
+(let* ((control (make-bytevector 65536 0))
+       (control-address (#%$fxaddress control))
+       (template-address (#%$fxaddress ffi-zero-block)))
+  (collect (collect-maximum-generation))
+  (ok "control: ordinary template-sized bytevector moves"
+      (not (= control-address (#%$fxaddress control))))
+  (ok "shared zero template does not move in a full collection"
+      (= template-address (#%$fxaddress ffi-zero-block))))
 (define source-seen #f)
 (define (check n)
   (let* ((base (sa-foreign-alloc (+ n 2))) (p (+ base 1))
