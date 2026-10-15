@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Public-wrapper regression checks cover byte write overloads, rejected ranges,
   mutation isolation, and manual/arena-owned allocations across that boundary.
 
+### Fixed
+
+- **Fiber-preemption test completion witnesses.** Wait for the body's marker
+  and the runtime's terminal state together before checking completion. A
+  channel-barrier control detects premature body-only settlement without
+  increasing timeouts or weakening the terminal-state assertions.
+
 ## [0.8.22] - 2026-10-15
 
 Regular expressions follow java.util.regex where they parted ways: a loop over

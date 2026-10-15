@@ -37,6 +37,11 @@
              #f)
             (else (sleep (make-time 'time-duration 2000000 0)) (loop))))))
 
+;; A marker written by the body precedes the runtime's terminal transition.
+;; Keep both witnesses in the wait, not just the assertion that follows it.
+(define (body-and-fiber-done? body-done fiber)
+  (and (unbox body-done) (eq? 'done (jolt-fiber-state fiber))))
+
 (printf "== fiber preemption ==\n")
 
 ;; --- 1. off by default ------------------------------------------------------
@@ -483,7 +488,7 @@
 (ok "11b. an interrupt for a parked fiber does not resume it"
     (eq? 'parked (jolt-fiber-state rp-a2)))
 (set-box! rp-stop2 #t)
-(wait-until (lambda () (unbox rp-c-done)) 5.0 "11b. the running fiber is not abandoned")
+(wait-until (lambda () (body-and-fiber-done? rp-c-done rp-c)) 5.0 "11b. the running fiber is not abandoned")
 (ok "11b. the fiber that owned the carrier still finished"
     (and (unbox rp-c-done) (eq? 'done (jolt-fiber-state rp-c))))
 ;; and the interrupt is not lost — the resume re-takes BOTH halves of the borrow,
@@ -496,7 +501,7 @@
 
 ;; A's own borrow still ends properly once it is fed.
 (jolt-async-give rp-ch 1)
-(wait-until (lambda () (unbox rp-returned)) 5.0 "11b. A returns from the borrow")
+(wait-until (lambda () (body-and-fiber-done? rp-returned rp-a)) 5.0 "11b. A returns from the borrow")
 (ok "11b. the parked borrower returned normally"
     (and (unbox rp-returned) (eq? 'done (jolt-fiber-state rp-a))))
 
@@ -728,6 +733,27 @@
 ;; leaves the timer disarmed.
 (define rb-off (jolt-run-interruptible (jolt-make-interrupt) (lambda () (rb-spin 1000) 'off)))
 (ok "14. off a fiber the borrow is unchanged" (eq? 'off rb-off))
+
+;; A controlled real-fiber gap between the body's marker and terminal state.
+;; The barrier widens that exact ordering window without a timing sleep; a
+;; body-only completion predicate must be rejected while the fiber is parked.
+(define cw-body-done (box #f))
+(define cw-release (ac-make 1 'fixed #f))
+(define cw-fiber
+  (sa-fiber-spawn
+   (lambda ()
+     (set-box! cw-body-done #t)
+     (jolt-fiber-<! cw-release))))
+(jolt-fiber-ensure-carrier!)
+(wait-until (lambda () (eq? 'parked (jolt-fiber-state cw-fiber))) 5.0
+            "15. controlled fiber parks after marking its body")
+(ok "15. body marker is visible before terminal state" (unbox cw-body-done))
+(ok "15. body-only marker cannot settle a fiber"
+    (not (body-and-fiber-done? cw-body-done cw-fiber)))
+(jolt-async-give cw-release 1)
+(wait-until (lambda () (body-and-fiber-done? cw-body-done cw-fiber)) 5.0
+            "15. released fiber reaches stable completion")
+(ok "15. released fiber is terminal" (eq? 'done (jolt-fiber-state cw-fiber)))
 
 (jolt-fiber-preempt-ticks-set! #f)
 (jolt-fiber-pool-reset!)
