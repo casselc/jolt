@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Avoid constructing a transient buffer for single-collection `mapv` over nil
+  or an empty builtin vector. Keep custom source reduction, lazy realization,
+  metadata behavior and nonempty/multiple-input paths unchanged.
+
 ## [0.8.22] - 2026-10-15
 
 Regular expressions follow java.util.regex where they parted ways: a loop over

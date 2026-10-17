@@ -61,7 +61,12 @@
 ;; 1317 µs / 4.6 MB over 26k — the lazy map's cells and the seq->list copy are
 ;; what the old body paid for. The transient gate pins the per-element bytes.
 (defn mapv
-  ([f coll] (persistent! (reduce (fn [v o] (conj! v (f o))) (transient []) coll)))
+  ([f coll]
+   ;; Only builtin vectors and nil: a custom reducer can produce values even
+   ;; when its seq is empty, so do not use an arbitrary empty? shortcut here.
+   (if (or (nil? coll) (and (vector? coll) (zero? (count coll))))
+     []
+     (persistent! (reduce (fn [v o] (conj! v (f o))) (transient []) coll))))
   ([f c1 c2] (into [] (map f c1 c2)))
   ([f c1 c2 c3] (into [] (map f c1 c2 c3)))
   ([f c1 c2 c3 & colls] (into [] (apply map f c1 c2 c3 colls))))
