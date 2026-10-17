@@ -183,7 +183,7 @@ install: build
 CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient sortedcoll rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
-  hasheq narrowhash \
+  hasheq narrowhash base64check \
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
@@ -484,6 +484,14 @@ errorreport: testbin
 # and a registry entry nothing raises is a doc rotting into decoration.
 errorkinds:
 	@sh host/chez/error-kinds-check.sh
+
+# Base64 wire parity and a generous allocation ceiling for the bulk encoder.
+# The ceiling distinguishes one output String from the old character lists;
+# no wall-time ratio or decoder performance is asserted.
+.PHONY: base64check
+base64check:
+	@JOLT_NO_USER_DEPS=1 bin/jolt -Srepro test/base64_encoder_test.clj
+	@JOLT_NO_USER_DEPS=1 bin/jolt -Srepro test/base64_encoder_allocation_test.clj
 
 # The IR schema validator (JOLT_IR_VALIDATE) reports no problems on real code.
 irvalidate:

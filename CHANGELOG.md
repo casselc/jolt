@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Encode Base64 into a pre-sized String instead of building and copying
+  character lists. This reduces temporary allocation for bulk encoding while
+  preserving basic/URL alphabets, optional padding and MIME line wrapping.
+
 ## [0.8.22] - 2026-10-15
 
 Regular expressions follow java.util.regex where they parted ways: a loop over
