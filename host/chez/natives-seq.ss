@@ -97,12 +97,24 @@
 (define (into-xform to xform from)
   ;; conj onto a nil accumulator starts a list, as (conj nil x) does — into nil
   ;; is (reduce conj nil from) on the JVM, and an empty source leaves nil.
-  (let* ((conj-rf (lambda a (if (fx=? (length a) 1) (car a)   ; completion = identity
-                               (jolt-conj1 (if (jolt-nil? (car a)) jolt-empty-list (car a)) (cadr a)))))
+  ;; Match two-argument into's editable-target split. Keep source-driven reduce
+  ;; and transducer completion, but do not rebuild a persistent target per item.
+  (let* ((editable? (or (pvec? to) (pmap? to) (pset? to)))
+         (metadata (if editable? (jolt-meta to) jolt-nil))
+         (initial (if editable? (jolt-transient-new to) to))
+         (conj-rf
+           (if editable?
+               ;; Finalize in the reducing function's completion arity, as on
+               ;; the JVM: an outer xform may inspect/project the final value.
+               (case-lambda
+                 ((acc) (jolt-with-meta (jolt-persistent! acc) metadata))
+                 ((acc x) (jolt-conj! acc x)))
+               (lambda a (if (fx=? (length a) 1) (car a)
+                             (jolt-conj1 (if (jolt-nil? (car a)) jolt-empty-list (car a)) (cadr a))))))
          (xrf (jolt-invoke xform conj-rf))
          ;; into-fold, not reduce-seq: an IReduce(Init) source drives its own
          ;; reduce here too (seq.ss).
-         (res (into-fold xrf to from)))
+         (res (into-fold xrf initial from)))
     (jolt-invoke xrf res)))
 
 ;; mapcat: (mapcat f) -> transducer; (mapcat f coll & colls) -> map f across the

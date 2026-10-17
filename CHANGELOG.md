@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Accumulate three-argument `into` into editable targets using transients,
+  preserving target metadata and finalizing inside reducing-function completion.
+  Keep source-driven reduction, custom completion results and noneditable
+  target behavior. Add semantic and persistent-conj-path regression controls.
+
 - Update the compilation-unit writer-emission fixture for guarded StringWriter
   primitives. Require synchronized append/toString lowering, reject the old
   unlocked spellings, and retain concrete-tag guards and generic fallback.

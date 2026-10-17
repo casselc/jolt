@@ -1021,6 +1021,7 @@ sortedcoll:
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
 	@$(CHEZ) --script test/chez/transient-test.ss
+	@$(CHEZ) --script test/chez/into-xform-test.ss
 
 .PHONY: transientassoc
 transientassoc: testbin
