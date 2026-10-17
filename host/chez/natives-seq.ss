@@ -100,17 +100,22 @@
   ;; Match two-argument into's editable-target split. Keep source-driven reduce
   ;; and transducer completion, but do not rebuild a persistent target per item.
   (let* ((editable? (or (pvec? to) (pmap? to) (pset? to)))
+         (metadata (if editable? (jolt-meta to) jolt-nil))
          (initial (if editable? (jolt-transient-new to) to))
-         (conj-rf (lambda a (if (fx=? (length a) 1) (car a)   ; completion = identity
-                               (if editable?
-                                   (jolt-conj! (car a) (cadr a))
-                                   (jolt-conj1 (if (jolt-nil? (car a)) jolt-empty-list (car a)) (cadr a))))))
+         (conj-rf
+           (if editable?
+               ;; Finalize in the reducing function's completion arity, as on
+               ;; the JVM: an outer xform may inspect/project the final value.
+               (case-lambda
+                 ((acc) (jolt-with-meta (jolt-persistent! acc) metadata))
+                 ((acc x) (jolt-conj! acc x)))
+               (lambda a (if (fx=? (length a) 1) (car a)
+                             (jolt-conj1 (if (jolt-nil? (car a)) jolt-empty-list (car a)) (cadr a))))))
          (xrf (jolt-invoke xform conj-rf))
          ;; into-fold, not reduce-seq: an IReduce(Init) source drives its own
          ;; reduce here too (seq.ss).
-         (res (into-fold xrf initial from))
-         (completed (jolt-invoke xrf res)))
-    (if editable? (meta-carry to (jolt-persistent! completed)) completed)))
+         (res (into-fold xrf initial from)))
+    (jolt-invoke xrf res)))
 
 ;; mapcat: (mapcat f) -> transducer; (mapcat f coll & colls) -> map f across the
 ;; colls (stops at shortest), then concat the results.

@@ -36,6 +36,10 @@
 (is "completion once" "(let [n (atom 0) xf (fn [rf] (fn ([r] (swap! n inc) (rf r)) ([r x] (rf r x)))) result (into [] xf [1 2])] [result @n])" "[[1 2] 1]")
 (is "IReduceInit source" "(let [n (atom 0) source (reify clojure.lang.IReduceInit (reduce [_ rf init] (swap! n inc) (rf init 7))) result (into [] (map inc) source)] [result @n])" "[[8] 1]")
 (is "exception identity and stop order" "(let [seen (atom []) error (ex-info \"stop\" {})] (try (into [] (map (fn [x] (swap! seen conj x) (if (= x 2) (throw error) x))) (range 10)) (catch clojure.lang.ExceptionInfo got [(identical? error got) @seen])))" "[true [0 1 2]]")
+(is "based vector source stays immutable" "(let [source (vec (range 40)) result (into source (map inc) (range 100))] [(= (seq source) (range 40)) (= (seq result) (concat (range 40) (range 1 101))) (count source) (count result)])" "[true true 40 140]")
+(is "custom step observes transient accumulator" "(let [seen (atom []) xf (fn [rf] (fn ([r] (rf r)) ([r x] (swap! seen conj (vector? r)) (rf r x)))) result (into [] xf [1 2])] [result @seen])" "[[1 2] [false false]]")
+(is "completion can project the finalized result" "(try (let [xf (fn [rf] (fn ([r] (let [p (rf r)] [(vector? p) (count p) (vec (seq p))])) ([r x] (rf r x))))] (into [] xf [1 2])) (catch Throwable _ :failed))" "[true 2 [1 2]]")
+(is "completion can replace result metadata" "(try (let [xf (fn [rf] (fn ([r] (with-meta (rf r) {:completion true})) ([r x] (rf r x))))] (meta (into (with-meta [] {:source true}) xf [1]))) (catch Throwable _ :failed))" "{:completion true}")
 
 ;; Compile before installing the observation, so compiler collection building
 ;; cannot be counted as the operation under test.
@@ -43,7 +47,8 @@
   (map (lambda (s) (jolt-compile-eval s "user"))
        '("(fn [] (into [] (map inc) (range 64)))"
          "(fn [] (into {} (map (fn [i] [i i])) (range 64)))"
-         "(fn [] (into #{} (map inc) (range 64)))")))
+         "(fn [] (into #{} (map inc) (range 64)))"
+         "(fn [] (into (vec (range 40)) (map inc) (range 64)))")))
 (define persistent-target-steps 0)
 (define previous-conj1 jolt-conj1)
 (dynamic-wind
