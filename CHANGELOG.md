@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Avoid transient buffers for single-input `mapv` over nil or an empty builtin
+  vector. Preserve custom reduction/realization, multi-input behavior and
+  metadata stripping. Port the stock-0.8.22 proposal without discarding the
+  retained interop, string and transduced-into improvements.
+
 - Accumulate three-argument `into` into editable targets using transients,
   preserving target metadata and finalizing inside reducing-function completion.
   Keep source-driven reduction, custom completion results and noneditable
