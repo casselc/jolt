@@ -958,6 +958,7 @@ sortedcoll:
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
 	@$(CHEZ) --script test/chez/transient-test.ss
+	@$(CHEZ) --script test/chez/into-xform-test.ss
 
 # RRB vector: catvec/slice against a list model with structural invariants
 # (seeded sequences, seed printed on failure), and the n-vs-4n complexity

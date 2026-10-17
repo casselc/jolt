@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Transduced `into` uses transient accumulation for editable targets.**
+  Three-argument `into` now builds vectors, maps and sets without rebuilding a
+  persistent target for each item, like two-argument `into`. Metadata, reduced
+  termination, source-driven reduction and transducer completion are retained;
+  noneditable targets keep their persistent accumulation path.
+
 ## [0.8.22] - 2026-10-15
 
 Regular expressions follow java.util.regex where they parted ways: a loop over
