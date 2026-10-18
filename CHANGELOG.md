@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Add the reviewed runtime-owned stock sorted-map predicate and seq-order fold
+  to the qualified capability baseline. Keep custom per-object operations on
+  their own sequence path; preserve callback order and exception boundaries
+  without allocating entries or sequence chunks. No existing path switched.
+
 - Update the compilation-unit writer-emission fixture for guarded StringWriter
   primitives. Require synchronized append/toString lowering, reject the old
   unlocked spellings, and retain concrete-tag guards and generic fallback.

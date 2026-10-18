@@ -1017,6 +1017,7 @@ flow:
 # answered from the tree. Values pinned to the JVM; scaling pinned as allocation.
 sortedcoll:
 	@$(CHEZ) --script test/chez/sorted-test.ss
+	@$(CHEZ) --script test/chez/sorted-map-fold-test.ss
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
