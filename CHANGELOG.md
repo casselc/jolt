@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - cumulative performance candidate
 
+- Retain the stock sorted-map operation table during tree shaking: the native
+  fold predicate references its private Var outside the application IR graph.
+  Keep the existing runtime-root reference gate unchanged.
+
 - Add the reviewed runtime-owned stock sorted-map predicate and seq-order fold
   to the qualified capability baseline. Keep custom per-object operations on
   their own sequence path; preserve callback order and exception boundaries
