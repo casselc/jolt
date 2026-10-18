@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or sequence chunks. The fold preserves stock sequence callback order and
   never calls the comparator; maps with custom operation tables are rejected
   before visiting entries. No portable API or existing traversal path changes.
+  Retain the defining operation table during tree shaking for the native
+  predicate's private Var lookup.
 
 ## [0.8.23] - 2026-10-17
 

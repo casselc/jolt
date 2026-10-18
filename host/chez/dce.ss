@@ -282,6 +282,9 @@
     ;; native map itself and resolves find-other by name for every other type — so
     ;; an app that only ever calls find has no IR edge to it
     "clojure.core/find-other"
+    ;; The native stock sorted-map predicate (host-table.ss) compares the map's
+    ;; operation table with this private root, outside the app IR call graph.
+    "clojure.core/sm-ops"
     ;; java.util.TreeMap (java/tree-map.ss) is a sorted-map-by in a mutable root
     ;; and navigates it with subseq / rsubseq and the comparison fns they test with
     "clojure.core/sorted-map-by" "clojure.core/subseq" "clojure.core/rsubseq"
