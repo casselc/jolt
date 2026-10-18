@@ -1,10 +1,10 @@
-name: measured 0.8.21 durable runtime artifact
+name: qualified stock-fold durable runtime artifact
 
 # Exact bare-runtime capability producer, not an aspect-compiler qualification.
 # Compiler source is independent of the workflow source and never follows HEAD.
 on:
   push:
-    branches: [ci/measured-runtime-0821-20261014]
+    branches: [ci/qualified-stock-fold-artifact-20261018]
     paths: [.github/workflows/durable-runtime-artifact.yml]
   workflow_dispatch:
 
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: measured-durable-runtime-0821
+  group: qualified-stock-fold-runtime-20261018
   cancel-in-progress: false
 
 jobs:
@@ -20,9 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      COMPILER_SOURCE: 1ae7e0d19aa3088789410106610beb171bcfb0ef
-      COMPILER_TREE: e9b3978fbd7949e85827578b8bf79581cb176861
-      COMPILER_EXPECTED_VERSION: 'jolt v0.8.21-58-g1ae7e0d1'
+      COMPILER_SOURCE: 631984d66445b8b123f2cfa154fc6442cf468fd4
+      COMPILER_TREE: 79cd95a4fbee07670da584d0b1c0fd201581f05e
+      COMPILER_EXPECTED_VERSION: 'jolt v0.8.21-59-g631984d6'
       UPSTREAM_SOURCE: 5b46858a171f30949f5b09eb484bc6c5ff93c6ea
       UPSTREAM_TREE: a6e73f0343dae1cc8ae311612f2ecd9ca0a7b8c5
       CHEZ: /opt/chez/bin/chez
@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: casselc/jolt
-          ref: 1ae7e0d19aa3088789410106610beb171bcfb0ef
+          ref: 631984d66445b8b123f2cfa154fc6442cf468fd4
           path: compiler
           fetch-depth: 0
           submodules: recursive
@@ -115,6 +115,27 @@ jobs:
             (let [check (jolt.scheme/eval-string "(lambda () (and (bitwise-bit-set? (procedure-arity-mask make-protocol-method-site) 3) (procedure? sb-append*!) (procedure? sb-str*)))")]
               (assert (check))
               (println :observable-native-writer-capabilities-pass))'
+          timeout 30s target/release/jolt -Srepro -e '
+            (require (quote jolt.scheme) (quote jolt.host))
+            (let [admit (jolt.scheme/proc "stock-sorted-map?")
+                  fold (jolt.scheme/proc "sorted-map-fold-seq-order")
+                  m (sorted-map "b" false "a" 42)
+                  marker []
+                  calls (atom 0)
+                  custom (sorted-map "a" 42)]
+              (assert (admit m))
+              (assert (= [["a" 42] ["b" false]]
+                         (fold m (fn [k v acc] (conj acc [k v])) [])))
+              (assert (identical? marker
+                         (fold (sorted-map) (fn [& _] (throw (ex-info "unexpected empty visit" {}))) marker)))
+              (jolt.host/ref-put! custom :ops
+                (assoc (jolt.host/ref-get custom :ops) :seq
+                  (fn [_] (swap! calls inc) (throw (ex-info "unexpected custom seq" {})))))
+              (assert (false? (admit custom)))
+              (assert (try (fold custom (fn [& _] (swap! calls inc)) nil)
+                           false (catch Throwable _ true)))
+              (assert (zero? @calls))
+              (println :stock-sorted-fold-binary-capability-pass))'
       - name: Verify built source remains unchanged
         run: |
           set -euo pipefail
@@ -154,7 +175,7 @@ jobs:
             printf 'require_buildlib=1\n'
             printf 'binary_version=%s\n' "$(target/release/jolt --version)"
             printf 'binary_sha256=%s\n' "$(sha256sum target/release/jolt | cut -d ' ' -f 1)"
-            printf 'gate=pass\nranged_append_ascii=98\nruntime_kind=plain\n'
+            printf 'gate=pass\nranged_append_ascii=98\nruntime_kind=plain\nstock_sorted_map_fold=pass\n'
             printf 'submodules_begin\n'
             git submodule status --recursive
             printf 'submodules_end\n'
@@ -164,7 +185,7 @@ jobs:
         id: artifact
         uses: actions/upload-artifact@v4
         with:
-          name: durable-runtime-1ae7e0d1-linux-x64
+          name: durable-runtime-stock-fold-631984d6-linux-x64
           path: runtime-artifact/
           if-no-files-found: error
           retention-days: 90
