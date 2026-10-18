@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Internal Chez `stock-sorted-map?` and `sorted-map-fold-seq-order` helpers for
+  native consumers that need key/value traversal without temporary map entries
+  or sequence chunks. The fold preserves stock sequence callback order and
+  never calls the comparator; maps with custom operation tables are rejected
+  before visiting entries. No portable API or existing traversal path changes.
+
 ## [0.8.23] - 2026-10-17
 
 Code loaded at the REPL or by `jolt run` can opt into the optimizations a

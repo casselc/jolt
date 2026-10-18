@@ -213,6 +213,35 @@
       acc
       (sc-tree-fold (sc-nd-right t) f (f t (sc-tree-fold (sc-nd-left t) f acc)))))
 
+;; Internal native-consumer helpers, not portable Clojure APIs. Keep sorted
+;; tree layout here, as pmap-fold-seq-order keeps native map layout in core.
+;; Only the defining core's ordinary operation table is eligible: a per-object
+;; replacement must retain its own seq/first/next behavior. Core-private roots
+;; and immutable collection internals are trusted, as for the ordinary walker.
+;; The cell is interned before 25-sorted.clj defines its root during bootstrap.
+(define sc-stock-map-ops-cell (jolt-var "clojure.core" "sm-ops"))
+(define sc-stock-map-type-key (keyword "jolt" "type"))
+(define sc-stock-map-type (keyword "jolt" "sorted-map"))
+(define sc-stock-map-ops-key (keyword #f "ops"))
+(define (stock-sorted-map? m)
+  (and (htable? m)
+       (eq? (jolt-ref-get m sc-stock-map-type-key) sc-stock-map-type)
+       (let ((ops (var-cell-root sc-stock-map-ops-cell)))
+         (and (pmap? ops) (eq? (jolt-ref-get m sc-stock-map-ops-key) ops)))))
+;; Same callback order as the stock map seq, including custom-comparator maps,
+;; without constructing entries or seq chunks and without calling a comparator.
+;; Capture the immutable root before callbacks. Nested folds and exceptions
+;; need no shared cursor; accumulator values (including Reduced) are ordinary
+;; values, not an early-termination protocol. VISIT is a native 3-arg procedure.
+(define (sorted-map-fold-seq-order m visit acc)
+  (unless (stock-sorted-map? m)
+    (error 'sorted-map-fold-seq-order "expected a stock sorted map" m))
+  (let loop ((tree (jolt-ref-get m kw-tree)) (acc acc))
+    (if (jolt-nil? tree) acc
+        (let* ((left (loop (sc-nd-left tree) acc))
+               (next (visit (sc-nd-key tree) (sc-nd-val tree) left)))
+          (loop (sc-nd-right tree) next)))))
+
 ;; --- extend the collection dispatchers with a sorted arm ---------------------
 ;; A sorted coll's seq is the :seq op's: the lazy walk above, already flavored
 ;; (a map's is a PersistentTreeMap$Seq, a set's an APersistentMap$KeySeq —
