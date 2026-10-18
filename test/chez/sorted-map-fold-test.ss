@@ -35,7 +35,9 @@
     (let ((calls 0))
       (ok "non-stock collections decline without callbacks" (not (stock-sorted-map? m)))
       (ok "fold rejects unsupported input"
-          (guard (e (else #t))
+          (guard (e (else (and (message-condition? e)
+                              (string=? (condition-message e) "expected a stock sorted map")
+                              (or (not (irritants-condition? e)) (null? (condition-irritants e))))))
             (sorted-map-fold-seq-order m (lambda args (set! calls (+ calls 1))) #f) #f))
       (ok "no visit on rejection" (= calls 0))))
   (list jolt-nil #f (ev "{}") (ev "[]") (ev "(sorted-set 1 2)")))

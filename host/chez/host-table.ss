@@ -235,7 +235,7 @@
 ;; values, not an early-termination protocol. VISIT is a native 3-arg procedure.
 (define (sorted-map-fold-seq-order m visit acc)
   (unless (stock-sorted-map? m)
-    (error 'sorted-map-fold-seq-order "expected a stock sorted map" m))
+    (error 'sorted-map-fold-seq-order "expected a stock sorted map"))
   (let loop ((tree (jolt-ref-get m kw-tree)) (acc acc))
     (if (jolt-nil? tree) acc
         (let* ((left (loop (sc-nd-left tree) acc))
