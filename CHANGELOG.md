@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Comparing a sorted map or set with a function now rejects the type mismatch
+  without first constructing a complete hash collection. Both operand orders
+  retain their false result; map/set comparison and earlier registered equality
+  extensions keep their existing paths. This avoids linear allocation for a
+  constant-time mismatch, such as a function marker checked against a value.
+
 ## [0.8.23] - 2026-10-17
 
 Code loaded at the REPL or by `jolt run` can opt into the optimizations a

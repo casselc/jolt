@@ -83,6 +83,31 @@
 (is "[(= (sorted-map :a 1) (sorted-map :b 1)) (= (sorted-set :a) (sorted-set :b)) (= (sorted-set) #{}) (= (sorted-map) {})]" "[false false true true]")
 (is "[(= (sorted-map 1 nil) {2 nil}) (= (sorted-map 1 nil) {1 nil}) (= (sorted-map nil 1) {nil 1})]" "[false true true]")
 
+;; A function is not a collection, including when the map/set is empty. Both
+;; operand orders must reject it before the sorted fallback builds a hash coll.
+(is "(let [f (fn [x] x)] (mapv (fn [s] [(= f s) (= s f)]) [(sorted-map) (sorted-set) sm ss]))"
+    "[[false false] [false false] [false false] [false false]]")
+(ok "function/map mismatch is decided by the sorted fast path"
+    (eq? 'ne (sorted-fast= (var-deref "user" "sm") (lambda (x) x))))
+(ok "function/set mismatch is decided by the sorted fast path"
+    (eq? 'ne (sorted-fast= (var-deref "user" "ss") (lambda (x) x))))
+
+;; Later extension predicates still run before the sorted arm. The rejection
+;; does not move equality ahead of the registry or bypass a selected handler.
+(let* ((saved jolt-eq-arms) (f (lambda (x) x))
+       (m (var-deref "user" "sm")) (calls 0))
+  (dynamic-wind
+    (lambda ()
+      (register-eq-arm!
+        (lambda (a b) (or (and (eq? a f) (eq? b m))
+                          (and (eq? a m) (eq? b f))))
+        (lambda (a b) (set! calls (+ calls 1)) #t)))
+    (lambda ()
+      (ok "a later selected extension still handles fn/map" (jolt=2 f m))
+      (ok "a later selected extension still handles map/fn" (jolt=2 m f))
+      (ok "selected extension runs once per comparison" (= 2 calls)))
+    (lambda () (set! jolt-eq-arms saved))))
+
 ;; --- scaling, as bytes allocated --------------------------------------------
 (define (bytes-of thunk reps)
   (thunk)
@@ -113,6 +138,10 @@
 ;; the hash is computed once per value; = of different counts is a count compare
 (flat "a repeated (hash sm)" "(hash sm)" 256)
 (flat "(= ss ss2) with different counts" "(= ss ss2)" 1024)
+(flat "(= identity sm) rejects without normalization" "(= identity sm)" 1024)
+(flat "(= sm identity) rejects without normalization" "(= sm identity)" 1024)
+(flat "(= identity ss) rejects without normalization" "(= identity ss)" 1024)
+(flat "(= ss identity) rejects without normalization" "(= ss identity)" 1024)
 ;; and = of equal colls walks the trees without building a hash coll, where the
 ;; conversion allocated a HAMT per side
 (let* ((n 40000)

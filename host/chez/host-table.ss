@@ -342,6 +342,9 @@
                                (sc-push-spine (sc-nd-right nb) #t (cdr sb)))))))))
   (if (htable-sorted-map? s)
       (cond
+        ;; Functions are neither maps nor sets. Do not build a complete plain
+        ;; collection merely to discover this type mismatch in the fallback.
+        ((procedure? o) 'ne)
         ((pmap? o)
          (verdict (and (eqv? (sc-count s) (pmap-cnt o))
                        (sc-tree-every? (jolt-ref-get s kw-tree)
@@ -353,6 +356,7 @@
                                                (jolt=2 (sc-nd-val a) (sc-nd-val b)))))))
         (else #f))
       (cond
+        ((procedure? o) 'ne)
         ((pset? o)
          (verdict (and (eqv? (sc-count s) (pset-count o))
                        (sc-tree-every? (jolt-ref-get s kw-tree)
